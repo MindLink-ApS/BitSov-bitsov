@@ -2004,7 +2004,7 @@ async fn gossip_status_requires_auth() {
 }
 
 #[tokio::test]
-async fn gossip_publish_valid_web_manifest() {
+async fn gossip_publish_web_manifest_rejected_until_paid_broadcast_lands() {
     let state = test_state_with_gossip();
     let app = build_router(state.clone());
     let auth = auth_header(&state);
@@ -2027,15 +2027,7 @@ async fn gossip_publish_valid_web_manifest() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(resp.into_body(), 10_000).await.unwrap(),
-    ).unwrap();
-    assert!(body["message_id"].is_string());
-    assert!(!body["message_id"].as_str().unwrap().is_empty());
-    // StubTransport has no connected peers, so peers_sent=0
-    assert_eq!(body["peers_sent"], 0);
-    assert_eq!(body["peers_total"], 0);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
