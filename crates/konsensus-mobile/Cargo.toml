@@ -1,0 +1,45 @@
+[package]
+name = "konsensus-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BitSov mobile SDK — UniFFI bindings + Noise-over-WSS transport for iOS/Android"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+uniffi = { version = "0.28", features = ["tokio"] }
+
+tokio = { version = "1.40", features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+] }
+
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "io"] }
+
+snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+rand = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+zeroize = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
+tracing-subscriber = { workspace = true }

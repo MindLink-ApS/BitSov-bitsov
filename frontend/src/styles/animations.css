@@ -1,0 +1,963 @@
+/* BitSov — Animation & Micro-Interaction System
+ *
+ * Motion design specification for a sovereign, premium desktop app.
+ * All animations use CSS transforms + opacity (GPU-composited, 60fps).
+ * No heavy animation libraries required.
+ *
+ * Design principles:
+ *   1. Motion conveys meaning — every animation tells the user something
+ *   2. Brevity over spectacle — 150-300ms for UI, up to 600ms for dramatic moments
+ *   3. Physics-inspired — spring/ease-out for arrivals, ease-in for departures
+ *   4. Respect reduced-motion — all animations disabled via prefers-reduced-motion
+ *   5. Bitcoin orange (#F7931A) is the energy pulse — used sparingly for payment/crypto moments
+ *
+ * References:
+ *   - Apple HIG: quick, precise, realistic motion
+ *   - Material Design 3: container transform, shared axis, fade through
+ *   - Linear: 120ms hovers, spring-feel transitions, stagger children
+ *   - Stripe: 20x attention to detail, natural timing variation
+ *   - Telegram: Lottie-based send effects, 60fps composited animations
+ */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SECTION 1: MOTION TOKENS (Design Variables)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── Duration Scale ── */
+  --duration-instant:  80ms;    /* Hover highlights, opacity micro-shifts */
+  --duration-fast:     150ms;   /* Button press, icon swap, sidebar hover */
+  --duration-normal:   250ms;   /* Page transitions, panel slides, most UI */
+  --duration-slow:     400ms;   /* Dramatic reveals, QR draw, connection lines */
+  --duration-dramatic: 600ms;   /* Mnemonic reveal, sovereignty banner, first-run */
+
+  /* ── Easing Curves ── */
+  /*
+   * ease-out-expo: sharp deceleration — objects "land" with authority
+   *   Inspired by Apple's spring animations. Use for elements entering view.
+   */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /*
+   * ease-out-back: slight overshoot then settle — playful, alive
+   *   Use for message bubbles, notifications, badges. The 0.34 overshoots ~5%.
+   */
+  --ease-out-back: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /*
+   * ease-in-out-quart: smooth acceleration/deceleration
+   *   Use for page transitions, sidebar expand/collapse.
+   */
+  --ease-in-out-quart: cubic-bezier(0.76, 0, 0.24, 1);
+
+  /*
+   * ease-in-quad: gentle acceleration — objects leaving view
+   *   Use for elements exiting, fading out.
+   */
+  --ease-in-quad: cubic-bezier(0.55, 0.085, 0.68, 0.53);
+
+  /*
+   * ease-spring: approximated spring via CSS linear()
+   *   For supported browsers: a true spring feel (damping ratio ~0.6)
+   *   Fallback: ease-out-expo
+   */
+  --ease-spring: linear(
+    0, 0.006, 0.025, 0.058, 0.105, 0.167, 0.241, 0.328, 0.425,
+    0.530, 0.642, 0.756, 0.868, 0.974, 1.067, 1.141, 1.192,
+    1.219, 1.222, 1.204, 1.169, 1.122, 1.068, 1.013, 0.960,
+    0.914, 0.878, 0.855, 0.845, 0.848, 0.862, 0.884, 0.911,
+    0.940, 0.967, 0.989, 1.005, 1.014, 1.016, 1.013, 1.006,
+    1.000
+  );
+
+  /* ── Bitcoin Orange Palette (Dark Mode) ── */
+  /*
+   * Core orange #F7931A is vivid — on dark backgrounds it can overwhelm.
+   * Strategy: use full orange ONLY for payment moments (sats, Lightning, confirmations).
+   * For general accent, use the muted/dim variants already in global.css.
+   *
+   * Complementary: Azure #1A7EF7 (exact complement on color wheel)
+   * Split-complementary: Teal #1AC8C8, Blue-violet #4A1AF7
+   * Triadic: Magenta #F71A93, Green #1AF793
+   *
+   * Dark mode orange scale (luminance-adjusted for WCAG AA on #121214):
+   */
+  --btc-orange-100: #FEF3E2;   /* Lightest tint — barely there backgrounds */
+  --btc-orange-200: #FDDCAA;   /* Subtle warm glow backgrounds */
+  --btc-orange-300: #FBBA5C;   /* Readable text on dark (5.8:1 contrast) */
+  --btc-orange-400: #F7931A;   /* THE Bitcoin orange — icons, badges, payment flash */
+  --btc-orange-500: #D47A0E;   /* Hover state on dark — less eye-strain */
+  --btc-orange-600: #A85E00;   /* Pressed/active state */
+  --btc-orange-glow-subtle: rgba(247, 147, 26, 0.08);  /* Background wash */
+  --btc-orange-glow-medium: rgba(247, 147, 26, 0.18);  /* Hover glow */
+  --btc-orange-glow-strong: rgba(247, 147, 26, 0.35);  /* Payment flash */
+  --btc-orange-glow-intense: rgba(247, 147, 26, 0.55); /* Active payment pulse */
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SECTION 2: KEYFRAME DEFINITIONS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 2.1 Message Send: bubble scale-in + encrypting shimmer + payment flash ── */
+
+@keyframes message-appear {
+  0% {
+    opacity: 0;
+    transform: translateY(12px) scale(0.95);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes encrypting-shimmer {
+  0% {
+    background-position: -200% center;
+  }
+  100% {
+    background-position: 200% center;
+  }
+}
+
+@keyframes payment-flash {
+  0% {
+    box-shadow: 0 0 0 0 var(--btc-orange-glow-strong);
+    border-color: transparent;
+  }
+  30% {
+    box-shadow: 0 0 16px 4px var(--btc-orange-glow-intense);
+    border-color: var(--btc-orange-400);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    border-color: transparent;
+  }
+}
+
+@keyframes checkmark-draw {
+  0% {
+    stroke-dashoffset: 24;
+    opacity: 0;
+  }
+  40% {
+    opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+/* ── 2.2 Sats Counter / Payment Received ── */
+
+@keyframes sats-count-up {
+  0% {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+  60% {
+    transform: translateY(-2px);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes sats-glow-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    box-shadow: 0 0 12px 2px var(--btc-orange-glow-medium);
+  }
+}
+
+/* ── 2.3 Peer Connection / Disconnection ── */
+
+@keyframes node-connect-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(52, 168, 83, 0.5);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow: 0 0 12px 4px rgba(52, 168, 83, 0.25);
+    transform: scale(1.08);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    transform: scale(1);
+  }
+}
+
+@keyframes connection-line-draw {
+  0% {
+    stroke-dashoffset: 100%;
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+@keyframes node-disconnect-fade {
+  0% {
+    opacity: 1;
+    filter: saturate(1);
+  }
+  100% {
+    opacity: 0.4;
+    filter: saturate(0);
+  }
+}
+
+@keyframes connection-line-dissolve {
+  0% {
+    opacity: 1;
+    stroke-dashoffset: 0;
+  }
+  100% {
+    opacity: 0;
+    stroke-dashoffset: 100%;
+  }
+}
+
+/* ── 2.4 Navigation / Page Transitions ── */
+
+@keyframes page-enter {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes page-exit {
+  0% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+
+/* Shared axis (Material Design 3 pattern) — forward navigation */
+@keyframes shared-axis-enter {
+  0% {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes shared-axis-exit {
+  0% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(-24px);
+  }
+}
+
+/* ── 2.5 Sidebar Hover / Icon Scale ── */
+
+@keyframes sidebar-item-highlight {
+  0% {
+    background-color: transparent;
+  }
+  100% {
+    background-color: var(--glass-bg-light);
+  }
+}
+
+/* ── 2.6 Sovereignty Banner ── */
+
+@keyframes sovereignty-pulse {
+  0% {
+    opacity: 0;
+    transform: translateY(-4px);
+    box-shadow: 0 0 0 0 var(--btc-orange-glow-medium);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  60% {
+    box-shadow: 0 0 12px 2px var(--btc-orange-glow-medium);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+/* ── 2.7 QR Code — Draw from Center Outward ── */
+
+@keyframes qr-scale-reveal {
+  0% {
+    opacity: 0;
+    transform: scale(0);
+    clip-path: circle(0% at 50% 50%);
+  }
+  60% {
+    opacity: 1;
+    transform: scale(1.02);
+    clip-path: circle(55% at 50% 50%);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+    clip-path: circle(75% at 50% 50%);
+  }
+}
+
+/* ── 2.8 Mnemonic Reveal — Words Appear One by One ── */
+
+@keyframes word-appear {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.92);
+    filter: blur(4px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+/* ── 2.9 Error Shake — Gentle, Not Aggressive ── */
+
+@keyframes gentle-shake {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-4px);
+  }
+  40% {
+    transform: translateX(4px);
+  }
+  60% {
+    transform: translateX(-3px);
+  }
+  80% {
+    transform: translateX(2px);
+  }
+}
+
+/* ── 2.10 Generic Utility Animations ── */
+
+@keyframes fade-in {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@keyframes fade-out {
+  0% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+@keyframes slide-up {
+  0% {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slide-down {
+  0% {
+    opacity: 0;
+    transform: translateY(-16px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scale-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SECTION 3: ANIMATION CLASSES (Apply to elements)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 3.1 Message Send Sequence ──
+ *
+ * Sequence: .msg-appear → .msg-encrypting → .msg-payment-flash → .msg-sent
+ * Total perceived duration: ~800ms
+ * JS orchestration: add classes sequentially with setTimeout
+ *
+ * Timeline:
+ *   0ms:   .msg-appear       — bubble slides up, fades in (200ms, ease-out-expo)
+ *   200ms: .msg-encrypting   — gradient shimmer sweeps left-to-right (400ms, linear)
+ *   500ms: .msg-payment-flash — orange glow pulses once (300ms, ease-out)
+ *   650ms: .msg-sent          — checkmark draws (250ms)
+ */
+
+.msg-appear {
+  animation: message-appear 200ms var(--ease-out-expo) both;
+}
+
+.msg-encrypting {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--btc-orange-glow-subtle) 25%,
+    var(--btc-orange-glow-medium) 50%,
+    var(--btc-orange-glow-subtle) 75%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: encrypting-shimmer 400ms linear both;
+}
+
+.msg-payment-flash {
+  animation: payment-flash 300ms ease-out both;
+}
+
+.msg-sent .checkmark-icon {
+  stroke-dasharray: 24;
+  stroke-dashoffset: 24;
+  animation: checkmark-draw 250ms var(--ease-out-expo) both;
+}
+
+/* ── 3.2 Sats Counter / Payment Received ──
+ *
+ * The counter number animates upward (JS increments the value).
+ * Container gets a warm orange glow that pulses once then fades.
+ *
+ * Duration: 400ms count + 600ms glow
+ * Easing: ease-out-back for the bounce, ease-out for the glow
+ */
+
+.sats-update {
+  animation: sats-count-up 400ms var(--ease-out-back) both;
+}
+
+.sats-glow {
+  animation: sats-glow-pulse 600ms ease-out both;
+}
+
+/* Inline sats display — subtle orange tint on update */
+.sats-badge {
+  transition: color var(--duration-fast) ease-out,
+              background-color var(--duration-fast) ease-out;
+}
+
+.sats-badge.updating {
+  color: var(--btc-orange-300);
+  background-color: var(--btc-orange-glow-subtle);
+}
+
+/* ── 3.3 Peer Connect / Disconnect ──
+ *
+ * Connect: green pulse on avatar/node icon, connection line draws in SVG
+ * Disconnect: desaturate to gray, line dissolves
+ *
+ * Connect: 400ms total (pulse) + 500ms (line draw)
+ * Disconnect: 350ms fade to gray + 300ms line dissolve
+ */
+
+.peer-connect {
+  animation: node-connect-pulse 400ms var(--ease-out-expo) both;
+}
+
+.peer-connect-line {
+  stroke-dasharray: 100%;
+  animation: connection-line-draw 500ms var(--ease-in-out-quart) both;
+}
+
+.peer-disconnect {
+  animation: node-disconnect-fade 350ms ease-out both;
+}
+
+.peer-disconnect-line {
+  animation: connection-line-dissolve 300ms var(--ease-in-quad) both;
+}
+
+/* Peer status dot */
+.peer-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  transition: background-color var(--duration-normal) ease-out,
+              box-shadow var(--duration-normal) ease-out;
+}
+
+.peer-status-dot.online {
+  background-color: var(--success);
+  box-shadow: 0 0 6px rgba(52, 168, 83, 0.4);
+}
+
+.peer-status-dot.offline {
+  background-color: var(--text-muted);
+  box-shadow: none;
+}
+
+/* ── 3.4 Navigation / Page Transitions ──
+ *
+ * Default: fade + subtle vertical shift (Material "fade through" pattern)
+ * Forward nav: shared axis (slide right-to-left)
+ * Back nav: shared axis (slide left-to-right)
+ *
+ * Duration: 250ms — fast enough to feel instant, slow enough to perceive
+ * Easing: ease-in-out-quart for smoothness
+ */
+
+.page-enter {
+  animation: page-enter 250ms var(--ease-out-expo) both;
+}
+
+.page-exit {
+  animation: page-exit 150ms var(--ease-in-quad) both;
+}
+
+.page-enter-forward {
+  animation: shared-axis-enter 250ms var(--ease-out-expo) both;
+}
+
+.page-exit-forward {
+  animation: shared-axis-exit 150ms var(--ease-in-quad) both;
+}
+
+/* Reverse for back navigation — just flip the direction */
+.page-enter-back {
+  animation: shared-axis-exit 250ms var(--ease-out-expo) both reverse;
+}
+
+.page-exit-back {
+  animation: shared-axis-enter 150ms var(--ease-in-quad) both reverse;
+}
+
+/* ── 3.5 Sidebar Hover / Icon Scale ──
+ *
+ * Linear-style: 120ms hover, icon scales 1.05x, background highlight fades in.
+ * No transform on text — only icons scale. Text shifts feel jarring.
+ *
+ * Duration: 120ms hover-in, 200ms hover-out (asymmetric = feels natural)
+ */
+
+.sidebar-item {
+  position: relative;
+  transition: background-color 120ms ease-out;
+  border-radius: var(--radius-sm);
+}
+
+.sidebar-item:hover {
+  background-color: var(--glass-bg-light);
+}
+
+.sidebar-item .sidebar-icon {
+  transition: transform 120ms var(--ease-out-back),
+              color 120ms ease-out;
+  will-change: transform;
+}
+
+.sidebar-item:hover .sidebar-icon {
+  transform: scale(1.08);
+  color: var(--accent);
+}
+
+/* Active state — persistent highlight, no ongoing animation */
+.sidebar-item.active {
+  background-color: var(--accent-dim);
+}
+
+.sidebar-item.active .sidebar-icon {
+  color: var(--accent);
+}
+
+/* Unread badge — subtle pulse to draw attention without screaming */
+.sidebar-badge {
+  transition: transform var(--duration-fast) var(--ease-out-back);
+}
+
+.sidebar-badge.has-unread {
+  animation: sats-glow-pulse 2s ease-in-out infinite;
+  background-color: var(--accent);
+}
+
+/* ── 3.6 Sovereignty Banner ──
+ *
+ * First appearance: slides down + orange glow pulse, then settles static.
+ * Subsequent views: no animation (use JS to track first-seen state).
+ *
+ * Duration: 600ms total
+ * Easing: ease-out-expo for slide, ease-out for glow fade
+ */
+
+.sovereignty-banner {
+  transition: opacity var(--duration-normal) ease-out;
+}
+
+.sovereignty-banner.first-appear {
+  animation: sovereignty-pulse 600ms var(--ease-out-expo) both;
+}
+
+/* ── 3.7 QR Code Generate ──
+ *
+ * Circle clip-path expands from center, slight scale overshoot.
+ * The QR modules can be SVG rects that stagger in with CSS animation-delay.
+ *
+ * Duration: 500ms
+ * Easing: ease-out-expo
+ */
+
+.qr-reveal {
+  animation: qr-scale-reveal 500ms var(--ease-out-expo) both;
+}
+
+/* For individual QR modules (if using SVG), stagger with inline --delay */
+.qr-module {
+  opacity: 0;
+  animation: scale-in 200ms var(--ease-out-back) both;
+  animation-delay: var(--delay, 0ms);
+}
+
+/* ── 3.8 Mnemonic Reveal ──
+ *
+ * Words appear one by one with de-blur effect. Typewriter-inspired but softer.
+ * Each word has an inline --index variable set by JS for stagger.
+ *
+ * Per-word duration: 200ms
+ * Stagger: 80ms between words (24 words = ~2s total — dramatic but not slow)
+ * Easing: ease-out-expo
+ */
+
+.mnemonic-word {
+  opacity: 0;
+  animation: word-appear 200ms var(--ease-out-expo) both;
+  animation-delay: calc(var(--index, 0) * 80ms);
+}
+
+/* The container fades in first */
+.mnemonic-grid {
+  animation: fade-in 200ms ease-out both;
+}
+
+/* ── 3.9 Error State ──
+ *
+ * Gentle horizontal shake (amplitude: 4px max, not 10px+ like aggressive shakes).
+ * Combined with red border transition and subtle red background tint.
+ *
+ * Duration: 400ms for shake, 200ms for color transitions
+ * Easing: ease-out (decelerating oscillation)
+ */
+
+.error-shake {
+  animation: gentle-shake 400ms ease-out;
+}
+
+.input-error {
+  border-color: var(--error) !important;
+  background-color: var(--error-dim) !important;
+  transition: border-color 200ms ease-out,
+              background-color 200ms ease-out;
+}
+
+/* Toast/notification error — slides in from top-right */
+.toast-error {
+  animation: slide-down 250ms var(--ease-out-expo) both;
+  border-left: 3px solid var(--error);
+}
+
+/* ── 3.10 Generic Utility Classes ── */
+
+.animate-fade-in {
+  animation: fade-in var(--duration-normal) ease-out both;
+}
+
+.animate-fade-out {
+  animation: fade-out var(--duration-fast) ease-in both;
+}
+
+.animate-slide-up {
+  animation: slide-up var(--duration-normal) var(--ease-out-expo) both;
+}
+
+.animate-slide-down {
+  animation: slide-down var(--duration-normal) var(--ease-out-expo) both;
+}
+
+.animate-scale-in {
+  animation: scale-in var(--duration-normal) var(--ease-out-back) both;
+}
+
+.animate-spin {
+  animation: spin 800ms linear infinite;
+}
+
+/* Stagger children — set --stagger-delay on parent, --index on children */
+.stagger-children > * {
+  animation-delay: calc(var(--index, 0) * var(--stagger-delay, 50ms));
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SECTION 4: INTERACTIVE TRANSITIONS (Hover, Focus, Active States)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Buttons ── */
+
+.btn-transition {
+  transition: transform var(--duration-fast) var(--ease-out-expo),
+              box-shadow var(--duration-fast) ease-out,
+              background-color var(--duration-fast) ease-out,
+              border-color var(--duration-fast) ease-out;
+  will-change: transform;
+}
+
+.btn-transition:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+
+.btn-transition:active {
+  transform: translateY(0) scale(0.98);
+  transition-duration: var(--duration-instant);
+}
+
+/* Primary button — Bitcoin orange glow on hover */
+.btn-primary-glow:hover {
+  box-shadow: 0 4px 16px var(--btc-orange-glow-medium);
+}
+
+/* ── Cards / Panels ── */
+
+.card-hover {
+  transition: transform var(--duration-normal) var(--ease-out-expo),
+              box-shadow var(--duration-normal) ease-out,
+              border-color var(--duration-normal) ease-out;
+}
+
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--glass-border);
+}
+
+/* ── Avatars / Profile Images ── */
+
+.avatar-hover {
+  transition: transform var(--duration-fast) var(--ease-out-back),
+              box-shadow var(--duration-fast) ease-out;
+}
+
+.avatar-hover:hover {
+  transform: scale(1.06);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* ── Inputs / Text Fields ── */
+
+.input-focus-transition {
+  transition: border-color var(--duration-fast) ease-out,
+              box-shadow var(--duration-fast) ease-out;
+}
+
+.input-focus-transition:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--btc-orange-glow-subtle);
+}
+
+/* ── Toggle / Switch ── */
+
+.toggle-thumb {
+  transition: transform var(--duration-fast) var(--ease-spring, var(--ease-out-expo));
+}
+
+.toggle-track {
+  transition: background-color var(--duration-fast) ease-out;
+}
+
+/* ── Tooltips ── */
+
+.tooltip-enter {
+  animation: scale-in var(--duration-fast) var(--ease-out-back) both;
+  transform-origin: var(--tooltip-origin, bottom center);
+}
+
+/* ── Dropdowns / Menus ── */
+
+.dropdown-enter {
+  animation: slide-down var(--duration-fast) var(--ease-out-expo) both;
+  transform-origin: top center;
+}
+
+.dropdown-exit {
+  animation: fade-out var(--duration-instant) ease-in both;
+}
+
+/* ── Modal / Dialog ── */
+
+.modal-backdrop {
+  animation: fade-in var(--duration-normal) ease-out both;
+}
+
+.modal-content {
+  animation: scale-in var(--duration-normal) var(--ease-spring, var(--ease-out-expo)) both;
+}
+
+.modal-exit .modal-backdrop {
+  animation: fade-out var(--duration-fast) ease-in both;
+}
+
+.modal-exit .modal-content {
+  animation: fade-out var(--duration-fast) ease-in both;
+  transform: scale(0.96);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SECTION 5: LOADING / SKELETON STATES
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Skeleton shimmer — dark mode variant */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-secondary) 0%,
+    var(--bg-tertiary) 40%,
+    var(--bg-secondary) 80%
+  );
+  background-size: 200% 100%;
+  animation: encrypting-shimmer 1.5s linear infinite;
+  border-radius: var(--radius-sm);
+}
+
+/* Lightning payment pending — orange shimmer */
+.payment-pending {
+  background: linear-gradient(
+    90deg,
+    var(--bg-secondary) 0%,
+    var(--btc-orange-glow-subtle) 40%,
+    var(--bg-secondary) 80%
+  );
+  background-size: 200% 100%;
+  animation: encrypting-shimmer 2s linear infinite;
+}
+
+/* Connection establishing — green shimmer */
+.connecting {
+  background: linear-gradient(
+    90deg,
+    var(--bg-secondary) 0%,
+    var(--success-dim) 40%,
+    var(--bg-secondary) 80%
+  );
+  background-size: 200% 100%;
+  animation: encrypting-shimmer 1.8s linear infinite;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SECTION 6: ACCESSIBILITY — REDUCED MOTION
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Preserve essential state indicators without motion */
+  .peer-status-dot.online {
+    box-shadow: none;
+  }
+
+  .sidebar-badge.has-unread {
+    animation: none;
+  }
+
+  /* Error: red background instead of shake */
+  .error-shake {
+    animation: none;
+    background-color: var(--error-dim);
+  }
+
+  /* Sovereignty banner: just appear, no pulse */
+  .sovereignty-banner.first-appear {
+    animation: none;
+    opacity: 1;
+  }
+
+  /* Mnemonic: all words visible immediately */
+  .mnemonic-word {
+    animation: none;
+    opacity: 1;
+  }
+
+  /* QR: just appear */
+  .qr-reveal {
+    animation: none;
+    opacity: 1;
+    clip-path: none;
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SECTION 7: PERFORMANCE NOTES (GPU compositing)
+   ═══════════════════════════════════════════════════════════════════════════
+ *
+ * All animations exclusively use GPU-composited properties:
+ *   - transform (translate, scale, rotate)
+ *   - opacity
+ *   - clip-path (composited in modern browsers)
+ *   - box-shadow (triggers paint, but no layout — acceptable for accents)
+ *   - filter: blur() (composited when will-change is set)
+ *
+ * We avoid animating:
+ *   - width, height, top, left, margin, padding (trigger layout)
+ *   - color, background-color (trigger paint — only used in transitions, not keyframes)
+ *   - border-width (triggers layout)
+ *
+ * will-change is applied sparingly to avoid memory overhead:
+ *   - Only on elements that animate frequently (sidebar icons, buttons)
+ *   - NOT on one-shot animations (message appear, QR reveal)
+ *
+ * Target: 60fps on integrated GPUs (Intel UHD 620, Apple M1 base)
+ * Tested assumption: Tauri WebView2/WebKit compositor handles these efficiently
+ */

@@ -1,0 +1,252 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  # 2026-04-30: paths-ignore REMOVED from pull_request. Branch protection on
+  # main requires Frontend Build + Rust Check & Test + Semgrep to report
+  # status; if a PR matches paths-ignore the workflow is skipped, the
+  # required checks never report, and the PR is permanently blocked
+  # (deadlock). Cost of running CI on doc-only PRs is ~10 min compute,
+  # acceptable. The push trigger keeps paths-ignore so daily-merged docs
+  # don't waste CI minutes on main itself.
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Rust Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # bitsov-browser crate depends on Wry/Tao which needs GTK3 + WebKit2GTK
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Check disk space
+        run: df -h /
+
+      - name: cargo check
+        run: cargo check --workspace
+
+      # Clean debug artifacts before test to free disk — ldk-node is ~5GB compiled
+      - name: Clean before test
+        run: |
+          rm -rf target/debug/build/ldk-node-* target/debug/deps/libldk_node-* target/debug/incremental/ 2>/dev/null || true
+          df -h /
+
+      - name: cargo test (core crates only — ldk-node too large for CI runner)
+        run: |
+          cargo test -p konsensus-core -p konsensus-crypto -p konsensus-storage \
+            -p konsensus-message -p konsensus-pricing -p konsensus-chain \
+            -p konsensus-routing -p konsensus-gossip -p konsensus-bsx \
+            -p konsensus-lightning -p konsensus-api -p konsensus-node
+
+      - name: cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install and build
+        working-directory: frontend
+        run: |
+          npm ci
+          npx tsc --noEmit
+          npx vite build
+
+  semgrep:
+    name: Semgrep Security Rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install semgrep
+        run: pip install semgrep
+
+      # Two-pass scan:
+      #   Pass 1 — full report (no --error), all findings visible in CI log.
+      #   Pass 2 — ERROR-severity only with --error; blocks the build if any found.
+      # Rules exclude test/, mock*, *_test.rs, benches/ — see semgrep-rules.yml.
+      # To suppress a specific false positive: add `# nosemgrep: <rule-id>` inline.
+      - name: Run BitSov security rules
+        run: |
+          semgrep --config docs/qa/semgrep-rules.yml \
+            --exclude 'target/' \
+            --exclude 'vendor/' \
+            . || true
+          semgrep --config docs/qa/semgrep-rules.yml \
+            --severity ERROR --error \
+            --exclude 'target/' \
+            --exclude 'vendor/' \
+            .
+
+  # Build CLI server binary for headless/VPS deployments
+  release-cli:
+    name: Release CLI (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, frontend]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: konsensus-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: konsensus-linux-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+
+      - name: Build release binary
+        run: cargo build --release -p konsensus-node --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/konsensus artifacts/${{ matrix.artifact }}
+          chmod +x artifacts/${{ matrix.artifact }}
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/${{ matrix.artifact }}
+
+  # Build Tauri desktop app for all platforms
+  release-desktop:
+    name: Release Desktop (${{ matrix.label }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, frontend]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-22.04
+          - label: macos-arm64
+            runner: macos-latest
+          - label: macos-x86_64
+            runner: macos-13
+          - label: windows-x86_64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # Linux needs GTK3 and WebKit2GTK for Tauri
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            frontend/src-tauri/target/
+          key: ${{ runner.os }}-tauri-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-tauri-
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: frontend
+          tagName: ${{ github.ref_name }}
+          releaseName: "Konsensus ${{ github.ref_name }}"
+          releaseBody: "Sovereign mesh network desktop client. See CHANGELOG for details."
+          releaseDraft: false
+          prerelease: false
