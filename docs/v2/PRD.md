@@ -1,7 +1,17 @@
-# Konsensus v2 — Product Requirements Document
+# BitSov/Konsensus v2 — Product Requirements Document
 
 > **Status:** At rest — pending v1 field testing
 > **Related:** [ARCHITECTURE.md](ARCHITECTURE.md) | [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) | [CURRENT_GAPS.md](CURRENT_GAPS.md)
+
+> **Public-core note (2026-05-20):** This is an early v2 reference document.
+> The normative launch docs are `CHARTER.md`, `README.md`,
+> `RELAY_PROTOCOL.md`, `REMOTE_ACCESS_IDENTITY.md`, and
+> `TIER_MIGRATION_PROTOCOL.md`. Where this document uses old "Tier 3/4"
+> labels, read them as Full/Infrastructure resource profiles, not a
+> custodial Tier-3 product. Where this document rejects public relays, it
+> rejects unauthenticated, decrypting, or gateway-style relays; the current
+> Tier-2 Relay design is non-custodial, payment-gated, whitelist-scoped, and
+> ciphertext-only.
 
 ---
 
@@ -37,7 +47,7 @@ v1 uses lightweight Bitcoin verification (Neutrino block filters or Electrum ser
 
 **Impact:** A compromised Electrum server or malicious Neutrino peer could feed false block data, undermining chain-aware message pricing (the live Principle 5 engine — see ADR-027) and payment verification.
 
-**v2 resolution:** Tier 3-4 nodes run Bitcoin Core directly. Tier 1-2 nodes use Neutrino/Electrum but with configurable trust levels and multiple peer validation.
+**v2 resolution:** Full and Infrastructure nodes run Bitcoin Core directly. Light and Standard nodes use Neutrino/Electrum but with configurable trust levels and multiple peer validation.
 
 #### 1.3 Pricing surfaces unwired (Principle 5 Gap)
 
@@ -90,8 +100,8 @@ These principles are the DNA of Konsensus. Every architectural decision in v2 mu
 |---|-----------|-----------------|
 | 1 | **Node = Sovereign Identity & Server** | The Bitcoin keypair on the node is the user; everything else derives from it |
 | 2 | **Lightning Clearance = Message Gate** | No payment, no packet — every message backed by a settled Lightning payment |
-| 3 | **Closed Mesh** | Zero reliance on third-party relays; every hop is direct node-to-node |
-| 4 | **Data Lives Only on Sender & Receiver** | No central storage, no cloud backup, no third-party gateways |
+| 3 | **Closed Mesh** | No unauthenticated public gateways; direct node-to-node where possible, with any relay constrained to whitelist/payment-gated ciphertext forwarding |
+| 4 | **Data Lives Only on Sender & Receiver** | No central plaintext storage, no cloud backup of decryptable data, no operator-held message keys |
 | 5 | **Timechain Pricing & ChainBridge Flywheel** _(see ADR-027 for terminology)_ | SaaS profit funds new nodes; subscriptions locked to Bitcoin block height. The "chain-aware message pricing" portion lives in core; the "timechain contract pricing" portion is a separate vision-layer concept (see ADR-028). |
 
 ### Biological Framework
@@ -150,7 +160,7 @@ v2 introduces a tiered architecture where a single `konsensus` binary adapts its
 
 **Key tradeoff:** Electrum server dependency. Mitigated by self-hosting Electrum or connecting to multiple servers with consensus validation.
 
-### Tier 3: Full Node
+### Full Node
 
 **Profile:** Maximum sovereignty. Runs Bitcoin Core for independent chain verification.
 
@@ -167,9 +177,9 @@ v2 introduces a tiered architecture where a single `konsensus` binary adapts its
 
 **Key tradeoff:** Resource requirements. Requires dedicated hardware or a capable VPS. Justified for operators who need or want maximum sovereignty.
 
-### Tier 4: Infrastructure Node
+### Infrastructure Node
 
-**Profile:** Network backbone operator. Runs everything in Tier 3 plus contributes to mesh infrastructure.
+**Profile:** Network backbone operator. Runs everything in the Full Node profile plus contributes to mesh infrastructure.
 
 | Attribute | Value |
 |-----------|-------|
@@ -325,7 +335,7 @@ v2 explicitly does **not** attempt the following. These are out of scope to main
 | **Browser wallet** | Browser-based wallets introduce custody and security concerns. The node is the wallet. |
 | **Fiat payment integration** | v2 is Bitcoin-native. Fiat on-ramps are a ChainBridge concern, not a protocol concern. |
 | **Smart contract platform** | Konsensus is a communication protocol, not a computation platform. Chain-aware message pricing (ADR-027) uses Bitcoin's timechain as a fee/halving signal, not as a programmable-contract platform. The Agreements layer (ADR-028) composes audited primitives (CLTV/CSV/HTLC/Miniscript/DLC) but is itself out of scope for v2. |
-| **Public relay/gateway mode** | Running a Konsensus node as a public relay would violate Principle 3 (Closed Mesh). Every node is sovereign, not a service provider for anonymous users. |
+| **Unauthenticated or decrypting public relay/gateway mode** | Running a node as an open gateway, plaintext relay, or anonymous service provider would violate Principle 3. Non-custodial Tier-2 Relay is allowed only when it is payment-gated, whitelist-scoped, and ciphertext-only. |
 | **Backwards compatibility with XMPP clients** | v2's native transport is not XMPP. XMPP clients cannot connect directly. The Electron client will be updated for v2. |
 | **Multi-tenant hosting** | One node, one operator. Multi-tenant hosting violates Principle 4. Managed hosting providers run separate node instances per customer. |
 | **Consensus mechanism** | Konsensus is not a blockchain. It uses Bitcoin's consensus; it does not implement its own. |
