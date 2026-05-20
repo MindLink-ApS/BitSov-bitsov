@@ -62,11 +62,11 @@ async fn app_extension_price() {
 }
 
 #[tokio::test]
-async fn realtime_signaling_not_priceable() {
+async fn realtime_signaling_price() {
     let e = engine();
-    assert!(e.get_price_msat(KIND_CALL_INVITE).await.is_err());
-    assert!(e.get_price_msat(KIND_CALL_ANSWER).await.is_err());
-    assert!(e.get_price_msat(KIND_ICE_CANDIDATE).await.is_err());
+    assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 50);
+    assert_eq!(e.get_price_msat(KIND_CALL_ANSWER).await.unwrap(), 50);
+    assert_eq!(e.get_price_msat(KIND_ICE_CANDIDATE).await.unwrap(), 50);
 }
 
 #[tokio::test]
@@ -105,10 +105,12 @@ async fn category_pricing() {
             .unwrap(),
         100
     );
-    assert!(e
-        .get_category_price_msat(KindCategory::RealTimeSignaling)
-        .await
-        .is_err());
+    assert_eq!(
+        e.get_category_price_msat(KindCategory::RealTimeSignaling)
+            .await
+            .unwrap(),
+        50
+    );
 }
 
 #[tokio::test]
@@ -120,6 +122,7 @@ async fn custom_config() {
         file_ref_msat: 500,
         control_msat: 5,
         collaboration_msat: 75,
+        realtime_signal_msat: 90,
         app_ext_msat: 25,
         web_content_msat: 100,
     };
@@ -129,6 +132,7 @@ async fn custom_config() {
     assert_eq!(e.get_price_msat(KIND_LONGFORM).await.unwrap(), 200);
     assert_eq!(e.get_price_msat(KIND_FILE_REF).await.unwrap(), 500);
     assert_eq!(e.get_price_msat(KIND_TYPING).await.unwrap(), 5);
+    assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 90);
 }
 
 #[test]
@@ -139,6 +143,7 @@ fn default_config_matches_toml_example() {
     assert_eq!(config.calendar_msat, 25);
     assert_eq!(config.file_ref_msat, 100);
     assert_eq!(config.control_msat, 1);
+    assert_eq!(config.realtime_signal_msat, 50);
 }
 
 #[test]

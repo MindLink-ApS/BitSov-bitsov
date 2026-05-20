@@ -493,11 +493,11 @@ async fn empty_whitelist_rejects_all() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NOT-PRICEABLE KIND
+// REALTIME SIGNALING
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn realtime_signaling_kind_rejected() {
+async fn realtime_signaling_kind_uses_payment_gate() {
     let id_alice = make_identity(MNEMONIC_ALICE);
     let id_bob = make_identity(MNEMONIC_BOB);
     let bob_id = *id_bob.node_id();
@@ -507,7 +507,7 @@ async fn realtime_signaling_kind_rejected() {
     let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
     let proof = PaymentProof::new(payment_hash, preimage, 100);
 
-    // Kind 400 = realtime signaling, not priceable
+    // Kind 400 = realtime signaling and must be priceable, not a free lane.
     let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
         400,
         *id_alice.node_id(),
@@ -537,8 +537,8 @@ async fn realtime_signaling_kind_rejected() {
         .await;
 
     assert!(
-        matches!(result, Err(GateRejection::KindNotPriceable(400))),
-        "realtime signaling kind should be rejected with KindNotPriceable, got: {result:?}"
+        result.is_ok(),
+        "paid realtime signaling kind should pass the payment gate, got: {result:?}"
     );
 }
 

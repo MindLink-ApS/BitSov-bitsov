@@ -38,7 +38,7 @@ export function tierInfo(t: NodeTier): { label: string; desc: string; sovereignt
     case "cloud":
       return {
         label: "Cloud",
-        desc: "Hosted node by MindLink. Easiest setup. Your identity is yours, but data is hosted.",
+        desc: "Hosted relay node. Easiest setup. Your identity is yours; operator-held data must remain encrypted.",
         sovereignty: "Managed",
       };
     case "light":

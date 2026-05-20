@@ -5,7 +5,7 @@
 //! - **100–199:** Structured data (calendar events, RSVP, contacts)
 //! - **200–299:** Files & media (file refs, inline images, voice memos)
 //! - **300–399:** Collaboration (CRDT ops, document snapshots)
-//! - **400–499:** Real-time signaling (call invite/answer/ICE/hangup) — DEFERRED
+//! - **400–499:** Real-time signaling (call invite/answer/ICE/hangup)
 //! - **500–599:** Web content (page requests/responses, manifests — sovereign browser)
 //! - **900–999:** Control (typing, read receipts, presence, room ops, key exchange, MLS)
 //! - **1000+:** Application extension space
@@ -73,7 +73,7 @@ pub const KIND_TOPIC_SUBSCRIBE: u16 = 522;
 /// Topic unsubscription request — a node unsubscribes from a named topic feed on a peer.
 pub const KIND_TOPIC_UNSUBSCRIBE: u16 = 523;
 
-// ── Real-time Signaling (400–499) — DEFERRED ───────────────────────────
+// ── Real-time Signaling (400–499) ──────────────────────────────────────
 
 /// Call invite. (Deferred — not implemented in v2.0)
 pub const KIND_CALL_INVITE: u16 = 400;
@@ -127,7 +127,7 @@ pub enum KindCategory {
     FilesMedia,
     /// CRDT ops, document snapshots (300–399).
     Collaboration,
-    /// Call signaling (400–499) — deferred.
+    /// Call signaling (400–499).
     RealTimeSignaling,
     /// Web content: page requests, responses, manifests (500–599).
     WebContent,

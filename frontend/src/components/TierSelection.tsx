@@ -54,7 +54,7 @@ const TIERS: TierOption[] = [
       "Your keys, your Lightning channels",
       "Your own chain data (Esplora)",
       "Encrypted storage by default",
-      "Complete independence from MindLink",
+      "Complete independence from relay operators",
     ],
   },
 ];

@@ -7,7 +7,7 @@
  * Units:
  *   "sats"  — satoshis (default)
  *   "btc"   — whole bitcoin, 8 decimal places
- *   "fiat"  — USD equivalent via BTC/USD spot price (mempool.space)
+ *   "fiat"  — USD equivalent via a user/operator configured BTC/USD provider
  */
 
 import { createSignal } from "solid-js";
@@ -16,6 +16,7 @@ export type BalanceUnit = "sats" | "btc" | "fiat";
 
 const UNIT_KEY = "bitsov_balance_unit";
 const FIAT_ENABLED_KEY = "bitsov_fiat_enabled";
+const FIAT_PRICE_URL_KEY = "bitsov_fiat_price_url";
 const MSAT_PER_BTC = 100_000_000_000;
 
 function readUnit(): BalanceUnit {
@@ -26,6 +27,14 @@ function readUnit(): BalanceUnit {
 
 function readFiatEnabled(): boolean {
   return localStorage.getItem(FIAT_ENABLED_KEY) !== "false";
+}
+
+function readFiatPriceUrl(): string | null {
+  const fromEnv = import.meta.env.VITE_BTC_PRICE_URL;
+  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return fromEnv.trim();
+  const fromStorage = localStorage.getItem(FIAT_PRICE_URL_KEY);
+  if (fromStorage && fromStorage.trim().length > 0) return fromStorage.trim();
+  return null;
 }
 
 const [balanceUnit, setBalanceUnitRaw] = createSignal<BalanceUnit>(readUnit());
@@ -62,14 +71,16 @@ export function setFiatEnabled(enabled: boolean): void {
 }
 
 /**
- * Fetch the current BTC/USD price from mempool.space.
- * Fire-and-forget safe — on error, fiat display shows "—".
+ * Fetch the current BTC/USD price from a configured provider.
+ * Fire-and-forget safe — on error or missing provider, fiat display shows "—".
  */
 export async function refreshFiatPrice(): Promise<void> {
   if (loadingPrice()) return;
+  const priceUrl = readFiatPriceUrl();
+  if (!priceUrl) return;
   setLoadingPrice(true);
   try {
-    const res = await fetch("https://mempool.space/api/v1/prices");
+    const res = await fetch(priceUrl);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = (await res.json()) as { USD?: number };
     if (typeof data.USD === "number" && data.USD > 0) {

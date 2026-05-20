@@ -28,6 +28,7 @@ backend = "sqlite"
     assert_eq!(config.network.tier, SovereigntyTier::T1);
     assert_eq!(config.pricing.chat_msat, 10);
     assert_eq!(config.api.listen_addr.port(), 3141);
+    assert!(matches!(config.storage, StorageConfig::Sqlite { encrypted: true, .. }));
 }
 
 #[test]
@@ -84,6 +85,7 @@ auto_connect = false
     assert_eq!(config.pricing.file_ref_msat, 200);
     // Default values for unset fields
     assert_eq!(config.pricing.control_msat, 1);
+    assert_eq!(config.pricing.realtime_signal_msat, 50);
     assert_eq!(config.peers.len(), 2);
     assert_eq!(config.peers[0].label.as_deref(), Some("Alice"));
     assert!(!config.peers[1].auto_connect);
@@ -566,6 +568,15 @@ fn validate_zero_control_pricing_rejected() {
 }
 
 #[test]
+fn validate_zero_realtime_pricing_rejected() {
+    let mut config = NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
+    config.peers.clear();
+    config.pricing.realtime_signal_msat = 0;
+    let err = config.validate().unwrap_err();
+    assert!(err.to_string().contains("pricing"), "got: {err}");
+}
+
+#[test]
 fn validate_different_ports_ok() {
     let mut config = NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
     config.peers.clear();
@@ -641,6 +652,7 @@ fn default_config_for_each_tier() {
         assert!(config.pricing.longform_msat > 0);
         assert!(config.pricing.file_ref_msat > 0);
         assert!(config.pricing.control_msat > 0);
+        assert!(config.pricing.realtime_signal_msat > 0);
     }
 }
 
@@ -943,7 +955,7 @@ fn full_tier_uses_encrypted_storage() {
 }
 
 #[test]
-fn cloud_tier_does_not_use_encrypted_storage() {
+fn cloud_tier_uses_encrypted_storage() {
     let config = NodeConfig::default_for_tier(
         NodeTier::Cloud,
         PathBuf::from("/dev/null"),
@@ -951,9 +963,24 @@ fn cloud_tier_does_not_use_encrypted_storage() {
     );
     match &config.storage {
         StorageConfig::Sqlite { encrypted, .. } => {
-            assert!(!encrypted, "Cloud tier should not encrypt storage");
+            assert!(encrypted, "Cloud tier must use encrypted storage");
         }
         _ => panic!("Cloud tier must use SQLite"),
+    }
+}
+
+#[test]
+fn light_tier_uses_encrypted_storage() {
+    let config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    match &config.storage {
+        StorageConfig::Sqlite { encrypted, .. } => {
+            assert!(encrypted, "Light tier must use encrypted storage");
+        }
+        _ => panic!("Light tier must use SQLite"),
     }
 }
 
@@ -1016,7 +1043,7 @@ lsp_token = "mytoken"
 
 #[test]
 fn storage_config_rejects_typo_in_encrypted() {
-    // "encrypred" instead of "encrypted" must fail, not silently use false.
+    // "encrypred" instead of "encrypted" must fail, not silently use a default.
     let toml = r#"
 backend = "sqlite"
 encrypred = true

@@ -481,41 +481,17 @@ pub(super) fn spawn_reader_task(
                         warn!(peer = %peer_id, error = %e, "failed to send GossipReceived control event");
                     }
                 }
-                Frame::CallOffer { session_id, sdp } => {
-                    debug!(peer = %peer_id, %session_id, "received call offer");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::CallOfferReceived { peer_id, session_id, sdp })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send CallOfferReceived control event");
-                    }
+                Frame::CallOffer { session_id, .. } => {
+                    warn!(peer = %peer_id, %session_id, "rejected legacy unpaid call offer frame; use paid UKM realtime kind");
                 }
-                Frame::CallAnswer { session_id, sdp } => {
-                    debug!(peer = %peer_id, %session_id, "received call answer");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::CallAnswerReceived { peer_id, session_id, sdp })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send CallAnswerReceived control event");
-                    }
+                Frame::CallAnswer { session_id, .. } => {
+                    warn!(peer = %peer_id, %session_id, "rejected legacy unpaid call answer frame; use paid UKM realtime kind");
                 }
-                Frame::IceCandidate { session_id, candidate } => {
-                    debug!(peer = %peer_id, %session_id, "received ICE candidate");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::IceCandidateReceived { peer_id, session_id, candidate })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send IceCandidateReceived control event");
-                    }
+                Frame::IceCandidate { session_id, .. } => {
+                    warn!(peer = %peer_id, %session_id, "rejected legacy unpaid ICE candidate frame; use paid UKM realtime kind");
                 }
-                Frame::CallEnd { session_id, reason } => {
-                    debug!(peer = %peer_id, %session_id, %reason, "received call end");
-                    if let Err(e) = control_tx
-                        .send(ControlEvent::CallEndReceived { peer_id, session_id, reason })
-                        .await
-                    {
-                        warn!(peer = %peer_id, error = %e, "failed to send CallEndReceived control event");
-                    }
+                Frame::CallEnd { session_id, .. } => {
+                    warn!(peer = %peer_id, %session_id, "rejected legacy unpaid call end frame; use paid UKM realtime kind");
                 }
                 _ => {
                     warn!(peer = %peer_id, "unexpected frame type in reader loop");

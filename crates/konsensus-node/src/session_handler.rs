@@ -284,54 +284,39 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     }
 
                     ControlEvent::CallOfferReceived { peer_id, session_id, sdp } => {
-                        info!(
+                        warn!(
                             peer = %peer_id,
                             %session_id,
                             sdp_len = sdp.len(),
-                            "received call offer — relaying to peer"
+                            "rejected legacy unpaid call offer; use paid UKM realtime kind"
                         );
-                        let frame = Frame::CallOffer { session_id, sdp };
-                        if let Err(e) = transport.send_frame(&peer_id, &frame).await {
-                            warn!(peer = %peer_id, error = %e, "failed to relay CallOffer");
-                        }
                     }
 
                     ControlEvent::CallAnswerReceived { peer_id, session_id, sdp } => {
-                        info!(
+                        warn!(
                             peer = %peer_id,
                             %session_id,
                             sdp_len = sdp.len(),
-                            "received call answer — relaying to peer"
+                            "rejected legacy unpaid call answer; use paid UKM realtime kind"
                         );
-                        let frame = Frame::CallAnswer { session_id, sdp };
-                        if let Err(e) = transport.send_frame(&peer_id, &frame).await {
-                            warn!(peer = %peer_id, error = %e, "failed to relay CallAnswer");
-                        }
                     }
 
                     ControlEvent::IceCandidateReceived { peer_id, session_id, candidate } => {
-                        info!(
+                        warn!(
                             peer = %peer_id,
                             %session_id,
-                            "received ICE candidate — relaying to peer"
+                            candidate_len = candidate.len(),
+                            "rejected legacy unpaid ICE candidate; use paid UKM realtime kind"
                         );
-                        let frame = Frame::IceCandidate { session_id, candidate };
-                        if let Err(e) = transport.send_frame(&peer_id, &frame).await {
-                            warn!(peer = %peer_id, error = %e, "failed to relay IceCandidate");
-                        }
                     }
 
                     ControlEvent::CallEndReceived { peer_id, session_id, reason } => {
-                        info!(
+                        warn!(
                             peer = %peer_id,
                             %session_id,
                             %reason,
-                            "received call end — relaying to peer"
+                            "rejected legacy unpaid call end; use paid UKM realtime kind"
                         );
-                        let frame = Frame::CallEnd { session_id, reason };
-                        if let Err(e) = transport.send_frame(&peer_id, &frame).await {
-                            warn!(peer = %peer_id, error = %e, "failed to relay CallEnd");
-                        }
                     }
                 }
             }
@@ -1034,14 +1019,16 @@ async fn handle_lightning_info_received(
     true
 }
 
-/// Allowed gossip kinds — only public data types.
-const GOSSIP_ALLOWED_KINDS: &[u16] = &[
-    konsensus_core::kind::KIND_WEB_MANIFEST,
-];
-
-/// Handle an incoming gossip message: validate, re-broadcast to other peers.
+/// Allowed legacy free-gossip kinds.
 ///
-/// Gossip bypasses the payment gate (public data) but is:
+/// Empty by design: free gossip is disabled until paid broadcast semantics
+/// land on the normal UKM payment-gated path.
+const GOSSIP_ALLOWED_KINDS: &[u16] = &[];
+
+/// Handle an incoming legacy gossip message: validate policy, then re-broadcast.
+///
+/// Free gossip is currently disabled. If legacy kinds are explicitly re-enabled
+/// for a closed deployment, they are:
 /// 1. Recipient-checked (must be Broadcast)
 /// 2. Kind-restricted (only allowed gossip types)
 /// 3. Deduplicated, rate-limited, and time-bounded (GossipValidator)

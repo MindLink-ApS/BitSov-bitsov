@@ -310,10 +310,9 @@ pub enum Recipient {
     Room(RoomId),
     /// Broadcast to all connected peers (gossip propagation).
     ///
-    /// Gossip messages are re-broadcast to all connected peers (with dedup).
-    /// They bypass the payment gate but are rate-limited per sender.
-    /// Only public data (web manifests, pricing tables, capabilities) should
-    /// use this variant — never private content.
+    /// Legacy free gossip is disabled in launch-facing nodes until paid
+    /// broadcast semantics land on the normal UKM payment-gated path. Only
+    /// public data should ever use this variant — never private content.
     Broadcast,
 }
 

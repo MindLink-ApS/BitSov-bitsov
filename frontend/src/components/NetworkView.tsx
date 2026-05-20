@@ -1,7 +1,7 @@
 /**
  * Network — Mesh explorer, peer directory, chain data, and node identity.
  * Pulls data from the node's health, pricing, and peer APIs.
- * Chain data sourced read-only from mempool.space (never shares private data).
+ * Chain data is sourced through the node's configured ChainProvider.
  */
 
 import { createSignal, onMount, onCleanup, Show, For, createMemo } from "solid-js";
@@ -177,8 +177,7 @@ export default function NetworkView() {
   async function fetchChainData() {
     setChainLoading(true);
     try {
-      // Fetch chain data from the node backend (proxied through ChainProvider)
-      // This avoids CORS issues with mempool.space in Tauri/browser contexts
+      // Fetch chain data from the node backend (proxied through ChainProvider).
       const baseUrl = api.getBaseUrl();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);

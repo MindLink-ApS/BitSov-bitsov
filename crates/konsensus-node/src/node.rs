@@ -234,6 +234,7 @@ impl KonsensusNode {
             file_ref_msat: config.pricing.file_ref_msat,
             control_msat: config.pricing.control_msat,
             collaboration_msat: config.pricing.collaboration_msat,
+            realtime_signal_msat: config.pricing.realtime_signal_msat,
             app_ext_msat: config.pricing.app_ext_msat,
             web_content_msat: config.pricing.web_content_msat,
         };

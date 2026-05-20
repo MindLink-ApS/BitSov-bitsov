@@ -13,7 +13,7 @@ use crate::kind::KindCategory;
 /// Errors from pricing operations.
 #[derive(Debug, Error)]
 pub enum PricingError {
-    /// The kind is not priceable (e.g., deferred real-time signaling).
+    /// The kind is not priceable.
     #[error("kind {0} is not priceable")]
     NotPriceable(u16),
 
@@ -42,14 +42,11 @@ pub enum PricingError {
 pub trait PricingEngine: Send + Sync {
     /// Get the price in millisatoshis for a message of the given kind.
     ///
-    /// Returns `Err(PricingError::NotPriceable)` for deferred kinds (400–499).
+    /// Returns `Err(PricingError::NotPriceable)` for unsupported/deferred kinds.
     async fn get_price_msat(&self, kind: u16) -> Result<u64, PricingError>;
 
     /// Get the price for a kind category (bulk pricing lookup).
-    async fn get_category_price_msat(
-        &self,
-        category: KindCategory,
-    ) -> Result<u64, PricingError>;
+    async fn get_category_price_msat(&self, category: KindCategory) -> Result<u64, PricingError>;
 
     /// Downcast to concrete type for engine-specific operations.
     ///

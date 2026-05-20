@@ -38,6 +38,7 @@ fn static_config_default_serde_roundtrip() {
     assert_eq!(deserialized.file_ref_msat, config.file_ref_msat);
     assert_eq!(deserialized.control_msat, config.control_msat);
     assert_eq!(deserialized.collaboration_msat, config.collaboration_msat);
+    assert_eq!(deserialized.realtime_signal_msat, config.realtime_signal_msat);
     assert_eq!(deserialized.app_ext_msat, config.app_ext_msat);
     assert_eq!(deserialized.web_content_msat, config.web_content_msat);
 }
@@ -61,6 +62,7 @@ fn static_config_partial_json_uses_defaults() {
     assert_eq!(config.control_msat, 2);
     // These use #[serde(default)] functions
     assert_eq!(config.collaboration_msat, 25);
+    assert_eq!(config.realtime_signal_msat, 50);
     assert_eq!(config.app_ext_msat, 10);
     assert_eq!(config.web_content_msat, 50);
 }
@@ -74,6 +76,7 @@ fn static_config_custom_values() {
         file_ref_msat: 1000,
         control_msat: 5,
         collaboration_msat: 300,
+        realtime_signal_msat: 40,
         app_ext_msat: 50,
         web_content_msat: 200,
     };
@@ -92,6 +95,7 @@ fn static_config_zero_prices_allowed() {
         "file_ref_msat": 0,
         "control_msat": 0,
         "collaboration_msat": 0,
+        "realtime_signal_msat": 0,
         "app_ext_msat": 0,
         "web_content_msat": 0
     }"#;
@@ -234,17 +238,17 @@ async fn build_price_table_includes_all_priceable_categories() {
     let engine = StaticPricingEngine::new(StaticPricingConfig::default());
     let table = build_price_table(&engine).await;
 
-    // Should have 7 priceable categories (not RealTimeSignaling or Unknown)
+    // Should have every known priceable category except Unknown.
     assert!(table.contains_key("communication"));
     assert!(table.contains_key("structured_data"));
     assert!(table.contains_key("files_media"));
     assert!(table.contains_key("collaboration"));
+    assert!(table.contains_key("realtime_signaling"));
     assert!(table.contains_key("web_content"));
     assert!(table.contains_key("control"));
     assert!(table.contains_key("app_extension"));
 
-    // Should NOT have realtime or unknown
-    assert!(!table.contains_key("realtime_signaling"));
+    // Should NOT have unknown
     assert!(!table.contains_key("unknown"));
 }
 
@@ -256,6 +260,7 @@ async fn build_price_table_values_match_engine() {
     assert_eq!(table["communication"], 10);
     assert_eq!(table["files_media"], 100);
     assert_eq!(table["control"], 1);
+    assert_eq!(table["realtime_signaling"], 50);
     assert_eq!(table["web_content"], 50);
 }
 
@@ -268,6 +273,7 @@ async fn build_price_table_with_custom_config() {
         file_ref_msat: 999,
         control_msat: 5,
         collaboration_msat: 299,
+        realtime_signal_msat: 59,
         app_ext_msat: 49,
         web_content_msat: 399,
     };
@@ -277,6 +283,7 @@ async fn build_price_table_with_custom_config() {
     assert_eq!(table["communication"], 99);
     assert_eq!(table["files_media"], 999);
     assert_eq!(table["control"], 5);
+    assert_eq!(table["realtime_signaling"], 59);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -468,10 +475,10 @@ async fn static_engine_boundary_kinds() {
     assert_eq!(engine.get_price_msat(300).await.unwrap(), 25);
     // Boundary: kind 399 is still Collaboration
     assert_eq!(engine.get_price_msat(399).await.unwrap(), 25);
-    // Boundary: kind 400 is RealTimeSignaling (not priceable)
-    assert!(engine.get_price_msat(400).await.is_err());
+    // Boundary: kind 400 is RealTimeSignaling
+    assert_eq!(engine.get_price_msat(400).await.unwrap(), 50);
     // Boundary: kind 499 is still RealTimeSignaling
-    assert!(engine.get_price_msat(499).await.is_err());
+    assert_eq!(engine.get_price_msat(499).await.unwrap(), 50);
     // Boundary: kind 500 is WebContent
     assert_eq!(engine.get_price_msat(500).await.unwrap(), 50);
     // Boundary: kind 599 is still WebContent
