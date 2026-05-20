@@ -13,7 +13,6 @@ members = [
     "crates/konsensus-node",
     "crates/konsensus-bsx",
     "crates/konsensus-fiat",
-    "crates/konsensus-ai",
     "crates/konsensus-mobile",
 ]
 exclude = [

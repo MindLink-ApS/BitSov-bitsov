@@ -1,0 +1,220 @@
+# BitSov Custom Semgrep Security Rules
+# Enforces BitSov's Five Immutable Principles at the source level.
+#
+# Usage (local):
+#   semgrep --config docs/qa/semgrep-rules.yml .
+#
+# CI integration: .github/workflows/ci.yml (semgrep job).
+#
+# Rules:
+#   bitsov-no-plaintext-logging  — P4: key material must not appear as log fields
+#   bitsov-no-unwrap-in-crypto   — P1: no panics in crypto paths (DoS vector)
+#   bitsov-payment-bypass        — P2: detect full payment gate bypass patterns
+#   bitsov-keys-in-error         — P4: key material must not appear in error format args
+#   bitsov-timing-attack         — P1: use constant-time comparisons for crypto values
+#
+# Suppressing a false positive:
+#   Add `# nosemgrep: <rule-id>` on the offending line.
+
+rules:
+
+  # ── P4: Data Sovereignty ─────────────────────────────────────────────────────
+  #
+  # Logging sensitive fields exposes key material to log aggregators, SIEM tools,
+  # and anyone with log-read access — a direct violation of data sovereignty.
+  #
+  # This rule detects sensitive variable/field NAMES (e.g. `preimage = %val`) in
+  # tracing macro calls. It deliberately does NOT match the sensitive word when it
+  # appears inside a quoted message string (e.g. "no preimage returned"), which is
+  # safe and a common pattern in this codebase.
+  #
+  # Pattern: (info|debug|warn|error|trace)!( ... SENSITIVE_NAME = ... )
+  #          where SENSITIVE_NAME appears before an `=` and not inside quotes.
+  - id: bitsov-no-plaintext-logging
+    languages: [rust]
+    severity: WARNING
+    message: >
+      Structured log field '$FIELD' exposes sensitive key material. Fields named
+      'preimage', 'secret_key', 'signing_key', 'aes_key', 'shared_secret', etc.
+      must never appear as log field names. Redact with "[REDACTED]" or log only a
+      public identifier (e.g. hex-encoded NodeId or payment_hash — never the
+      preimage or raw secret itself).
+    metadata:
+      category: security
+      principle: P4-data-sovereignty
+      cwe: "CWE-532: Information Exposure Through Log Files"
+      confidence: MEDIUM
+    # Match: `warn!(preimage = %val, "msg")` — sensitive word is a FIELD NAME before `=`
+    # Skip:  `warn!(hash = %h, "no preimage returned")` — "preimage" is inside the string
+    pattern-regex: '\b(?:info|debug|warn|error|trace)!\s*\([^"(]*\b(?:preimage|secret_key|signing_key|aes_key|x25519_secret|key_material|shared_secret|mnemonic|seed_bytes|private_key)\s*='
+    paths:
+      include:
+        - "**/*.rs"
+
+  # ── P1: Sovereign Identity ────────────────────────────────────────────────────
+  #
+  # `.unwrap()` panics when the Result is Err — a crash on malformed remote input.
+  # In crypto code (handshake, key derivation, AEAD), the remote peer controls the
+  # data. A crafted invalid ciphertext or handshake message can kill the node via
+  # panic, enabling a remote denial-of-service attack.
+  #
+  # Use `?` to propagate or `map_err()` to convert and propagate.
+  # Tests are excluded: `.unwrap()` in test assertions is acceptable.
+  - id: bitsov-no-unwrap-in-crypto
+    languages: [rust]
+    severity: ERROR
+    message: >
+      .unwrap() in crypto code causes a process panic on malformed input — a
+      denial-of-service vector when a remote peer controls the data. Replace with
+      '?' to propagate errors, or map_err() to convert and propagate. Panics are
+      especially dangerous in handshake, key-derivation, and AEAD decryption paths.
+    metadata:
+      category: security
+      principle: P1-sovereign-identity
+      cwe: "CWE-390: Detection of Error Condition Without Action"
+      confidence: HIGH
+    patterns:
+      - pattern: $EXPR.unwrap()
+      # Inline #[cfg(test)] modules are test-only code — same intent as a
+      # separate tests/ file but co-located in the source file.
+      - pattern-not-inside: |
+          #[cfg(test)]
+          mod $M { ... }
+    paths:
+      include:
+        - "**/konsensus-crypto/**/*.rs"
+        - "**/crypto/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/mock*.rs"
+        - "**/*mock*.rs"
+        - "**/benches/**"
+        # plaintext_cache.rs uses .expect() with explanatory messages in production
+        # code; .unwrap() only appears inside #[cfg(test)] inline test blocks.
+        - "**/plaintext_cache.rs"
+
+  # ── P2: Lightning Gate ────────────────────────────────────────────────────────
+  #
+  # The payment gate is fail-closed. `trust_discount = 1.0` eliminates the payment
+  # requirement entirely (100% discount → 0 sats required). The maximum allowed
+  # discount is 0.5 (50%), enforced by gate.rs. A `todo!()` or `unimplemented!()`
+  # placeholder in gate/payment code makes the gate silently pass every message
+  # without verifying payment.
+  #
+  # Scoped to gate, payment, and Lightning crates to minimise false positives.
+  - id: bitsov-payment-bypass
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Payment gate bypass detected. Principle 2 (Lightning Gate) requires fail-closed
+      enforcement — no full bypasses. Allowed trust discounts are clamped to [0.0, 0.5].
+      A trust_discount of 1.0 waives payment entirely. A todo!()/unimplemented!()
+      placeholder leaves the gate wide open. Fix: use a discount in [0.0, 0.5] and
+      implement real payment verification.
+    metadata:
+      category: security
+      principle: P2-lightning-gate
+      cwe: "CWE-284: Improper Access Control"
+      confidence: HIGH
+    pattern-either:
+      - pattern: |
+          let trust_discount = 1.0;
+      - pattern: |
+          let trust_discount: f64 = 1.0;
+      - pattern: |
+          let trust_discount = 1.0_f64;
+      - pattern: todo!()
+      - pattern: unimplemented!()
+    paths:
+      include:
+        - "**/gate.rs"
+        - "**/payment*.rs"
+        - "**/konsensus-lightning/**/*.rs"
+        - "**/lightning*.rs"
+
+  # ── P4: Data Sovereignty ─────────────────────────────────────────────────────
+  #
+  # Error messages propagate up the call stack and may be: logged by upstream code,
+  # serialised into API responses (HTTP 400/500 bodies), written to disk, or sent
+  # over the wire. Embedding key material (preimage, secret, signing key) in an
+  # error string leaks it to any system that receives or stores the error.
+  #
+  # This rule catches sensitive variable names used as format! ARGUMENTS, i.e.
+  # appearing AFTER the format string. It does NOT match strings that merely
+  # MENTION a sensitive word (e.g. `format!("invalid preimage: {e}")` — safe).
+  #
+  # Pattern: format!("...", ..., SENSITIVE_VAR, ...)
+  #          SENSITIVE_VAR appears after the format string and before the closing paren.
+  - id: bitsov-keys-in-error
+    languages: [rust]
+    severity: WARNING
+    message: >
+      Sensitive variable found as a format! argument in an error string. Variables
+      named 'preimage', 'secret_key', 'signing_key', 'aes_key', 'shared_secret',
+      etc. must not appear in error messages — they travel up the call stack and may
+      reach logs, API responses, or the wire. Use a public identifier (NodeId, hash
+      hex) or omit entirely.
+    metadata:
+      category: security
+      principle: P4-data-sovereignty
+      cwe: "CWE-209: Information Exposure Through an Error Message"
+      confidence: MEDIUM
+    # Match: format!("msg: {}", preimage)       ← variable AFTER format string
+    # Skip:  format!("invalid preimage: {e}")   ← "preimage" only inside the string
+    # Skip:  format!("error: {}", mnemonic_path) ← mnemonic_path ≠ \bmnemonic\b
+    pattern-regex: '\bformat!\s*\("[^"]*"\s*,\s*[^)]*\b(?:preimage|secret_key|signing_key|aes_key|x25519_secret|key_material|shared_secret|mnemonic|seed_bytes|private_key)\b'
+    paths:
+      include:
+        - "**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/mock*.rs"
+        - "**/*mock*.rs"
+        - "**/benches/**"
+
+  # ── P1: Sovereign Identity ────────────────────────────────────────────────────
+  #
+  # Comparing cryptographic byte values with == or != leaks timing information.
+  # An attacker who controls one operand can determine matches byte-by-byte via a
+  # timing oracle, enabling preimage recovery, MAC forgery, or signature bypass.
+  #
+  # This codebase already uses `subtle::ConstantTimeEq::ct_eq()` for payment_hash
+  # preimage verification (types.rs). This rule ensures new code follows the same
+  # pattern for all variables whose names suggest they hold cryptographic material.
+  #
+  # Fix: replace `a == b` with `subtle::ConstantTimeEq::ct_eq(&a, &b).into()`
+  #      (add `subtle` to Cargo.toml if not already present in that crate).
+  - id: bitsov-timing-attack
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Direct '==' or '!=' on '$LEFT' may leak timing information. Comparing hashes,
+      MACs, preimages, or signatures with == enables timing oracle attacks. Use
+      'subtle::ConstantTimeEq::ct_eq()' for all constant-time comparisons of
+      cryptographic byte arrays.
+    metadata:
+      category: security
+      principle: P1-sovereign-identity
+      cwe: "CWE-208: Observable Timing Discrepancy"
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: $LEFT == $RIGHT
+          - pattern: $LEFT != $RIGHT
+      - metavariable-regex:
+          metavariable: $LEFT
+          regex: '^(?i)(payment_hash|preimage|hmac|mac_tag|digest|computed_hash|expected_hash|expected_mac|received_mac|signature_bytes)$'
+    paths:
+      include:
+        - "**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/test_*.rs"
+        - "**/*_test.rs"
+        - "**/mock*.rs"
+        - "**/*mock*.rs"
+        - "**/benches/**"
