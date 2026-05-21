@@ -97,7 +97,7 @@ rpassword = "5"
 toml = "0.8"
 
 # JWT
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
