@@ -76,6 +76,34 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace -- -D warnings
 
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-audit
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+
+      - name: cargo audit
+        run: cargo audit
+
   frontend:
     name: Frontend Build
     runs-on: ubuntu-latest
@@ -125,10 +153,12 @@ jobs:
   release-cli:
     name: Release CLI (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, frontend]
+    needs: [check, audit, frontend]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -151,6 +181,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install release signing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
 
       - uses: actions/cache@v4
         with:
@@ -176,21 +211,59 @@ jobs:
           chmod +x artifacts/${{ matrix.artifact }}
           (cd artifacts && sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256)
 
+      - name: Require release signing key
+        env:
+          MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+        run: |
+          test -n "$MINISIGN_PRIVATE_KEY" || {
+            echo "MINISIGN_PRIVATE_KEY is required for public release tags" >&2
+            exit 1
+          }
+
+      - name: Sign checksum
+        env:
+          MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+        run: |
+          key_file="$(mktemp)"
+          printf '%s' "$MINISIGN_PRIVATE_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          minisign -S -W \
+            -s "$key_file" \
+            -m artifacts/${{ matrix.artifact }}.sha256 \
+            -x artifacts/${{ matrix.artifact }}.sha256.minisig
+          rm -f "$key_file"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: artifacts/${{ matrix.artifact }}
+          format: spdx-json
+          output-file: artifacts/${{ matrix.artifact }}.sbom.spdx.json
+
+      - name: Attest binary provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: artifacts/${{ matrix.artifact }}
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/${{ matrix.artifact }}
             artifacts/${{ matrix.artifact }}.sha256
+            artifacts/${{ matrix.artifact }}.sha256.minisig
+            artifacts/${{ matrix.artifact }}.sbom.spdx.json
 
   # Build Tauri desktop app for all platforms
   release-desktop:
     name: Release Desktop (${{ matrix.label }})
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, frontend]
+    needs: [check, audit, frontend]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
