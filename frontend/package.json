@@ -10,7 +10,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@noble/ed25519": "^2.1.0",
+    "@noble/ed25519": "^3.1.0",
     "@solidjs/router": "^0.14.0",
     "qrcode-generator": "^2.0.4",
     "solid-js": "^1.9.0"
