@@ -24,7 +24,9 @@
 
 use konsensus_core::envelope::UkmEnvelope;
 use konsensus_core::types::{MessageId, NodeId};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// Errors from wire protocol operations.
@@ -73,7 +75,7 @@ pub fn is_realtime_signal(kind: u16) -> bool {
 }
 
 /// Capabilities a node can advertise during the federation handshake.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Capability {
     /// Supports PQXDH key exchange for 1:1 E2EE.
     Pqxdh,
@@ -89,8 +91,95 @@ pub enum Capability {
     /// federation handshake containing its Lightning pubkey. Peers can then
     /// use keysend instead of the RequestInvoice/InvoiceResponse flow.
     Keysend,
+    /// Supports Tier-2 Relay protocol negotiation.
+    ///
+    /// This only advertises relay protocol awareness. Nodes must still opt in
+    /// to relay behavior separately via configuration.
+    Relay,
     /// Application-defined capability.
     Custom(String),
+}
+
+impl Serialize for Capability {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Capability::Pqxdh => serializer.serialize_str("Pqxdh"),
+            Capability::X3dh => serializer.serialize_str("X3dh"),
+            Capability::Mls => serializer.serialize_str("Mls"),
+            Capability::FileTransfer => serializer.serialize_str("FileTransfer"),
+            Capability::Keysend => serializer.serialize_str("Keysend"),
+            Capability::Relay => serializer.serialize_str("Relay"),
+            Capability::Custom(value) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("Custom", value)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Capability {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CapabilityVisitor;
+
+        impl<'de> Visitor<'de> for CapabilityVisitor {
+            type Value = Capability;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a capability string or Custom capability object")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(match value {
+                    "Pqxdh" => Capability::Pqxdh,
+                    "X3dh" => Capability::X3dh,
+                    "Mls" => Capability::Mls,
+                    "FileTransfer" => Capability::FileTransfer,
+                    "Keysend" => Capability::Keysend,
+                    "Relay" => Capability::Relay,
+                    other => Capability::Custom(other.to_string()),
+                })
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let key = map
+                    .next_key::<String>()?
+                    .ok_or_else(|| de::Error::custom("empty capability object"))?;
+
+                if key == "Custom" {
+                    let value = map.next_value::<String>()?;
+                    if map.next_key::<de::IgnoredAny>()?.is_some() {
+                        return Err(de::Error::custom("capability object has multiple keys"));
+                    }
+                    return Ok(Capability::Custom(value));
+                }
+
+                let _ = map.next_value::<de::IgnoredAny>()?;
+                Ok(Capability::Custom(key))
+            }
+        }
+
+        deserializer.deserialize_any(CapabilityVisitor)
+    }
 }
 
 /// The sovereignty tier of a node.
@@ -1285,6 +1374,7 @@ mod tests {
             Capability::X3dh,
             Capability::Mls,
             Capability::FileTransfer,
+            Capability::Relay,
             Capability::Custom("sovereign-browser".to_string()),
         ];
         let frame = Frame::Hello {
@@ -1513,6 +1603,21 @@ mod tests {
         let json = serde_json::to_string(&cap).unwrap();
         let decoded: Capability = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, Capability::Keysend);
+    }
+
+    #[test]
+    fn capability_relay_serialization() {
+        let cap = Capability::Relay;
+        let json = serde_json::to_string(&cap).unwrap();
+        assert_eq!(json, "\"Relay\"");
+        let decoded: Capability = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, Capability::Relay);
+    }
+
+    #[test]
+    fn unknown_capability_deserializes_as_custom() {
+        let decoded: Capability = serde_json::from_str("\"FutureRelayV2\"").unwrap();
+        assert_eq!(decoded, Capability::Custom("FutureRelayV2".to_string()));
     }
 
     // ── Gossip frame tests ─────────────────────────────────────────────
