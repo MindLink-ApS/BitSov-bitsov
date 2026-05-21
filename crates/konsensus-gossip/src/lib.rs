@@ -1,17 +1,17 @@
 #![forbid(unsafe_code)]
-#![doc = "Gossip protocol for public data propagation across the BitSov mesh."]
+#![doc = "Gossip validation primitives for public data propagation across the BitSov mesh."]
 //!
-//! Gossip enables nodes to share public information (web manifests, pricing
-//! tables, node capabilities) with all connected peers. Messages propagate
-//! through the mesh via re-broadcast, with deduplication preventing loops.
+//! Legacy free gossip transport is disabled in launch-facing nodes until paid
+//! broadcast semantics land on the normal UKM payment-gated path. This crate
+//! provides the deduplication, freshness, and rate-limit primitives used by
+//! deployments that explicitly enable a gossip surface.
 //!
 //! # Design principles
 //!
 //! - **Public data only** — gossip is for data the sender wants widely known.
 //!   Private content uses direct E2EE messaging.
-//! - **Rate-limited, not payment-gated** — gossip bypasses the payment gate
-//!   but is capped at [`DEFAULT_MAX_GOSSIP_PER_SENDER_PER_HOUR`] messages per
-//!   sender per hour to prevent abuse.
+//! - **Rate-limited when enabled** — rate limiting is defense in depth, not a
+//!   replacement for the payment gate on public launch surfaces.
 //! - **Signed** — every gossip message carries an Ed25519 signature from the
 //!   originator, verifiable by any node in the mesh.
 //! - **Time-bounded** — messages older than [`DEFAULT_MAX_AGE_SECS`] are rejected.

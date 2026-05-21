@@ -536,14 +536,14 @@ fn make_gossip_ws_tx() -> broadcast::Sender<Arc<konsensus_api::state::WsMessage>
 }
 
 #[tokio::test]
-async fn gossip_valid_signature_accepted() {
+async fn gossip_legacy_free_kind_rejected() {
     let identity = make_gossip_identity();
     let envelope = make_signed_gossip_envelope(&identity);
     let validator = konsensus_gossip::GossipValidator::new(Default::default());
     let transport = make_gossip_test_transport();
     let audit = make_gossip_audit_log();
 
-    // Should not panic or reject — valid signature
+    // Legacy free gossip is fail-closed until paid broadcast lands.
     handle_gossip_received(
         test_peer_id(),
         envelope,
@@ -552,7 +552,7 @@ async fn gossip_valid_signature_accepted() {
         &audit,
         &make_gossip_ws_tx(),
     ).await;
-    // If we get here without panic, the message was accepted.
+    assert_eq!(validator.store().len(), 0, "legacy free gossip must not be stored");
 }
 
 #[tokio::test]
@@ -680,7 +680,7 @@ async fn gossip_non_broadcast_recipient_rejected() {
 }
 
 #[tokio::test]
-async fn gossip_valid_message_broadcast_to_ws() {
+async fn gossip_legacy_free_message_not_broadcast_to_ws() {
     let identity = make_gossip_identity();
     let envelope = make_signed_gossip_envelope(&identity);
     let validator = konsensus_gossip::GossipValidator::new(Default::default());
@@ -697,12 +697,8 @@ async fn gossip_valid_message_broadcast_to_ws() {
         &ws_tx,
     ).await;
 
-    // Should receive the gossip message on WS
-    let msg = ws_rx.recv().await.unwrap();
-    assert_eq!(msg.envelope.kind, konsensus_core::kind::KIND_WEB_MANIFEST);
-    assert_eq!(msg.envelope.sender, *identity.node_id());
-    // Plaintext should be the gossip payload (it's public data, not E2EE)
-    assert_eq!(msg.plaintext.as_deref(), Some("test gossip payload"));
+    assert!(ws_rx.try_recv().is_err(), "legacy free gossip must not reach WebSocket clients");
+    assert_eq!(validator.store().len(), 0, "legacy free gossip must not be stored");
 }
 
 #[tokio::test]
@@ -773,7 +769,7 @@ async fn gossip_oversized_payload_rejected() {
 }
 
 #[tokio::test]
-async fn gossip_exactly_at_size_limit_accepted() {
+async fn gossip_exactly_at_size_limit_rejected_while_legacy_free_gossip_disabled() {
     let identity = make_gossip_identity();
 
     // Build an envelope with payload at exactly MAX_GOSSIP_RELAY_PAYLOAD (64 KB)
@@ -805,10 +801,8 @@ async fn gossip_exactly_at_size_limit_accepted() {
         &ws_tx,
     ).await;
 
-    // Exactly at the limit should be accepted and broadcast to WS
-    let msg = ws_rx.try_recv();
-    assert!(msg.is_ok(), "gossip at exactly 64 KB should be accepted");
-    assert_eq!(validator.store().len(), 1, "accepted gossip should be stored");
+    assert!(ws_rx.try_recv().is_err(), "legacy free gossip must not reach WebSocket clients");
+    assert_eq!(validator.store().len(), 0, "legacy free gossip must not be stored");
 }
 
 /// Verify that a forged-signature gossip message does NOT consume dedup
@@ -849,9 +843,9 @@ async fn gossip_forged_signature_does_not_consume_dedup_store() {
 }
 
 /// Verify that after a forged message is rejected, the same message ID
-/// from the real sender (with valid signature) is still accepted.
+/// from the real sender is still rejected while legacy free gossip is disabled.
 #[tokio::test]
-async fn gossip_valid_message_accepted_after_forged_attempt() {
+async fn gossip_valid_message_still_rejected_after_forged_attempt() {
     let real_sender = make_gossip_identity();
     let envelope = make_signed_gossip_envelope(&real_sender);
 
@@ -878,7 +872,7 @@ async fn gossip_valid_message_accepted_after_forged_attempt() {
     assert!(ws_rx.try_recv().is_err(), "forged message should not reach WS");
     assert_eq!(validator.store().len(), 0);
 
-    // Send real — should be accepted (not blocked by dedup)
+    // Send real — still rejected because free gossip is disabled.
     handle_gossip_received(
         test_peer_id(),
         envelope,
@@ -887,8 +881,8 @@ async fn gossip_valid_message_accepted_after_forged_attempt() {
         &audit,
         &ws_tx,
     ).await;
-    assert!(ws_rx.try_recv().is_ok(), "real message should be accepted after forged attempt");
-    assert_eq!(validator.store().len(), 1, "accepted message should be in dedup store");
+    assert!(ws_rx.try_recv().is_err(), "legacy free gossip must not reach WS");
+    assert_eq!(validator.store().len(), 0, "legacy free gossip must not be stored");
 }
 
 // ── Peer exchange handler tests ───────────────────────────

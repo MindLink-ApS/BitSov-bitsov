@@ -259,7 +259,7 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
             println!("  1. Set up LND or CLN for Lightning payments");
             println!("  2. Edit {} to configure:", config_path.display());
             println!("     - Switch lightning backend to 'lnbits' (pointing to your LND)");
-            println!("     - Chain backend is set to 'esplora' (mempool.space)");
+            println!("     - Chain backend is set to 'esplora'; use your own provider for full sovereignty");
             println!("     - Storage encryption is ON by default");
             println!("  3. Run: konsensus start -c {}", config_path.display());
         }
@@ -607,7 +607,7 @@ async fn cmd_start(config_path: &Path, password: Option<&str>) -> Result<()> {
                     }
                     crate::config::NodeTier::Light => {
                         "Light tier: check your LNbits API URL and admin key in konsensus.toml.\n  \
-                         If using hosted Lightning, ensure https://lightning.konsensus.network is reachable.\n  \
+                         If using hosted Lightning, ensure your configured provider is reachable.\n  \
                          You can switch to mock Lightning for testing: set [lightning] backend = \"mock\"."
                     }
                     crate::config::NodeTier::Full => {

@@ -16,7 +16,7 @@ BitSov replaces centralized platforms with a decentralized, privacy-respecting, 
 
 ### Option 1: Download Binary
 
-Download the latest release from [GitHub Releases](https://github.com/MindLink-ApS/Konsensus_v02/releases).
+Download the latest release from [GitHub Releases](https://github.com/BitSov/bitsov/releases).
 
 ```bash
 # Initialize a new node (generates BIP-39 identity)
@@ -30,8 +30,8 @@ Download the latest release from [GitHub Releases](https://github.com/MindLink-A
 
 ```bash
 # Clone and run
-git clone https://github.com/MindLink-ApS/Konsensus_v02.git
-cd Konsensus_v02
+git clone https://github.com/BitSov/bitsov.git
+cd bitsov
 docker compose up -d
 
 # With Lightning (LNbits):
@@ -42,8 +42,8 @@ docker compose --profile lightning up -d
 
 ```bash
 # Prerequisites: Rust 1.75+, Node.js 20+
-git clone https://github.com/MindLink-ApS/Konsensus_v02.git
-cd Konsensus_v02
+git clone https://github.com/BitSov/bitsov.git
+cd bitsov
 
 # Build the node binary
 cargo build --release -p konsensus-node

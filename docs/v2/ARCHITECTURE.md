@@ -1,7 +1,15 @@
-# Konsensus v2 — Core Stack Specification
+# BitSov/Konsensus v2 — Core Stack Specification
 
 > **Status:** At rest — pending v1 field testing
 > **Related:** [PRD.md](PRD.md) | [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) | [CURRENT_GAPS.md](CURRENT_GAPS.md)
+
+> **Public-core note (2026-05-20):** This is an early v2 reference document.
+> The launch boundary is now governed by `CHARTER.md`,
+> `RELAY_PROTOCOL.md`, `REMOTE_ACCESS_IDENTITY.md`, and
+> `TIER_MIGRATION_PROTOCOL.md`. Historical "Tier 3/4" labels below refer to
+> Full/Infrastructure resource profiles, not custodial hosting. Any hosted or
+> relay deployment must remain non-custodial: user-held identity keys,
+> encrypted storage, and ciphertext-only relay surfaces.
 
 ---
 
@@ -984,7 +992,7 @@ pubkey = "ed25519:def456..."
 address = "tcp://peer2.example.com:9735"
 ```
 
-### `konsensus.toml` — Tier 3 (Full Node)
+### `konsensus.toml` — Full Node
 
 ```toml
 [node]
@@ -1053,7 +1061,7 @@ pubkey = "ed25519:def456..."
 address = "onion://abcdef1234567890.onion:9735"
 ```
 
-### `konsensus.toml` — Tier 4 (Infrastructure Node)
+### `konsensus.toml` — Infrastructure Node
 
 ```toml
 [node]

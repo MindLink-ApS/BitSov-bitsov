@@ -2,7 +2,7 @@
 //!
 //! Reads prices from configuration. Maps each UKM kind to its category,
 //! then returns the configured price for that category. Real-time signaling
-//! kinds (400-499) are not priceable in v2.0 (deferred).
+//! kinds (400-499) are priceable and must use the normal payment gate.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,9 @@ pub struct StaticPricingConfig {
     /// Price for collaboration messages (kinds 300-399) in millisatoshis.
     #[serde(default = "default_collab_msat")]
     pub collaboration_msat: u64,
+    /// Price for real-time signaling messages (kinds 400-499) in millisatoshis.
+    #[serde(default = "default_realtime_signal_msat")]
+    pub realtime_signal_msat: u64,
     /// Price for app extension messages (kinds 1000+) in millisatoshis.
     #[serde(default = "default_app_ext_msat")]
     pub app_ext_msat: u64,
@@ -40,6 +43,10 @@ pub struct StaticPricingConfig {
 
 fn default_collab_msat() -> u64 {
     25
+}
+
+fn default_realtime_signal_msat() -> u64 {
+    50
 }
 
 fn default_app_ext_msat() -> u64 {
@@ -59,6 +66,7 @@ impl Default for StaticPricingConfig {
             file_ref_msat: 100,
             control_msat: 1,
             collaboration_msat: 25,
+            realtime_signal_msat: 50,
             app_ext_msat: 10,
             web_content_msat: 50,
         }
@@ -85,7 +93,7 @@ impl StaticPricingEngine {
             KindCategory::StructuredData => Ok(self.config.calendar_msat),
             KindCategory::FilesMedia => Ok(self.config.file_ref_msat),
             KindCategory::Collaboration => Ok(self.config.collaboration_msat),
-            KindCategory::RealTimeSignaling => Err(PricingError::NotPriceable(400)),
+            KindCategory::RealTimeSignaling => Ok(self.config.realtime_signal_msat),
             KindCategory::WebContent => Ok(self.config.web_content_msat),
             KindCategory::Control => Ok(self.config.control_msat),
             KindCategory::AppExtension => Ok(self.config.app_ext_msat),
@@ -102,9 +110,6 @@ impl PricingEngine for StaticPricingEngine {
 
     async fn get_price_msat(&self, kind: u16) -> Result<u64, PricingError> {
         let category = KindCategory::from_kind(kind);
-        if matches!(category, KindCategory::RealTimeSignaling) {
-            return Err(PricingError::NotPriceable(kind));
-        }
         if matches!(category, KindCategory::Unknown) {
             return Err(PricingError::NotPriceable(kind));
         }
@@ -116,10 +121,7 @@ impl PricingEngine for StaticPricingEngine {
         self.price_for_category(category)
     }
 
-    async fn get_category_price_msat(
-        &self,
-        category: KindCategory,
-    ) -> Result<u64, PricingError> {
+    async fn get_category_price_msat(&self, category: KindCategory) -> Result<u64, PricingError> {
         self.price_for_category(category)
     }
 }

@@ -135,10 +135,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            artifact: konsensus-linux-x86_64
+            artifact: bitsov-linux-x86_64
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            artifact: konsensus-linux-aarch64
+            artifact: bitsov-linux-aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -174,11 +174,14 @@ jobs:
           mkdir -p artifacts
           cp target/${{ matrix.target }}/release/konsensus artifacts/${{ matrix.artifact }}
           chmod +x artifacts/${{ matrix.artifact }}
+          (cd artifacts && sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256)
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/${{ matrix.artifact }}
+          files: |
+            artifacts/${{ matrix.artifact }}
+            artifacts/${{ matrix.artifact }}.sha256
 
   # Build Tauri desktop app for all platforms
   release-desktop:
@@ -246,7 +249,7 @@ jobs:
         with:
           projectPath: frontend
           tagName: ${{ github.ref_name }}
-          releaseName: "Konsensus ${{ github.ref_name }}"
+          releaseName: "BitSov ${{ github.ref_name }}"
           releaseBody: "Sovereign mesh network desktop client. See CHANGELOG for details."
           releaseDraft: false
           prerelease: false

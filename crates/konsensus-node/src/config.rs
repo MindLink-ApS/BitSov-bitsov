@@ -169,8 +169,8 @@ pub enum LightningConfig {
     Lnbits {
         /// Base URL of the LNbits instance.
         ///
-        /// For Light tier, defaults to the hosted MindLink instance.
-        /// For Full tier, point this to your own LNbits.
+        /// For Light tier, point this to a user-selected LNbits instance.
+        /// For Full tier, prefer embedded LDK or point this to your own LNbits.
         api_url: String,
         /// Admin API key for the wallet.
         admin_key: String,
@@ -381,7 +381,7 @@ pub struct PricingConfig {
     /// ```
     ///
     /// Category names: "communication", "structured_data", "files_media",
-    /// "collaboration", "control", "app_extension".
+    /// "collaboration", "realtime_signaling", "control", "app_extension".
     /// Only used when mode = "chain_aware".
     #[serde(default)]
     pub category_fee_targets: std::collections::HashMap<String, u32>,
@@ -404,6 +404,9 @@ pub struct PricingConfig {
     /// Price for collaboration messages (kinds 300-399) in millisatoshis.
     #[serde(default = "default_collab_msat")]
     pub collaboration_msat: u64,
+    /// Price for real-time signaling messages (kinds 400-499) in millisatoshis.
+    #[serde(default = "default_realtime_signal_msat")]
+    pub realtime_signal_msat: u64,
     /// Price for application extension messages (kinds 1000+) in millisatoshis.
     #[serde(default = "default_app_ext_msat")]
     pub app_ext_msat: u64,
@@ -428,6 +431,7 @@ impl Default for PricingConfig {
             file_ref_msat: default_file_ref_msat(),
             control_msat: default_control_msat(),
             collaboration_msat: default_collab_msat(),
+            realtime_signal_msat: default_realtime_signal_msat(),
             app_ext_msat: default_app_ext_msat(),
             web_content_msat: default_web_content_msat(),
         }
@@ -448,7 +452,7 @@ pub enum StorageConfig {
         #[serde(default = "default_sqlite_path")]
         path: String,
         /// Enable AES-256-GCM at-rest encryption.
-        #[serde(default)]
+        #[serde(default = "default_true")]
         encrypted: bool,
         /// Message retention in days. 0 = keep forever (default).
         #[serde(default)]
@@ -460,7 +464,7 @@ pub enum StorageConfig {
         /// PostgreSQL connection URL.
         url: String,
         /// Enable AES-256-GCM at-rest encryption.
-        #[serde(default)]
+        #[serde(default = "default_true")]
         encrypted: bool,
         /// Message retention in days. 0 = keep forever (default).
         #[serde(default)]
@@ -483,7 +487,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self::Sqlite {
             path: default_sqlite_path(),
-            encrypted: false,
+            encrypted: true,
             retention_days: 0,
         }
     }
@@ -700,8 +704,13 @@ impl NodeConfig {
         // Validate pricing (all prices must be > 0 for payment gate)
         if self.pricing.chat_msat == 0
             || self.pricing.longform_msat == 0
+            || self.pricing.calendar_msat == 0
             || self.pricing.file_ref_msat == 0
             || self.pricing.control_msat == 0
+            || self.pricing.collaboration_msat == 0
+            || self.pricing.realtime_signal_msat == 0
+            || self.pricing.app_ext_msat == 0
+            || self.pricing.web_content_msat == 0
         {
             anyhow::bail!(
                 "all pricing values must be > 0 (Principle 2: payment gate is fail-closed)"
@@ -731,8 +740,8 @@ impl NodeConfig {
     /// Generate a tier-appropriate default configuration.
     ///
     /// Each tier pre-configures different backend defaults:
-    /// - **Cloud/Relay**: mock backends until paired with a relay/LSP
-    /// - **Light**: mock Lightning until user configures a provider, SQLite storage
+    /// - **Cloud/Relay**: mock backends until paired with a relay/LSP, encrypted SQLite
+    /// - **Light**: mock Lightning until user configures a provider, encrypted SQLite
     /// - **Full**: mock Lightning (user switches to LND), Esplora chain, encrypted SQLite
     pub fn default_for_tier(tier: NodeTier, mnemonic_file: PathBuf, node_dir: &Path) -> Self {
         let abs_dir = std::fs::canonicalize(node_dir).unwrap_or_else(|_| node_dir.to_path_buf());
@@ -748,7 +757,7 @@ impl NodeConfig {
                 ChainConfig::Mock,
                 StorageConfig::Sqlite {
                     path: db_path.to_string_lossy().into_owned(),
-                    encrypted: false,
+                    encrypted: true,
                     retention_days: 0,
                 },
                 SovereigntyTier::T1,
@@ -760,7 +769,7 @@ impl NodeConfig {
                 ChainConfig::Mock,
                 StorageConfig::Sqlite {
                     path: db_path.to_string_lossy().into_owned(),
-                    encrypted: false,
+                    encrypted: true,
                     retention_days: 0,
                 },
                 SovereigntyTier::T1,
@@ -936,6 +945,9 @@ fn default_control_msat() -> u64 {
 }
 fn default_collab_msat() -> u64 {
     25
+}
+fn default_realtime_signal_msat() -> u64 {
+    50
 }
 fn default_app_ext_msat() -> u64 {
     10

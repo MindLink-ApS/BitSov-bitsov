@@ -126,6 +126,7 @@ export default function Settings() {
     loadFreeBusyPolicies(),
   );
   const id = identity();
+  const canRevealRecoveryPhrase = createMemo(() => tier() !== "cloud");
 
   function getPeerPolicy(peerId: string): FreeBusyPolicy {
     return freeBusyPolicies()[peerId] ?? "partial";
@@ -167,6 +168,10 @@ export default function Settings() {
   }
 
   async function loadMnemonic() {
+    if (!canRevealRecoveryPhrase()) {
+      setMnemonicError("Recovery phrase export is unavailable in hosted mode.");
+      return;
+    }
     setMnemonicLoading(true);
     setMnemonicError("");
     try {
@@ -365,59 +370,78 @@ export default function Settings() {
       </div>
 
       {/* Mnemonic Backup */}
-      <div class="card mb-16">
-        <div class="card-header">
-          <IconKey size={16} />
-          <span style={{ "margin-left": "8px" }}>Recovery Phrase</span>
-        </div>
-        <p class="form-hint mb-8">
-          Your 24-word recovery phrase is the master key to your identity. Write it down and store it securely offline.
-        </p>
-        <Show when={!mnemonicVisible()}>
-          <button
-            class="btn btn-secondary"
-            onClick={toggleMnemonic}
-            aria-label="Show recovery phrase"
-          >
-            <IconEye size={14} />
-            <span style={{ "margin-left": "6px" }}>Reveal Recovery Phrase</span>
-          </button>
-        </Show>
-        <Show when={mnemonicVisible()}>
-          <Show when={mnemonicLoading()}>
-            <div class="skeleton" style={{ height: "120px" }} />
-          </Show>
-          <Show when={mnemonicError()}>
+      <Show
+        when={canRevealRecoveryPhrase()}
+        fallback={
+          <div class="card mb-16">
+            <div class="card-header">
+              <IconKey size={16} />
+              <span style={{ "margin-left": "8px" }}>Recovery Phrase</span>
+            </div>
+            <p class="form-hint mb-8">
+              Recovery phrase export is unavailable in hosted mode.
+            </p>
             <div class="settings-identity-warning">
               <span><IconWarning size={16} /></span>
-              <span class="text-sm text-warning">{mnemonicError()}</span>
+              <span class="text-sm">Hosted nodes must not expose mnemonic export through the web interface.</span>
             </div>
+          </div>
+        }
+      >
+        <div class="card mb-16">
+          <div class="card-header">
+            <IconKey size={16} />
+            <span style={{ "margin-left": "8px" }}>Recovery Phrase</span>
+          </div>
+          <p class="form-hint mb-8">
+            Your 24-word recovery phrase is the master key to your identity. Write it down and store it securely offline.
+          </p>
+          <Show when={!mnemonicVisible()}>
+            <button
+              class="btn btn-secondary"
+              onClick={toggleMnemonic}
+              aria-label="Show recovery phrase"
+            >
+              <IconEye size={14} />
+              <span style={{ "margin-left": "6px" }}>Reveal Recovery Phrase</span>
+            </button>
           </Show>
-          <Show when={mnemonicWords().length > 0}>
-            <div class="mnemonic-grid-settings">
-              <For each={mnemonicWords()}>
-                {(word, i) => (
-                  <div class="mnemonic-word-cell">
-                    <span class="mnemonic-word-num">{i() + 1}</span>
-                    <span class="mnemonic-word-text">{word}</span>
-                  </div>
-                )}
-              </For>
-            </div>
-            <div class="settings-identity-warning mt-8">
-              <span><IconWarning size={16} /></span>
-              <span class="text-sm text-warning">Never share your recovery phrase. Anyone with these words controls your identity and funds.</span>
-            </div>
+          <Show when={mnemonicVisible()}>
+            <Show when={mnemonicLoading()}>
+              <div class="skeleton" style={{ height: "120px" }} />
+            </Show>
+            <Show when={mnemonicError()}>
+              <div class="settings-identity-warning">
+                <span><IconWarning size={16} /></span>
+                <span class="text-sm text-warning">{mnemonicError()}</span>
+              </div>
+            </Show>
+            <Show when={mnemonicWords().length > 0}>
+              <div class="mnemonic-grid-settings">
+                <For each={mnemonicWords()}>
+                  {(word, i) => (
+                    <div class="mnemonic-word-cell">
+                      <span class="mnemonic-word-num">{i() + 1}</span>
+                      <span class="mnemonic-word-text">{word}</span>
+                    </div>
+                  )}
+                </For>
+              </div>
+              <div class="settings-identity-warning mt-8">
+                <span><IconWarning size={16} /></span>
+                <span class="text-sm text-warning">Never share your recovery phrase. Anyone with these words controls your identity and funds.</span>
+              </div>
+            </Show>
+            <button
+              class="btn btn-ghost mt-8"
+              onClick={toggleMnemonic}
+              aria-label="Hide recovery phrase"
+            >
+              Hide
+            </button>
           </Show>
-          <button
-            class="btn btn-ghost mt-8"
-            onClick={toggleMnemonic}
-            aria-label="Hide recovery phrase"
-          >
-            Hide
-          </button>
-        </Show>
-      </div>
+        </div>
+      </Show>
 
       {/* Notifications */}
       <div class="card mb-16">

@@ -65,7 +65,8 @@ impl PeerPriceEntry {
     /// `discounted = base * (1 - trust_discount)`.
     /// Returns `None` if the kind's category isn't in the peer's table.
     pub fn get_discounted_price_for_kind(&self, kind: u16) -> Option<u64> {
-        self.get_price_for_kind(kind).map(|base| apply_trust_discount(base, self.trust_discount))
+        self.get_price_for_kind(kind)
+            .map(|base| apply_trust_discount(base, self.trust_discount))
     }
 
     /// Check whether this price table is stale relative to a given block height.
@@ -142,7 +143,9 @@ impl PeerPriceCache {
     /// kind's category isn't in their table.
     pub async fn get_peer_price(&self, peer_id: &NodeId, kind: u16) -> Option<u64> {
         let entries = self.entries.read().await;
-        entries.get(peer_id).and_then(|e| e.get_price_for_kind(kind))
+        entries
+            .get(peer_id)
+            .and_then(|e| e.get_price_for_kind(kind))
     }
 
     /// Get the discounted price a peer requires, applying plasticity trust discount.
@@ -401,6 +404,7 @@ pub async fn build_price_table(
         KindCategory::StructuredData,
         KindCategory::FilesMedia,
         KindCategory::Collaboration,
+        KindCategory::RealTimeSignaling,
         KindCategory::WebContent,
         KindCategory::Control,
         KindCategory::AppExtension,

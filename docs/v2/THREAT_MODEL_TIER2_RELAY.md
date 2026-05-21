@@ -27,7 +27,7 @@ E2EE protects payload + kind (kind is encrypted alongside payload per UNIFIED_PR
 3. **Frame timestamp** — supports timing correlation with off-path captures.
 4. **Payment-proof hash + msat amount** — reveals message-class (chat ≈ 1 msat vs file ≈ 100+ msat) and chains custody to the user's LN node.
 5. **Ciphertext length** — discriminates kind family (64-byte ≈ typing indicator, 4 MB ≈ file). Sizing alone separates chat / call-invite / file / CRDT.
-6. **Signalling kinds 400-499** travel as dedicated `Frame` variants (`CallOffer`, `CallAnswer`, `IceCandidate`, `CallEnd`) and **bypass the payment gate**. The relay sees who is calling whom, when, and SDP/ICE shape (which leaks candidate IPs unless TURN is used).
+6. **Signalling kinds 400-499** now travel as paid UKM envelopes; legacy dedicated `Frame` variants (`CallOffer`, `CallAnswer`, `IceCandidate`, `CallEnd`) are decode-compatible but rejected by launch-facing nodes. The relay still sees who is calling whom, when, and SDP/ICE shape unless TURN and padding are used.
 7. **TCP source IP** — geolocates the user unless they run Tor.
 8. **Connect/disconnect cadence** — derives sleep schedule, work hours, travel.
 9. **Whitelist membership** — relay knows the user's federation set.

@@ -1,8 +1,8 @@
-//! Gossip publishing endpoints — allows the local node to originate gossip
-//! messages (e.g., web manifests) that propagate across the mesh.
+//! Gossip publishing endpoints.
 //!
-//! Gossip bypasses the payment gate (it's public data) but is rate-limited,
-//! signed, and kind-restricted. Only `KIND_WEB_MANIFEST` (510) is allowed.
+//! Free gossip is disabled until paid broadcast semantics land. The route is
+//! kept to provide an explicit fail-closed response instead of silently
+//! creating a payment-gate bypass.
 
 use std::sync::Arc;
 
@@ -12,7 +12,6 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use konsensus_core::kind::KIND_WEB_MANIFEST;
 use konsensus_core::types::{PaymentProof, Recipient, Signature};
 use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_message::Frame;
@@ -22,8 +21,12 @@ use crate::error::ApiError;
 use crate::handlers::utils::generate_valid_proof;
 use crate::state::AppState;
 
-/// Allowed gossip kinds — must match the session handler's `GOSSIP_ALLOWED_KINDS`.
-const GOSSIP_ALLOWED_KINDS: &[u16] = &[KIND_WEB_MANIFEST];
+/// Allowed legacy free-gossip kinds.
+///
+/// Empty by design: public launch must not expose an unpaid broadcast lane.
+/// Paid broadcast/gossip will re-open this surface through the normal UKM
+/// payment gate.
+const GOSSIP_ALLOWED_KINDS: &[u16] = &[];
 
 /// Maximum gossip payload size (64 KB — web manifests should be small).
 const MAX_GOSSIP_PAYLOAD: usize = 65_536;
@@ -74,12 +77,8 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 /// POST /api/v1/gossip/publish — publish a gossip message to the mesh.
 ///
-/// Creates a signed UkmEnvelope with `Recipient::Broadcast`, sends it as
-/// `Frame::Gossip` to all connected peers. The message propagates through
-/// the mesh via re-broadcast (with deduplication at each hop).
-///
-/// Gossip is public data — no E2EE, no payment gate. The payload is included
-/// as-is in the ciphertext field (gossip content is not secret).
+/// Currently returns an explicit fail-closed error for every kind. Paid
+/// broadcast/gossip must be implemented on the normal UKM payment-gated path.
 async fn publish_gossip(
     _auth: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -88,8 +87,8 @@ async fn publish_gossip(
     // 1. Validate kind is allowed for gossip
     if !GOSSIP_ALLOWED_KINDS.contains(&req.kind) {
         return Err(ApiError::BadRequest(format!(
-            "kind {} is not allowed for gossip (allowed: {:?})",
-            req.kind, GOSSIP_ALLOWED_KINDS
+            "legacy free gossip is disabled until paid broadcast lands (kind {})",
+            req.kind
         )));
     }
 
@@ -105,8 +104,7 @@ async fn publish_gossip(
         )));
     }
 
-    // 3. Build the envelope — gossip uses plaintext "ciphertext" (public data)
-    //    with a zero-value payment proof (gossip bypasses the payment gate)
+    // 3. Build the envelope for any future explicitly enabled legacy kind.
     let (hash, preimage, amount) = generate_valid_proof(0);
     let proof = PaymentProof::new(hash, preimage, amount);
     let sender = *state.identity.node_id();
@@ -206,8 +204,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gossip_allowed_kinds_includes_web_manifest() {
-        assert!(GOSSIP_ALLOWED_KINDS.contains(&KIND_WEB_MANIFEST));
+    fn gossip_allowed_kinds_empty_until_paid_broadcast_lands() {
+        assert!(GOSSIP_ALLOWED_KINDS.is_empty());
     }
 
     #[test]

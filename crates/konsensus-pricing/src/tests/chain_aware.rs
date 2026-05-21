@@ -96,10 +96,11 @@ async fn zero_fee_rate_returns_base_price() {
 }
 
 #[tokio::test]
-async fn realtime_signaling_still_not_priceable() {
+async fn realtime_signaling_uses_payment_gate_price() {
     let engine = make_engine(10.0);
-    assert!(engine.get_price_msat(KIND_CALL_INVITE).await.is_err());
-    assert!(engine.get_price_msat(KIND_ICE_CANDIDATE).await.is_err());
+    // Base 50 + ceil(50 * 10.0 * 1.8 / 100) = 50 + 9 = 59
+    assert_eq!(engine.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 59);
+    assert_eq!(engine.get_price_msat(KIND_ICE_CANDIDATE).await.unwrap(), 59);
 }
 
 #[tokio::test]

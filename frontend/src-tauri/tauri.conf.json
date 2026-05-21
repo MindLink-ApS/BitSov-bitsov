@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* https://127.0.0.1:* wss://127.0.0.1:* https://mempool.space https://api.amboss.space https://1ml.com; font-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* https://127.0.0.1:* wss://127.0.0.1:*; font-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
     }
   },
   "bundle": {

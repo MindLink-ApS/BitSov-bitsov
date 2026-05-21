@@ -214,9 +214,10 @@ pub enum ControlEvent {
 
     /// Received a gossip message from a peer.
     ///
-    /// Gossip messages carry public data (web manifests, pricing tables) and
-    /// are re-broadcast to all connected peers (with deduplication). They
-    /// bypass the payment gate but are rate-limited per sender.
+    /// Legacy gossip message from a peer.
+    ///
+    /// Launch-facing nodes reject free gossip until paid broadcast semantics
+    /// land on the normal UKM payment-gated path.
     GossipReceived {
         /// The peer who relayed this gossip message to us.
         from_peer: NodeId,

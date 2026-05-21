@@ -58,10 +58,9 @@ pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 ///
 /// Includes call invite, call answer, ICE candidates, and call hangup.
 ///
-/// Legacy note: these are still represented by dedicated `Frame` variants
-/// below, which means they bypass the normal UKM payment gate. That is not
-/// acceptable for public relay launch. T2R0a must fold this range into the
-/// paid UKM path before relay capability work becomes launch-facing.
+/// Real-time signaling must travel as paid UKM envelopes in this kind range.
+/// The legacy dedicated `Frame` variants remain decode-compatible, but
+/// launch-facing nodes reject them instead of creating an unpaid control lane.
 pub const KIND_REALTIME_SIGNAL_START: u16 = 400;
 
 /// Last kind value in the real-time signaling range (400–499).
@@ -386,9 +385,10 @@ pub enum Frame {
         reason: String,
     },
 
-    /// Gossip message — public data propagated across the mesh.
+    /// Legacy gossip message — public data propagated across the mesh.
     ///
-    /// Gossip messages bypass the payment gate but are rate-limited per sender.
+    /// Launch-facing nodes currently reject free gossip frames until paid
+    /// broadcast semantics land. This variant remains for decode compatibility.
     /// The envelope's `recipient` field MUST be `Recipient::Broadcast`.
     /// The `sender` field is the original author, and the signature is verified
     /// by every node that receives the gossip (preventing spoofing).

@@ -1,6 +1,6 @@
 /** Sovereignty banner — persistent indicator of the user's tier.
  *
- * - Cloud: amber banner — "Managed by MindLink"
+ * - Cloud: amber banner — "Managed by relay operator"
  * - Light: green banner — "Sovereign"
  * - Full: green + lock icon — "Fully Sovereign"
  *

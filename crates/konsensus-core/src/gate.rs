@@ -90,9 +90,8 @@ pub enum GateRejection {
     #[error("lightning verification failed: {0}")]
     LightningUnavailable(String),
 
-    /// Message kind is not priceable (e.g. real-time signaling) and no valid
-    /// session exists to cover it. Fail-closed: reject until the feature is
-    /// properly implemented with session-level pre-payment.
+    /// Message kind is not priceable and no valid session exists to cover it.
+    /// Fail-closed: reject until the feature has an explicit price.
     #[error("kind {0} is not priceable and has no covering session")]
     KindNotPriceable(u16),
 }
@@ -334,9 +333,6 @@ impl PaymentGate {
             Ok(price) => price,
             Err(PricingError::NotPriceable(kind)) => {
                 // Fail-closed: reject kinds that have no price.
-                // Real-time signaling (400-499) will need session-level
-                // pre-payment validation when VoIP is implemented. Until
-                // then, accepting them at zero cost is a gate bypass.
                 warn!(
                     kind,
                     "rejected: kind is not priceable and no covering session exists"
@@ -1219,7 +1215,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_not_priceable_kind_with_zero_payment() {
-        // Real-time signaling kinds (400-499) return NotPriceable from pricing.
+        // Pricing engines may still mark future/disabled kinds as NotPriceable.
         // Gate must reject them (fail-closed) — no free messages through the gate.
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
@@ -1227,7 +1223,7 @@ mod tests {
         let proof = make_proof(0);
 
         let mut envelope = UkmEnvelopeBuilder::new(
-            crate::kind::KIND_CALL_INVITE, // 400 — real-time signaling
+            crate::kind::KIND_CALL_INVITE, // forced NotPriceable by the mock pricing engine
             sender,
             recipient,
             b"signaling data".to_vec(),
@@ -1256,15 +1252,14 @@ mod tests {
 
     #[tokio::test]
     async fn reject_not_priceable_kind_even_with_payment() {
-        // Even with a payment attached, NotPriceable kinds must be rejected
-        // because there is no session-level pre-payment to cover them.
+        // Even with a payment attached, NotPriceable kinds must be rejected.
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
         let proof = make_proof(100);
 
         let mut envelope = UkmEnvelopeBuilder::new(
-            crate::kind::KIND_CALL_ANSWER, // 401 — real-time signaling
+            crate::kind::KIND_CALL_ANSWER, // forced NotPriceable by the mock pricing engine
             sender,
             recipient,
             b"answer data".to_vec(),

@@ -317,9 +317,8 @@ async fn decrypt_and_process(
         process_page_request(&bytes, sender, envelope, content_server, pricing, identity, session_mgr, transport, audit).await
     } else if konsensus_message::wire::is_realtime_signal(envelope.kind) {
         // Real-time signaling (400–499): log at INFO and relay plaintext to WebSocket.
-        // Full WebRTC signaling is carried via dedicated Frame variants (CallOffer,
-        // CallAnswer, IceCandidate, CallEnd) at the transport layer. These UKM
-        // envelopes carry the same payload for app-level record and WebSocket broadcast.
+        // Dedicated legacy Call* frame variants are rejected by the transport;
+        // signaling must use this payment-gated UKM path.
         info!(
             sender = %sender,
             kind = envelope.kind,
