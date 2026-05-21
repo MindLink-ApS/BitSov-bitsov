@@ -223,7 +223,7 @@ jobs:
       # ── Upload report as artifact (always) ────────────────────────────────
 
       - name: Upload security report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: security-report-${{ steps.report.outputs.scan_date }}
           path: ${{ steps.report.outputs.report_file }}
