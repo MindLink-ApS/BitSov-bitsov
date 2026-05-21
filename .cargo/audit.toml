@@ -1,0 +1,17 @@
+[advisories]
+# Accepted until the ldk-node/sqlx SQLite dependency island is upgraded.
+#
+# Context:
+# - The workspace pins sqlx to 0.8.0 because sqlx 0.8.1+ moves to a
+#   libsqlite3-sys range that conflicts with ldk-node 0.7.0's rusqlite stack.
+# - These ignores keep Cargo Audit useful: new, unrelated vulnerabilities still
+#   fail CI, while this known island remains explicit and reviewable.
+# - Revisit before the first public release candidate, and remove once ldk-node
+#   or the storage backend dependency graph can move forward.
+ignore = [
+  "RUSTSEC-2023-0071", # rsa via sqlx-mysql; MySQL is not an enabled BitSov storage backend.
+  "RUSTSEC-2024-0363", # sqlx 0.8.0; pinned by libsqlite3-sys conflict documented in Cargo.toml.
+  "RUSTSEC-2026-0098", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
+  "RUSTSEC-2026-0099", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
+  "RUSTSEC-2026-0104", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
+]
