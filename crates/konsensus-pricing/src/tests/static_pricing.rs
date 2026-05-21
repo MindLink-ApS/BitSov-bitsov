@@ -78,6 +78,17 @@ async fn web_content_price() {
 }
 
 #[tokio::test]
+async fn relay_storage_category_price() {
+    let e = engine();
+    assert_eq!(
+        e.get_category_price_msat(KindCategory::Storage)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn unknown_kind_not_priceable() {
     let e = engine();
     assert!(e.get_price_msat(600).await.is_err());
@@ -111,6 +122,12 @@ async fn category_pricing() {
             .unwrap(),
         50
     );
+    assert_eq!(
+        e.get_category_price_msat(KindCategory::Storage)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -125,6 +142,7 @@ async fn custom_config() {
         realtime_signal_msat: 90,
         app_ext_msat: 25,
         web_content_msat: 100,
+        relay_storage_msat_per_byte_day: 3,
     };
     let e = StaticPricingEngine::new(config);
 
@@ -133,6 +151,12 @@ async fn custom_config() {
     assert_eq!(e.get_price_msat(KIND_FILE_REF).await.unwrap(), 500);
     assert_eq!(e.get_price_msat(KIND_TYPING).await.unwrap(), 5);
     assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 90);
+    assert_eq!(
+        e.get_category_price_msat(KindCategory::Storage)
+            .await
+            .unwrap(),
+        3
+    );
 }
 
 #[test]
@@ -144,6 +168,7 @@ fn default_config_matches_toml_example() {
     assert_eq!(config.file_ref_msat, 100);
     assert_eq!(config.control_msat, 1);
     assert_eq!(config.realtime_signal_msat, 50);
+    assert_eq!(config.relay_storage_msat_per_byte_day, 1);
 }
 
 #[test]

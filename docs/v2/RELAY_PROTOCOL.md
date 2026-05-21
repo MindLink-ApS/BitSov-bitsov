@@ -215,8 +215,10 @@ plasticity = chain_adjusted * (1 - trust_discount(depositor))
 final_rate_msat_per_byte_day = plasticity
 ```
 
-**Divergence flag:** `PricingEngine::KindCategory` needs a new `Storage`
-variant. Non-breaking if marked `#[non_exhaustive]`.
+**Implemented T2R2 baseline:** `PricingEngine::KindCategory::Storage` exists
+as a relay service category with no direct UKM kind range. Relay settlement
+queries this category directly until relay binding publications get a
+collision-free UKM kind assignment.
 
 ### Settlement
 
@@ -257,10 +259,10 @@ variant. Non-breaking if marked `#[non_exhaustive]`.
 
 ## 5. Multi-relay routing
 
-**Recommendation: yes, with signed `RelayBindingPublication` (kind=960).**
+**Recommendation: yes, with signed `RelayBindingPublication` (kind TBD).**
 
 ```
-kind=960  RelayBindingPublication  {
+kind=TBD  RelayBindingPublication  {
     relays: Vec<RelayEndpoint>,
     published_at: u64,
     revoked_relays: Vec<NodeId>
@@ -322,7 +324,7 @@ Relay_A deletes binding_id_old AFTER Ack received
 
 ### Phase 5 — Publish new binding
 
-Thin node issues fresh `RelayBindingPublication` (kind=960) to known peers.
+Thin node issues fresh `RelayBindingPublication` (kind TBD) to known peers.
 Depositors update caches.
 
 ### Atomicity properties
@@ -369,8 +371,11 @@ serde tolerance judged too risky.
 - Relay role opt-in: `konsensus.toml: [relay].enabled = true`
 - `crates/konsensus-storage/` — `RelayBinding`, `RelayHeldEnvelope` tables.
   No schema change to existing UKM tables.
-- `crates/konsensus-pricing/` — extend `KindCategory::Storage`
-- `crates/konsensus-core/src/kind.rs` — assign `KIND_RELAY_BINDING_PUB = 960`
+- `crates/konsensus-pricing/` — `KindCategory::Storage` is available as a
+  category-only storage price
+- `crates/konsensus-core/src/kind.rs` — future work must assign a
+  collision-free `KIND_RELAY_BINDING_PUB`; `960` is already used by
+  `KIND_MLS_WELCOME`
 
 ## 9. Open questions
 
@@ -414,7 +419,7 @@ but cannot impersonate, decrypt, or moderate.
 ## Divergences from existing build (restated)
 
 1. `Capability` and `Frame` need `#[serde(other)]` tolerance (§7)
-2. `PricingEngine::KindCategory` needs a `Storage` variant (§3)
+2. Relay binding publications need a collision-free UKM kind assignment (§5)
 3. Real-time signaling kinds (THREAT_MODEL §6.7) should fold into payment-gated
    path before relay protocol ships
 4. Wake-notify push-token handling is binary-level policy; wire protocol

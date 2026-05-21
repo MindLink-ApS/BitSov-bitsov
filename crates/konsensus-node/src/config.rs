@@ -381,7 +381,8 @@ pub struct PricingConfig {
     /// ```
     ///
     /// Category names: "communication", "structured_data", "files_media",
-    /// "collaboration", "realtime_signaling", "control", "app_extension".
+    /// "collaboration", "realtime_signaling", "web_content", "storage",
+    /// "control", "app_extension".
     /// Only used when mode = "chain_aware".
     #[serde(default)]
     pub category_fee_targets: std::collections::HashMap<String, u32>,
@@ -414,6 +415,11 @@ pub struct PricingConfig {
     /// Used by the sovereign browser.
     #[serde(default = "default_web_content_msat")]
     pub web_content_msat: u64,
+    /// Relay storage rate in millisatoshis per byte-day.
+    ///
+    /// Storage is a relay service category, not a UKM kind range.
+    #[serde(default = "default_relay_storage_msat_per_byte_day")]
+    pub relay_storage_msat_per_byte_day: u64,
 }
 
 impl Default for PricingConfig {
@@ -434,6 +440,7 @@ impl Default for PricingConfig {
             realtime_signal_msat: default_realtime_signal_msat(),
             app_ext_msat: default_app_ext_msat(),
             web_content_msat: default_web_content_msat(),
+            relay_storage_msat_per_byte_day: default_relay_storage_msat_per_byte_day(),
         }
     }
 }
@@ -711,6 +718,7 @@ impl NodeConfig {
             || self.pricing.realtime_signal_msat == 0
             || self.pricing.app_ext_msat == 0
             || self.pricing.web_content_msat == 0
+            || self.pricing.relay_storage_msat_per_byte_day == 0
         {
             anyhow::bail!(
                 "all pricing values must be > 0 (Principle 2: payment gate is fail-closed)"
@@ -954,6 +962,9 @@ fn default_app_ext_msat() -> u64 {
 }
 fn default_web_content_msat() -> u64 {
     50
+}
+fn default_relay_storage_msat_per_byte_day() -> u64 {
+    1
 }
 
 #[cfg(test)]

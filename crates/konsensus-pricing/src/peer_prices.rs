@@ -286,6 +286,7 @@ pub fn category_to_string(category: KindCategory) -> String {
         KindCategory::Collaboration => "collaboration".to_string(),
         KindCategory::RealTimeSignaling => "realtime_signaling".to_string(),
         KindCategory::WebContent => "web_content".to_string(),
+        KindCategory::Storage => "storage".to_string(),
         KindCategory::Control => "control".to_string(),
         KindCategory::AppExtension => "app_extension".to_string(),
         KindCategory::Unknown => "unknown".to_string(),
@@ -406,6 +407,7 @@ pub async fn build_price_table(
         KindCategory::Collaboration,
         KindCategory::RealTimeSignaling,
         KindCategory::WebContent,
+        KindCategory::Storage,
         KindCategory::Control,
         KindCategory::AppExtension,
     ];
