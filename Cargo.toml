@@ -91,7 +91,7 @@ lightning-invoice = "0.34"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
-rpassword = "5"
+rpassword = "7"
 
 # Config
 toml = "0.8"
