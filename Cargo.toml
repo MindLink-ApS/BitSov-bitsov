@@ -74,7 +74,7 @@ ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
 x25519-dalek = { version = "2.0", features = ["serde", "static_secrets"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
-snow = "0.9"
+snow = "0.10"
 rand = "0.8"
 sha2 = "0.10"
 hkdf = "0.12"

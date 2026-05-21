@@ -25,7 +25,7 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "io"] }
 
-snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
+snow = { version = "0.10", default-features = false, features = ["default-resolver"] }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
