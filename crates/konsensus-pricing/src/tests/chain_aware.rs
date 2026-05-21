@@ -120,6 +120,14 @@ async fn category_pricing_with_chain_data() {
         .await
         .unwrap();
     assert_eq!(file_price, 190);
+
+    // Storage is category-only relay pricing: base 1 msat/byte-day,
+    // 1 + ceil(1 * 50 * 1.8 / 100) = 2.
+    let storage_price = engine
+        .get_category_price_msat(KindCategory::Storage)
+        .await
+        .unwrap();
+    assert_eq!(storage_price, 2);
 }
 
 #[tokio::test]

@@ -7,6 +7,7 @@
 //! - **300–399:** Collaboration (CRDT ops, document snapshots)
 //! - **400–499:** Real-time signaling (call invite/answer/ICE/hangup)
 //! - **500–599:** Web content (page requests/responses, manifests — sovereign browser)
+//! - **Storage:** Relay storage pricing category only; no direct UKM kind range yet
 //! - **900–999:** Control (typing, read receipts, presence, room ops, key exchange, MLS)
 //! - **1000+:** Application extension space
 
@@ -131,6 +132,11 @@ pub enum KindCategory {
     RealTimeSignaling,
     /// Web content: page requests, responses, manifests (500–599).
     WebContent,
+    /// Relay-held ciphertext storage service.
+    ///
+    /// Storage is priced as a relay service category, not a normal UKM payload
+    /// kind. Relay deposit settlement should query this category directly.
+    Storage,
     /// Typing, receipts, presence, room ops, key exchange, MLS (900–999).
     Control,
     /// Application extensions (1000+).
@@ -319,6 +325,14 @@ mod tests {
                 "KIND {kind} must be Unknown (reserved gap)"
             );
         }
+    }
+
+    /// Storage is a relay service pricing category, not a UKM payload range.
+    #[test]
+    fn storage_category_has_no_direct_kind_range_yet() {
+        assert_eq!(KindCategory::from_kind(600), KindCategory::Unknown);
+        assert_eq!(KindCategory::from_kind(899), KindCategory::Unknown);
+        assert_ne!(KindCategory::from_kind(600), KindCategory::Storage);
     }
 
     /// Verify category boundaries are exact.

@@ -237,6 +237,7 @@ impl KonsensusNode {
             realtime_signal_msat: config.pricing.realtime_signal_msat,
             app_ext_msat: config.pricing.app_ext_msat,
             web_content_msat: config.pricing.web_content_msat,
+            relay_storage_msat_per_byte_day: config.pricing.relay_storage_msat_per_byte_day,
         };
         let pricing: Arc<dyn PricingEngine> = match config.pricing.mode {
             PricingMode::Static => {

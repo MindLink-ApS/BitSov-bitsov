@@ -27,6 +27,7 @@ backend = "sqlite"
     );
     assert_eq!(config.network.tier, SovereigntyTier::T1);
     assert_eq!(config.pricing.chat_msat, 10);
+    assert_eq!(config.pricing.relay_storage_msat_per_byte_day, 1);
     assert_eq!(config.api.listen_addr.port(), 3141);
     assert!(matches!(config.storage, StorageConfig::Sqlite { encrypted: true, .. }));
 }
@@ -86,6 +87,7 @@ auto_connect = false
     // Default values for unset fields
     assert_eq!(config.pricing.control_msat, 1);
     assert_eq!(config.pricing.realtime_signal_msat, 50);
+    assert_eq!(config.pricing.relay_storage_msat_per_byte_day, 1);
     assert_eq!(config.peers.len(), 2);
     assert_eq!(config.peers[0].label.as_deref(), Some("Alice"));
     assert!(!config.peers[1].auto_connect);
@@ -336,6 +338,7 @@ backend = "sqlite"
     assert_eq!(config.pricing.chat_msat, 15);
     // Defaults for unset fields
     assert_eq!(config.pricing.control_msat, 1);
+    assert_eq!(config.pricing.relay_storage_msat_per_byte_day, 1);
 }
 
 #[test]
@@ -577,6 +580,16 @@ fn validate_zero_realtime_pricing_rejected() {
 }
 
 #[test]
+fn validate_zero_relay_storage_pricing_rejected() {
+    let mut config =
+        NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
+    config.peers.clear();
+    config.pricing.relay_storage_msat_per_byte_day = 0;
+    let err = config.validate().unwrap_err();
+    assert!(err.to_string().contains("pricing"), "got: {err}");
+}
+
+#[test]
 fn validate_different_ports_ok() {
     let mut config = NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
     config.peers.clear();
@@ -653,6 +666,7 @@ fn default_config_for_each_tier() {
         assert!(config.pricing.file_ref_msat > 0);
         assert!(config.pricing.control_msat > 0);
         assert!(config.pricing.realtime_signal_msat > 0);
+        assert!(config.pricing.relay_storage_msat_per_byte_day > 0);
     }
 }
 
@@ -756,6 +770,10 @@ fn config_save_and_load_roundtrip() {
     let loaded = NodeConfig::load(&config_path).unwrap();
     assert_eq!(loaded.tier, config.tier);
     assert_eq!(loaded.pricing.chat_msat, config.pricing.chat_msat);
+    assert_eq!(
+        loaded.pricing.relay_storage_msat_per_byte_day,
+        config.pricing.relay_storage_msat_per_byte_day
+    );
     assert_eq!(
         loaded.network.listen_addr.port(),
         config.network.listen_addr.port()
