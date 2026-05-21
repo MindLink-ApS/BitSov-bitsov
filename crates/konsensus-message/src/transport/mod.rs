@@ -2287,6 +2287,10 @@ mod tests {
         assert_eq!(config.version, 2);
         assert_eq!(config.tier, SovereigntyTier::T1);
         assert!(config.capabilities.contains(&Capability::X3dh));
+        assert!(
+            !config.capabilities.contains(&Capability::Relay),
+            "relay capability must be opt-in"
+        );
         assert!(config.whitelist.is_empty());
     }
 
@@ -2536,8 +2540,12 @@ mod tests {
         let info = info.unwrap();
         // Default TransportConfig uses T1 tier
         assert_eq!(info.tier, "T1");
-        // Default capabilities include X3dh and FileTransfer
+        // Default capabilities include X3dh but do not opt into relay behavior.
         assert!(!info.capabilities.is_empty(), "should have at least one capability");
+        assert!(
+            !info.capabilities.iter().any(|cap| cap == "Relay"),
+            "default peers should not advertise Relay"
+        );
 
         // Disconnected peer returns None
         let unknown = NodeId::from_hex(
@@ -2547,6 +2555,63 @@ mod tests {
         assert!(
             transport_a.peer_info(&unknown).await.is_none(),
             "peer_info should return None for unknown peer"
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn relay_capability_is_advertised_only_when_configured() {
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let node_a_id = *id_a.node_id();
+        let node_b_id = *id_b.node_id();
+
+        let config_a = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            capabilities: vec![Capability::X3dh],
+            whitelist: vec![node_b_id],
+            ..Default::default()
+        };
+        let config_b = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            capabilities: vec![Capability::X3dh, Capability::Relay],
+            whitelist: vec![node_a_id],
+            ..Default::default()
+        };
+
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
+
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().expect("should have actual listen addr");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        transport_a
+            .connect(&node_b_id, &addr_b.to_string())
+            .await
+            .unwrap();
+
+        let _ = transport_a.recv_control().await;
+        let _ = transport_b.recv_control().await;
+
+        let b_info = transport_a
+            .peer_info(&node_b_id)
+            .await
+            .expect("node B should be connected");
+        assert!(
+            b_info.capabilities.iter().any(|cap| cap == "Relay"),
+            "configured relay peer should advertise Relay capability"
+        );
+
+        let a_info = transport_b
+            .peer_info(&node_a_id)
+            .await
+            .expect("node A should be connected");
+        assert!(
+            !a_info.capabilities.iter().any(|cap| cap == "Relay"),
+            "non-relay peer should not advertise Relay capability"
         );
 
         transport_a.shutdown();

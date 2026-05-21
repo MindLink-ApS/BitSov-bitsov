@@ -668,6 +668,7 @@ fn capability_serde_all_variants() {
         Capability::X3dh,
         Capability::Mls,
         Capability::FileTransfer,
+        Capability::Relay,
         Capability::Custom("test".to_string()),
     ];
     for cap in &caps {
