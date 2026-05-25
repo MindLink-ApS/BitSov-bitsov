@@ -11,7 +11,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 uniffi = { version = "0.28", features = ["tokio"] }
 
-tokio = { version = "1.40", features = [
+tokio = { version = "1.52", features = [
     "rt",
     "rt-multi-thread",
     "net",
@@ -41,5 +41,5 @@ zeroize = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
 tracing-subscriber = { workspace = true }
