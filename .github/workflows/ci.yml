@@ -26,12 +26,26 @@ jobs:
   check:
     name: Rust Check & Test
     runs-on: ubuntu-latest
+    env:
+      # Keep the hosted runner below disk/linker pressure during the core test
+      # phase. The workspace check builds heavy Lightning dependencies first;
+      # the test step then links many binaries. Lower parallelism and no
+      # incremental artifacts are slower but much less likely to exhaust
+      # ubuntu-latest.
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
 
       # Keep Linux GUI/WebKit headers available for optional/transitive crates
       # that still probe these libraries on CI runners.
