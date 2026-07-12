@@ -647,11 +647,11 @@ Clean. No circular dependencies. No protocol-specific crates in the core.
 
 ### The Application Layer Revelation
 
-The Electron frontend has multiple views, but they ALL read from the same UKM store:
+The reference app has multiple views, but they ALL read from the same UKM store:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     ELECTRON FRONTEND                        │
+│                      REFERENCE APP                           │
 │                                                              │
 │  ┌──────┐ ┌──────┐ ┌────────┐ ┌──────┐ ┌──────┐ ┌──────┐  │
 │  │ Chat │ │ Mail │ │Calendar│ │Files │ │Calls │ │ Docs │  │

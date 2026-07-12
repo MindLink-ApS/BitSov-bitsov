@@ -43,9 +43,9 @@ The codebase carries **two** invite mechanisms with **non-interchangeable** toke
 
 **Decision:** `POST /api/v1/invites/accept` (the invitee-bound `BitSovInvite`) is the **canonical** Tier-2 onboarding path. The legacy `InviteToken` routes are **deprecated** and now emit RFC 8594 / RFC 9745 signalling — `Deprecation: true`, `Sunset: Sun, 31 Jan 2027 00:00:00 GMT`, and `Link: </api/v1/invites/accept>; rel="successor-version"` — plus a structured `tracing::warn!(deprecated = true)` per call so legacy-path usage is observable before any removal.
 
-**This amendment is signalling only — no behaviour change.** The legacy routes remain fully functional. Aliasing or 410-ing `/invite/redeem` onto `/invites/accept` is **not** done and would be wrong: an `InviteToken` carries no `invitee_pubkey`, so it cannot satisfy `accept_invite`'s invitee check — aliasing would 400 ~100% of legacy traffic, and the frontend still ships `redeemInvite` (`PeerList.tsx`) and `generateInvite` (`ProfileView.tsx`). The `Sunset` date above is a **migration target, not a removal commitment**.
+**This amendment is signalling only — no behaviour change.** The legacy routes remain fully functional. Aliasing or 410-ing `/invite/redeem` onto `/invites/accept` is **not** done and would be wrong: an `InviteToken` carries no `invitee_pubkey`, so it cannot satisfy `accept_invite`'s invitee check — aliasing would 400 ~100% of legacy traffic, and existing clients may still call the legacy redeem/generate flow until the reference-app migration lands. The `Sunset` date above is a **migration target, not a removal commitment**.
 
-**Route removal is gated on the operator** ratifying: (a) a `BitSovInvite`-based peer-add UX that replaces the symmetric `redeemInvite` flow in `PeerList.tsx`, and (b) a confirmed near-zero legacy-route call rate (via the `deprecated = true` telemetry). Until both hold, the legacy routes stay.
+**Route removal is gated on the operator** ratifying: (a) a `BitSovInvite`-based peer-add UX that replaces the symmetric legacy redeem flow in the reference app, and (b) a confirmed near-zero legacy-route call rate (via the `deprecated = true` telemetry). Until both hold, the legacy routes stay.
 
 ## Decision
 
@@ -202,7 +202,7 @@ discretion.
 - [ ] Replay test: same invite presented twice → second rejected with 409 (target ONB3)
 - [ ] Expiry test: token with `expiry_unix < now` → rejected (target ONB1)
 - [ ] Wrong-invitee test: token with mismatched `invitee_pubkey` → rejected (target ONB3)
-- [ ] Frontend e2e: paste invite → confirmation modal → click accept → first-message wizard appears (target ONB7 + ONB9)
+- [ ] Reference-app e2e: paste invite → confirmation modal → click accept → first-message wizard appears (target ONB7 + ONB9)
 
 ## Open questions
 

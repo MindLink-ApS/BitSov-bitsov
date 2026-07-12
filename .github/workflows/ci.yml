@@ -33,7 +33,8 @@ jobs:
         with:
           components: clippy
 
-      # bitsov-browser crate depends on Wry/Tao which needs GTK3 + WebKit2GTK
+      # Keep Linux GUI/WebKit headers available for optional/transitive crates
+      # that still probe these libraries on CI runners.
       - name: Install system dependencies
         run: |
           sudo apt-get update
