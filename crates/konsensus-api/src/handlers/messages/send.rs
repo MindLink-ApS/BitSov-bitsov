@@ -11,6 +11,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use konsensus_core::types::{NodeId, Recipient};
+use konsensus_storage::StorageNonceAdapter;
 
 use crate::audit::events;
 use crate::auth::AuthUser;
@@ -106,6 +107,27 @@ pub(super) async fn send_message(
     let sig = state.identity.sign(&envelope.signable_bytes());
     envelope.signature = konsensus_core::Signature::from_ed25519(&sig);
 
+    envelope
+        .validate()
+        .map_err(|e| ApiError::BadRequest(format!("invalid envelope: {e}")))?;
+
+    let nonce_store = StorageNonceAdapter::new(Arc::clone(&state.storage));
+    state
+        .gate
+        .verify(
+            &envelope,
+            &nonce_store,
+            state.pricing.as_ref(),
+            None,
+            Some(state.lightning.as_ref()),
+            0.0,
+            // Send path: the envelope is addressed to a PEER, not this node, so
+            // recipient binding is intentionally N/A here (unchanged behavior).
+            None,
+        )
+        .await
+        .map_err(|e| ApiError::PaymentRequired(e.to_string()))?;
+
     // Store the message
     state
         .storage
@@ -132,7 +154,15 @@ pub(super) async fn send_message(
             }
         }
         Recipient::Room(ref room_id) => {
-            // Room delivery: send to all room members who are connected
+            // Room delivery: send to all room members who are connected.
+            //
+            // DBH2 / ROOM-FANOUT-STREAM: get_room_members() is now UNBOUNDED (the old
+            // LIMIT 10000 was a silent-truncation fail-open). We collect the full
+            // member set into a Vec and fan out in one synchronous pass below, which
+            // is fine at present mesh size but is a memory/latency cliff on a very
+            // large room. Tracked follow-up ROOM-FANOUT-STREAM (TASK_QUEUE.md, Track
+            // DBH) replaces this collect-then-send with chunked/streamed delivery +
+            // backpressure. Keep this loop O(members)-friendly until then.
             let members = state
                 .storage
                 .get_room_members(room_id)

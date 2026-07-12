@@ -808,13 +808,14 @@ mod tests {
     #[test]
     fn render_embed() {
         let mut doc = minimal_doc();
+        let source_pubkey = "demo-source-pubkey";
         doc.blocks = vec![BsxBlock::Embed {
-            source_pubkey: "abcdef1234567890".into(),
+            source_pubkey: source_pubkey.into(),
             path: "/about".into(),
         }];
         let html = render_to_html(&doc);
         assert!(html.contains("bsx-embed"));
-        assert!(html.contains("data-source=\"abcdef1234567890\""));
-        assert!(html.contains("abcdef12..."));
+        assert!(html.contains("data-source=\"demo-source-pubkey\""));
+        assert!(html.contains("demo-sou..."));
     }
 }

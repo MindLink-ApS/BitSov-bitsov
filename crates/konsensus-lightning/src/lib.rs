@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod circuit_breaker;
 pub mod ldk;
 pub mod lnd;
 pub mod lnbits;
@@ -19,6 +20,7 @@ pub mod scb_rotate;
 #[cfg(test)]
 mod lnbits_tests;
 
+pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerLightning};
 pub use ldk::{
     esplora_tx_visible, probe_esplora_fee_estimates, select_esplora_endpoint, LdkConfig,
     LdkProvider,

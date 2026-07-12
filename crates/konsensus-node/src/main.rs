@@ -13,9 +13,12 @@ mod node;
 mod onboarding;
 mod pending_handler;
 mod profile_handler;
+mod relay;
 mod session_handler;
 #[path = "cli/scb_restore.rs"]
 mod scb_restore;
+#[path = "cli/whitelist.rs"]
+mod whitelist_cmd;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,7 +31,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::NodeId;
-use crate::cli::{Cli, Command, ScbCommand};
+use crate::cli::{Cli, Command, ScbCommand, WhitelistCommand};
 use crate::config::{NodeConfig, NodeTier};
 use crate::node::KonsensusNode;
 
@@ -112,8 +115,8 @@ async fn main() -> Result<()> {
         Command::Init { dir, non_interactive, tier, encrypt } => {
             cmd_init(&dir, non_interactive, tier.as_deref(), encrypt)?;
         }
-        Command::Start { config, password } => {
-            cmd_start(&config, password.as_deref()).await?;
+        Command::Start { config, password, admission_mode } => {
+            cmd_start(&config, password.as_deref(), admission_mode.as_deref()).await?;
         }
         Command::Restore { dir, mnemonic, tier, encrypt } => {
             cmd_restore(&dir, mnemonic.as_deref(), tier.as_deref(), encrypt)?;
@@ -142,6 +145,23 @@ async fn main() -> Result<()> {
                     confirm,
                 )
                 .await?;
+            }
+        },
+        Command::Whitelist { command } => match command {
+            WhitelistCommand::Backup {
+                config,
+                out,
+                password,
+            } => {
+                whitelist_cmd::cmd_whitelist_backup(&config, password.as_deref(), out.as_deref())
+                    .await?;
+            }
+            WhitelistCommand::Restore {
+                from,
+                config,
+                password,
+            } => {
+                whitelist_cmd::cmd_whitelist_restore(&config, password.as_deref(), &from).await?;
             }
         },
     }
@@ -547,10 +567,36 @@ fn cmd_sign_challenge(mnemonic_path: &Path, passphrase: &str) -> Result<()> {
 }
 
 /// `konsensus start` — boot the node.
-async fn cmd_start(config_path: &Path, password: Option<&str>) -> Result<()> {
+async fn cmd_start(
+    config_path: &Path,
+    password: Option<&str>,
+    admission_mode: Option<&str>,
+) -> Result<()> {
     // Load configuration
-    let config = NodeConfig::load(config_path)
+    let mut config = NodeConfig::load(config_path)
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+
+    // M1a: apply the optional `--admission-mode` CLI override BEFORE building the
+    // node, so the configured mode reaches every wall (gate carrier + handshake +
+    // connect). Absence leaves the config-file value (default Whitelist) — this is
+    // the only way besides `konsensus.toml` to enable price-admission, and it stays
+    // off-by-default. `clap`'s value_parser already constrains the input to
+    // {whitelist, price-open}; the `_` arm is a defensive fail-closed to Whitelist.
+    if let Some(m) = admission_mode {
+        config.admission_mode = match m {
+            "price-open" => konsensus_message::ReachabilityMode::PriceOpen,
+            _ => konsensus_message::ReachabilityMode::Whitelist,
+        };
+        info!(admission_mode = ?config.admission_mode, "admission mode overridden via CLI");
+        // RE-VALIDATE: NodeConfig::load already validated the FILE, but this
+        // override mutates admission_mode afterwards and from_config does not
+        // re-validate. Without this, `--admission-mode price-open` on a
+        // settlement-off (e.g. Mock) backend would bypass the fail-closed
+        // settlement guard and admit strangers preimage-only (Principle 2).
+        config
+            .validate()
+            .context("config invalid after --admission-mode override")?;
+    }
 
     // If the mnemonic file is encrypted and no password was provided via CLI,
     // prompt interactively. This avoids silently using an empty password which
@@ -741,6 +787,7 @@ async fn cmd_start(config_path: &Path, password: Option<&str>) -> Result<()> {
         transport: Arc::clone(node.transport()) as Arc<dyn konsensus_core::traits::transport::MessageTransport>,
         session_manager,
         jwt_secret,
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: config.api.cors_enabled,
         operator_probes_enabled: config
             .api
@@ -750,6 +797,9 @@ async fn cmd_start(config_path: &Path, password: Option<&str>) -> Result<()> {
         ws_broadcast: ws_tx.clone(),
         ws_delivery_broadcast: ws_delivery_tx.clone(),
         rate_limiter,
+        mnemonic_reveal_limiter: Arc::new(
+            konsensus_api::rate_limit::RateLimiter::mnemonic_reveal_default(),
+        ),
         audit_log: Arc::clone(&audit_log),
         started_at: std::time::Instant::now(),
         content_dir: if config.web.enabled {
@@ -771,12 +821,52 @@ async fn cmd_start(config_path: &Path, password: Option<&str>) -> Result<()> {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         data_dir: config_path.parent().map(|p| p.to_path_buf()),
+        backup_dir: Some(std::path::PathBuf::from(&config.backup.scb_dir)),
         lightning_backend: config.lightning.backend_name().to_string(),
         chain_backend: config.chain.backend_name().to_string(),
         gossip_validator: Some(Arc::clone(&gossip_validator)),
     });
 
     // ── Spawn background tasks ─────────────────────────────────────────
+
+    // R3 SEAM-B (Route B, default-off). Build the relay engine ONLY when
+    // `[relay] enabled`; a disabled node holds `None`, allocates no engine/store,
+    // and its receive path is byte-identical to a non-relay build. The backend is
+    // operator-selected: the durable SQLite store (P8.1) when `[relay]
+    // durable_db_path` is set, else the non-durable in-memory store (smoke-test
+    // only; held mail lost on restart). The node NEVER creates the durable DB or
+    // schema — that is the operator's `[MANUAL]` CREATE TABLE migration, and a
+    // missing file/schema fails boot loudly rather than silently degrading.
+    let relay_engine = if config.relay.enabled {
+        let store: Arc<dyn relay::RelayBindingStore> =
+            match config.relay.durable_db_path.as_deref() {
+                Some(path) => {
+                    let pool = relay::open_durable_pool(path).await.map_err(|e| {
+                        anyhow::anyhow!(
+                            "[relay] durable_db_path is set to {} but the durable store could \
+                             not be opened ({e:?}) — run the [MANUAL] CREATE TABLE migration first",
+                            path.display()
+                        )
+                    })?;
+                    info!(path = %path.display(), "[relay] using DURABLE SQLite store");
+                    Arc::new(relay::SqliteRelayStore::new(pool))
+                }
+                None => {
+                    warn!(
+                        "[relay] enabled with a NON-DURABLE in-memory store — held mail is LOST \
+                         on restart; smoke-test only (set [relay] durable_db_path for production \
+                         relay)"
+                    );
+                    Arc::new(relay::InMemoryRelayStore::new())
+                }
+            };
+        Some(Arc::new(relay::RelayEngine::new(
+            store,
+            relay::RelayPolicy::inert_default(),
+        )))
+    } else {
+        None
+    };
 
     // Incoming message handler (routes P2P messages through payment gate to storage + WS)
     let msg_handle = tokio::spawn(msg_handler::run(msg_handler::MsgHandlerDeps {
@@ -800,6 +890,11 @@ async fn cmd_start(config_path: &Path, password: Option<&str>) -> Result<()> {
         )),
         ws_tx,
         audit_log: Arc::clone(&audit_log),
+        // M1a: wire the configured admission mode into the receive-path gate carrier.
+        // Without this the field would be a latent no-op.
+        admission_mode: config.admission_mode,
+        // R3 SEAM-B: backend selected above (durable SQLite vs in-memory).
+        relay_engine,
         shutdown_rx: node.shutdown_rx(),
     }));
 
@@ -826,6 +921,7 @@ async fn cmd_start(config_path: &Path, password: Option<&str>) -> Result<()> {
             notifier: auto_channel_notifier,
             event_rx: auto_channel_rx,
             shutdown_rx: node.shutdown_rx(),
+            subsidy: config.onboarding_subsidy.clone(),
         },
     ));
     let advertised_lightning_addr = config.lightning.advertised_lightning_addr();
@@ -937,6 +1033,16 @@ async fn cmd_start(config_path: &Path, password: Option<&str>) -> Result<()> {
             ws_delivery_tx: hosting_ws_delivery_tx,
             shutdown_rx: node.shutdown_rx(),
         },
+    ));
+
+    // RV-RESTORE producer: keep an encrypted whitelist sidecar next to the SCB so a
+    // mnemonic+SCB restore onto fresh hardware also recovers peers + accepted
+    // invites (the SCB carries only LDK channel state). Best-effort; never fatal.
+    let whitelist_backup_handle = tokio::spawn(housekeeping::run_whitelist_backup(
+        Arc::clone(node.storage()),
+        Arc::clone(node.identity()),
+        Path::new(&config.backup.scb_dir).join(whitelist_cmd::WHITELIST_BACKUP_NAME),
+        node.shutdown_rx(),
     ));
 
     info!(
@@ -1061,6 +1167,7 @@ async fn cmd_start(config_path: &Path, password: Option<&str>) -> Result<()> {
             if let Err(e) = invoice_req_cleanup_handle.await { warn!(error = %e, "invoice_requests cleanup task panicked"); }
             if let Err(e) = fiat_snapshot_handle.await { warn!(error = %e, "fiat rate snapshot task panicked"); }
             if let Err(e) = hosting_payment_handle.await { warn!(error = %e, "operator hosting payment task panicked"); }
+            if let Err(e) = whitelist_backup_handle.await { warn!(error = %e, "whitelist backup task panicked"); }
             if let Err(e) = api_handle.await { warn!(error = %e, "API server task panicked"); }
         },
     )
@@ -1179,6 +1286,153 @@ mod whitelist_replay_tests {
         assert_eq!(replayed, 1);
         assert!(whitelist.contains(&NodeId::from_bytes(active_pubkey)));
         assert!(!whitelist.contains(&NodeId::from_bytes(expired_pubkey)));
+    }
+
+    async fn make_storage(path: &str, encrypted: bool, key: &[u8; 32]) -> Arc<dyn Storage> {
+        let sqlite = SqliteStorage::open(path).await.expect("open sqlite");
+        if encrypted {
+            Arc::new(konsensus_storage::EncryptedStorage::new(sqlite, key))
+        } else {
+            Arc::new(sqlite)
+        }
+    }
+
+    /// RV-RESTORE end-to-end: a node backed up with `write_whitelist_backup`, then
+    /// restored onto FRESH hardware with `read_whitelist_backup`, recovers BOTH
+    /// admission paths — the REST `/peers` peer (gate whitelist via the P3-2
+    /// boot-load) AND the invite-only peer (transport whitelist via accepted-invite
+    /// replay). The invite-only half is the path the SCB never covered: without this
+    /// sidecar a restored node rejected every invite-onboarded peer `NotWhitelisted`.
+    /// Parameterized over plaintext and EncryptedStorage so the wrapper layer that
+    /// the running node actually uses is exercised too.
+    async fn fresh_hardware_recovery(encrypted: bool) {
+        use crate::node::merge_persisted_peers;
+        use konsensus_message::PeerRegistry;
+        use konsensus_storage::Peer;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_key = [0x42u8; 32]; // mnemonic-derived AES storage key (same on A and B)
+        let backup_key = [0x11u8; 32]; // mnemonic-derived sidecar seal key
+        let sidecar = dir.path().join(crate::whitelist_cmd::WHITELIST_BACKUP_NAME);
+
+        let rest_pubkey = [21u8; 32];
+        let inviter_pubkey = [77u8; 32];
+        let rest_peer = NodeId::from_bytes(rest_pubkey);
+        let inviter = NodeId::from_bytes(inviter_pubkey);
+
+        // Source node A: one REST peer + one invite-only peer. Producer writes sidecar.
+        {
+            let a = make_storage(
+                dir.path().join("a.db").to_str().unwrap(),
+                encrypted,
+                &storage_key,
+            )
+            .await;
+            let mut peer = Peer::new(rest_peer);
+            peer.address = Some("203.0.113.50:9735".into());
+            a.upsert_peer(&peer).await.expect("upsert rest peer");
+            a.add_accepted_invite(&AcceptedInviteRecord {
+                nonce: [5u8; 16],
+                inviter_pubkey,
+                expiry_unix: 4_000_000_000,
+                accepted_at: 1_800_000_000,
+            })
+            .await
+            .expect("add invite");
+
+            crate::whitelist_cmd::write_whitelist_backup(a.as_ref(), &backup_key, &sidecar)
+                .await
+                .expect("write sidecar");
+        }
+
+        // Fresh node B: empty DB (new hardware). Consumer restores the sidecar.
+        let b = make_storage(
+            dir.path().join("b.db").to_str().unwrap(),
+            encrypted,
+            &storage_key,
+        )
+        .await;
+        assert!(
+            b.list_peers().await.unwrap().is_empty(),
+            "fresh node must start with an empty whitelist"
+        );
+        let restored = crate::whitelist_cmd::read_whitelist_backup(b.as_ref(), &backup_key, &sidecar)
+            .await
+            .expect("read sidecar");
+        assert_eq!(restored, 1, "the REST peer row is restored");
+
+        // Gate half: the REST peer lands in the boot-loaded gate whitelist (P3-2).
+        let mut registry = PeerRegistry::new();
+        merge_persisted_peers(&mut registry, b.list_peers().await.unwrap());
+        assert!(
+            registry.whitelist().contains(&rest_peer),
+            "REST peer must recover into the gate whitelist (encrypted={encrypted})"
+        );
+
+        // Invite-only half: the accepted-invite inviter is replayed into the
+        // transport whitelist at boot — the relationship the SCB alone lost.
+        let transport = RecordingTransport::default();
+        let replayed = replay_accepted_invite_whitelist(b.as_ref(), &transport, 1_900_000_000)
+            .await
+            .expect("replay invites");
+        assert_eq!(replayed, 1, "the accepted invite is replayed");
+        assert!(
+            transport.whitelist.lock().await.contains(&inviter),
+            "invite-only peer must recover into the transport whitelist (encrypted={encrypted})"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_hardware_restore_recovers_invite_only_peer_plaintext() {
+        fresh_hardware_recovery(false).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_hardware_restore_recovers_invite_only_peer_encrypted() {
+        fresh_hardware_recovery(true).await;
+    }
+
+    /// Coupling guard pinned to DBH1 (#207). This wiring is correct, but the
+    /// *completeness* of the backup above 1000 peers depends on DBH1: on this
+    /// branch base (origin/main) `list_peers()` still caps at `LIMIT 1000`, so
+    /// `WhitelistBackup::collect` truncates a >1000-peer whitelist BEFORE this
+    /// producer ever seals it. `#[ignore]`d so the coupling is documented, not
+    /// hidden — un-ignore once DBH1 is on the base (the full 1500-peer backup
+    /// round-trip is already proven in konsensus-storage by #207).
+    #[tokio::test]
+    #[ignore = "requires DBH1 (#207): origin/main list_peers still caps at LIMIT 1000"]
+    async fn recovery_is_complete_above_1000_peers_after_dbh1() {
+        use konsensus_storage::Peer;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backup_key = [0x11u8; 32];
+        let sidecar = dir.path().join(crate::whitelist_cmd::WHITELIST_BACKUP_NAME);
+
+        let src = SqliteStorage::open(dir.path().join("src.db").to_str().unwrap())
+            .await
+            .expect("open src");
+        for i in 0u32..1500 {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_be_bytes());
+            src.upsert_peer(&Peer::new(NodeId::from_bytes(bytes)))
+                .await
+                .expect("seed peer");
+        }
+        crate::whitelist_cmd::write_whitelist_backup(&src, &backup_key, &sidecar)
+            .await
+            .expect("write sidecar");
+
+        let dst = SqliteStorage::open(dir.path().join("dst.db").to_str().unwrap())
+            .await
+            .expect("open dst");
+        crate::whitelist_cmd::read_whitelist_backup(&dst, &backup_key, &sidecar)
+            .await
+            .expect("read sidecar");
+        assert_eq!(
+            dst.list_peers().await.unwrap().len(),
+            1500,
+            "a >1000-peer whitelist must survive backup+restore once DBH1 removes the cap"
+        );
     }
 }
 

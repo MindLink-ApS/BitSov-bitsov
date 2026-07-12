@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
+use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::gate::NonceStore;
 use konsensus_core::types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, RoomId, Signature};
-use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_storage::models::{FileRecord, Peer, Room};
 use konsensus_storage::{EncryptedStorage, SqliteStorage, Storage, StorageNonceAdapter};
 use sha2::{Digest, Sha256};
@@ -277,6 +277,30 @@ async fn nonce_adapter_multiple_unique_nonces() {
     }
 }
 
+#[tokio::test]
+async fn nonce_adapter_payment_hash_reuse_returns_false() {
+    let db = Arc::new(setup().await);
+    let adapter = StorageNonceAdapter::new(db);
+    let sender = make_node_id(1);
+    let message_a = MessageId::from_bytes([1u8; 32]);
+    let message_b = MessageId::from_bytes([2u8; 32]);
+    let payment_hash = [9u8; 32];
+
+    assert!(
+        adapter
+            .check_and_store_payment_hash(&payment_hash, &sender, &message_a)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !adapter
+            .check_and_store_payment_hash(&payment_hash, &sender, &message_b)
+            .await
+            .unwrap(),
+        "reused Lightning payment hash should be rejected"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // PLAINTEXT CACHE EDGE CASES
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -502,10 +526,16 @@ async fn file_with_message_id_set() {
     db.store_file(&file).await.unwrap();
 
     let loaded = db.get_file("linked-file").await.unwrap().unwrap();
-    assert_eq!(loaded.message_id.as_deref(), Some(&hex::encode([0xAA; 32])[..]));
+    assert_eq!(
+        loaded.message_id.as_deref(),
+        Some(&hex::encode([0xAA; 32])[..])
+    );
 
     let meta = db.get_file_metadata("linked-file").await.unwrap().unwrap();
-    assert_eq!(meta.message_id.as_deref(), Some(&hex::encode([0xAA; 32])[..]));
+    assert_eq!(
+        meta.message_id.as_deref(),
+        Some(&hex::encode([0xAA; 32])[..])
+    );
 }
 
 #[tokio::test]
@@ -745,4 +775,131 @@ async fn payment_proof_fields_roundtrip() {
     assert_eq!(loaded.payment_proof.amount_msat, 25_000);
     assert_eq!(loaded.signature.as_bytes(), &[0xCC; 64]);
     assert_eq!(loaded.nonce.as_bytes(), &[0xDD; 24]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// END-TO-END PAYMENT-HASH REPLAY REJECTION THROUGH THE PAYMENT GATE
+//
+// HARD-5 regression: proves economic replay protection is NOT a no-op on the
+// production money-path. Two fully-signed, fresh-nonce envelopes that reuse the
+// SAME settled Lightning payment hash are run through `PaymentGate::verify` using
+// the *production* `StorageNonceAdapter` over a real SQLite store. The first must
+// be accepted; the second must be rejected with `PaymentProofReused`. Before the
+// fix, the permissive `Ok(true)` defaults on `NonceStore::check_and_store_payment_hash`
+// and `Storage::store_payment_receipt` could silently turn this into a no-op for
+// any backend that forgot to override them.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mod replay_e2e {
+    use super::*;
+    use konsensus_core::gate::{GateRejection, PaymentGate};
+    use konsensus_core::identity::NodeIdentity;
+    use konsensus_core::kind::{KIND_CHAT, KindCategory};
+    use konsensus_core::traits::pricing::{PricingEngine, PricingError};
+
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon abandon abandon abandon \
+         abandon abandon abandon abandon abandon abandon abandon art";
+
+    struct FixedPricing {
+        price_msat: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl PricingEngine for FixedPricing {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn get_price_msat(&self, _kind: u16) -> Result<u64, PricingError> {
+            Ok(self.price_msat)
+        }
+
+        async fn get_category_price_msat(
+            &self,
+            _category: KindCategory,
+        ) -> Result<u64, PricingError> {
+            Ok(self.price_msat)
+        }
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// Build a fully-signed chat envelope. The payment proof is deterministic
+    /// (fixed preimage), so two envelopes built by this helper share the same
+    /// `payment_hash` while getting distinct fresh nonces from the builder.
+    fn signed_chat_envelope(identity: &NodeIdentity, amount_msat: u64) -> konsensus_core::UkmEnvelope {
+        let sender = *identity.node_id();
+        let recipient = Recipient::Node(make_node_id(2));
+        let preimage = [42u8; 32];
+        let hash: [u8; 32] = Sha256::digest(preimage).into();
+        let proof = PaymentProof::new(hash, preimage, amount_msat);
+
+        let mut envelope =
+            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"encrypted content".to_vec(), proof)
+                .timestamp(now_ms())
+                .build();
+
+        let signable = envelope.signable_bytes();
+        let sig = identity.sign(&signable);
+        envelope.signature = Signature::from_ed25519(&sig);
+        envelope
+    }
+
+    /// A settled Lightning payment proof buys exactly ONE message. Replaying the
+    /// same payment hash under a fresh nonce + fresh signed envelope must be
+    /// rejected end-to-end through the production gate + SqliteStorage adapter.
+    #[tokio::test]
+    async fn replayed_payment_hash_rejected_through_gate_and_sqlite() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+
+        let first = signed_chat_envelope(&identity, 100);
+        let second = signed_chat_envelope(&identity, 100);
+
+        // Sanity: fresh nonce, but identical economic proof (payment hash).
+        assert_ne!(first.nonce, second.nonce, "envelopes must have distinct nonces");
+        assert_eq!(
+            first.payment_proof.payment_hash, second.payment_proof.payment_hash,
+            "envelopes must reuse the same payment hash for this test to mean anything"
+        );
+
+        // Production wiring: gate + StorageNonceAdapter over a REAL SQLite store.
+        let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        let nonce_store = StorageNonceAdapter::new(Arc::clone(&db));
+        let gate = PaymentGate::new();
+        let pricing = FixedPricing { price_msat: 10 };
+
+        // First envelope: accepted (new nonce + new payment hash).
+        gate.verify(&first, &nonce_store, &pricing, None, None, 0.0, None)
+            .await
+            .expect("first paid envelope should be accepted");
+
+        // Second envelope: fresh nonce passes the nonce check, but the reused
+        // payment hash must be rejected at Step 7 (economic replay).
+        let result = gate
+            .verify(&second, &nonce_store, &pricing, None, None, 0.0, None)
+            .await;
+
+        assert!(
+            matches!(result, Err(GateRejection::PaymentProofReused { .. })),
+            "replayed payment hash must be rejected end-to-end, got: {result:?}"
+        );
+
+        // And the receipt is durably persisted: a direct re-check returns false.
+        assert!(
+            !db.store_payment_receipt(
+                &second.payment_proof.payment_hash,
+                &second.sender,
+                &second.id,
+            )
+            .await
+            .unwrap(),
+            "payment receipt must be durably stored and reject reuse"
+        );
+    }
 }

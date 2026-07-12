@@ -26,7 +26,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
-jsonwebtoken.workspace = true
+hmac.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 hex.workspace = true
@@ -36,6 +36,8 @@ rand.workspace = true
 blake3.workspace = true
 base64.workspace = true
 lightning-invoice.workspace = true
+futures.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 mockall.workspace = true

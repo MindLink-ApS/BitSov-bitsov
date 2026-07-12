@@ -255,18 +255,40 @@ async fn invoice_error_drops_sender_channel() {
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
-    // Simulate InvoiceErrorReceived event handling (inline from the match arm)
-    {
-        let mut requests = map.lock().await;
-        requests.remove(&request_id);
-    }
+    handle_invoice_error_received(&peer_id, &request_id, "invoice failed", true, &map).await;
 
     // Receiver should get Err (channel closed)
     assert!(rx.await.is_err());
     assert!(map.lock().await.is_empty());
+}
 
-    // Verify for a peer context (use the variable)
-    let _ = peer_id;
+#[tokio::test]
+async fn unprivileged_invoice_error_does_not_drop_sender_channel() {
+    let request_id = "req-error-unprivileged".to_string();
+    let peer_id = test_peer_id();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceResponseData>();
+    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    map.lock().await.insert(request_id.clone(), tx);
+
+    handle_invoice_error_received(&peer_id, &request_id, "attacker-forged error", false, &map).await;
+
+    let sender = map
+        .lock()
+        .await
+        .remove(&request_id)
+        .expect("unprivileged invoice error must not remove pending request");
+    assert!(
+        sender
+            .send(InvoiceResponseData {
+                bolt11: "lnbc100n1...".to_string(),
+                payment_hash: "hash".to_string(),
+            })
+            .is_ok(),
+        "receiver should still be open after unprivileged invoice error"
+    );
+    assert!(rx.await.is_ok());
 }
 
 #[tokio::test]
@@ -910,8 +932,8 @@ async fn peer_exchange_request_builds_response_excluding_requester() {
     let our_node_id = make_peer_id(99);
     let registry = make_peer_registry_with_entries(vec![
         (1, "127.0.0.1:9001"), // requester — should be excluded
-        (2, "127.0.0.1:9002"),
-        (3, "127.0.0.1:9003"),
+        (2, "5.6.7.8:9002"),
+        (3, "5.6.7.8:9003"),
     ]);
     let transport = make_gossip_test_transport();
     let mut cooldown = std::collections::HashMap::new();
@@ -929,7 +951,7 @@ async fn peer_exchange_request_throttled_by_cooldown() {
     let requester = make_peer_id(1);
     let our_node_id = make_peer_id(99);
     let registry = make_peer_registry_with_entries(vec![
-        (2, "127.0.0.1:9002"),
+        (2, "5.6.7.8:9002"),
     ]);
     let transport = make_gossip_test_transport();
     let mut cooldown = std::collections::HashMap::new();
@@ -959,13 +981,13 @@ async fn peer_exchange_received_adds_new_peers() {
     let peers = vec![
         konsensus_message::wire::PeerExchangeEntry {
             node_id: make_peer_id(2),
-            addr: "127.0.0.1:9002".parse().unwrap(),
+            addr: "5.6.7.8:9002".parse().unwrap(),
             label: Some("peer-2".to_string()),
             tier: konsensus_message::wire::SovereigntyTier::T1,
         },
         konsensus_message::wire::PeerExchangeEntry {
             node_id: make_peer_id(3),
-            addr: "127.0.0.1:9003".parse().unwrap(),
+            addr: "5.6.7.8:9003".parse().unwrap(),
             label: None,
             tier: konsensus_message::wire::SovereigntyTier::T2,
         },
@@ -976,9 +998,23 @@ async fn peer_exchange_received_adds_new_peers() {
     ).await;
 
     let reg = registry.read().await;
-    assert!(reg.contains(&make_peer_id(2)));
-    assert!(reg.contains(&make_peer_id(3)));
-    assert!(!reg.contains(&sender), "sender itself should not be in our registry from exchange");
+    // B2: PEX is discovery, not admission — suggested peers land in the
+    // discovered set with NO gate authority, never in the whitelist.
+    assert!(reg.is_discovered(&make_peer_id(2)));
+    assert!(reg.is_discovered(&make_peer_id(3)));
+    assert!(
+        !reg.contains(&make_peer_id(2)),
+        "PEX peer must NOT be admitted/whitelisted"
+    );
+    assert!(
+        !reg.contains(&make_peer_id(3)),
+        "PEX peer must NOT be admitted/whitelisted"
+    );
+    assert!(!reg.whitelist_set().contains(&make_peer_id(2)));
+    assert!(
+        !reg.is_known(&sender),
+        "sender itself should not be discovered from its own exchange"
+    );
 }
 
 #[tokio::test]
@@ -992,13 +1028,13 @@ async fn peer_exchange_received_skips_self() {
     let peers = vec![
         konsensus_message::wire::PeerExchangeEntry {
             node_id: our_node_id, // our own ID
-            addr: "127.0.0.1:9099".parse().unwrap(),
+            addr: "5.6.7.8:9099".parse().unwrap(),
             label: None,
             tier: konsensus_message::wire::SovereigntyTier::T1,
         },
         konsensus_message::wire::PeerExchangeEntry {
             node_id: make_peer_id(5),
-            addr: "127.0.0.1:9005".parse().unwrap(),
+            addr: "5.6.7.8:9005".parse().unwrap(),
             label: None,
             tier: konsensus_message::wire::SovereigntyTier::T1,
         },
@@ -1009,8 +1045,12 @@ async fn peer_exchange_received_skips_self() {
     ).await;
 
     let reg = registry.read().await;
-    assert!(!reg.contains(&our_node_id), "should not add ourselves");
-    assert!(reg.contains(&make_peer_id(5)));
+    assert!(!reg.is_known(&our_node_id), "should not add ourselves");
+    assert!(reg.is_discovered(&make_peer_id(5)));
+    assert!(
+        !reg.contains(&make_peer_id(5)),
+        "discovered via PEX, not admitted"
+    );
 }
 
 #[tokio::test]
@@ -1018,20 +1058,20 @@ async fn peer_exchange_received_skips_duplicates() {
     let sender = make_peer_id(1);
     let our_node_id = make_peer_id(99);
     let registry = make_peer_registry_with_entries(vec![
-        (2, "127.0.0.1:9002"), // already known
+        (2, "5.6.7.8:9002"), // already known
     ]);
     let mut cooldown = std::collections::HashMap::new();
 
     let peers = vec![
         konsensus_message::wire::PeerExchangeEntry {
             node_id: make_peer_id(2), // already in registry
-            addr: "127.0.0.1:9999".parse().unwrap(), // different addr
+            addr: "5.6.7.8:9999".parse().unwrap(), // different addr
             label: Some("renamed".to_string()),
             tier: konsensus_message::wire::SovereigntyTier::T1,
         },
         konsensus_message::wire::PeerExchangeEntry {
             node_id: make_peer_id(4), // new
-            addr: "127.0.0.1:9004".parse().unwrap(),
+            addr: "5.6.7.8:9004".parse().unwrap(),
             label: None,
             tier: konsensus_message::wire::SovereigntyTier::T1,
         },
@@ -1042,12 +1082,19 @@ async fn peer_exchange_received_skips_duplicates() {
     ).await;
 
     let reg = registry.read().await;
-    // Peer 2 should keep its original address (not overwritten)
+    // Peer 2 was already ADMITTED — a PEX suggestion must neither overwrite its
+    // address nor demote it to discovered.
     let all = reg.all();
     let peer2 = all.iter().find(|p| p.node_id == make_peer_id(2)).unwrap();
-    assert_eq!(peer2.addr, "127.0.0.1:9002".parse::<std::net::SocketAddr>().unwrap());
-    // Peer 4 should be added
-    assert!(reg.contains(&make_peer_id(4)));
+    assert_eq!(peer2.addr, "5.6.7.8:9002".parse::<std::net::SocketAddr>().unwrap());
+    assert!(reg.contains(&make_peer_id(2)), "still admitted");
+    assert!(!reg.is_discovered(&make_peer_id(2)));
+    // Peer 4 is newly DISCOVERED — known but not admitted.
+    assert!(reg.is_discovered(&make_peer_id(4)));
+    assert!(
+        !reg.contains(&make_peer_id(4)),
+        "PEX peer is discovered, not admitted"
+    );
 }
 
 #[tokio::test]
@@ -1061,7 +1108,7 @@ async fn peer_exchange_received_truncates_oversized_list() {
     let peers: Vec<_> = (10..70u8).map(|i| {
         konsensus_message::wire::PeerExchangeEntry {
             node_id: make_peer_id(i),
-            addr: format!("127.0.0.1:{}", 9000 + i as u16).parse().unwrap(),
+            addr: format!("5.6.7.8:{}", 9000 + i as u16).parse().unwrap(),
             label: None,
             tier: konsensus_message::wire::SovereigntyTier::T1,
         }
@@ -1073,8 +1120,9 @@ async fn peer_exchange_received_truncates_oversized_list() {
     ).await;
 
     let reg = registry.read().await;
-    let count = reg.all().len();
+    let count = reg.discovered_len();
     assert_eq!(count, 50, "should truncate to MAX_PEER_EXCHANGE_ENTRIES, got {count}");
+    assert!(reg.is_empty(), "PEX peers are discovered, never admitted");
 }
 
 #[tokio::test]
@@ -1087,7 +1135,7 @@ async fn peer_exchange_received_throttled_by_cooldown() {
     let peers = vec![
         konsensus_message::wire::PeerExchangeEntry {
             node_id: make_peer_id(2),
-            addr: "127.0.0.1:9002".parse().unwrap(),
+            addr: "5.6.7.8:9002".parse().unwrap(),
             label: None,
             tier: konsensus_message::wire::SovereigntyTier::T1,
         },
@@ -1097,13 +1145,13 @@ async fn peer_exchange_received_throttled_by_cooldown() {
     handle_peer_exchange_received(
         &sender, peers.clone(), our_node_id, &registry, &mut cooldown,
     ).await;
-    assert!(registry.read().await.contains(&make_peer_id(2)));
+    assert!(registry.read().await.is_discovered(&make_peer_id(2)));
 
     // Second call within cooldown — should be throttled, peer 3 NOT added
     let peers2 = vec![
         konsensus_message::wire::PeerExchangeEntry {
             node_id: make_peer_id(3),
-            addr: "127.0.0.1:9003".parse().unwrap(),
+            addr: "5.6.7.8:9003".parse().unwrap(),
             label: None,
             tier: konsensus_message::wire::SovereigntyTier::T1,
         },
@@ -1111,8 +1159,8 @@ async fn peer_exchange_received_throttled_by_cooldown() {
     handle_peer_exchange_received(
         &sender, peers2, our_node_id, &registry, &mut cooldown,
     ).await;
-    assert!(!registry.read().await.contains(&make_peer_id(3)),
-        "peer 3 should NOT be added — exchange was throttled");
+    assert!(!registry.read().await.is_known(&make_peer_id(3)),
+        "peer 3 should NOT be discovered — exchange was throttled");
 }
 
 // ── Invoice requested handler tests ────────────────────────
@@ -1173,7 +1221,116 @@ async fn invoice_requested_sends_error_on_lightning_failure() {
     // No panic = success
 }
 
+// ── M1b: privilege-gated invoice carve-out ─────────────────
+
+fn admission_pricing() -> Arc<dyn konsensus_core::traits::pricing::PricingEngine> {
+    Arc::new(konsensus_pricing::StaticPricingEngine::new(
+        konsensus_pricing::StaticPricingConfig::default(),
+    ))
+}
+
+#[tokio::test]
+async fn privileged_invoice_request_honours_caller_amount_unchanged() {
+    // Whitelist/promoted peers keep the exact pre-M1b behaviour: the caller's
+    // amount is honoured verbatim. Byte-identical to the legacy path.
+    let peer_id = test_peer_id();
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+
+    handle_invoice_requested_gated(
+        &peer_id, "req-priv", 25_000, "konsensus message", true,
+        &pricing, &lightning, &transport,
+    ).await;
+
+    let payments = lightning.list_payments(10).await.unwrap();
+    assert_eq!(payments.len(), 1, "privileged request must create exactly one invoice");
+    assert_eq!(payments[0].amount_msat, 25_000, "caller amount honoured for privileged peer");
+}
+
+#[tokio::test]
+async fn unprivileged_non_admission_invoice_request_is_dropped() {
+    // P2: an unprivileged stranger asking for an ordinary message invoice gets
+    // NOTHING — no invoice is minted on our wallet.
+    let peer_id = test_peer_id();
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+
+    handle_invoice_requested_gated(
+        &peer_id, "req-strange", 1_000_000, "konsensus message", false,
+        &pricing, &lightning, &transport,
+    ).await;
+
+    let payments = lightning.list_payments(10).await.unwrap();
+    assert!(payments.is_empty(), "no invoice may be created for an unprivileged non-admission request");
+}
+
+#[tokio::test]
+async fn unprivileged_admission_invoice_is_issued_and_repriced() {
+    // The single bootstrap carve-out: the reserved admission purpose yields ONE
+    // invoice, RE-PRICED from our engine (KIND_CHAT floor). The caller's bogus
+    // huge amount is IGNORED — a stranger cannot dictate the invoice amount.
+    let peer_id = test_peer_id();
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing = admission_pricing();
+
+    let chat_floor = pricing
+        .get_price_msat(konsensus_core::kind::KIND_CHAT)
+        .await
+        .unwrap();
+
+    handle_invoice_requested_gated(
+        &peer_id, "req-admit", 9_999_999, ADMISSION_INVOICE_PURPOSE, false,
+        &pricing, &lightning, &transport,
+    ).await;
+
+    let payments = lightning.list_payments(10).await.unwrap();
+    assert_eq!(payments.len(), 1, "admission carve-out must create exactly one invoice");
+    assert_eq!(
+        payments[0].amount_msat, chat_floor,
+        "admission invoice must be re-priced from the engine, not the caller's amount"
+    );
+    assert_ne!(
+        payments[0].amount_msat, 9_999_999,
+        "the caller-supplied amount must be IGNORED"
+    );
+}
+
 // ── Price query handler tests ──────────────────────────────
+
+#[tokio::test]
+async fn unprivileged_price_table_does_not_update_peer_price_cache() {
+    let peer_id = test_peer_id();
+    let cache = konsensus_pricing::PeerPriceCache::new();
+    let mut prices = std::collections::HashMap::new();
+    prices.insert("chat".to_string(), 42);
+
+    handle_price_table_received(peer_id, prices, 850_000, 144, 0.0, false, &cache).await;
+
+    assert!(
+        cache.get_peer_entry(&peer_id).await.is_none(),
+        "unprivileged PriceTableReceived must not create a peer price entry"
+    );
+}
+
+#[tokio::test]
+async fn unprivileged_price_response_does_not_update_peer_price_cache() {
+    let peer_id = test_peer_id();
+    let cache = konsensus_pricing::PeerPriceCache::new();
+    let kind = 100;
+
+    handle_price_response_received(peer_id, kind, 50, 850_001, false, &cache).await;
+
+    assert!(
+        cache.get_peer_price(&peer_id, kind).await.is_none(),
+        "unprivileged PriceResponseReceived must not create a per-kind peer price"
+    );
+}
 
 #[tokio::test]
 async fn price_query_responds_with_price() {
@@ -1227,4 +1384,83 @@ async fn price_query_skips_response_when_chain_unavailable() {
     // Should not panic — skips response due to chain failure
     handle_price_query(&peer_id, 100, &pricing, &chain, &transport).await;
     // No panic = success (handler returns early with warning)
+}
+
+#[test]
+fn routable_peer_addr_filter() {
+    use std::net::SocketAddr;
+    let parse = |s: &str| s.parse::<SocketAddr>().expect("valid socketaddr");
+
+    // Publicly-routable addresses are accepted.
+    assert!(is_routable_peer_addr(&parse("1.2.3.4:9735")));
+    assert!(is_routable_peer_addr(&parse("[2606:4700:4700::1111]:9735")));
+
+    // Non-routable IPv4 are rejected (poison-resistance).
+    for a in [
+        "127.0.0.1:9735",   // loopback
+        "0.0.0.0:9735",     // unspecified
+        "10.1.2.3:9735",    // RFC1918
+        "192.168.1.1:9735", // RFC1918
+        "172.16.0.1:9735",  // RFC1918
+        "169.254.1.1:9735", // link-local
+        "224.0.0.1:9735",   // multicast
+        "192.0.2.1:9735",   // documentation
+        "1.2.3.4:0",        // zero port
+    ] {
+        assert!(!is_routable_peer_addr(&parse(a)), "{a} must be rejected");
+    }
+
+    // Non-routable IPv6 are rejected.
+    for a in [
+        "[::1]:9735",          // loopback
+        "[::]:9735",           // unspecified
+        "[fc00::1]:9735",      // ULA
+        "[fd12:3456::1]:9735", // ULA
+        "[fe80::1]:9735",      // link-local
+        "[ff02::1]:9735",      // multicast
+    ] {
+        assert!(!is_routable_peer_addr(&parse(a)), "{a} must be rejected");
+    }
+}
+
+#[tokio::test]
+async fn admission_invoice_cooldown_rate_limits_unpaid_repeat() {
+    // P2 DoS guard: the only unpaid *service* an unprivileged stranger can
+    // drive under PriceOpen is the one reserved admission invoice (a
+    // `create_invoice` wallet RPC). It must be per-peer rate-limited so a
+    // stranger cannot loop it; unpaid control-plane *state* is already
+    // `privileged`-gated elsewhere.
+    use std::time::Duration;
+
+    let mut map = std::collections::HashMap::new();
+    let peer = NodeId::from_bytes([7u8; 32]);
+    let other = NodeId::from_bytes([8u8; 32]);
+    let t0 = tokio::time::Instant::now();
+
+    // First request from a peer is allowed (and records the timestamp).
+    assert!(!admission_invoice_rate_limited(&mut map, &peer, t0));
+    // A rapid repeat within the cooldown is dropped.
+    assert!(admission_invoice_rate_limited(
+        &mut map,
+        &peer,
+        t0 + Duration::from_secs(1)
+    ));
+    // Still within the window (just before the cooldown elapses) → dropped.
+    assert!(admission_invoice_rate_limited(
+        &mut map,
+        &peer,
+        t0 + ADMISSION_INVOICE_COOLDOWN - Duration::from_millis(1)
+    ));
+    // A different peer is independent — the limit throttles only the offender.
+    assert!(!admission_invoice_rate_limited(
+        &mut map,
+        &other,
+        t0 + Duration::from_secs(1)
+    ));
+    // Once the cooldown elapses, the peer may request again (bootstrap retry).
+    assert!(!admission_invoice_rate_limited(
+        &mut map,
+        &peer,
+        t0 + ADMISSION_INVOICE_COOLDOWN + Duration::from_secs(1)
+    ));
 }

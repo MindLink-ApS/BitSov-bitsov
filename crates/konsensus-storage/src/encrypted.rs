@@ -9,7 +9,7 @@
 //! - **Message ciphertext** — the E2EE payload (already encrypted, defense-in-depth)
 //! - **Peer metadata** — display_name, address, metadata (protects social graph / topology)
 //! - **Room metadata** — name, metadata (protects group identifiers)
-//! - **File metadata** — filename, mime_type (protects file content indicators)
+//! - **File metadata and bytes** — filename, mime_type, data
 //!
 //! Principle 4: Data lives only on sender & receiver — no plaintext at any layer.
 
@@ -17,8 +17,11 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce as AesNonce,
 };
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use rand::RngCore;
+use tokio::sync::Mutex as TokioMutex;
 
 use hex;
 
@@ -43,6 +46,13 @@ use crate::traits::Storage;
 pub struct EncryptedStorage<S: Storage> {
     inner: S,
     cipher: Aes256Gcm,
+    /// Per-peer locks serialising `upsert_peer`'s read-decrypt-merge-encrypt-write
+    /// sequence. The merge that preserves `invite_ref` / `whitelist_source` cannot
+    /// be pushed into the inner SQL UPSERT because the metadata is an opaque
+    /// ciphertext blob at the DB layer, so the read-modify-write must instead be
+    /// serialised here to close the TOCTOU window (HARD-3). Locks are keyed by
+    /// `NodeId` so writes to different peers never contend.
+    peer_locks: std::sync::Mutex<std::collections::HashMap<NodeId, Arc<TokioMutex<()>>>>,
 }
 
 impl<S: Storage> EncryptedStorage<S> {
@@ -51,7 +61,20 @@ impl<S: Storage> EncryptedStorage<S> {
     /// The `key` should be the 32-byte AES key from `NodeIdentity::aes_key()`.
     pub fn new(inner: S, key: &[u8; 32]) -> Self {
         let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256 key is always 32 bytes");
-        Self { inner, cipher }
+        Self {
+            inner,
+            cipher,
+            peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Get (or lazily create) the per-peer serialisation lock for `node_id`.
+    fn peer_lock(&self, node_id: &NodeId) -> Arc<TokioMutex<()>> {
+        let mut locks = self
+            .peer_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.entry(*node_id).or_default().clone()
     }
 
     /// Encrypt data with a random 12-byte nonce.
@@ -228,7 +251,7 @@ impl<S: Storage> EncryptedStorage<S> {
         })
     }
 
-    /// Encrypt a FileRecord's sensitive metadata fields (filename, mime_type).
+    /// Encrypt a FileRecord's sensitive fields (filename, mime_type, data).
     fn encrypt_file_record(&self, file: &FileRecord) -> Result<FileRecord, StorageError> {
         Ok(FileRecord {
             id: file.id.clone(),
@@ -238,12 +261,12 @@ impl<S: Storage> EncryptedStorage<S> {
             blake3_hash: file.blake3_hash.clone(),
             sender: file.sender.clone(),
             message_id: file.message_id.clone(),
-            data: file.data.clone(),
+            data: self.encrypt(&file.data)?,
             created_at: file.created_at.clone(),
         })
     }
 
-    /// Decrypt a FileRecord's sensitive metadata fields.
+    /// Decrypt a FileRecord's sensitive fields.
     fn decrypt_file_record(&self, file: &FileRecord) -> Result<FileRecord, StorageError> {
         Ok(FileRecord {
             id: file.id.clone(),
@@ -253,7 +276,7 @@ impl<S: Storage> EncryptedStorage<S> {
             blake3_hash: file.blake3_hash.clone(),
             sender: file.sender.clone(),
             message_id: file.message_id.clone(),
-            data: file.data.clone(),
+            data: self.decrypt(&file.data)?,
             created_at: file.created_at.clone(),
         })
     }
@@ -270,6 +293,51 @@ impl<S: Storage> EncryptedStorage<S> {
             message_id: meta.message_id.clone(),
             created_at: meta.created_at.clone(),
         })
+    }
+
+    /// Build the encrypted `metadata_json` blob (as a JSON string scalar) for an
+    /// invite-derived peer write.
+    ///
+    /// Reads and decrypts any existing peer metadata, merges in the invite tag
+    /// (`invite_ref` / `whitelist_source`) preserving prior keys, then encrypts
+    /// the whole object with `encrypt_json`. The returned string is exactly what
+    /// the inner backend stores in `metadata_json`, so the invite tag is
+    /// ciphertext at rest rather than plaintext JSON (Principle 4).
+    ///
+    /// Callers must hold the per-peer lock for `node_id` so the read-decrypt of
+    /// the existing metadata cannot race a concurrent `upsert_peer` (HARD-3).
+    async fn encrypted_invite_peer_metadata(
+        &self,
+        node_id: &NodeId,
+        invite_id: &uuid::Uuid,
+    ) -> Result<String, StorageError> {
+        let existing = match self.inner.get_peer(node_id).await? {
+            Some(encrypted) => Some(self.decrypt_peer(&encrypted)?),
+            None => None,
+        };
+
+        let mut metadata = existing
+            .map(|peer| peer.metadata)
+            .filter(|value| value.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        // `is_object()` is guaranteed by the filter above; fall back defensively.
+        let Some(obj) = metadata.as_object_mut() else {
+            return Err(StorageError::Serialization(
+                "decrypted peer metadata is not a JSON object".into(),
+            ));
+        };
+        obj.insert(
+            "invite_ref".to_string(),
+            serde_json::Value::String(invite_id.to_string()),
+        );
+        obj.insert(
+            "whitelist_source".to_string(),
+            serde_json::Value::String("invite".to_string()),
+        );
+
+        let encrypted = self.encrypt_json(&metadata)?;
+        serde_json::to_string(&encrypted).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
     /// Get a reference to the inner storage.
@@ -381,6 +449,16 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     // Peer operations — encrypt display_name, address, metadata at rest
     async fn upsert_peer(&self, peer: &Peer) -> Result<(), StorageError> {
+        // The metadata is encrypted into an opaque ciphertext blob before it
+        // reaches the inner store, so the `invite_ref` / `whitelist_source`
+        // preservation merge cannot be delegated to the inner SQL UPSERT (it
+        // would have to decrypt to merge). The read-decrypt-merge-encrypt-write
+        // sequence is therefore performed here and serialised per-peer so two
+        // concurrent `upsert_peer` calls on the same node cannot read the same
+        // "before" state and clobber each other's update (HARD-3 TOCTOU fix).
+        let lock = self.peer_lock(&peer.node_id);
+        let _guard = lock.lock().await;
+
         let existing = match self.inner.get_peer(&peer.node_id).await? {
             Some(encrypted) => Some(self.decrypt_peer(&encrypted)?),
             None => None,
@@ -413,6 +491,17 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     // Nonce operations pass through unchanged
     async fn store_nonce(&self, nonce: &Nonce, sender: &NodeId) -> Result<bool, StorageError> {
         self.inner.store_nonce(nonce, sender).await
+    }
+
+    async fn store_payment_receipt(
+        &self,
+        payment_hash: &[u8; 32],
+        sender: &NodeId,
+        message_id: &MessageId,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .store_payment_receipt(payment_hash, sender, message_id)
+            .await
     }
 
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
@@ -567,8 +656,26 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         invite: &InviteIssuedRecord,
         peer_pubkey: [u8; 32],
     ) -> Result<(), StorageError> {
+        // The inner backend builds the peer `metadata_json` itself, writing
+        // `invite_ref` / `whitelist_source` as *plaintext* JSON. Routing it
+        // straight through would leave that invite tag readable at rest until a
+        // later `upsert_peer` re-encrypted it — a Principle 4 violation and the
+        // encrypted-storage split-write bug class. Instead we encrypt the peer
+        // metadata here and hand the inner backend an opaque ciphertext blob via
+        // `add_invite_and_whitelist_with_peer_metadata`, which still writes the
+        // invite row and the peer row in one transaction (atomicity preserved).
+        //
+        // The per-peer lock serialises the read-decrypt-merge-encrypt against
+        // `upsert_peer` so the two cannot race and clobber each other (HARD-3).
+        let node_id = NodeId::from_bytes(peer_pubkey);
+        let lock = self.peer_lock(&node_id);
+        let _guard = lock.lock().await;
+
+        let metadata_json = self
+            .encrypted_invite_peer_metadata(&node_id, &invite.id)
+            .await?;
         self.inner
-            .add_invite_and_whitelist(invite, peer_pubkey)
+            .add_invite_and_whitelist_with_peer_metadata(invite, peer_pubkey, &metadata_json)
             .await
     }
 
@@ -627,8 +734,22 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         pubkey: [u8; 32],
         invite_id: uuid::Uuid,
     ) -> Result<(), StorageError> {
+        // Share the same per-peer lock as `upsert_peer` so the invite_ref write
+        // cannot interleave with `upsert_peer`'s read-decrypt-merge-encrypt-write
+        // and be silently overwritten by a stale-read upsert (HARD-3 TOCTOU fix).
+        let node_id = NodeId::from_bytes(pubkey);
+        let lock = self.peer_lock(&node_id);
+        let _guard = lock.lock().await;
+
+        // Encrypt the invite tag here rather than delegating to the inner backend
+        // (which would write `invite_ref` / `whitelist_source` as plaintext JSON
+        // at rest — Principle 4 violation). The inner backend stores the opaque
+        // ciphertext blob verbatim via `add_whitelisted_peer_with_metadata`.
+        let metadata_json = self
+            .encrypted_invite_peer_metadata(&node_id, &invite_id)
+            .await?;
         self.inner
-            .add_whitelisted_peer_with_invite_ref(pubkey, invite_id)
+            .add_whitelisted_peer_with_metadata(pubkey, &metadata_json)
             .await
     }
 
@@ -755,6 +876,17 @@ impl<S: Storage + konsensus_core::gate::NonceStore> konsensus_core::gate::NonceS
         sender: &NodeId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.check_and_store(nonce, sender).await
+    }
+
+    async fn check_and_store_payment_hash(
+        &self,
+        payment_hash: &[u8; 32],
+        sender: &NodeId,
+        message_id: &MessageId,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner
+            .check_and_store_payment_hash(payment_hash, sender, message_id)
+            .await
     }
 }
 

@@ -73,8 +73,31 @@ const SESSION_SELF_HEAL_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// PeerExchange requests/responses to trigger expensive registry writes.
 const PEER_EXCHANGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Per-peer cooldown on the UNPRIVILEGED admission-invoice path. An unpaid
+/// stranger may request the one reserved admission invoice
+/// (`handle_invoice_requested_gated` calls `lightning.create_invoice` for it
+/// pre-payment so the stranger can *pay* to join), but must not loop that
+/// request to spam wallet RPCs. This is a DoS guard on the only unpaid *service*
+/// reachable under PriceOpen — unpaid control-plane *state* is already
+/// `privileged`-gated (privileged is granted only by a settled, recipient-bound,
+/// single-use payment). Privileged (already-paid) peers are unthrottled.
+const ADMISSION_INVOICE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Maximum number of peer exchange entries we process from a single response.
 const MAX_PEER_EXCHANGE_ENTRIES: usize = 50;
+
+/// M1b bootstrap carve-out — the reserved purpose string that an UNPRIVILEGED
+/// (PriceOpen stranger) peer must use to obtain the single admission invoice that
+/// lets the promote-on-paid pay-loop start. Any other purpose from an
+/// unprivileged peer is dropped (P2: no free invoice on our wallet). The amount is
+/// NOT taken from the requester — it is re-derived from our [`PricingEngine`] at
+/// [`ADMISSION_INVOICE_KIND`], so a stranger cannot mint a zero-value invoice.
+const ADMISSION_INVOICE_PURPOSE: &str = "konsensus:admission";
+
+/// The message kind whose price is the admission floor. A stranger's first paid
+/// message is a chat (`KIND_CHAT`), so the admission invoice is priced at the
+/// chat floor — the minimum energy required to be admitted and promoted.
+const ADMISSION_INVOICE_KIND: u16 = konsensus_core::kind::KIND_CHAT;
 
 /// Runs the session/control event handler loop.
 pub(crate) async fn run(deps: SessionHandlerDeps) {
@@ -111,6 +134,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         std::collections::HashMap::new();
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
+    let mut last_admission_invoice: std::collections::HashMap<NodeId, tokio::time::Instant> =
+        std::collections::HashMap::new();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
     let mut cooldown_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -131,7 +156,17 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 };
 
                 match event {
-                    ControlEvent::PeerConnected { peer_id } => {
+                    // M1b: PeerConnected for an UNPRIVILEGED (PriceOpen stranger)
+                    // connection must NOT make us volunteer X3DH / price table /
+                    // Lightning info / durable onboarding. We accept the connection
+                    // (ciphertext is up, P4) but stay silent until the peer pays and
+                    // is promoted. In Whitelist mode `privileged` is always true, so
+                    // this is byte-identical to pre-M1b.
+                    ControlEvent::PeerConnected { peer_id, privileged } => {
+                        if !privileged {
+                            debug!(peer = %peer_id, "PriceOpen: unprivileged peer connected — withholding prekey/onboarding until payment");
+                            continue;
+                        }
                         handle_peer_connected(
                             &peer_id, &identity, &session_manager, &transport, &pricing,
                             &chain, &pending_tx, &lightning, &routing,
@@ -142,73 +177,115 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::PrekeyOffer { peer_id, bundle } => {
+                    ControlEvent::PrekeyOffer { peer_id, bundle, privileged } => {
+                        if !privileged {
+                            warn!(peer = %peer_id, "DROP PrekeyOffer from unprivileged peer (P2: no free X3DH before payment)");
+                            continue;
+                        }
                         handle_prekey_offer(
                             &peer_id, bundle, our_node_id, &session_manager, &storage,
                             &transport, &audit_log, &mut last_negotiation,
                         ).await;
                     }
 
-                    ControlEvent::SessionInit { peer_id, init_data } => {
+                    ControlEvent::SessionInit { peer_id, init_data, privileged } => {
+                        if !privileged {
+                            warn!(peer = %peer_id, "DROP SessionInit from unprivileged peer (P2: no free durable session before payment)");
+                            continue;
+                        }
                         handle_session_init(
                             &peer_id, init_data, &session_manager, &storage,
                             &transport, &audit_log, &mut last_negotiation,
                         ).await;
                     }
 
-                    ControlEvent::SessionAck { peer_id } => {
+                    ControlEvent::SessionAck { peer_id, privileged } => {
+                        if !privileged {
+                            warn!(peer = %peer_id, "DROP SessionAck from unprivileged peer (P2: no free session-state before payment)");
+                            continue;
+                        }
                         handle_session_ack(
                             &peer_id, &session_manager, &transport, &audit_log,
                         ).await;
                     }
 
-                    ControlEvent::RatchetInit { peer_id, payload } => {
+                    ControlEvent::RatchetInit { peer_id, payload, privileged } => {
+                        if !privileged {
+                            warn!(peer = %peer_id, "DROP RatchetInit from unprivileged peer (P2: no free ratchet-state before payment)");
+                            continue;
+                        }
                         handle_ratchet_init(
                             &peer_id, &payload, &session_manager, &storage, &transport,
                         ).await;
                     }
 
-                    ControlEvent::MessageAcked { peer_id, message_id } => {
+                    ControlEvent::MessageAcked { peer_id, message_id, privileged } => {
+                        if !privileged {
+                            warn!(peer = %peer_id, "DROP MessageAck from unprivileged peer (P2: no free trust-weight pump before payment)");
+                            continue;
+                        }
                         handle_message_acked(
                             &peer_id, &message_id, &send_timestamps, &storage,
                             &routing, &ws_delivery_tx,
                         ).await;
                     }
 
-                    ControlEvent::MessageRejected { peer_id, message_id, reason } => {
+                    ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
+                        if !privileged {
+                            warn!(peer = %peer_id, "DROP MessageReject from unprivileged peer (P2: no free trust-weight pump before payment)");
+                            continue;
+                        }
                         handle_message_rejected(
                             &peer_id, &message_id, &reason, &routing, &ws_delivery_tx,
                         ).await;
                     }
 
-                    ControlEvent::PriceTableReceived { peer_id, prices, block_height, valid_blocks, trust_discount } => {
-                        info!(
-                            peer = %peer_id,
-                            categories = prices.len(),
-                            block_height,
-                            valid_blocks,
-                            trust_discount,
-                            "received peer price table"
-                        );
-                        peer_prices.update(peer_id, prices, block_height, valid_blocks, trust_discount).await;
+                    ControlEvent::PriceTableReceived { peer_id, prices, block_height, valid_blocks, trust_discount, privileged } => {
+                        handle_price_table_received(
+                            peer_id, prices, block_height, valid_blocks, trust_discount, privileged,
+                            &peer_prices,
+                        ).await;
                     }
 
-                    ControlEvent::PriceQueryReceived { peer_id, kind } => {
+                    ControlEvent::PriceQueryReceived { peer_id, kind, privileged } => {
+                        if !privileged {
+                            debug!(peer = %peer_id, kind, "DROP PriceQuery from unprivileged peer (info-disclosure floor: strangers learn our price surface only via the admission path)");
+                            continue;
+                        }
                         handle_price_query(&peer_id, kind, &pricing, &chain, &transport).await;
                     }
 
-                    ControlEvent::PriceResponseReceived { peer_id, kind, price_msat, block_height } => {
-                        debug!(
-                            peer = %peer_id, kind, price_msat, block_height,
-                            "received price response, updating peer cache"
-                        );
-                        peer_prices.update_kind_price(peer_id, kind, price_msat, block_height).await;
+                    ControlEvent::PriceResponseReceived { peer_id, kind, price_msat, block_height, privileged } => {
+                        handle_price_response_received(
+                            peer_id, kind, price_msat, block_height, privileged, &peer_prices,
+                        ).await;
                     }
 
-                    ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose } => {
-                        handle_invoice_requested(
-                            &peer_id, &request_id, amount_msat, &purpose,
-                            &lightning, &transport,
+                    ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged } => {
+                        // DoS guard (P2): an unprivileged peer may request the one
+                        // reserved admission invoice (the handler calls
+                        // lightning.create_invoice for it pre-payment), but must not
+                        // loop it to spam wallet RPCs. Rate-limit ONLY the unpaid
+                        // admission path; privileged (paid) peers and non-admission
+                        // purposes (dropped by the handler) are unaffected.
+                        if !privileged
+                            && purpose == ADMISSION_INVOICE_PURPOSE
+                            && admission_invoice_rate_limited(
+                                &mut last_admission_invoice,
+                                &peer_id,
+                                tokio::time::Instant::now(),
+                            )
+                        {
+                            warn!(
+                                peer = %peer_id,
+                                cooldown_secs = ADMISSION_INVOICE_COOLDOWN.as_secs(),
+                                "DROP admission-invoice request from unprivileged peer within cooldown (P2 DoS guard: unpaid create_invoice rate-limit)"
+                            );
+                            continue;
+                        }
+                        handle_invoice_requested_gated(
+                            &peer_id, &request_id, amount_msat, &purpose, privileged,
+                            &pricing, &lightning, &transport,
                         ).await;
                     }
 
@@ -218,32 +295,39 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::InvoiceErrorReceived { peer_id, request_id, reason } => {
-                        warn!(
-                            peer = %peer_id, %request_id, %reason,
-                            "peer reported invoice creation error — failing compose"
-                        );
-                        let mut requests = invoice_requests.lock().await;
-                        // Remove and drop the sender — the compose handler's
-                        // rx.await will return Err (channel closed).
-                        requests.remove(&request_id);
+                    ControlEvent::InvoiceErrorReceived { peer_id, request_id, reason, privileged } => {
+                        handle_invoice_error_received(
+                            &peer_id, &request_id, &reason, privileged, &invoice_requests,
+                        ).await;
                     }
 
-                    ControlEvent::PeerExchangeRequested { peer_id } => {
+                    ControlEvent::PeerExchangeRequested { peer_id, privileged } => {
+                        if !privileged {
+                            warn!(peer = %peer_id, "DROP PeerExchange request from unprivileged peer (P3: no mesh-topology / social-graph leak before payment)");
+                            continue;
+                        }
                         handle_peer_exchange_request(
                             &peer_id, our_node_id, &peer_registry, &transport,
                             &mut last_peer_exchange,
                         ).await;
                     }
 
-                    ControlEvent::PeerExchangeReceived { peer_id, peers } => {
+                    ControlEvent::PeerExchangeReceived { peer_id, peers, privileged } => {
+                        if !privileged {
+                            warn!(peer = %peer_id, "DROP PeerExchange response from unprivileged peer (P2/P3: no unauthenticated registry write before payment)");
+                            continue;
+                        }
                         handle_peer_exchange_received(
                             &peer_id, peers, our_node_id, &peer_registry,
                             &mut last_peer_exchange,
                         ).await;
                     }
 
-                    ControlEvent::LightningInfoReceived { peer_id, ln_pubkey, ln_addr } => {
+                    ControlEvent::LightningInfoReceived { peer_id, ln_pubkey, ln_addr, privileged } => {
+                        if !privileged {
+                            warn!(peer = %peer_id, "DROP LightningInfo from unprivileged peer (P2: no durable onboarding write or auto-channel open — spends sats — before payment)");
+                            continue;
+                        }
                         let valid = handle_lightning_info_received(
                             &peer_id, &ln_pubkey, &peer_ln_pubkeys,
                         ).await;
@@ -276,7 +360,11 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         }
                     }
 
-                    ControlEvent::GossipReceived { from_peer, envelope } => {
+                    ControlEvent::GossipReceived { from_peer, envelope, privileged } => {
+                        if !privileged {
+                            warn!(peer = %from_peer, "DROP Gossip from unprivileged peer (P2: no free relay/amplification before payment)");
+                            continue;
+                        }
                         handle_gossip_received(
                             from_peer, *envelope, &gossip_validator,
                             &transport, &audit_log, &ws_broadcast,
@@ -327,6 +415,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 last_negotiation.retain(|_, ts| now.duration_since(*ts) < SESSION_NEGOTIATION_COOLDOWN * 6);
                 let before_pex = last_peer_exchange.len();
                 last_peer_exchange.retain(|_, ts| now.duration_since(*ts) < PEER_EXCHANGE_COOLDOWN * 6);
+                let before_adm = last_admission_invoice.len();
+                last_admission_invoice.retain(|_, ts| now.duration_since(*ts) < ADMISSION_INVOICE_COOLDOWN * 6);
                 // Defense-in-depth: if maps still exceed cap after TTL eviction,
                 // force-clear to prevent unbounded growth from a burst of unique peer IDs.
                 if last_negotiation.len() > MAX_COOLDOWN_ENTRIES {
@@ -337,12 +427,18 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     warn!(len = last_peer_exchange.len(), cap = MAX_COOLDOWN_ENTRIES, "peer exchange cooldown map exceeded cap, clearing");
                     last_peer_exchange.clear();
                 }
+                if last_admission_invoice.len() > MAX_COOLDOWN_ENTRIES {
+                    warn!(len = last_admission_invoice.len(), cap = MAX_COOLDOWN_ENTRIES, "admission invoice cooldown map exceeded cap, clearing");
+                    last_admission_invoice.clear();
+                }
                 let removed_neg = before_neg - last_negotiation.len();
                 let removed_pex = before_pex - last_peer_exchange.len();
-                if removed_neg > 0 || removed_pex > 0 {
+                let removed_adm = before_adm - last_admission_invoice.len();
+                if removed_neg > 0 || removed_pex > 0 || removed_adm > 0 {
                     debug!(
                         removed_negotiation = removed_neg,
                         removed_peer_exchange = removed_pex,
+                        removed_admission_invoice = removed_adm,
                         "pruned stale cooldown map entries"
                     );
                 }
@@ -668,7 +764,13 @@ async fn heal_connected_e2ee_sessions(
     session_manager: &SessionManager,
     transport: &Arc<NoiseTransport>,
 ) {
-    let connected_peers = transport.connected_peers().await;
+    // P2 (no prekey before settlement): self-heal sessions ONLY to PRIVILEGED
+    // peers. An unprivileged PriceOpen stranger completes Noise transport but must
+    // NOT receive our X3DH prekey bundle until a settled payment promotes them.
+    // This mirrors the `PeerConnected` withholding above (line ~166); without it,
+    // the periodic self-heal would re-offer the prekey to every connected peer
+    // regardless of privilege, leaking free X3DH to an unpaid peer.
+    let connected_peers = transport.connected_privileged_peers().await;
     for peer_id in connected_peers {
         if !e2ee_needs_self_heal(session_manager, &peer_id).await {
             continue;
@@ -812,6 +914,124 @@ async fn handle_price_query(
     }
 }
 
+async fn handle_price_table_received(
+    peer_id: NodeId,
+    prices: std::collections::HashMap<String, u64>,
+    block_height: u64,
+    valid_blocks: u32,
+    trust_discount: f64,
+    privileged: bool,
+    peer_prices: &PeerPriceCache,
+) {
+    if !privileged {
+        warn!(peer = %peer_id, "DROP PriceTable from unprivileged peer (P2: no price-cache poisoning before payment)");
+        return;
+    }
+    info!(
+        peer = %peer_id,
+        categories = prices.len(),
+        block_height,
+        valid_blocks,
+        trust_discount,
+        "received peer price table"
+    );
+    peer_prices.update(peer_id, prices, block_height, valid_blocks, trust_discount).await;
+}
+
+async fn handle_price_response_received(
+    peer_id: NodeId,
+    kind: u16,
+    price_msat: u64,
+    block_height: u64,
+    privileged: bool,
+    peer_prices: &PeerPriceCache,
+) {
+    if !privileged {
+        warn!(peer = %peer_id, kind, "DROP PriceResponse from unprivileged peer (P2: no price-cache poisoning before payment)");
+        return;
+    }
+    debug!(
+        peer = %peer_id, kind, price_msat, block_height,
+        "received price response, updating peer cache"
+    );
+    peer_prices.update_kind_price(peer_id, kind, price_msat, block_height).await;
+}
+
+/// M1b: privilege-gated invoice dispatch (the bootstrap carve-out).
+///
+/// * `privileged == true` (whitelisted peer, or one already promoted by a settled
+///   payment): unchanged behaviour — the caller's `amount_msat`/`purpose` are
+///   honoured exactly as pre-M1b (Whitelist mode is byte-identical).
+/// * `privileged == false` (PriceOpen stranger): the ONLY issuable invoice is the
+///   single reserved admission invoice (`purpose == ADMISSION_INVOICE_PURPOSE`).
+///   Its amount is re-derived from OUR [`PricingEngine`] at
+///   [`ADMISSION_INVOICE_KIND`]; the caller's `amount_msat` is IGNORED so a
+///   stranger cannot mint a zero-value or attacker-chosen invoice on our wallet.
+///   Any other unprivileged invoice request is dropped (P2: no free Lightning
+///   invoice before payment).
+#[allow(clippy::too_many_arguments)]
+async fn handle_invoice_requested_gated(
+    peer_id: &NodeId,
+    request_id: &str,
+    amount_msat: u64,
+    purpose: &str,
+    privileged: bool,
+    pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
+    lightning: &Arc<dyn LightningProvider>,
+    transport: &Arc<NoiseTransport>,
+) {
+    if privileged {
+        handle_invoice_requested(peer_id, request_id, amount_msat, purpose, lightning, transport).await;
+        return;
+    }
+
+    if purpose != ADMISSION_INVOICE_PURPOSE {
+        warn!(peer = %peer_id, %request_id, %purpose, "DROP invoice request from unprivileged peer (P2: only the reserved admission invoice is issuable pre-payment)");
+        return;
+    }
+
+    let admission_msat = match pricing.get_price_msat(ADMISSION_INVOICE_KIND).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(peer = %peer_id, %request_id, error = %e, "cannot price admission invoice — refusing");
+            let error_frame = Frame::InvoiceError {
+                request_id: request_id.to_string(),
+                reason: "admission pricing unavailable".to_string(),
+            };
+            if let Err(se) = transport.send_frame(peer_id, &error_frame).await {
+                warn!(peer = %peer_id, %request_id, error = %se, "failed to send admission InvoiceError");
+            }
+            return;
+        }
+    };
+    info!(peer = %peer_id, %request_id, admission_msat, "issuing reserved admission invoice to unprivileged peer (caller amount ignored)");
+    // The reserved purpose is preserved verbatim so the description stays
+    // attributable; the AMOUNT is the engine-derived admission floor.
+    handle_invoice_requested(peer_id, request_id, admission_msat, purpose, lightning, transport).await;
+}
+
+/// DoS guard for the unpaid admission-invoice path. Returns `true` (drop the
+/// request) if `peer` requested within [`ADMISSION_INVOICE_COOLDOWN`] of its
+/// last allowed request; otherwise records `now` and returns `false` (allow).
+///
+/// Pure + unit-testable (the `now` is injected) so the rate-limit is provable
+/// without driving the full handler loop. Per-peer, keyed by the authenticated
+/// federation NodeId — a stranger throttles only itself, and a 1-msat keysend
+/// flood cannot loop free `create_invoice` wallet RPCs.
+fn admission_invoice_rate_limited(
+    last_admission_invoice: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
+    peer: &NodeId,
+    now: tokio::time::Instant,
+) -> bool {
+    if let Some(last) = last_admission_invoice.get(peer) {
+        if now.duration_since(*last) < ADMISSION_INVOICE_COOLDOWN {
+            return true;
+        }
+    }
+    last_admission_invoice.insert(*peer, now);
+    false
+}
+
 async fn handle_invoice_requested(
     peer_id: &NodeId,
     request_id: &str,
@@ -852,6 +1072,27 @@ async fn handle_invoice_requested(
             }
         }
     }
+}
+
+async fn handle_invoice_error_received(
+    peer_id: &NodeId,
+    request_id: &str,
+    reason: &str,
+    privileged: bool,
+    invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>,
+) {
+    if !privileged {
+        warn!(peer = %peer_id, "DROP InvoiceError from unprivileged peer (P2: no pending-invoice bookkeeping drive before payment)");
+        return;
+    }
+    warn!(
+        peer = %peer_id, %request_id, %reason,
+        "peer reported invoice creation error — failing compose"
+    );
+    let mut requests = invoice_requests.lock().await;
+    // Remove and drop the sender — the compose handler's rx.await will return
+    // Err (channel closed).
+    requests.remove(request_id);
 }
 
 async fn handle_invoice_response(
@@ -961,8 +1202,21 @@ async fn handle_peer_exchange_received(
         if entry.node_id == our_node_id {
             continue;
         }
-        if !registry.contains(&entry.node_id) {
-            registry.add(konsensus_message::peer::PeerEntry {
+        if !is_routable_peer_addr(&entry.addr) {
+            warn!(
+                peer = %peer_id,
+                addr = %entry.addr,
+                "skipping peer-exchange entry with non-routable address"
+            );
+            continue;
+        }
+        // B2 (PEX authority): a PeerExchange suggestion is DISCOVERY, not
+        // admission. Store the endpoint in the registry's `discovered` set — it
+        // holds NO gate authority and never enters the whitelist. A privileged
+        // peer can no longer inject admitted NodeIds via PEX; promotion to
+        // admitted requires a settled payment or an explicit operator action.
+        if !registry.is_known(&entry.node_id) {
+            registry.add_discovered(konsensus_message::peer::PeerEntry {
                 node_id: entry.node_id,
                 addr: entry.addr,
                 label: entry.label.clone(),
@@ -972,7 +1226,41 @@ async fn handle_peer_exchange_received(
         }
     }
     if added > 0 {
-        info!(added, "added discovered peers to registry");
+        info!(added, "stored discovered (not admitted) peers");
+    }
+}
+
+/// Returns `true` if `addr` is a publicly-routable peer address worth storing
+/// from a peer-exchange entry.
+///
+/// Rejects a zero port, loopback, unspecified, multicast and broadcast, plus
+/// RFC1918 private / link-local / documentation IPv4 and ULA (`fc00::/7`) /
+/// link-local (`fe80::/10`) IPv6. A hostile peer must not be able to poison our
+/// registry with non-routable addresses that we would then re-serve to others.
+fn is_routable_peer_addr(addr: &std::net::SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_documentation())
+        }
+        std::net::IpAddr::V6(ip) => {
+            let seg0 = ip.segments()[0];
+            let is_unique_local = (seg0 & 0xfe00) == 0xfc00;
+            let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || is_unique_local
+                || is_link_local)
+        }
     }
 }
 

@@ -18,7 +18,7 @@ use base64::Engine;
 use ed25519_dalek::{Verifier, VerifyingKey};
 use tower::ServiceExt;
 
-use konsensus_api::build_router;
+use common::test_router as build_router;
 use konsensus_core::invite::{BitSovInvite, UnsignedBitSovInvite};
 use konsensus_core::NodeId;
 use konsensus_storage::{InviteIssuedRecord, InviteState, SqliteStorage, Storage};
@@ -64,6 +64,36 @@ fn signed_invite_token_for_with_nonce(invitee_pubkey: [u8; 32], nonce: [u8; 16])
 
 fn signed_invite_token_for(invitee_pubkey: [u8; 32]) -> String {
     signed_invite_token_for_with_nonce(invitee_pubkey, [0x22; 16])
+}
+
+/// P3-2c non-interchangeability: a canonical `BitSovInvite` (base64url JSON) must
+/// NOT be redeemable on the legacy `/api/v1/invite/redeem` route, which parses a
+/// base58 `InviteToken`. This is why the legacy route cannot be aliased/410-ed onto
+/// `/invites/accept` — an alias would 400 ~100% of legacy traffic. Deprecation is
+/// signalling only; the formats stay distinct.
+#[tokio::test]
+async fn legacy_redeem_rejects_canonical_bitsov_invite() {
+    let state = test_state();
+    let auth = auth_header(&state);
+    let app = build_router(Arc::clone(&state));
+
+    let bitsov_token = signed_invite_token_for([0xAB; 32]);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/invite/redeem")
+        .header("authorization", &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "invite": bitsov_token }).to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a base64url BitSovInvite must not parse as a base58 InviteToken on the legacy redeem route"
+    );
 }
 
 #[tokio::test]
@@ -570,6 +600,40 @@ async fn invites_accept_happy_path() {
     assert!(
         peer.is_some(),
         "inviter should be persisted as whitelisted peer"
+    );
+}
+
+#[tokio::test]
+async fn invites_accept_adds_inviter_to_gate_whitelist() {
+    // P3-2 regression: the PaymentGate reads its whitelist from the in-memory
+    // PeerRegistry. Accepting an invite must place the inviter there, or the
+    // invited peer connects but every message is rejected NotWhitelisted.
+    let state = test_state();
+    let auth = auth_header(&state);
+    let app = build_router(Arc::clone(&state));
+    let token = signed_invite_token_for(state.identity.ed25519_verifying_key().to_bytes());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/invites/accept")
+        .header("authorization", &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "token": token }).to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let inviter = NodeId::from_hex(json["inviter_pubkey"].as_str().expect("inviter_pubkey"))
+        .expect("valid inviter hex");
+
+    let registry = state.peer_registry.read().await;
+    assert!(
+        registry.whitelist().contains(&inviter),
+        "inviter must be in the PeerRegistry the PaymentGate reads (P3-2)"
     );
 }
 

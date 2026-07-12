@@ -29,7 +29,7 @@ use konsensus_api::audit::AuditLog;
 use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use konsensus_api::build_router;
+use common::test_router as build_router;
 
 
 #[tokio::test]
@@ -1633,6 +1633,118 @@ async fn invite_redeem_adds_peer() {
         .get(other.node_id())
         .expect("peer should be in registry");
     assert_eq!(peer.label.as_deref(), Some("Bob"));
+}
+
+/// P3-2c: the legacy redeem route emits RFC 8594/9745 deprecation headers while the
+/// body and behaviour stay UNCHANGED (same flow as `invite_redeem_adds_peer`).
+#[tokio::test]
+async fn invite_redeem_emits_deprecation_headers() {
+    let state = test_state();
+    let auth = auth_header(&state);
+    let other =
+        konsensus_core::NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
+    let token =
+        konsensus_core::InviteToken::generate(&other, "10.0.0.2:9735", Some("Bob"), 0).unwrap();
+    let app = build_router(Arc::clone(&state));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/invite/redeem")
+        .header("content-type", "application/json")
+        .header("authorization", &auth)
+        .body(Body::from(
+            serde_json::json!({ "invite": token }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("deprecation").map(|v| v.to_str().unwrap()),
+        Some("true"),
+        "legacy redeem must advertise Deprecation: true"
+    );
+    assert!(
+        resp.headers().contains_key("sunset"),
+        "legacy redeem must advertise a Sunset target"
+    );
+    assert!(
+        resp.headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("/api/v1/invites/accept")),
+        "legacy redeem must Link the successor route"
+    );
+
+    // Headers are additive — the body is byte-for-byte what it was before.
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["addr"], "10.0.0.2:9735");
+    assert_eq!(json["label"], "Bob");
+    assert!(json["added"].as_bool().unwrap());
+}
+
+/// P3-2c: the legacy invite-generate route emits deprecation headers too.
+#[tokio::test]
+async fn invite_generate_emits_deprecation_headers() {
+    let state = test_state();
+    let auth = auth_header(&state);
+    let app = build_router(Arc::clone(&state));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/invite")
+        .header("content-type", "application/json")
+        .header("authorization", &auth)
+        .body(Body::from(
+            serde_json::json!({ "addr": "10.0.0.9:9735" }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("deprecation").map(|v| v.to_str().unwrap()),
+        Some("true"),
+        "legacy generate must advertise Deprecation: true"
+    );
+    assert!(resp.headers().contains_key("sunset"));
+
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["token"].is_string(), "generate still returns a token");
+}
+
+/// P3-2c non-interchangeability (other direction): a legacy base58 `InviteToken`
+/// must NOT be accepted on the canonical `/api/v1/invites/accept` route.
+#[tokio::test]
+async fn canonical_accept_rejects_legacy_invite_token() {
+    let state = test_state();
+    let auth = auth_header(&state);
+    let other =
+        konsensus_core::NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
+    let token =
+        konsensus_core::InviteToken::generate(&other, "10.0.0.2:9735", Some("Bob"), 0).unwrap();
+    let app = build_router(Arc::clone(&state));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/invites/accept")
+        .header("content-type", "application/json")
+        .header("authorization", &auth)
+        .body(Body::from(
+            serde_json::json!({ "token": token }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a base58 InviteToken must not parse as a base64url BitSovInvite on the canonical accept route"
+    );
 }
 
 #[tokio::test]

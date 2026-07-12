@@ -1,16 +1,18 @@
 # BitSov
 
-A sovereign mesh network where every user is a node with Bitcoin-anchored identity, payment-gated communication, and true data sovereignty.
+A sovereign mesh network where every user is a node with Bitcoin-anchored identity, payment-gated communication, and user-held keys.
 
-BitSov replaces centralized platforms with a decentralized, privacy-respecting, Bitcoin-backed network for messaging, calls, file sharing, calendar, and collaboration.
+BitSov is a decentralized, privacy-respecting, Bitcoin-backed substrate for messaging, calls, files, scheduling, and collaboration where the node, not a platform account, owns the relationship.
+
+Node IDs and public keys are the protocol identity layer. IP addresses and DNS names are reachability hints, not identity or admission authority. Nodes may learn those hints through invites, QR codes, manual entry, relays, or other out-of-band discovery, but communication remains governed by the node identity, encryption state, and payment/admission policy.
 
 ## Principles
 
-1. **Sovereign Identity** -- Your node IS your identity, derived from a BIP-39 mnemonic
-2. **Lightning Gate** -- Every message costs real sats. Spam is economically impossible
-3. **Closed Mesh** -- Whitelist-only federation. You choose who can reach you
-4. **Data Sovereignty** -- End-to-end encrypted. Zero plaintext at any layer
-5. **Chain-Aware Message Pricing** -- Message costs track Bitcoin's chain state (see `docs/v2/ADR-027`)
+1. **Sovereign Identity** -- Your node identity is derived from user-held key material.
+2. **Bitcoin/Lightning Gate** -- Message admission and abuse resistance are tied to settled payment policy. Paid admission raises the cost of unwanted traffic.
+3. **Opt-In Mesh** -- You choose who can reach you through paid-open admission policy, explicit peer policy, or closed/private operation.
+4. **Data Sovereignty** -- Message content is end-to-end encrypted under the audited client/key path. Data lives on sender and receiver nodes, or their authorized ciphertext relays, with metadata caveats documented in the threat model.
+5. **Chain-Aware Message Pricing** -- Message costs can track Bitcoin's chain state (see `docs/v2/ADR-027`).
 
 ## Quick Start
 
@@ -41,17 +43,12 @@ docker compose --profile lightning up -d
 ### Option 3: Build from Source
 
 ```bash
-# Prerequisites: Rust 1.75+, Node.js 20+
+# Prerequisites: Rust 1.75+
 git clone https://github.com/BitSov/bitsov.git
 cd bitsov
 
 # Build the node binary
 cargo build --release -p konsensus-node
-
-# Build the desktop app (requires Tauri CLI)
-cd frontend
-npm install
-npx tauri build
 ```
 
 ## Configuration
@@ -66,7 +63,7 @@ Key settings:
 - **Lightning backend**: LNbits (production) or Mock (development)
 - **Storage**: SQLite (single node) or PostgreSQL (production)
 - **Pricing**: Per-message-kind sat costs
-- **Peers**: Whitelist of known nodes to connect to
+- **Peers**: Opt-in peers. Node IDs are the protocol identity; network addresses are reachability hints obtained out-of-band.
 
 See `konsensus.toml.example` for all options.
 
@@ -77,6 +74,8 @@ See `konsensus.toml.example` for all options.
 | **Relay** | Paired remote access | User-held keys | User-authorized payments | Relay-held ciphertext |
 | **Light** | Download binary | Local mnemonic | User-selected Lightning | Local SQLite |
 | **Full** | Self-hosted | HSM-ready | Own LDK/LND node | Encrypted SQLite/PostgreSQL |
+
+All tiers use node identity as the canonical endpoint identifier. Reachability hints are secondary.
 
 ## Architecture
 
@@ -96,7 +95,7 @@ BitSov is a Rust workspace with 9 crates (internal names prefixed `konsensus-`):
 | `konsensus-api` | REST + WebSocket API, JWT auth, rate limiting |
 | `konsensus-node` | Binary entry point, CLI, content server |
 
-The desktop frontend uses Tauri + SolidJS.
+The public reference app lives in the separate `bitsov-app` repository and talks to the node over the REST/WebSocket API.
 
 ## Development
 
@@ -106,9 +105,6 @@ cargo test --workspace
 
 # Check for issues
 cargo clippy --workspace -- -D warnings
-
-# Run the frontend dev server
-cd frontend && npm run dev
 ```
 
 ## License

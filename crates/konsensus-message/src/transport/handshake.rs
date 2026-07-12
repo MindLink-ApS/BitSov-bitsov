@@ -17,17 +17,25 @@ use crate::wire::{Capability, Frame, SovereigntyTier};
 
 use super::{
     write_noise_message, read_noise_message,
-    TransportConfig, SharedWhitelist,
+    ReachabilityMode, TransportConfig, SharedWhitelist,
     HANDSHAKE_TIMEOUT,
 };
 
 // ─── Noise_XX handshake ─────────────────────────────────────────────────────
 
-/// Perform Noise_XX handshake as initiator (owns the NoiseSession).
+/// Perform Noise_XX handshake as initiator.
+///
+/// Owns Noise session creation (from `x25519_secret`) so it can transparently
+/// satisfy a peer's pre-Noise anti-DoS cookie (doorway hardening #2): the
+/// initiator speaks an optimistic Noise message-1 first, and if the responder
+/// answers with a self-describing cookie challenge (recognizable *without* any
+/// prior capability negotiation), it echoes the cookie and restarts the Noise
+/// handshake with a fresh session. A responder that does not require a cookie
+/// replies with message-2 and the path is byte-identical to pre-cookie.
 pub(super) async fn noise_handshake_initiator(
     mut reader: tokio::io::ReadHalf<TcpStream>,
     mut writer: tokio::io::WriteHalf<TcpStream>,
-    mut noise: NoiseSession,
+    x25519_secret: [u8; 32],
 ) -> Result<
     (
         tokio::io::ReadHalf<TcpStream>,
@@ -36,7 +44,9 @@ pub(super) async fn noise_handshake_initiator(
     ),
     TransportError,
 > {
-    // Message 1: → e
+    // Message 1: → e (optimistic; no cookie assumed).
+    let mut noise = NoiseSession::initiator(&x25519_secret)
+        .map_err(|e| TransportError::NoiseError(e.to_string()))?;
     let msg1 = noise
         .write_handshake(&[])
         .map_err(|e| TransportError::NoiseError(e.to_string()))?;
@@ -44,10 +54,32 @@ pub(super) async fn noise_handshake_initiator(
         .await
         .map_err(|e| TransportError::NoiseError(e.to_string()))?;
 
-    // Message 2: ← e, ee, s, es
-    let msg2 = read_noise_message(&mut reader)
+    // The reply is either Noise message-2 or a self-describing cookie challenge.
+    let reply = read_noise_message(&mut reader)
         .await
         .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+
+    let msg2 = if let Some(challenge) = super::cookie::parse_challenge(&reply) {
+        // Peer requires a cookie. Echo it, then restart Noise with a FRESH
+        // session — the responder never consumed our optimistic message-1, so a
+        // clean ephemeral is sent for the real DH.
+        super::cookie::answer_challenge(&mut writer, &challenge).await?;
+        noise = NoiseSession::initiator(&x25519_secret)
+            .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+        let fresh_msg1 = noise
+            .write_handshake(&[])
+            .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+        write_noise_message(&mut writer, &fresh_msg1)
+            .await
+            .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+        read_noise_message(&mut reader)
+            .await
+            .map_err(|e| TransportError::NoiseError(e.to_string()))?
+    } else {
+        reply
+    };
+
+    // Message 2: ← e, ee, s, es
     noise
         .read_handshake(&msg2)
         .map_err(|e| TransportError::NoiseError(e.to_string()))?;
@@ -312,6 +344,7 @@ pub(super) async fn perform_federation_handshake_responder(
         tokio::io::ReadHalf<TcpStream>,
         tokio::io::WriteHalf<TcpStream>,
         NoiseSession,
+        bool,
     ),
     TransportError,
 > {
@@ -360,10 +393,16 @@ pub(super) async fn perform_federation_handshake_responder(
 
             // Whitelist check BEFORE sending HelloAck (QA-M5: prevents identity leak
             // to unauthorized peers). Empty whitelist = reject all (Principle 3).
+            //
+            // M1a: in PriceOpen mode this wall INVERTS — a non-whitelisted peer is not
+            // rejected here but completes the handshake TAGGED UNPRIVILEGED. The three
+            // prior security checks (version, identity-binding, X25519==Noise-static
+            // MITM) above are intact and run BEFORE HelloAck regardless of mode. The
+            // per-message PaymentGate remains the sole admission authority.
             let wl = whitelist.read().await;
-            let whitelisted = !wl.is_empty() && wl.contains(&node_id);
+            let privileged = !wl.is_empty() && wl.contains(&node_id);
             drop(wl);
-            if !whitelisted {
+            if config.admission_mode == ReachabilityMode::Whitelist && !privileged {
                 let disconnect = Frame::Disconnect {
                     reason: "not in whitelist".to_string(),
                 };
@@ -376,12 +415,12 @@ pub(super) async fn perform_federation_handshake_responder(
                 )));
             }
 
-            // Send HelloAck
+            // Send HelloAck (in PriceOpen, also sent to the unprivileged stranger).
             let ack = build_hello_ack_frame(identity, config, &noise);
             send_encrypted_frame(&mut writer, &mut noise, &ack).await?;
 
-            info!(peer = %node_id, tier = ?tier, "federation handshake complete (responder)");
-            Ok((node_id, tier, capabilities, reader, writer, noise))
+            info!(peer = %node_id, tier = ?tier, privileged, "federation handshake complete (responder)");
+            Ok((node_id, tier, capabilities, reader, writer, noise, privileged))
         }
         Frame::Disconnect { reason } => {
             Err(TransportError::Rejected(format!("peer disconnected: {reason}")))
@@ -409,7 +448,6 @@ pub(super) async fn connect_to_peer(
 
     use super::{PeerConnection, spawn_reader_task};
     use super::ControlEvent;
-    use konsensus_crypto::noise::NoiseSession;
 
     let stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -418,12 +456,12 @@ pub(super) async fn connect_to_peer(
     info!(%addr, "TCP connected, starting Noise handshake");
 
     let (reader, writer) = tokio::io::split(stream);
-    let noise = NoiseSession::initiator(ctx.identity.x25519_secret_bytes())
-        .map_err(|e| TransportError::NoiseError(e.to_string()))?;
 
+    // The initiator builds its own Noise session(s) inside the handshake so it can
+    // restart cleanly if the responder requires a pre-Noise cookie (#2).
     let (reader, writer, noise) = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        noise_handshake_initiator(reader, writer, noise),
+        noise_handshake_initiator(reader, writer, *ctx.identity.x25519_secret_bytes()),
     )
     .await
     .map_err(|_| {
@@ -467,16 +505,27 @@ pub(super) async fn connect_to_peer(
         )));
     }
 
+    // M1a: capture our privilege toward this peer from our own whitelist at connect
+    // time. In Whitelist mode the outbound wall in `MessageTransport::connect`
+    // already guarantees this is true; in PriceOpen it may be false for a stranger
+    // we dialed. Per-message payment still gates every message on an unprivileged
+    // session.
+    let privileged = {
+        let wl = ctx.whitelist.read().await;
+        !wl.is_empty() && wl.contains(peer)
+    };
+
     let now = Instant::now();
     let conn = Arc::new(Mutex::new(PeerConnection {
+        privileged,
         noise,
         writer,
         tier,
         capabilities,
         last_recv: now,
         pending_ping: None,
-        invalid_frame_count: 0,
-        invalid_frame_window_start: now,
+        invalid_frame_level: 0.0,
+        invalid_frame_last_leak: now,
         bytes_received: 0,
         memory_budget_window_start: now,
     }));
@@ -496,11 +545,14 @@ pub(super) async fn connect_to_peer(
         ctx.control_tx.clone(),
     );
 
-    // Notify application layer of new peer connection
+    // Notify application layer of new peer connection. M1b: carry the privilege
+    // tag (computed above from our own whitelist) so the session handler does NOT
+    // volunteer X3DH/onboarding to a stranger we dialed in PriceOpen until they pay.
     if let Err(e) = ctx
         .control_tx
         .send(ControlEvent::PeerConnected {
             peer_id: peer_node_id,
+            privileged,
         })
         .await
     {

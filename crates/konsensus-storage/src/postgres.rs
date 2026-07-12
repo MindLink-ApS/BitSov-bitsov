@@ -18,10 +18,7 @@ use crate::error::StorageError;
 use crate::invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,
 };
-use crate::models::{
-    merge_peer_metadata_preserving_invite_ref, FileMetadata, FileRecord, OnboardingStateRecord,
-    Peer, Room,
-};
+use crate::models::{FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
 use crate::traits::Storage;
 
 /// PostgreSQL-backed storage for T2+ sovereignty tiers.
@@ -414,6 +411,20 @@ impl PostgresStorage {
                     ADD COLUMN IF NOT EXISTS inviter_ln_pubkey TEXT;
                 "#,
             ),
+            (
+                19,
+                "payment_receipts",
+                r#"
+                CREATE TABLE IF NOT EXISTS payment_receipts (
+                    payment_hash TEXT PRIMARY KEY,
+                    message_id   TEXT NOT NULL,
+                    sender       TEXT NOT NULL,
+                    received_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_payment_receipts_sender
+                    ON payment_receipts(sender, received_at DESC);
+                "#,
+            ),
         ]
     }
 
@@ -590,6 +601,95 @@ fn row_to_hosting_payment(
         memo,
     })
 }
+
+/// Session-listing query for the Postgres backend. Returns ALL stored sessions —
+/// deliberately **no `LIMIT`** (DBH2), mirroring the SQLite backend. `restore_sessions()`
+/// reads this at boot to resume every E2EE session; a cap here silently drops the
+/// overflow ratchet state (the old `LIMIT 1000` discarded the oldest by
+/// `updated_at DESC`), a Principle-2 fail-open at scale. CI has no Postgres service,
+/// so this path is guarded by code symmetry with SQLite plus the `dbh2_guard`
+/// string-assertion test below — not a live query.
+const SESSIONS_SELECT: &str = "SELECT peer_id FROM sessions ORDER BY updated_at DESC";
+
+/// Distinct-recipient query for the Postgres backend. Returns EVERY peer with a
+/// queued delivery — deliberately **no `LIMIT`** (DBH2), mirroring SQLite. A cap
+/// here means a node with queued mail to more than the cap of distinct peers never
+/// flushes the overflow recipients on reconnect, a Principle-2 fail-open. Guarded by
+/// code symmetry with SQLite plus the `dbh2_guard` test below.
+const PENDING_PEERS_SELECT: &str = "SELECT DISTINCT recipient_id FROM pending_deliveries";
+
+/// Room-membership query for the Postgres backend. Returns ALL members of a room —
+/// deliberately **no `LIMIT`** (DBH2), mirroring SQLite. The room message fan-out
+/// reads this; a cap silently excludes the overflow members from delivery on a room
+/// larger than the cap (old `LIMIT 10000`), a Principle-2 fail-open. Guarded by code
+/// symmetry with SQLite plus the `dbh2_guard` test below.
+const ROOM_MEMBERS_SELECT: &str =
+    "SELECT node_id FROM room_members WHERE room_id = $1 ORDER BY joined_at";
+
+// ── HARD-4 complete-set query constants (Postgres) ───────────────────────
+//
+// Mirror of the SQLite `*_SELECT` constants (see `sqlite.rs`). Same HARD-4
+// classification (AUTHORITY / correctness-complete / WHERE-scoped read-surface):
+// none of these queries may grow a bare `LIMIT`, which would re-create the
+// DBH1/DBH2 silent fail-open. The `hard4_guard` test below asserts no `LIMIT`
+// regresses in. Postgres has no `list_fiat_rate_snapshots` impl (it falls back
+// to the trait default), so that constant lives only in `sqlite.rs`.
+
+/// `get_pending_for_peer` — AUTHORITY. Per-peer outbound delivery queue; the
+/// pending-delivery flusher must see the complete queue. WHERE-scoped to one
+/// peer.
+const PENDING_FOR_PEER_SELECT: &str =
+    "SELECT message_id, attempts FROM pending_deliveries \
+     WHERE recipient_id = $1 ORDER BY queued_at ASC";
+
+/// `list_invites_issued` — AUTHORITY. Duplicate-pending-invite gate and
+/// acceptance lookup; must be complete.
+const INVITES_ISSUED_SELECT: &str =
+    "SELECT id, invitee_pubkey, expiry_unix, channel_size_hint_sats, addr, max_fee_rate_sat_per_vb, channel_open_intent_expiry_unix, nonce, state, created_at, accepted_at, revoked_at \
+     FROM invites_issued ORDER BY created_at DESC";
+
+/// `list_recurring_master_events` — correctness-complete. All recurring masters
+/// for occurrence expansion in the calendar view.
+const RECURRING_MASTER_EVENTS_SELECT: &str =
+    "SELECT id, message_id, organizer, title, description, start_ms, end_ms, tz,
+            location, attendees_json, recurrence_json, color, created_at, parent_id
+     FROM calendar_events
+     WHERE recurrence_json IS NOT NULL AND parent_id IS NULL
+     ORDER BY start_ms ASC";
+
+/// `list_calendar_exceptions_in_range` — correctness-complete. Exceptions
+/// suppress expanded occurrences; range-scoped, must be complete in range.
+const CALENDAR_EXCEPTIONS_IN_RANGE_SELECT: &str =
+    "SELECT id, message_id, organizer, title, description, start_ms, end_ms, tz,
+            location, attendees_json, recurrence_json, color, created_at, parent_id
+     FROM calendar_events
+     WHERE parent_id IS NOT NULL AND start_ms < $2 AND end_ms > $1
+     ORDER BY start_ms ASC";
+
+/// `list_operator_hosting_contracts` — AUTHORITY (money-path). The daily payment
+/// task iterates every contract; a cap silently skips paying tenants. If a
+/// memory bound is ever needed it MUST be streaming/chunked, never a bare
+/// `LIMIT`.
+const OPERATOR_HOSTING_CONTRACTS_SELECT: &str =
+    "SELECT id, tenant_pubkey, operator_pubkey, sats_per_day, started_at, last_paid_at, state
+     FROM operator_hosting_contracts
+     ORDER BY started_at ASC";
+
+/// `list_operator_hosting_payments` — READ-SURFACE, scoped to one contract.
+const OPERATOR_HOSTING_PAYMENTS_SELECT: &str =
+    "SELECT payment_hash, contract_id, tenant_pubkey, operator_pubkey, amount_msat,
+            paid_at, direction, preimage, memo
+     FROM operator_hosting_payments
+     WHERE contract_id = $1
+     ORDER BY paid_at DESC";
+/// Peer-listing query for the Postgres backend. Returns ALL peers — deliberately
+/// **no `LIMIT`** (DBH1), mirroring the SQLite backend. The `peers` table is the
+/// durable gate-whitelist authority (boot-loaded via `merge_persisted_peers`) and
+/// the RV-RESTORE backup source; a cap here is a Principle-2 fail-open at scale.
+/// CI has no Postgres service, so this path is guarded by code symmetry with
+/// SQLite plus the `dbh1_guard` string-assertion test below — not a live query.
+const PEERS_SELECT: &str =
+    "SELECT node_id, address, last_seen, display_name, metadata_json FROM peers ORDER BY node_id";
 
 #[async_trait]
 impl Storage for PostgresStorage {
@@ -913,9 +1013,7 @@ impl Storage for PostgresStorage {
     async fn get_room_members(&self, room_id: &RoomId) -> Result<Vec<NodeId>, StorageError> {
         let rid = room_id.to_string();
 
-        let rows = sqlx::query_as::<_, (String,)>(
-            "SELECT node_id FROM room_members WHERE room_id = $1 ORDER BY joined_at LIMIT 10000",
-        )
+        let rows = sqlx::query_as::<_, (String,)>(ROOM_MEMBERS_SELECT)
         .bind(&rid)
         .fetch_all(&self.pool)
         .await?;
@@ -930,22 +1028,23 @@ impl Storage for PostgresStorage {
 
     async fn upsert_peer(&self, peer: &Peer) -> Result<(), StorageError> {
         let nid = peer.node_id.to_hex();
-        let existing_metadata = sqlx::query_as::<_, (String,)>(
-            "SELECT metadata_json FROM peers WHERE node_id = $1",
-        )
-        .bind(&nid)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(|(metadata_json,)| {
-            serde_json::from_str::<serde_json::Value>(&metadata_json)
-                .map_err(|e| StorageError::Serialization(e.to_string()))
-        })
-        .transpose()?;
-        let merged_metadata =
-            merge_peer_metadata_preserving_invite_ref(&peer.metadata, existing_metadata.as_ref());
-        let metadata = serde_json::to_string(&merged_metadata)
+        let metadata = serde_json::to_string(&peer.metadata)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
+        // Single atomic UPSERT — no read-then-write. The `invite_ref` /
+        // `whitelist_source` preservation that previously required a SELECT +
+        // Rust-side merge is now expressed inside the `ON CONFLICT` clause so a
+        // concurrent writer cannot interleave between the read and the write
+        // (HARD-3 TOCTOU fix). Mirrors `merge_peer_metadata_preserving_invite_ref`:
+        // for each preserved key, the existing row's value wins, falling back to
+        // the incoming value when the existing row lacks it.
+        //
+        // The `jsonb_typeof(...) = 'object'` guard makes this safe for the
+        // `EncryptedStorage` wrapper, where `metadata_json` is an opaque
+        // encrypted *string scalar* rather than a JSON object: in that case we
+        // overwrite wholesale (the wrapper merges plaintext metadata itself
+        // before encrypting). `metadata_json` is a TEXT column, so we cast to
+        // jsonb for the merge and back to text for storage.
         sqlx::query(
             "INSERT INTO peers (node_id, address, last_seen, display_name, metadata_json) \
              VALUES ($1, $2, $3, $4, $5) \
@@ -953,7 +1052,20 @@ impl Storage for PostgresStorage {
              address = COALESCE(EXCLUDED.address, peers.address), \
              last_seen = COALESCE(EXCLUDED.last_seen, peers.last_seen), \
              display_name = COALESCE(EXCLUDED.display_name, peers.display_name), \
-             metadata_json = EXCLUDED.metadata_json",
+             metadata_json = CASE \
+               WHEN jsonb_typeof(EXCLUDED.metadata_json::jsonb) = 'object' \
+                AND jsonb_typeof(peers.metadata_json::jsonb) = 'object' \
+               THEN ( \
+                 (EXCLUDED.metadata_json::jsonb) || jsonb_strip_nulls(jsonb_build_object( \
+                   'invite_ref', COALESCE( \
+                     peers.metadata_json::jsonb -> 'invite_ref', \
+                     EXCLUDED.metadata_json::jsonb -> 'invite_ref'), \
+                   'whitelist_source', COALESCE( \
+                     peers.metadata_json::jsonb -> 'whitelist_source', \
+                     EXCLUDED.metadata_json::jsonb -> 'whitelist_source')) \
+                 ))::text \
+               ELSE EXCLUDED.metadata_json \
+             END",
         )
         .bind(&nid)
         .bind(&peer.address)
@@ -996,7 +1108,7 @@ impl Storage for PostgresStorage {
 
     async fn list_peers(&self) -> Result<Vec<Peer>, StorageError> {
         let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, String)>(
-            "SELECT node_id, address, last_seen, display_name, metadata_json FROM peers ORDER BY node_id LIMIT 1000",
+            PEERS_SELECT,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1035,6 +1147,29 @@ impl Storage for PostgresStorage {
             "INSERT INTO nonces (nonce_hex, sender) VALUES ($1, $2) ON CONFLICT DO NOTHING",
         )
         .bind(&nonce_hex)
+        .bind(&sender_hex)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn store_payment_receipt(
+        &self,
+        payment_hash: &[u8; 32],
+        sender: &NodeId,
+        message_id: &MessageId,
+    ) -> Result<bool, StorageError> {
+        let payment_hash_hex = hex::encode(payment_hash);
+        let sender_hex = sender.to_hex();
+        let message_id_hex = message_id.to_hex();
+
+        let result = sqlx::query(
+            "INSERT INTO payment_receipts (payment_hash, message_id, sender) \
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(&payment_hash_hex)
+        .bind(&message_id_hex)
         .bind(&sender_hex)
         .execute(&self.pool)
         .await?;
@@ -1117,7 +1252,7 @@ impl Storage for PostgresStorage {
 
     async fn list_sessions(&self) -> Result<Vec<NodeId>, StorageError> {
         let rows = sqlx::query_as::<_, (String,)>(
-            "SELECT peer_id FROM sessions ORDER BY updated_at DESC LIMIT 1000",
+            SESSIONS_SELECT,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1158,13 +1293,10 @@ impl Storage for PostgresStorage {
     ) -> Result<Vec<(MessageId, u32)>, StorageError> {
         let rid = recipient.to_hex();
 
-        let rows = sqlx::query_as::<_, (String, i32)>(
-            "SELECT message_id, attempts FROM pending_deliveries \
-             WHERE recipient_id = $1 ORDER BY queued_at ASC",
-        )
-        .bind(&rid)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query_as::<_, (String, i32)>(PENDING_FOR_PEER_SELECT)
+            .bind(&rid)
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter()
             .map(|(mid, attempts)| {
@@ -1218,7 +1350,7 @@ impl Storage for PostgresStorage {
 
     async fn get_pending_peers(&self) -> Result<Vec<NodeId>, StorageError> {
         let rows = sqlx::query_as::<_, (String,)>(
-            "SELECT DISTINCT recipient_id FROM pending_deliveries LIMIT 1000",
+            PENDING_PEERS_SELECT,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1565,6 +1697,79 @@ impl Storage for PostgresStorage {
         Ok(())
     }
 
+    async fn add_invite_and_whitelist_with_peer_metadata(
+        &self,
+        invite: &InviteIssuedRecord,
+        peer_pubkey: [u8; 32],
+        metadata_json: &str,
+    ) -> Result<(), StorageError> {
+        let expiry_unix = i64::try_from(invite.expiry_unix).map_err(|_| {
+            StorageError::Conversion(format!("expiry_unix overflows i64: {}", invite.expiry_unix))
+        })?;
+        let channel_size_hint_sats = invite.channel_size_hint_sats.map(i64::from);
+        let max_fee_rate_sat_per_vb = invite.max_fee_rate_sat_per_vb.map(i64::from);
+        let channel_open_intent_expiry_unix = invite
+            .channel_open_intent_expiry_unix
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StorageError::Conversion("channel_open_intent_expiry_unix overflows i64".into()))?;
+        let created_at = i64::try_from(invite.created_at).map_err(|_| {
+            StorageError::Conversion(format!("created_at overflows i64: {}", invite.created_at))
+        })?;
+        let accepted_at = invite
+            .accepted_at
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StorageError::Conversion("accepted_at overflows i64".into()))?;
+        let revoked_at = invite
+            .revoked_at
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StorageError::Conversion("revoked_at overflows i64".into()))?;
+
+        let node_id = NodeId::from_bytes(peer_pubkey).to_hex();
+        let mut tx = self.pool.begin().await.map_err(StorageError::Database)?;
+
+        sqlx::query(
+            "INSERT INTO invites_issued \
+             (id, invitee_pubkey, expiry_unix, channel_size_hint_sats, addr, max_fee_rate_sat_per_vb, channel_open_intent_expiry_unix, nonce, state, created_at, accepted_at, revoked_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(invite.id.as_bytes().as_slice())
+        .bind(invite.invitee_pubkey.as_slice())
+        .bind(expiry_unix)
+        .bind(channel_size_hint_sats)
+        .bind(&invite.addr)
+        .bind(max_fee_rate_sat_per_vb)
+        .bind(channel_open_intent_expiry_unix)
+        .bind(invite.nonce.as_slice())
+        .bind(invite.state.to_string())
+        .bind(created_at)
+        .bind(accepted_at)
+        .bind(revoked_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(StorageError::Database)?;
+
+        // Overwrite the peer metadata wholesale with the caller-supplied blob.
+        // For the EncryptedStorage wrapper this is an opaque ciphertext scalar,
+        // so the backend must never parse/merge it — the caller already merged
+        // `invite_ref` / `whitelist_source` before encrypting.
+        sqlx::query(
+            "INSERT INTO peers (node_id, address, last_seen, display_name, metadata_json) \
+             VALUES ($1, NULL, NULL, NULL, $2) \
+             ON CONFLICT(node_id) DO UPDATE SET metadata_json = EXCLUDED.metadata_json",
+        )
+        .bind(&node_id)
+        .bind(metadata_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(StorageError::Database)?;
+
+        tx.commit().await.map_err(StorageError::Database)?;
+        Ok(())
+    }
+
     async fn find_invite_issued(
         &self,
         id: &uuid::Uuid,
@@ -1674,8 +1879,7 @@ impl Storage for PostgresStorage {
                 Option<i64>,
             ),
         >(
-            "SELECT id, invitee_pubkey, expiry_unix, channel_size_hint_sats, addr, max_fee_rate_sat_per_vb, channel_open_intent_expiry_unix, nonce, state, created_at, accepted_at, revoked_at \
-             FROM invites_issued ORDER BY created_at DESC",
+            INVITES_ISSUED_SELECT,
         )
         .fetch_all(&self.pool)
         .await
@@ -1873,6 +2077,31 @@ impl Storage for PostgresStorage {
         )
         .bind(&node_id)
         .bind(&metadata_json)
+        .execute(&self.pool)
+        .await
+        .map_err(StorageError::Database)?;
+
+        Ok(())
+    }
+
+    async fn add_whitelisted_peer_with_metadata(
+        &self,
+        pubkey: [u8; 32],
+        metadata_json: &str,
+    ) -> Result<(), StorageError> {
+        let node_id = NodeId::from_bytes(pubkey).to_hex();
+
+        // Overwrite the peer metadata wholesale with the caller-supplied blob.
+        // The caller owns the `invite_ref` / `whitelist_source` merge and (for
+        // the EncryptedStorage wrapper) the encryption, so the backend must not
+        // parse or merge this value — it may be an opaque ciphertext scalar.
+        sqlx::query(
+            "INSERT INTO peers (node_id, address, last_seen, display_name, metadata_json) \
+             VALUES ($1, NULL, NULL, NULL, $2) \
+             ON CONFLICT(node_id) DO UPDATE SET metadata_json = EXCLUDED.metadata_json",
+        )
+        .bind(&node_id)
+        .bind(metadata_json)
         .execute(&self.pool)
         .await
         .map_err(StorageError::Database)?;
@@ -2253,15 +2482,9 @@ impl Storage for PostgresStorage {
             Option<String>,
             String,
             Option<String>,
-        )> = sqlx::query_as(
-            "SELECT id, message_id, organizer, title, description, start_ms, end_ms, tz,
-                    location, attendees_json, recurrence_json, color, created_at, parent_id
-             FROM calendar_events
-             WHERE recurrence_json IS NOT NULL AND parent_id IS NULL
-             ORDER BY start_ms ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        )> = sqlx::query_as(RECURRING_MASTER_EVENTS_SELECT)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -2309,17 +2532,11 @@ impl Storage for PostgresStorage {
             Option<String>,
             String,
             Option<String>,
-        )> = sqlx::query_as(
-            "SELECT id, message_id, organizer, title, description, start_ms, end_ms, tz,
-                    location, attendees_json, recurrence_json, color, created_at, parent_id
-             FROM calendar_events
-             WHERE parent_id IS NOT NULL AND start_ms < $2 AND end_ms > $1
-             ORDER BY start_ms ASC",
-        )
-        .bind(from_ms as i64)
-        .bind(to_ms as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        )> = sqlx::query_as(CALENDAR_EXCEPTIONS_IN_RANGE_SELECT)
+            .bind(from_ms as i64)
+            .bind(to_ms as i64)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -2405,13 +2622,9 @@ impl Storage for PostgresStorage {
         &self,
     ) -> Result<Vec<OperatorHostingContract>, StorageError> {
         let rows: Vec<(String, String, String, i64, i64, Option<i64>, String)> =
-            sqlx::query_as(
-                "SELECT id, tenant_pubkey, operator_pubkey, sats_per_day, started_at, last_paid_at, state
-                 FROM operator_hosting_contracts
-                 ORDER BY started_at ASC",
-            )
-            .fetch_all(&self.pool)
-            .await?;
+            sqlx::query_as(OPERATOR_HOSTING_CONTRACTS_SELECT)
+                .fetch_all(&self.pool)
+                .await?;
 
         rows.into_iter()
             .map(|(id, tenant, operator, sats, started, last_paid, state)| {
@@ -2498,16 +2711,10 @@ impl Storage for PostgresStorage {
             String,
             Option<String>,
             Option<String>,
-        )> = sqlx::query_as(
-            "SELECT payment_hash, contract_id, tenant_pubkey, operator_pubkey, amount_msat,
-                    paid_at, direction, preimage, memo
-             FROM operator_hosting_payments
-             WHERE contract_id = $1
-             ORDER BY paid_at DESC",
-        )
-        .bind(contract_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
+        )> = sqlx::query_as(OPERATOR_HOSTING_PAYMENTS_SELECT)
+            .bind(contract_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter()
             .map(|(hash, id, tenant, operator, amount, paid_at, direction, preimage, memo)| {
@@ -2529,5 +2736,104 @@ impl konsensus_core::gate::NonceStore for PostgresStorage {
         sender: &NodeId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.store_nonce(nonce, sender).await?)
+    }
+
+    async fn check_and_store_payment_hash(
+        &self,
+        payment_hash: &[u8; 32],
+        sender: &NodeId,
+        message_id: &MessageId,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.store_payment_receipt(payment_hash, sender, message_id).await?)
+    }
+}
+
+#[cfg(test)]
+mod dbh2_guard {
+    /// DBH2: the Postgres sibling authority-listing queries
+    /// (`list_sessions`, `get_pending_peers`, `get_room_members`) must never
+    /// regain a `LIMIT` — each is a durable authority where a cap is a
+    /// Principle-2 fail-open at scale, identical in shape to the DBH1
+    /// `list_peers` truncation. CI has no Postgres service, so this string
+    /// assertion plus code symmetry with the SQLite backend is the in-CI proof;
+    /// the only true Postgres proof is the operator's GA-drill against a live
+    /// Postgres node, which is out of scope for the autonomous build.
+    #[test]
+    fn sessions_select_is_unbounded() {
+        assert!(
+            !super::SESSIONS_SELECT.to_uppercase().contains("LIMIT"),
+            "postgres SESSIONS_SELECT must not contain LIMIT (DBH2 fail-open guard): {}",
+            super::SESSIONS_SELECT
+        );
+    }
+
+    #[test]
+    fn pending_peers_select_is_unbounded() {
+        assert!(
+            !super::PENDING_PEERS_SELECT.to_uppercase().contains("LIMIT"),
+            "postgres PENDING_PEERS_SELECT must not contain LIMIT (DBH2 fail-open guard): {}",
+            super::PENDING_PEERS_SELECT
+        );
+    }
+
+    #[test]
+    fn room_members_select_is_unbounded() {
+        assert!(
+            !super::ROOM_MEMBERS_SELECT.to_uppercase().contains("LIMIT"),
+            "postgres ROOM_MEMBERS_SELECT must not contain LIMIT (DBH2 fail-open guard): {}",
+            super::ROOM_MEMBERS_SELECT
+        );
+    }
+}
+
+#[cfg(test)]
+mod hard4_guard {
+    // CI has no Postgres service (see ci.yml), so the Postgres HARD-4 path is
+    // verified by code symmetry with the SQLite impl plus this const-string
+    // guard — the same approach DBH1/DBH2 used for their Postgres guards. The
+    // only true Postgres proof is the operator's GA-drill against a live node.
+    use super::*;
+
+    #[test]
+    fn hard4_postgres_select_consts_have_no_limit() {
+        for (name, sql) in [
+            ("PENDING_FOR_PEER_SELECT", PENDING_FOR_PEER_SELECT),
+            ("INVITES_ISSUED_SELECT", INVITES_ISSUED_SELECT),
+            ("RECURRING_MASTER_EVENTS_SELECT", RECURRING_MASTER_EVENTS_SELECT),
+            (
+                "CALENDAR_EXCEPTIONS_IN_RANGE_SELECT",
+                CALENDAR_EXCEPTIONS_IN_RANGE_SELECT,
+            ),
+            (
+                "OPERATOR_HOSTING_CONTRACTS_SELECT",
+                OPERATOR_HOSTING_CONTRACTS_SELECT,
+            ),
+            (
+                "OPERATOR_HOSTING_PAYMENTS_SELECT",
+                OPERATOR_HOSTING_PAYMENTS_SELECT,
+            ),
+        ] {
+            assert!(
+                !sql.to_ascii_uppercase().contains("LIMIT"),
+                "HARD-4: {name} must stay COMPLETE — a bare LIMIT re-creates the \
+                 DBH1/DBH2 silent fail-open. Use a streaming/chunked complete-set \
+                 read if a memory bound is genuinely needed."
+            );
+        }
+    }
+
+    /// DBH1: the Postgres peer-listing query must never regain a `LIMIT` clause —
+    /// that silently truncates the durable gate-whitelist authority on a node
+    /// with more than 1000 peers (Principle-2 fail-open). CI has no Postgres service, so
+    /// this string assertion + code symmetry with the SQLite backend is the in-CI
+    /// proof. The only true Postgres proof is the operator's GA-drill against a
+    /// live Postgres node, which is out of scope for the autonomous build.
+    #[test]
+    fn peers_select_is_unbounded() {
+        assert!(
+            !super::PEERS_SELECT.to_uppercase().contains("LIMIT"),
+            "postgres PEERS_SELECT must not contain LIMIT (DBH1 fail-open guard): {}",
+            super::PEERS_SELECT
+        );
     }
 }

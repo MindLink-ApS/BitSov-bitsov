@@ -27,12 +27,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, instrument};
 
 use konsensus_core::traits::lightning::{
-    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection, PaymentStatus,
+    InboundPayment, Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection,
+    PaymentStatus,
 };
 
 /// Configuration for the mock provider.
@@ -51,6 +54,10 @@ impl Default for MockLightningConfig {
     }
 }
 
+/// A `(payment_hash, binding_tlv)` pair recorded by the mock's
+/// `keysend_with_binding` send-half (test/inspection only).
+type SentBinding = (String, Vec<u8>);
+
 /// In-memory Lightning provider for testnet and development.
 ///
 /// Invoices start as `Pending` until explicitly paid. Payment proofs are
@@ -60,6 +67,21 @@ pub struct MockLightningProvider {
     balance_msat: Arc<Mutex<u64>>,
     /// Stored invoices/payments by payment hash.
     payments: Arc<Mutex<HashMap<String, PaymentDetails>>>,
+    /// Broadcast sender for settled INBOUND payments surfaced by
+    /// `watch_inbound_keysend`. Test code drives it via `inject_inbound_keysend`.
+    inbound_tx: broadcast::Sender<InboundPayment>,
+    /// Record of `(payment_hash, binding_tlv)` pairs pushed via
+    /// `keysend_with_binding`, so a test can assert the send-half threaded the
+    /// ADR-037 binding verbatim. Test/inspection only.
+    sent_bindings: Arc<Mutex<Vec<SentBinding>>>,
+    /// Test knob: when `Some(n)`, the next `keysend` returns `InFlight` (carrying
+    /// a payment hash but no preimage) instead of settling synchronously, and
+    /// `get_payment_status` reports `InFlight` for `n` polls before flipping to
+    /// `Settled`. Lets a test exercise the in-flight → settled poll path that
+    /// real Lightning takes. `None` (default) = synchronous settle.
+    keysend_defer_polls: Arc<Mutex<Option<u32>>>,
+    /// Per-hash remaining `InFlight` polls for the deferred-settlement knob.
+    pending_settle: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl MockLightningProvider {
@@ -70,10 +92,31 @@ impl MockLightningProvider {
 
     /// Create a new mock provider with custom config.
     pub fn with_config(config: MockLightningConfig) -> Self {
+        let (inbound_tx, _) = broadcast::channel(256);
         Self {
             balance_msat: Arc::new(Mutex::new(config.initial_balance_msat)),
             payments: Arc::new(Mutex::new(HashMap::new())),
+            inbound_tx,
+            sent_bindings: Arc::new(Mutex::new(Vec::new())),
+            keysend_defer_polls: Arc::new(Mutex::new(None)),
+            pending_settle: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Test-only: arm the next [`LightningProvider::keysend`] to return
+    /// `InFlight` and only report `Settled` after `polls`
+    /// [`LightningProvider::get_payment_status`] calls — simulating a real HTLC
+    /// that settles asynchronously a moment after dispatch.
+    pub async fn defer_next_keysend_settlement(&self, polls: u32) {
+        *self.keysend_defer_polls.lock().await = Some(polls);
+    }
+
+    /// Test/inspection-only: the `(payment_hash, binding_tlv)` pairs pushed via
+    /// [`LightningProvider::keysend_with_binding`], in send order. Lets a test
+    /// assert the send-half threaded the ADR-037 binding bytes verbatim onto the
+    /// keysend without a real network.
+    pub async fn sent_bindings(&self) -> Vec<SentBinding> {
+        self.sent_bindings.lock().await.clone()
     }
 
     /// Generate a random preimage and its SHA256 hash.
@@ -83,6 +126,53 @@ impl MockLightningProvider {
         rand::thread_rng().fill_bytes(&mut preimage);
         let hash: [u8; 32] = Sha256::digest(preimage).into();
         (preimage, hash)
+    }
+
+    /// Test/simulation-only: inject a settled, INBOUND keysend as if a
+    /// counterparty pushed a spontaneous payment to us. Mirrors [`Self::keysend`]
+    /// but flips `direction` to `Incoming`, records the settled record in the
+    /// payments map so the gate's `get_payment_status` poll finds it, and emits it
+    /// on the `watch_inbound_keysend` stream. Returns the `payment_hash` (hex).
+    ///
+    /// This is the keystone of the mock-first R2 proof: the mock is the only
+    /// backend that can deterministically drive an unsolicited inbound keysend in
+    /// a unit test, so it proves the receive→verify→admit wiring with no network.
+    /// The preimage hashes to the returned `payment_hash` (a cryptographically
+    /// valid proof the payment gate accepts).
+    pub async fn inject_inbound_keysend(
+        &self,
+        amount_msat: u64,
+        binding_tlv: Option<Vec<u8>>,
+    ) -> String {
+        let (preimage, hash) = Self::generate_proof();
+        let payment_hash = hex::encode(hash);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let details = PaymentDetails {
+            payment_hash: payment_hash.clone(),
+            preimage: Some(hex::encode(preimage)),
+            amount_msat,
+            status: PaymentStatus::Settled,
+            direction: PaymentDirection::Incoming,
+            timestamp: now,
+            memo: None,
+            fee_msat: None,
+        };
+        // Poll-consistency: the gate's verify_settlement poll
+        // (`get_payment_status`) must find this exact settled record.
+        self.payments
+            .lock()
+            .await
+            .insert(payment_hash.clone(), details.clone());
+        // Emit on the inbound stream. A send error only means no subscriber is
+        // currently listening; the record is still persisted for the poll path.
+        let _ = self.inbound_tx.send(InboundPayment {
+            details,
+            binding_tlv,
+        });
+        payment_hash
     }
 
     /// Encode a mock BOLT11 string that carries the preimage for cross-instance pay.
@@ -261,6 +351,28 @@ impl LightningProvider for MockLightningProvider {
         &self,
         payment_hash: &str,
     ) -> Result<PaymentDetails, LightningError> {
+        // Deferred-settlement test knob: report InFlight (masking the preimage)
+        // until the per-hash poll counter drains, then fall through to the
+        // stored Settled record.
+        {
+            let mut pending = self.pending_settle.lock().await;
+            if let Some(remaining) = pending.get_mut(payment_hash) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    let mut d = self
+                        .payments
+                        .lock()
+                        .await
+                        .get(payment_hash)
+                        .cloned()
+                        .ok_or_else(|| LightningError::PaymentNotFound(payment_hash.to_string()))?;
+                    d.status = PaymentStatus::InFlight;
+                    d.preimage = None;
+                    return Ok(d);
+                }
+                pending.remove(payment_hash);
+            }
+        }
         self.payments
             .lock()
             .await
@@ -285,6 +397,26 @@ impl LightningProvider for MockLightningProvider {
 
     async fn is_available(&self) -> bool {
         true
+    }
+
+    async fn watch_inbound_keysend(
+        &self,
+    ) -> Result<BoxStream<'static, InboundPayment>, LightningError> {
+        let rx = self.inbound_tx.subscribe();
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(item) => return Some((item, rx)),
+                    // A lagged consumer skips missed items rather than ending the
+                    // stream. (The LDK backend's authoritative admission path will
+                    // use mpsc backpressure so a settled payment is never dropped;
+                    // the mock keeps the stream alive for test ergonomics.)
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        Ok(stream.boxed())
     }
 
     #[instrument(skip(self))]
@@ -332,6 +464,22 @@ impl LightningProvider for MockLightningProvider {
             fee_msat: None,
         };
 
+        // Test knob: optionally return in-flight and only settle on later polls,
+        // keyed by the raw hash so `get_payment_status` can find and settle it.
+        if let Some(n) = self.keysend_defer_polls.lock().await.take() {
+            self.payments
+                .lock()
+                .await
+                .insert(payment_hash.clone(), details.clone());
+            self.pending_settle.lock().await.insert(payment_hash.clone(), n);
+            debug!(payment_hash = %payment_hash, polls = n, "mock keysend in-flight (deferred settle)");
+            return Ok(PaymentDetails {
+                status: PaymentStatus::InFlight,
+                preimage: None,
+                ..details
+            });
+        }
+
         self.payments
             .lock()
             .await
@@ -342,6 +490,43 @@ impl LightningProvider for MockLightningProvider {
             dest = %dest_pubkey,
             amount_msat,
             "mock keysend settled"
+        );
+
+        Ok(details)
+    }
+
+    #[instrument(skip(self, binding_tlv))]
+    async fn keysend_with_binding(
+        &self,
+        dest_pubkey: &str,
+        amount_msat: u64,
+        binding_tlv: &[u8],
+    ) -> Result<PaymentDetails, LightningError> {
+        if binding_tlv.is_empty() {
+            return Err(LightningError::Backend(
+                "binding-TLV keysend requires a non-empty binding".into(),
+            ));
+        }
+
+        // Reuse the bare-keysend settlement path (balance debit, proof, record).
+        let details = self.keysend(dest_pubkey, amount_msat, None).await?;
+
+        // Record the ADR-037 binding the send-half threaded onto this keysend so
+        // a test can assert it round-trips verbatim. The mock models a single
+        // node, so this does NOT loop back to our own `watch_inbound_keysend`
+        // (that would conflate send and receive on one node); the true on-wire
+        // join is exercised by the LDK regtest round-trip test.
+        self.sent_bindings
+            .lock()
+            .await
+            .push((details.payment_hash.clone(), binding_tlv.to_vec()));
+
+        debug!(
+            payment_hash = %details.payment_hash,
+            dest = %dest_pubkey,
+            amount_msat,
+            binding_len = binding_tlv.len(),
+            "mock keysend_with_binding settled"
         );
 
         Ok(details)

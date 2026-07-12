@@ -147,6 +147,7 @@ fn encrypt_decrypt_raw() {
     let wrapper = EncryptedStorage {
         inner: (), // won't be used
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let plaintext = b"Principle 4: no plaintext at any layer";
@@ -166,6 +167,7 @@ fn decrypt_truncated_data_too_short() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let result = wrapper.decrypt(&[1, 2, 3, 4, 5]);
@@ -182,6 +184,7 @@ fn decrypt_exactly_12_bytes_nonce_only() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let result = wrapper.decrypt(&[0u8; 12]);
@@ -198,6 +201,7 @@ fn decrypt_corrupted_aead_tag() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let plaintext = b"sensitive data";
@@ -219,6 +223,7 @@ fn decrypt_corrupted_nonce() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let plaintext = b"sensitive data";
@@ -239,6 +244,7 @@ fn encrypt_empty_plaintext() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let encrypted = wrapper.encrypt(b"").unwrap();
@@ -257,6 +263,7 @@ fn encrypt_produces_different_ciphertext_each_time() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let plaintext = b"same plaintext";
@@ -305,6 +312,7 @@ fn decrypt_empty_data() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let result = wrapper.decrypt(&[]);
@@ -320,6 +328,7 @@ fn encrypt_decrypt_string_roundtrip() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let original = "192.0.2.11:9736";
@@ -338,6 +347,7 @@ fn encrypt_opt_string_none_stays_none() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let result = wrapper.encrypt_opt_string(&None).unwrap();
@@ -353,6 +363,7 @@ fn encrypt_opt_string_some_roundtrips() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let original = Some("Alice".to_string());
@@ -370,6 +381,7 @@ fn encrypt_json_roundtrip() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let original = serde_json::json!({"role": "admin", "notes": "trusted peer"});
@@ -387,6 +399,7 @@ fn encrypt_json_empty_object() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let original = serde_json::json!({});
@@ -403,6 +416,7 @@ fn decrypt_json_unencrypted_passthrough() {
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
+        peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let original = serde_json::json!({"key": "value"});
@@ -532,10 +546,15 @@ async fn file_metadata_encrypted_at_rest() {
     assert_eq!(retrieved.mime_type, "application/pdf");
     assert_eq!(retrieved.data, vec![1, 2, 3, 4, 5]);
 
-    // Read raw — filename and mime_type encrypted
+    // Read raw — filename, mime_type, and bytes encrypted
     let raw = store.inner().get_file("file-001").await.unwrap().unwrap();
     assert_ne!(raw.filename, "confidential_report.pdf");
     assert_ne!(raw.mime_type, "application/pdf");
+    assert_ne!(raw.data, vec![1, 2, 3, 4, 5]);
+    assert!(
+        raw.data.len() > 5,
+        "encrypted file bytes should include nonce + authentication tag"
+    );
 }
 
 #[tokio::test]
@@ -875,6 +894,230 @@ async fn encrypted_upsert_peer_preserves_invite_ref_metadata() {
     assert_eq!(peer.metadata["source"], "manual");
     assert_eq!(peer.metadata["invite_ref"], invite_id.to_string());
     assert_eq!(peer.metadata["whitelist_source"], "invite");
+}
+
+/// HARD-3 regression: many concurrent `upsert_peer` calls on the same peer must
+/// never lose the `invite_ref` / `whitelist_source` metadata set by an earlier
+/// whitelist write. The pre-fix read-decrypt-merge-encrypt-write was not atomic,
+/// so two writers racing on the same node could each read the same "before"
+/// state and the loser's write would clobber the winner's preserved invite_ref.
+#[tokio::test]
+async fn encrypted_upsert_peer_concurrent_preserves_invite_ref() {
+    use std::sync::Arc;
+
+    let sqlite = SqliteStorage::in_memory().await.unwrap();
+    let key = [7u8; 32];
+    let store = Arc::new(EncryptedStorage::new(sqlite, &key));
+
+    let invitee_pubkey = [0xADu8; 32];
+    let invitee = NodeId::from_bytes(invitee_pubkey);
+    let invite_id = uuid::Uuid::new_v4();
+
+    // Seed the invite_ref / whitelist_source metadata.
+    store
+        .add_whitelisted_peer_with_invite_ref(invitee_pubkey, invite_id)
+        .await
+        .unwrap();
+
+    // Fire many concurrent updates, each carrying metadata that does NOT
+    // include invite_ref. Every one of them must preserve it.
+    let mut handles = Vec::new();
+    for i in 0..32u32 {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            let mut peer = Peer::new(invitee);
+            peer.display_name = Some(format!("name-{i}"));
+            peer.metadata = serde_json::json!({ "round": i });
+            store.upsert_peer(&peer).await.unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let peer = store.get_peer(&invitee).await.unwrap().unwrap();
+    assert_eq!(
+        peer.metadata["invite_ref"],
+        invite_id.to_string(),
+        "invite_ref must survive concurrent upserts"
+    );
+    assert_eq!(peer.metadata["whitelist_source"], "invite");
+    // The last writer wins on the non-preserved keys, so exactly one `round`
+    // value remains — proving updates were serialised rather than torn.
+    assert!(peer.metadata["round"].is_u64());
+}
+
+/// HARD-3 regression: a whitelist write racing concurrent `upsert_peer` calls on
+/// the encrypted layer must still land the `invite_ref`. The pre-fix code let an
+/// `upsert_peer` that read the peer *before* the whitelist write commit, then
+/// wrote *after* it, silently drop the invite_ref from the encrypted blob.
+#[tokio::test]
+async fn encrypted_whitelist_write_races_upsert_keeps_invite_ref() {
+    use std::sync::Arc;
+
+    let sqlite = SqliteStorage::in_memory().await.unwrap();
+    let key = [9u8; 32];
+    let store = Arc::new(EncryptedStorage::new(sqlite, &key));
+
+    let invitee_pubkey = [0xAEu8; 32];
+    let invitee = NodeId::from_bytes(invitee_pubkey);
+    let invite_id = uuid::Uuid::new_v4();
+
+    // Pre-create the peer row (no invite_ref yet).
+    let mut seed = Peer::new(invitee);
+    seed.display_name = Some("seed".into());
+    store.upsert_peer(&seed).await.unwrap();
+
+    // Race the whitelist write against a barrage of plain upserts.
+    let mut handles = Vec::new();
+    {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            store
+                .add_whitelisted_peer_with_invite_ref(invitee_pubkey, invite_id)
+                .await
+                .unwrap();
+        }));
+    }
+    for i in 0..16u32 {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            let mut peer = Peer::new(invitee);
+            peer.metadata = serde_json::json!({ "round": i });
+            store.upsert_peer(&peer).await.unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let peer = store.get_peer(&invitee).await.unwrap().unwrap();
+    assert_eq!(
+        peer.metadata["invite_ref"],
+        invite_id.to_string(),
+        "invite_ref must survive the whitelist-write / upsert race"
+    );
+    assert_eq!(peer.metadata["whitelist_source"], "invite");
+}
+
+/// Principle 4 (P4) regression: after `add_invite_and_whitelist`, the invite tag
+/// (`invite_ref` / `whitelist_source`) must be CIPHERTEXT at rest in the inner
+/// backend — never plaintext JSON. The pre-fix wrapper delegated the peer write
+/// straight to the inner backend, which built and stored the metadata as
+/// plaintext JSON, leaving the invite reference readable on the operator's disk
+/// until a later `upsert_peer` happened to re-encrypt it.
+#[tokio::test]
+async fn encrypted_add_invite_and_whitelist_metadata_is_ciphertext_at_rest() {
+    let sqlite = SqliteStorage::in_memory().await.unwrap();
+    let key = [7u8; 32];
+    let store = EncryptedStorage::new(sqlite, &key);
+
+    let invitee_pubkey = [0xB1u8; 32];
+    let invitee = NodeId::from_bytes(invitee_pubkey);
+    let invite_id = uuid::Uuid::new_v4();
+    let invite = InviteIssuedRecord {
+        id: invite_id,
+        invitee_pubkey,
+        expiry_unix: 1_900_000_000,
+        channel_size_hint_sats: Some(25_000),
+        addr: "127.0.0.1:9735".to_string(),
+        max_fee_rate_sat_per_vb: Some(25),
+        channel_open_intent_expiry_unix: Some(1_900_000_000),
+        nonce: [8u8; 16],
+        state: InviteState::Pending,
+        created_at: 1_800_000_000,
+        accepted_at: None,
+        revoked_at: None,
+    };
+
+    store
+        .add_invite_and_whitelist(&invite, invitee_pubkey)
+        .await
+        .unwrap();
+
+    // Through the wrapper: plaintext is recoverable (decrypts correctly).
+    let peer = store.get_peer(&invitee).await.unwrap().unwrap();
+    assert_eq!(peer.metadata["invite_ref"], invite_id.to_string());
+    assert_eq!(peer.metadata["whitelist_source"], "invite");
+
+    // At rest in the inner backend: the metadata is an opaque ciphertext string,
+    // NOT a JSON object, and does NOT leak the invite reference or marker.
+    let raw = store.inner().get_peer(&invitee).await.unwrap().unwrap();
+    let raw_blob = raw.metadata.as_str().expect(
+        "inner peer metadata must be an encrypted string scalar, not a plaintext JSON object",
+    );
+    let invite_id_str = invite_id.to_string();
+    assert!(
+        !raw_blob.contains(&invite_id_str),
+        "invite_ref leaked as plaintext at rest: {raw_blob}"
+    );
+    assert!(
+        !raw_blob.contains("invite_ref"),
+        "invite_ref key leaked as plaintext at rest: {raw_blob}"
+    );
+    assert!(
+        !raw_blob.contains("whitelist_source"),
+        "whitelist_source key leaked as plaintext at rest: {raw_blob}"
+    );
+    // Decrypting the blob with the storage key yields the real plaintext object.
+    let decrypted = store
+        .decrypt_json(&raw.metadata)
+        .expect("ciphertext blob must decrypt with the storage key");
+    assert_eq!(decrypted["invite_ref"], invite_id_str);
+    assert_eq!(decrypted["whitelist_source"], "invite");
+}
+
+/// P4 regression for the standalone whitelist write path. Same invariant as
+/// `encrypted_add_invite_and_whitelist_metadata_is_ciphertext_at_rest`, exercised
+/// through `add_whitelisted_peer_with_invite_ref`, including the case where an
+/// encrypted peer row already exists (its prior metadata must survive and stay
+/// encrypted alongside the new invite tag).
+#[tokio::test]
+async fn encrypted_add_whitelisted_peer_metadata_is_ciphertext_at_rest() {
+    let sqlite = SqliteStorage::in_memory().await.unwrap();
+    let key = [5u8; 32];
+    let store = EncryptedStorage::new(sqlite, &key);
+
+    let invitee_pubkey = [0xB2u8; 32];
+    let invitee = NodeId::from_bytes(invitee_pubkey);
+    let invite_id = uuid::Uuid::new_v4();
+
+    // Pre-existing encrypted peer with prior metadata that must be preserved.
+    let mut seed = Peer::new(invitee);
+    seed.display_name = Some("seed-name".to_string());
+    seed.metadata = serde_json::json!({ "note": "prior-secret" });
+    store.upsert_peer(&seed).await.unwrap();
+
+    store
+        .add_whitelisted_peer_with_invite_ref(invitee_pubkey, invite_id)
+        .await
+        .unwrap();
+
+    // Through the wrapper: invite tag landed AND the prior metadata survived.
+    let peer = store.get_peer(&invitee).await.unwrap().unwrap();
+    assert_eq!(peer.metadata["invite_ref"], invite_id.to_string());
+    assert_eq!(peer.metadata["whitelist_source"], "invite");
+    assert_eq!(peer.metadata["note"], "prior-secret");
+    assert_eq!(peer.display_name.as_deref(), Some("seed-name"));
+
+    // At rest: ciphertext string, no plaintext leakage of the tag or the prior
+    // secret.
+    let raw = store.inner().get_peer(&invitee).await.unwrap().unwrap();
+    let raw_blob = raw
+        .metadata
+        .as_str()
+        .expect("inner peer metadata must be an encrypted string scalar");
+    assert!(
+        !raw_blob.contains("invite_ref")
+            && !raw_blob.contains("whitelist_source")
+            && !raw_blob.contains(&invite_id.to_string())
+            && !raw_blob.contains("prior-secret"),
+        "invite tag or prior metadata leaked as plaintext at rest: {raw_blob}"
+    );
+    let decrypted = store.decrypt_json(&raw.metadata).unwrap();
+    assert_eq!(decrypted["invite_ref"], invite_id.to_string());
+    assert_eq!(decrypted["whitelist_source"], "invite");
+    assert_eq!(decrypted["note"], "prior-secret");
 }
 
 #[async_trait]

@@ -449,8 +449,27 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
     );
 
     // ── 13. Verify balance changes ──────────────────────────────────────
-    let channels_a_after = provider_a.list_channels().await.unwrap();
-    let channels_b_after = provider_b.list_channels().await.unwrap();
+    // A's local balance should decrease and B's should increase after the
+    // payment settles. The sender (A) debits immediately, but the receiver (B)
+    // only reflects the credit in `list_channels()` after the post-settlement
+    // commitment round-trip, which can lag A's debit by a few hundred ms. Poll
+    // until both balances reflect rather than reading a single early snapshot.
+    // This is a settlement-reflection timing wait, NOT an assertion relaxation:
+    // a genuine failure to credit B still trips the asserts below on timeout.
+    let mut channels_a_after = provider_a.list_channels().await.unwrap();
+    let mut channels_b_after = provider_b.list_channels().await.unwrap();
+    for _ in 0..40 {
+        let a_decreased =
+            channels_a_after[0].local_balance_msat < channels_a[0].local_balance_msat;
+        let b_increased =
+            channels_b_after[0].local_balance_msat > channels_b[0].local_balance_msat;
+        if a_decreased && b_increased {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        channels_a_after = provider_a.list_channels().await.unwrap();
+        channels_b_after = provider_b.list_channels().await.unwrap();
+    }
 
     // A's local balance should have decreased
     assert!(
@@ -592,4 +611,156 @@ async fn ldk_keysend_payment() {
     assert_eq!(keysend_payment.status, PaymentStatus::Settled);
 
     println!("=== B8 Keysend Test PASSED ===");
+}
+
+/// R2 seam-3c: on-wire proof that `keysend_with_binding` delivers the ADR-037
+/// binding TLV across a real regtest channel.
+///
+/// This closes the one integration gap the unit tests cannot cover: that a
+/// custom (odd) application TLV pushed via `SpontaneousPayment::send_with_custom_tlvs`
+/// actually survives a real HTLC and arrives in the recipient's
+/// `Event::PaymentReceived.custom_records`. Everything downstream of that event
+/// — the drainer fan-out, `extract_binding_tlv`, and the `watch_inbound_keysend`
+/// stream — is already proven in-process by unit tests (mock keystone,
+/// `ldk_event_drain`, and the `extract_binding_tlv` suite), so here we assert the
+/// wire delivery that only two real nodes can demonstrate.
+#[tokio::test(flavor = "multi_thread")]
+async fn ldk_keysend_with_binding_delivers_adr037_tlv_on_wire() {
+    // The agreed BitSov binding TLV type (ADR-037). Must match
+    // `BITSOV_BINDING_TLV_TYPE` in `ldk.rs` (private there; pinned here so a
+    // drift in the const is caught by this on-wire assertion). Odd per BOLT-1.
+    const BITSOV_BINDING_TLV_TYPE: u64 = 0x4253_4F56_0001;
+
+    // ── Setup (mirrors ldk_keysend_payment) ─────────────────────────────
+    println!("Starting bitcoind + electrsd...");
+    let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+    let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
+
+    let port_a = random_port();
+    let port_b = random_port();
+    let (node_a_raw, _dir_a) = build_ldk_node(&esplora_url, port_a);
+    let (node_b_raw, _dir_b) = build_ldk_node(&esplora_url, port_b);
+
+    let provider_a = LdkProvider::from_node(Arc::new(node_a_raw));
+    let provider_b = LdkProvider::from_node(Arc::new(node_b_raw));
+
+    mine_blocks_and_sync(
+        &bitcoind,
+        &electrsd,
+        &[provider_a.node(), provider_b.node()],
+        101,
+    )
+    .await;
+
+    // Fund node A
+    let addr_a = provider_a.node().onchain_payment().new_address().unwrap();
+    let send_amounts =
+        serde_json::json!({ addr_a.to_string(): Amount::from_sat(2_100_000).to_btc() });
+    bitcoind
+        .client
+        .call::<serde_json::Value>("sendmany", &[serde_json::json!(""), send_amounts])
+        .unwrap();
+    mine_blocks_and_sync(
+        &bitcoind,
+        &electrsd,
+        &[provider_a.node(), provider_b.node()],
+        1,
+    )
+    .await;
+
+    // Open channel A -> B, push half so B can be paid immediately
+    let b_addr = provider_b
+        .node()
+        .listening_addresses()
+        .unwrap()
+        .first()
+        .unwrap()
+        .clone();
+    provider_a
+        .node()
+        .open_channel(
+            provider_b.node().node_id(),
+            b_addr,
+            1_000_000,
+            Some(500_000_000),
+            None,
+        )
+        .unwrap();
+
+    let _ = expect_event(provider_a.node(), 30).await;
+    provider_a.node().event_handled().unwrap();
+    let _ = expect_event(provider_b.node(), 30).await;
+    provider_b.node().event_handled().unwrap();
+
+    mine_blocks_and_sync(
+        &bitcoind,
+        &electrsd,
+        &[provider_a.node(), provider_b.node()],
+        6,
+    )
+    .await;
+
+    let _ = expect_event(provider_a.node(), 30).await;
+    provider_a.node().event_handled().unwrap();
+    let _ = expect_event(provider_b.node(), 30).await;
+    provider_b.node().event_handled().unwrap();
+
+    // ── Send a keysend carrying the ADR-037 binding ─────────────────────
+    let pubkey_b = provider_b.get_node_pubkey().await.unwrap();
+    let amount_msat: u64 = 50_000;
+    let binding = b"r2-seam3c-envelope-binding-pointer".to_vec();
+
+    println!("A keysend_with_binding -> B ({pubkey_b}), {} byte binding...", binding.len());
+    let payment = provider_a
+        .keysend_with_binding(&pubkey_b, amount_msat, &binding)
+        .await
+        .expect("keysend_with_binding should succeed over a real channel");
+    assert_eq!(payment.direction, PaymentDirection::Outgoing);
+
+    // A: PaymentSuccessful
+    let ev_a = expect_event(provider_a.node(), 30).await;
+    assert!(
+        matches!(ev_a, ldk_node::Event::PaymentSuccessful { .. }),
+        "Expected PaymentSuccessful on A, got: {ev_a:?}"
+    );
+    provider_a.node().event_handled().unwrap();
+
+    // B: PaymentReceived — MUST carry our binding TLV in custom_records
+    let ev_b = expect_event(provider_b.node(), 30).await;
+    let (recv_amount, custom_records) = match &ev_b {
+        ldk_node::Event::PaymentReceived {
+            amount_msat,
+            custom_records,
+            ..
+        } => (*amount_msat, custom_records.clone()),
+        other => panic!("Expected PaymentReceived on B, got: {other:?}"),
+    };
+    provider_b.node().event_handled().unwrap();
+
+    assert_eq!(recv_amount, amount_msat, "received amount matches sent");
+
+    // ── ON-WIRE PROOF ───────────────────────────────────────────────────
+    // Exactly one BitSov binding record arrived, with the bytes verbatim.
+    let bitsov_records: Vec<_> = custom_records
+        .iter()
+        .filter(|r| r.type_num == BITSOV_BINDING_TLV_TYPE)
+        .collect();
+    assert_eq!(
+        bitsov_records.len(),
+        1,
+        "exactly one BitSov binding TLV must arrive (the send-side single-record \
+         invariant the receiver's duplicate-guard relies on); got {} (all type_nums: {:?})",
+        bitsov_records.len(),
+        custom_records.iter().map(|r| r.type_num).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        bitsov_records[0].value, binding,
+        "the binding bytes must survive the real HTLC verbatim — this is exactly \
+         the input the receive-half's extract_binding_tlv consumes"
+    );
+
+    println!(
+        "=== R2 seam-3c PASSED: ADR-037 binding TLV ({} bytes) delivered on-wire ===",
+        binding.len()
+    );
 }

@@ -93,6 +93,70 @@ pub async fn cmd_scb_restore(
         }
     }
 
+    // RV-RESTORE consumer: the SCB above carries only LDK channel-monitor state.
+    // The gate whitelist (peers + accepted_invites in konsensus.db) lives in the
+    // encrypted `whitelist-latest.aes` sidecar the node writes on the SCB cadence.
+    // Apply it (if present) to the LIVE konsensus.db — independent of the --confirm
+    // force-close gate below, because it is non-destructive relationship recovery —
+    // so the restored node re-admits invite-onboarded peers at the gate on next
+    // start. Look next to the SCB first, then the configured backup dir.
+    println!();
+    // Provenance guard (Codex #208): only AUTO-apply a whitelist sidecar from a
+    // trusted location. A sidecar beside `--from` is trusted ONLY when `--from`
+    // itself lives in the configured backup dir; a sidecar merely co-located with
+    // an out-of-backup-dir `--from` (e.g. an unrelated `whitelist-latest.aes` in
+    // /tmp) has unverified provenance and could re-admit an UNRELATED node's peers
+    // into the gate whitelist, so it is never applied silently. The configured
+    // backup dir is always trusted; anything else must be applied deliberately via
+    // `konsensus whitelist restore`.
+    let configured =
+        Path::new(&config.backup.scb_dir).join(crate::whitelist_cmd::WHITELIST_BACKUP_NAME);
+    let sidecar_beside = from
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(crate::whitelist_cmd::WHITELIST_BACKUP_NAME);
+    let from_in_backup_dir = {
+        let backup_dir_canon = canonical_target(Path::new(&config.backup.scb_dir)).ok();
+        let from_dir_canon =
+            canonical_target(from.parent().unwrap_or_else(|| Path::new("."))).ok();
+        matches!((backup_dir_canon, from_dir_canon), (Some(b), Some(f)) if b == f)
+    };
+    let sidecar = if from_in_backup_dir && sidecar_beside.exists() {
+        Some(sidecar_beside.clone())
+    } else if configured.exists() {
+        Some(configured.clone())
+    } else {
+        None
+    };
+    // A sidecar sitting beside an out-of-backup-dir `--from` is NOT auto-applied —
+    // surface it so the operator can apply it deliberately after verifying it.
+    if !from_in_backup_dir && sidecar_beside.exists() {
+        println!(
+            "NOTE: a whitelist sidecar ({}) sits next to --from but OUTSIDE the configured \
+             backup dir {} — NOT auto-applying it (unverified provenance). If you trust it, \
+             apply it explicitly: konsensus whitelist restore --from {}",
+            crate::whitelist_cmd::WHITELIST_BACKUP_NAME,
+            config.backup.scb_dir,
+            sidecar_beside.display()
+        );
+    }
+    match sidecar {
+        Some(path) => {
+            crate::whitelist_cmd::cmd_whitelist_restore(config_path, mnemonic_password, &path)
+                .await
+                .context("whitelist sidecar restore failed")?;
+        }
+        None => {
+            println!(
+                "No whitelist sidecar ({}) found next to the SCB or in {} — peer/invite \
+                 whitelist will NOT be recovered. Run `konsensus whitelist backup` on the \
+                 source node and `konsensus whitelist restore` here to recover relationships.",
+                crate::whitelist_cmd::WHITELIST_BACKUP_NAME,
+                config.backup.scb_dir
+            );
+        }
+    }
+
     if !confirm {
         restored
             .node

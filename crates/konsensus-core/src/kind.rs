@@ -7,7 +7,6 @@
 //! - **300–399:** Collaboration (CRDT ops, document snapshots)
 //! - **400–499:** Real-time signaling (call invite/answer/ICE/hangup)
 //! - **500–599:** Web content (page requests/responses, manifests — sovereign browser)
-//! - **Storage:** Relay storage pricing category only; no direct UKM kind range yet
 //! - **900–999:** Control (typing, read receipts, presence, room ops, key exchange, MLS)
 //! - **1000+:** Application extension space
 
@@ -112,6 +111,28 @@ pub const KIND_MLS_COMMIT: u16 = 961;
 /// MLS proposal.
 pub const KIND_MLS_PROPOSAL: u16 = 962;
 
+// ── Relay Storage (600–699) ────────────────────────────────────────────
+// Control kinds for the Tier-2 store-and-forward relay (RELAY_PROTOCOL.md,
+// ADR-034). T2R3 adds the taxonomy + pricing surface ONLY — the relay engine is
+// not implemented here. A relay holds only sealed ciphertext and never decrypts;
+// relay storage is a paid service, separate from the sender→recipient message
+// payment.
+
+/// Relay register: a node asks a relay to hold messages for it while offline (600).
+pub const KIND_RELAY_REGISTER: u16 = 600;
+
+/// Relay deposit: a peer hands the relay a sealed envelope for an offline recipient (601).
+pub const KIND_RELAY_DEPOSIT: u16 = 601;
+
+/// Relay ack: recipient confirms receipt so the relay can delete the held envelope (602).
+pub const KIND_RELAY_ACK: u16 = 602;
+
+/// Relay drain: a node coming online collects its held envelopes (603).
+pub const KIND_RELAY_DRAIN: u16 = 603;
+
+/// Relay unregister: a node tells the relay to stop holding for it (604).
+pub const KIND_RELAY_UNREGISTER: u16 = 604;
+
 // ── Application Extension (1000+) ──────────────────────────────────────
 
 /// Start of application extension space. Kinds >= 1000 are user-defined.
@@ -132,10 +153,9 @@ pub enum KindCategory {
     RealTimeSignaling,
     /// Web content: page requests, responses, manifests (500–599).
     WebContent,
-    /// Relay-held ciphertext storage service.
-    ///
-    /// Storage is priced as a relay service category, not a normal UKM payload
-    /// kind. Relay deposit settlement should query this category directly.
+    /// Tier-2 relay storage control: register, deposit, ack, drain, unregister
+    /// (600–699). A paid service kind — the relay store-and-forwards sealed
+    /// ciphertext (RELAY_PROTOCOL.md, ADR-034); it never decrypts.
     Storage,
     /// Typing, receipts, presence, room ops, key exchange, MLS (900–999).
     Control,
@@ -155,6 +175,7 @@ impl KindCategory {
             300..=399 => Self::Collaboration,
             400..=499 => Self::RealTimeSignaling,
             500..=599 => Self::WebContent,
+            600..=699 => Self::Storage,
             900..=999 => Self::Control,
             1000.. => Self::AppExtension,
             _ => Self::Unknown,
@@ -181,7 +202,7 @@ mod tests {
         assert_eq!(KindCategory::from_kind(KIND_PAGE_RESPONSE), KindCategory::WebContent);
         assert_eq!(KindCategory::from_kind(KIND_WEB_MANIFEST), KindCategory::WebContent);
         assert_eq!(KindCategory::from_kind(1000), KindCategory::AppExtension);
-        assert_eq!(KindCategory::from_kind(600), KindCategory::Unknown);
+        assert_eq!(KindCategory::from_kind(600), KindCategory::Storage);
     }
 
     /// Verify every defined KIND_* constant falls in the correct category.
@@ -318,21 +339,14 @@ mod tests {
     /// Verify the "unknown" gap ranges (600-899) are classified correctly.
     #[test]
     fn unknown_gap_ranges() {
-        for kind in [600, 700, 800, 899] {
+        // 600-699 is now the relay Storage category (T2R3); 700-899 stays reserved.
+        for kind in [700, 800, 899] {
             assert_eq!(
                 KindCategory::from_kind(kind),
                 KindCategory::Unknown,
                 "KIND {kind} must be Unknown (reserved gap)"
             );
         }
-    }
-
-    /// Storage is a relay service pricing category, not a UKM payload range.
-    #[test]
-    fn storage_category_has_no_direct_kind_range_yet() {
-        assert_eq!(KindCategory::from_kind(600), KindCategory::Unknown);
-        assert_eq!(KindCategory::from_kind(899), KindCategory::Unknown);
-        assert_ne!(KindCategory::from_kind(600), KindCategory::Storage);
     }
 
     /// Verify category boundaries are exact.
@@ -361,9 +375,13 @@ mod tests {
 
         // WebContent: 500-599
         assert_eq!(KindCategory::from_kind(599), KindCategory::WebContent);
-        assert_eq!(KindCategory::from_kind(600), KindCategory::Unknown);
+        assert_eq!(KindCategory::from_kind(600), KindCategory::Storage);
 
-        // Unknown: 600-899
+        // Storage (relay): 600-699
+        assert_eq!(KindCategory::from_kind(699), KindCategory::Storage);
+        assert_eq!(KindCategory::from_kind(700), KindCategory::Unknown);
+
+        // Unknown: 700-899
         assert_eq!(KindCategory::from_kind(899), KindCategory::Unknown);
         assert_eq!(KindCategory::from_kind(900), KindCategory::Control);
 
@@ -387,6 +405,8 @@ mod tests {
             KIND_TYPING, KIND_READ_RECEIPT, KIND_PRESENCE,
             KIND_ROOM_CREATE, KIND_ROOM_INVITE, KIND_ROOM_JOIN, KIND_ROOM_LEAVE, KIND_ROOM_UPDATE,
             KIND_KEY_EXCHANGE, KIND_MLS_WELCOME, KIND_MLS_COMMIT, KIND_MLS_PROPOSAL,
+            KIND_RELAY_REGISTER, KIND_RELAY_DEPOSIT, KIND_RELAY_ACK, KIND_RELAY_DRAIN,
+            KIND_RELAY_UNREGISTER,
             KIND_APP_EXT_START,
         ];
         let mut seen = std::collections::HashSet::new();
@@ -396,5 +416,35 @@ mod tests {
                 "duplicate KIND constant: {kind}"
             );
         }
+    }
+
+    /// T2R3: the relay control kinds (600-699) classify as the Storage category.
+    #[test]
+    fn kind_category_relay_storage() {
+        for kind in [
+            KIND_RELAY_REGISTER,
+            KIND_RELAY_DEPOSIT,
+            KIND_RELAY_ACK,
+            KIND_RELAY_DRAIN,
+            KIND_RELAY_UNREGISTER,
+        ] {
+            assert!(
+                (600..=699).contains(&kind),
+                "relay control kind {kind} must live in the 600-699 Storage range"
+            );
+            assert_eq!(
+                KindCategory::from_kind(kind),
+                KindCategory::Storage,
+                "kind {kind} must classify as Storage"
+            );
+        }
+        // The five control operations are distinct.
+        let distinct: std::collections::HashSet<u16> = [
+            KIND_RELAY_REGISTER, KIND_RELAY_DEPOSIT, KIND_RELAY_ACK,
+            KIND_RELAY_DRAIN, KIND_RELAY_UNREGISTER,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(distinct.len(), 5);
     }
 }

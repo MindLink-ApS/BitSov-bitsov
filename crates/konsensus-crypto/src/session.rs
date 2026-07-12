@@ -268,19 +268,31 @@ impl SessionManager {
         // normal X3DH flow on next contact.
         //
         // For one-time migration of legacy plaintext sessions written
-        // before AES-GCM-at-rest landed (ADR-019), set
-        // `KONSENSUS_LEGACY_SESSION_MIGRATION=1` for ONE boot. After that
-        // boot completes (sessions get re-persisted encrypted), unset the
-        // env var. The flag is intentionally an env var, not a config
-        // file setting, so it cannot persist accidentally across reboots.
-        let allow_legacy_plaintext_migration =
-            std::env::var("KONSENSUS_LEGACY_SESSION_MIGRATION").as_deref() == Ok("1");
+        // before AES-GCM-at-rest landed (ADR-019), a dedicated migration
+        // binary built with `--features legacy-session-migration` AND booted
+        // with `KONSENSUS_LEGACY_SESSION_MIGRATION=1` may import a plaintext
+        // blob ONCE (it is immediately re-persisted encrypted). Both gates
+        // are required:
+        //
+        //   * the cargo feature compiles the plaintext-accepting code IN —
+        //     a default/production build does not contain it at all, so a
+        //     plaintext blob is rejected unconditionally regardless of any
+        //     env var an attacker might set on the process;
+        //   * the env var is a second, per-boot operator opt-in so the
+        //     migration capability is not active just because a migration
+        //     binary happens to be running.
+        //
+        // `allow_legacy_plaintext_migration` is the AND of both gates. In a
+        // default build it is a compile-time `false`, so every plaintext
+        // branch below is dead code the optimizer drops.
+        let allow_legacy_plaintext_migration = legacy_plaintext_migration_enabled();
         if allow_legacy_plaintext_migration {
             warn!(
-                "KONSENSUS_LEGACY_SESSION_MIGRATION=1 is set — plaintext-fallback restore \
-                 enabled FOR THIS BOOT ONLY. Operator MUST unset this env var after the \
-                 first successful boot. Legacy plaintext sessions are a downgrade-attack \
-                 vector if left enabled; use only for a single legacy migration boot."
+                "legacy-session-migration build with KONSENSUS_LEGACY_SESSION_MIGRATION=1 — \
+                 plaintext-fallback restore enabled FOR THIS BOOT ONLY. Operator MUST unset \
+                 this env var (and redeploy a default-build binary) after the first \
+                 successful boot. Legacy plaintext sessions are a downgrade-attack vector if \
+                 left enabled; use only for a single legacy migration boot."
             );
         }
 
@@ -289,46 +301,17 @@ impl SessionManager {
             match store.load_session(peer_id).await {
                 Ok(Some(blob)) => {
                     // Decrypt the stored session state (AES-256-GCM: nonce || ciphertext).
-                    let json_bytes = if blob.len() > 12 {
-                        match self.decrypt_session_blob(&blob) {
-                            Ok(decrypted) => decrypted,
-                            Err(e) => {
-                                if allow_legacy_plaintext_migration {
-                                    warn!(
-                                        peer = %peer_id,
-                                        error = %e,
-                                        "decryption failed; legacy-migration mode active, attempting plaintext fallback ONCE"
-                                    );
-                                    blob.clone()
-                                } else {
-                                    warn!(
-                                        peer = %peer_id,
-                                        error = %e,
-                                        "decryption failed and legacy-migration mode is OFF; skipping session — will re-establish via X3DH on next contact"
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                    } else {
-                        // Blob too short to be AES-GCM (12-byte nonce + ≥1-byte ciphertext).
-                        // This branch ONLY kicks in for legacy plaintext blobs from before
-                        // ADR-019 landed; same migration policy applies.
-                        if allow_legacy_plaintext_migration {
-                            warn!(
-                                peer = %peer_id,
-                                len = blob.len(),
-                                "blob below AES-GCM minimum; legacy-migration mode active, treating as plaintext ONCE"
-                            );
-                            blob.clone()
-                        } else {
-                            warn!(
-                                peer = %peer_id,
-                                len = blob.len(),
-                                "blob below AES-GCM minimum and legacy-migration mode is OFF; skipping"
-                            );
-                            continue;
-                        }
+                    // `decrypt_or_migrate_blob` returns the JSON bytes on success, or
+                    // `None` to skip the session. In a default (production) build it ONLY
+                    // ever returns `Some` for a blob that authenticated under AES-256-GCM;
+                    // the plaintext-accepting branches are compiled out.
+                    let json_bytes = match self.decrypt_or_migrate_blob(
+                        peer_id,
+                        &blob,
+                        allow_legacy_plaintext_migration,
+                    ) {
+                        Some(bytes) => bytes,
+                        None => continue,
                     };
 
                     match serde_json::from_slice::<RatchetState>(&json_bytes) {
@@ -342,7 +325,9 @@ impl SessionManager {
                             debug!(peer = %peer_id, "restored E2EE session from storage");
 
                             // Re-persist with encryption only when we just imported a
-                            // legacy-plaintext blob under the migration flag.
+                            // legacy-plaintext blob under the migration flag. The feature
+                            // gate keeps this branch out of default builds entirely.
+                            #[cfg(feature = "legacy-session-migration")]
                             if allow_legacy_plaintext_migration
                                 && self.decrypt_session_blob(&blob).is_err()
                             {
@@ -364,6 +349,96 @@ impl SessionManager {
 
         debug!(count = restored, total = peer_ids.len(), "session restore complete");
         restored
+    }
+
+    /// Resolve a stored session blob to its JSON bytes during restore.
+    ///
+    /// Returns `Some(json)` for a blob to load, or `None` to skip the session
+    /// (it will re-establish via X3DH on next contact).
+    ///
+    /// # Security
+    ///
+    /// In a default (production) build — i.e. WITHOUT the
+    /// `legacy-session-migration` feature — this function ONLY returns `Some`
+    /// for a blob that authenticated under AES-256-GCM. The plaintext-accepting
+    /// branches are compiled out, so a non-encrypted blob is unconditionally
+    /// rejected (`None`) no matter what `KONSENSUS_LEGACY_SESSION_MIGRATION` is
+    /// set to. This closes the downgrade vector where an attacker with
+    /// disk-write access plants attacker-known ratchet state in plaintext and a
+    /// flipped env var would launder it (L0b / MED-A).
+    ///
+    /// `allow_legacy` is the AND of the build feature and the per-boot env var;
+    /// in a default build it is always `false`.
+    fn decrypt_or_migrate_blob(
+        &self,
+        peer_id: &NodeId,
+        blob: &[u8],
+        allow_legacy: bool,
+    ) -> Option<Vec<u8>> {
+        // Authenticated path: a valid AES-GCM blob is `nonce(12) || ciphertext`.
+        if blob.len() > 12 {
+            match self.decrypt_session_blob(blob) {
+                Ok(decrypted) => return Some(decrypted),
+                Err(e) => {
+                    // Decryption failed. In a default build the only safe action
+                    // is to skip. The plaintext fallback below is compiled in
+                    // ONLY for the migration build, and even then requires the
+                    // per-boot env var.
+                    if !allow_legacy {
+                        warn!(
+                            peer = %peer_id,
+                            error = %e,
+                            "decryption failed; legacy-migration disabled — skipping session, \
+                             will re-establish via X3DH on next contact"
+                        );
+                        return None;
+                    }
+                    #[cfg(feature = "legacy-session-migration")]
+                    {
+                        warn!(
+                            peer = %peer_id,
+                            error = %e,
+                            "decryption failed; legacy-migration build + env flag active, \
+                             attempting plaintext fallback ONCE"
+                        );
+                        return Some(blob.to_vec());
+                    }
+                    // Defensive: unreachable in a default build because
+                    // `allow_legacy` is compile-time false there. Kept so the
+                    // function still type-checks without the feature.
+                    #[cfg(not(feature = "legacy-session-migration"))]
+                    {
+                        let _ = e;
+                        return None;
+                    }
+                }
+            }
+        }
+
+        // Blob below the AES-GCM minimum (12-byte nonce + >=1-byte ciphertext).
+        // This can only be a legacy plaintext blob from before ADR-019.
+        if !allow_legacy {
+            warn!(
+                peer = %peer_id,
+                len = blob.len(),
+                "blob below AES-GCM minimum; legacy-migration disabled — skipping"
+            );
+            return None;
+        }
+        #[cfg(feature = "legacy-session-migration")]
+        {
+            warn!(
+                peer = %peer_id,
+                len = blob.len(),
+                "blob below AES-GCM minimum; legacy-migration build + env flag active, \
+                 treating as plaintext ONCE"
+            );
+            Some(blob.to_vec())
+        }
+        #[cfg(not(feature = "legacy-session-migration"))]
+        {
+            None
+        }
     }
 
     /// Encrypt a session state blob with AES-256-GCM.
@@ -750,6 +825,34 @@ fn deserialize_prekey_bundle(
         one_time_prekey,
         one_time_prekey_id: bundle.one_time_prekey_id,
     })
+}
+
+/// Whether the legacy plaintext-session migration path is active for this boot.
+///
+/// This is the AND of two independent gates:
+///
+///   1. **Build gate** — the `legacy-session-migration` cargo feature must be
+///      compiled in. A default/production build returns a compile-time `false`
+///      here, which lets the optimizer drop every plaintext-handling branch in
+///      [`SessionManager::restore_sessions`]. The plaintext-accepting code does
+///      not exist in a production binary.
+///   2. **Runtime gate** — even in a migration build, the operator must set
+///      `KONSENSUS_LEGACY_SESSION_MIGRATION=1` for the single migration boot.
+///
+/// Both must be true to ingest a non-encrypted session blob. This is
+/// defense-in-depth: an attacker who can only influence the process
+/// environment (set the env var) cannot re-enable the downgrade path against a
+/// default build, because the code to do so was never compiled.
+#[inline]
+fn legacy_plaintext_migration_enabled() -> bool {
+    #[cfg(feature = "legacy-session-migration")]
+    {
+        std::env::var("KONSENSUS_LEGACY_SESSION_MIGRATION").as_deref() == Ok("1")
+    }
+    #[cfg(not(feature = "legacy-session-migration"))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]

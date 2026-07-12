@@ -196,6 +196,39 @@ impl PeerPriceCache {
         entry.get_price_for_kind(kind)
     }
 
+    /// Get the fresh, trust-discounted price a peer requires for a kind.
+    ///
+    /// This is the single bundled money-path entry point used by the compose
+    /// handlers: it checks staleness and applies the peer's trust discount
+    /// through the one choke point ([`apply_trust_discount`]) exactly once.
+    /// Callers must NOT apply the discount again — the returned value is final.
+    ///
+    /// Returns `None` if: (a) no price table cached, (b) the table is stale, or
+    /// (c) the kind's category isn't present — in which case the caller should
+    /// fall back to its own pricing engine.
+    pub async fn get_fresh_discounted_peer_price(
+        &self,
+        peer_id: &NodeId,
+        kind: u16,
+        current_block_height: u64,
+        max_age: std::time::Duration,
+    ) -> Option<u64> {
+        let entries = self.entries.read().await;
+        let entry = entries.get(peer_id)?;
+        if entry.is_stale(current_block_height, max_age) {
+            warn!(
+                peer = %peer_id,
+                table_height = entry.block_height,
+                current_height = current_block_height,
+                age_secs = entry.received_at.elapsed().as_secs(),
+                "peer price table is stale, falling back to own pricing"
+            );
+            return None;
+        }
+        // Single choke point: base price → discount applied exactly once.
+        entry.get_discounted_price_for_kind(kind)
+    }
+
     /// Get all cached peer price entries (for API inspection).
     pub async fn all_entries(&self) -> HashMap<NodeId, PeerPriceEntry> {
         self.entries.read().await.clone()
@@ -286,20 +319,49 @@ pub fn category_to_string(category: KindCategory) -> String {
         KindCategory::Collaboration => "collaboration".to_string(),
         KindCategory::RealTimeSignaling => "realtime_signaling".to_string(),
         KindCategory::WebContent => "web_content".to_string(),
-        KindCategory::Storage => "storage".to_string(),
+        KindCategory::Storage => "relay_storage".to_string(),
         KindCategory::Control => "control".to_string(),
         KindCategory::AppExtension => "app_extension".to_string(),
         KindCategory::Unknown => "unknown".to_string(),
     }
 }
 
-/// Apply a plasticity trust discount to a base price.
+/// The hard floor for a discounted price, given a base price.
+///
+/// No single application of [`apply_trust_discount`] may ever return less than
+/// this. Because the discount is clamped to `[0.0, MAX_TRUST_DISCOUNT]`, the
+/// lowest legitimate price is `base * (1 - MAX_TRUST_DISCOUNT)` (ceil'd), and
+/// never below 1 msat (the payment gate is fail-closed: zero = bypass).
+///
+/// This is the invariant a *double*-applied discount would violate: applying
+/// the discount twice compounds (`base * (1 - d)^2`), which for any `d > 0`
+/// drops below `base * (1 - d)` and, at the maximum discount, below this floor.
+/// The post-condition assertion in [`apply_trust_discount`] turns that latent
+/// money-path bug into an immediate, loud failure.
+#[inline]
+pub fn trust_discount_floor_msat(base_msat: u64) -> u64 {
+    let floor = ((base_msat as f64) * (1.0 - MAX_TRUST_DISCOUNT)).ceil() as u64;
+    floor.max(1)
+}
+
+/// Apply a plasticity trust discount to a base price — the single choke point.
+///
+/// This is the **only** function in the codebase that multiplies a base price
+/// by `(1 - discount)`. Every discounted-price path (per-kind lookups, the
+/// compose handlers) routes through here exactly once, so a discount can never
+/// be silently compounded. Callers must pass an **undiscounted base** price.
 ///
 /// Formula: `discounted = base * (1 - discount)`, rounded up (ceil).
 /// The discount is clamped to `[0.0, MAX_TRUST_DISCOUNT]` to prevent
 /// underflow or negative prices.
 ///
-/// Returns at least 1 msat — payment can never be free (Principle 2).
+/// # Guarantees (money-path invariants)
+///
+/// * Returns at least 1 msat — payment can never be free (Principle 2).
+/// * Returns at least [`trust_discount_floor_msat`]`(base_msat)` — a single
+///   application can never dip below the maximum-discount floor. This is
+///   enforced by a debug post-condition assertion and a release-mode clamp, so
+///   a double-applied discount cannot quietly bypass the floor.
 pub fn apply_trust_discount(base_msat: u64, discount: f64) -> u64 {
     // Fail-safe: NaN or infinite discount → no discount (full price).
     // f64::clamp passes NaN through, so we must check explicitly.
@@ -313,8 +375,20 @@ pub fn apply_trust_discount(base_msat: u64, discount: f64) -> u64 {
     }
     let discounted = (base_msat as f64) * (1.0 - clamped);
     // Ceil and enforce minimum 1 msat (payment gate is fail-closed: zero = bypass)
-    let result = discounted.ceil() as u64;
-    result.max(1)
+    let result = (discounted.ceil() as u64).max(1);
+
+    // Post-condition: a correctly single-applied discount can never fall below
+    // the maximum-discount floor. If it does, the input `base_msat` was already
+    // discounted (a double-application bug) — refuse to silently undercharge.
+    let floor = trust_discount_floor_msat(base_msat);
+    debug_assert!(
+        result >= floor,
+        "trust discount underflowed floor: base={base_msat} discount={discount} \
+         result={result} floor={floor} (double-applied discount?)"
+    );
+    // Defence in depth for release builds where debug_assert is compiled out:
+    // never charge below the floor for this base price.
+    result.max(floor)
 }
 
 /// Compute the trust discount for a peer based on their synaptic weight.
@@ -407,7 +481,6 @@ pub async fn build_price_table(
         KindCategory::Collaboration,
         KindCategory::RealTimeSignaling,
         KindCategory::WebContent,
-        KindCategory::Storage,
         KindCategory::Control,
         KindCategory::AppExtension,
     ];

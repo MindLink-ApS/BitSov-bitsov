@@ -1,6 +1,6 @@
 use super::*;
-use konsensus_core::kind::KIND_CHAT;
 use konsensus_core::UkmEnvelopeBuilder;
+use konsensus_core::kind::KIND_CHAT;
 use sha2::{Digest, Sha256};
 
 fn make_proof() -> PaymentProof {
@@ -10,14 +10,20 @@ fn make_proof() -> PaymentProof {
 }
 
 fn make_envelope(sender: NodeId, recipient: Recipient) -> UkmEnvelope {
-    UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"test ciphertext".to_vec(), make_proof())
-        .timestamp(1_700_000_000_000)
-        .build()
+    UkmEnvelopeBuilder::new(
+        KIND_CHAT,
+        sender,
+        recipient,
+        b"test ciphertext".to_vec(),
+        make_proof(),
+    )
+    .timestamp(1_700_000_000_000)
+    .build()
 }
 
 #[tokio::test]
-async fn sqlite_invite_schema_capabilities_reports_v2_columns(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn sqlite_invite_schema_capabilities_reports_v2_columns()
+-> Result<(), Box<dyn std::error::Error>> {
     let db = SqliteStorage::in_memory().await?;
     let caps = db.invite_schema_capabilities().await?;
 
@@ -36,7 +42,10 @@ async fn message_store_and_retrieve() -> Result<(), Box<dyn std::error::Error>> 
     let envelope = make_envelope(sender, recipient);
 
     db.store_message(&envelope).await?;
-    let retrieved = db.get_message(&envelope.id).await?.expect("value should exist");
+    let retrieved = db
+        .get_message(&envelope.id)
+        .await?
+        .expect("value should exist");
 
     assert_eq!(retrieved.id, envelope.id);
     assert_eq!(retrieved.kind, envelope.kind);
@@ -88,9 +97,7 @@ async fn messages_for_recipient_pagination() -> Result<(), Box<dyn std::error::E
     }
 
     // Get all — should return 3, newest first
-    let msgs = db
-        .get_messages_for_recipient(&recipient, 10, None)
-        .await?;
+    let msgs = db.get_messages_for_recipient(&recipient, 10, None).await?;
     assert_eq!(msgs.len(), 3);
     assert!(msgs[0].timestamp > msgs[1].timestamp);
 
@@ -103,21 +110,34 @@ async fn messages_for_recipient_pagination() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
-async fn conversation_messages_includes_both_directions() -> Result<(), Box<dyn std::error::Error>> {
+async fn conversation_messages_includes_both_directions() -> Result<(), Box<dyn std::error::Error>>
+{
     let db = SqliteStorage::in_memory().await?;
     let alice = NodeId::from_bytes([1u8; 32]);
     let bob = NodeId::from_bytes([2u8; 32]);
 
     // Alice sends to Bob (outgoing from Alice's perspective)
     let env1 = UkmEnvelopeBuilder::new(
-        KIND_CHAT, alice, Recipient::Node(bob), b"hello bob".to_vec(), make_proof(),
-    ).timestamp(1_700_000_000_000).build();
+        KIND_CHAT,
+        alice,
+        Recipient::Node(bob),
+        b"hello bob".to_vec(),
+        make_proof(),
+    )
+    .timestamp(1_700_000_000_000)
+    .build();
     db.store_message(&env1).await?;
 
     // Bob sends to Alice (incoming from Alice's perspective)
     let env2 = UkmEnvelopeBuilder::new(
-        KIND_CHAT, bob, Recipient::Node(alice), b"hello alice".to_vec(), make_proof(),
-    ).timestamp(1_700_000_001_000).build();
+        KIND_CHAT,
+        bob,
+        Recipient::Node(alice),
+        b"hello alice".to_vec(),
+        make_proof(),
+    )
+    .timestamp(1_700_000_001_000)
+    .build();
     db.store_message(&env2).await?;
 
     // Conversation from Alice's POV should include both
@@ -146,10 +166,20 @@ async fn conversation_messages_pagination() -> Result<(), Box<dyn std::error::Er
 
     for i in 0..5u64 {
         let sender = if i % 2 == 0 { alice } else { bob };
-        let recipient = if i % 2 == 0 { Recipient::Node(bob) } else { Recipient::Node(alice) };
+        let recipient = if i % 2 == 0 {
+            Recipient::Node(bob)
+        } else {
+            Recipient::Node(alice)
+        };
         let env = UkmEnvelopeBuilder::new(
-            KIND_CHAT, sender, recipient, format!("msg {i}").into_bytes(), make_proof(),
-        ).timestamp(1_700_000_000_000 + i * 1000).build();
+            KIND_CHAT,
+            sender,
+            recipient,
+            format!("msg {i}").into_bytes(),
+            make_proof(),
+        )
+        .timestamp(1_700_000_000_000 + i * 1000)
+        .build();
         db.store_message(&env).await?;
     }
 
@@ -162,7 +192,10 @@ async fn conversation_messages_pagination() -> Result<(), Box<dyn std::error::Er
     // Get before the middle message (timestamp of msg 2 = base + 2000)
     let older = db
         .get_conversation_messages(
-            &alice.to_hex(), &bob.to_hex(), false, 10,
+            &alice.to_hex(),
+            &bob.to_hex(),
+            false,
+            10,
             Some(1_700_000_002_000),
         )
         .await?;
@@ -185,18 +218,28 @@ async fn conversation_messages_room() -> Result<(), Box<dyn std::error::Error>> 
 
     // Two messages in the same room from different senders
     let env1 = UkmEnvelopeBuilder::new(
-        KIND_CHAT, alice, Recipient::Room(room_id), b"alice msg".to_vec(), make_proof(),
-    ).timestamp(1_700_000_000_000).build();
+        KIND_CHAT,
+        alice,
+        Recipient::Room(room_id),
+        b"alice msg".to_vec(),
+        make_proof(),
+    )
+    .timestamp(1_700_000_000_000)
+    .build();
     let env2 = UkmEnvelopeBuilder::new(
-        KIND_CHAT, bob, Recipient::Room(room_id), b"bob msg".to_vec(), make_proof(),
-    ).timestamp(1_700_000_001_000).build();
+        KIND_CHAT,
+        bob,
+        Recipient::Room(room_id),
+        b"bob msg".to_vec(),
+        make_proof(),
+    )
+    .timestamp(1_700_000_001_000)
+    .build();
     db.store_message(&env1).await?;
     db.store_message(&env2).await?;
 
     let msgs = db
-        .get_conversation_messages(
-            &alice.to_hex(), &room_id.to_string(), true, 10, None,
-        )
+        .get_conversation_messages(&alice.to_hex(), &room_id.to_string(), true, 10, None)
         .await?;
     assert_eq!(msgs.len(), 2);
     Ok(())
@@ -211,12 +254,24 @@ async fn conversation_messages_excludes_other_peers() -> Result<(), Box<dyn std:
 
     // Alice <-> Bob
     let env1 = UkmEnvelopeBuilder::new(
-        KIND_CHAT, alice, Recipient::Node(bob), b"to bob".to_vec(), make_proof(),
-    ).timestamp(1_700_000_000_000).build();
+        KIND_CHAT,
+        alice,
+        Recipient::Node(bob),
+        b"to bob".to_vec(),
+        make_proof(),
+    )
+    .timestamp(1_700_000_000_000)
+    .build();
     // Alice <-> Charlie
     let env2 = UkmEnvelopeBuilder::new(
-        KIND_CHAT, alice, Recipient::Node(charlie), b"to charlie".to_vec(), make_proof(),
-    ).timestamp(1_700_000_001_000).build();
+        KIND_CHAT,
+        alice,
+        Recipient::Node(charlie),
+        b"to charlie".to_vec(),
+        make_proof(),
+    )
+    .timestamp(1_700_000_001_000)
+    .build();
     db.store_message(&env1).await?;
     db.store_message(&env2).await?;
 
@@ -327,11 +382,79 @@ async fn add_whitelisted_peer_with_invite_ref() -> Result<(), Box<dyn std::error
     let invite_id_2 = uuid::Uuid::new_v4();
     db.add_whitelisted_peer_with_invite_ref(invitee_bytes, invite_id_2)
         .await?;
-    let updated = db.get_peer(&invitee).await?.expect("peer should still exist");
+    let updated = db
+        .get_peer(&invitee)
+        .await?
+        .expect("peer should still exist");
     assert_eq!(updated.address.as_deref(), Some("127.0.0.1:9735"));
     assert_eq!(updated.metadata["invite_ref"], invite_id_2.to_string());
     assert_eq!(updated.metadata["whitelist_source"], "invite");
 
+    Ok(())
+}
+
+/// HARD-3 regression for the plaintext SQLite backend: `upsert_peer` is now a
+/// single atomic `INSERT ... ON CONFLICT` that merges `invite_ref` /
+/// `whitelist_source` in SQL. Concurrent upserts that omit those keys must never
+/// drop them. The pre-fix SELECT-then-INSERT could lose the update because the
+/// two statements released the pooled connection between `await`s, letting
+/// another task interleave and clobber the preserved metadata.
+#[tokio::test]
+async fn sqlite_upsert_peer_concurrent_preserves_invite_ref(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+
+    let db = Arc::new(SqliteStorage::in_memory().await?);
+    let invitee_bytes = [0xCDu8; 32];
+    let invitee = NodeId::from_bytes(invitee_bytes);
+    let invite_id = uuid::Uuid::new_v4();
+
+    db.add_whitelisted_peer_with_invite_ref(invitee_bytes, invite_id)
+        .await?;
+
+    let mut handles = Vec::new();
+    for i in 0..32u32 {
+        let db = Arc::clone(&db);
+        handles.push(tokio::spawn(async move {
+            let mut peer = Peer::new(invitee);
+            peer.display_name = Some(format!("name-{i}"));
+            peer.metadata = serde_json::json!({ "round": i });
+            db.upsert_peer(&peer).await.unwrap();
+        }));
+    }
+    for h in handles {
+        h.await?;
+    }
+
+    let peer = db.get_peer(&invitee).await?.expect("peer should exist");
+    assert_eq!(
+        peer.metadata["invite_ref"],
+        invite_id.to_string(),
+        "invite_ref must survive concurrent upserts"
+    );
+    assert_eq!(peer.metadata["whitelist_source"], "invite");
+    assert!(peer.metadata["round"].is_u64());
+    Ok(())
+}
+
+/// DBH2 regression: `busy_timeout` must be applied via the connect options so
+/// every pooled connection inherits it. A connection drawn from the pool must
+/// report `busy_timeout = 5000`. Before the fix the pragma was run via
+/// `execute(&pool)` on a single connection (and `in_memory()` set none at all),
+/// so other connections defaulted to busy_timeout = 0 and concurrent writers
+/// raced into an immediate SQLITE_BUSY. Asserted deterministically (no
+/// file-backed concurrency, which is flaky on CI filesystems).
+#[tokio::test]
+async fn sqlite_busy_timeout_applied_to_pooled_connections(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = SqliteStorage::in_memory().await?;
+    let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(
+        busy_timeout, 5000,
+        "busy_timeout must be set on pooled connections via connect options"
+    );
     Ok(())
 }
 
@@ -518,7 +641,8 @@ async fn clear_pending_for_peer_removes_all() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
-async fn cleanup_stale_pending_removes_high_attempt_entries() -> Result<(), Box<dyn std::error::Error>> {
+async fn cleanup_stale_pending_removes_high_attempt_entries()
+-> Result<(), Box<dyn std::error::Error>> {
     let db = SqliteStorage::in_memory().await?;
     let sender = NodeId::from_bytes([1u8; 32]);
     let peer = NodeId::from_bytes([2u8; 32]);
@@ -574,7 +698,8 @@ async fn remove_pending_delivery_nonexistent_is_noop() -> Result<(), Box<dyn std
 
 /// increment_pending_attempts on nonexistent entry does not error.
 #[tokio::test]
-async fn increment_pending_attempts_nonexistent_is_noop() -> Result<(), Box<dyn std::error::Error>> {
+async fn increment_pending_attempts_nonexistent_is_noop() -> Result<(), Box<dyn std::error::Error>>
+{
     let db = SqliteStorage::in_memory().await?;
     let peer = NodeId::from_bytes([2u8; 32]);
     let fake_id = MessageId::from_bytes(rand::random::<[u8; 32]>());
@@ -669,7 +794,10 @@ async fn file_store_and_retrieve() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(retrieved.blake3_hash, hash);
 
     // Retrieve metadata only
-    let meta = db.get_file_metadata("file-001").await?.expect("value should exist");
+    let meta = db
+        .get_file_metadata("file-001")
+        .await?
+        .expect("value should exist");
     assert_eq!(meta.filename, "document.txt");
     assert_eq!(meta.size_bytes, data.len() as u64);
 
@@ -746,8 +874,7 @@ async fn plaintext_cache_store_and_retrieve() -> Result<(), Box<dyn std::error::
 
     // Store plaintext cache
     let plaintext = b"encrypted-at-rest plaintext data";
-    db.store_message_plaintext(&envelope.id, plaintext)
-        .await?;
+    db.store_message_plaintext(&envelope.id, plaintext).await?;
 
     // Retrieve it
     let retrieved = db
@@ -775,7 +902,8 @@ async fn plaintext_cache_returns_none_for_uncached() -> Result<(), Box<dyn std::
 }
 
 #[tokio::test]
-async fn plaintext_cache_returns_none_for_nonexistent_message() -> Result<(), Box<dyn std::error::Error>> {
+async fn plaintext_cache_returns_none_for_nonexistent_message()
+-> Result<(), Box<dyn std::error::Error>> {
     let db = SqliteStorage::in_memory().await?;
     let id = MessageId::from_bytes([0u8; 32]);
 
@@ -820,8 +948,7 @@ async fn plaintext_cache_empty_bytes() -> Result<(), Box<dyn std::error::Error>>
     db.store_message(&envelope).await?;
 
     // Store empty bytes
-    db.store_message_plaintext(&envelope.id, b"")
-        .await?;
+    db.store_message_plaintext(&envelope.id, b"").await?;
 
     let retrieved = db
         .get_message_plaintext(&envelope.id)
@@ -859,9 +986,7 @@ async fn messages_for_recipient_empty_result() -> Result<(), Box<dyn std::error:
     let node = NodeId::from_bytes([99u8; 32]);
     let recipient = Recipient::Node(node);
 
-    let msgs = db
-        .get_messages_for_recipient(&recipient, 10, None)
-        .await?;
+    let msgs = db.get_messages_for_recipient(&recipient, 10, None).await?;
     assert!(msgs.is_empty());
     Ok(())
 }
@@ -874,9 +999,7 @@ async fn messages_for_recipient_limit_zero() -> Result<(), Box<dyn std::error::E
     let envelope = make_envelope(sender, recipient);
     db.store_message(&envelope).await?;
 
-    let msgs = db
-        .get_messages_for_recipient(&recipient, 0, None)
-        .await?;
+    let msgs = db.get_messages_for_recipient(&recipient, 0, None).await?;
     assert!(msgs.is_empty());
     Ok(())
 }
@@ -957,9 +1080,7 @@ async fn room_messages_with_room_recipient() -> Result<(), Box<dyn std::error::E
     let envelope = make_envelope(sender, recipient);
     db.store_message(&envelope).await?;
 
-    let msgs = db
-        .get_messages_for_recipient(&recipient, 10, None)
-        .await?;
+    let msgs = db.get_messages_for_recipient(&recipient, 10, None).await?;
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].id, envelope.id);
     Ok(())
@@ -1324,19 +1445,15 @@ async fn retention_deletes_old_messages_keeps_new() -> Result<(), Box<dyn std::e
     let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
 
     // Store an old message (timestamp 1000ms)
-    let old = UkmEnvelopeBuilder::new(
-        KIND_CHAT, sender, recipient.clone(), b"old".to_vec(), make_proof(),
-    )
-    .timestamp(1000)
-    .build();
+    let old = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"old".to_vec(), make_proof())
+        .timestamp(1000)
+        .build();
     db.store_message(&old).await?;
 
     // Store a new message (timestamp 5000ms)
-    let new = UkmEnvelopeBuilder::new(
-        KIND_CHAT, sender, recipient, b"new".to_vec(), make_proof(),
-    )
-    .timestamp(5000)
-    .build();
+    let new = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"new".to_vec(), make_proof())
+        .timestamp(5000)
+        .build();
     db.store_message(&new).await?;
 
     // Delete messages older than 3000ms
@@ -1375,9 +1492,7 @@ async fn retention_deletes_all_when_cutoff_in_future() -> Result<(), Box<dyn std
     db.store_message(&msg).await?;
 
     // Cutoff far in the future — should delete everything
-    let deleted = db
-        .delete_messages_older_than(2_000_000_000_000)
-        .await?;
+    let deleted = db.delete_messages_older_than(2_000_000_000_000).await?;
     assert_eq!(deleted, 1);
     assert!(db.get_message(&msg.id).await?.is_none());
     Ok(())
@@ -1398,12 +1513,17 @@ async fn retention_also_removes_plaintext_cache() -> Result<(), Box<dyn std::err
     let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
 
     let msg = UkmEnvelopeBuilder::new(
-        KIND_CHAT, sender, recipient, b"ciphertext".to_vec(), make_proof(),
+        KIND_CHAT,
+        sender,
+        recipient,
+        b"ciphertext".to_vec(),
+        make_proof(),
     )
     .timestamp(1000)
     .build();
     db.store_message(&msg).await?;
-    db.store_message_plaintext(&msg.id, b"encrypted-plaintext").await?;
+    db.store_message_plaintext(&msg.id, b"encrypted-plaintext")
+        .await?;
 
     // Verify plaintext cache is stored
     let pt = db.get_message_plaintext(&msg.id).await?;
@@ -1417,4 +1537,86 @@ async fn retention_also_removes_plaintext_cache() -> Result<(), Box<dyn std::err
     assert!(db.get_message(&msg.id).await?.is_none());
     assert!(db.get_message_plaintext(&msg.id).await?.is_none());
     Ok(())
+}
+
+// ── HARD-4: complete-set query contract guards ───────────────────────────
+//
+// Each flagged query (HARD-4, Codex red-team on #225) must return the COMPLETE
+// set. The behavioral test below proves it for `list_invites_issued` — an
+// AUTHORITY query (duplicate-pending-invite gate + acceptance lookup) — with a
+// >1000-row round-trip (the same shape DBH1 used for `list_peers`). The
+// `hard4_*_select_has_no_limit` guards assert no `*_SELECT` const ever regains a
+// bare `LIMIT`, which would re-create the DBH1/DBH2 silent fail-open.
+
+/// AUTHORITY behavioral proof: 1500 issued invites all survive a
+/// `list_invites_issued` round-trip. FAILS if a `LIMIT 1000`-style cap is ever
+/// (re)introduced on the `invites_issued` query.
+#[tokio::test]
+async fn hard4_list_invites_issued_returns_complete_set() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = SqliteStorage::in_memory().await?;
+    const N: u32 = 1500;
+
+    for i in 0..N {
+        // Distinct invitee pubkey + nonce per invite so each is a separate row.
+        let mut invitee_pubkey = [0u8; 32];
+        invitee_pubkey[0..4].copy_from_slice(&i.to_le_bytes());
+        let mut nonce = [0u8; 16];
+        nonce[0..4].copy_from_slice(&i.to_le_bytes());
+
+        let invite = InviteIssuedRecord {
+            id: uuid::Uuid::new_v4(),
+            invitee_pubkey,
+            expiry_unix: 1_900_000_000,
+            channel_size_hint_sats: Some(50_000),
+            addr: "127.0.0.1:9735".to_string(),
+            max_fee_rate_sat_per_vb: Some(42),
+            channel_open_intent_expiry_unix: Some(1_900_000_000),
+            nonce,
+            state: InviteState::Pending,
+            created_at: 1_800_000_000 + u64::from(i),
+            accepted_at: None,
+            revoked_at: None,
+        };
+        db.add_invite_and_whitelist(&invite, invitee_pubkey).await?;
+    }
+
+    let listed = db.list_invites_issued().await?;
+    assert_eq!(
+        listed.len(),
+        N as usize,
+        "list_invites_issued must return ALL {N} issued invites (no silent cap)"
+    );
+    Ok(())
+}
+
+#[test]
+fn hard4_sqlite_select_consts_have_no_limit() {
+    // AUTHORITY / correctness-complete / WHERE-scoped read-surface — none may
+    // grow a bare LIMIT (see the consts' doc comments + HARD-4 classification).
+    for (name, sql) in [
+        ("PENDING_FOR_PEER_SELECT", PENDING_FOR_PEER_SELECT),
+        ("INVITES_ISSUED_SELECT", INVITES_ISSUED_SELECT),
+        ("RECURRING_MASTER_EVENTS_SELECT", RECURRING_MASTER_EVENTS_SELECT),
+        (
+            "CALENDAR_EXCEPTIONS_IN_RANGE_SELECT",
+            CALENDAR_EXCEPTIONS_IN_RANGE_SELECT,
+        ),
+        ("FIAT_RATE_SNAPSHOTS_SELECT", FIAT_RATE_SNAPSHOTS_SELECT),
+        (
+            "OPERATOR_HOSTING_CONTRACTS_SELECT",
+            OPERATOR_HOSTING_CONTRACTS_SELECT,
+        ),
+        (
+            "OPERATOR_HOSTING_PAYMENTS_SELECT",
+            OPERATOR_HOSTING_PAYMENTS_SELECT,
+        ),
+    ] {
+        assert!(
+            !sql.to_ascii_uppercase().contains("LIMIT"),
+            "HARD-4: {name} must stay COMPLETE — a bare LIMIT re-creates the \
+             DBH1/DBH2 silent fail-open. Use a streaming/chunked complete-set \
+             read if a memory bound is genuinely needed."
+        );
+    }
 }

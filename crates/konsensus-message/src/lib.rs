@@ -14,5 +14,5 @@ pub mod transport;
 pub mod wire;
 
 pub use peer::{PeerConfig, PeerEntry, PeerRegistry};
-pub use transport::{ControlEvent, NoiseTransport, TransportConfig};
+pub use transport::{CookieMode, ReachabilityMode, ControlEvent, NoiseTransport, TransportConfig};
 pub use wire::{Capability, Frame, PeerExchangeEntry, SovereigntyTier, WireError};

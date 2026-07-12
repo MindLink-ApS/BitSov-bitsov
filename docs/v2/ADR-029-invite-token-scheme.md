@@ -31,6 +31,22 @@ Three amendments from PR #70 AI review, applied as fix commits on the same branc
 
 3. **`verify(&self, now_unix: u64)` takes time as a parameter.** Original `verify(&self)` shape internally called `SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()`, which silently fails OPEN on a broken clock (defaults to 0, so every non-expired invite trivially passes). Caller-supplied `now_unix` is testable without clock mocks and fail-closes at the caller boundary, consistent with the rest of the codebase's time handling.
 
+## Amendment (2026-06-09) — `BitSovInvite` is canonical; legacy `InviteToken` routes deprecated (P3-2c)
+
+The codebase carries **two** invite mechanisms with **non-interchangeable** token formats:
+
+| | Legacy `InviteToken` | Canonical `BitSovInvite` |
+|---|---|---|
+| Routes | `POST /api/v1/invite` (issue), `POST /api/v1/invite/redeem` | `POST /api/v1/invites` (issue), `POST /api/v1/invites/accept` |
+| Wire form | base58, `konsensus://invite/…` | base64url JSON, `bitsov://…` |
+| Binding | none (symmetric peer-add) | ed25519-signed, **invitee-bound** (`invitee_pubkey`); `accept_invite` hard-rejects a wrong invitee |
+
+**Decision:** `POST /api/v1/invites/accept` (the invitee-bound `BitSovInvite`) is the **canonical** Tier-2 onboarding path. The legacy `InviteToken` routes are **deprecated** and now emit RFC 8594 / RFC 9745 signalling — `Deprecation: true`, `Sunset: Sun, 31 Jan 2027 00:00:00 GMT`, and `Link: </api/v1/invites/accept>; rel="successor-version"` — plus a structured `tracing::warn!(deprecated = true)` per call so legacy-path usage is observable before any removal.
+
+**This amendment is signalling only — no behaviour change.** The legacy routes remain fully functional. Aliasing or 410-ing `/invite/redeem` onto `/invites/accept` is **not** done and would be wrong: an `InviteToken` carries no `invitee_pubkey`, so it cannot satisfy `accept_invite`'s invitee check — aliasing would 400 ~100% of legacy traffic, and the frontend still ships `redeemInvite` (`PeerList.tsx`) and `generateInvite` (`ProfileView.tsx`). The `Sunset` date above is a **migration target, not a removal commitment**.
+
+**Route removal is gated on the operator** ratifying: (a) a `BitSovInvite`-based peer-add UX that replaces the symmetric `redeemInvite` flow in `PeerList.tsx`, and (b) a confirmed near-zero legacy-route call rate (via the `deprecated = true` telemetry). Until both hold, the legacy routes stay.
+
 ## Decision
 
 ### Token shape

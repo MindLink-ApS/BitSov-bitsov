@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::Router;
 use base64::Engine;
 use tower::ServiceExt;
 
@@ -29,10 +30,29 @@ use konsensus_api::audit::AuditLog;
 use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use konsensus_api::build_router;
+use common::test_router as build_router;
 
 
 // ─── Tests ──────────────────────────────────────────────────────────
+
+async fn fetch_auth_challenge(app: Router) -> String {
+    let req = Request::builder()
+        .uri("/api/v1/auth/challenge")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    json["challenge"].as_str().unwrap().to_owned()
+}
+
+async fn signed_auth_body(state: &AppState, app: Router) -> String {
+    let challenge = fetch_auth_challenge(app).await;
+    let sig = state.identity.sign(challenge.as_bytes());
+    let sig_hex = hex::encode(sig.to_bytes());
+    serde_json::json!({"challenge": challenge, "signature": sig_hex}).to_string()
+}
 
 #[tokio::test]
 async fn health_returns_ok() {
@@ -51,7 +71,12 @@ async fn health_returns_ok() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert_eq!(json["version"], 2);
-    assert!(json["node_id"].is_string());
+    // node_id is owner-only; the unauthenticated /health endpoint must not
+    // expose node identity (moved to /api/v1/status — A1 drift-kill).
+    assert!(
+        json.get("node_id").is_none(),
+        "unauth /health must not expose node identity"
+    );
 }
 
 #[tokio::test]
@@ -105,12 +130,14 @@ async fn mnemonic_routes_not_mounted_when_sensitive_identity_disabled() {
     let token = auth_header(&state);
     let app = build_router(state);
 
-    let get_mnemonic = Request::builder()
+    let reveal_mnemonic = Request::builder()
+        .method("POST")
         .uri("/api/v1/identity/mnemonic")
         .header("Authorization", token.clone())
-        .body(Body::empty())
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"challenge":"x","signature":"00"}"#))
         .unwrap();
-    let resp = app.clone().oneshot(get_mnemonic).await.unwrap();
+    let resp = app.clone().oneshot(reveal_mnemonic).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let restore = Request::builder()
@@ -143,20 +170,14 @@ async fn unauthenticated_request_returns_401() {
 #[tokio::test]
 async fn auth_token_flow() {
     let state = test_state();
-
-    // Sign the challenge "konsensus-auth" with the node's key
-    let sig = state.identity.sign(b"konsensus-auth");
-    let sig_hex = hex::encode(sig.to_bytes());
-
     let app = build_router(Arc::clone(&state));
+    let body = signed_auth_body(&state, app.clone()).await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/token")
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({"signature": sig_hex}).to_string(),
-        ))
+        .body(Body::from(body))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -169,16 +190,77 @@ async fn auth_token_flow() {
 }
 
 #[tokio::test]
+async fn auth_challenge_does_not_leak_node_id() {
+    // The unauthenticated /auth/challenge must not embed the node_id. `/health`
+    // already redacts it (owner-only), so a scanner must not be able to recover
+    // it via the challenge. The node_id is not load-bearing for token issuance —
+    // the signature + single-use challenge-map membership are the auth, and the
+    // 32-byte nonce makes each challenge unique.
+    let state = test_state();
+    let node_id_hex = state.identity.node_id().to_hex();
+    let app = build_router(Arc::clone(&state));
+
+    let challenge = fetch_auth_challenge(app.clone()).await;
+    assert!(
+        !challenge.contains(&node_id_hex),
+        "auth challenge must not leak the node_id (got: {challenge})"
+    );
+
+    // The full sign -> token flow still succeeds with the node-id-free challenge.
+    let body = signed_auth_body(&state, app.clone()).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/token")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a node-id-free challenge must still authenticate"
+    );
+}
+
+#[tokio::test]
+async fn auth_token_challenge_is_single_use() {
+    let state = test_state();
+    let app = build_router(Arc::clone(&state));
+    let body = signed_auth_body(&state, app.clone()).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.clone()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let replay = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/token")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+
+    let resp = app.oneshot(replay).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn auth_rejects_bad_signature() {
     let state = test_state();
     let app = build_router(state);
+    let challenge = fetch_auth_challenge(app.clone()).await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/token")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"signature": "aa".repeat(64)}).to_string(),
+            serde_json::json!({"challenge": challenge, "signature": "aa".repeat(64)}).to_string(),
         ))
         .unwrap();
 
@@ -210,11 +292,18 @@ async fn identity_returns_keys() {
 
 #[tokio::test]
 async fn local_auth_rejects_non_localhost() {
-    let state = test_state();
-    let app = build_router(state);
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    // Without ConnectInfo (no TCP socket), the endpoint treats the
-    // request as non-local and rejects it.
+    let state = test_state();
+    // Inject a *non-loopback* client address. This passes the per-IP
+    // rate-limit middleware (which fails closed only on a *missing* IP,
+    // not on a public one) and reaches the auth/local handler, which then
+    // rejects the request because the caller is not on localhost.
+    let app = konsensus_api::build_router(state).layer(MockConnectInfo(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 40000),
+    ));
+
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/local")
@@ -253,7 +342,7 @@ async fn invalid_jwt_returns_401() {
 }
 
 #[tokio::test]
-async fn health_endpoint_returns_extended_info() {
+async fn health_endpoint_returns_public_counters_and_redacts_secrets() {
     let state = test_state();
     let app = build_router(state);
 
@@ -269,14 +358,48 @@ async fn health_endpoint_returns_extended_info() {
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
+    // Public, non-sensitive operational fields are present.
     assert_eq!(json["status"], "ok");
-    assert!(json["node_id"].is_string());
     assert_eq!(json["connected_peers"], 0);
-    assert!(json["connected_peer_ids"].is_array());
     assert_eq!(json["e2ee_sessions"], 0);
     assert_eq!(json["pending_deliveries"], 0);
     assert_eq!(json["version"], 2);
     assert!(json["uptime_secs"].is_number());
+
+    // Sensitive fields are redacted from the unauthenticated /health endpoint;
+    // they are served only by the owner-only /api/v1/status (A1 drift-kill).
+    assert!(json.get("node_id").is_none(), "unauth /health must not expose node_id");
+    assert!(
+        json.get("connected_peer_ids").is_none(),
+        "unauth /health must not expose peer IDs (social graph)"
+    );
+    assert!(
+        json.get("lightning_balance_msat").is_none(),
+        "unauth /health must not expose wallet balance"
+    );
+    assert!(
+        json.get("lightning_node_pubkey").is_none(),
+        "unauth /health must not expose LN pubkey"
+    );
+}
+
+#[tokio::test]
+async fn status_endpoint_requires_auth() {
+    let state = test_state();
+    let app = build_router(state);
+
+    // The full node status (identity, peers, balance) is owner-only.
+    let req = Request::builder()
+        .uri("/api/v1/status")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "/api/v1/status must require auth"
+    );
 }
 
 #[tokio::test]
@@ -306,6 +429,7 @@ async fn audit_log_records_events() {
 async fn auth_rejects_malformed_hex_signature() {
     let state = test_state();
     let app = build_router(state);
+    let challenge = fetch_auth_challenge(app.clone()).await;
 
     // Not valid hex
     let req = Request::builder()
@@ -313,7 +437,7 @@ async fn auth_rejects_malformed_hex_signature() {
         .uri("/api/v1/auth/token")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"signature": "zzzz-not-hex"}).to_string(),
+            serde_json::json!({"challenge": challenge, "signature": "zzzz-not-hex"}).to_string(),
         ))
         .unwrap();
 
@@ -329,6 +453,7 @@ async fn auth_rejects_malformed_hex_signature() {
 async fn auth_rejects_truncated_signature() {
     let state = test_state();
     let app = build_router(state);
+    let challenge = fetch_auth_challenge(app.clone()).await;
 
     // Valid hex but too short for Ed25519 signature (need 64 bytes = 128 hex chars)
     let req = Request::builder()
@@ -336,7 +461,7 @@ async fn auth_rejects_truncated_signature() {
         .uri("/api/v1/auth/token")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"signature": "aabb"}).to_string(),
+            serde_json::json!({"challenge": challenge, "signature": "aabb"}).to_string(),
         ))
         .unwrap();
 
@@ -688,6 +813,7 @@ async fn error_body_contains_message_and_code() {
 async fn auth_token_rejects_unknown_fields() {
     let state = test_state();
     let app = build_router(state);
+    let challenge = fetch_auth_challenge(app.clone()).await;
 
     let req = Request::builder()
         .method("POST")
@@ -695,6 +821,7 @@ async fn auth_token_rejects_unknown_fields() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
+                "challenge": challenge,
                 "signature": "aa".repeat(64),
                 "extra_field": "typo"
             })
@@ -933,56 +1060,62 @@ async fn verify_mnemonic_rejects_100_word_input() {
     );
 }
 
+/// Build a POST request to the hardened mnemonic reveal route carrying a
+/// valid re-auth body (fresh challenge + node-key signature).
+async fn reveal_request_with_reauth(state: &AppState, app: Router, auth: &str) -> Request<Body> {
+    let body = signed_auth_body(state, app).await;
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/identity/mnemonic")
+        .header("authorization", auth)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 #[tokio::test]
-async fn get_mnemonic_encrypted_returns_error() {
+async fn reveal_mnemonic_encrypted_returns_error() {
     let dir = tempfile::tempdir().unwrap();
     // Create an encrypted mnemonic file
     std::fs::write(dir.path().join("mnemonic.enc"), b"encrypted-data").unwrap();
 
     let state = test_state_with_data_dir(dir.path().to_path_buf());
     let auth = auth_header(&state);
-    let app = build_router(state);
+    let app = build_router(Arc::clone(&state));
 
-    let req = Request::builder()
-        .uri("/api/v1/identity/mnemonic")
-        .header("authorization", &auth)
-        .body(Body::empty())
-        .unwrap();
-
+    let req = reveal_request_with_reauth(&state, app.clone(), &auth).await;
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn get_mnemonic_missing_returns_not_found() {
+async fn reveal_mnemonic_missing_returns_not_found() {
     let dir = tempfile::tempdir().unwrap();
     // No mnemonic file exists
 
     let state = test_state_with_data_dir(dir.path().to_path_buf());
     let auth = auth_header(&state);
-    let app = build_router(state);
+    let app = build_router(Arc::clone(&state));
 
-    let req = Request::builder()
-        .uri("/api/v1/identity/mnemonic")
-        .header("authorization", &auth)
-        .body(Body::empty())
-        .unwrap();
-
+    let req = reveal_request_with_reauth(&state, app.clone(), &auth).await;
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn get_mnemonic_requires_auth() {
+async fn reveal_mnemonic_requires_auth() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("mnemonic.txt"), "test words").unwrap();
 
     let state = test_state_with_data_dir(dir.path().to_path_buf());
     let app = build_router(state);
 
+    // No Authorization header — AuthUser extractor rejects before re-auth.
     let req = Request::builder()
+        .method("POST")
         .uri("/api/v1/identity/mnemonic")
-        .body(Body::empty())
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"challenge":"x","signature":"00"}"#))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -990,20 +1123,178 @@ async fn get_mnemonic_requires_auth() {
 }
 
 #[tokio::test]
-async fn get_mnemonic_no_data_dir_returns_error() {
+async fn reveal_mnemonic_no_data_dir_returns_error() {
     // test_state() has data_dir: None
     let state = test_state();
     let auth = auth_header(&state);
-    let app = build_router(state);
+    let app = build_router(Arc::clone(&state));
 
+    let req = reveal_request_with_reauth(&state, app.clone(), &auth).await;
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+// ─── HARD-9: mnemonic reveal re-auth + rate-limit + audit ──────────────
+
+/// A valid JWT alone (no re-auth signature) must NOT reveal the seed.
+/// This is the core HARD-9 guarantee: a leaked session token cannot
+/// silently exfiltrate the recovery phrase.
+#[tokio::test]
+async fn reveal_mnemonic_rejects_jwt_without_reauth_signature() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("mnemonic.txt"),
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    )
+    .unwrap();
+
+    let state = test_state_with_data_dir(dir.path().to_path_buf());
+    let auth = auth_header(&state);
+    let app = build_router(Arc::clone(&state));
+
+    // Hold a valid JWT but present an unknown challenge + bogus signature.
     let req = Request::builder()
+        .method("POST")
         .uri("/api/v1/identity/mnemonic")
         .header("authorization", &auth)
-        .body(Body::empty())
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "challenge": "never-issued-challenge",
+                "signature": "aa".repeat(64),
+            })
+            .to_string(),
+        ))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid JWT without a fresh re-auth signature must not reveal the seed"
+    );
+}
+
+/// A valid JWT + a fresh challenge but a WRONG signature must be rejected.
+#[tokio::test]
+async fn reveal_mnemonic_rejects_wrong_signature() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("mnemonic.txt"),
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    )
+    .unwrap();
+
+    let state = test_state_with_data_dir(dir.path().to_path_buf());
+    let auth = auth_header(&state);
+    let app = build_router(Arc::clone(&state));
+
+    // Fetch a real challenge, but sign garbage instead of the challenge.
+    let challenge = fetch_auth_challenge(app.clone()).await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/identity/mnemonic")
+        .header("authorization", &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "challenge": challenge,
+                "signature": "bb".repeat(64),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The happy path: valid JWT + valid re-auth signature reveals the seed,
+/// the challenge is single-use, and a success audit event is written.
+#[tokio::test]
+async fn reveal_mnemonic_with_reauth_succeeds_and_audits() {
+    const PHRASE: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
+
+    // Place the audit log inside the (long-lived) test dir so we can read it
+    // back by path after the request. `test_state_with_data_dir` would put it
+    // in a NamedTempFile that is unlinked when the helper returns.
+    let audit_path = dir.path().join("audit.log");
+    let base = test_state_with_data_dir(dir.path().to_path_buf());
+    let state = Arc::new(AppState {
+        audit_log: Arc::new(AuditLog::open(&audit_path).unwrap()),
+        ..(*base).clone()
+    });
+    let auth = auth_header(&state);
+    let app = build_router(Arc::clone(&state));
+
+    let req = reveal_request_with_reauth(&state, app.clone(), &auth).await;
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["mnemonic"], PHRASE);
+
+    // A success audit event must be present — and must NOT contain the seed.
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(
+        audit.contains("identity.mnemonic_revealed"),
+        "reveal must emit an audit event"
+    );
+    assert!(
+        audit.contains("\"success\":true"),
+        "successful reveal must be audited as success"
+    );
+    assert!(
+        !audit.contains("abandon"),
+        "the audit log must never contain the seed phrase"
+    );
+}
+
+/// The strict reveal limiter caps reveal attempts. Once the per-actor
+/// budget is exhausted, further attempts are rate-limited (429) even with
+/// a valid JWT — bounding brute-force of the re-auth gate (HARD-9).
+#[tokio::test]
+async fn reveal_mnemonic_is_rate_limited() {
+    let dir = tempfile::tempdir().unwrap();
+    // No file — the file checks come AFTER the rate-limit + re-auth gate, so
+    // we drive the limiter without needing a valid signature each time.
+    let base = test_state_with_data_dir(dir.path().to_path_buf());
+    // Tight limiter: 2 attempts per (long) window so the test is deterministic.
+    let state = Arc::new(AppState {
+        mnemonic_reveal_limiter: Arc::new(
+            konsensus_api::rate_limit::RateLimiter::with_window(
+                2,
+                std::time::Duration::from_secs(300),
+            ),
+        ),
+        ..(*base).clone()
+    });
+    let auth = auth_header(&state);
+    let app = build_router(Arc::clone(&state));
+
+    let make_req = |auth: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/identity/mnemonic")
+            .header("authorization", auth)
+            .header("content-type", "application/json")
+            // Unknown challenge: fails re-auth with 401, but each call still
+            // consumes one unit of the reveal limiter budget first.
+            .body(Body::from(r#"{"challenge":"nope","signature":"00"}"#))
+            .unwrap()
+    };
+
+    // First two attempts: pass the limiter, fail re-auth (401).
+    for _ in 0..2 {
+        let resp = app.clone().oneshot(make_req(&auth)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    // Third attempt: limiter is exhausted → 429 before re-auth is even checked.
+    let resp = app.oneshot(make_req(&auth)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 // ─── WebSocket Auth Rejection Test ─────────────────────────────────
@@ -1051,13 +1342,14 @@ async fn ws_rejects_invalid_token() {
 async fn auth_token_invalid_hex_signature() {
     let state = test_state();
     let app = build_router(Arc::clone(&state));
+    let challenge = fetch_auth_challenge(app.clone()).await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/token")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"signature": "not-valid-hex"}).to_string(),
+            serde_json::json!({"challenge": challenge, "signature": "not-valid-hex"}).to_string(),
         ))
         .unwrap();
 
@@ -1069,8 +1361,9 @@ async fn auth_token_invalid_hex_signature() {
 async fn auth_token_wrong_signature() {
     let state = test_state();
     let app = build_router(Arc::clone(&state));
+    let challenge = fetch_auth_challenge(app.clone()).await;
 
-    // Sign a different message than "konsensus-auth"
+    // Sign a different message than the issued challenge.
     let sig = state.identity.sign(b"wrong-challenge");
     let sig_hex = hex::encode(sig.to_bytes());
 
@@ -1079,7 +1372,7 @@ async fn auth_token_wrong_signature() {
         .uri("/api/v1/auth/token")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"signature": sig_hex}).to_string(),
+            serde_json::json!({"challenge": challenge, "signature": sig_hex}).to_string(),
         ))
         .unwrap();
 
@@ -1091,6 +1384,7 @@ async fn auth_token_wrong_signature() {
 async fn auth_token_truncated_signature() {
     let state = test_state();
     let app = build_router(Arc::clone(&state));
+    let challenge = fetch_auth_challenge(app.clone()).await;
 
     // A valid hex string but too short for an Ed25519 signature (64 bytes)
     let req = Request::builder()
@@ -1098,7 +1392,7 @@ async fn auth_token_truncated_signature() {
         .uri("/api/v1/auth/token")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"signature": "aabbccdd"}).to_string(),
+            serde_json::json!({"challenge": challenge, "signature": "aabbccdd"}).to_string(),
         ))
         .unwrap();
 
@@ -1110,13 +1404,14 @@ async fn auth_token_truncated_signature() {
 async fn auth_token_empty_signature() {
     let state = test_state();
     let app = build_router(Arc::clone(&state));
+    let challenge = fetch_auth_challenge(app.clone()).await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/token")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"signature": ""}).to_string(),
+            serde_json::json!({"challenge": challenge, "signature": ""}).to_string(),
         ))
         .unwrap();
 
@@ -1146,8 +1441,8 @@ async fn auth_token_missing_signature_field() {
 async fn auth_token_unknown_fields_rejected() {
     let state = test_state();
     let app = build_router(Arc::clone(&state));
-
-    let sig = state.identity.sign(b"konsensus-auth");
+    let challenge = fetch_auth_challenge(app.clone()).await;
+    let sig = state.identity.sign(challenge.as_bytes());
     let sig_hex = hex::encode(sig.to_bytes());
 
     let req = Request::builder()
@@ -1156,6 +1451,7 @@ async fn auth_token_unknown_fields_rejected() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
+                "challenge": challenge,
                 "signature": sig_hex,
                 "extra_field": true
             })
@@ -1169,9 +1465,18 @@ async fn auth_token_unknown_fields_rejected() {
 
 #[tokio::test]
 async fn auth_local_without_connect_info_rejected() {
-    // When ConnectInfo is not available (None), local auth should fail
+    // When the client IP is unavailable (no ConnectInfo), the request must
+    // be refused and no token issued. As of HARD-8 the per-IP rate-limit
+    // middleware fails closed on a missing client IP — it never substitutes
+    // a loopback placeholder — so the request is rejected at that layer
+    // (500) before it can reach the auth/local handler. Either way, the
+    // security-critical invariant holds: a caller with no identifiable
+    // address never receives a local-trust token.
+    //
+    // Uses the raw router (no injected MockConnectInfo) to reproduce the
+    // genuinely-missing-ConnectInfo condition.
     let state = test_state();
-    let app = build_router(Arc::clone(&state));
+    let app = konsensus_api::build_router(Arc::clone(&state));
 
     let req = Request::builder()
         .method("POST")
@@ -1180,26 +1485,93 @@ async fn auth_local_without_connect_info_rejected() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    // Without ConnectInfo (which is None in test without real listener),
-    // is_local is false → 401
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Must NOT succeed: no token for an unidentifiable caller.
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "a request with no client IP must never receive a local token"
+    );
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    assert!(
+        !String::from_utf8_lossy(&body).contains("token"),
+        "rejected response must not contain a token"
+    );
+}
+
+#[tokio::test]
+async fn auth_local_rate_limited_after_burst() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+
+    let state = test_state();
+    let app = build_router(Arc::clone(&state));
+    let loopback: SocketAddr = ([127, 0, 0, 1], 54321).into();
+
+    let make_req = || {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/local")
+            .body(Body::empty())
+            .unwrap();
+        // Inject loopback ConnectInfo so the handler treats this as a local request
+        // and reaches the SEC1 rate-limit check (the other /auth/local tests omit
+        // ConnectInfo and are rejected 401 before it — so this is the only test that
+        // drives the shared "auth_local" bucket, which therefore starts fresh here).
+        req.extensions_mut().insert(ConnectInfo(loopback));
+        req
+    };
+
+    // First 5 within the 60s window succeed.
+    for i in 1..=5 {
+        let resp = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "local token issuance {i}/5 should succeed"
+        );
+    }
+    // The 6th is throttled (SEC1: 5/min).
+    let resp = app.clone().oneshot(make_req()).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the 6th /auth/local mint within a minute must be rate-limited"
+    );
+}
+
+#[tokio::test]
+async fn auth_local_not_mounted_when_sensitive_identity_disabled() {
+    let base = test_state();
+    let state = Arc::new(AppState {
+        sensitive_identity_routes_enabled: false,
+        ..(*base).clone()
+    });
+    let app = build_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/local")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn auth_token_response_has_correct_fields() {
     let state = test_state();
     let app = build_router(Arc::clone(&state));
-
-    let sig = state.identity.sign(b"konsensus-auth");
-    let sig_hex = hex::encode(sig.to_bytes());
+    let body = signed_auth_body(&state, app.clone()).await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/auth/token")
         .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({"signature": sig_hex}).to_string(),
-        ))
+        .body(Body::from(body))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -1230,4 +1602,194 @@ async fn auth_token_get_method_not_allowed() {
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+// ─── HARD-9 (#238): reveal_mnemonic post-re-auth failures must still audit ────
+
+/// Drive the real `POST /api/v1/identity/mnemonic` endpoint through a genuinely
+/// passing re-auth (fresh challenge + node-key signature) and assert the given
+/// post-re-auth failure path STILL records a `success:false`
+/// `identity.mnemonic_revealed` audit event with the expected reason — and never
+/// writes a seed phrase. These are the sensitive cases Codex flagged on #238:
+/// the caller has already proven possession of the node key, so the
+/// "every reveal attempt is audited" contract must hold on these returns too.
+async fn assert_post_reauth_reveal_failure_audited(
+    state: Arc<AppState>,
+    audit_path: &std::path::Path,
+    expected_status: StatusCode,
+    expected_reason: &str,
+) {
+    let token = auth_header(&state);
+    let app = build_router(state.clone());
+    // Genuine re-auth: fetch a fresh challenge and sign it with the node key.
+    let body = signed_auth_body(&state, app.clone()).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/identity/mnemonic")
+        .header("Authorization", token)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        expected_status,
+        "reveal failure path should return {expected_status} (reason {expected_reason})"
+    );
+
+    let contents = std::fs::read_to_string(audit_path).unwrap();
+    assert!(
+        contents.contains("mnemonic_revealed"),
+        "post-re-auth failure must emit a mnemonic_revealed audit event: {contents}"
+    );
+    assert!(
+        contents.contains(&format!("\"reason\":\"{expected_reason}\"")),
+        "audit event must carry reason={expected_reason}: {contents}"
+    );
+    assert!(
+        contents.contains("\"success\":false"),
+        "audit event must record success=false: {contents}"
+    );
+    // The seed is never read on these paths; assert no BIP-39 phrase leaked into
+    // the audit log (defence-in-depth against a future detail change).
+    assert!(
+        !contents.contains("abandon"),
+        "audit log must never contain a seed phrase: {contents}"
+    );
+}
+
+#[tokio::test]
+async fn reveal_mnemonic_audits_no_data_dir_failure() {
+    let scratch = tempfile::tempdir().unwrap();
+    let audit_tmp = tempfile::NamedTempFile::new().unwrap();
+    let audit_path = audit_tmp.path().to_path_buf();
+    let base = test_state_with_data_dir(scratch.path().to_path_buf());
+    let state = Arc::new(AppState {
+        audit_log: Arc::new(AuditLog::open(&audit_path).unwrap()),
+        data_dir: None,
+        backup_dir: None,
+        ..(*base).clone()
+    });
+    assert_post_reauth_reveal_failure_audited(
+        state,
+        &audit_path,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "no_data_dir",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reveal_mnemonic_audits_encrypted_failure() {
+    let data_dir = tempfile::tempdir().unwrap();
+    std::fs::write(data_dir.path().join("mnemonic.enc"), b"ciphertext").unwrap();
+    let audit_tmp = tempfile::NamedTempFile::new().unwrap();
+    let audit_path = audit_tmp.path().to_path_buf();
+    let base = test_state_with_data_dir(data_dir.path().to_path_buf());
+    let state = Arc::new(AppState {
+        audit_log: Arc::new(AuditLog::open(&audit_path).unwrap()),
+        ..(*base).clone()
+    });
+    assert_post_reauth_reveal_failure_audited(
+        state,
+        &audit_path,
+        StatusCode::BAD_REQUEST,
+        "mnemonic_encrypted",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reveal_mnemonic_audits_missing_file_failure() {
+    // Empty data dir: neither mnemonic.txt nor mnemonic.enc present.
+    let data_dir = tempfile::tempdir().unwrap();
+    let audit_tmp = tempfile::NamedTempFile::new().unwrap();
+    let audit_path = audit_tmp.path().to_path_buf();
+    let base = test_state_with_data_dir(data_dir.path().to_path_buf());
+    let state = Arc::new(AppState {
+        audit_log: Arc::new(AuditLog::open(&audit_path).unwrap()),
+        ..(*base).clone()
+    });
+    assert_post_reauth_reveal_failure_audited(
+        state,
+        &audit_path,
+        StatusCode::NOT_FOUND,
+        "mnemonic_file_missing",
+    )
+    .await;
+}
+
+/// Regression guard for the uniform-401 membrane fix (#332): the AuthUser
+/// extractor must return the SAME opaque body — exactly "invalid token" — for
+/// EVERY token-failure class. If the body ever again interpolates the error
+/// (malformed vs bad-signature vs unsupported-alg vs expired vs bad-claims),
+/// this test fails. Class detail stays in tracing/metrics only.
+#[tokio::test]
+async fn auth_user_rejection_body_is_uniform_across_failure_classes() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use hmac::Mac;
+
+    let state = test_state();
+    let secret = state.jwt_secret.clone();
+
+    // Mint a token with arbitrary header/claims JSON and a VALID HMAC-SHA256
+    // signature under `sign_secret` — lets us reach every rejection class.
+    let mint = |header: &str, claims: &str, sign_secret: &str| -> String {
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let mut mac =
+            hmac::Hmac::<sha2::Sha256>::new_from_slice(sign_secret.as_bytes()).unwrap();
+        mac.update(h.as_bytes());
+        mac.update(b".");
+        mac.update(p.as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{h}.{p}.{s}")
+    };
+
+    let good_claims = r#"{"sub":"node1","iat":1000000,"exp":9999999999}"#;
+    let cases: Vec<(&str, String)> = vec![
+        ("malformed (not a JWT)", "garbage-not-a-jwt".to_string()),
+        (
+            "bad signature (signed with a different secret)",
+            mint(r#"{"alg":"HS256","typ":"JWT"}"#, good_claims, "another-secret-entirely-000000"),
+        ),
+        (
+            "unsupported alg (valid MAC, HS512 header)",
+            mint(r#"{"alg":"HS512","typ":"JWT"}"#, good_claims, &secret),
+        ),
+        (
+            "expired (valid MAC, past exp)",
+            mint(
+                r#"{"alg":"HS256","typ":"JWT"}"#,
+                r#"{"sub":"node1","iat":1000000,"exp":1000001}"#,
+                &secret,
+            ),
+        ),
+        (
+            "invalid claims (valid MAC, exp is a string)",
+            mint(
+                r#"{"alg":"HS256","typ":"JWT"}"#,
+                r#"{"sub":"node1","iat":1000000,"exp":"soon"}"#,
+                &secret,
+            ),
+        ),
+    ];
+
+    for (label, token) in cases {
+        let app = build_router(Arc::clone(&state));
+        let req = Request::builder()
+            .uri("/api/v1/status")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{label}: expected 401");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            body, "invalid token",
+            "{label}: 401 body must be uniformly \"invalid token\", got {body:?}"
+        );
+    }
 }

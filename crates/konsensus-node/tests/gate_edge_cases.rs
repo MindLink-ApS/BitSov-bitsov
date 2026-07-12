@@ -71,12 +71,14 @@ fn default_pricing() -> konsensus_pricing::StaticPricingEngine {
 /// In-memory nonce store for testing.
 struct InMemoryNonceStore {
     seen: tokio::sync::Mutex<HashSet<Vec<u8>>>,
+    seen_payment_hashes: tokio::sync::Mutex<HashSet<[u8; 32]>>,
 }
 
 impl InMemoryNonceStore {
     fn new() -> Self {
         Self {
             seen: tokio::sync::Mutex::new(HashSet::new()),
+            seen_payment_hashes: tokio::sync::Mutex::new(HashSet::new()),
         }
     }
 }
@@ -90,6 +92,16 @@ impl konsensus_core::gate::NonceStore for InMemoryNonceStore {
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let mut seen = self.seen.lock().await;
         Ok(seen.insert(nonce.as_bytes().to_vec()))
+    }
+
+    async fn check_and_store_payment_hash(
+        &self,
+        payment_hash: &[u8; 32],
+        _sender: &NodeId,
+        _message_id: &konsensus_core::MessageId,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let mut seen = self.seen_payment_hashes.lock().await;
+        Ok(seen.insert(*payment_hash))
     }
 }
 
@@ -113,6 +125,7 @@ async fn replay_attack_rejected_on_second_submission() {
         &pricing,
         Some(&whitelist),
         None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+        None,
     )
     .await
     .expect("first submission should pass");
@@ -125,6 +138,7 @@ async fn replay_attack_rejected_on_second_submission() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -163,6 +177,7 @@ async fn tampered_signature_rejected() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -198,6 +213,7 @@ async fn zeroed_signature_rejected() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -235,6 +251,7 @@ async fn tampered_ciphertext_rejected() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -287,6 +304,7 @@ async fn wrong_preimage_rejected() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -318,6 +336,7 @@ async fn zero_payment_rejected() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -370,6 +389,7 @@ async fn far_future_timestamp_rejected() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -418,6 +438,7 @@ async fn expired_message_rejected() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -454,6 +475,7 @@ async fn non_whitelisted_sender_rejected() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -483,6 +505,7 @@ async fn empty_whitelist_rejects_all() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -533,6 +556,7 @@ async fn realtime_signaling_kind_uses_payment_gate() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -578,6 +602,7 @@ async fn tight_max_age_rejects_slightly_old_message() {
         max_message_age_ms: 5_000,
         max_future_ms: 5_000,
         verify_lightning_settlement: false,
+        min_admission_cost_msat: 0,
     };
     let gate = PaymentGate::with_config(config);
     let nonce_store = InMemoryNonceStore::new();
@@ -591,6 +616,7 @@ async fn tight_max_age_rejects_slightly_old_message() {
             &pricing,
             Some(&whitelist),
             None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None,
         )
         .await;
 
@@ -624,6 +650,7 @@ async fn valid_envelope_passes_all_checks() {
         &pricing,
         Some(&whitelist),
         None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+        None,
     )
     .await
     .expect("valid envelope should pass all gate checks");
@@ -648,6 +675,7 @@ async fn valid_envelope_with_no_whitelist_passes() {
         &pricing,
         None,
         None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+        None,
     )
     .await
     .expect("envelope without whitelist enforcement should pass");

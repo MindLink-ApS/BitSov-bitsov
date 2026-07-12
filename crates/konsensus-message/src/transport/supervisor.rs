@@ -40,6 +40,7 @@ impl NoiseTransport {
                 banned_peers: Arc::clone(&self.banned_peers),
                 incoming_tx: self.incoming_tx.clone(),
                 control_tx: self.control_tx.clone(),
+                cookie_keyring: Arc::clone(&self.cookie_keyring),
             };
             let mut shutdown_rx = self.shutdown.subscribe();
             let ping_counter = Arc::clone(&self.ping_counter);
@@ -204,6 +205,7 @@ impl NoiseTransport {
             banned_peers: Arc::clone(&self.banned_peers),
             incoming_tx: self.incoming_tx.clone(),
             control_tx: self.control_tx.clone(),
+            cookie_keyring: Arc::clone(&self.cookie_keyring),
         };
         let mut shutdown_rx = self.shutdown.subscribe();
         let ping_counter = Arc::clone(&self.ping_counter);

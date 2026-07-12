@@ -13,11 +13,6 @@ members = [
     "crates/konsensus-node",
     "crates/konsensus-bsx",
     "crates/konsensus-fiat",
-    "crates/konsensus-mobile",
-]
-exclude = [
-    "frontend/src-tauri",
-    "bitsov-browser",
 ]
 resolver = "2"
 
@@ -83,7 +78,9 @@ blake3 = "1"
 
 # Bitcoin / Lightning
 bitcoin = { version = "0.32", features = ["serde", "rand-std"] }
-bip39 = { version = "2", features = ["rand"] }
+# `zeroize` enables `ZeroizeOnDrop` on `bip39::Mnemonic` so parsed seed
+# phrases scrub their entropy from memory on drop (HARD-9).
+bip39 = { version = "2", features = ["rand", "zeroize"] }
 ldk-node = "0.7"
 lightning-invoice = "0.34"
 # tonic/prost — reserved for future gRPC (LND/CLN) providers
@@ -91,13 +88,16 @@ lightning-invoice = "0.34"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
-rpassword = "5"
+rpassword = "7"
 
 # Config
 toml = "0.8"
 
-# JWT
-jsonwebtoken = "9"
+# JWT: no third-party JWT crate. jsonwebtoken 9 carried GHSA-h395-gr6q-cpjc (no 9.x
+# fix); 10's rust_crypto feature force-pulls rsa 0.9.10 (unfixed RUSTSEC-2023-0071
+# Marvin) and aws_lc_rs would add a new C/cmake dep. BitSov only ever accepts HS256,
+# so konsensus-api implements that one path by composing the audited in-tree
+# RustCrypto crates (hmac + sha2) — see konsensus-api/src/auth.rs.
 
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }

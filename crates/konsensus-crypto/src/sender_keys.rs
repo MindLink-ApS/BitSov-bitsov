@@ -27,16 +27,22 @@
 //! 2. She distributes a `SenderKeyDistribution` message to each group member
 //!    over their 1:1 Double Ratchet channel.
 //! 3. To send a group message, Alice ratchets her chain key, derives a message
-//!    key, and encrypts with AES-256-GCM. She signs the ciphertext with her
-//!    signing key for authentication.
+//!    key, and encrypts with AES-256-GCM. The AEAD associated data binds the
+//!    ciphertext to its `(format_version, group_id, sender_id, generation,
+//!    message_number)` context so it cannot be replayed into a different group,
+//!    attributed to a different sender, or have its counters rewritten. She
+//!    signs the ciphertext with her signing key for authentication.
 //! 4. Recipients look up Alice's sender key, derive the same message key,
-//!    decrypt, and verify the signature.
+//!    reconstruct the AEAD associated data from *their own* session context
+//!    (group + claimed sender + message counters), decrypt, and verify the
+//!    signature. A context mismatch fails the AEAD tag check before any
+//!    plaintext is produced.
 //! 5. On member removal, every remaining member generates a new `SenderKeyState`
 //!    and redistributes — the removed member cannot decrypt future messages.
 
 use std::collections::HashMap;
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce as AesNonce};
 use ed25519_dalek::{Signer, Verifier};
 use hkdf::Hkdf;
@@ -77,6 +83,31 @@ pub enum SenderKeyError {
 
 /// Maximum number of skipped message keys to store per sender.
 const MAX_SKIP: u32 = 256;
+
+/// AEAD framing version for group ciphertexts.
+///
+/// Version 1 is the original framing: AES-256-GCM with **no** associated data
+/// and a nonce derived from `(message_key, message_number)` only. It is kept as
+/// a named constant for documentation and forward-compatibility but is no longer
+/// produced or accepted — there are no live group sessions on the wire yet, so
+/// this is a clean break rather than a dual-decode path.
+///
+/// Version 2 (current) binds `(format_version, group_id, sender_id, generation,
+/// message_number)` as AEAD associated data and folds the same context into the
+/// nonce derivation for domain separation. The version byte is itself part of
+/// the associated data, so downgrading the framing is detectable: a v1 reader
+/// could never produce the v2 tag, and a v2 reader rebuilds the v2 AAD.
+const SENDER_KEY_AEAD_VERSION: u8 = 2;
+
+/// Domain-separation tag mixed into the AEAD associated data and the nonce
+/// HKDF. Distinguishes group sender-key ciphertexts from every other AEAD use
+/// in the crate (e.g. the Double Ratchet), so a key/ciphertext can never be
+/// cross-applied between protocols even if a key were ever reused.
+const SENDER_KEY_AAD_DOMAIN: &[u8] = b"konsensus-v2-sender-key-aead";
+
+/// HKDF `info` tag for the group message nonce. Kept distinct from the AAD
+/// domain tag so the nonce stream and the AAD never collide.
+const SENDER_KEY_NONCE_INFO: &[u8] = b"konsensus-v2-sender-key-nonce-v2";
 
 /// A sender key distribution message — sent to each group member via 1:1 channel.
 ///
@@ -171,9 +202,20 @@ impl SenderKeyState {
 
     /// Encrypt a plaintext message for the group.
     ///
+    /// `group_id` / `sender` identify the context this ciphertext is produced
+    /// for; they are bound into the AEAD associated data (alongside the
+    /// generation and message number) so the ciphertext cannot be replayed into
+    /// another group or attributed to another sender. They are *not* placed on
+    /// the wire — the recipient reconstructs them from its own session state.
+    ///
     /// Returns a `GroupCiphertext` containing the encrypted payload, message
     /// counter, signing key generation, and Ed25519 signature.
-    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<GroupCiphertext, SenderKeyError> {
+    pub fn encrypt(
+        &mut self,
+        group_id: &[u8; 32],
+        sender: &NodeId,
+        plaintext: &[u8],
+    ) -> Result<GroupCiphertext, SenderKeyError> {
         // Derive message key from chain key
         let (next_chain, message_key) = ratchet_chain_key(&self.chain_key);
         self.chain_key = next_chain;
@@ -181,14 +223,11 @@ impl SenderKeyState {
         let msg_num = self.message_count;
         self.message_count += 1;
 
-        // Encrypt with AES-256-GCM
-        let nonce = derive_nonce(&message_key, msg_num);
-        let cipher = Aes256Gcm::new((&message_key).into());
-        let aes_nonce = AesNonce::from_slice(&nonce);
+        // Bind (version, group, sender, generation, message number) as AEAD AAD.
+        let aad = build_aad(group_id, sender, self.generation, msg_num);
 
-        let ciphertext = cipher
-            .encrypt(aes_nonce, plaintext)
-            .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
+        // Encrypt with AES-256-GCM (nonce + AAD both context-bound).
+        let ciphertext = aead_encrypt(&message_key, plaintext, &aad)?;
 
         // Sign: generation || message_number || ciphertext
         let sig_payload = build_sig_payload(self.generation, msg_num, &ciphertext);
@@ -333,7 +372,10 @@ impl GroupSession {
     /// Uses our sender key — all group members who have our distribution
     /// can decrypt.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<GroupCiphertext, SenderKeyError> {
-        self.our_sender_key.encrypt(plaintext)
+        let group_id = self.group_id;
+        let our_node_id = self.our_node_id;
+        self.our_sender_key
+            .encrypt(&group_id, &our_node_id, plaintext)
     }
 
     /// Decrypt a group message from a specific sender.
@@ -342,6 +384,10 @@ impl GroupSession {
         sender: &NodeId,
         message: &GroupCiphertext,
     ) -> Result<Vec<u8>, SenderKeyError> {
+        // Copy out the group id before borrowing `member_keys` mutably so the
+        // AEAD AAD can be built from session context without a borrow conflict.
+        let group_id = self.group_id;
+
         let entry = self
             .member_keys
             .get_mut(sender)
@@ -364,10 +410,16 @@ impl GroupSession {
             .verify(&sig_payload, &signature)
             .map_err(|e| SenderKeyError::InvalidSignature(e.to_string()))?;
 
+        // Rebuild the AEAD associated data from *our* session context: this
+        // group, the claimed sender, and the message's own counters. A
+        // ciphertext minted for a different (group, sender) context — or with
+        // rewritten counters — yields a different AAD and fails the GCM tag
+        // check, so cross-context substitution cannot smuggle plaintext through.
+        let aad = build_aad(&group_id, sender, message.generation, message.message_number);
+
         // Check for skipped key
         if let Some(message_key) = entry.skipped_keys.remove(&message.message_number) {
-            let nonce = derive_nonce(&message_key, message.message_number);
-            return aead_decrypt(&message_key, &nonce, &message.ciphertext);
+            return aead_decrypt(&message_key, &message.ciphertext, &aad);
         }
 
         // Message is behind our chain — can't go backwards
@@ -396,8 +448,7 @@ impl GroupSession {
         entry.chain_key = next_chain;
         entry.chain_index = message.message_number + 1;
 
-        let nonce = derive_nonce(&message_key, message.message_number);
-        aead_decrypt(&message_key, &nonce, &message.ciphertext)
+        aead_decrypt(&message_key, &message.ciphertext, &aad)
     }
 
     /// Remove a member from the group.
@@ -452,11 +503,41 @@ fn ratchet_chain_key(chain_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     (next_chain, message_key)
 }
 
-/// Derive a 12-byte AES-GCM nonce from a message key and message number.
-fn derive_nonce(message_key: &[u8; 32], message_number: u32) -> [u8; 12] {
-    let hkdf = Hkdf::<Sha256>::new(Some(message_key), &message_number.to_be_bytes());
+/// Build the AEAD associated data binding a group ciphertext to its context.
+///
+/// Layout:
+/// `domain || version(1) || group_id(32) || sender_id(32) || generation(4 BE) || msg_no(4 BE)`,
+/// where `domain` is [`SENDER_KEY_AAD_DOMAIN`]. Both encrypt and decrypt rebuild
+/// this from authoritative session context, never from attacker-controlled bytes
+/// beyond the (signed, then re-checked) counters, so a ciphertext is
+/// cryptographically pinned to exactly one
+/// `(domain, version, group, sender, generation, message_number)` tuple.
+fn build_aad(group_id: &[u8; 32], sender: &NodeId, generation: u32, message_number: u32) -> Vec<u8> {
+    let sender_bytes = sender.as_bytes();
+    let mut aad =
+        Vec::with_capacity(SENDER_KEY_AAD_DOMAIN.len() + 1 + 32 + sender_bytes.len() + 4 + 4);
+    aad.extend_from_slice(SENDER_KEY_AAD_DOMAIN);
+    aad.push(SENDER_KEY_AEAD_VERSION);
+    aad.extend_from_slice(group_id);
+    aad.extend_from_slice(sender_bytes);
+    aad.extend_from_slice(&generation.to_be_bytes());
+    aad.extend_from_slice(&message_number.to_be_bytes());
+    aad
+}
+
+/// Derive a 12-byte AES-GCM nonce from a message key and the AEAD associated
+/// data.
+///
+/// Each message key is used exactly once (the chain ratchets forward per
+/// message), so a deterministic nonce is sound. Folding the full AAD into the
+/// HKDF salt — alongside the domain-separated [`SENDER_KEY_NONCE_INFO`] `info`
+/// tag — gives key/domain/context separation: two different contexts can never
+/// collide on the same `(key, nonce)` pair, and the nonce stream is disjoint
+/// from every other AEAD use in the crate.
+fn derive_nonce(message_key: &[u8; 32], aad: &[u8]) -> [u8; 12] {
+    let hkdf = Hkdf::<Sha256>::new(Some(message_key), aad);
     let mut nonce = [0u8; 12];
-    hkdf.expand(b"konsensus-v2-sender-key-nonce", &mut nonce)
+    hkdf.expand(SENDER_KEY_NONCE_INFO, &mut nonce)
         .expect("12 bytes is a valid HKDF output length");
     nonce
 }
@@ -470,16 +551,23 @@ fn build_sig_payload(generation: u32, message_number: u32, ciphertext: &[u8]) ->
     payload
 }
 
-/// AES-256-GCM decrypt.
-fn aead_decrypt(
-    key: &[u8; 32],
-    nonce: &[u8; 12],
-    ciphertext: &[u8],
-) -> Result<Vec<u8>, SenderKeyError> {
+/// AES-256-GCM encrypt with context-bound nonce and associated data.
+fn aead_encrypt(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SenderKeyError> {
     let cipher = Aes256Gcm::new(key.into());
-    let aes_nonce = AesNonce::from_slice(nonce);
+    let nonce_bytes = derive_nonce(key, aad);
+    let aes_nonce = AesNonce::from_slice(&nonce_bytes);
     cipher
-        .decrypt(aes_nonce, ciphertext)
+        .encrypt(aes_nonce, Payload { msg: plaintext, aad })
+        .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))
+}
+
+/// AES-256-GCM decrypt with context-bound nonce and associated data.
+fn aead_decrypt(key: &[u8; 32], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SenderKeyError> {
+    let cipher = Aes256Gcm::new(key.into());
+    let nonce_bytes = derive_nonce(key, aad);
+    let aes_nonce = AesNonce::from_slice(&nonce_bytes);
+    cipher
+        .decrypt(aes_nonce, Payload { msg: ciphertext, aad })
         .map_err(|e| SenderKeyError::DecryptionFailed(e.to_string()))
 }
 

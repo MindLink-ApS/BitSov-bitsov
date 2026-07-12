@@ -3,6 +3,7 @@
 //! Implementations: LNbits (HTTP), LND (gRPC), CLN (gRPC), LDK (embedded).
 
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -50,6 +51,12 @@ pub struct Invoice {
 /// Information about a Lightning channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInfo {
+    /// Provider-local channel identifier — the SAME string `open_channel` returns
+    /// and `close_channel` accepts (LDK: the `user_channel_id`; LND: `chan_id`).
+    /// Required so a client that lists channels can close/inspect one without
+    /// having to remember the id from the open call. Distinct from
+    /// `short_channel_id` (the routing scid, only assigned after confirmation).
+    pub channel_id: String,
     /// Remote peer's public key (hex).
     pub peer_pubkey: String,
     /// Total channel capacity in millisatoshis.
@@ -85,6 +92,29 @@ pub struct PaymentDetails {
     /// Fee paid in millisatoshis (outgoing only).
     #[serde(default)]
     pub fee_msat: Option<u64>,
+}
+
+/// A single settled, INBOUND payment surfaced by
+/// [`LightningProvider::watch_inbound_keysend`].
+///
+/// This is the receive-half of "payment is the connection": the node admits a
+/// session ON this settled payment, after pairing `binding_tlv` to the matching
+/// `UkmEnvelope` and routing it through the unchanged `PaymentGate`. A provider
+/// MUST only surface items whose `details.status == Settled` and
+/// `details.direction == Incoming`; pending/in-flight/outgoing HTLCs MUST NOT be
+/// surfaced.
+#[derive(Debug, Clone)]
+pub struct InboundPayment {
+    /// The settled inbound payment record (hash/preimage/amount, Settled+Incoming).
+    /// Feeds the gate's settlement check verbatim.
+    pub details: PaymentDetails,
+    /// Raw bytes from the application keysend TLV record (ADR-037), if the sender
+    /// pushed one; `None` for a bare keysend.
+    ///
+    /// HONEST FLOOR: this is a *binding* (a `payment_hash` / envelope-id pointer or
+    /// digest), NOT necessarily the full `UkmEnvelope` — large payloads stay on the
+    /// out-of-band transport and are linked by `payment_hash`.
+    pub binding_tlv: Option<Vec<u8>>,
 }
 
 /// Errors from Lightning operations.
@@ -258,6 +288,91 @@ pub trait LightningProvider: Send + Sync {
         Err(LightningError::Backend(
             "keysend not supported by this provider".into(),
         ))
+    }
+
+    /// Send a spontaneous keysend that carries the BitSov payment→envelope
+    /// *binding* as a custom keysend TLV record (ADR-037) — the send-half
+    /// mirror of [`watch_inbound_keysend`](LightningProvider::watch_inbound_keysend).
+    ///
+    /// This is the sender's side of "payment is the connection": a node pays its
+    /// way onto a counterparty by pushing a settled keysend whose binding TLV
+    /// lets the recipient pair the HTLC to the out-of-band `UkmEnvelope` and
+    /// route it through `PaymentGate::verify`. It is distinct from
+    /// [`keysend`](LightningProvider::keysend) precisely because the caller MUST
+    /// be able to supply the binding bytes; a bare keysend cannot.
+    ///
+    /// # Arguments
+    /// * `dest_pubkey` — Destination Lightning node public key (hex).
+    /// * `amount_msat` — Amount in millisatoshis (≥ the recipient's published price).
+    /// * `binding_tlv` — Non-empty application binding bytes pushed in the
+    ///   ADR-037 custom (odd) keysend TLV record. HONEST FLOOR: this is a
+    ///   `payment_hash` / envelope-id pointer or digest, NOT necessarily the
+    ///   full envelope — bulk ciphertext rides out-of-band on the transport,
+    ///   linked by `payment_hash`.
+    ///
+    /// Default implementation returns `Err(Backend(..))` — fail **closed**. A
+    /// backend that cannot attach an application TLV to a keysend MUST refuse
+    /// rather than send an *unbindable* payment, which the recipient would be
+    /// forced to drop (silently burning the sender's sats). This mirrors the
+    /// fail-closed default of [`watch_inbound_keysend`](LightningProvider::watch_inbound_keysend):
+    /// neither half of ADR-037 ever degrades to a free or lossy path. Empty
+    /// bindings MUST be rejected before payment send/debit because they cannot
+    /// bind a payment to an envelope.
+    async fn keysend_with_binding(
+        &self,
+        _dest_pubkey: &str,
+        _amount_msat: u64,
+        _binding_tlv: &[u8],
+    ) -> Result<PaymentDetails, LightningError> {
+        Err(LightningError::Backend(
+            "binding-TLV keysend not supported by this provider".into(),
+        ))
+    }
+
+    /// Subscribe to SETTLED, INBOUND payments as they arrive — the receive-half
+    /// mirror of [`keysend`](LightningProvider::keysend).
+    ///
+    /// This is the "payment is the connection" primitive: the node listens for an
+    /// unsolicited *settled* inbound payment and admits a session ON that payment,
+    /// rather than accepting a free transport handshake and charging per message.
+    /// Each yielded [`InboundPayment`] carries the settled [`PaymentDetails`]
+    /// (`status == Settled`, `direction == Incoming`) plus any application binding
+    /// the sender pushed in a custom keysend TLV record, so the caller can recover
+    /// the matching `UkmEnvelope` and route it through `PaymentGate::verify`.
+    ///
+    /// The returned stream MUST only yield already-settled, incoming records;
+    /// pending/in-flight HTLCs MUST NOT be surfaced. Stream-level termination
+    /// (backend dropped) ends the stream and the caller re-subscribes.
+    ///
+    /// Provider streams may be lossy fan-out unless the implementation states a
+    /// stronger guarantee. Live admission wiring MUST NOT rely on this stream
+    /// alone unless it also provides durable replay/reconciliation (for example,
+    /// by polling settled incoming payments) or replaces the provider fan-out
+    /// with a non-lossy admission ingress. A missed stream item must fail closed,
+    /// never create a free-admission fallback. Admission callers MUST explicitly
+    /// inspect [`LightningProvider::inbound_keysend_stream_requires_reconciliation`]
+    /// before consuming this stream.
+    ///
+    /// Default implementation returns `Err(Backend(..))` — a backend that cannot
+    /// expose a settled-inbound signal fails **closed**, never degrading to a
+    /// free-admission path.
+    async fn watch_inbound_keysend(
+        &self,
+    ) -> Result<BoxStream<'static, InboundPayment>, LightningError> {
+        Err(LightningError::Backend(
+            "inbound payment subscription not supported by this provider".into(),
+        ))
+    }
+
+    /// Whether [`watch_inbound_keysend`](LightningProvider::watch_inbound_keysend)
+    /// is only a lossy notification stream and therefore requires durable
+    /// replay/reconciliation before live admission may consume it.
+    ///
+    /// Defaults to `true` so new backends fail conservative: until a provider
+    /// explicitly proves non-lossy admission ingress, downstream receive→admit
+    /// wiring must add reconciliation or refuse to rely on the stream.
+    fn inbound_keysend_stream_requires_reconciliation(&self) -> bool {
+        true
     }
 
     /// Create a HODL invoice — payment is held until the preimage is released.

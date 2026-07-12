@@ -46,6 +46,12 @@ pub enum Command {
         /// provided, the node will prompt interactively.
         #[arg(long)]
         password: Option<String>,
+
+        /// Override admission mode for this run: `whitelist` (default) or `price-open`.
+        /// Operator-selectable price-admission mode; this is NOT an open network.
+        /// When omitted, the config-file value (default `whitelist`) is used.
+        #[arg(long, value_parser = ["whitelist", "price-open"])]
+        admission_mode: Option<String>,
     },
 
     /// Print the node ID derived from a mnemonic file.
@@ -114,6 +120,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ScbCommand,
     },
+
+    /// Whitelist (peers + accepted invites) backup/restore for fresh-hardware recovery.
+    Whitelist {
+        #[command(subcommand)]
+        command: WhitelistCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -143,6 +155,46 @@ pub enum ScbCommand {
         /// Required to execute destructive force-close operations.
         #[arg(long)]
         confirm: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WhitelistCommand {
+    /// Export the gate-whitelist state into an encrypted sidecar (RV-RESTORE).
+    ///
+    /// The SCB backs up only LDK channel state; this backs up the storage-DB
+    /// whitelist (peers + accepted invites) so a fresh-hardware restore can
+    /// re-admit invite-onboarded peers. Run on the SCB-rotation cadence and
+    /// keep the file alongside `scb-latest.aes`.
+    Backup {
+        /// Path to node config (for mnemonic + storage settings).
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+
+        /// Output path. Defaults to `<backup.scb_dir>/whitelist-latest.aes`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// Password to decrypt an encrypted mnemonic file (`.enc`), if needed.
+        #[arg(long)]
+        password: Option<String>,
+    },
+
+    /// Restore the gate-whitelist state from an encrypted sidecar into the
+    /// configured storage DB (RV-RESTORE). Run after `scb restore` on fresh
+    /// hardware so the node re-admits invite-onboarded peers. Idempotent.
+    Restore {
+        /// Path to the encrypted whitelist backup (`whitelist-latest.aes`).
+        #[arg(long)]
+        from: PathBuf,
+
+        /// Path to node config (for mnemonic + storage settings).
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+
+        /// Password to decrypt an encrypted mnemonic file (`.enc`), if needed.
+        #[arg(long)]
+        password: Option<String>,
     },
 }
 

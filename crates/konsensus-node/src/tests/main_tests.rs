@@ -43,9 +43,25 @@ fn init_full_tier_creates_config() -> Result<()> {
     let dir = tmp.path().join("node");
 
     cmd_init(&dir, true, Some("full"), None)?;
+    let config_path = dir.join("konsensus.toml");
+    assert!(config_path.exists(), "full-tier config file must be written");
 
-    let config = crate::config::NodeConfig::load(&dir.join("konsensus.toml"))?;
-    assert_eq!(config.tier, crate::config::NodeTier::Full);
+    // A fresh full-tier default leaves BOTH the P2P network listener and the LDK
+    // Lightning listener on 0.0.0.0:9735. `NodeConfig::load` runs `validate()`,
+    // which now rejects that collision with a loud, actionable error instead of
+    // letting the node boot and silently hang at runtime (LDK shuts down + the
+    // transport listener never returns + the API never binds — reproduced on 2
+    // hosts during R4.5 staging). The operator resolves it by giving P2P and
+    // Lightning distinct ports (e.g. alpha runs P2P 9736 / Lightning 9735).
+    let err = crate::config::NodeConfig::load(&config_path).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("same port"), "got: {msg}");
+    assert!(msg.contains("Lightning listening address"), "got: {msg}");
+
+    // The raw TOML still parses to a Full-tier config; only validation rejects it.
+    let raw = std::fs::read_to_string(&config_path)?;
+    let parsed: crate::config::NodeConfig = toml::from_str(&raw)?;
+    assert_eq!(parsed.tier, crate::config::NodeTier::Full);
     Ok(())
 }
 
@@ -189,7 +205,7 @@ fn restore_with_encryption() -> Result<()> {
     assert!(enc_path.exists(), "encrypted mnemonic file must exist");
 
     let decrypted = mnemonic_crypto::read_mnemonic(&enc_path, Some("secret"))?;
-    assert_eq!(decrypted, TEST_MNEMONIC);
+    assert_eq!(decrypted.as_str(), TEST_MNEMONIC);
     Ok(())
 }
 

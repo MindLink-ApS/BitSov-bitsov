@@ -53,9 +53,12 @@ fn parse_init_all_flags() {
 fn parse_start_default_config() {
     let cli = Cli::parse_from(["konsensus", "start"]);
     match cli.command {
-        Command::Start { config, password } => {
+        Command::Start { config, password, admission_mode } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert!(password.is_none());
+            // M1a: off-by-default — absence of the flag leaves the override None,
+            // so cmd_start falls back to the config-file value (default Whitelist).
+            assert!(admission_mode.is_none());
         }
         _ => panic!("expected Start command"),
     }
@@ -65,9 +68,10 @@ fn parse_start_default_config() {
 fn parse_start_custom_config() {
     let cli = Cli::parse_from(["konsensus", "start", "--config", "/etc/konsensus.toml"]);
     match cli.command {
-        Command::Start { config, password } => {
+        Command::Start { config, password, admission_mode } => {
             assert_eq!(config, PathBuf::from("/etc/konsensus.toml"));
             assert!(password.is_none());
+            assert!(admission_mode.is_none());
         }
         _ => panic!("expected Start command"),
     }
@@ -77,12 +81,36 @@ fn parse_start_custom_config() {
 fn parse_start_with_password() {
     let cli = Cli::parse_from(["konsensus", "start", "--password", "secret123"]);
     match cli.command {
-        Command::Start { config, password } => {
+        Command::Start { config, password, admission_mode } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert_eq!(password.as_deref(), Some("secret123"));
+            assert!(admission_mode.is_none());
         }
         _ => panic!("expected Start command"),
     }
+}
+
+#[test]
+fn parse_start_admission_mode_price_open() {
+    // M1a CLI override: `--admission-mode price-open` is captured as Some("price-open").
+    // cmd_start maps it to ReachabilityMode::PriceOpen before building the node.
+    let cli = Cli::parse_from(["konsensus", "start", "--admission-mode", "price-open"]);
+    match cli.command {
+        Command::Start { config, password, admission_mode } => {
+            assert_eq!(config, PathBuf::from("konsensus.toml"));
+            assert!(password.is_none());
+            assert_eq!(admission_mode.as_deref(), Some("price-open"));
+        }
+        _ => panic!("expected Start command"),
+    }
+}
+
+#[test]
+fn parse_start_admission_mode_rejects_unknown() {
+    // clap's value_parser constrains the flag to {whitelist, price-open};
+    // any other value is a parse error (defensive — never silently misconfigured).
+    let result = Cli::try_parse_from(["konsensus", "start", "--admission-mode", "open"]);
+    assert!(result.is_err(), "unknown admission mode must be rejected by clap");
 }
 
 #[test]

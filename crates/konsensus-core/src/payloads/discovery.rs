@@ -159,6 +159,10 @@ pub struct TopicUnsubscribeRequest {
 mod tests {
     use super::*;
 
+    fn test_node_pubkey(prefix: &str, byte: &str) -> String {
+        format!("{prefix}{}", byte.repeat(32))
+    }
+
     // ── PeerEndorseList ────────────────────────────────────────────────────
 
     #[test]
@@ -166,11 +170,11 @@ mod tests {
         let list = PeerEndorseList {
             endorsements: vec![
                 PeerEndorsement {
-                    node_pubkey: "02a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string(),
+                    node_pubkey: test_node_pubkey("02", "a1"),
                     note: "Trusted developer peer".to_string(),
                 },
                 PeerEndorsement {
-                    node_pubkey: "03deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef01".to_string(),
+                    node_pubkey: test_node_pubkey("03", "b2"),
                     note: String::new(),
                 },
             ],

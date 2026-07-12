@@ -62,6 +62,11 @@ impl Storage for TestStorage {
     async fn delete_peer(&self, _id: &NodeId) -> Result<bool, StorageError> { Ok(false) }
     async fn store_nonce(&self, _n: &Nonce, _s: &NodeId) -> Result<bool, StorageError> { Ok(true) }
     async fn has_nonce(&self, _n: &Nonce) -> Result<bool, StorageError> { Ok(false) }
+    // HARD-5 (#237) made the Storage `store_payment_receipt` default fail-closed.
+    // This in-memory test stub accepts fresh payment hashes (mirrors MemStorage +
+    // store_nonce above) so a covering proof verifies; replay coverage lives in the
+    // konsensus-storage backend suites.
+    async fn store_payment_receipt(&self, _h: &[u8; 32], _s: &NodeId, _m: &MessageId) -> Result<bool, StorageError> { Ok(true) }
     async fn cleanup_expired_nonces(&self, _a: u64) -> Result<u64, StorageError> { Ok(0) }
     async fn store_session(&self, _p: &NodeId, _b: &[u8]) -> Result<(), StorageError> { Ok(()) }
     async fn load_session(&self, _p: &NodeId) -> Result<Option<Vec<u8>>, StorageError> { Ok(None) }
@@ -703,4 +708,159 @@ async fn decrypt_non_utf8_returns_none() {
 
     // Non-UTF8 for a chat message returns None
     assert!(result.is_none());
+}
+
+// ── HARD-11: registry read guard released before the gate await ──────
+//
+// Codex objection on #230: the code shape scopes the read guard before
+// `PaymentGate::verify().await`, but no test proved the REAL seam — that a peer
+// add/remove (a registry writer) can acquire the write lock while verification
+// is pending. These tests drive the extracted `whitelist_then_verify` helper
+// (the exact code `run()` calls) with a payment gate that blocks mid-`verify`,
+// and assert a concurrent writer is NOT stalled behind it.
+
+use konsensus_core::kind::KindCategory;
+use konsensus_core::traits::pricing::{PricingEngine, PricingError};
+use konsensus_message::peer::PeerEntry;
+
+/// A `PricingEngine` that parks inside `get_price_msat` (the method
+/// `PaymentGate::verify_price` calls) until released by the test, so the test can
+/// observe lock state *while* `verify().await` is pending. It fires `entered`
+/// once the gate await has reached pricing — by which point the registry read
+/// guard in `whitelist_then_verify` has provably been dropped.
+struct BlockingPricing {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl PricingEngine for BlockingPricing {
+    async fn get_price_msat(&self, _kind: u16) -> Result<u64, PricingError> {
+        // Inside verify(), past the read-guard drop. Signal, then block.
+        self.entered.notify_one();
+        let _permit = self.release.acquire().await.expect("semaphore closed");
+        Ok(1) // 1 msat required; the 100-msat proof covers it.
+    }
+    async fn get_category_price_msat(&self, _c: KindCategory) -> Result<u64, PricingError> {
+        self.entered.notify_one();
+        let _permit = self.release.acquire().await.expect("semaphore closed");
+        Ok(1)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[tokio::test]
+async fn whitelist_read_guard_released_before_gate_await() {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let sender = *alice.node_id();
+
+    // Registry with the sender whitelisted.
+    let registry = Arc::new(tokio::sync::RwLock::new(PeerRegistry::new()));
+    {
+        let mut w = registry.write().await;
+        w.add(PeerEntry {
+            node_id: sender,
+            addr: "127.0.0.1:9999".parse().unwrap(),
+            label: None,
+            auto_connect: false,
+        });
+    }
+
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
+    let nonce_adapter =
+        Arc::new(konsensus_storage::StorageNonceAdapter::new(Arc::clone(&storage)));
+    let gate = PaymentGate::new();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pricing = BlockingPricing {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+
+    let envelope = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_CHAT,
+        b"ciphertext-bytes".to_vec(),
+    );
+
+    // Drive the real seam: take the read lock, drop it, then await verify(),
+    // which parks inside BlockingPricing with no registry lock held.
+    let registry_for_task = Arc::clone(&registry);
+    let handle = tokio::spawn(async move {
+        whitelist_then_verify(
+            &envelope,
+            registry_for_task.as_ref(),
+            &gate,
+            nonce_adapter.as_ref(),
+            &pricing,
+            None,
+            0.0,
+            None,
+            // M1a: Whitelist mode keeps this lock-release test passing Some(&whitelist)
+            // into the gate (HARD-11 seam preserved); the new arg does not change it.
+            konsensus_message::ReachabilityMode::Whitelist,
+        )
+        .await
+    });
+
+    // Wait until verify() has reached pricing → the read guard is dropped.
+    entered.notified().await;
+
+    // PROOF: a registry writer acquires the write lock while verify() is pending.
+    // If the read guard were held across the await, this would block until the
+    // gate finished; assert it completes well within a generous timeout.
+    let write_acquired = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut w = registry.write().await;
+        w.remove(&sender); // a real mutation: revoke the peer mid-verification
+    })
+    .await;
+    assert!(
+        write_acquired.is_ok(),
+        "registry write lock must be acquirable while gate verify() is pending \
+         — the read guard must NOT be held across the await (HARD-11)"
+    );
+
+    // Release pricing so verify() finishes and the task joins cleanly.
+    release.add_permits(1);
+    let result = handle.await.unwrap();
+    assert!(
+        result.is_ok(),
+        "whitelisted message with a covering proof should verify: {result:?}"
+    );
+}
+
+// ── corrective price-table rate-limit (no free connection back) ──────
+
+#[tokio::test]
+async fn corrective_price_table_is_per_peer_cooldown_throttled() {
+    let mut map: HashMap<NodeId, tokio::time::Instant> = HashMap::new();
+    let a = NodeId::from_bytes([1u8; 32]);
+    let b = NodeId::from_bytes([2u8; 32]);
+    let t0 = tokio::time::Instant::now();
+
+    // First send to `a` is allowed (false = not rate-limited).
+    assert!(!corrective_price_table_rate_limited(&mut map, &a, t0));
+    // A second within the cooldown is throttled — an unpaid flood resends nothing.
+    assert!(corrective_price_table_rate_limited(
+        &mut map,
+        &a,
+        t0 + std::time::Duration::from_secs(5)
+    ));
+    // A different peer is independent — a legitimate mis-priced sender is unaffected.
+    assert!(!corrective_price_table_rate_limited(
+        &mut map,
+        &b,
+        t0 + std::time::Duration::from_secs(5)
+    ));
+    // After the cooldown fully elapses, `a` may receive one corrective table again.
+    assert!(!corrective_price_table_rate_limited(
+        &mut map,
+        &a,
+        t0 + CORRECTIVE_PRICE_TABLE_COOLDOWN + std::time::Duration::from_secs(1)
+    ));
 }

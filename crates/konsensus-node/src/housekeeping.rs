@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use konsensus_core::traits::chain::ChainProvider;
 use konsensus_core::traits::transport::MessageTransport;
@@ -40,6 +40,98 @@ pub(crate) async fn run_nonce_cleanup(
                 debug!("nonce cleanup task shutting down");
                 break;
             }
+        }
+    }
+}
+
+/// Spawns the whitelist-backup task (RV-RESTORE producer) — periodically writes
+/// the encrypted `whitelist-latest.aes` sidecar (the `peers` + `accepted_invites`
+/// rows) next to `scb-latest.aes`. The SCB carries only LDK channel-monitor state;
+/// this sidecar carries the gate whitelist, so a mnemonic+SCB restore onto fresh
+/// hardware can recover relationships, not just channels (`project_scb_restore_scope`).
+///
+/// Each individual write stays best-effort (never crashes the node), but a
+/// *persistent* failure is a recovery-drill blocker — a node whose sidecar has
+/// gone stale will NOT re-admit invite-onboarded peers after a mnemonic+SCB
+/// restore (Codex #208). So a one-off failure is a `warn!`, while
+/// [`WHITELIST_BACKUP_FAILURE_ALERT_THRESHOLD`] consecutive failures escalate to
+/// a loud `error!` (alertable) that names the recovery impact. Writes once at
+/// startup (so a node that never reaches a tick still has a current sidecar) and
+/// then on the SCB-rotation cadence (300s).
+pub(crate) async fn run_whitelist_backup(
+    storage: Arc<dyn konsensus_storage::Storage>,
+    identity: Arc<konsensus_core::NodeIdentity>,
+    backup_path: std::path::PathBuf,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let backup_interval = std::time::Duration::from_secs(300); // every 5 minutes, matches SCB cadence
+
+    let mut consecutive_failures: u32 = 0;
+    consecutive_failures = record_sidecar_outcome(
+        write_whitelist_sidecar(storage.as_ref(), identity.aes_key(), &backup_path).await,
+        consecutive_failures,
+        &backup_path,
+    );
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(backup_interval) => {
+                consecutive_failures = record_sidecar_outcome(
+                    write_whitelist_sidecar(storage.as_ref(), identity.aes_key(), &backup_path).await,
+                    consecutive_failures,
+                    &backup_path,
+                );
+            }
+            _ = shutdown_rx.changed() => {
+                debug!("whitelist backup task shutting down");
+                break;
+            }
+        }
+    }
+}
+
+/// Consecutive whitelist-sidecar write failures at which a transient `warn!`
+/// becomes a loud, alertable `error!`. Each write remains non-fatal; this only
+/// changes the log level once failures look persistent (≈ this many × the 300s
+/// cadence), which is the signal that recovery is silently degrading.
+const WHITELIST_BACKUP_FAILURE_ALERT_THRESHOLD: u32 = 3;
+
+/// Fold one write outcome into the consecutive-failure counter, escalating the
+/// log level once failures persist. Returns the updated counter.
+fn record_sidecar_outcome(ok: bool, consecutive_failures: u32, out_path: &std::path::Path) -> u32 {
+    if ok {
+        return 0;
+    }
+    let consecutive = consecutive_failures.saturating_add(1);
+    if consecutive >= WHITELIST_BACKUP_FAILURE_ALERT_THRESHOLD {
+        error!(
+            consecutive,
+            path = %out_path.display(),
+            "whitelist backup sidecar has failed {consecutive}× consecutively — a mnemonic+SCB \
+             restore will NOT recover invite-onboarded peers until this clears (recovery-drill \
+             blocker). Check free disk space and write permissions on the backup directory."
+        );
+    }
+    consecutive
+}
+
+/// One best-effort whitelist-sidecar write. Reuses the shipped
+/// `write_whitelist_backup` producer (collect → seal → atomic rename) so the
+/// periodic path and the `konsensus whitelist backup` CLI stay byte-identical.
+/// Returns `true` on success, `false` on a (logged, non-fatal) failure.
+async fn write_whitelist_sidecar(
+    storage: &dyn konsensus_storage::Storage,
+    key: &[u8; 32],
+    out_path: &std::path::Path,
+) -> bool {
+    match crate::whitelist_cmd::write_whitelist_backup(storage, key, out_path).await {
+        Ok(bytes) => {
+            debug!(bytes, path = %out_path.display(), "wrote whitelist backup sidecar");
+            true
+        }
+        Err(e) => {
+            warn!(error = %e, path = %out_path.display(), "whitelist backup sidecar write failed (will retry next cadence)");
+            false
         }
     }
 }

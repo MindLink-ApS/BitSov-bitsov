@@ -41,10 +41,6 @@ fn static_config_default_serde_roundtrip() {
     assert_eq!(deserialized.realtime_signal_msat, config.realtime_signal_msat);
     assert_eq!(deserialized.app_ext_msat, config.app_ext_msat);
     assert_eq!(deserialized.web_content_msat, config.web_content_msat);
-    assert_eq!(
-        deserialized.relay_storage_msat_per_byte_day,
-        config.relay_storage_msat_per_byte_day
-    );
 }
 
 #[test]
@@ -69,7 +65,6 @@ fn static_config_partial_json_uses_defaults() {
     assert_eq!(config.realtime_signal_msat, 50);
     assert_eq!(config.app_ext_msat, 10);
     assert_eq!(config.web_content_msat, 50);
-    assert_eq!(config.relay_storage_msat_per_byte_day, 1);
 }
 
 #[test]
@@ -84,13 +79,12 @@ fn static_config_custom_values() {
         realtime_signal_msat: 40,
         app_ext_msat: 50,
         web_content_msat: 200,
-        relay_storage_msat_per_byte_day: 7,
+        ..Default::default()
     };
     let json = serde_json::to_string(&config).unwrap();
     let deserialized: StaticPricingConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.chat_msat, 100);
     assert_eq!(deserialized.web_content_msat, 200);
-    assert_eq!(deserialized.relay_storage_msat_per_byte_day, 7);
 }
 
 #[test]
@@ -104,13 +98,11 @@ fn static_config_zero_prices_allowed() {
         "collaboration_msat": 0,
         "realtime_signal_msat": 0,
         "app_ext_msat": 0,
-        "web_content_msat": 0,
-        "relay_storage_msat_per_byte_day": 0
+        "web_content_msat": 0
     }"#;
     let config: StaticPricingConfig = serde_json::from_str(json).unwrap();
     assert_eq!(config.chat_msat, 0);
     assert_eq!(config.file_ref_msat, 0);
-    assert_eq!(config.relay_storage_msat_per_byte_day, 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -254,7 +246,6 @@ async fn build_price_table_includes_all_priceable_categories() {
     assert!(table.contains_key("collaboration"));
     assert!(table.contains_key("realtime_signaling"));
     assert!(table.contains_key("web_content"));
-    assert!(table.contains_key("storage"));
     assert!(table.contains_key("control"));
     assert!(table.contains_key("app_extension"));
 
@@ -272,7 +263,6 @@ async fn build_price_table_values_match_engine() {
     assert_eq!(table["control"], 1);
     assert_eq!(table["realtime_signaling"], 50);
     assert_eq!(table["web_content"], 50);
-    assert_eq!(table["storage"], 1);
 }
 
 #[tokio::test]
@@ -287,7 +277,7 @@ async fn build_price_table_with_custom_config() {
         realtime_signal_msat: 59,
         app_ext_msat: 49,
         web_content_msat: 399,
-        relay_storage_msat_per_byte_day: 7,
+        ..Default::default()
     };
     let engine = StaticPricingEngine::new(config);
     let table = build_price_table(&engine).await;
@@ -296,7 +286,6 @@ async fn build_price_table_with_custom_config() {
     assert_eq!(table["files_media"], 999);
     assert_eq!(table["control"], 5);
     assert_eq!(table["realtime_signaling"], 59);
-    assert_eq!(table["storage"], 7);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -311,7 +300,6 @@ fn category_to_string_all_categories() {
     assert_eq!(category_to_string(KindCategory::Collaboration), "collaboration");
     assert_eq!(category_to_string(KindCategory::RealTimeSignaling), "realtime_signaling");
     assert_eq!(category_to_string(KindCategory::WebContent), "web_content");
-    assert_eq!(category_to_string(KindCategory::Storage), "storage");
     assert_eq!(category_to_string(KindCategory::Control), "control");
     assert_eq!(category_to_string(KindCategory::AppExtension), "app_extension");
     assert_eq!(category_to_string(KindCategory::Unknown), "unknown");
@@ -497,9 +485,12 @@ async fn static_engine_boundary_kinds() {
     assert_eq!(engine.get_price_msat(500).await.unwrap(), 50);
     // Boundary: kind 599 is still WebContent
     assert_eq!(engine.get_price_msat(599).await.unwrap(), 50);
-    // Boundary: kind 600 is Unknown (not priceable)
-    assert!(engine.get_price_msat(600).await.is_err());
-    // Boundary: kind 899 is Unknown
+    // Boundary: kind 600 is relay Storage (priceable, T2R3)
+    assert_eq!(engine.get_price_msat(600).await.unwrap(), 100);
+    // Boundary: kind 699 is the top of the Storage range
+    assert_eq!(engine.get_price_msat(699).await.unwrap(), 100);
+    // Boundary: kind 700 and 899 stay Unknown (not priceable)
+    assert!(engine.get_price_msat(700).await.is_err());
     assert!(engine.get_price_msat(899).await.is_err());
     // Boundary: kind 900 is Control
     assert_eq!(engine.get_price_msat(900).await.unwrap(), 1);

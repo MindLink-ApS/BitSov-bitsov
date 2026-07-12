@@ -350,3 +350,374 @@ fn convert_failed_payment_zero_amount() {
     assert_eq!(result.amount_msat, 0, "None amount should default to 0");
     assert_eq!(result.status, PaymentStatus::Failed);
 }
+
+// ─── R2 seam-2: binding-TLV extraction ───────────────────────────────────────
+
+#[test]
+fn extract_binding_tlv_picks_only_the_bitsov_record() {
+    // The receiver pulls exactly the BitSov binding record out of the inbound
+    // custom TLVs, ignoring unrelated records (e.g. the keysend preimage record
+    // 5482373484). Proves seam-2 reads the right odd type_num.
+    let records = vec![
+        CustomTlvRecord {
+            type_num: 5482373484,
+            value: vec![0xAA; 32],
+        },
+        CustomTlvRecord {
+            type_num: BITSOV_BINDING_TLV_TYPE,
+            value: b"envelope-id-pointer".to_vec(),
+        },
+        CustomTlvRecord {
+            type_num: 9999,
+            value: vec![0xFF],
+        },
+    ];
+    assert_eq!(
+        extract_binding_tlv(&records),
+        Ok(Some(b"envelope-id-pointer".to_vec()))
+    );
+}
+
+#[test]
+fn extract_binding_tlv_none_when_absent_and_type_is_odd() {
+    // No BitSov record present → None (bare keysend / no binding).
+    let records = vec![CustomTlvRecord {
+        type_num: 5482373484,
+        value: vec![0xAA; 32],
+    }];
+    assert_eq!(extract_binding_tlv(&records), Ok(None));
+    assert_eq!(extract_binding_tlv(&[]), Ok(None));
+    // Doctrine: the binding TLV type MUST be odd (BOLT-1 forward-compat).
+    assert_eq!(
+        BITSOV_BINDING_TLV_TYPE % 2,
+        1,
+        "BitSov binding TLV type must be odd"
+    );
+}
+
+#[test]
+fn extract_binding_tlv_rejects_duplicate_bitsov_records() {
+    let records = vec![
+        CustomTlvRecord {
+            type_num: BITSOV_BINDING_TLV_TYPE,
+            value: b"first-binding".to_vec(),
+        },
+        CustomTlvRecord {
+            type_num: BITSOV_BINDING_TLV_TYPE,
+            value: b"second-binding".to_vec(),
+        },
+    ];
+    assert_eq!(
+        extract_binding_tlv(&records),
+        Err(BindingTlvError::Duplicate),
+        "duplicate BitSov binding TLVs must fail loudly"
+    );
+}
+
+#[test]
+fn extract_binding_tlv_rejects_oversized_record() {
+    let records = vec![CustomTlvRecord {
+        type_num: BITSOV_BINDING_TLV_TYPE,
+        value: vec![0xAB; BITSOV_BINDING_TLV_MAX_BYTES + 1],
+    }];
+
+    assert_eq!(
+        extract_binding_tlv(&records),
+        Err(BindingTlvError::TooLarge {
+            len: BITSOV_BINDING_TLV_MAX_BYTES + 1
+        }),
+        "BitSov binding TLVs are pointers/digests and must stay bounded"
+    );
+}
+
+#[test]
+fn seam3b_send_record_round_trips_through_receive_extractor() {
+    // R2 seam-3b CONTRACT (network-free): the single record the SEND-half
+    // (`keysend_with_binding` → `binding_tlv_record`) attaches is EXACTLY what
+    // the RECEIVE-half (`extract_binding_tlv`, seam-2) pulls back out, and a lone
+    // send record is unambiguous (Ok(Some), never Err(Duplicate)). Proves
+    // send↔receive agree on the wire shape without a running LDK node; the
+    // on-wire send is the seam-3c regtest round-trip.
+    let binding = b"envelope-id-pointer".to_vec();
+    let sent = binding_tlv_record(&binding);
+
+    // The send-side record carries the agreed odd type and the exact bytes.
+    assert_eq!(sent.type_num, BITSOV_BINDING_TLV_TYPE);
+    assert_eq!(sent.value, binding);
+
+    // Round-trips through the receiver's (Result-returning) extractor verbatim,
+    // and a single send record is never duplicate/oversized.
+    assert_eq!(extract_binding_tlv(&[sent]), Ok(Some(binding)));
+}
+
+#[test]
+fn seam3b_send_preflight_rejects_unbindable_binding() {
+    // The send-half uses this exact preflight before invoking LDK, so an
+    // over-cap binding returns before `send_with_custom_tlvs` can spend sats on
+    // a payment the receive-half would reject as `BindingTooLarge`.
+    match binding_tlv_record_for_send(&[]) {
+        Err(LightningError::Backend(msg)) => {
+            assert!(msg.contains("requires a non-empty binding"));
+        }
+        other => panic!("expected send preflight to reject empty binding, got {other:?}"),
+    }
+
+    let at_cap = vec![0xCD; BITSOV_BINDING_TLV_MAX_BYTES];
+    assert_eq!(
+        extract_binding_tlv(&[binding_tlv_record_for_send(&at_cap).unwrap()]),
+        Ok(Some(at_cap)),
+        "a binding exactly at the cap must round-trip"
+    );
+
+    let over_cap = vec![0xCD; BITSOV_BINDING_TLV_MAX_BYTES + 1];
+    match binding_tlv_record_for_send(&over_cap) {
+        Err(LightningError::Backend(msg)) => {
+            assert!(msg.contains("binding TLV too large"));
+            assert!(msg.contains("receiver would reject"));
+        }
+        other => panic!("expected send preflight to fail closed, got {other:?}"),
+    }
+}
+
+#[test]
+fn seam3b_inflight_fallback_preserves_payment_hash() {
+    // LDK Node returns a PaymentId immediately for spontaneous/keysend sends,
+    // while `node.payment(payment_id)` may lag. For spontaneous payments the
+    // PaymentId bytes are the payment hash bytes, so the binding path must not
+    // return an empty hash in that in-flight window.
+    let payment_hash = [0x2A; 32];
+    let details = in_flight_spontaneous_payment_details(payment_hash, 21_000, 42);
+
+    assert_eq!(details.payment_hash, hex::encode(payment_hash));
+    assert_eq!(details.amount_msat, 21_000);
+    assert_eq!(details.status, PaymentStatus::InFlight);
+    assert_eq!(details.direction, PaymentDirection::Outgoing);
+    assert_eq!(details.timestamp, 42);
+    assert!(details.preimage.is_none());
+}
+
+fn inbound_payment_details(
+    status: PaymentStatus,
+    direction: PaymentDirection,
+    preimage: Option<&str>,
+) -> PaymentDetails {
+    PaymentDetails {
+        payment_hash: "00".repeat(32),
+        preimage: preimage.map(str::to_owned),
+        amount_msat: 1_000,
+        status,
+        direction,
+        timestamp: 0,
+        memo: None,
+        fee_msat: None,
+    }
+}
+
+fn inbound_payment_details_with_amount(
+    status: PaymentStatus,
+    direction: PaymentDirection,
+    preimage: Option<&str>,
+    amount_msat: u64,
+) -> PaymentDetails {
+    PaymentDetails {
+        amount_msat,
+        ..inbound_payment_details(status, direction, preimage)
+    }
+}
+
+#[test]
+fn inbound_stream_items_require_settled_incoming_preimage() {
+    assert!(is_admittable_inbound_payment(&inbound_payment_details(
+        PaymentStatus::Settled,
+        PaymentDirection::Incoming,
+        Some(&"11".repeat(32)),
+    )));
+    assert!(!is_admittable_inbound_payment(&inbound_payment_details(
+        PaymentStatus::Settled,
+        PaymentDirection::Incoming,
+        None,
+    )));
+    assert!(!is_admittable_inbound_payment(&inbound_payment_details(
+        PaymentStatus::Pending,
+        PaymentDirection::Incoming,
+        Some(&"11".repeat(32)),
+    )));
+    assert!(!is_admittable_inbound_payment(&inbound_payment_details(
+        PaymentStatus::Settled,
+        PaymentDirection::Outgoing,
+        Some(&"11".repeat(32)),
+    )));
+    assert!(!is_admittable_inbound_payment(
+        &inbound_payment_details_with_amount(
+            PaymentStatus::Settled,
+            PaymentDirection::Incoming,
+            Some(&"11".repeat(32)),
+            0,
+        )
+    ));
+}
+
+#[test]
+fn inbound_payment_from_received_event_emits_single_binding() {
+    let details = inbound_payment_details(
+        PaymentStatus::Settled,
+        PaymentDirection::Incoming,
+        Some(&"11".repeat(32)),
+    );
+    let records = vec![CustomTlvRecord {
+        type_num: BITSOV_BINDING_TLV_TYPE,
+        value: b"envelope-id-pointer".to_vec(),
+    }];
+
+    let inbound = inbound_payment_from_received_event(
+        [0u8; 32],
+        details.amount_msat,
+        Some(&details),
+        &records,
+    )
+    .unwrap();
+
+    assert_eq!(inbound.details.payment_hash, details.payment_hash);
+    assert_eq!(inbound.binding_tlv, Some(b"envelope-id-pointer".to_vec()));
+}
+
+#[test]
+fn inbound_payment_from_received_event_rejects_store_miss() {
+    assert_eq!(
+        inbound_payment_from_received_event([0u8; 32], 1_000, None, &[]).unwrap_err(),
+        InboundPaymentRejection::MissingStoreRecord
+    );
+}
+
+#[test]
+fn inbound_payment_from_received_event_rejects_malformed_store_hash() {
+    let mut details = inbound_payment_details(
+        PaymentStatus::Settled,
+        PaymentDirection::Incoming,
+        Some(&"11".repeat(32)),
+    );
+    details.payment_hash = "not-hex".to_owned();
+
+    assert_eq!(
+        inbound_payment_from_received_event([0u8; 32], details.amount_msat, Some(&details), &[])
+            .unwrap_err(),
+        InboundPaymentRejection::MalformedStoreHash
+    );
+}
+
+#[test]
+fn inbound_payment_from_received_event_rejects_hash_mismatch() {
+    let details = inbound_payment_details(
+        PaymentStatus::Settled,
+        PaymentDirection::Incoming,
+        Some(&"11".repeat(32)),
+    );
+
+    assert_eq!(
+        inbound_payment_from_received_event([0xff; 32], details.amount_msat, Some(&details), &[])
+            .unwrap_err(),
+        InboundPaymentRejection::HashMismatch
+    );
+}
+
+#[test]
+fn inbound_payment_from_received_event_rejects_amount_mismatch() {
+    let details = inbound_payment_details(
+        PaymentStatus::Settled,
+        PaymentDirection::Incoming,
+        Some(&"11".repeat(32)),
+    );
+
+    assert_eq!(
+        inbound_payment_from_received_event(
+            [0u8; 32],
+            details.amount_msat + 1,
+            Some(&details),
+            &[],
+        )
+        .unwrap_err(),
+        InboundPaymentRejection::EventStoreAmountMismatch
+    );
+}
+
+#[test]
+fn inbound_payment_from_received_event_rejects_non_admittable_record() {
+    let details = inbound_payment_details(PaymentStatus::Pending, PaymentDirection::Incoming, None);
+
+    assert_eq!(
+        inbound_payment_from_received_event([0u8; 32], details.amount_msat, Some(&details), &[])
+            .unwrap_err(),
+        InboundPaymentRejection::NotAdmittableProof
+    );
+}
+
+#[test]
+fn inbound_payment_from_received_event_rejects_zero_amount() {
+    let details = inbound_payment_details_with_amount(
+        PaymentStatus::Settled,
+        PaymentDirection::Incoming,
+        Some(&"11".repeat(32)),
+        0,
+    );
+
+    assert_eq!(
+        inbound_payment_from_received_event([0u8; 32], 0, Some(&details), &[]).unwrap_err(),
+        InboundPaymentRejection::NotAdmittableProof
+    );
+}
+
+#[test]
+fn inbound_payment_from_received_event_rejects_duplicate_binding() {
+    let details = inbound_payment_details(
+        PaymentStatus::Settled,
+        PaymentDirection::Incoming,
+        Some(&"11".repeat(32)),
+    );
+    let records = vec![
+        CustomTlvRecord {
+            type_num: BITSOV_BINDING_TLV_TYPE,
+            value: b"first-binding".to_vec(),
+        },
+        CustomTlvRecord {
+            type_num: BITSOV_BINDING_TLV_TYPE,
+            value: b"second-binding".to_vec(),
+        },
+    ];
+
+    assert_eq!(
+        inbound_payment_from_received_event(
+            [0u8; 32],
+            details.amount_msat,
+            Some(&details),
+            &records,
+        )
+        .unwrap_err(),
+        InboundPaymentRejection::DuplicateBinding
+    );
+}
+
+#[test]
+fn inbound_payment_from_received_event_rejects_oversized_binding() {
+    let details = inbound_payment_details(
+        PaymentStatus::Settled,
+        PaymentDirection::Incoming,
+        Some(&"11".repeat(32)),
+    );
+    let records = vec![CustomTlvRecord {
+        type_num: BITSOV_BINDING_TLV_TYPE,
+        value: vec![0xAB; BITSOV_BINDING_TLV_MAX_BYTES + 1],
+    }];
+
+    assert_eq!(
+        inbound_payment_from_received_event(
+            [0u8; 32],
+            details.amount_msat,
+            Some(&details),
+            &records,
+        )
+        .unwrap_err(),
+        InboundPaymentRejection::BindingTooLarge {
+            len: BITSOV_BINDING_TLV_MAX_BYTES + 1
+        }
+    );
+}

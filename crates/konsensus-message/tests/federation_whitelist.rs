@@ -12,28 +12,24 @@
 //!    no active session exists and reconnect is blocked.
 //!
 //! 3. **Forged federation handshake** — an attacker claiming a different node_id
-//!    is rejected at two independent layers:
-//!      (a) Ed25519 identity binding: attacker cannot produce a valid signature
-//!          over their X25519 key using the victim's private key.
-//!      (b) Transport integration: attacker's real node_id (bound to Noise static key)
-//!          is not in the responder's whitelist -> rejected before HelloAck.
+//!    is rejected by Ed25519 identity binding and by the transport integration
+//!    check that compares the bound Noise identity to the responder whitelist.
 
 use std::sync::Arc;
 
+use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::identity::NodeIdentity;
 use konsensus_core::traits::transport::{MessageTransport, TransportError};
 use konsensus_core::types::{NodeId, Nonce, PaymentProof, Recipient, Signature};
-use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_message::wire::{Capability, SovereigntyTier};
-use konsensus_message::{NoiseTransport, TransportConfig};
+use konsensus_message::{ReachabilityMode, NoiseTransport, TransportConfig};
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Deterministic test identities -- one mnemonic, passphrase differentiates.
 // ---------------------------------------------------------------------------
 
-const MNEMONIC: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon \
+const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon abandon \
      abandon abandon abandon abandon abandon abandon abandon art";
 
@@ -48,6 +44,8 @@ fn make_config(whitelist: Vec<NodeId>) -> TransportConfig {
         capabilities: vec![Capability::X3dh],
         whitelist,
         version: 2,
+        admission_mode: ReachabilityMode::Whitelist,
+        cookie_mode: Default::default(),
     }
 }
 
@@ -110,7 +108,9 @@ async fn non_whitelisted_peer_rejected_by_responder() {
         .await
         .expect("Bob listener failed to bind");
 
-    let bob_addr = transport_bob.listen_addr().expect("Bob listen addr not set");
+    let bob_addr = transport_bob
+        .listen_addr()
+        .expect("Bob listen addr not set");
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let transport_alice = NoiseTransport::new(Arc::clone(&alice), config_alice);
@@ -121,7 +121,10 @@ async fn non_whitelisted_peer_rejected_by_responder() {
         .connect(&bob_id, &bob_addr.to_string())
         .await;
 
-    assert!(result.is_err(), "non-whitelisted connection must be rejected");
+    assert!(
+        result.is_err(),
+        "non-whitelisted connection must be rejected"
+    );
     match result.unwrap_err() {
         TransportError::Rejected(msg) => {
             assert!(
@@ -170,7 +173,9 @@ async fn self_removal_reconnect_and_send_rejected() {
         .start_listener()
         .await
         .expect("Bob listener failed to bind");
-    let bob_addr = transport_bob.listen_addr().expect("Bob listen addr not set");
+    let bob_addr = transport_bob
+        .listen_addr()
+        .expect("Bob listen addr not set");
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let transport_alice = Arc::new(NoiseTransport::new(Arc::clone(&alice), config_alice));
@@ -281,7 +286,9 @@ fn forged_hello_identity_binding_rejected() {
     // her published node manifest). Their signature over it still fails against Alice's key.
     let attacker_sig_over_alice_x25519 = attacker.sign(&alice_x25519);
     assert!(
-        alice.verify(&alice_x25519, &attacker_sig_over_alice_x25519).is_err(),
+        alice
+            .verify(&alice_x25519, &attacker_sig_over_alice_x25519)
+            .is_err(),
         "attacker's signature over Alice's X25519 pubkey must not verify against Alice's key"
     );
 }
@@ -322,7 +329,9 @@ async fn attacker_node_rejected_whitelist_is_final_gate() {
         .start_listener()
         .await
         .expect("Bob listener failed to bind");
-    let bob_addr = transport_bob.listen_addr().expect("Bob listen addr not set");
+    let bob_addr = transport_bob
+        .listen_addr()
+        .expect("Bob listen addr not set");
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let transport_attacker = NoiseTransport::new(Arc::clone(&attacker), config_attacker);
