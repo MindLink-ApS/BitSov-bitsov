@@ -1,7 +1,6 @@
 * @BitSov/core-maintainers
 
 CHARTER.md @BitSov/charter-board @BitSov/security-maintainers
-docs/v2/OPERATOR_SOVEREIGNTY_CHARTER.md @BitSov/charter-board @BitSov/security-maintainers
 docs/v2/THREAT_MODEL_TIER2_RELAY.md @BitSov/security-maintainers
 docs/v2/RELAY_PROTOCOL.md @BitSov/core-maintainers @BitSov/security-maintainers
 docs/v2/REMOTE_ACCESS_IDENTITY.md @BitSov/core-maintainers @BitSov/security-maintainers
