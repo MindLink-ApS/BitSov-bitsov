@@ -250,6 +250,154 @@ pub(super) async fn list_messages(
     Ok(Json(responses))
 }
 
+/// Maximum number of most-recent messages a single search will decrypt and scan.
+/// Bounds the in-memory decryption work so a search cannot be turned into a DoS.
+pub(super) const MAX_SEARCH_SCAN: u32 = 1000;
+
+/// Query parameters for searching messages.
+#[derive(Deserialize)]
+pub struct SearchMessagesQuery {
+    /// Case-insensitive substring to match against decrypted message plaintext.
+    pub q: String,
+    /// Maximum number of matches to return (capped at 1000).
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    /// Restrict the search to one conversation (peer node ID hex or room UUID).
+    /// Without it, searches this node's received messages.
+    pub peer: Option<String>,
+}
+
+/// A single search hit — message metadata plus a plaintext snippet around the match.
+#[derive(Serialize)]
+pub struct SearchResult {
+    /// Message ID (hex-encoded blake3 hash).
+    pub id: String,
+    /// Message kind (u16 from the kind taxonomy).
+    pub kind: u16,
+    /// Sender node ID (hex).
+    pub sender: String,
+    /// Recipient node ID (hex) or room ID (UUID string).
+    pub recipient: String,
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp: u64,
+    /// Plaintext snippet around the first match. Built in RAM; never persisted.
+    pub snippet: String,
+}
+
+/// Build a plaintext snippet around the first (case-insensitive) match.
+///
+/// Character-based windowing keeps this panic-free on any UTF-8 input. The match
+/// index is derived from the lowercased haystack; for input whose length changes
+/// under lowercasing the window may shift by a few characters — acceptable for a
+/// display snippet and never unsafe.
+fn search_snippet(text: &str, needle_lower: &str, ctx: usize) -> String {
+    let lower = text.to_lowercase();
+    match lower.find(needle_lower) {
+        Some(byte_idx) => {
+            let match_char = lower[..byte_idx].chars().count();
+            let start = match_char.saturating_sub(ctx);
+            let take = ctx * 2 + needle_lower.chars().count();
+            let body: String = text.chars().skip(start).take(take).collect();
+            let prefix = if start > 0 { "\u{2026}" } else { "" };
+            let suffix = if text.chars().count() > start + take { "\u{2026}" } else { "" };
+            format!("{prefix}{body}{suffix}")
+        }
+        None => text.chars().take(ctx * 2).collect(),
+    }
+}
+
+/// `GET /api/v1/messages/search?q=…` — local, on-device message search.
+///
+/// **Principle 4:** there is NO plaintext (or FTS) index at rest. This decrypts
+/// the `plaintext_enc` cache of the most-recent messages IN MEMORY (bounded by
+/// [`MAX_SEARCH_SCAN`]) and substring-matches on the fly — exactly as
+/// `list_messages` already decrypts for display. Nothing is written; the
+/// decrypted content never leaves the node's RAM. Binary/undecryptable messages
+/// are silently skipped. Without `peer`, searches received messages (mirrors
+/// `list_messages`); with `peer`, searches that conversation.
+pub(super) async fn search_messages(
+    _auth: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SearchMessagesQuery>,
+) -> Result<Json<Vec<SearchResult>>, ApiError> {
+    let needle = params.q.trim();
+    if needle.is_empty() {
+        return Err(ApiError::BadRequest("search query 'q' must not be empty".into()));
+    }
+    let needle_lower = needle.to_lowercase();
+
+    let cipher = state.plaintext_cipher.as_deref().ok_or_else(|| {
+        ApiError::Internal("search requires the plaintext cache to be configured".into())
+    })?;
+
+    let my_node_hex = state.identity.node_id().to_hex();
+
+    // Load the most-recent messages to scan (bounded). Mirrors list_messages.
+    let messages = if let Some(ref peer_id) = params.peer {
+        let is_room = if peer_id.contains('-') {
+            Uuid::parse_str(peer_id)
+                .map_err(|e| ApiError::BadRequest(format!("invalid room UUID: {e}")))?;
+            true
+        } else {
+            if peer_id.len() != 64 || !peer_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ApiError::BadRequest(
+                    "invalid peer: expected 64-char hex node ID or UUID".into(),
+                ));
+            }
+            false
+        };
+        state
+            .storage
+            .get_conversation_messages(&my_node_hex, peer_id, is_room, MAX_SEARCH_SCAN, None)
+            .await
+            .map_err(|e| ApiError::Storage(e.to_string()))?
+    } else {
+        let recipient = Recipient::Node(*state.identity.node_id());
+        state
+            .storage
+            .get_messages_for_recipient(&recipient, MAX_SEARCH_SCAN, None)
+            .await
+            .map_err(|e| ApiError::Storage(e.to_string()))?
+    };
+
+    let limit = clamp_limit(params.limit) as usize;
+    let mut results = Vec::new();
+    for env in &messages {
+        if results.len() >= limit {
+            break;
+        }
+        let encrypted = match state.storage.get_message_plaintext(&env.id).await {
+            Ok(Some(blob)) => blob,
+            _ => continue, // no cached plaintext (undecryptable / pre-cache) — skip
+        };
+        let decrypted = match cipher.decrypt(&encrypted) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let text = match String::from_utf8(decrypted) {
+            Ok(t) => t,
+            Err(_) => continue, // binary content — not text-searchable
+        };
+        if text.to_lowercase().contains(&needle_lower) {
+            let recipient_str = match &env.recipient {
+                Recipient::Node(id) => id.to_hex(),
+                Recipient::Room(id) => id.to_string(),
+                Recipient::Broadcast => "broadcast".to_string(),
+            };
+            results.push(SearchResult {
+                id: env.id.to_hex(),
+                kind: env.kind,
+                sender: env.sender.to_hex(),
+                recipient: recipient_str,
+                timestamp: env.timestamp,
+                snippet: search_snippet(&text, &needle_lower, 48),
+            });
+        }
+    }
+
+    Ok(Json(results))
+}
+
 /// `DELETE /api/v1/messages/:id` — delete a message.
 pub(super) async fn delete_message(
     _auth: AuthUser,
@@ -272,4 +420,49 @@ pub(super) async fn delete_message(
     );
 
     Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
+#[cfg(test)]
+mod search_snippet_tests {
+    use super::search_snippet;
+
+    #[test]
+    fn snippet_wraps_match_with_ellipses() {
+        let text = "the quick brown fox jumps over the lazy dog and keeps going for a while";
+        let s = super::search_snippet(text, "brown fox", 5);
+        assert!(s.contains("brown fox"), "snippet must contain the match: {s}");
+        // Match is mid-text, so both ends are elided.
+        assert!(s.starts_with('\u{2026}'), "expected leading ellipsis: {s}");
+    }
+
+    #[test]
+    fn snippet_at_start_has_no_leading_ellipsis() {
+        let s = search_snippet("hello world this is a message", "hello", 20);
+        assert!(s.starts_with("hello"), "no leading ellipsis when match is at start: {s}");
+    }
+
+    #[test]
+    fn snippet_case_insensitive_positioning() {
+        // Needle is already lowercased by the caller; text has mixed case.
+        let s = search_snippet("Meeting about the QUARTERLY budget review", "quarterly", 4);
+        assert!(s.to_lowercase().contains("quarterly"), "matches case-insensitively: {s}");
+        // Original casing is preserved in the returned snippet.
+        assert!(s.contains("QUARTERLY"), "preserves original casing: {s}");
+    }
+
+    #[test]
+    fn snippet_no_match_returns_head() {
+        let s = search_snippet("some other content entirely", "absent", 6);
+        assert!(!s.contains('\u{2026}') || s.len() <= "some other content entirely".len() + 3);
+        assert!(s.starts_with("some"), "falls back to head of text: {s}");
+    }
+
+    #[test]
+    fn snippet_is_panic_safe_on_multibyte() {
+        // Multibyte content around the match must never panic (char-based windowing).
+        let text = "café ☕ meeting notes — quarterly café review ☕ done";
+        let _ = search_snippet(text, "quarterly", 3);
+        let _ = search_snippet(text, "café", 2);
+        let _ = search_snippet("日本語のメッセージ test 検索", "test", 2);
+    }
 }

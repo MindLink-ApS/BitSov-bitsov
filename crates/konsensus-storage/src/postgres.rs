@@ -648,6 +648,16 @@ const INVITES_ISSUED_SELECT: &str =
     "SELECT id, invitee_pubkey, expiry_unix, channel_size_hint_sats, addr, max_fee_rate_sat_per_vb, channel_open_intent_expiry_unix, nonce, state, created_at, accepted_at, revoked_at \
      FROM invites_issued ORDER BY created_at DESC";
 
+/// `list_active_accepted_invites` — AUTHORITY. Replayed at node startup to
+/// repopulate the in-memory admission whitelist. A `LIMIT` is a Principle-2
+/// fail-open: it would omit active invites from the startup whitelist, so
+/// validly-invited peers are rejected as `NotWhitelisted` after a restart; the
+/// mnemonic-recovery / RV-RESTORE path also needs the complete active set. Must
+/// be complete. The `accepted_invites_guard` unit test asserts no `LIMIT`.
+const ACTIVE_ACCEPTED_INVITES_SELECT: &str =
+    "SELECT nonce, inviter_pubkey, expiry_unix, accepted_at \
+     FROM accepted_invites WHERE expiry_unix > $1 ORDER BY accepted_at ASC";
+
 /// `list_recurring_master_events` — correctness-complete. All recurring masters
 /// for occurrence expansion in the calendar view.
 const RECURRING_MASTER_EVENTS_SELECT: &str =
@@ -2188,14 +2198,11 @@ impl Storage for PostgresStorage {
         if !table_exists {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64, i64)>(
-            "SELECT nonce, inviter_pubkey, expiry_unix, accepted_at \
-             FROM accepted_invites WHERE expiry_unix > $1 ORDER BY accepted_at ASC",
-        )
-        .bind(now_unix)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(StorageError::Database)?;
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64, i64)>(ACTIVE_ACCEPTED_INVITES_SELECT)
+            .bind(now_unix)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StorageError::Database)?;
 
         rows.into_iter()
             .map(|r| {
@@ -2834,6 +2841,25 @@ mod hard4_guard {
             !super::PEERS_SELECT.to_uppercase().contains("LIMIT"),
             "postgres PEERS_SELECT must not contain LIMIT (DBH1 fail-open guard): {}",
             super::PEERS_SELECT
+        );
+    }
+}
+
+#[cfg(test)]
+mod accepted_invites_guard {
+    /// AUTHORITY: the accepted-invites replay query repopulates the admission
+    /// whitelist at node startup. A `LIMIT` would silently drop active invites —
+    /// a Principle-2 fail-open where validly-invited peers are rejected as
+    /// `NotWhitelisted` after a restart, and the RV-RESTORE path loses
+    /// relationships. Asserts the source constant so a cap cannot regress in.
+    #[test]
+    fn active_accepted_invites_select_is_unbounded() {
+        assert!(
+            !super::ACTIVE_ACCEPTED_INVITES_SELECT
+                .to_uppercase()
+                .contains("LIMIT"),
+            "postgres ACTIVE_ACCEPTED_INVITES_SELECT must not contain LIMIT (AUTHORITY fail-open guard): {}",
+            super::ACTIVE_ACCEPTED_INVITES_SELECT
         );
     }
 }

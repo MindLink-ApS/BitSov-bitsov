@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-use chrono::{Datelike, DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Weekday};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, TimeZone, Weekday};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
@@ -138,6 +138,16 @@ pub fn expand_occurrences(
         None => return Vec::new(),
     };
 
+    // A zero interval is malformed (RFC 5545 requires INTERVAL >= 1). It must be
+    // rejected before the expansion below, which (a) divides by `interval` in the
+    // open-ended `start_step` optimisation — an integer divide-by-zero *panic*
+    // reachable from `GET /api/v1/calendar/events` for any stored recurring event
+    // with `interval == 0` — and (b) would otherwise emit `step * 0` duplicate
+    // occurrences. Treat it like an unparseable rule: no occurrences.
+    if rule.interval == 0 {
+        return Vec::new();
+    }
+
     if from_ms >= to_ms {
         return Vec::new();
     }
@@ -178,12 +188,9 @@ pub fn expand_occurrences(
     // cannot possibly produce occurrences in [from_ms, to_ms).
     let start_step: u32 = if rule.count.is_none() && base.start < from_ms {
         let delta_ms = from_ms.saturating_sub(base.start);
-        let approx = match rule.freq {
-            Freq::Daily => delta_ms / (86_400_000 * rule.interval as u64),
-            Freq::Weekly => delta_ms / (7 * 86_400_000 * rule.interval as u64),
-            Freq::Monthly => delta_ms / (30 * 86_400_000 * rule.interval as u64),
-            Freq::Yearly => delta_ms / (365 * 86_400_000 * rule.interval as u64),
-        };
+        let approx = recurrence_period_ms(rule.freq, rule.interval)
+            .map(|period_ms| delta_ms / period_ms)
+            .unwrap_or(0);
         // Back off 2 steps to be safe near DST / month-length boundaries.
         (approx as u32).saturating_sub(2)
     } else {
@@ -198,26 +205,42 @@ pub fn expand_occurrences(
         // Compute candidate wall-clock NaiveDateTimes for this step.
         let candidates: Vec<NaiveDateTime> = match rule.freq {
             Freq::Daily => {
-                let offset = Duration::days((step * rule.interval) as i64);
-                vec![anchor_naive + offset]
+                let Some(offset) = checked_day_offset(recurrence_units(step, rule.interval)) else {
+                    break 'outer;
+                };
+                match anchor_naive.checked_add_signed(offset) {
+                    Some(dt) => vec![dt],
+                    None => break 'outer,
+                }
             }
 
             Freq::Weekly => {
-                let offset_weeks = (step * rule.interval) as i64;
+                let Some(offset) = checked_week_offset(recurrence_units(step, rule.interval))
+                else {
+                    break 'outer;
+                };
                 if byday_weekdays.is_empty() {
                     // Simple weekly: same weekday every N weeks.
-                    vec![anchor_naive + Duration::weeks(offset_weeks)]
+                    match anchor_naive.checked_add_signed(offset) {
+                        Some(dt) => vec![dt],
+                        None => break 'outer,
+                    }
                 } else {
                     // Weekly + BYDAY: enumerate matching weekdays in the step's week.
                     let days_from_mon = anchor_naive.weekday().num_days_from_monday() as i64;
-                    let mon_of_anchor =
-                        anchor_naive.date() - Duration::days(days_from_mon);
-                    let mon_of_step = mon_of_anchor + Duration::weeks(offset_weeks);
+                    let mon_of_anchor = anchor_naive.date() - Duration::days(days_from_mon);
+                    let Some(mon_of_step) = mon_of_anchor.checked_add_signed(offset) else {
+                        break 'outer;
+                    };
 
                     let mut week_cands = Vec::new();
                     for &wd in &byday_weekdays {
                         let day_offset = wd.num_days_from_monday() as i64;
-                        let naive_date = mon_of_step + Duration::days(day_offset);
+                        let Some(naive_date) =
+                            mon_of_step.checked_add_signed(Duration::days(day_offset))
+                        else {
+                            continue;
+                        };
                         let naive_dt = NaiveDateTime::new(naive_date, anchor_naive.time());
                         // For step 0 only include days on/after the anchor.
                         if step > 0 || naive_dt >= anchor_naive {
@@ -230,20 +253,20 @@ pub fn expand_occurrences(
             }
 
             Freq::Monthly => {
-                let months = step * rule.interval;
+                let months = recurrence_units(step, rule.interval);
                 if rule.bymonthday.is_empty() {
                     // Simple monthly: same day of month (clamped to last valid day).
                     match add_months_to_naive(anchor_naive, months) {
                         Some(dt) => vec![dt],
-                        None => continue,
+                        None => break 'outer,
                     }
                 } else {
                     // Monthly + BYMONTHDAY: map each bymonthday to a NaiveDate.
-                    let (ty, tm) = advance_year_month(
-                        anchor_naive.year(),
-                        anchor_naive.month(),
-                        months,
-                    );
+                    let Some((ty, tm)) =
+                        advance_year_month(anchor_naive.year(), anchor_naive.month(), months)
+                    else {
+                        break 'outer;
+                    };
                     let mut month_cands = Vec::new();
                     for &mday in &rule.bymonthday {
                         if let Some(nd) = resolve_bymonthday(ty, tm, mday) {
@@ -260,12 +283,14 @@ pub fn expand_occurrences(
             }
 
             Freq::Yearly => {
-                let years = (step * rule.interval) as i32;
-                match NaiveDate::from_ymd_opt(
-                    anchor_naive.year() + years,
-                    anchor_naive.month(),
-                    anchor_naive.day(),
-                ) {
+                let years = recurrence_units(step, rule.interval);
+                let Some(years) = i32::try_from(years).ok() else {
+                    break 'outer;
+                };
+                let Some(year) = anchor_naive.year().checked_add(years) else {
+                    break 'outer;
+                };
+                match NaiveDate::from_ymd_opt(year, anchor_naive.month(), anchor_naive.day()) {
                     Some(d) => vec![NaiveDateTime::new(d, anchor_naive.time())],
                     None => continue,
                 }
@@ -370,18 +395,43 @@ pub fn resolve_bymonthday(year: i32, month: u32, mday: i32) -> Option<NaiveDate>
     NaiveDate::from_ymd_opt(year, month, day)
 }
 
+fn recurrence_period_ms(freq: Freq, interval: u32) -> Option<u64> {
+    let base: u64 = match freq {
+        Freq::Daily => 86_400_000,
+        Freq::Weekly => 7 * 86_400_000,
+        Freq::Monthly => 30 * 86_400_000,
+        Freq::Yearly => 365 * 86_400_000,
+    };
+    base.checked_mul(u64::from(interval))
+}
+
+fn recurrence_units(step: u32, interval: u32) -> u64 {
+    u64::from(step) * u64::from(interval)
+}
+
+fn checked_day_offset(days: u64) -> Option<Duration> {
+    Duration::try_days(i64::try_from(days).ok()?)
+}
+
+fn checked_week_offset(weeks: u64) -> Option<Duration> {
+    checked_day_offset(weeks.checked_mul(7)?)
+}
+
 /// Advance (year, month) by `months` months without overflow.
-fn advance_year_month(year: i32, month: u32, months: u32) -> (i32, u32) {
-    let total = (year as i64) * 12 + (month as i64 - 1) + months as i64;
-    let new_year = (total / 12) as i32;
-    let new_month = (total % 12 + 1) as u32;
-    (new_year, new_month)
+fn advance_year_month(year: i32, month: u32, months: u64) -> Option<(i32, u32)> {
+    let total = i64::from(year)
+        .checked_mul(12)?
+        .checked_add(i64::from(month) - 1)?
+        .checked_add(i64::try_from(months).ok()?)?;
+    let new_year = i32::try_from(total.div_euclid(12)).ok()?;
+    let new_month = (total.rem_euclid(12) + 1) as u32;
+    Some((new_year, new_month))
 }
 
 /// Add `months` months to a `NaiveDateTime`, clamping the day to the last
 /// valid day in the target month (e.g. Jan 31 + 1 month → Feb 28/29).
-fn add_months_to_naive(dt: NaiveDateTime, months: u32) -> Option<NaiveDateTime> {
-    let (new_year, new_month) = advance_year_month(dt.year(), dt.month(), months);
+fn add_months_to_naive(dt: NaiveDateTime, months: u64) -> Option<NaiveDateTime> {
+    let (new_year, new_month) = advance_year_month(dt.year(), dt.month(), months)?;
     let dim = days_in_month(new_year, new_month);
     let day = dt.day().min(dim);
     NaiveDate::from_ymd_opt(new_year, new_month, day).map(|d| d.and_time(dt.time()))
@@ -440,7 +490,12 @@ mod tests {
     #[test]
     fn daily_basic() {
         let start = utc_ms(2026, 1, 1, 9, 0);
-        let rule = RRule { freq: Freq::Daily, interval: 1, count: Some(5), ..Default::default() };
+        let rule = RRule {
+            freq: Freq::Daily,
+            interval: 1,
+            count: Some(5),
+            ..Default::default()
+        };
         let base = make_base(start, "UTC", rule);
         let from = start;
         let to = start + 10 * 86_400_000;
@@ -452,10 +507,99 @@ mod tests {
         }
     }
 
+    /// A malformed `interval == 0` must not panic and must yield no occurrences.
+    /// Regression: the open-ended `start_step` optimisation divides by `interval`
+    /// (`delta_ms / (86_400_000 * interval)`), so an open-ended (`count = None`)
+    /// recurrence created in the past and queried for a later window hit an
+    /// integer divide-by-zero panic — reachable from `GET /api/v1/calendar/events`.
+    #[test]
+    fn zero_interval_open_ended_does_not_panic() {
+        let start = utc_ms(2026, 1, 1, 9, 0);
+        // count = None (open-ended) + query window strictly after start ⇒ the
+        // divide-by-`interval` branch, which panicked before the guard.
+        let rule = RRule {
+            freq: Freq::Daily,
+            interval: 0,
+            ..Default::default()
+        };
+        let base = make_base(start, "UTC", rule);
+        let from = start + 30 * 86_400_000; // 30 days after start
+        let to = from + 10 * 86_400_000;
+        let occs = expand_occurrences(&base, from, to, &[]);
+        assert!(occs.is_empty(), "zero interval must yield no occurrences");
+    }
+
+    /// Zero interval on every frequency and in the count-bounded path is also inert
+    /// (guards the `step * interval` duplicate-occurrence path).
+    #[test]
+    fn zero_interval_all_freqs_yield_nothing() {
+        let start = utc_ms(2026, 1, 1, 9, 0);
+        for freq in [Freq::Daily, Freq::Weekly, Freq::Monthly, Freq::Yearly] {
+            let rule = RRule {
+                freq,
+                interval: 0,
+                count: Some(5),
+                ..Default::default()
+            };
+            let base = make_base(start, "UTC", rule);
+            let occs = expand_occurrences(&base, start, start + 3650 * 86_400_000, &[]);
+            assert!(
+                occs.is_empty(),
+                "zero interval ({freq:?}) must yield no occurrences"
+            );
+        }
+    }
+
+    /// Malformed but deserializable huge intervals must not panic either. This
+    /// covers the open-ended skip optimisation (`period_ms * interval`) and the
+    /// candidate-step arithmetic (`step * interval`) for every frequency.
+    #[test]
+    fn huge_interval_open_ended_does_not_panic() {
+        let start = utc_ms(2026, 1, 1, 9, 0);
+        for freq in [Freq::Daily, Freq::Weekly, Freq::Monthly, Freq::Yearly] {
+            let rule = RRule {
+                freq,
+                interval: u32::MAX,
+                ..Default::default()
+            };
+            let base = make_base(start, "UTC", rule);
+            let from = start + 30 * 86_400_000;
+            let to = from + 10 * 86_400_000;
+            let occs = expand_occurrences(&base, from, to, &[]);
+            assert!(occs.is_empty(), "huge interval ({freq:?}) must not panic");
+        }
+    }
+
+    #[test]
+    fn huge_interval_count_bounded_preserves_anchor_only() {
+        let start = utc_ms(2026, 1, 1, 9, 0);
+        for freq in [Freq::Daily, Freq::Weekly, Freq::Monthly, Freq::Yearly] {
+            let rule = RRule {
+                freq,
+                interval: u32::MAX,
+                count: Some(5),
+                ..Default::default()
+            };
+            let base = make_base(start, "UTC", rule);
+            let occs = expand_occurrences(&base, start, start + 3650 * 86_400_000, &[]);
+            assert_eq!(
+                occs.len(),
+                1,
+                "huge interval ({freq:?}) keeps the anchor only"
+            );
+            assert_eq!(occs[0].start, start);
+        }
+    }
+
     #[test]
     fn weekly_count_5() {
         let start = utc_ms(2026, 1, 5, 9, 0); // Monday
-        let rule = RRule { freq: Freq::Weekly, interval: 1, count: Some(5), ..Default::default() };
+        let rule = RRule {
+            freq: Freq::Weekly,
+            interval: 1,
+            count: Some(5),
+            ..Default::default()
+        };
         let base = make_base(start, "UTC", rule);
         let occs = expand_occurrences(&base, start, start + 40 * 86_400_000, &[]);
         assert_eq!(occs.len(), 5);
@@ -505,7 +649,12 @@ mod tests {
     fn until_terminates() {
         let start = utc_ms(2026, 1, 1, 9, 0);
         let until = utc_ms(2026, 1, 15, 9, 0);
-        let rule = RRule { freq: Freq::Daily, interval: 1, until: Some(until), ..Default::default() };
+        let rule = RRule {
+            freq: Freq::Daily,
+            interval: 1,
+            until: Some(until),
+            ..Default::default()
+        };
         let base = make_base(start, "UTC", rule);
         let occs = expand_occurrences(&base, start, start + 60 * 86_400_000, &[]);
         assert!(occs.iter().all(|o| o.start <= until));
@@ -515,7 +664,12 @@ mod tests {
     #[test]
     fn exception_suppresses_occurrence() {
         let start = utc_ms(2026, 1, 5, 9, 0);
-        let rule = RRule { freq: Freq::Weekly, interval: 1, count: Some(4), ..Default::default() };
+        let rule = RRule {
+            freq: Freq::Weekly,
+            interval: 1,
+            count: Some(4),
+            ..Default::default()
+        };
         let base = make_base(start, "UTC", rule);
         // Exception for occurrence 2 (Jan 12)
         let exc_start = utc_ms(2026, 1, 12, 9, 0);
@@ -559,9 +713,18 @@ mod tests {
 
     #[test]
     fn rsvp_status_serialization() {
-        assert_eq!(serde_json::to_string(&RsvpStatus::Accepted).unwrap(), "\"accepted\"");
-        assert_eq!(serde_json::to_string(&RsvpStatus::Declined).unwrap(), "\"declined\"");
-        assert_eq!(serde_json::to_string(&RsvpStatus::Tentative).unwrap(), "\"tentative\"");
+        assert_eq!(
+            serde_json::to_string(&RsvpStatus::Accepted).unwrap(),
+            "\"accepted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RsvpStatus::Declined).unwrap(),
+            "\"declined\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RsvpStatus::Tentative).unwrap(),
+            "\"tentative\""
+        );
     }
 
     #[test]

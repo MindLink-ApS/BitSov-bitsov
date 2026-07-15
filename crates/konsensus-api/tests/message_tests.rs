@@ -632,6 +632,66 @@ async fn plaintext_requires_auth() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+// ─── Search endpoint (on-device, in-memory decrypt) ────────────────
+
+#[tokio::test]
+async fn search_finds_message_by_decrypted_plaintext() {
+    let storage = Arc::new(MemStorage::new());
+    let state = test_state_with_storage_and_cipher(storage);
+    let auth = auth_header(&state);
+    let match_id =
+        store_test_message_with_plaintext(&state, b"aaa", "Let's meet about the QUARTERLY budget review")
+            .await;
+    let _other =
+        store_test_message_with_plaintext(&state, b"bbb", "reminder: dentist appointment tomorrow").await;
+
+    let app = build_router(state);
+    let req = Request::builder()
+        .uri("/api/v1/messages/search?q=quarterly")
+        .header("authorization", &auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "exactly one match expected: {json}");
+    assert_eq!(arr[0]["id"].as_str().unwrap(), match_id);
+    assert!(
+        arr[0]["snippet"].as_str().unwrap().to_lowercase().contains("quarterly"),
+        "snippet must contain the match: {json}"
+    );
+}
+
+#[tokio::test]
+async fn search_empty_query_is_bad_request() {
+    let state = test_state_with_storage_and_cipher(Arc::new(MemStorage::new()));
+    let auth = auth_header(&state);
+    let app = build_router(state);
+    // Whitespace-only query trims to empty.
+    let req = Request::builder()
+        .uri("/api/v1/messages/search?q=%20%20")
+        .header("authorization", &auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn search_requires_auth() {
+    let state = test_state_with_storage_and_cipher(Arc::new(MemStorage::new()));
+    let app = build_router(state);
+    let req = Request::builder()
+        .uri("/api/v1/messages/search?q=hello")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 // ─── Send message (pre-encrypted ciphertext) ───────────────────────
 
 #[tokio::test]

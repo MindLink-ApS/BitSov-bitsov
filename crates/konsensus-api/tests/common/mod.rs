@@ -35,6 +35,8 @@ use konsensus_api::build_router;
 
 pub struct MemStorage {
     messages: Mutex<HashMap<String, UkmEnvelope>>,
+    /// AES-GCM-encrypted plaintext blobs keyed by message id hex (mirrors prod).
+    message_plaintext: Mutex<HashMap<String, Vec<u8>>>,
     rooms: Mutex<HashMap<String, Room>>,
     room_members: Mutex<HashMap<String, Vec<NodeId>>>,
     peers: Mutex<HashMap<String, Peer>>,
@@ -52,6 +54,7 @@ impl MemStorage {
     pub fn new() -> Self {
         Self {
             messages: Mutex::new(HashMap::new()),
+            message_plaintext: Mutex::new(HashMap::new()),
             rooms: Mutex::new(HashMap::new()),
             room_members: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
@@ -326,16 +329,20 @@ impl Storage for MemStorage {
     }
     async fn store_message_plaintext(
         &self,
-        _: &konsensus_core::MessageId,
-        _: &[u8],
+        id: &konsensus_core::MessageId,
+        encrypted: &[u8],
     ) -> Result<(), StorageError> {
+        self.message_plaintext
+            .lock()
+            .unwrap()
+            .insert(id.to_hex(), encrypted.to_vec());
         Ok(())
     }
     async fn get_message_plaintext(
         &self,
-        _: &konsensus_core::MessageId,
+        id: &konsensus_core::MessageId,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(None)
+        Ok(self.message_plaintext.lock().unwrap().get(&id.to_hex()).cloned())
     }
 
     async fn add_invite_issued(
@@ -813,6 +820,60 @@ pub fn test_state() -> Arc<AppState> {
     })
 }
 
+/// Fixed AES master key for the plaintext cache in cipher-enabled tests.
+pub const TEST_PLAINTEXT_KEY: [u8; 32] = [0x11u8; 32];
+
+/// The plaintext-cache cipher paired with [`TEST_PLAINTEXT_KEY`]; use it to seed
+/// encrypted plaintext that a cipher-enabled `AppState` can decrypt.
+pub fn test_plaintext_cipher() -> konsensus_crypto::PlaintextCacheCipher {
+    konsensus_crypto::PlaintextCacheCipher::new(&TEST_PLAINTEXT_KEY)
+}
+
+/// Like [`test_state_with_storage`] but with the plaintext-cache cipher configured
+/// (keyed by [`TEST_PLAINTEXT_KEY`]), so the message-plaintext and search endpoints
+/// can decrypt cached blobs seeded via [`test_plaintext_cipher`].
+pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppState> {
+    let identity = Arc::new(test_identity());
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+
+    Arc::new(AppState {
+        identity: Arc::clone(&identity),
+        storage,
+        lightning: Arc::new(StubLightning),
+        chain: Arc::new(StubChain),
+        pricing: Arc::new(StubPricing),
+        gate: Arc::new(PaymentGate::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        transport: Arc::new(StubTransport),
+        session_manager,
+        jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        cors_enabled: false,
+        operator_probes_enabled: true,
+        sensitive_identity_routes_enabled: true,
+        ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
+        rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
+        audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
+        started_at: std::time::Instant::now(),
+        content_dir: None,
+        web_page_price_msat: None,
+        peer_prices: Arc::new(konsensus_pricing::PeerPriceCache::new()),
+        routing: Arc::new(konsensus_routing::RoutingTable::with_defaults()),
+        plaintext_cipher: Some(Arc::new(test_plaintext_cipher())),
+        send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        data_dir: None,
+        backup_dir: None,
+        peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        lightning_backend: "mock".into(),
+        chain_backend: "mock".into(),
+        gossip_validator: None,
+    })
+}
+
 pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1176,5 +1237,40 @@ pub async fn store_test_envelope(state: &AppState) -> String {
 
     let msg_id = envelope.id.to_hex();
     state.storage.store_message(&envelope).await.unwrap();
+    msg_id
+}
+
+/// Store a to-self message with a distinct id (varied by `distinct`) plus its
+/// plaintext encrypted under [`test_plaintext_cipher`], so search/plaintext
+/// endpoints on a cipher-enabled state can decrypt it. Returns the message id.
+pub async fn store_test_message_with_plaintext(
+    state: &AppState,
+    distinct: &[u8],
+    plaintext: &str,
+) -> String {
+    use konsensus_core::{PaymentProof, UkmEnvelopeBuilder};
+    use sha2::{Digest, Sha256};
+
+    let sender = *state.identity.node_id();
+    let recipient = Recipient::Node(sender);
+    let preimage = [0xABu8; 32];
+    let hash: [u8; 32] = Sha256::digest(preimage).into();
+    let proof = PaymentProof::new(hash, preimage, 10);
+
+    // `distinct` varies the ciphertext so each message gets a unique id.
+    let mut envelope =
+        UkmEnvelopeBuilder::new(100, sender, recipient, distinct.to_vec(), proof).build();
+    let sig = state.identity.sign(&envelope.signable_bytes());
+    envelope.signature = konsensus_core::Signature::from_ed25519(&sig);
+
+    let msg_id = envelope.id.to_hex();
+    state.storage.store_message(&envelope).await.unwrap();
+
+    let encrypted = test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap();
+    state
+        .storage
+        .store_message_plaintext(&envelope.id, &encrypted)
+        .await
+        .unwrap();
     msg_id
 }

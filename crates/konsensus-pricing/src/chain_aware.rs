@@ -45,6 +45,9 @@ use konsensus_core::traits::pricing::{PricingEngine, PricingError};
 
 use crate::static_pricing::{StaticPricingConfig, StaticPricingEngine};
 
+const DEFAULT_MAX_PRICE_MULTIPLIER: f64 = 5.0;
+const DEFAULT_FEE_RATE_EMA_ALPHA: f64 = 0.3;
+
 /// Configuration for chain-aware pricing.
 #[derive(Debug, Clone)]
 pub struct ChainAwarePricingConfig {
@@ -103,8 +106,8 @@ impl Default for ChainAwarePricingConfig {
             base: StaticPricingConfig::default(),
             fee_target_blocks: 6,
             cache_ttl: Duration::from_secs(60),
-            max_price_multiplier: 5.0,
-            fee_rate_ema_alpha: 0.3,
+            max_price_multiplier: DEFAULT_MAX_PRICE_MULTIPLIER,
+            fee_rate_ema_alpha: DEFAULT_FEE_RATE_EMA_ALPHA,
             category_fee_targets: HashMap::new(),
         }
     }
@@ -131,6 +134,32 @@ impl ChainAwarePricingConfig {
             }
         }
         targets
+    }
+}
+
+fn normalized_ema_alpha(alpha: f64) -> f64 {
+    if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_FEE_RATE_EMA_ALPHA
+    }
+}
+
+fn normalized_fee_rate(rate: f64) -> Option<f64> {
+    if rate.is_finite() && rate >= 0.0 {
+        Some(rate)
+    } else {
+        None
+    }
+}
+
+fn normalized_max_multiplier(max_multiplier: f64) -> f64 {
+    if max_multiplier == 0.0 {
+        0.0
+    } else if max_multiplier.is_finite() && max_multiplier > 0.0 {
+        max_multiplier
+    } else {
+        DEFAULT_MAX_PRICE_MULTIPLIER
     }
 }
 
@@ -271,15 +300,28 @@ impl ChainAwarePricingEngine {
 
         let mut targets = HashMap::new();
         for (target_blocks, ema) in &snapshot.targets {
-            targets.insert(
-                *target_blocks,
-                TargetFeeState {
-                    raw_sat_per_vbyte: *ema, // Use EMA as both raw and EMA initially
-                    ema_sat_per_vbyte: *ema,
-                },
-            );
+            if let Some(ema) = normalized_fee_rate(*ema) {
+                targets.insert(
+                    *target_blocks,
+                    TargetFeeState {
+                        raw_sat_per_vbyte: ema, // Use EMA as both raw and EMA initially
+                        ema_sat_per_vbyte: ema,
+                    },
+                );
+            } else {
+                warn!(
+                    target_blocks,
+                    "ignoring non-finite or negative fee rate in EMA snapshot"
+                );
+            }
         }
 
+        if targets.is_empty() {
+            warn!("fee rate snapshot had no valid targets, skipping seed");
+            return;
+        }
+
+        let targets_seeded = targets.len();
         let mut cache = self.cached_state.write().await;
         *cache = Some(CachedChainState {
             targets,
@@ -290,7 +332,7 @@ impl ChainAwarePricingEngine {
         });
 
         info!(
-            targets_seeded = snapshot.targets.len(),
+            targets_seeded,
             block_height = snapshot.block_height,
             age_secs,
             "seeded EMA cache from snapshot"
@@ -339,7 +381,7 @@ impl ChainAwarePricingEngine {
         }
 
         let unique_targets = self.config.unique_targets();
-        let alpha = self.config.fee_rate_ema_alpha.clamp(0.0, 1.0);
+        let alpha = normalized_ema_alpha(self.config.fee_rate_ema_alpha);
 
         // Fetch block height first, then all unique fee targets.
         // Fee targets are fetched sequentially (typically 1-3 targets, each
@@ -371,16 +413,30 @@ impl ChainAwarePricingEngine {
             let target = unique_targets[i];
             match result {
                 Ok(estimate) => {
-                    let raw_rate = estimate.sat_per_vbyte;
+                    let Some(raw_rate) = normalized_fee_rate(estimate.sat_per_vbyte) else {
+                        warn!(
+                            target_blocks = target,
+                            sat_per_vbyte = estimate.sat_per_vbyte,
+                            "chain-aware pricing: ignoring non-finite or negative fee rate"
+                        );
+                        if let Some(prev) = prev_cache
+                            .as_ref()
+                            .and_then(|c| c.targets.get(&target))
+                            .filter(|p| normalized_fee_rate(p.ema_sat_per_vbyte).is_some())
+                        {
+                            new_targets.insert(target, prev.clone());
+                            any_succeeded = true;
+                        }
+                        continue;
+                    };
 
                     // Apply EMA smoothing using previous EMA for this target.
                     let ema_rate = match prev_cache
                         .as_ref()
                         .and_then(|c| c.targets.get(&target))
+                        .and_then(|prev| normalized_fee_rate(prev.ema_sat_per_vbyte))
                     {
-                        Some(prev) => {
-                            alpha * raw_rate + (1.0 - alpha) * prev.ema_sat_per_vbyte
-                        }
+                        Some(prev_ema) => alpha * raw_rate + (1.0 - alpha) * prev_ema,
                         None => raw_rate, // First fetch for this target.
                     };
 
@@ -403,6 +459,7 @@ impl ChainAwarePricingEngine {
                     if let Some(prev) = prev_cache
                         .as_ref()
                         .and_then(|c| c.targets.get(&target))
+                        .filter(|p| normalized_fee_rate(p.ema_sat_per_vbyte).is_some())
                     {
                         new_targets.insert(target, prev.clone());
                         any_succeeded = true;
@@ -514,34 +571,61 @@ impl ChainAwarePricingEngine {
         sensitivity: f64,
         max_multiplier: f64,
     ) -> u64 {
-        // Clamp fee_rate to non-negative (defensive — fee rates are always >= 0).
-        let clamped_fee = fee_rate.max(0.0);
-        let clamped_sens = sensitivity.max(1.0);
+        // Clamp fee_rate/sensitivity defensively. Chain data should be finite
+        // and non-negative; NaN/negative values are treated as no fee pressure,
+        // while +inf intentionally saturates into the cap below.
+        let clamped_fee = if fee_rate.is_infinite() && fee_rate.is_sign_positive() {
+            f64::MAX
+        } else {
+            normalized_fee_rate(fee_rate).unwrap_or(0.0)
+        };
+        let clamped_sens = if sensitivity.is_infinite() && sensitivity.is_sign_positive() {
+            4.0
+        } else if sensitivity.is_finite() {
+            sensitivity.max(1.0)
+        } else {
+            1.0
+        };
 
         // Compute the fee-rate adjustment: base_price * fee_rate * sensitivity / 100.
         // Use u128 intermediate to prevent overflow with large base prices.
         // Multiply by 1000 to preserve 3 decimal places, then divide by 100_000.
-        let effective_rate_milli = (clamped_fee * clamped_sens * 1000.0) as u128;
+        let effective_rate = clamped_fee * clamped_sens * 1000.0;
+        let effective_rate_milli = if effective_rate.is_finite() {
+            effective_rate as u128
+        } else {
+            u128::MAX
+        };
         let base = base_price as u128;
 
         // Ceiling division: (a + b - 1) / b, but only if remainder > 0.
-        let numerator = base * effective_rate_milli;
+        // Saturating: a compromised/buggy esplora returning an absurd fee_rate must
+        // not overflow this u128 multiply (panic in debug, silent wrap -> poisoned
+        // admission price in release). Saturation flows into the u64::MAX clamp and the
+        // max_multiplier cap below, so an insane fee simply pins to the cap. (the-fool)
+        let numerator = base.saturating_mul(effective_rate_milli);
         let adjustment = if numerator == 0 {
             0u64
         } else {
             let div = numerator / 100_000;
             let rem = numerator % 100_000;
             let ceiled = if rem > 0 { div + 1 } else { div };
-            // Clamp to u64 range.
+            // Clamp to u64 range. Do NOT early-return here: a bare `return u64::MAX`
+            // bypasses the max_multiplier cap below, letting an absurd fee produce an
+            // UNCAPPED price and defeating the plasticity "bounded adaptation" invariant.
+            // Yield u64::MAX as the adjustment so it flows through saturating_add and the
+            // cap, which pins the final price to base*max_multiplier. (the-fool)
             if ceiled > u64::MAX as u128 {
-                return u64::MAX;
+                u64::MAX
+            } else {
+                ceiled as u64
             }
-            ceiled as u64
         };
 
         let result = base_price.saturating_add(adjustment);
 
         // Apply volatility cap: price cannot exceed base * max_multiplier.
+        let max_multiplier = normalized_max_multiplier(max_multiplier);
         if max_multiplier > 0.0 {
             let cap_f64 = (base_price as f64) * max_multiplier;
             // Clamp to u64 range — f64 > u64::MAX would produce garbage via `as`

@@ -322,6 +322,18 @@ const INVITES_ISSUED_SELECT: &str =
     "SELECT id, invitee_pubkey, expiry_unix, channel_size_hint_sats, addr, max_fee_rate_sat_per_vb, channel_open_intent_expiry_unix, nonce, state, created_at, accepted_at, revoked_at \
      FROM invites_issued ORDER BY created_at DESC";
 
+/// `list_active_accepted_invites` — AUTHORITY. Replayed at node startup
+/// (`replay_accepted_invite_whitelist` in `konsensus-node`) to repopulate the
+/// in-memory admission whitelist from durable accepted invites. A `LIMIT` here
+/// is a Principle-2 fail-open: it would silently omit active invites from the
+/// startup whitelist, so validly-invited peers would be rejected as
+/// `NotWhitelisted` after a restart. The mnemonic-recovery / RV-RESTORE path
+/// also depends on the COMPLETE active set surviving. The `accepted_invites_guard`
+/// unit test asserts this constant never regains a `LIMIT`.
+const ACTIVE_ACCEPTED_INVITES_SELECT: &str =
+    "SELECT nonce, inviter_pubkey, expiry_unix, accepted_at \
+     FROM accepted_invites WHERE expiry_unix > ? ORDER BY accepted_at ASC";
+
 /// `list_recurring_master_events` — correctness-complete. The calendar view
 /// (`GET /api/v1/calendar/events`) expands every recurring master into
 /// occurrences inside the requested window; a cap would silently hide whole
@@ -1874,13 +1886,10 @@ impl Storage for SqliteStorage {
         let now_unix = i64::try_from(now_unix).map_err(|_| {
             StorageError::Conversion(format!("now_unix overflows i64: {now_unix}"))
         })?;
-        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64, i64)>(
-            "SELECT nonce, inviter_pubkey, expiry_unix, accepted_at \
-             FROM accepted_invites WHERE expiry_unix > ? ORDER BY accepted_at ASC",
-        )
-        .bind(now_unix)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64, i64)>(ACTIVE_ACCEPTED_INVITES_SELECT)
+            .bind(now_unix)
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter()
             .map(|r| {
@@ -2592,6 +2601,26 @@ mod dbh1_guard {
             !super::PEERS_SELECT.to_uppercase().contains("LIMIT"),
             "sqlite PEERS_SELECT must not contain LIMIT (DBH1 fail-open guard): {}",
             super::PEERS_SELECT
+        );
+    }
+}
+
+#[cfg(test)]
+mod accepted_invites_guard {
+    /// AUTHORITY: the accepted-invites replay query repopulates the admission
+    /// whitelist at node startup. A `LIMIT` would silently drop active invites
+    /// from the startup whitelist — a Principle-2 fail-open where validly-invited
+    /// peers are rejected as `NotWhitelisted` after a restart, and the
+    /// mnemonic-recovery / RV-RESTORE path loses relationships. This asserts the
+    /// source constant so a future edit cannot re-introduce a cap.
+    #[test]
+    fn active_accepted_invites_select_is_unbounded() {
+        assert!(
+            !super::ACTIVE_ACCEPTED_INVITES_SELECT
+                .to_uppercase()
+                .contains("LIMIT"),
+            "sqlite ACTIVE_ACCEPTED_INVITES_SELECT must not contain LIMIT (AUTHORITY fail-open guard): {}",
+            super::ACTIVE_ACCEPTED_INVITES_SELECT
         );
     }
 }
