@@ -77,7 +77,7 @@ jobs:
         id: osv_scan
         continue-on-error: true
         run: |
-          osv-scanner --recursive --format json . \
+          osv-scanner --recursive --config osv-scanner.toml --format json . \
             > /tmp/osv-scan.json 2>/dev/null || true
 
       # gitleaks --exit-code 0 means it always exits cleanly; findings appear
