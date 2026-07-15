@@ -27,7 +27,7 @@ jobs:
     name: Frontend Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Protocol repo has no frontend
         run: |
@@ -46,7 +46,7 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -106,7 +106,7 @@ jobs:
     name: Cargo Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -134,7 +134,7 @@ jobs:
     name: Semgrep Security Rules
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install semgrep
         run: pip install semgrep
@@ -177,7 +177,7 @@ jobs:
             runner: ubuntu-latest
             artifact: bitsov-linux-aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
