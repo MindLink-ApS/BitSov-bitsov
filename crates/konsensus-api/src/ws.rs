@@ -1,16 +1,19 @@
 //! WebSocket real-time message delivery.
 //!
 //! Connected clients receive new messages as they arrive. The WebSocket
-//! endpoint requires JWT authentication via a query parameter.
+//! endpoint requires JWT authentication before upgrade. Browser clients should
+//! send the JWT as a `bitsov.jwt.<token>` WebSocket subprotocol so reverse
+//! proxies do not log bearer tokens in URLs. The legacy query parameter remains
+//! accepted for local tooling only.
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -21,20 +24,31 @@ use crate::state::AppState;
 #[derive(Deserialize)]
 pub struct WsParams {
     /// JWT token for authentication.
-    pub token: String,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
-/// `GET /api/v1/ws?token=<jwt>` — WebSocket connection.
+const WS_PROTOCOL: &str = "bitsov.v1";
+const WS_JWT_PROTOCOL_PREFIX: &str = "bitsov.jwt.";
+
+/// `GET /api/v1/ws` — WebSocket connection.
 async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<WsParams>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let Some(token) = extract_ws_token(params.token.as_deref(), &headers) else {
+        warn!("WebSocket auth failed: missing token");
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    };
+
     // Validate JWT before upgrading — reject with 401 if invalid
-    match auth::validate_token(&params.token, &state.jwt_secret) {
+    match auth::validate_token(&token, &state.jwt_secret) {
         Ok(claims) => {
             debug!(node_id = %claims.sub, "WebSocket authenticated");
-            ws.on_upgrade(move |socket| handle_ws(socket, state))
+            ws.protocols([WS_PROTOCOL])
+                .on_upgrade(move |socket| handle_ws(socket, state))
                 .into_response()
         }
         Err(e) => {
@@ -42,6 +56,24 @@ async fn ws_handler(
             (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
         }
     }
+}
+
+fn extract_ws_token(query_token: Option<&str>, headers: &HeaderMap) -> Option<String> {
+    if let Some(token) = query_token.filter(|token| !token.trim().is_empty()) {
+        return Some(token.to_string());
+    }
+
+    headers
+        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|protocols| {
+            protocols
+                .split(',')
+                .map(str::trim)
+                .find_map(|protocol| protocol.strip_prefix(WS_JWT_PROTOCOL_PREFIX))
+        })
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Keepalive ping interval for WebSocket connections.
@@ -162,4 +194,43 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
 /// Registers the WebSocket upgrade route for real-time event streaming.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/ws", get(ws_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_ws_token_prefers_query_for_legacy_clients() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::SEC_WEBSOCKET_PROTOCOL,
+            "bitsov.v1, bitsov.jwt.header-token".parse().unwrap(),
+        );
+
+        assert_eq!(
+            extract_ws_token(Some("query-token"), &headers).as_deref(),
+            Some("query-token")
+        );
+    }
+
+    #[test]
+    fn extract_ws_token_accepts_subprotocol_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::SEC_WEBSOCKET_PROTOCOL,
+            "bitsov.v1, bitsov.jwt.header-token".parse().unwrap(),
+        );
+
+        assert_eq!(
+            extract_ws_token(None, &headers).as_deref(),
+            Some("header-token")
+        );
+    }
+
+    #[test]
+    fn extract_ws_token_rejects_missing_token() {
+        let headers = HeaderMap::new();
+        assert!(extract_ws_token(None, &headers).is_none());
+    }
 }

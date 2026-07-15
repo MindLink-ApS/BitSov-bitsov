@@ -220,6 +220,17 @@ async fn add_peer(
             .await;
     }
 
+    // P3-2: persist so the gate whitelist survives restart (the PeerRegistry is
+    // reloaded from the durable `peers` table at boot, not just config.peers).
+    let mut persisted = konsensus_storage::Peer::new(node_id);
+    persisted.address = Some(addr.to_string());
+    persisted.display_name = entry.label.clone();
+    state
+        .storage
+        .upsert_peer(&persisted)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to persist peer: {e}")))?;
+
     state.audit_log.record(
         events::PEER_ADDED,
         &_auth.node_id,
@@ -341,6 +352,18 @@ async fn update_peer(
     };
 
     registry.add(updated);
+    drop(registry);
+
+    // P3-2: persist the update so address/label/auto_connect edits survive
+    // restart (merge_persisted_peers reloads the durable row at boot).
+    let mut persisted = konsensus_storage::Peer::new(node_id);
+    persisted.address = Some(new_addr.to_string());
+    persisted.display_name = new_label.clone();
+    state
+        .storage
+        .upsert_peer(&persisted)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to persist peer update: {e}")))?;
 
     state.audit_log.record(
         events::PEER_UPDATED,
@@ -381,16 +404,29 @@ async fn connect_peer(
     let node_id = NodeId::from_hex(&node_id_hex)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
 
-    // Look up address from registry
-    let addr = {
+    // Look up address + label from registry
+    let (addr, label) = {
         let registry = state.peer_registry.read().await;
-        registry
-            .addr(&node_id)
-            .ok_or_else(|| ApiError::NotFound(format!("peer {node_id_hex} not in registry")))?
+        let entry = registry
+            .get(&node_id)
+            .ok_or_else(|| ApiError::NotFound(format!("peer {node_id_hex} not in registry")))?;
+        (entry.addr, entry.label.clone())
     };
 
     // Ensure peer is whitelisted — user clicked Connect, that's explicit consent
     state.transport.add_to_whitelist(&node_id).await;
+
+    // P3-2: persist this explicit-consent admission so it survives restart.
+    // connect_peer admits gossip-discovered peers that were registry-only;
+    // without persistence they drop off both whitelists on the next boot.
+    let mut persisted = konsensus_storage::Peer::new(node_id);
+    persisted.address = Some(addr.to_string());
+    persisted.display_name = label;
+    state
+        .storage
+        .upsert_peer(&persisted)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to persist connected peer: {e}")))?;
 
     state
         .transport
@@ -488,7 +524,7 @@ async fn import_peers(
         let node_id = match NodeId::from_hex(&entry.node_id) {
             Ok(id) => id,
             Err(e) => {
-                errors.push(format!("{}: invalid node ID — {e}", &entry.node_id));
+                errors.push(format!("{}: invalid node ID — {e}", entry.node_id));
                 continue;
             }
         };
@@ -503,7 +539,7 @@ async fn import_peers(
         let addr = match entry.addr.parse() {
             Ok(a) => a,
             Err(e) => {
-                errors.push(format!("{}: invalid address — {e}", &entry.node_id));
+                errors.push(format!("{}: invalid address — {e}", entry.node_id));
                 continue;
             }
         };
@@ -522,7 +558,7 @@ async fn import_peers(
             if label.len() > MAX_PEER_LABEL_LEN {
                 errors.push(format!(
                     "{}: peer label exceeds {MAX_PEER_LABEL_LEN} bytes",
-                    &entry.node_id
+                    entry.node_id
                 ));
                 continue;
             }
@@ -541,6 +577,17 @@ async fn import_peers(
         }
         // Add to transport whitelist (Principle 3)
         state.transport.add_to_whitelist(&node_id).await;
+
+        // P3-2: persist so imported peers survive restart.
+        let mut persisted = konsensus_storage::Peer::new(node_id);
+        persisted.address = Some(addr.to_string());
+        persisted.display_name = entry.label.clone();
+        if let Err(e) = state.storage.upsert_peer(&persisted).await {
+            errors.push(format!(
+                "{}: added to whitelist but failed to persist: {e}",
+                entry.node_id
+            ));
+        }
         imported += 1;
     }
 

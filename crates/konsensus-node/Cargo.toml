@@ -43,6 +43,12 @@ thiserror.workspace = true
 rpassword.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+zeroize.workspace = true
+# P8.1 D-place (A): the durable SqliteRelayStore (relay/store.rs) is colocated with
+# the trait + InMemory impl in konsensus-node, so this crate takes a direct sqlx dep
+# (already pulled transitively via konsensus-storage). Off-by-default: InMemoryRelayStore
+# stays the wired store until an operator flips a relay to the durable backend.
+sqlx.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }

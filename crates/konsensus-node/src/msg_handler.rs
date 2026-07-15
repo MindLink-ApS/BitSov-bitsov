@@ -25,6 +25,7 @@ use konsensus_message::Frame;
 use konsensus_routing::RoutingTable;
 
 use crate::content_server::ContentServer;
+use crate::relay::RelayEngine;
 
 /// All dependencies needed by the incoming message handler task.
 pub(crate) struct MsgHandlerDeps {
@@ -44,7 +45,120 @@ pub(crate) struct MsgHandlerDeps {
     pub plaintext_cipher: Arc<PlaintextCacheCipher>,
     pub ws_tx: broadcast::Sender<Arc<WsMessage>>,
     pub audit_log: Arc<AuditLog>,
+    /// Operator-selectable admission mode. In `Whitelist` (default) the receive-path
+    /// gate still passes `Some(&whitelist)` (Step-2 membership enforced); in
+    /// `PriceOpen` it passes `None`, skipping ONLY the membership test — every other
+    /// gate step (integrity, freshness, signature, replay, price-floor, and
+    /// recipient-bound settlement) still runs, so a stranger is admitted only by
+    /// full payment (P2 fail-closed, no free lane).
+    pub admission_mode: konsensus_message::ReachabilityMode,
+    /// R3 SEAM-B (Route B, default-off). `Some` ONLY when `[relay] enabled` — the
+    /// engine is constructed at node build only when enabled, so a disabled node
+    /// holds `None` and the receive path is byte-identical to a non-relay build.
+    /// When `Some`, kind-600+ (Storage-category) paid UKMs are intercepted after
+    /// the gate, before store/decrypt, and routed to the relay engine (never
+    /// stored as a message, never decrypted).
+    pub relay_engine: Option<Arc<RelayEngine>>,
     pub shutdown_rx: watch::Receiver<bool>,
+}
+
+/// Payment-gate verification (Principle 2) with the closed-mesh whitelist
+/// (Principle 3) enforced **inside** the gate, and the `PeerRegistry` read guard
+/// released **before** the gate await.
+///
+/// Extracted from [`run`] so the HARD-11 lock-release-before-await contract is
+/// directly unit-testable. We take an O(1) reference-counted snapshot of the
+/// registry's cached whitelist set ([`PeerRegistry::whitelist_arc`]) under a
+/// short-lived read lock, drop the guard, then pass that snapshot **into**
+/// `PaymentGate::verify` as `whitelist = Some(&snapshot)`. The gate therefore
+/// remains the sole authority for the Step-2 whitelist check (it owns the
+/// ordering, the `NotWhitelisted` rejection, and any audit/metrics shape) —
+/// closing the Principle-3 split where the receive path checked membership by
+/// hand and mirrored the rejection. `verify` awaits the nonce store, pricing
+/// engine, and (optionally) the Lightning backend; holding the read guard across
+/// that I/O would stall every peer add / remove / revocation behind in-flight
+/// verification, so only the cheap `Arc` clone happens under the lock. Mutations
+/// copy-on-write, so this in-flight snapshot is unaffected by a concurrent
+/// revocation.
+#[allow(clippy::too_many_arguments)]
+async fn whitelist_then_verify(
+    envelope: &konsensus_core::UkmEnvelope,
+    peer_registry: &tokio::sync::RwLock<PeerRegistry>,
+    gate: &PaymentGate,
+    nonce_store: &dyn konsensus_core::gate::NonceStore,
+    pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
+    lightning: Option<&dyn LightningProvider>,
+    trust_discount: f64,
+    our_node_id: Option<&konsensus_core::types::NodeId>,
+    admission_mode: konsensus_message::ReachabilityMode,
+) -> Result<(), konsensus_core::gate::GateRejection> {
+    // Snapshot the whitelist UNCONDITIONALLY (preserves the HARD-11
+    // lock-release-before-await seam even in PriceOpen, where the snapshot is
+    // ignored). Only the cheap Arc clone is held across the gate await.
+    let whitelist = {
+        let registry = peer_registry.read().await;
+        registry.whitelist_arc()
+    };
+    // M1a gate carrier (carrier A): branch ONLY the Step-2 membership argument.
+    //   Whitelist => Some(&whitelist), EXACTLY as before (Step-2 enforced).
+    //   PriceOpen  => None, so `PaymentGate::verify` short-circuits and SKIPS only
+    //                 the membership test. Steps 1, 2.5, 3, 4, 5 and the
+    //                 recipient-bound settlement (our_node_id, UNCHANGED) all still
+    //                 run — a stranger is admitted only by full payment.
+    let wl_arg: Option<&std::collections::HashSet<konsensus_core::types::NodeId>> =
+        match admission_mode {
+            konsensus_message::ReachabilityMode::Whitelist => Some(&whitelist),
+            konsensus_message::ReachabilityMode::PriceOpen => None,
+        };
+    gate.verify(
+        envelope,
+        nonce_store,
+        pricing,
+        wl_arg,
+        lightning,
+        trust_discount,
+        our_node_id,
+    )
+    .await
+}
+
+/// Cooldown between corrective price-table resends to the SAME peer. Long enough
+/// to throttle an unpaid flood, short enough that a legitimately mis-priced
+/// sender can retry promptly.
+const CORRECTIVE_PRICE_TABLE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cap on the corrective-price-table cooldown map (mirrors the session-handler's
+/// `MAX_COOLDOWN_ENTRIES`) so a spray of distinct sender IDs cannot grow it
+/// without bound.
+const MAX_CORRECTIVE_PRICE_TABLE_ENTRIES: usize = 10_000;
+
+/// Per-peer cooldown on the corrective price-table reply — the unpaid-sender
+/// "free connection back" + asymmetric-work guard. Returns `true` (drop the
+/// resend) if `peer` was already sent one within
+/// [`CORRECTIVE_PRICE_TABLE_COOLDOWN`]; otherwise records `now` and returns
+/// `false` (send allowed). Pure (clock injected) so the throttle is provable
+/// without driving the handler loop; mirrors
+/// `session_handler::admission_invoice_rate_limited`. In PriceOpen mode an
+/// UNPAID stranger lands on `InsufficientPayment`, so without this a 1-msat
+/// underpaid flood could loop a free `build_full_price_table` + wallet lookup +
+/// send (doctrine: no free connection back beyond the irreducible decode floor).
+fn corrective_price_table_rate_limited(
+    last_sent: &mut std::collections::HashMap<konsensus_core::types::NodeId, tokio::time::Instant>,
+    peer: &konsensus_core::types::NodeId,
+    now: tokio::time::Instant,
+) -> bool {
+    if let Some(last) = last_sent.get(peer) {
+        if now.duration_since(*last) < CORRECTIVE_PRICE_TABLE_COOLDOWN {
+            return true;
+        }
+    }
+    // Bound memory before inserting a new key: when saturated, evict entries
+    // whose cooldown has fully elapsed (mirrors the session-handler eviction).
+    if last_sent.len() >= MAX_CORRECTIVE_PRICE_TABLE_ENTRIES {
+        last_sent.retain(|_, ts| now.duration_since(*ts) < CORRECTIVE_PRICE_TABLE_COOLDOWN);
+    }
+    last_sent.insert(*peer, now);
+    false
 }
 
 /// Runs the incoming message handler loop.
@@ -69,8 +183,29 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
         plaintext_cipher,
         ws_tx: ws_tx_for_recv,
         audit_log: audit_for_recv,
+        admission_mode: admission_mode_for_recv,
+        relay_engine: relay_engine_for_recv,
         mut shutdown_rx,
     } = deps;
+
+    // Per-peer cooldown for the corrective price-table resend (DoS + "no free
+    // connection back" guard, throttled like the admission-invoice path).
+    let mut last_corrective_price_table: std::collections::HashMap<
+        konsensus_core::types::NodeId,
+        tokio::time::Instant,
+    > = std::collections::HashMap::new();
+
+    // Doorway hardening #3: wrap the settlement-verification provider in a
+    // circuit-breaker (timeout + breaker + bounded concurrency + short negative
+    // cache). A slow/down/unhealthy backend now fails the gate fast (fail-closed
+    // — never an admission) instead of head-of-line-stalling this inbound loop.
+    // Admission semantics are unchanged: a `Settled` result passes through
+    // verbatim, so the gate's recipient-binding/amount/replay/preimage checks all
+    // still run; the wrapper can only cause more rejections, never an admission.
+    let verify_lightning: std::sync::Arc<dyn konsensus_core::traits::lightning::LightningProvider> =
+        std::sync::Arc::new(konsensus_lightning::CircuitBreakerLightning::with_defaults(
+            std::sync::Arc::clone(&lightning_for_recv),
+        ));
 
     loop {
         tokio::select! {
@@ -79,13 +214,6 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                     Ok(envelope) => {
                         // PRINCIPLE 2: Every incoming message MUST pass the payment gate.
                         // Fail-closed: any verification failure = message rejected.
-                        let whitelist = peer_registry_for_recv
-                            .read()
-                            .await
-                            .whitelist()
-                            .into_iter()
-                            .collect::<std::collections::HashSet<_>>();
-
                         let sender = envelope.sender;
                         let msg_id = envelope.id;
 
@@ -97,17 +225,30 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             .map(konsensus_pricing::compute_trust_discount)
                             .unwrap_or(0.0);
 
-                        if let Err(rejection) = gate_for_recv
-                            .verify(
-                                &envelope,
-                                nonce_adapter.as_ref(),
-                                pricing_for_recv.as_ref(),
-                                Some(&whitelist),
-                                Some(lightning_for_recv.as_ref()),
-                                trust_discount,
-                            )
-                            .await
-                        {
+                        // Whitelist check (Principle 3: closed mesh) + payment-gate
+                        // verify (Principle 2), with the registry read guard
+                        // released BEFORE the gate await. Extracted into
+                        // `whitelist_then_verify` so the HARD-11
+                        // lock-release-before-await contract is directly
+                        // unit-testable (tests::whitelist_read_guard_released_*).
+                        let gate_result = whitelist_then_verify(
+                            &envelope,
+                            peer_registry_for_recv.as_ref(),
+                            gate_for_recv.as_ref(),
+                            nonce_adapter.as_ref(),
+                            pricing_for_recv.as_ref(),
+                            Some(verify_lightning.as_ref()),
+                            trust_discount,
+                            // Bind settlement to THIS node so a payment proof
+                            // addressed to a different node is non-transferable.
+                            Some(identity_for_recv.node_id()),
+                            // M1a: Whitelist => Step-2 membership enforced;
+                            // PriceOpen => membership skipped, payment still gates.
+                            admission_mode_for_recv,
+                        )
+                        .await;
+
+                        if let Err(rejection) = gate_result {
                             // Increment the appropriate Prometheus counter based on
                             // rejection type so alert rules can fire on the right signal.
                             match &rejection {
@@ -119,6 +260,8 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 }
                                 konsensus_core::gate::GateRejection::InsufficientPayment { .. }
                                 | konsensus_core::gate::GateRejection::PaymentNotSettled(_)
+                                | konsensus_core::gate::GateRejection::PaymentSettlementMismatch(_)
+                                | konsensus_core::gate::GateRejection::PaymentProofReused { .. }
                                 | konsensus_core::gate::GateRejection::LightningUnavailable(_) => {
                                     metrics::counter!(
                                         konsensus_api::metrics::PAYMENT_FAILURES
@@ -152,30 +295,92 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
 
                             // On pricing mismatch, proactively send our current price table
-                            // so the sender can update their cache and retry successfully.
+                            // so the sender can update their cache and retry successfully —
+                            // but throttle it per-peer. In PriceOpen mode an UNPAID stranger
+                            // also lands here, so an un-throttled resend is a "free connection
+                            // back" + asymmetric-work primitive (each underpaid packet would
+                            // loop a free build_full_price_table + wallet lookup + send). The
+                            // cooldown lets a legitimately mis-priced sender retry once while a
+                            // flood throttles itself.
                             if matches!(rejection, konsensus_core::gate::GateRejection::InsufficientPayment { .. }) {
-                                let meta = konsensus_pricing::peer_prices::build_full_price_table(
-                                    pricing_for_recv.as_ref(),
-                                    chain_for_recv.as_ref(),
-                                ).await;
-                                let peer_discount = routing_for_recv
-                                    .get_peer_weight(&sender)
-                                    .await
-                                    .map(konsensus_pricing::compute_trust_discount)
-                                    .unwrap_or(0.0);
-                                let price_frame = Frame::PriceTable {
-                                    prices: meta.prices,
-                                    block_height: meta.block_height,
-                                    valid_blocks: meta.valid_blocks,
-                                    trust_discount: peer_discount,
-                                };
-                                if let Err(e) = transport_for_ack.send_frame(&sender, &price_frame).await {
-                                    warn!(peer = %sender, error = %e, "failed to send corrective price table");
+                                if corrective_price_table_rate_limited(
+                                    &mut last_corrective_price_table,
+                                    &sender,
+                                    tokio::time::Instant::now(),
+                                ) {
+                                    debug!(peer = %sender, "corrective price table rate-limited; not resent");
                                 } else {
-                                    info!(peer = %sender, "sent corrective price table after payment mismatch");
+                                    let meta = konsensus_pricing::peer_prices::build_full_price_table(
+                                        pricing_for_recv.as_ref(),
+                                        chain_for_recv.as_ref(),
+                                    ).await;
+                                    let price_frame = Frame::PriceTable {
+                                        prices: meta.prices,
+                                        block_height: meta.block_height,
+                                        valid_blocks: meta.valid_blocks,
+                                        // Reuse the trust_discount already computed for this
+                                        // sender above — no second wallet weight lookup.
+                                        trust_discount,
+                                    };
+                                    if let Err(e) = transport_for_ack.send_frame(&sender, &price_frame).await {
+                                        warn!(peer = %sender, error = %e, "failed to send corrective price table");
+                                    } else {
+                                        info!(peer = %sender, "sent corrective price table after payment mismatch");
+                                    }
                                 }
                             }
                             continue;
+                        }
+
+                        // M1b promote-on-paid: the PaymentGate just accepted a
+                        // PAID, M2-recipient-bound UKM from `sender`. Flip this
+                        // connection to privileged so its subsequent control frames
+                        // (session/X3DH/invoice/peer-exchange/Lightning) are no
+                        // longer dropped. We promote by `sender`; the transport peer
+                        // map is keyed by the AUTHENTICATED federation NodeId, so a
+                        // relayer that forwards someone else's proof cannot promote
+                        // its own connection — only the connection that authenticated
+                        // as `sender` is flipped (binding: envelope.sender ==
+                        // connection.peer_id). In Whitelist mode the peer is already
+                        // privileged, so this is a no-op (byte-identical).
+                        if matches!(
+                            admission_mode_for_recv,
+                            konsensus_message::ReachabilityMode::PriceOpen
+                        ) && !transport_for_recv.promote_to_privileged(&sender).await
+                        {
+                            debug!(sender = %sender, "paid sender has no live connection to promote (relayed/offline proof)");
+                        }
+
+                        // R3 SEAM-B (Route B) — relay-control intercept. Fires only
+                        // when the relay engine is enabled (`Some`) and the kind is
+                        // Storage-category (600–699). The gate above has ALREADY
+                        // settled + recipient-bound + single-use + charged this
+                        // control UKM, so this is pure post-payment routing (no new
+                        // admission authority). Runs BEFORE `store_message` /
+                        // `decrypt_and_process`: a relay-control UKM is never stored
+                        // as a message and never fed to the ratchet — the relay
+                        // touches opaque routing fields only ("host the box, never
+                        // the plaintext"). Inert when disabled (None → skipped,
+                        // byte-identical to today).
+                        if let Some(relay_engine) = relay_engine_for_recv.as_ref() {
+                            if konsensus_core::kind::KindCategory::from_kind(envelope.kind)
+                                == konsensus_core::kind::KindCategory::Storage
+                            {
+                                for (peer, frame) in crate::relay::dispatch::handle_relay_control(
+                                    relay_engine.as_ref(),
+                                    &envelope,
+                                    identity_for_recv.node_id(),
+                                )
+                                .await
+                                {
+                                    if let Err(e) =
+                                        transport_for_ack.send_frame(&peer, &frame).await
+                                    {
+                                        warn!(peer = %peer, error = %e, "failed to send relay-control reply");
+                                    }
+                                }
+                                continue;
+                            }
                         }
 
                         // Gate passed — store the message (must succeed before ACK)
@@ -281,7 +486,9 @@ async fn decrypt_and_process(
             // Send our PrekeyOffer to trigger re-negotiation
             let bundle = session_mgr.prekey_bundle().await;
             if let Ok(bundle_json) = serde_json::to_value(&bundle) {
-                let frame = Frame::PrekeyOffer { bundle: bundle_json };
+                let frame = Frame::PrekeyOffer {
+                    bundle: bundle_json,
+                };
                 if let Err(e) = transport.send_frame(sender, &frame).await {
                     warn!(peer = %sender, error = %e, "failed to send PrekeyOffer for re-negotiation");
                 }
@@ -293,7 +500,10 @@ async fn decrypt_and_process(
     // Cache decrypted plaintext (encrypted at rest) for API access
     match plaintext_cipher.encrypt(&bytes) {
         Ok(encrypted) => {
-            if let Err(e) = storage.store_message_plaintext(&envelope.id, &encrypted).await {
+            if let Err(e) = storage
+                .store_message_plaintext(&envelope.id, &encrypted)
+                .await
+            {
                 warn!(msg_id = %envelope.id, error = %e, "failed to cache plaintext");
             }
         }
@@ -312,9 +522,29 @@ async fn decrypt_and_process(
     } else if envelope.kind == konsensus_core::kind::KIND_RSVP {
         process_rsvp(&bytes, sender, envelope, storage).await
     } else if envelope.kind == konsensus_core::kind::KIND_WEB_MANIFEST {
-        process_web_manifest(sender, content_server, chain, pricing, identity, session_mgr, transport).await
+        process_web_manifest(
+            sender,
+            content_server,
+            chain,
+            pricing,
+            identity,
+            session_mgr,
+            transport,
+        )
+        .await
     } else if envelope.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
-        process_page_request(&bytes, sender, envelope, content_server, pricing, identity, session_mgr, transport, audit).await
+        process_page_request(
+            &bytes,
+            sender,
+            envelope,
+            content_server,
+            pricing,
+            identity,
+            session_mgr,
+            transport,
+            audit,
+        )
+        .await
     } else if konsensus_message::wire::is_realtime_signal(envelope.kind) {
         // Real-time signaling (400–499): log at INFO and relay plaintext to WebSocket.
         // Dedicated legacy Call* frame variants are rejected by the transport;
@@ -562,7 +792,8 @@ async fn process_web_manifest(
             session_mgr,
             pricing,
             transport,
-        ).await;
+        )
+        .await;
     }
 
     Some("[web manifest request]".to_string())
@@ -581,13 +812,14 @@ async fn process_page_request(
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
 ) -> Option<String> {
-    let page_req: konsensus_core::payloads::content::PageRequest = match serde_json::from_slice(bytes) {
-        Ok(r) => r,
-        Err(e) => {
-            debug!(sender = %sender, error = %e, "KIND_PAGE_REQUEST payload not valid JSON");
-            return None;
-        }
-    };
+    let page_req: konsensus_core::payloads::content::PageRequest =
+        match serde_json::from_slice(bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(sender = %sender, error = %e, "KIND_PAGE_REQUEST payload not valid JSON");
+                return None;
+            }
+        };
 
     let Some(cs) = content_server else {
         debug!(sender = %sender, "page request received but content server disabled");
@@ -611,7 +843,8 @@ async fn process_page_request(
             session_mgr,
             pricing,
             transport,
-        ).await;
+        )
+        .await;
     }
 
     audit.record(

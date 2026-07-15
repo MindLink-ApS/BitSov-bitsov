@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::{
     ApiConfig, BackupConfig, ChainConfig, IdentityConfig, LightningConfig, NetworkConfig,
-    NodeConfig, NodeTier, PricingConfig, StorageConfig, WebConfig,
+    NodeConfig, NodeTier, PaymentGateConfig, PricingConfig, RelayConfig, StorageConfig, WebConfig,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,6 +29,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
         },
         chain: ChainConfig::Mock,
         pricing: PricingConfig::default(),
+        payment_gate: PaymentGateConfig::default(),
         storage: StorageConfig::Sqlite {
             path: dir.join("konsensus.db").to_string_lossy().into_owned(),
             encrypted: false,
@@ -38,6 +39,10 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
         api: ApiConfig::default(),
         web: WebConfig::default(),
         peers: Vec::new(),
+        admission_mode: konsensus_message::ReachabilityMode::Whitelist,
+        cookie_mode: konsensus_message::CookieMode::Disabled,
+        onboarding_subsidy: crate::config::SubsidyConfig::default(),
+        relay: RelayConfig::default(),
     }
 }
 
@@ -55,11 +60,16 @@ fn snapshot_config(storage: StorageConfig) -> NodeConfig {
         },
         chain: ChainConfig::Mock,
         pricing: PricingConfig::default(),
+        payment_gate: PaymentGateConfig::default(),
         storage,
         backup: BackupConfig::default(),
         api: ApiConfig::default(),
         web: WebConfig::default(),
         peers: Vec::new(),
+        admission_mode: konsensus_message::ReachabilityMode::Whitelist,
+        cookie_mode: konsensus_message::CookieMode::Disabled,
+        onboarding_subsidy: crate::config::SubsidyConfig::default(),
+        relay: RelayConfig::default(),
     }
 }
 
@@ -93,7 +103,10 @@ async fn from_config_missing_mnemonic_fails() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
     config.identity.mnemonic_file = PathBuf::from("/nonexistent/mnemonic.txt");
-    let err = KonsensusNode::from_config(config, None).await.err().expect("should fail");
+    let err = KonsensusNode::from_config(config, None)
+        .await
+        .err()
+        .expect("should fail");
     assert!(
         err.to_string().contains("failed to read mnemonic"),
         "got: {err}"
@@ -104,8 +117,15 @@ async fn from_config_missing_mnemonic_fails() {
 async fn from_config_invalid_mnemonic_fails() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
-    std::fs::write(&config.identity.mnemonic_file, "not a valid mnemonic at all").unwrap();
-    let err = KonsensusNode::from_config(config, None).await.err().expect("should fail");
+    std::fs::write(
+        &config.identity.mnemonic_file,
+        "not a valid mnemonic at all",
+    )
+    .unwrap();
+    let err = KonsensusNode::from_config(config, None)
+        .await
+        .err()
+        .expect("should fail");
     assert!(
         err.to_string().contains("mnemonic") || err.to_string().contains("identity"),
         "got: {err}"
@@ -117,7 +137,10 @@ async fn from_config_empty_mnemonic_fails() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     std::fs::write(&config.identity.mnemonic_file, "").unwrap();
-    let err = KonsensusNode::from_config(config, None).await.err().expect("should fail");
+    let err = KonsensusNode::from_config(config, None)
+        .await
+        .err()
+        .expect("should fail");
     assert!(err.to_string().contains("mnemonic") || err.to_string().contains("identity"));
 }
 
@@ -173,7 +196,10 @@ async fn from_config_invalid_peer_node_id_fails() {
         label: None,
         auto_connect: true,
     });
-    let err = KonsensusNode::from_config(config, None).await.err().expect("should fail");
+    let err = KonsensusNode::from_config(config, None)
+        .await
+        .err()
+        .expect("should fail");
     assert!(err.to_string().contains("invalid node_id"), "got: {err}");
 }
 
@@ -355,7 +381,10 @@ fn save_fee_rate_snapshot_overwrites_existing() {
 
     let path = KonsensusNode::fee_rate_snapshot_path(&config);
     let loaded = KonsensusNode::load_fee_rate_snapshot(&path).unwrap();
-    assert_eq!(loaded.block_height, 200, "second save should overwrite first");
+    assert_eq!(
+        loaded.block_height, 200,
+        "second save should overwrite first"
+    );
 }
 
 // ── Accessor tests ─────────────────────────────────────────────────

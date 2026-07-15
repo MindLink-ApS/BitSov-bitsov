@@ -8,9 +8,9 @@ BitSov is a sovereign mesh network where users hold their own cryptographic iden
 
 | Component | Supported |
 |-----------|-----------|
-| `bitsov` binary (latest `main`) | Yes |
-| `bitsov-browser` extension (latest `main`) | Yes |
-| `bitsov-push-relay` (latest `main`) | Yes |
+| `konsensus-node` CLI/binary and exported protocol crates (latest `main`) | Yes |
+| Public node API, CLI, and protocol documents in this repository | Yes |
+| Public reference app, hosted relay/service code, website, and commercial operations | Separate policy |
 | All earlier tagged releases | No — upgrade to latest |
 
 We do not backport security patches. Users should always run the latest build.
@@ -47,7 +47,7 @@ A useful report includes:
 - **Description** — what the vulnerability is and what it affects
 - **Impact** — what an attacker can do if they exploit it (keys? funds? messages? DoS?)
 - **Reproduction** — step-by-step instructions or a minimal proof-of-concept
-- **Affected components** — which crate(s), binary, or frontend module
+- **Affected components** — which crate(s), binary, API route, CLI command, or protocol document
 - **Suggested fix** (optional) — your proposed patch or mitigation
 
 The more detail you provide, the faster we can triage and respond.
@@ -97,14 +97,17 @@ Duplicate reports: first reporter wins. If two reports arrive simultaneously, we
 
 ## What Is In Scope
 
-- `bitsov` binary and all workspace crates (`bitsov-core`, `bitsov-identity`, `bitsov-payment`, `bitsov-storage`, `bitsov-transport`, `bitsov-crypto`, `bitsov-mesh`, `bitsov-rpc`)
-- `bitsov-browser` browser extension
-- `bitsov-push-relay` relay server
-- SolidJS/Tauri frontend (`frontend/`)
+- `konsensus-node` binary and all exported workspace crates in this repository
+  (`konsensus-api`, `konsensus-bsx`, `konsensus-chain`, `konsensus-core`,
+  `konsensus-crypto`, `konsensus-fiat`, `konsensus-gossip`,
+  `konsensus-lightning`, `konsensus-message`, `konsensus-node`,
+  `konsensus-pricing`, `konsensus-routing`, `konsensus-storage`)
+- Public node API and CLI surfaces
+- Protocol relay code and documents in this repository
 - Node-to-node wire protocol
 - Key derivation and identity anchoring logic
 - Payment gate and Lightning integration
-- Federation and whitelist enforcement
+- Federation, routing, invite, recovery, and whitelist enforcement
 
 ### Out of Scope
 

@@ -1,0 +1,10 @@
+title = "BitSov public protocol gitleaks allowlist"
+
+[allowlist]
+description = "Deterministic public test fixtures and demo pubkeys only"
+regexes = [
+  '''02abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab''',
+  '''abcdef1234567890''',
+  '''02a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2''',
+  '''02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc''',
+]

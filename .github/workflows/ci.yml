@@ -10,7 +10,7 @@ on:
       - 'LICENSE'
       - '.gitignore'
   # 2026-04-30: paths-ignore REMOVED from pull_request. Branch protection on
-  # main requires Frontend Build + Rust Check & Test + Semgrep to report
+  # main requires Rust Check & Test + Semgrep to report
   # status; if a PR matches paths-ignore the workflow is skipped, the
   # required checks never report, and the PR is permanently blocked
   # (deadlock). Cost of running CI on doc-only PRs is ~10 min compute,
@@ -23,9 +23,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Protocol repo has no frontend
+        run: |
+          test ! -d frontend
+          echo "BitSov-bitsov is protocol-only; frontend build is intentionally satisfied by the absence of frontend/."
+
   check:
     name: Rust Check & Test
     runs-on: ubuntu-latest
+    env:
+      # Keep the hosted runner below disk/linker pressure during the core test
+      # phase. The workspace check builds heavy Lightning dependencies first;
+      # the test step then links many binaries. Lower parallelism and no
+      # incremental artifacts are slower but much less likely to exhaust
+      # ubuntu-latest.
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -33,7 +52,14 @@ jobs:
         with:
           components: clippy
 
-      # bitsov-browser crate depends on Wry/Tao which needs GTK3 + WebKit2GTK
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      # Keep Linux GUI/WebKit headers available for optional/transitive crates
+      # that still probe these libraries on CI runners.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -104,25 +130,6 @@ jobs:
       - name: cargo audit
         run: cargo audit
 
-  frontend:
-    name: Frontend Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install and build
-        working-directory: frontend
-        run: |
-          npm ci
-          npx tsc --noEmit
-          npx vite build
-
   semgrep:
     name: Semgrep Security Rules
     runs-on: ubuntu-latest
@@ -153,7 +160,7 @@ jobs:
   release-cli:
     name: Release CLI (${{ matrix.target }})
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, audit, frontend]
+    needs: [check, audit, semgrep]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -253,76 +260,3 @@ jobs:
             artifacts/${{ matrix.artifact }}.sha256
             artifacts/${{ matrix.artifact }}.sha256.minisig
             artifacts/${{ matrix.artifact }}.sbom.spdx.json
-
-  # Build Tauri desktop app for all platforms
-  release-desktop:
-    name: Release Desktop (${{ matrix.label }})
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, audit, frontend]
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: linux-x86_64
-            runner: ubuntu-22.04
-          - label: macos-arm64
-            runner: macos-latest
-          - label: macos-x86_64
-            runner: macos-13
-          - label: windows-x86_64
-            runner: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install frontend dependencies
-        working-directory: frontend
-        run: npm ci
-
-      # Linux needs GTK3 and WebKit2GTK for Tauri
-      - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            frontend/src-tauri/target/
-          key: ${{ runner.os }}-tauri-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-tauri-
-
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          projectPath: frontend
-          tagName: ${{ github.ref_name }}
-          releaseName: "BitSov ${{ github.ref_name }}"
-          releaseBody: "Sovereign mesh network desktop client. See CHANGELOG for details."
-          releaseDraft: false
-          prerelease: false

@@ -12,9 +12,12 @@
 //! 5. Graceful disconnect or TCP drop
 
 mod connection;
+mod cookie;
 mod handshake;
 mod messaging;
 mod supervisor;
+
+pub use cookie::CookieMode;
 
 // Re-export internal helpers that sibling submodules access via `super::`.
 // handshake::connect_to_peer does `use super::{PeerConnection, spawn_reader_task}` —
@@ -59,6 +62,11 @@ pub enum ControlEvent {
     PeerConnected {
         /// The authenticated peer's NodeId.
         peer_id: NodeId,
+        /// M1b: whether this connection is whitelist-privileged. In `Whitelist`
+        /// mode this is always `true` (byte-identical to pre-M1b). In `PriceOpen`
+        /// a stranger connects `false`; the session handler then refrains from
+        /// volunteering X3DH/onboarding until the peer pays (promote-on-paid).
+        privileged: bool,
     },
 
     /// Peer offered their prekey bundle for X3DH session establishment.
@@ -67,6 +75,9 @@ pub enum ControlEvent {
         peer_id: NodeId,
         /// Serialized `SerializablePrekeyBundle` (JSON value).
         bundle: serde_json::Value,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS this state-mutating frame.
+        privileged: bool,
     },
 
     /// Peer initiated an E2EE session (X3DH initiator → responder).
@@ -75,12 +86,18 @@ pub enum ControlEvent {
         peer_id: NodeId,
         /// Serialized `SerializableSessionInit` (JSON value).
         init_data: serde_json::Value,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS this durable-session frame.
+        privileged: bool,
     },
 
     /// Peer acknowledged E2EE session establishment.
     SessionAck {
         /// The peer who acknowledged.
         peer_id: NodeId,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS this session-state frame.
+        privileged: bool,
     },
 
     /// Peer sent a ratchet initialization message (initiator → acceptor).
@@ -91,6 +108,9 @@ pub enum ControlEvent {
         peer_id: NodeId,
         /// Ratchet-encrypted payload.
         payload: Vec<u8>,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS this ratchet-state frame.
+        privileged: bool,
     },
 
     /// Peer acknowledged receipt of a message.
@@ -99,6 +119,11 @@ pub enum ControlEvent {
         peer_id: NodeId,
         /// The acknowledged message ID.
         message_id: konsensus_core::types::MessageId,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS this ack so an unprivileged
+        /// stranger cannot pump their own Hebbian routing/trust weight (which
+        /// lowers their gate `required_msat`) before paying — a P2 bypass.
+        privileged: bool,
     },
 
     /// Peer rejected a message (e.g., payment gate failure).
@@ -109,6 +134,10 @@ pub enum ControlEvent {
         message_id: konsensus_core::types::MessageId,
         /// Reason for rejection.
         reason: String,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS this so an unprivileged stranger
+        /// cannot drive our routing-weight bookkeeping before paying (P2).
+        privileged: bool,
     },
 
     /// Peer announced their pricing table.
@@ -127,6 +156,10 @@ pub enum ControlEvent {
         valid_blocks: u32,
         /// Plasticity trust discount offered to us by this peer (0.0 to 0.5).
         trust_discount: f64,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS this so an unprivileged stranger
+        /// cannot poison our cached view of a peer's price surface before paying.
+        privileged: bool,
     },
 
     /// Peer queried our price for a specific message kind.
@@ -135,6 +168,10 @@ pub enum ControlEvent {
         peer_id: NodeId,
         /// The kind they want to price.
         kind: u16,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS the query so a stranger learns
+        /// nothing about our price surface before paying (info-disclosure floor).
+        privileged: bool,
     },
 
     /// Peer responded with a price for a queried kind.
@@ -147,6 +184,10 @@ pub enum ControlEvent {
         price_msat: u64,
         /// Block height at which price was computed.
         block_height: u64,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS this so a stranger cannot seed our
+        /// price cache with a fabricated quote before paying.
+        privileged: bool,
     },
 
     /// Peer requested our known peer list for discovery.
@@ -156,6 +197,10 @@ pub enum ControlEvent {
     PeerExchangeRequested {
         /// The peer who requested.
         peer_id: NodeId,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS the request so we never leak the
+        /// peer registry (mesh topology / social graph) to an unpaid stranger.
+        privileged: bool,
     },
 
     /// Peer shared their known peer list.
@@ -167,6 +212,10 @@ pub enum ControlEvent {
         peer_id: NodeId,
         /// List of peer entries.
         peers: Vec<crate::wire::PeerExchangeEntry>,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS the list so a stranger cannot
+        /// inject fabricated peers into our registry before paying.
+        privileged: bool,
     },
 
     /// Peer requested a Lightning invoice (they want to pay us).
@@ -182,6 +231,11 @@ pub enum ControlEvent {
         amount_msat: u64,
         /// Purpose description from the requester.
         purpose: String,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler issues an invoice ONLY for the single
+        /// reserved admission purpose (re-priced from the PricingEngine, caller
+        /// `amount_msat` ignored); every other unprivileged invoice is DROPPED.
+        privileged: bool,
     },
 
     /// Peer responded with a Lightning invoice we requested.
@@ -210,6 +264,10 @@ pub enum ControlEvent {
         request_id: String,
         /// Human-readable error reason.
         reason: String,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS this so an unprivileged stranger
+        /// cannot drive our pending-invoice bookkeeping before paying.
+        privileged: bool,
     },
 
     /// Received a gossip message from a peer.
@@ -223,6 +281,11 @@ pub enum ControlEvent {
         from_peer: NodeId,
         /// The gossip envelope (sender is the original author, not the relayer).
         envelope: Box<konsensus_core::UkmEnvelope>,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS the gossip so an unprivileged
+        /// stranger cannot use us for free relay/amplification before paying
+        /// (P2). Dead today via empty `GOSSIP_ALLOWED_KINDS`, but M3 re-opens it.
+        privileged: bool,
     },
 
     /// Peer shared their Lightning node pubkey (for keysend payments).
@@ -238,6 +301,11 @@ pub enum ControlEvent {
         ln_pubkey: String,
         /// Dialable Lightning P2P address (`host:port`) for channel opens.
         ln_addr: Option<String>,
+        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
+        /// `false` => the session handler DROPS this frame so a stranger cannot
+        /// drive the durable onboarding write or queue an auto-channel open
+        /// (spends our sats) before paying.
+        privileged: bool,
     },
 
     // ── Real-time Signaling (KIND range 400–499) ──────────────────────────
@@ -299,6 +367,28 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 /// Limits resource consumption from connection storms or slow handshakes.
 const MAX_CONCURRENT_INBOUND: usize = 64;
 
+/// Sustained inbound-handshake rate, in new handshakes per second, allowed per
+/// source *subnet* (IPv4 /24, IPv6 /64). Aggregating at the subnet granularity
+/// stops a `/24` or a botnet within one block from evading the exact-IP
+/// concurrency cap ([`crate::transport::connection::MAX_INBOUND_PER_IP`]) by
+/// rotating addresses. Conservative: a legitimate cohort of peers behind one
+/// `/24` connects far below this; only floods exceed it. Pre-auth, identity-blind
+/// (consults only the source subnet) — availability defense, never admission.
+pub(crate) const INBOUND_HANDSHAKE_RATE_PER_SUBNET: f64 = 10.0;
+
+/// Burst capacity (token-bucket size) for the per-subnet inbound-handshake rate
+/// limiter. Allows a short burst of legitimate reconnects without throttling,
+/// while the sustained rate is bounded by [`INBOUND_HANDSHAKE_RATE_PER_SUBNET`].
+pub(crate) const INBOUND_HANDSHAKE_BURST_PER_SUBNET: f64 = 40.0;
+
+/// Hard ceiling on the number of distinct subnet token-buckets tracked at once.
+/// When reached, idle (full) buckets are dropped first, then — if every tracked
+/// subnet is still actively throttled — the buckets nearest full are evicted, so
+/// the limiter's memory is strictly bounded even under an active wide-source
+/// flood. ~64K buckets is a few MiB; an attacker cycling more distinct subnets
+/// than this only degrades the limiter toward the global concurrency cap.
+pub(crate) const MAX_TRACKED_SUBNETS: usize = 65_536;
+
 /// Timeout for a single TCP read operation (length prefix + payload).
 /// Prevents slowloris attacks where an attacker sends partial data to hold connections.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -307,15 +397,25 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Prevents attackers from holding inbound connection slots indefinitely.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Maximum number of invalid (unparseable) frames allowed per peer within
-/// [`INVALID_FRAME_WINDOW`] before the peer is disconnected and temporarily banned.
+/// Maximum sustained level of the per-peer invalid-frame leaky bucket before the
+/// peer is disconnected and temporarily banned.
 ///
 /// This defends against whitelisted peers sending garbage frames to consume parsing
 /// resources. The payment gate doesn't activate until a valid UKM envelope arrives,
 /// so garbage frames bypass economic rate-limiting.
+///
+/// The budget is enforced as a **decay-only leaky bucket** (see
+/// [`PeerConnection::invalid_frame_level`]): each invalid frame adds one token, and
+/// the bucket leaks continuously at [`INVALID_FRAME_BUDGET`] tokens per
+/// [`INVALID_FRAME_WINDOW`]. Crucially, a *valid* frame does NOT drain the bucket —
+/// otherwise an attacker could interleave one cheap valid frame between bursts of
+/// garbage to keep the allowance topped up indefinitely (the classic
+/// reset-on-valid bypass). The level is sticky: it only falls as real time passes.
 const INVALID_FRAME_BUDGET: u32 = 10;
 
-/// Time window for counting invalid frames (seconds).
+/// Time window over which the invalid-frame leaky bucket drains a full
+/// [`INVALID_FRAME_BUDGET`] worth of tokens. Defines the leak rate
+/// (`INVALID_FRAME_BUDGET / INVALID_FRAME_WINDOW` tokens per second).
 const INVALID_FRAME_WINDOW: Duration = Duration::from_secs(60);
 
 /// Duration to ban a peer after exhausting their frame validation budget.
@@ -334,6 +434,97 @@ const MEMORY_BUDGET_WINDOW: Duration = Duration::from_secs(60);
 /// Prevents unbounded growth when many peers are banned and never reconnect.
 const BAN_EVICTION_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Operator-selectable **reachability** mode (Principle 3 scaffolding).
+///
+/// This enum decides who may *reach* the node at the transport layer — i.e. open
+/// a Noise session or be dialed — NOT who is *admitted*. Admission is settled by
+/// the per-message [`PaymentGate`], the sole admission authority in every mode.
+/// The type was renamed from `AdmissionMode` to `ReachabilityMode` (R1/A3)
+/// precisely because the old name implied the whitelist *was* the admission
+/// authority, contradicting the gate's role (CODEX.md: "PaymentGate is the sole
+/// admission authority").
+///
+/// `Whitelist` (default): only explicitly whitelisted peers may handshake or be
+/// dialed; empty whitelist rejects all (closed mesh, byte-identical to pre-M1).
+/// `PriceOpen`: a non-whitelisted peer may complete the Noise handshake and be
+/// dialed, but the session is UNPRIVILEGED — the per-message PaymentGate remains
+/// the sole admission authority (P2 fail-closed, no free lane; P4 ciphertext-only).
+///
+/// ## Wire tokens are pinned (doctrine: renames fail loud, never silent-default)
+/// Each variant's serde token is locked with an explicit `#[serde(rename = …)]`
+/// instead of a derived `rename_all`, so a future *identifier* rename cannot
+/// silently change the on-the-wire/config token for the live-mesh nodes (their
+/// `konsensus.toml` carries `admission_mode = "whitelist" | "price_open"`). There
+/// is deliberately **no** `#[serde(other)]` catch-all: an unknown or stale token
+/// fails loud (errors) instead of falling back to `Whitelist`, which would
+/// otherwise re-install membership-as-admission invisibly (CODEX.md §Renames).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ReachabilityMode {
+    /// Closed mesh — whitelist gates handshake + connect (default). Token: `"whitelist"`.
+    #[default]
+    #[serde(rename = "whitelist")]
+    Whitelist,
+    /// Operator-selectable price-admission — strangers handshake unprivileged;
+    /// per-message payment is the sole gate. Token: `"price_open"`.
+    #[serde(rename = "price_open")]
+    PriceOpen,
+}
+
+#[cfg(test)]
+mod reachability_mode_serde {
+    use super::ReachabilityMode;
+
+    #[test]
+    fn tokens_are_pinned_and_round_trip() {
+        // Wire/config tokens are locked to these exact strings. Changing either is a
+        // breaking change for every live-mesh konsensus.toml; this guards against a
+        // future identifier rename silently shifting the token.
+        assert_eq!(
+            serde_json::to_string(&ReachabilityMode::Whitelist).unwrap(),
+            "\"whitelist\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReachabilityMode::PriceOpen).unwrap(),
+            "\"price_open\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ReachabilityMode>("\"whitelist\"").unwrap(),
+            ReachabilityMode::Whitelist
+        );
+        assert_eq!(
+            serde_json::from_str::<ReachabilityMode>("\"price_open\"").unwrap(),
+            ReachabilityMode::PriceOpen
+        );
+    }
+
+    #[test]
+    fn unknown_token_errors_never_silent_default() {
+        // Doctrine (CODEX.md §Renames fail loud): an unknown/stale/typo token must
+        // FAIL LOUD, never fall back to the Whitelist default — a silent default
+        // would re-install membership-as-admission invisibly. This includes the old
+        // type name, the CLI hyphen spelling, and case variants.
+        for bad in [
+            "\"admission\"",
+            "\"open\"",
+            "\"price-open\"",
+            "\"Whitelist\"",
+            "\"PriceOpen\"",
+            "\"\"",
+        ] {
+            assert!(
+                serde_json::from_str::<ReachabilityMode>(bad).is_err(),
+                "token {bad} must error, not silently default to Whitelist"
+            );
+        }
+    }
+
+    #[test]
+    fn default_is_fail_closed_whitelist() {
+        // The fail-closed default is the closed mesh, never PriceOpen.
+        assert_eq!(ReachabilityMode::default(), ReachabilityMode::Whitelist);
+    }
+}
+
 /// Configuration for the Noise transport.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
@@ -347,6 +538,17 @@ pub struct TransportConfig {
     pub whitelist: Vec<NodeId>,
     /// Protocol version (always 2).
     pub version: u16,
+    /// Operator-selectable admission mode. In `Whitelist` (default) the handshake
+    /// and connect walls enforce the whitelist byte-identically to pre-M1; in
+    /// `PriceOpen` a non-whitelisted peer may handshake/be-dialed unprivileged and
+    /// the per-message PaymentGate is the sole admission authority.
+    pub admission_mode: ReachabilityMode,
+    /// Pre-Noise anti-DoS cookie (doorway hardening #2). `Disabled` by default —
+    /// the handshake is then byte-identical to pre-cookie. `Required` makes this
+    /// node demand a stateless return-routability cookie before it spends a Noise
+    /// DH (self-describing challenge, graceful, no flag-day; availability defense
+    /// only — never admission). Operator opt-in.
+    pub cookie_mode: CookieMode,
 }
 
 impl Default for TransportConfig {
@@ -357,6 +559,8 @@ impl Default for TransportConfig {
             capabilities: vec![Capability::X3dh],
             whitelist: Vec::new(),
             version: 2,
+            admission_mode: ReachabilityMode::default(),
+            cookie_mode: CookieMode::default(),
         }
     }
 }
@@ -371,6 +575,16 @@ pub type SharedWhitelist = Arc<RwLock<HashSet<NodeId>>>;
 
 /// State of an active peer connection.
 struct PeerConnection {
+    /// Whether this session is whitelist-privileged. In PriceOpen, a non-
+    /// whitelisted peer is admitted UNPRIVILEGED (ciphertext established; per-message
+    /// payment is the gate). Informational — the PaymentGate is the auth authority.
+    ///
+    /// M1a PLUMBS this tag (set at both construction sites). M1b READS it: the
+    /// reader stamps it onto the dangerous `ControlEvent` variants per frame so
+    /// the session handler can drop state-mutating frames from unprivileged peers,
+    /// and `NoiseTransport::promote_to_privileged` flips it to `true` once the
+    /// message-plane PaymentGate accepts a settled payment from this peer.
+    privileged: bool,
     /// The Noise session for encrypt/decrypt.
     noise: NoiseSession,
     /// TCP write half — protected by mutex for send serialization.
@@ -383,11 +597,19 @@ struct PeerConnection {
     last_recv: Instant,
     /// Outstanding ping nonce (Some if we sent a Ping and are waiting for Pong).
     pending_ping: Option<u64>,
-    /// Count of invalid (unparseable) frames received within the current window.
-    /// If this exceeds [`INVALID_FRAME_BUDGET`], the peer is disconnected and banned.
-    invalid_frame_count: u32,
-    /// Start of the current invalid-frame counting window.
-    invalid_frame_window_start: Instant,
+    /// Leaky-bucket level for invalid (unparseable) frames.
+    ///
+    /// Each invalid frame adds one token; the bucket drains continuously at
+    /// [`INVALID_FRAME_BUDGET`] tokens per [`INVALID_FRAME_WINDOW`]. When the level
+    /// exceeds [`INVALID_FRAME_BUDGET`], the peer is disconnected and banned.
+    ///
+    /// This is **decay-only**: valid frames never reset or reduce the level. The
+    /// bucket only falls as real time elapses (see [`Self::invalid_frame_last_leak`]),
+    /// which closes the interleave-a-valid-frame bypass where a single cheap valid
+    /// frame would otherwise refill the entire bad-frame allowance.
+    invalid_frame_level: f64,
+    /// Timestamp the leaky bucket was last drained, used to compute elapsed leak.
+    invalid_frame_last_leak: Instant,
     /// Bytes received from this peer within the current memory budget window.
     /// If this exceeds [`PEER_MEMORY_BUDGET`], the peer is disconnected and banned.
     bytes_received: u64,
@@ -413,6 +635,9 @@ struct TransportCtx {
     banned_peers: BanMap,
     incoming_tx: mpsc::Sender<UkmEnvelope>,
     control_tx: mpsc::Sender<ControlEvent>,
+    /// Shared pre-Noise cookie secret (doorway hardening #2). Consulted by the
+    /// inbound handler only when `config.cookie_mode == CookieMode::Required`.
+    cookie_keyring: Arc<cookie::CookieKeyring>,
 }
 
 /// Noise_XX encrypted TCP transport.
@@ -447,6 +672,10 @@ pub struct NoiseTransport {
     actual_listen_addr: tokio::sync::watch::Sender<Option<SocketAddr>>,
     /// Receiver for the actual listen address.
     actual_listen_addr_rx: tokio::sync::watch::Receiver<Option<SocketAddr>>,
+    /// Per-node secret for the pre-Noise anti-DoS cookie (doorway hardening #2).
+    /// Random at start, never persisted; only consulted when
+    /// `config.cookie_mode == CookieMode::Required`.
+    cookie_keyring: Arc<cookie::CookieKeyring>,
 }
 
 impl NoiseTransport {
@@ -476,6 +705,7 @@ impl NoiseTransport {
             ping_counter: Arc::new(AtomicU64::new(1)),
             actual_listen_addr,
             actual_listen_addr_rx,
+            cookie_keyring: Arc::new(cookie::CookieKeyring::random()),
         }
     }
 }
@@ -497,6 +727,38 @@ async fn write_noise_message(
     writer.write_all(data).await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Read a length-prefixed frame, refusing — **without allocating** — any frame
+/// whose declared length exceeds `max_len`. Used for the pre-Noise cookie
+/// exchange (doorway hardening #2) so a source that has not yet proven
+/// return-routability cannot make this node allocate a large buffer; the normal
+/// [`read_noise_message`] cap applies only once the cookie has passed.
+async fn read_bounded_message(
+    reader: &mut tokio::io::ReadHalf<TcpStream>,
+    max_len: usize,
+) -> Result<Vec<u8>, WireError> {
+    tokio::time::timeout(READ_TIMEOUT, async {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > max_len {
+            return Err(WireError::FrameTooLarge {
+                size: len,
+                max: max_len,
+            });
+        }
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf).await?;
+        Ok(buf)
+    })
+    .await
+    .map_err(|_| {
+        WireError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "read timed out (slowloris protection)",
+        ))
+    })?
 }
 
 /// Read a length-prefixed Noise message from a TCP stream with timeout.
@@ -578,8 +840,11 @@ impl MessageTransport for NoiseTransport {
 
     #[instrument(skip(self), fields(peer = %peer, addr = %addr))]
     async fn connect(&self, peer: &NodeId, addr: &str) -> Result<(), TransportError> {
-        // Check whitelist (Principle 3)
-        if !self.is_whitelisted(peer).await {
+        // Check whitelist (Principle 3). In PriceOpen mode the outbound wall is
+        // skipped so a stranger can be dialed UNPRIVILEGED; the per-message
+        // PaymentGate remains the sole admission authority.
+        if self.config.admission_mode == ReachabilityMode::Whitelist && !self.is_whitelisted(peer).await
+        {
             return Err(TransportError::Rejected(format!(
                 "peer {} not in whitelist",
                 peer.to_hex()
@@ -603,6 +868,7 @@ impl MessageTransport for NoiseTransport {
             banned_peers: Arc::clone(&self.banned_peers),
             incoming_tx: self.incoming_tx.clone(),
             control_tx: self.control_tx.clone(),
+            cookie_keyring: Arc::clone(&self.cookie_keyring),
         };
         handshake::connect_to_peer(peer, &socket_addr, &ctx).await
     }
@@ -777,6 +1043,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_b_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let config_b_fixed = TransportConfig {
@@ -785,6 +1053,8 @@ mod tests {
             capabilities: vec![Capability::X3dh, Capability::Mls],
             whitelist: vec![node_a_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let transport_b = Arc::new(NoiseTransport::new(Arc::clone(&identity_b), config_b_fixed));
@@ -860,6 +1130,8 @@ mod tests {
             capabilities: vec![],
             whitelist: vec![NodeId::from_bytes([99u8; 32])], // some other node
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let transport_a = NoiseTransport::new(Arc::clone(&identity_a), config_a);
@@ -964,6 +1236,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_b_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -971,6 +1245,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_a_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let transport_b = Arc::new(NoiseTransport::new(Arc::clone(&identity_b), config_b));
@@ -1166,6 +1442,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_b_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1173,6 +1451,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_a_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         // Start B's listener
@@ -1255,6 +1535,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_b_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1262,6 +1544,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_a_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let transport_b = Arc::new(NoiseTransport::new(Arc::clone(&identity_b), config_b));
@@ -1362,14 +1646,14 @@ mod tests {
 
         // Verify PeerConnected events
         match event_a {
-            ControlEvent::PeerConnected { peer_id } => {
+            ControlEvent::PeerConnected { peer_id, .. } => {
                 assert_eq!(peer_id, node_b_id, "A should see B connected");
             }
             other => panic!("expected PeerConnected, got {:?}", other),
         }
 
         match event_b {
-            ControlEvent::PeerConnected { peer_id } => {
+            ControlEvent::PeerConnected { peer_id, .. } => {
                 assert_eq!(peer_id, node_a_id, "B should see A connected");
             }
             other => panic!("expected PeerConnected, got {:?}", other),
@@ -1437,7 +1721,7 @@ mod tests {
         .expect("channel closed");
 
         match event {
-            ControlEvent::PrekeyOffer { peer_id, bundle } => {
+            ControlEvent::PrekeyOffer { peer_id, bundle, .. } => {
                 assert_eq!(peer_id, node_a_id);
                 assert_eq!(bundle, test_bundle);
             }
@@ -1509,6 +1793,7 @@ mod tests {
             ControlEvent::SessionInit {
                 peer_id,
                 init_data: received,
+                ..
             } => {
                 assert_eq!(peer_id, node_a_id);
                 assert_eq!(received, init_data);
@@ -1531,7 +1816,7 @@ mod tests {
         .expect("channel closed");
 
         match event {
-            ControlEvent::SessionAck { peer_id } => {
+            ControlEvent::SessionAck { peer_id, .. } => {
                 assert_eq!(peer_id, node_b_id);
             }
             other => panic!("expected SessionAck, got {:?}", other),
@@ -1599,6 +1884,7 @@ mod tests {
             ControlEvent::MessageAcked {
                 peer_id,
                 message_id,
+                ..
             } => {
                 assert_eq!(peer_id, node_b_id);
                 assert_eq!(message_id, test_id);
@@ -1626,6 +1912,7 @@ mod tests {
                 peer_id,
                 message_id,
                 reason,
+                ..
             } => {
                 assert_eq!(peer_id, node_b_id);
                 assert_eq!(message_id, test_id);
@@ -1716,12 +2003,16 @@ mod tests {
                 block_height,
                 valid_blocks,
                 trust_discount,
+                privileged,
             } => {
                 assert_eq!(peer_id, node_a_id);
                 assert_eq!(recv_prices, prices);
                 assert_eq!(block_height, 850_000);
                 assert_eq!(valid_blocks, 144);
                 assert!((trust_discount - 0.0).abs() < f64::EPSILON);
+                // setup_connected_pair federates both ends, so the reader stamps
+                // privileged=true; this asserts the tag is wired end-to-end.
+                assert!(privileged);
             }
             other => panic!("expected PriceTableReceived, got {:?}", other),
         }
@@ -1749,7 +2040,7 @@ mod tests {
         .expect("channel closed");
 
         match event {
-            ControlEvent::PriceQueryReceived { peer_id, kind } => {
+            ControlEvent::PriceQueryReceived { peer_id, kind, .. } => {
                 assert_eq!(peer_id, node_a_id);
                 assert_eq!(kind, 100);
             }
@@ -1779,11 +2070,14 @@ mod tests {
                 kind,
                 price_msat,
                 block_height,
+                privileged,
             } => {
                 assert_eq!(peer_id, node_b_id);
                 assert_eq!(kind, 100);
                 assert_eq!(price_msat, 50);
                 assert_eq!(block_height, 850_001);
+                // Both ends federated by setup_connected_pair => privileged tag set.
+                assert!(privileged);
             }
             other => panic!("expected PriceResponseReceived, got {:?}", other),
         }
@@ -1813,7 +2107,7 @@ mod tests {
         .expect("channel closed");
 
         match event {
-            ControlEvent::PeerExchangeRequested { peer_id } => {
+            ControlEvent::PeerExchangeRequested { peer_id, .. } => {
                 assert_eq!(peer_id, node_a_id);
             }
             other => panic!("expected PeerExchangeRequested, got {:?}", other),
@@ -1842,7 +2136,7 @@ mod tests {
         .expect("channel closed");
 
         match event {
-            ControlEvent::PeerExchangeReceived { peer_id, peers } => {
+            ControlEvent::PeerExchangeReceived { peer_id, peers, .. } => {
                 assert_eq!(peer_id, node_b_id);
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0].node_id, gamma_id);
@@ -1881,6 +2175,7 @@ mod tests {
             ControlEvent::RatchetInit {
                 peer_id,
                 payload: recv_payload,
+                ..
             } => {
                 assert_eq!(peer_id, node_a_id);
                 assert_eq!(recv_payload, payload);
@@ -2057,6 +2352,447 @@ mod tests {
         assert!(
             !transport_b.is_connected(&node_a_id).await,
             "empty whitelist node must not accept inbound peers"
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    // ─── M1a price-admission transport (ReachabilityMode::PriceOpen) ────────────
+
+    #[tokio::test]
+    async fn priceopen_responder_admits_unprivileged_stranger() {
+        // M1a wall-2 inversion: a responder in PriceOpen mode with an EMPTY
+        // whitelist completes the Noise handshake with a NON-whitelisted initiator,
+        // registers it as a peer, and tags the session privileged == false.
+        // Ciphertext transport is established (P4) — the per-message PaymentGate,
+        // not the transport, is the admission authority (P2).
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let node_a_id = *id_a.node_id();
+        let node_b_id = *id_b.node_id();
+
+        // B is the responder: PriceOpen + EMPTY whitelist (a true stranger inbound).
+        let config_b = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![],
+            admission_mode: ReachabilityMode::PriceOpen,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+
+        // A is the initiator. A whitelists B so A's own outbound wall passes; A's
+        // session toward B is privileged, but that is independent of B's view of A.
+        let config_a = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_b_id],
+            ..Default::default()
+        };
+
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
+
+        transport_a
+            .connect(&node_b_id, &addr_b.to_string())
+            .await
+            .expect("PriceOpen responder must admit a non-whitelisted initiator");
+
+        // Give B time to register the inbound peer.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            transport_b.is_connected(&node_a_id).await,
+            "PriceOpen responder must register the stranger as a connected peer"
+        );
+
+        // The stranger's session on B must be UNPRIVILEGED.
+        {
+            let peers = transport_b.peers.read().await;
+            let conn = peers.get(&node_a_id).expect("stranger peer present on B");
+            let conn = conn.lock().await;
+            assert!(
+                !conn.privileged,
+                "non-whitelisted PriceOpen peer must be tagged privileged == false"
+            );
+        }
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn priceopen_connect_dials_stranger() {
+        // M1a wall-3 inversion: an initiator in PriceOpen mode with an EMPTY
+        // whitelist may dial a non-whitelisted peer; the outbound wall is skipped.
+        // The resulting initiator-side session is tagged privileged == false.
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let node_a_id = *id_a.node_id();
+        let node_b_id = *id_b.node_id();
+
+        // A: PriceOpen + EMPTY whitelist — must still be able to dial a stranger.
+        let config_a = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![],
+            admission_mode: ReachabilityMode::PriceOpen,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+
+        // B: PriceOpen so it admits the inbound stranger (A is not in B's whitelist).
+        let config_b = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![],
+            admission_mode: ReachabilityMode::PriceOpen,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
+
+        transport_a
+            .connect(&node_b_id, &addr_b.to_string())
+            .await
+            .expect("PriceOpen initiator must dial a non-whitelisted peer");
+
+        assert!(
+            transport_a.is_connected(&node_b_id).await,
+            "PriceOpen initiator must register the dialed stranger"
+        );
+
+        // A's session toward the stranger B is UNPRIVILEGED (B not in A's whitelist).
+        {
+            let peers = transport_a.peers.read().await;
+            let conn = peers.get(&node_b_id).expect("dialed peer present on A");
+            let conn = conn.lock().await;
+            assert!(
+                !conn.privileged,
+                "initiator-side session to a non-whitelisted peer must be privileged == false"
+            );
+        }
+
+        // Sanity: B saw A connect too (the responder also admitted the stranger).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(transport_b.is_connected(&node_a_id).await);
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    // ─── M1b promote-on-paid + reader stamping ───────────────────────────────
+
+    #[tokio::test]
+    async fn promote_to_privileged_flips_unprivileged_connection() {
+        // M1b step 4: after the message-plane gate accepts a settled payment, the
+        // handler calls promote_to_privileged(sender). It must flip the in-memory
+        // flag on the connection keyed by that sender, and subsequent reader frame
+        // stamps must read `true`.
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let node_a_id = *id_a.node_id();
+        let node_b_id = *id_b.node_id();
+
+        // B: PriceOpen responder with empty whitelist → admits A unprivileged.
+        let config_b = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![],
+            admission_mode: ReachabilityMode::PriceOpen,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+        let config_a = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_b_id],
+            ..Default::default()
+        };
+
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
+        transport_a.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A starts UNPRIVILEGED on B.
+        {
+            let peers = transport_b.peers.read().await;
+            let conn = peers.get(&node_a_id).expect("stranger present").lock().await;
+            assert!(!conn.privileged, "stranger must start unprivileged");
+        }
+
+        // Promote returns true and flips the flag.
+        assert!(
+            transport_b.promote_to_privileged(&node_a_id).await,
+            "promote must find and flip the live stranger connection"
+        );
+        {
+            let peers = transport_b.peers.read().await;
+            let conn = peers.get(&node_a_id).expect("stranger present").lock().await;
+            assert!(conn.privileged, "promote_to_privileged must flip the flag to true");
+        }
+
+        // Promoting an unknown sender returns false (no connection to promote).
+        let stranger = NodeId::from_bytes([7u8; 32]);
+        assert!(
+            !transport_b.promote_to_privileged(&stranger).await,
+            "promote on a sender with no live connection must return false"
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn connected_privileged_peers_excludes_unprivileged_until_promoted() {
+        // P2 regression (no prekey before settlement): the E2EE self-heal loop must
+        // iterate `connected_privileged_peers`, NOT `connected_peers`, so an unpaid
+        // PriceOpen stranger never receives a proactively self-healed X3DH prekey
+        // bundle. An unprivileged connection is EXCLUDED from
+        // `connected_privileged_peers` while still present in `connected_peers`;
+        // a settled-payment promotion moves it into the privileged self-heal set.
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let node_a_id = *id_a.node_id();
+        let node_b_id = *id_b.node_id();
+
+        // B: PriceOpen responder, empty whitelist → admits A UNPRIVILEGED.
+        let config_b = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![],
+            admission_mode: ReachabilityMode::PriceOpen,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+        let config_a = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_b_id],
+            ..Default::default()
+        };
+
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
+        transport_a.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // A is CONNECTED to B but UNPRIVILEGED: present in connected_peers,
+        // ABSENT from connected_privileged_peers (the self-heal set).
+        assert!(
+            transport_b.connected_peers().await.contains(&node_a_id),
+            "stranger must be connected"
+        );
+        assert!(
+            !transport_b
+                .connected_privileged_peers()
+                .await
+                .contains(&node_a_id),
+            "unprivileged stranger must NOT be in the privileged self-heal set — \
+             no prekey before settlement (P2)"
+        );
+
+        // Settled-payment promotion moves A into the privileged self-heal set.
+        assert!(transport_b.promote_to_privileged(&node_a_id).await);
+        assert!(
+            transport_b
+                .connected_privileged_peers()
+                .await
+                .contains(&node_a_id),
+            "after promotion the paid peer is eligible for E2EE self-heal"
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn promote_binds_sender_to_its_own_connection() {
+        // M1b step 4 anti-relay binding: the peer map is keyed by the AUTHENTICATED
+        // federation NodeId. Promoting `sender` flips ONLY the connection that
+        // authenticated as `sender` — a different live connection (a would-be
+        // relayer forwarding sender's proof) is NEVER promoted.
+        let id_a = make_identity(TEST_MNEMONIC_A); // the payer (sender)
+        let id_b = make_identity(TEST_MNEMONIC_B); // our node (the promoter)
+        let id_c = make_identity(TEST_MNEMONIC_C); // an unrelated relayer connection
+        let node_a_id = *id_a.node_id();
+        let node_b_id = *id_b.node_id();
+        let node_c_id = *id_c.node_id();
+
+        let config_b = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![],
+            admission_mode: ReachabilityMode::PriceOpen,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+        let open = |wl: Vec<NodeId>| TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: wl,
+            admission_mode: ReachabilityMode::PriceOpen,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), open(vec![]));
+        let transport_c = NoiseTransport::new(Arc::clone(&id_c), open(vec![]));
+        transport_a.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
+        transport_c.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Both strangers are connected and unprivileged on B.
+        assert!(transport_b.is_connected(&node_a_id).await);
+        assert!(transport_b.is_connected(&node_c_id).await);
+
+        // A pays → we promote by A's sender id. C (the relayer) must stay UNPRIVILEGED.
+        assert!(transport_b.promote_to_privileged(&node_a_id).await);
+        {
+            let peers = transport_b.peers.read().await;
+            let a = peers.get(&node_a_id).unwrap().lock().await;
+            assert!(a.privileged, "the paying sender's own connection is promoted");
+        }
+        {
+            let peers = transport_b.peers.read().await;
+            let c = peers.get(&node_c_id).unwrap().lock().await;
+            assert!(
+                !c.privileged,
+                "a relayer's connection must NOT be promoted by someone else's proof"
+            );
+        }
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+        transport_c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reader_stamps_current_privilege_onto_control_events() {
+        // M1b step 1: the reader stamps `conn.privileged` onto dangerous control
+        // events per frame. Before promotion the stamp is false; after promotion
+        // the NEXT frame is stamped true. Drive a PriceQuery frame across the wire.
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let node_a_id = *id_a.node_id();
+        let node_b_id = *id_b.node_id();
+
+        let config_b = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![],
+            admission_mode: ReachabilityMode::PriceOpen,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+        let config_a = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_b_id],
+            admission_mode: ReachabilityMode::PriceOpen,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
+        transport_a.connect(&node_b_id, &addr_b.to_string()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Drain B's PeerConnected for A.
+        let _ = tokio::time::timeout(Duration::from_secs(1), transport_b.recv_control()).await;
+
+        // A → B PriceQuery; B's reader stamps privileged == false (stranger).
+        transport_a.send_frame(&node_b_id, &Frame::PriceQuery { kind: 0 }).await.unwrap();
+        let ev = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
+                .await
+                .expect("timeout")
+                .expect("closed");
+            if let ControlEvent::PriceQueryReceived { privileged, peer_id, .. } = ev {
+                assert_eq!(peer_id, node_a_id);
+                break privileged;
+            }
+        };
+        assert!(!ev, "unprivileged stranger's PriceQuery must be stamped privileged == false");
+
+        // Promote A, then a SECOND PriceQuery must be stamped privileged == true.
+        assert!(transport_b.promote_to_privileged(&node_a_id).await);
+        transport_a.send_frame(&node_b_id, &Frame::PriceQuery { kind: 0 }).await.unwrap();
+        let ev2 = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(2), transport_b.recv_control())
+                .await
+                .expect("timeout")
+                .expect("closed");
+            if let ControlEvent::PriceQueryReceived { privileged, .. } = ev {
+                break privileged;
+            }
+        };
+        assert!(ev2, "after promotion the next frame must be stamped privileged == true");
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn whitelist_responder_still_rejects_empty() {
+        // M1a regression: the wall-2 inversion is MODE-GATED. A responder in the
+        // DEFAULT Whitelist mode with an empty whitelist still rejects a stranger
+        // inbound (byte-identical to pre-M1) — the default closed-mesh path is
+        // untouched.
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let node_a_id = *id_a.node_id();
+        let node_b_id = *id_b.node_id();
+
+        // B: Whitelist mode (explicit), EMPTY whitelist — must reject inbound.
+        let config_b = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![],
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+
+        // A whitelists B so A's outbound wall passes and it actually dials B.
+        let config_a = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_b_id],
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
+            ..Default::default()
+        };
+
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
+
+        let _ = transport_a
+            .connect(&node_b_id, &addr_b.to_string())
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !transport_b.is_connected(&node_a_id).await,
+            "Whitelist-mode responder with empty whitelist must still reject inbound"
         );
 
         transport_a.shutdown();
@@ -2287,10 +3023,6 @@ mod tests {
         assert_eq!(config.version, 2);
         assert_eq!(config.tier, SovereigntyTier::T1);
         assert!(config.capabilities.contains(&Capability::X3dh));
-        assert!(
-            !config.capabilities.contains(&Capability::Relay),
-            "relay capability must be opt-in"
-        );
         assert!(config.whitelist.is_empty());
     }
 
@@ -2363,9 +3095,11 @@ mod tests {
         transport_b.shutdown();
     }
 
-    /// Peer sending 9 garbage frames + 1 valid frame stays connected (counter resets).
+    /// A few garbage frames well under budget, even with a valid frame mixed in,
+    /// leave the peer connected. This is the legitimate-but-noisy peer case: the
+    /// leaky bucket tolerates occasional bad frames.
     #[tokio::test]
-    async fn frame_validation_budget_resets_on_valid_frame() {
+    async fn frame_validation_budget_tolerates_occasional_garbage() {
         let id_a = make_identity(TEST_MNEMONIC_A);
         let id_b = make_identity(TEST_MNEMONIC_B);
         let node_a_id = *id_a.node_id();
@@ -2397,8 +3131,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(transport_b.is_connected(&node_a_id).await);
 
-        // Send 9 garbage frames (below budget of 10)
-        for i in 0..9 {
+        // Send 5 garbage frames (well below budget of 10)
+        for i in 0..5 {
             let garbage = format!("not valid json {i}");
             transport_a
                 .send_raw_bytes(&node_b_id, garbage.as_bytes())
@@ -2407,15 +3141,15 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // Send 1 valid frame (Ping) — should reset the counter
+        // Send a valid frame (Ping) interleaved — connection is healthy.
         let ping = Frame::Ping { nonce: 42 };
         transport_a.send_frame(&node_b_id, &ping).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // B should still be connected to A (counter was reset by valid Ping)
+        // B should still be connected to A — bucket level (~5) is under budget.
         assert!(
             transport_b.is_connected(&node_a_id).await,
-            "peer A should still be connected after 9 garbage + 1 valid frame"
+            "peer A should still be connected after 5 garbage + 1 valid frame"
         );
 
         // Ban list should be empty
@@ -2423,6 +3157,108 @@ mod tests {
         assert!(
             !bans.contains_key(&node_a_id),
             "peer A should NOT be banned"
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    /// Regression test for the reset-on-valid-frame bypass (MEDIUM finding).
+    ///
+    /// Previously, every valid frame reset `invalid_frame_count` to zero, so an
+    /// attacker could send 9 garbage frames, then 1 cheap valid frame to refill the
+    /// allowance, and repeat forever — never tripping the ban. With the decay-only
+    /// leaky bucket, valid frames do NOT drain the bad-frame level, so the same
+    /// interleaved pattern accumulates and the peer is disconnected and banned.
+    ///
+    /// The frames are sent fast enough that real-time leak (10 tokens / 60s) is
+    /// negligible over the test's lifetime, so only the no-reset property is under
+    /// test, not the leak rate.
+    #[tokio::test]
+    async fn frame_validation_budget_not_refilled_by_interleaved_valid_frames() {
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let node_a_id = *id_a.node_id();
+        let node_b_id = *id_b.node_id();
+
+        let config_a = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_b_id],
+            ..Default::default()
+        };
+
+        let config_b = TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![node_a_id],
+            ..Default::default()
+        };
+
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
+        transport_a
+            .connect(&node_b_id, &addr_b.to_string())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(transport_b.is_connected(&node_a_id).await);
+
+        // Attack pattern: alternate one garbage frame with one valid Ping. Under the
+        // old reset-on-valid logic this would keep the count pinned at 1 forever and
+        // the peer would never be banned.
+        //
+        // We send the frames as a tight back-to-back burst (no inter-frame sleeps) so
+        // the elapsed wall-clock time — and therefore the real-time leak (10 tokens /
+        // 60s) — is negligible even under a heavily loaded test scheduler. This keeps
+        // the test deterministic: it exercises only the no-reset (sticky) property,
+        // not the leak rate. 20 garbage frames is double the budget of 10, so even a
+        // generous leak margin cannot prevent the ban.
+        for i in 0..20 {
+            let garbage = format!("{{garbage interleaved frame {i}");
+            // Connection may be torn down mid-loop once the budget trips; an error
+            // here means B already disconnected A, which is the behavior we want.
+            if transport_a
+                .send_raw_bytes(&node_b_id, garbage.as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+
+            let ping = Frame::Ping { nonce: i as u64 };
+            if transport_a.send_frame(&node_b_id, &ping).await.is_err() {
+                break;
+            }
+        }
+
+        // Poll (instead of a single fixed sleep) for B to process the frames and ban
+        // A. Polling avoids flakiness from reader-task scheduling jitter.
+        let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !transport_b.is_connected(&node_a_id).await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        // B must have disconnected A despite the interleaved valid frames.
+        assert!(
+            disconnected.is_ok(),
+            "peer A should be disconnected: interleaved valid frames must NOT refill \
+             the bad-frame budget"
+        );
+
+        // And A must be banned.
+        let bans = transport_b.banned_peers.read().await;
+        assert!(
+            bans.contains_key(&node_a_id),
+            "peer A should be banned after exceeding the sticky bad-frame budget"
         );
 
         transport_a.shutdown();
@@ -2540,12 +3376,8 @@ mod tests {
         let info = info.unwrap();
         // Default TransportConfig uses T1 tier
         assert_eq!(info.tier, "T1");
-        // Default capabilities include X3dh but do not opt into relay behavior.
+        // Default capabilities include X3dh and FileTransfer
         assert!(!info.capabilities.is_empty(), "should have at least one capability");
-        assert!(
-            !info.capabilities.iter().any(|cap| cap == "Relay"),
-            "default peers should not advertise Relay"
-        );
 
         // Disconnected peer returns None
         let unknown = NodeId::from_hex(
@@ -2555,63 +3387,6 @@ mod tests {
         assert!(
             transport_a.peer_info(&unknown).await.is_none(),
             "peer_info should return None for unknown peer"
-        );
-
-        transport_a.shutdown();
-        transport_b.shutdown();
-    }
-
-    #[tokio::test]
-    async fn relay_capability_is_advertised_only_when_configured() {
-        let id_a = make_identity(TEST_MNEMONIC_A);
-        let id_b = make_identity(TEST_MNEMONIC_B);
-        let node_a_id = *id_a.node_id();
-        let node_b_id = *id_b.node_id();
-
-        let config_a = TransportConfig {
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
-            capabilities: vec![Capability::X3dh],
-            whitelist: vec![node_b_id],
-            ..Default::default()
-        };
-        let config_b = TransportConfig {
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
-            capabilities: vec![Capability::X3dh, Capability::Relay],
-            whitelist: vec![node_a_id],
-            ..Default::default()
-        };
-
-        let transport_a = NoiseTransport::new(Arc::clone(&id_a), config_a);
-        let transport_b = NoiseTransport::new(Arc::clone(&id_b), config_b);
-
-        transport_b.start_listener().await.unwrap();
-        let addr_b = transport_b.listen_addr().expect("should have actual listen addr");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        transport_a
-            .connect(&node_b_id, &addr_b.to_string())
-            .await
-            .unwrap();
-
-        let _ = transport_a.recv_control().await;
-        let _ = transport_b.recv_control().await;
-
-        let b_info = transport_a
-            .peer_info(&node_b_id)
-            .await
-            .expect("node B should be connected");
-        assert!(
-            b_info.capabilities.iter().any(|cap| cap == "Relay"),
-            "configured relay peer should advertise Relay capability"
-        );
-
-        let a_info = transport_b
-            .peer_info(&node_a_id)
-            .await
-            .expect("node A should be connected");
-        assert!(
-            !a_info.capabilities.iter().any(|cap| cap == "Relay"),
-            "non-relay peer should not advertise Relay capability"
         );
 
         transport_a.shutdown();
@@ -2632,6 +3407,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![], // Empty — B not whitelisted
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2639,6 +3416,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_a_id], // A is whitelisted by B
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let transport_a = Arc::new(NoiseTransport::new(Arc::clone(&identity_a), config_a));
@@ -2680,6 +3459,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_b_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2687,6 +3468,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_a_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let transport_a = Arc::new(NoiseTransport::new(Arc::clone(&identity_a), config_a));
@@ -2733,6 +3516,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_b_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let config_b = TransportConfig {
@@ -2741,6 +3526,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_a_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let transport_a = Arc::new(NoiseTransport::new(Arc::clone(&identity_a), config_a));
@@ -2781,6 +3568,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_b_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let config_b = TransportConfig {
@@ -2789,6 +3578,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_a_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let transport_a = Arc::new(NoiseTransport::new(Arc::clone(&identity_a), config_a));
@@ -2970,6 +3761,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_b_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -2977,6 +3770,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_a_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let transport_a = NoiseTransport::new(Arc::clone(&identity_a), config_a);
@@ -3028,6 +3823,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_b_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3035,6 +3832,8 @@ mod tests {
             capabilities: vec![Capability::X3dh],
             whitelist: vec![node_a_id],
             version: 2,
+            admission_mode: ReachabilityMode::Whitelist,
+            cookie_mode: Default::default(),
         };
 
         let transport_a = NoiseTransport::new(Arc::clone(&identity_a), config_a);

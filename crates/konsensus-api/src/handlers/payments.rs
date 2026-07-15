@@ -306,6 +306,9 @@ async fn keysend(
 /// Channel info response.
 #[derive(Serialize)]
 pub struct ChannelResponse {
+    /// Provider-local channel id — the string `close_channel` accepts. Required
+    /// so the client can close/inspect a channel it listed without re-deriving it.
+    pub channel_id: String,
     /// Remote peer's public key (hex).
     pub peer_pubkey: String,
     /// Total channel capacity in millisatoshis.
@@ -335,6 +338,7 @@ async fn list_channels(
         channels
             .into_iter()
             .map(|ch| ChannelResponse {
+                channel_id: ch.channel_id,
                 peer_pubkey: ch.peer_pubkey,
                 capacity_msat: ch.capacity_msat,
                 local_balance_msat: ch.local_balance_msat,

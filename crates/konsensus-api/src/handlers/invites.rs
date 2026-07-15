@@ -522,12 +522,35 @@ async fn accept_invite(
     //   - transport.add_to_whitelist for the runtime gate
     // This is a known-imperfect bridge; ONB4 ships add_whitelisted_peer
     // as a proper trait method with invite_ref metadata.
+    // P3-2: the PaymentGate reads its whitelist from the in-memory PeerRegistry
+    // (msg_handler builds the gate whitelist from `peer_registry.whitelist()`).
+    // accept_invite previously updated only the durable peer row + the
+    // transport whitelist, so the invited peer completed the Noise handshake
+    // but every message was then rejected `NotWhitelisted` at the gate. Persist
+    // the inviter (the durable authority reloaded into the registry at boot)
+    // AND mirror the admission into the in-memory registry.
+    //
+    // The signed invite carries the inviter's dialable address, so record it —
+    // discarding it would leave the invitee unable to ever initiate a
+    // connection back to the inviter (reachable only if the inviter dials in).
+    let inviter_addr: Option<std::net::SocketAddr> = invite.addr.parse().ok();
+    let mut inviter_peer = Peer::new(inviter_node_id);
+    inviter_peer.address = inviter_addr.map(|a| a.to_string());
     state
         .storage
-        .upsert_peer(&Peer::new(inviter_node_id))
+        .upsert_peer(&inviter_peer)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to upsert inviter peer: {e}")))?;
     state.transport.add_to_whitelist(&inviter_node_id).await;
+    {
+        let mut registry = state.peer_registry.write().await;
+        registry.add(konsensus_message::PeerEntry {
+            node_id: inviter_node_id,
+            addr: inviter_addr.unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
+            label: None,
+            auto_connect: false,
+        });
+    }
 
     let previous_onboarding = state.storage.get_onboarding_state().await.ok().flatten();
     let scoped_onboarding = OnboardingStateRecord {

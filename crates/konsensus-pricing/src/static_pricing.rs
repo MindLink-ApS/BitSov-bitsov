@@ -39,12 +39,11 @@ pub struct StaticPricingConfig {
     /// Used by the sovereign browser — page requests, responses, manifests.
     #[serde(default = "default_web_content_msat")]
     pub web_content_msat: u64,
-    /// Relay storage rate in millisatoshis per byte-day.
-    ///
-    /// Storage is a service category for relay-held ciphertext, not a direct
-    /// UKM kind. Relay settlement multiplies this rate by bytes and TTL.
-    #[serde(default = "default_relay_storage_msat_per_byte_day")]
-    pub relay_storage_msat_per_byte_day: u64,
+    /// Price for relay storage control kinds (600-699) in millisatoshis.
+    /// Relay store-and-forward is a paid service, separate from the
+    /// sender→recipient message payment (T2R3, ADR-034).
+    #[serde(default = "default_relay_storage_msat")]
+    pub relay_storage_msat: u64,
 }
 
 fn default_collab_msat() -> u64 {
@@ -63,8 +62,8 @@ fn default_web_content_msat() -> u64 {
     50
 }
 
-fn default_relay_storage_msat_per_byte_day() -> u64 {
-    1
+fn default_relay_storage_msat() -> u64 {
+    100
 }
 
 impl Default for StaticPricingConfig {
@@ -79,7 +78,7 @@ impl Default for StaticPricingConfig {
             realtime_signal_msat: 50,
             app_ext_msat: 10,
             web_content_msat: 50,
-            relay_storage_msat_per_byte_day: 1,
+            relay_storage_msat: 100,
         }
     }
 }
@@ -106,7 +105,7 @@ impl StaticPricingEngine {
             KindCategory::Collaboration => Ok(self.config.collaboration_msat),
             KindCategory::RealTimeSignaling => Ok(self.config.realtime_signal_msat),
             KindCategory::WebContent => Ok(self.config.web_content_msat),
-            KindCategory::Storage => Ok(self.config.relay_storage_msat_per_byte_day),
+            KindCategory::Storage => Ok(self.config.relay_storage_msat),
             KindCategory::Control => Ok(self.config.control_msat),
             KindCategory::AppExtension => Ok(self.config.app_ext_msat),
             KindCategory::Unknown => Err(PricingError::NotPriceable(0)),

@@ -178,7 +178,15 @@ async fn l0b_session_restore_downgrade_resistance() {
         assert!(manager2.has_session(&peer_id).await);
     }
 
-    // ─── Scenario 3: migration flag re-enables plaintext ONCE ────────────
+    // ─── Scenario 3: migration gate behavior ─────────────────────────────
+    //
+    // MED-A (2026-06-13): the plaintext-accepting path is now COMPILED OUT of
+    // default/production builds. The env var is therefore only meaningful when
+    // the binary was built with `--features legacy-session-migration`. We
+    // assert BOTH halves:
+    //
+    //   * default build  — env var is inert, plaintext blob is REJECTED;
+    //   * migration build — env var + feature together restore the blob ONCE.
     std::env::set_var("KONSENSUS_LEGACY_SESSION_MIGRATION", "1");
     {
         let identity = make_identity();
@@ -191,11 +199,78 @@ async fn l0b_session_restore_downgrade_resistance() {
         store.inject_raw(peer_id, plaintext_blob).await;
 
         let restored = manager.restore_sessions().await;
-        assert_eq!(
-            restored, 1,
-            "migration-flag path failed to restore plaintext blob"
-        );
-        assert!(manager.has_session(&peer_id).await);
+
+        #[cfg(feature = "legacy-session-migration")]
+        {
+            assert_eq!(
+                restored, 1,
+                "migration build: migration-flag path failed to restore plaintext blob"
+            );
+            assert!(manager.has_session(&peer_id).await);
+        }
+
+        #[cfg(not(feature = "legacy-session-migration"))]
+        {
+            assert_eq!(
+                restored, 0,
+                "MED-A violation: default build must reject plaintext blob even with \
+                 KONSENSUS_LEGACY_SESSION_MIGRATION=1 set — the env var must be inert when \
+                 the plaintext path is not compiled in"
+            );
+            assert!(
+                !manager.has_session(&peer_id).await,
+                "MED-A violation: plaintext session was loaded in a default build"
+            );
+        }
     }
     std::env::remove_var("KONSENSUS_LEGACY_SESSION_MIGRATION");
+}
+
+/// MED-A: a plaintext (non-AES-GCM) session blob MUST be rejected by default,
+/// even when an attacker has flipped `KONSENSUS_LEGACY_SESSION_MIGRATION=1` on
+/// the process environment. This is the explicit "rejected by default" proof
+/// the hardening task requires. It runs in EVERY build configuration; in a
+/// default build it proves the env var is inert, and in a migration build it
+/// proves that the env var alone (without re-enabling it inside this test) is
+/// not what is being relied on — the dedicated Scenario 3 above covers the
+/// migration-on path. Kept as its own test so the default-reject guarantee is
+/// named and discoverable independently of the combined L0b scenarios.
+#[cfg(not(feature = "legacy-session-migration"))]
+#[tokio::test]
+async fn med_a_plaintext_blob_rejected_by_default_despite_env_flag() {
+    // Hostile environment: attacker set the migration env var.
+    std::env::set_var("KONSENSUS_LEGACY_SESSION_MIGRATION", "1");
+
+    let identity = make_identity();
+    let store = MemorySessionStore::new();
+    let manager = SessionManager::with_store(Arc::clone(&identity), Arc::clone(&store) as _);
+
+    let peer_id = make_node_id(23);
+    let plaintext_blob = attacker_plaintext_ratchet_blob();
+    let original = plaintext_blob.clone();
+    store.inject_raw(peer_id, plaintext_blob).await;
+
+    let restored = manager.restore_sessions().await;
+
+    std::env::remove_var("KONSENSUS_LEGACY_SESSION_MIGRATION");
+
+    assert_eq!(
+        restored, 0,
+        "MED-A: a default build must NOT ingest a plaintext session blob, env var notwithstanding"
+    );
+    assert!(
+        !manager.has_session(&peer_id).await,
+        "MED-A: plaintext session must not be loaded in a default build"
+    );
+    // The on-disk blob must be left byte-for-byte untouched — never silently
+    // re-encrypted (which would launder attacker-injected ratchet state).
+    let stored = store
+        .load_session(&peer_id)
+        .await
+        .unwrap()
+        .expect("blob should still be present");
+    assert_eq!(
+        stored, original,
+        "MED-A: rejected plaintext blob must not be rewritten/laundered on disk"
+    );
 }

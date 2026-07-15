@@ -18,6 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bip39::Mnemonic;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use ldk_node::config::EsploraSyncConfig;
 use ldk_node::lightning_invoice::{
     Bolt11InvoiceDescription as LdkInvoiceDescription,
@@ -25,13 +27,15 @@ use ldk_node::lightning_invoice::{
 };
 use ldk_node::payment::PaymentKind as LdkPaymentKind;
 use ldk_node::payment::PaymentStatus as LdkPaymentStatus;
-use ldk_node::{Builder as LdkBuilder, Node as LdkNode};
+use ldk_node::{Builder as LdkBuilder, CustomTlvRecord, Node as LdkNode};
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, instrument, warn};
+use zeroize::Zeroizing;
 
 use konsensus_core::fee_rate::validate_fee_rate_sat_per_vb;
 use konsensus_core::traits::lightning::{
-    ChannelInfo, Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection,
-    PaymentStatus,
+    ChannelInfo, InboundPayment, Invoice, LightningError, LightningProvider, PaymentDetails,
+    PaymentDirection, PaymentStatus,
 };
 use crate::scb_export::write_monitor_store_scb;
 use crate::scb_rotate::{rotate_scb_backup, ScbRotationConfig};
@@ -70,6 +74,166 @@ pub struct LdkConfig {
     pub listening_address: Option<String>,
 }
 
+/// Application keysend TLV type carrying the BitSov payment→envelope *binding*
+/// (R2 / ADR-037, **Proposed**). MUST be ODD (BOLT 1: odd = "it's ok to be odd",
+/// optional/forward-compatible) and distinct from the keysend preimage record
+/// `5482373484`. The TLV carries a binding (payment_hash / envelope-id pointer),
+/// NOT the full `UkmEnvelope` — the bulk ciphertext rides the out-of-band
+/// transport, linked by `payment_hash`. Pinned here until ADR-037 ratifies it;
+/// the send side (pushing this record on keysend) is a later seam.
+const BITSOV_BINDING_TLV_TYPE: u64 = 0x4253_4F56_0001; // "BSOV" + 0x0001, odd
+
+/// Bounded fan-out for inbound keysend subscribers. Lag is observable and
+/// fail-closed downstream; the event drainer itself remains backpressured.
+const INBOUND_BROADCAST_CAPACITY: usize = 256;
+
+/// ADR-037 binding values are pointers/digests, not envelopes. Keep the copy
+/// into `InboundPayment` bounded so a peer cannot turn a paid contact into a
+/// large allocation/logging surface.
+const BITSOV_BINDING_TLV_MAX_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingTlvError {
+    Duplicate,
+    TooLarge { len: usize },
+}
+
+/// Extract the BitSov binding payload from a received payment's custom TLV
+/// records, if exactly one is present. Ignores unrelated records (e.g. the
+/// keysend preimage record). Duplicate or oversized records are explicit
+/// errors, so admission cannot accidentally treat ambiguous/large bindings as a
+/// bare keysend. Pure — unit-testable without an LDK node.
+fn extract_binding_tlv(
+    custom_records: &[CustomTlvRecord],
+) -> Result<Option<Vec<u8>>, BindingTlvError> {
+    let mut matches = custom_records
+        .iter()
+        .filter(|r| r.type_num == BITSOV_BINDING_TLV_TYPE);
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(BindingTlvError::Duplicate);
+    }
+    if first.value.len() > BITSOV_BINDING_TLV_MAX_BYTES {
+        return Err(BindingTlvError::TooLarge {
+            len: first.value.len(),
+        });
+    }
+    Ok(Some(first.value.clone()))
+}
+
+/// Construct the single BitSov binding TLV record (ADR-037) the send-half
+/// (`keysend_with_binding`, seam-3b) attaches to a keysend. Kept next to
+/// [`extract_binding_tlv`] so send and receive share one definition of the
+/// record shape: what this emits, that extracts. Pure — unit-testable without
+/// an LDK node; the seam-3b contract test asserts the round-trip.
+fn binding_tlv_record(binding: &[u8]) -> CustomTlvRecord {
+    CustomTlvRecord {
+        type_num: BITSOV_BINDING_TLV_TYPE,
+        value: binding.to_vec(),
+    }
+}
+
+/// Construct the outbound binding TLV record after applying the same cap the
+/// receive-half enforces. This is the send-side preflight used before calling
+/// LDK, so an oversized binding fails closed before any sats are spent.
+fn binding_tlv_record_for_send(binding: &[u8]) -> Result<CustomTlvRecord, LightningError> {
+    if binding.is_empty() {
+        return Err(LightningError::Backend(
+            "binding-TLV keysend requires a non-empty binding".into(),
+        ));
+    }
+
+    if binding.len() > BITSOV_BINDING_TLV_MAX_BYTES {
+        return Err(LightningError::Backend(format!(
+            "binding TLV too large: {} > {BITSOV_BINDING_TLV_MAX_BYTES} bytes (receiver would reject as BindingTooLarge)",
+            binding.len()
+        )));
+    }
+
+    Ok(binding_tlv_record(binding))
+}
+
+/// Construct an in-flight spontaneous payment fallback when LDK has returned a
+/// `PaymentId` but its payment store has not surfaced the record yet. LDK Node
+/// sets spontaneous `PaymentId` bytes to the generated payment hash bytes, so a
+/// binding path must preserve those bytes instead of returning an empty hash.
+fn in_flight_spontaneous_payment_details(
+    payment_hash: [u8; 32],
+    amount_msat: u64,
+    timestamp: u64,
+) -> PaymentDetails {
+    PaymentDetails {
+        payment_hash: hex::encode(payment_hash),
+        preimage: None,
+        amount_msat,
+        status: PaymentStatus::InFlight,
+        direction: PaymentDirection::Outgoing,
+        timestamp,
+        memo: None,
+        fee_msat: None,
+    }
+}
+
+/// `watch_inbound_keysend` may only surface payment records that are already
+/// admissible proof material for the downstream gate: settled, incoming, and
+/// carrying the preimage that proves settlement.
+fn is_admittable_inbound_payment(details: &PaymentDetails) -> bool {
+    details.status == PaymentStatus::Settled
+        && details.direction == PaymentDirection::Incoming
+        && details.amount_msat > 0
+        && details.preimage.is_some()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundPaymentRejection {
+    MissingStoreRecord,
+    MalformedStoreHash,
+    HashMismatch,
+    EventStoreAmountMismatch,
+    NotAdmittableProof,
+    DuplicateBinding,
+    BindingTooLarge { len: usize },
+}
+
+fn payment_hash_bytes_from_details(
+    details: &PaymentDetails,
+) -> Result<[u8; 32], InboundPaymentRejection> {
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(&details.payment_hash, &mut bytes)
+        .map_err(|_| InboundPaymentRejection::MalformedStoreHash)?;
+    Ok(bytes)
+}
+
+fn inbound_payment_from_received_event(
+    event_payment_hash: [u8; 32],
+    event_amount_msat: u64,
+    details: Option<&PaymentDetails>,
+    custom_records: &[CustomTlvRecord],
+) -> Result<InboundPayment, InboundPaymentRejection> {
+    let Some(details) = details else {
+        return Err(InboundPaymentRejection::MissingStoreRecord);
+    };
+    if payment_hash_bytes_from_details(details)? != event_payment_hash {
+        return Err(InboundPaymentRejection::HashMismatch);
+    }
+    if details.amount_msat != event_amount_msat {
+        return Err(InboundPaymentRejection::EventStoreAmountMismatch);
+    }
+    if !is_admittable_inbound_payment(details) {
+        return Err(InboundPaymentRejection::NotAdmittableProof);
+    }
+    let binding_tlv = extract_binding_tlv(custom_records).map_err(|e| match e {
+        BindingTlvError::Duplicate => InboundPaymentRejection::DuplicateBinding,
+        BindingTlvError::TooLarge { len } => InboundPaymentRejection::BindingTooLarge { len },
+    })?;
+    Ok(InboundPayment {
+        details: details.clone(),
+        binding_tlv,
+    })
+}
+
 /// Embedded LDK Lightning provider — the node IS its own Lightning node.
 ///
 /// This is the most sovereign option: no external Lightning daemon needed.
@@ -95,6 +259,12 @@ pub struct LdkProvider {
     /// node. Also set in `from_node` (test path) so tests don't spawn
     /// a drainer that would touch an external node they don't own.
     drainer_shutdown: Arc<AtomicBool>,
+    /// R2 seam-2: broadcast sender for SETTLED, INBOUND payments surfaced by
+    /// [`LightningProvider::watch_inbound_keysend`]. The event drainer's async
+    /// consumer emits an [`InboundPayment`] here on each `Event::PaymentReceived`
+    /// (it FEEDS the stream from the single mpsc consumer, preserving the
+    /// drainer's backpressure for the log/SCB path — the broadcast is fan-out).
+    inbound_tx: broadcast::Sender<InboundPayment>,
 }
 
 impl std::fmt::Debug for LdkProvider {
@@ -115,19 +285,31 @@ impl LdkProvider {
     /// deterministically derived from the same mnemonic as the BitSov
     /// identity, but on a separate derivation domain — recovering the
     /// mnemonic recovers both the node identity and the Lightning wallet.
-    pub async fn new(config: LdkConfig) -> Result<Self, LightningError> {
-        let mnemonic = Mnemonic::from_str(&config.mnemonic).map_err(|e| {
+    pub async fn new(mut config: LdkConfig) -> Result<Self, LightningError> {
+        // Move the plaintext seed phrase out of `config` into a `Zeroizing`
+        // wrapper so the inbound `String` copy is scrubbed from memory when
+        // this function returns (HARD-9), regardless of which branch we take.
+        // The parsed `bip39::Mnemonic` (built with the `zeroize` feature) is
+        // itself `ZeroizeOnDrop`.
+        let mnemonic_phrase = Zeroizing::new(std::mem::take(&mut config.mnemonic));
+        let mnemonic = Mnemonic::from_str(&mnemonic_phrase).map_err(|e| {
             LightningError::Backend(format!("invalid mnemonic: {e}"))
         })?;
 
-        // Derive BIP-39 seed (64 bytes) from mnemonic + passphrase
+        // Derive BIP-39 seed (64 bytes) from mnemonic + passphrase.
+        //
+        // Wrapped in `Zeroizing` so the raw seed bytes are scrubbed from
+        // memory when this function returns (HARD-9). A `[u8; 64]` is `Copy`
+        // and never runs `Drop`, so without this the seed would linger on the
+        // stack until the frame is overwritten by chance.
         let passphrase = config.passphrase.as_deref().unwrap_or("");
-        let bip39_seed = mnemonic.to_seed(passphrase);
+        let bip39_seed = Zeroizing::new(mnemonic.to_seed(passphrase));
 
         // Derive LDK-specific 64-byte entropy via blake3 KDF with domain separation.
         // This keeps LDK keys deterministically linked to the mnemonic but isolated
         // from the BitSov identity keys (which use different context strings).
-        let ldk_seed = derive_ldk_entropy(&bip39_seed);
+        // Also `Zeroizing` — it is just as sensitive as the BIP-39 seed.
+        let ldk_seed = Zeroizing::new(derive_ldk_entropy(&*bip39_seed));
 
         let network = parse_network(&config.network)?;
 
@@ -147,7 +329,7 @@ impl LdkProvider {
 
         let mut builder = LdkBuilder::new();
         builder.set_network(network);
-        builder.set_entropy_seed_bytes(ldk_seed);
+        builder.set_entropy_seed_bytes(*ldk_seed);
         builder.set_storage_dir_path(
             config
                 .storage_dir
@@ -224,16 +406,26 @@ impl LdkProvider {
             config.scb_rotation_count,
             &ldk_seed,
         ));
+        // `ldk_seed` and `bip39_seed` are no longer needed; drop them now so
+        // their `Zeroizing` wrappers scrub the raw entropy from memory before
+        // the node begins serving (HARD-9). `ScbProducer::new` has already
+        // derived and retained only the rotation key it needs.
+        drop(ldk_seed);
+        drop(bip39_seed);
 
         // L0g (2026-04-30): spawn the dedicated LDK-event drainer ONCE at
         // init. Replaces the synchronous `process_events()` calls that
         // used to fire at the top of every async trait method (which
         // stalled a tokio runtime worker thread for the duration of the
         // ChannelMonitor fsync — tens of ms under disk pressure).
+        // R2 seam-2: inbound-payment fan-out. The initial receiver is dropped;
+        // subscribers come from `watch_inbound_keysend` via `.subscribe()`.
+        let (inbound_tx, _) = broadcast::channel(INBOUND_BROADCAST_CAPACITY);
         Self::spawn_event_drainer(
             Arc::clone(&node),
             Arc::clone(&drainer_shutdown),
             Arc::clone(&scb_producer),
+            inbound_tx.clone(),
         );
         Self::spawn_scb_timer(Arc::clone(&drainer_shutdown), scb_producer);
 
@@ -242,6 +434,7 @@ impl LdkProvider {
             payment_capable: AtomicBool::new(true),
             esplora_url: chosen_esplora_url,
             drainer_shutdown,
+            inbound_tx,
         })
     }
 
@@ -254,6 +447,9 @@ impl LdkProvider {
     /// have, and (b) call `next_event()` against a node the test may
     /// have constructed without expecting the wider lifecycle.
     pub fn from_node(node: Arc<LdkNode>) -> Self {
+        // Test path does not spawn the drainer, so nothing emits here; the
+        // inbound stream simply stays empty.
+        let (inbound_tx, _) = broadcast::channel(INBOUND_BROADCAST_CAPACITY);
         Self {
             node,
             payment_capable: AtomicBool::new(true),
@@ -264,6 +460,7 @@ impl LdkProvider {
             // Pre-set to `true` so any consumer wrapping a from_node-constructed
             // provider sees the drainer as already-shutdown.
             drainer_shutdown: Arc::new(AtomicBool::new(true)),
+            inbound_tx,
         }
     }
 
@@ -292,6 +489,7 @@ impl LdkProvider {
         node: Arc<LdkNode>,
         shutdown: Arc<AtomicBool>,
         scb_producer: Arc<ScbProducer>,
+        inbound_tx: broadcast::Sender<InboundPayment>,
     ) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ldk_node::Event>(64);
 
@@ -320,11 +518,122 @@ impl LdkProvider {
             debug!("LDK event drainer task exiting");
         });
 
-        // Consumer (async) — logs events. Replaces the old per-method
-        // process_events() match block.
+        // Consumer (async) — logs events AND (R2 seam-2) feeds the inbound
+        // payment stream. Emitting from THIS single mpsc consumer preserves the
+        // drainer's `blocking_send` backpressure for the log/SCB path (no event
+        // dropped); the broadcast is pure fan-out for `watch_inbound_keysend`.
+        let consumer_node = Arc::clone(&node);
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 Self::log_event(&event);
+                if let ldk_node::Event::PaymentReceived {
+                    payment_id,
+                    payment_hash,
+                    amount_msat,
+                    custom_records,
+                } = &event
+                {
+                    let event_payment_hash = payment_hash.0;
+                    let event_payment_hash_hex = hex::encode(event_payment_hash);
+                    // PaymentReceived is the settled inbound claim. The stream
+                    // is admission-adjacent, so it never fabricates a proof from
+                    // event fields alone: it emits only when LDK's payment store
+                    // contains a Settled+Incoming record with a preimage.
+                    let details = payment_id
+                        .and_then(|pid| consumer_node.payment(&pid))
+                        .map(|p| convert_payment_details(&p));
+                    let inbound = match inbound_payment_from_received_event(
+                        event_payment_hash,
+                        *amount_msat,
+                        details.as_ref(),
+                        custom_records,
+                    ) {
+                        Ok(inbound) => inbound,
+                        Err(InboundPaymentRejection::MissingStoreRecord) => {
+                            warn!(
+                                payment_id = ?payment_id,
+                                payment_hash = %event_payment_hash_hex,
+                                amount_msat,
+                                "LDK PaymentReceived without poll-verifiable store record; skipping inbound admission stream item"
+                            );
+                            continue;
+                        }
+                        Err(InboundPaymentRejection::MalformedStoreHash) => {
+                            if let Some(details) = &details {
+                                warn!(
+                                    payment_id = ?payment_id,
+                                    event_payment_hash = %event_payment_hash_hex,
+                                    store_payment_hash = %details.payment_hash,
+                                    "LDK PaymentReceived store record hash is not canonical 32-byte hex; skipping inbound admission stream item"
+                                );
+                            }
+                            continue;
+                        }
+                        Err(InboundPaymentRejection::HashMismatch) => {
+                            if let Some(details) = &details {
+                                warn!(
+                                    payment_id = ?payment_id,
+                                    event_payment_hash = %event_payment_hash_hex,
+                                    store_payment_hash = %details.payment_hash,
+                                    "LDK PaymentReceived store record hash mismatch; skipping inbound admission stream item"
+                                );
+                            }
+                            continue;
+                        }
+                        Err(InboundPaymentRejection::EventStoreAmountMismatch) => {
+                            if let Some(details) = &details {
+                                warn!(
+                                    payment_id = ?payment_id,
+                                    payment_hash = %details.payment_hash,
+                                    event_amount_msat = amount_msat,
+                                    store_amount_msat = details.amount_msat,
+                                    "LDK PaymentReceived event/store amount mismatch; skipping inbound admission stream item"
+                                );
+                            }
+                            continue;
+                        }
+                        Err(InboundPaymentRejection::NotAdmittableProof) => {
+                            if let Some(details) = &details {
+                                warn!(
+                                    payment_id = ?payment_id,
+                                    payment_hash = %details.payment_hash,
+                                    amount_msat = details.amount_msat,
+                                    status = ?details.status,
+                                    direction = ?details.direction,
+                                    has_preimage = details.preimage.is_some(),
+                                    admission_reconcile_required = true,
+                                    "LDK PaymentReceived store record is not settled incoming proof material; skipping inbound admission stream item; durable reconciliation must recover if this was an event/store ordering race"
+                                );
+                            }
+                            continue;
+                        }
+                        Err(InboundPaymentRejection::DuplicateBinding) => {
+                            if let Some(details) = &details {
+                                warn!(
+                                    payment_id = ?payment_id,
+                                    payment_hash = %details.payment_hash,
+                                    "LDK PaymentReceived carried duplicate BitSov binding TLVs; skipping inbound admission stream item"
+                                );
+                            }
+                            continue;
+                        }
+                        Err(InboundPaymentRejection::BindingTooLarge { len }) => {
+                            if let Some(details) = &details {
+                                warn!(
+                                    payment_id = ?payment_id,
+                                    payment_hash = %details.payment_hash,
+                                    binding_len = len,
+                                    max_binding_len = BITSOV_BINDING_TLV_MAX_BYTES,
+                                    "LDK PaymentReceived BitSov binding TLV exceeds size cap; skipping inbound admission stream item"
+                                );
+                            }
+                            continue;
+                        }
+                    };
+                    // Err only means no current subscriber; record is still
+                    // observable via the get_payment_status poll path.
+                    let _ = inbound_tx.send(inbound);
+                }
                 if is_channel_state_change_event(&event) {
                     if let Err(e) = scb_producer.produce_once().await {
                         warn!(error = %e, "SCB producer failed on channel state-change event");
@@ -707,6 +1016,9 @@ impl LightningProvider for LdkProvider {
                 let scid = ch.short_channel_id.map(|id| id.to_string());
 
                 ChannelInfo {
+                    // Same formatting `open_channel` returns and `close_channel`
+                    // parses back (UserChannelId Display).
+                    channel_id: format!("{}", ch.user_channel_id),
                     peer_pubkey: ch.counterparty_node_id.to_string(),
                     capacity_msat: capacity_sats * 1000,
                     local_balance_msat: outbound_msat,
@@ -772,6 +1084,85 @@ impl LightningProvider for LdkProvider {
             memo: None,
             fee_msat: None,
         })
+    }
+
+    /// R2 seam-3b: send-half of ADR-037 over a real LDK node. Mirrors
+    /// [`keysend`](Self::keysend), but attaches the BitSov payment→envelope
+    /// *binding* as a single custom (odd) keysend TLV record
+    /// ([`BITSOV_BINDING_TLV_TYPE`]) so the recipient's seam-2
+    /// `watch_inbound_keysend` can pair the settled HTLC to the out-of-band
+    /// `UkmEnvelope`.
+    ///
+    /// Fails closed BEFORE spending if the binding exceeds
+    /// [`BITSOV_BINDING_TLV_MAX_BYTES`]: the receive-half rejects an oversized
+    /// binding as `BindingTooLarge`, so sending it would burn the sender's sats
+    /// on a payment the recipient can never bind. This method supplies exactly
+    /// one binding record, so the receiver's duplicate guard never trips on our
+    /// own send.
+    async fn keysend_with_binding(
+        &self,
+        dest_pubkey: &str,
+        amount_msat: u64,
+        binding_tlv: &[u8],
+    ) -> Result<PaymentDetails, LightningError> {
+        let custom_tlvs = vec![binding_tlv_record_for_send(binding_tlv)?];
+
+        let pubkey: bitcoin::secp256k1::PublicKey = dest_pubkey
+            .parse()
+            .map_err(|e| LightningError::Backend(format!("invalid destination pubkey: {e}")))?;
+
+        let payment_id = self
+            .node
+            .spontaneous_payment()
+            .send_with_custom_tlvs(amount_msat, pubkey, None, custom_tlvs)
+            .map_err(|e| {
+                self.payment_capable.store(false, Ordering::Relaxed);
+                warn!(error = %e, "LDK keysend_with_binding failed — marking as payment-incapable");
+                LightningError::PaymentFailed(format!("keysend_with_binding failed: {e}"))
+            })?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Check if the payment completed quickly
+        if let Some(details) = self.node.payment(&payment_id) {
+            return Ok(convert_payment_details(&details));
+        }
+
+        Ok(in_flight_spontaneous_payment_details(
+            payment_id.0,
+            amount_msat,
+            now,
+        ))
+    }
+
+    /// R2 seam-2: subscribe to settled inbound payments. The event drainer's
+    /// consumer feeds `inbound_tx` on each `Event::PaymentReceived`; this
+    /// returns a stream over a fresh subscription. A lagged subscriber skips
+    /// missed items (the authoritative no-drop guarantee for admission belongs
+    /// to the downstream receive→admit wiring, not this fan-out).
+    async fn watch_inbound_keysend(
+        &self,
+    ) -> Result<BoxStream<'static, InboundPayment>, LightningError> {
+        let rx = self.inbound_tx.subscribe();
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(item) => return Some((item, rx)),
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            skipped,
+                            "inbound_keysend stream lagged; subscriber skipped settled inbound payments"
+                        );
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        Ok(stream.boxed())
     }
 
     async fn get_node_pubkey(&self) -> Option<String> {

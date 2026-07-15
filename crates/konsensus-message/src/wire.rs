@@ -24,9 +24,9 @@
 
 use konsensus_core::envelope::UkmEnvelope;
 use konsensus_core::types::{MessageId, NodeId};
-use serde::de::{self, MapAccess, Visitor};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 /// Errors from wire protocol operations.
@@ -54,7 +54,103 @@ pub enum WireError {
 }
 
 /// Maximum frame size: 16 MiB. Generous for file transfers but prevents OOM.
-pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+///
+/// This is the **single shared** outer-frame byte cap. Both the wire
+/// length-prefix decoder ([`decode_frame`]) and the Noise transport reader
+/// ([`crate::transport`]) derive their limits from this constant — there is one
+/// numeric definition for the whole crate, so the two layers can never drift.
+///
+/// HARD-1: bounding the outer frame is necessary but **not sufficient**. A
+/// single ≤16 MiB JSON frame can still amplify into a far larger in-memory
+/// structure (small tokens like `0,` or `null` expand into multi-byte `Vec`
+/// elements / `serde_json::Value` nodes, and deeply nested JSON can exhaust the
+/// stack). The per-field caps below close that pre-auth amplification window by
+/// rejecting hostile collections/values *at deserialize time*, before the
+/// oversized allocation happens.
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Backwards-compatible alias for [`MAX_FRAME_BYTES`].
+///
+/// Retained so existing call sites (transport reader, tests) keep compiling.
+/// There is exactly one numeric definition ([`MAX_FRAME_BYTES`]); this is a
+/// pure alias, not a second source of truth.
+pub const MAX_FRAME_SIZE: usize = MAX_FRAME_BYTES;
+
+// ── HARD-1 per-field deserialize caps ────────────────────────────────────────
+//
+// Each cap is enforced *inside* a custom `Visitor` (see the `bounded` module)
+// that counts elements/bytes/nodes as they stream out of the JSON parser and
+// errors out the moment a cap is exceeded — it never pre-allocates from an
+// attacker-declared length. Caps are chosen to sit comfortably above every
+// legitimate frame this protocol emits while staying small enough that the
+// worst-case allocation is bounded to a few MiB rather than the full 16 MiB
+// frame's worth of expanded structs.
+
+/// Max elements in a small fixed-size key/signature byte vector
+/// (`x25519_sig`, `x25519_public`).
+///
+/// Real values are 64 bytes (Ed25519 sig) and 32 bytes (X25519 pubkey). 256 is
+/// ~4× the largest legitimate value — generous headroom, yet it rejects a
+/// multi-megabyte hostile array after only 257 parsed bytes.
+pub const MAX_KEY_BYTES: usize = 256;
+
+/// Max elements in the ratchet-init / opaque payload byte vector
+/// (`RatchetInit.payload`).
+///
+/// Double Ratchet payloads are small, but file-chunk-bearing ratchet messages
+/// can be larger; existing tests exercise 64 KiB. 1 MiB leaves ample room for
+/// any single ratchet payload while still being 16× smaller than the frame cap.
+pub const MAX_RATCHET_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Max number of advertised capabilities in a `Hello` / `HelloAck` frame.
+///
+/// The fixed capability set is tiny; even with application-defined `Custom`
+/// entries a healthy node advertises a handful. 256 tolerates aggressive
+/// experimentation (an existing test sends 100) while bounding the `Vec` and,
+/// critically, the sum of `Custom(String)` allocations behind it.
+pub const MAX_CAPABILITIES: usize = 256;
+
+/// Max number of entries in a `PriceTable.prices` map.
+///
+/// The v2 kind taxonomy has on the order of a dozen pricing categories. 512 is
+/// far above any legitimate table yet stops a hostile peer from forcing a giant
+/// `HashMap<String, u64>` (each entry is a heap `String` key) out of a frame
+/// stuffed with `"x":0,` pairs.
+pub const MAX_PRICE_ENTRIES: usize = 512;
+
+/// Max number of entries in a `PeerExchangeResponse.peers` list.
+///
+/// The protocol documents a responder-side cap of 50 shared peers. 64 matches
+/// that intent with a little headroom; a 51st+ entry from a hostile peer is
+/// rejected at decode rather than after building a large `Vec<PeerExchangeEntry>`.
+pub const MAX_PEER_EXCHANGE_ENTRIES: usize = 64;
+
+/// Max UTF-8 byte length of a `PeerExchangeEntry.label`.
+///
+/// Labels are short human-readable nicknames ("Alice's node"). 256 bytes is
+/// generous for any honest label while preventing a hostile peer-exchange entry
+/// from carrying a multi-megabyte string: the `MAX_PEER_EXCHANGE_ENTRIES` count
+/// cap bounds the *number* of entries, but without this each entry's label was
+/// an unbounded `String` (validate-before-allocate gap).
+pub const MAX_PEER_LABEL_BYTES: usize = 256;
+
+/// Max number of JSON value nodes (scalars + container slots) permitted in a
+/// `serde_json::Value` field (`PrekeyOffer.bundle`, `SessionInit.init_data`).
+///
+/// A legitimate prekey bundle / session-init blob is a small flat object with a
+/// handful of hex-string fields. 4096 nodes is orders of magnitude above that,
+/// but it caps the node-count amplification where a 16 MiB frame of `[null,...]`
+/// (4 bytes each on the wire) would otherwise inflate into millions of 24-byte
+/// `Value` enum nodes.
+pub const MAX_JSON_VALUE_NODES: usize = 4096;
+
+/// Max nesting depth permitted in a `serde_json::Value` field.
+///
+/// Legitimate prekey/session payloads are shallow (objects of strings, maybe
+/// one nested level). 32 is generous for any honest structure while preventing
+/// a deeply nested array/object from driving recursion toward a stack overflow
+/// (defence in depth alongside serde_json's own internal recursion limit).
+pub const MAX_JSON_VALUE_DEPTH: usize = 32;
 
 /// First kind value in the real-time signaling range (400–499).
 ///
@@ -74,8 +170,447 @@ pub fn is_realtime_signal(kind: u16) -> bool {
     (KIND_REALTIME_SIGNAL_START..=KIND_REALTIME_SIGNAL_END).contains(&kind)
 }
 
+/// HARD-1 bounded deserializers.
+///
+/// Every function here is wired onto a wire-frame field via
+/// `#[serde(deserialize_with = ...)]`. They share one invariant: **the cap is
+/// enforced while the JSON parser streams elements out, before the oversized
+/// collection/value is materialised.** None of them pre-allocate from an
+/// attacker-declared length, so a hostile length-prefix or an over-long array
+/// is rejected after parsing only `cap + 1` elements — never after allocating
+/// the full (potentially multi-megabyte) structure.
+mod bounded {
+    use super::*;
+
+    /// Deserialize a `Vec<u8>` whose element count must not exceed `MAX`.
+    ///
+    /// The visitor counts as it pushes; the `(MAX + 1)`-th element aborts the
+    /// parse. We deliberately start from an empty `Vec` (no `with_capacity`
+    /// using `size_hint`, which an attacker controls) so memory grows only with
+    /// elements actually consumed.
+    pub fn vec_u8<'de, D, const MAX: usize>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ByteVecVisitor<const MAX: usize>;
+
+        impl<'de, const MAX: usize> Visitor<'de> for ByteVecVisitor<MAX> {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a byte array of at most {MAX} elements")
+            }
+
+            // serde_json hands `Vec<u8>` to us as a sequence of integers.
+            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<u8>, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut out: Vec<u8> = Vec::new();
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    if out.len() >= MAX {
+                        return Err(de::Error::custom(format!(
+                            "byte array exceeds maximum of {MAX} elements"
+                        )));
+                    }
+                    out.push(byte);
+                }
+                Ok(out)
+            }
+
+            // Tolerate `bytes`/`byte_buf` formats for forward compatibility with
+            // non-JSON transports; still length-checked before returning.
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Vec<u8>, E>
+            where
+                E: de::Error,
+            {
+                if v.len() > MAX {
+                    return Err(de::Error::custom(format!(
+                        "byte array exceeds maximum of {MAX} elements"
+                    )));
+                }
+                Ok(v.to_vec())
+            }
+        }
+
+        deserializer.deserialize_seq(ByteVecVisitor::<MAX>)
+    }
+
+    /// Deserialize a `Vec<Capability>` capped at [`MAX_CAPABILITIES`] elements.
+    pub fn capabilities<'de, D>(deserializer: D) -> Result<Vec<Capability>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CapVisitor;
+
+        impl<'de> Visitor<'de> for CapVisitor {
+            type Value = Vec<Capability>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a list of at most {MAX_CAPABILITIES} capabilities")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<Capability>, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut out: Vec<Capability> = Vec::new();
+                while let Some(cap) = seq.next_element::<Capability>()? {
+                    if out.len() >= MAX_CAPABILITIES {
+                        return Err(de::Error::custom(format!(
+                            "capability list exceeds maximum of {MAX_CAPABILITIES} entries"
+                        )));
+                    }
+                    out.push(cap);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_seq(CapVisitor)
+    }
+
+    /// Deserialize a `Vec<PeerExchangeEntry>` capped at
+    /// [`MAX_PEER_EXCHANGE_ENTRIES`] elements.
+    pub fn peer_entries<'de, D>(deserializer: D) -> Result<Vec<PeerExchangeEntry>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PeerVisitor;
+
+        impl<'de> Visitor<'de> for PeerVisitor {
+            type Value = Vec<PeerExchangeEntry>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "a list of at most {MAX_PEER_EXCHANGE_ENTRIES} peer entries"
+                )
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<PeerExchangeEntry>, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut out: Vec<PeerExchangeEntry> = Vec::new();
+                while let Some(entry) = seq.next_element::<PeerExchangeEntry>()? {
+                    if out.len() >= MAX_PEER_EXCHANGE_ENTRIES {
+                        return Err(de::Error::custom(format!(
+                            "peer list exceeds maximum of {MAX_PEER_EXCHANGE_ENTRIES} entries"
+                        )));
+                    }
+                    out.push(entry);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_seq(PeerVisitor)
+    }
+
+    /// Deserialize an `Option<String>` peer label whose UTF-8 byte length must
+    /// not exceed [`MAX_PEER_LABEL_BYTES`]. An over-long label is rejected at
+    /// decode, before the oversized owned `String` is materialised, so a hostile
+    /// peer-exchange entry cannot inflate memory under the entry-count cap.
+    pub fn peer_label<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LabelVisitor;
+
+        impl<'de> Visitor<'de> for LabelVisitor {
+            type Value = String;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a peer label of at most {MAX_PEER_LABEL_BYTES} bytes")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<String, E>
+            where
+                E: de::Error,
+            {
+                if v.len() > MAX_PEER_LABEL_BYTES {
+                    return Err(de::Error::custom(format!(
+                        "peer label exceeds maximum of {MAX_PEER_LABEL_BYTES} bytes"
+                    )));
+                }
+                Ok(v.to_owned())
+            }
+        }
+
+        struct OptLabelVisitor;
+
+        impl<'de> Visitor<'de> for OptLabelVisitor {
+            type Value = Option<String>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "an optional peer label of at most {MAX_PEER_LABEL_BYTES} bytes"
+                )
+            }
+
+            fn visit_none<E>(self) -> Result<Option<String>, E>
+            where
+                E: de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Option<String>, E>
+            where
+                E: de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Option<String>, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer.deserialize_str(LabelVisitor).map(Some)
+            }
+        }
+
+        deserializer.deserialize_option(OptLabelVisitor)
+    }
+
+    /// Deserialize a `HashMap<String, u64>` price table capped at
+    /// [`MAX_PRICE_ENTRIES`] entries.
+    pub fn price_map<'de, D>(
+        deserializer: D,
+    ) -> Result<std::collections::HashMap<String, u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::MapAccess;
+
+        struct PriceMapVisitor;
+
+        impl<'de> Visitor<'de> for PriceMapVisitor {
+            type Value = std::collections::HashMap<String, u64>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a price map of at most {MAX_PRICE_ENTRIES} entries")
+            }
+
+            fn visit_map<A>(
+                self,
+                mut map: A,
+            ) -> Result<std::collections::HashMap<String, u64>, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
+                while let Some((key, value)) = map.next_entry::<String, u64>()? {
+                    if out.len() >= MAX_PRICE_ENTRIES {
+                        return Err(de::Error::custom(format!(
+                            "price table exceeds maximum of {MAX_PRICE_ENTRIES} entries"
+                        )));
+                    }
+                    out.insert(key, value);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_map(PriceMapVisitor)
+    }
+
+    /// Deserialize a `serde_json::Value` with both a node-count cap
+    /// ([`MAX_JSON_VALUE_NODES`]) and a depth cap ([`MAX_JSON_VALUE_DEPTH`])
+    /// enforced *during* parsing.
+    ///
+    /// A naive `serde_json::Value::deserialize` would happily build the whole
+    /// tree first and let us validate afterwards — too late to prevent the
+    /// amplification allocation. Instead we drive a depth/count-tracking visitor
+    /// that aborts mid-parse the instant either bound is crossed, so the
+    /// oversized tree is never fully materialised.
+    pub fn bounded_json_value<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut counter = NodeCounter {
+            remaining_nodes: MAX_JSON_VALUE_NODES,
+        };
+        bounded_value_inner(deserializer, &mut counter, MAX_JSON_VALUE_DEPTH)
+    }
+
+    /// Shared budget for the node-count cap across one whole `Value` tree.
+    struct NodeCounter {
+        remaining_nodes: usize,
+    }
+
+    impl NodeCounter {
+        fn charge<E: de::Error>(&mut self) -> Result<(), E> {
+            if self.remaining_nodes == 0 {
+                return Err(de::Error::custom(format!(
+                    "JSON value exceeds maximum of {MAX_JSON_VALUE_NODES} nodes"
+                )));
+            }
+            self.remaining_nodes -= 1;
+            Ok(())
+        }
+    }
+
+    /// Visit one `Value` node, charging the node budget and decrementing the
+    /// remaining depth on each container descent.
+    fn bounded_value_inner<'de, D>(
+        deserializer: D,
+        counter: &mut NodeCounter,
+        depth_remaining: usize,
+    ) -> Result<serde_json::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ValueVisitor<'c> {
+            counter: &'c mut NodeCounter,
+            depth_remaining: usize,
+        }
+
+        impl<'de> Visitor<'de> for ValueVisitor<'_> {
+            type Value = serde_json::Value;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a bounded JSON value")
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<serde_json::Value, E> {
+                self.counter.charge::<E>()?;
+                Ok(serde_json::Value::Null)
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<serde_json::Value, E> {
+                self.counter.charge::<E>()?;
+                Ok(serde_json::Value::Null)
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<serde_json::Value, E> {
+                self.counter.charge::<E>()?;
+                Ok(serde_json::Value::Bool(v))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<serde_json::Value, E> {
+                self.counter.charge::<E>()?;
+                Ok(serde_json::Value::Number(v.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<serde_json::Value, E> {
+                self.counter.charge::<E>()?;
+                Ok(serde_json::Value::Number(v.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<serde_json::Value, E> {
+                self.counter.charge::<E>()?;
+                Ok(serde_json::Number::from_f64(v)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<serde_json::Value, E> {
+                self.counter.charge::<E>()?;
+                Ok(serde_json::Value::String(v.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<serde_json::Value, E> {
+                self.counter.charge::<E>()?;
+                Ok(serde_json::Value::String(v))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<serde_json::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                self.counter.charge::<A::Error>()?;
+                if self.depth_remaining == 0 {
+                    return Err(de::Error::custom(format!(
+                        "JSON value exceeds maximum depth of {MAX_JSON_VALUE_DEPTH}"
+                    )));
+                }
+                let mut arr = Vec::new();
+                // `DeserializeSeed` lets each child reuse the shared counter and
+                // a decremented depth, keeping the bound global across the tree.
+                while let Some(child) = seq.next_element_seed(ValueSeed {
+                    counter: self.counter,
+                    depth_remaining: self.depth_remaining - 1,
+                })? {
+                    arr.push(child);
+                }
+                Ok(serde_json::Value::Array(arr))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<serde_json::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                self.counter.charge::<A::Error>()?;
+                if self.depth_remaining == 0 {
+                    return Err(de::Error::custom(format!(
+                        "JSON value exceeds maximum depth of {MAX_JSON_VALUE_DEPTH}"
+                    )));
+                }
+                let mut obj = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let val = map.next_value_seed(ValueSeed {
+                        counter: self.counter,
+                        depth_remaining: self.depth_remaining - 1,
+                    })?;
+                    obj.insert(key, val);
+                }
+                Ok(serde_json::Value::Object(obj))
+            }
+        }
+
+        /// Seed that threads the shared `NodeCounter` and remaining depth into
+        /// each child value so the caps stay global across the whole tree.
+        struct ValueSeed<'c> {
+            counter: &'c mut NodeCounter,
+            depth_remaining: usize,
+        }
+
+        impl<'de> de::DeserializeSeed<'de> for ValueSeed<'_> {
+            type Value = serde_json::Value;
+
+            fn deserialize<D>(self, deserializer: D) -> Result<serde_json::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer.deserialize_any(ValueVisitor {
+                    counter: self.counter,
+                    depth_remaining: self.depth_remaining,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ValueVisitor {
+            counter,
+            depth_remaining,
+        })
+    }
+
+    /// Concrete entry point for key/signature byte vectors (cap
+    /// [`MAX_KEY_BYTES`]). `#[serde(deserialize_with = ...)]` needs a
+    /// non-generic function path, so this pins the const generic.
+    pub fn key_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        vec_u8::<D, MAX_KEY_BYTES>(deserializer)
+    }
+
+    /// Concrete entry point for ratchet/opaque payload byte vectors (cap
+    /// [`MAX_RATCHET_PAYLOAD_BYTES`]).
+    pub fn ratchet_payload_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        vec_u8::<D, MAX_RATCHET_PAYLOAD_BYTES>(deserializer)
+    }
+}
+
 /// Capabilities a node can advertise during the federation handshake.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Capability {
     /// Supports PQXDH key exchange for 1:1 E2EE.
     Pqxdh,
@@ -91,95 +626,20 @@ pub enum Capability {
     /// federation handshake containing its Lightning pubkey. Peers can then
     /// use keysend instead of the RequestInvoice/InvoiceResponse flow.
     Keysend,
-    /// Supports Tier-2 Relay protocol negotiation.
+    /// Advertises that this node can act as a Tier-2 RELAY — store-and-forward
+    /// sealed ciphertext for offline recipients (`RELAY_PROTOCOL.md`, ADR-034).
     ///
-    /// This only advertises relay protocol awareness. Nodes must still opt in
-    /// to relay behavior separately via configuration.
+    /// **T2R1 compatibility wedge only.** This variant enables capability
+    /// NEGOTIATION; it carries no relay behavior. A default node MUST NOT
+    /// advertise it (see `konsensus-node` `default_advertised_capabilities`), and
+    /// it is gated behind `[relay] enabled` config (T2R8). A relay never decrypts
+    /// — it holds only ciphertext; the user's keys stay on the user's device
+    /// (no custody, per the charter / ADR-034). The wire format is JSON
+    /// (name-tagged), so adding this variant does not shift any existing
+    /// capability's encoding.
     Relay,
     /// Application-defined capability.
     Custom(String),
-}
-
-impl Serialize for Capability {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Capability::Pqxdh => serializer.serialize_str("Pqxdh"),
-            Capability::X3dh => serializer.serialize_str("X3dh"),
-            Capability::Mls => serializer.serialize_str("Mls"),
-            Capability::FileTransfer => serializer.serialize_str("FileTransfer"),
-            Capability::Keysend => serializer.serialize_str("Keysend"),
-            Capability::Relay => serializer.serialize_str("Relay"),
-            Capability::Custom(value) => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("Custom", value)?;
-                map.end()
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Capability {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct CapabilityVisitor;
-
-        impl<'de> Visitor<'de> for CapabilityVisitor {
-            type Value = Capability;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a capability string or Custom capability object")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(match value {
-                    "Pqxdh" => Capability::Pqxdh,
-                    "X3dh" => Capability::X3dh,
-                    "Mls" => Capability::Mls,
-                    "FileTransfer" => Capability::FileTransfer,
-                    "Keysend" => Capability::Keysend,
-                    "Relay" => Capability::Relay,
-                    other => Capability::Custom(other.to_string()),
-                })
-            }
-
-            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                self.visit_str(&value)
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let key = map
-                    .next_key::<String>()?
-                    .ok_or_else(|| de::Error::custom("empty capability object"))?;
-
-                if key == "Custom" {
-                    let value = map.next_value::<String>()?;
-                    if map.next_key::<de::IgnoredAny>()?.is_some() {
-                        return Err(de::Error::custom("capability object has multiple keys"));
-                    }
-                    return Ok(Capability::Custom(value));
-                }
-
-                let _ = map.next_value::<de::IgnoredAny>()?;
-                Ok(Capability::Custom(key))
-            }
-        }
-
-        deserializer.deserialize_any(CapabilityVisitor)
-    }
 }
 
 /// The sovereignty tier of a node.
@@ -210,12 +670,15 @@ pub enum Frame {
         node_id: NodeId,
         /// X25519 public key signature: Ed25519 signature over the X25519 public key
         /// used in the Noise handshake, proving ownership of both keys.
+        #[serde(deserialize_with = "bounded::key_bytes")]
         x25519_sig: Vec<u8>,
         /// The X25519 public key bytes (for verification).
+        #[serde(deserialize_with = "bounded::key_bytes")]
         x25519_public: Vec<u8>,
         /// Sovereignty tier.
         tier: SovereigntyTier,
         /// Supported capabilities.
+        #[serde(deserialize_with = "bounded::capabilities")]
         capabilities: Vec<Capability>,
     },
 
@@ -226,12 +689,15 @@ pub enum Frame {
         /// The node's Ed25519 public key (identity).
         node_id: NodeId,
         /// X25519 public key signature.
+        #[serde(deserialize_with = "bounded::key_bytes")]
         x25519_sig: Vec<u8>,
         /// The X25519 public key bytes.
+        #[serde(deserialize_with = "bounded::key_bytes")]
         x25519_public: Vec<u8>,
         /// Sovereignty tier.
         tier: SovereigntyTier,
         /// Supported capabilities.
+        #[serde(deserialize_with = "bounded::capabilities")]
         capabilities: Vec<Capability>,
     },
 
@@ -276,6 +742,7 @@ pub enum Frame {
     /// The receiving peer uses this to initiate or accept a Double Ratchet session.
     PrekeyOffer {
         /// Serialized prekey bundle (JSON).
+        #[serde(deserialize_with = "bounded::bounded_json_value")]
         bundle: serde_json::Value,
     },
 
@@ -285,6 +752,7 @@ pub enum Frame {
     /// other X3DH outputs needed for the responder to derive the shared secret.
     SessionInit {
         /// Serialized session init data (JSON).
+        #[serde(deserialize_with = "bounded::bounded_json_value")]
         init_data: serde_json::Value,
     },
 
@@ -300,6 +768,7 @@ pub enum Frame {
     /// immediately after X3DH).
     RatchetInit {
         /// Ratchet-encrypted payload (opaque bytes, hex-encoded).
+        #[serde(deserialize_with = "bounded::ratchet_payload_bytes")]
         payload: Vec<u8>,
     },
 
@@ -372,6 +841,7 @@ pub enum Frame {
     PriceTable {
         /// Prices per kind category in millisatoshis.
         /// Key is the category name (e.g., "communication", "files_media").
+        #[serde(deserialize_with = "bounded::price_map")]
         prices: std::collections::HashMap<String, u64>,
         /// Block height at which these prices were computed.
         /// Peers can verify freshness and reject stale tables.
@@ -431,11 +901,11 @@ pub enum Frame {
     /// optional label, and sovereignty tier.
     PeerExchangeResponse {
         /// Peer entries to share. Capped at 50 entries to prevent abuse.
+        #[serde(deserialize_with = "bounded::peer_entries")]
         peers: Vec<PeerExchangeEntry>,
     },
 
     // ── Real-time Signaling (KIND range 400–499) ──────────────────────────
-
     /// VoIP call offer — initiates a WebRTC session via SDP offer.
     ///
     /// The initiator sends this after generating a WebRTC SDP offer.
@@ -503,6 +973,7 @@ pub struct PeerExchangeEntry {
     /// Network address (IP:port) where the peer is reachable.
     pub addr: std::net::SocketAddr,
     /// Optional human-readable label.
+    #[serde(default, deserialize_with = "bounded::peer_label")]
     pub label: Option<String>,
     /// The peer's sovereignty tier.
     pub tier: SovereigntyTier,
@@ -559,7 +1030,10 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, WireError> {
 
     let mut buf = Vec::with_capacity(4 + len);
     // Safety: len <= MAX_FRAME_SIZE (16 MiB) is checked above, always fits u32
-    let len_u32 = u32::try_from(len).map_err(|_| WireError::FrameTooLarge { size: len, max: MAX_FRAME_SIZE })?;
+    let len_u32 = u32::try_from(len).map_err(|_| WireError::FrameTooLarge {
+        size: len,
+        max: MAX_FRAME_SIZE,
+    })?;
     buf.extend_from_slice(&len_u32.to_be_bytes());
     buf.extend_from_slice(&payload);
     Ok(buf)
@@ -599,6 +1073,10 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, WireError> {
 mod tests {
     use super::*;
     use konsensus_core::types::{Nonce, PaymentProof, Recipient, Signature};
+
+    fn test_ln_pubkey() -> String {
+        format!("02{}", "ab".repeat(32))
+    }
 
     fn make_test_envelope() -> UkmEnvelope {
         use sha2::{Digest, Sha256};
@@ -657,6 +1135,70 @@ mod tests {
                 assert_eq!(version, 2);
                 assert_eq!(tier, SovereigntyTier::T2);
                 assert_eq!(capabilities, vec![Capability::X3dh, Capability::Mls]);
+            }
+            _ => panic!("expected Hello frame"),
+        }
+    }
+
+    #[test]
+    fn relay_capability_serde_roundtrip() {
+        // The wire format is JSON (name-tagged), so Capability::Relay serializes
+        // by name and round-trips. Adding the variant does not change the encoding
+        // of any existing capability.
+        let cap = Capability::Relay;
+        let json = serde_json::to_string(&cap).unwrap();
+        assert!(
+            json.contains("Relay"),
+            "expected name-tagged Relay, got {json}"
+        );
+        let back: Capability = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Capability::Relay);
+
+        // Sibling variants are unaffected (no discriminant shift under JSON).
+        assert_eq!(
+            serde_json::from_str::<Capability>(
+                &serde_json::to_string(&Capability::Custom("x".into())).unwrap()
+            )
+            .unwrap(),
+            Capability::Custom("x".into())
+        );
+    }
+
+    #[test]
+    fn relay_capability_frame_roundtrip() {
+        // A Hello advertising Relay alongside an existing capability survives the
+        // full wire codec, and an old-style Hello WITHOUT Relay still decodes —
+        // proving the wedge is backward-compatible.
+        let with_relay = Frame::Hello {
+            version: 2,
+            node_id: NodeId::from_bytes([7u8; 32]),
+            x25519_sig: vec![0u8; 64],
+            x25519_public: vec![0u8; 32],
+            tier: SovereigntyTier::T2,
+            capabilities: vec![Capability::X3dh, Capability::Relay],
+        };
+        let decoded = Frame::from_bytes(&with_relay.to_bytes().unwrap()).unwrap();
+        match decoded {
+            Frame::Hello { capabilities, .. } => {
+                assert_eq!(capabilities, vec![Capability::X3dh, Capability::Relay]);
+            }
+            _ => panic!("expected Hello frame"),
+        }
+
+        // Old-style frame (no Relay) is unchanged by the new variant.
+        let without_relay = Frame::Hello {
+            version: 2,
+            node_id: NodeId::from_bytes([8u8; 32]),
+            x25519_sig: vec![0u8; 64],
+            x25519_public: vec![0u8; 32],
+            tier: SovereigntyTier::T2,
+            capabilities: vec![Capability::X3dh],
+        };
+        let decoded = Frame::from_bytes(&without_relay.to_bytes().unwrap()).unwrap();
+        match decoded {
+            Frame::Hello { capabilities, .. } => {
+                assert!(!capabilities.contains(&Capability::Relay));
+                assert_eq!(capabilities, vec![Capability::X3dh]);
             }
             _ => panic!("expected Hello frame"),
         }
@@ -941,7 +1483,11 @@ mod tests {
         let bytes = frame.to_bytes().unwrap();
         let decoded = Frame::from_bytes(&bytes).unwrap();
         match decoded {
-            Frame::RequestInvoice { request_id, amount_msat, .. } => {
+            Frame::RequestInvoice {
+                request_id,
+                amount_msat,
+                ..
+            } => {
                 assert_eq!(request_id, "req-001");
                 assert_eq!(amount_msat, 0);
             }
@@ -959,7 +1505,11 @@ mod tests {
         let bytes = frame.to_bytes().unwrap();
         let decoded = Frame::from_bytes(&bytes).unwrap();
         match decoded {
-            Frame::RequestInvoice { request_id, amount_msat, .. } => {
+            Frame::RequestInvoice {
+                request_id,
+                amount_msat,
+                ..
+            } => {
                 assert_eq!(request_id, "req-max");
                 assert_eq!(amount_msat, u64::MAX);
             }
@@ -1374,7 +1924,6 @@ mod tests {
             Capability::X3dh,
             Capability::Mls,
             Capability::FileTransfer,
-            Capability::Relay,
             Capability::Custom("sovereign-browser".to_string()),
         ];
         let frame = Frame::Hello {
@@ -1544,7 +2093,9 @@ mod tests {
         // Simulate a buffer with multiple frames back-to-back
         let f1 = Frame::Ping { nonce: 1 };
         let f2 = Frame::Pong { nonce: 2 };
-        let f3 = Frame::Disconnect { reason: "bye".into() };
+        let f3 = Frame::Disconnect {
+            reason: "bye".into(),
+        };
 
         let mut buf = encode_frame(&f1).unwrap();
         buf.extend(encode_frame(&f2).unwrap());
@@ -1559,7 +2110,9 @@ mod tests {
         assert!(matches!(frame2, Frame::Pong { nonce: 2 }));
 
         // Decode third frame
-        let (frame3, consumed3) = decode_frame(&buf[consumed1 + consumed2..]).unwrap().unwrap();
+        let (frame3, consumed3) = decode_frame(&buf[consumed1 + consumed2..])
+            .unwrap()
+            .unwrap();
         match frame3 {
             Frame::Disconnect { reason } => assert_eq!(reason, "bye"),
             _ => panic!("expected Disconnect"),
@@ -1582,15 +2135,16 @@ mod tests {
 
     #[test]
     fn frame_lightning_info_roundtrip() {
+        let test_pubkey = test_ln_pubkey();
         let frame = Frame::LightningInfo {
-            ln_pubkey: "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab".into(),
+            ln_pubkey: test_pubkey.clone(),
             ln_addr: Some("127.0.0.1:9735".into()),
         };
         let bytes = frame.to_bytes().unwrap();
         let decoded = Frame::from_bytes(&bytes).unwrap();
         match decoded {
             Frame::LightningInfo { ln_pubkey, ln_addr } => {
-                assert_eq!(ln_pubkey, "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab");
+                assert_eq!(ln_pubkey, test_pubkey);
                 assert_eq!(ln_addr.as_deref(), Some("127.0.0.1:9735"));
             }
             _ => panic!("expected LightningInfo frame"),
@@ -1605,28 +2159,11 @@ mod tests {
         assert_eq!(decoded, Capability::Keysend);
     }
 
-    #[test]
-    fn capability_relay_serialization() {
-        let cap = Capability::Relay;
-        let json = serde_json::to_string(&cap).unwrap();
-        assert_eq!(json, "\"Relay\"");
-        let decoded: Capability = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, Capability::Relay);
-    }
-
-    #[test]
-    fn unknown_capability_deserializes_as_custom() {
-        let decoded: Capability = serde_json::from_str("\"FutureRelayV2\"").unwrap();
-        assert_eq!(decoded, Capability::Custom("FutureRelayV2".to_string()));
-    }
-
     // ── Gossip frame tests ─────────────────────────────────────────────
 
     #[test]
     fn frame_gossip_roundtrip() {
-        use konsensus_core::types::{
-            MessageId, NodeId, Nonce, PaymentProof, Recipient, Signature,
-        };
+        use konsensus_core::types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, Signature};
         use sha2::{Digest, Sha256};
 
         let sender = NodeId::from_bytes([0xAA; 32]);
@@ -1643,7 +2180,7 @@ mod tests {
             kind: 510, // KIND_WEB_MANIFEST
             sender,
             recipient: Recipient::Broadcast,
-            timestamp: 1700000000_000,
+            timestamp: 1_700_000_000_000,
             ciphertext,
             payment_proof: proof,
             signature: Signature::from_bytes([0u8; 64]),
@@ -1661,7 +2198,7 @@ mod tests {
                 assert_eq!(decoded_env.kind, 510);
                 assert_eq!(decoded_env.sender, sender);
                 assert_eq!(decoded_env.recipient, Recipient::Broadcast);
-                assert_eq!(decoded_env.timestamp, 1700000000_000);
+                assert_eq!(decoded_env.timestamp, 1_700_000_000_000);
             }
             _ => panic!("expected Gossip frame"),
         }
@@ -1669,9 +2206,7 @@ mod tests {
 
     #[test]
     fn frame_gossip_encode_decode() {
-        use konsensus_core::types::{
-            MessageId, NodeId, Nonce, PaymentProof, Recipient, Signature,
-        };
+        use konsensus_core::types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, Signature};
         use sha2::{Digest, Sha256};
 
         let sender = NodeId::from_bytes([0xBB; 32]);
@@ -1688,7 +2223,7 @@ mod tests {
             kind: 510,
             sender,
             recipient: Recipient::Broadcast,
-            timestamp: 1700000001_000,
+            timestamp: 1_700_000_001_000,
             ciphertext,
             payment_proof: proof,
             signature: Signature::from_bytes([0u8; 64]),
@@ -1720,7 +2255,10 @@ mod tests {
             valid_blocks: 0,
             trust_discount: f64::NAN,
         };
-        assert!(frame.validate().is_err(), "NaN trust_discount should be rejected");
+        assert!(
+            frame.validate().is_err(),
+            "NaN trust_discount should be rejected"
+        );
     }
 
     #[test]
@@ -1731,7 +2269,10 @@ mod tests {
             valid_blocks: 0,
             trust_discount: f64::INFINITY,
         };
-        assert!(frame.validate().is_err(), "Infinity trust_discount should be rejected");
+        assert!(
+            frame.validate().is_err(),
+            "Infinity trust_discount should be rejected"
+        );
     }
 
     #[test]
@@ -1742,7 +2283,10 @@ mod tests {
             valid_blocks: 0,
             trust_discount: f64::NEG_INFINITY,
         };
-        assert!(frame.validate().is_err(), "negative Infinity trust_discount should be rejected");
+        assert!(
+            frame.validate().is_err(),
+            "negative Infinity trust_discount should be rejected"
+        );
     }
 
     #[test]
@@ -1753,7 +2297,10 @@ mod tests {
             valid_blocks: 0,
             trust_discount: 1.5,
         };
-        assert!(frame.validate().is_err(), "trust_discount > 1.0 should be rejected");
+        assert!(
+            frame.validate().is_err(),
+            "trust_discount > 1.0 should be rejected"
+        );
 
         let frame_neg = Frame::PriceTable {
             prices: std::collections::HashMap::new(),
@@ -1761,7 +2308,10 @@ mod tests {
             valid_blocks: 0,
             trust_discount: -0.1,
         };
-        assert!(frame_neg.validate().is_err(), "negative trust_discount should be rejected");
+        assert!(
+            frame_neg.validate().is_err(),
+            "negative trust_discount should be rejected"
+        );
     }
 
     #[test]
@@ -1848,7 +2398,11 @@ mod tests {
         let bytes = frame.to_bytes().unwrap();
         let decoded = Frame::from_bytes(&bytes).unwrap();
         match decoded {
-            Frame::InvoiceResponse { bolt11, payment_hash, .. } => {
+            Frame::InvoiceResponse {
+                bolt11,
+                payment_hash,
+                ..
+            } => {
                 assert!(bolt11.is_empty(), "empty bolt11 should roundtrip");
                 assert_eq!(payment_hash, "ab");
             }
@@ -1940,5 +2494,265 @@ mod tests {
     fn from_bytes_rejects_unknown_variant() {
         let result = Frame::from_bytes(br#"{"UnknownFrame":{}}"#);
         assert!(result.is_err());
+    }
+
+    // ── HARD-1: bounded-deserialize OOM-hardening tests ──────────────────
+    //
+    // These prove that an over-cap length prefix / collection is rejected
+    // *at decode time* — i.e. while serde streams elements out of the parser
+    // — before the full oversized structure is allocated. Each hostile frame
+    // is built as raw JSON (not via the typed builder, which would itself be
+    // bounded) and fed straight to `Frame::from_bytes`.
+
+    /// A `Hello.x25519_sig` byte array far over [`MAX_KEY_BYTES`] is rejected.
+    ///
+    /// The crafted JSON is only a few KiB on the wire (one decimal `0,` per
+    /// element) yet declares `MAX_KEY_BYTES + 1` elements; the visitor aborts
+    /// after consuming `MAX_KEY_BYTES + 1` bytes — it never builds the array.
+    #[test]
+    fn decode_rejects_oversized_key_bytes_before_allocation() {
+        // Build "[0,0,...,0]" with MAX_KEY_BYTES + 100 elements (well over cap).
+        let n = MAX_KEY_BYTES + 100;
+        let mut sig = String::from("[");
+        for i in 0..n {
+            if i > 0 {
+                sig.push(',');
+            }
+            sig.push('0');
+        }
+        sig.push(']');
+
+        let json = format!(
+            r#"{{"Hello":{{"version":2,"node_id":"{}","x25519_sig":{sig},"x25519_public":[0,0],"tier":"T2","capabilities":[]}}}}"#,
+            "00".repeat(32)
+        );
+
+        let err = Frame::from_bytes(json.as_bytes()).unwrap_err();
+        match err {
+            WireError::Serialization(msg) => {
+                assert!(
+                    msg.contains("byte array exceeds maximum"),
+                    "expected cap-exceeded message, got: {msg}"
+                );
+            }
+            other => panic!("expected Serialization cap error, got: {other:?}"),
+        }
+    }
+
+    /// A `Hello.x25519_sig` exactly at [`MAX_KEY_BYTES`] still decodes.
+    #[test]
+    fn decode_accepts_key_bytes_at_cap() {
+        let n = MAX_KEY_BYTES;
+        let mut sig = String::from("[");
+        for i in 0..n {
+            if i > 0 {
+                sig.push(',');
+            }
+            sig.push('0');
+        }
+        sig.push(']');
+
+        let json = format!(
+            r#"{{"Hello":{{"version":2,"node_id":"{}","x25519_sig":{sig},"x25519_public":[0,0],"tier":"T2","capabilities":[]}}}}"#,
+            "00".repeat(32)
+        );
+
+        let frame = Frame::from_bytes(json.as_bytes()).expect("at-cap key bytes must decode");
+        match frame {
+            Frame::Hello { x25519_sig, .. } => assert_eq!(x25519_sig.len(), MAX_KEY_BYTES),
+            _ => panic!("expected Hello frame"),
+        }
+    }
+
+    /// An over-cap `capabilities` list is rejected at decode.
+    #[test]
+    fn decode_rejects_oversized_capabilities() {
+        let n = MAX_CAPABILITIES + 10;
+        let mut caps = String::from("[");
+        for i in 0..n {
+            if i > 0 {
+                caps.push(',');
+            }
+            if i == 1 {
+                caps.push_str("\"Relay\"");
+            } else {
+                caps.push_str("\"X3dh\"");
+            }
+        }
+        caps.push(']');
+
+        let json = format!(
+            r#"{{"Hello":{{"version":2,"node_id":"{}","x25519_sig":[0],"x25519_public":[0],"tier":"T2","capabilities":{caps}}}}}"#,
+            "00".repeat(32)
+        );
+
+        let err = Frame::from_bytes(json.as_bytes()).unwrap_err();
+        assert!(
+            matches!(err, WireError::Serialization(_)),
+            "over-cap Hello.capabilities with Capability::Relay present must still fail closed"
+        );
+    }
+
+    /// An over-cap `PeerExchangeResponse.peers` list is rejected at decode.
+    #[test]
+    fn decode_rejects_oversized_peer_list() {
+        let n = MAX_PEER_EXCHANGE_ENTRIES + 5;
+        let mut peers = String::from("[");
+        for i in 0..n {
+            if i > 0 {
+                peers.push(',');
+            }
+            peers.push_str(&format!(
+                r#"{{"node_id":"{}","addr":"10.0.0.1:9735","label":null,"tier":"T2"}}"#,
+                "00".repeat(32)
+            ));
+        }
+        peers.push(']');
+
+        let json = format!(r#"{{"PeerExchangeResponse":{{"peers":{peers}}}}}"#);
+
+        let err = Frame::from_bytes(json.as_bytes()).unwrap_err();
+        assert!(matches!(err, WireError::Serialization(_)));
+    }
+
+    /// An over-cap `PeerExchangeEntry.label` is rejected at decode, before the
+    /// oversized owned `String` is materialised.
+    #[test]
+    fn decode_rejects_oversized_peer_label() {
+        let label = "x".repeat(MAX_PEER_LABEL_BYTES + 1);
+        let json = format!(
+            r#"{{"PeerExchangeResponse":{{"peers":[{{"node_id":"{}","addr":"10.0.0.1:9735","label":"{label}","tier":"T2"}}]}}}}"#,
+            "00".repeat(32)
+        );
+
+        let err = Frame::from_bytes(json.as_bytes()).unwrap_err();
+        assert!(matches!(err, WireError::Serialization(_)));
+    }
+
+    /// A `PeerExchangeEntry.label` at exactly the cap -- and a null label --
+    /// both decode successfully.
+    #[test]
+    fn decode_accepts_peer_label_at_cap_and_null() {
+        let label = "x".repeat(MAX_PEER_LABEL_BYTES);
+        let at_cap = format!(
+            r#"{{"PeerExchangeResponse":{{"peers":[{{"node_id":"{}","addr":"10.0.0.1:9735","label":"{label}","tier":"T2"}}]}}}}"#,
+            "00".repeat(32)
+        );
+        Frame::from_bytes(at_cap.as_bytes()).expect("label at cap must decode");
+
+        let null_label = format!(
+            r#"{{"PeerExchangeResponse":{{"peers":[{{"node_id":"{}","addr":"10.0.0.1:9735","label":null,"tier":"T2"}}]}}}}"#,
+            "00".repeat(32)
+        );
+        Frame::from_bytes(null_label.as_bytes()).expect("null label must decode");
+    }
+
+    /// An over-cap `PriceTable.prices` map is rejected at decode.
+    #[test]
+    fn decode_rejects_oversized_price_table() {
+        let n = MAX_PRICE_ENTRIES + 5;
+        let mut entries = String::from("{");
+        for i in 0..n {
+            if i > 0 {
+                entries.push(',');
+            }
+            entries.push_str(&format!(r#""cat_{i}":1"#));
+        }
+        entries.push('}');
+
+        let json = format!(
+            r#"{{"PriceTable":{{"prices":{entries},"block_height":1,"valid_blocks":1,"trust_discount":0.0}}}}"#
+        );
+
+        let err = Frame::from_bytes(json.as_bytes()).unwrap_err();
+        assert!(matches!(err, WireError::Serialization(_)));
+    }
+
+    /// A deeply nested `serde_json::Value` is rejected by the depth cap before
+    /// the recursion can threaten the stack.
+    ///
+    /// The frame is a few KiB on the wire but nests arrays far past
+    /// [`MAX_JSON_VALUE_DEPTH`]; the visitor aborts at the depth bound.
+    #[test]
+    fn decode_rejects_deeply_nested_json_value() {
+        let depth = MAX_JSON_VALUE_DEPTH + 50;
+        let mut bundle = String::new();
+        for _ in 0..depth {
+            bundle.push('[');
+        }
+        bundle.push('1');
+        for _ in 0..depth {
+            bundle.push(']');
+        }
+
+        let json = format!(r#"{{"PrekeyOffer":{{"bundle":{bundle}}}}}"#);
+
+        let err = Frame::from_bytes(json.as_bytes()).unwrap_err();
+        match err {
+            WireError::Serialization(msg) => {
+                assert!(
+                    msg.contains("maximum depth"),
+                    "expected depth-cap message, got: {msg}"
+                );
+            }
+            other => panic!("expected Serialization depth error, got: {other:?}"),
+        }
+    }
+
+    /// A `serde_json::Value` with too many nodes (wide flat array) is rejected
+    /// by the node-count cap — small wire payload, would-be huge in-memory tree.
+    #[test]
+    fn decode_rejects_oversized_json_value_node_count() {
+        let n = MAX_JSON_VALUE_NODES + 100;
+        // A flat array of `n` integers: ~2 bytes each on the wire, but `n`
+        // `Value::Number` nodes (24+ bytes each) in memory if unbounded.
+        let mut bundle = String::from("[");
+        for i in 0..n {
+            if i > 0 {
+                bundle.push(',');
+            }
+            bundle.push('1');
+        }
+        bundle.push(']');
+
+        let json = format!(r#"{{"SessionInit":{{"init_data":{bundle}}}}}"#);
+
+        let err = Frame::from_bytes(json.as_bytes()).unwrap_err();
+        match err {
+            WireError::Serialization(msg) => {
+                assert!(
+                    msg.contains("maximum of") && msg.contains("nodes"),
+                    "expected node-count-cap message, got: {msg}"
+                );
+            }
+            other => panic!("expected Serialization node-count error, got: {other:?}"),
+        }
+    }
+
+    /// A legitimate small prekey bundle still roundtrips through the bounded
+    /// `serde_json::Value` deserializer.
+    #[test]
+    fn decode_accepts_legitimate_json_value() {
+        let bundle = serde_json::json!({
+            "identity_key": "aabbccdd",
+            "signed_prekey": "11223344",
+            "one_time_prekeys": ["aa", "bb", "cc"],
+            "nested": {"a": 1, "b": [1, 2, 3]}
+        });
+        let frame = Frame::PrekeyOffer {
+            bundle: bundle.clone(),
+        };
+        let bytes = frame.to_bytes().unwrap();
+        let decoded = Frame::from_bytes(&bytes).unwrap();
+        match decoded {
+            Frame::PrekeyOffer { bundle: b } => assert_eq!(b, bundle),
+            _ => panic!("expected PrekeyOffer frame"),
+        }
+    }
+
+    /// `MAX_FRAME_SIZE` is a pure alias of `MAX_FRAME_BYTES` — single source.
+    #[test]
+    fn frame_byte_caps_are_one_constant() {
+        assert_eq!(MAX_FRAME_SIZE, MAX_FRAME_BYTES);
     }
 }

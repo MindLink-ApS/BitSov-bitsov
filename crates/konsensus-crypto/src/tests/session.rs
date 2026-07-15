@@ -415,26 +415,52 @@ async fn restore_migrates_plaintext_to_encrypted() {
     // Phase 2: Create new manager with store and restore.
     //
     // L0b (2026-04-30): plaintext-fallback restore is OFF by default.
-    // The operator must opt in via `KONSENSUS_LEGACY_SESSION_MIGRATION=1`
-    // for one migration boot. This test was the original "legacy
-    // plaintext migrates to encrypted" coverage; under L0b we keep the
-    // assertion but exercise the migration path explicitly so the
-    // default (drop-the-blob) doesn't re-introduce the silent downgrade
-    // vector. The companion external test
-    // `tests/session_downgrade_resistance.rs` covers the default-OFF
-    // path; this in-source test covers the migration-flag-ON path.
+    // MED-A (2026-06-13): the plaintext-accepting code is now COMPILED OUT of
+    // default/production builds. The operator must BOTH build with
+    // `--features legacy-session-migration` AND set
+    // `KONSENSUS_LEGACY_SESSION_MIGRATION=1` for one migration boot. The env
+    // var alone is inert in a default build.
+    //
+    // This test therefore asserts BOTH halves of the gate:
+    //   * default build (feature off): the env var is ignored, the plaintext
+    //     blob is rejected, nothing is restored, and the on-disk blob is left
+    //     untouched as plaintext;
+    //   * migration build (feature on): the plaintext blob migrates to
+    //     encrypted, as the legacy one-shot path intends.
     std::env::set_var("KONSENSUS_LEGACY_SESSION_MIGRATION", "1");
     let mgr_a2 = SessionManager::with_store(Arc::clone(&id_a), store.clone());
     let restored = mgr_a2.restore_sessions().await;
     std::env::remove_var("KONSENSUS_LEGACY_SESSION_MIGRATION");
-    assert_eq!(restored, 1, "should restore the plaintext session under migration flag");
 
-    // After restore, the session should have been re-encrypted
+    #[cfg(feature = "legacy-session-migration")]
     {
+        assert_eq!(
+            restored, 1,
+            "migration build: should restore the plaintext session under migration flag"
+        );
+        // After restore, the session should have been re-encrypted.
         let data = store.data.read().await;
         let blob = data.get(&node_b).unwrap();
-        assert!(serde_json::from_slice::<serde_json::Value>(blob).is_err(),
-            "session should be re-encrypted after migration");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(blob).is_err(),
+            "session should be re-encrypted after migration"
+        );
+    }
+
+    #[cfg(not(feature = "legacy-session-migration"))]
+    {
+        assert_eq!(
+            restored, 0,
+            "default build: env var must be inert — plaintext blob must be rejected"
+        );
+        // The on-disk blob must be left exactly as it was — still plaintext,
+        // never silently re-encrypted (no laundering of injected state).
+        let data = store.data.read().await;
+        let blob = data.get(&node_b).unwrap();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(blob).is_ok(),
+            "default build: untouched plaintext blob must remain plaintext (not laundered)"
+        );
     }
 }
 

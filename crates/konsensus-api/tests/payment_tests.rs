@@ -29,8 +29,15 @@ use konsensus_api::audit::AuditLog;
 use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use konsensus_api::build_router;
+use common::test_router as build_router;
 
+fn test_dest_pubkey() -> String {
+    format!("02{}", "11".repeat(32))
+}
+
+fn test_txid() -> String {
+    format!("{}{}", "ba".repeat(16), "cd".repeat(16))
+}
 
 #[tokio::test]
 async fn payments_balance() {
@@ -244,12 +251,14 @@ async fn pricing_own_chain_aware_reports_mode() {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -260,6 +269,7 @@ async fn pricing_own_chain_aware_reports_mode() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -267,7 +277,7 @@ async fn pricing_own_chain_aware_reports_mode() {
     });
 
     let auth = auth_header(&state);
-    let app = konsensus_api::build_router(Arc::clone(&state));
+    let app = build_router(Arc::clone(&state));
 
     let req = Request::builder()
         .uri("/api/v1/pricing")
@@ -580,8 +590,12 @@ async fn health_includes_lightning_balance() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["lightning_available"], true);
     assert_eq!(json["lightning_payment_capable"], true);
-    // StubLightning returns 100_000_000 msat
-    assert_eq!(json["lightning_balance_msat"], 100_000_000);
+    // Balance is owner-only — redacted from the unauthenticated /health
+    // endpoint and served only by /api/v1/status (A1 drift-kill).
+    assert!(
+        json.get("lightning_balance_msat").is_none(),
+        "unauth /health must not expose wallet balance"
+    );
 }
 
 #[tokio::test]
@@ -1032,7 +1046,7 @@ async fn keysend_success() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "dest_pubkey": "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc",
+                "dest_pubkey": test_dest_pubkey(),
                 "amount_msat": 1000
             })
             .to_string(),
@@ -1109,7 +1123,7 @@ async fn keysend_rejects_amount_below_minimum() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "dest_pubkey": "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc",
+                "dest_pubkey": test_dest_pubkey(),
                 "amount_msat": 500
             })
             .to_string(),
@@ -1133,7 +1147,7 @@ async fn keysend_rejects_amount_above_maximum() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "dest_pubkey": "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc",
+                "dest_pubkey": test_dest_pubkey(),
                 "amount_msat": 200_000_000_000_u64
             })
             .to_string(),
@@ -1241,12 +1255,14 @@ async fn health_lightning_unavailable_shows_null_balance() {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -1257,6 +1273,7 @@ async fn health_lightning_unavailable_shows_null_balance() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -1734,12 +1751,14 @@ async fn chain_status_with_failing_provider() {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -1750,6 +1769,7 @@ async fn chain_status_with_failing_provider() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -1840,12 +1860,14 @@ async fn chain_status_partial_failure() {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -1856,6 +1878,7 @@ async fn chain_status_partial_failure() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -1937,7 +1960,7 @@ async fn send_onchain_with_fee_rate_succeeds() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "address": "bc1qfc6qtnlnnw4whjgk9mx8f0d7ksz4mwyde73h2z",
+                "address": "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
                 "amount_sats": 10_000_u64,
                 "fee_rate_sat_per_vb": 5.0
             })
@@ -1969,7 +1992,7 @@ async fn send_onchain_without_fee_rate_is_backward_compatible() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "address": "bc1qfc6qtnlnnw4whjgk9mx8f0d7ksz4mwyde73h2z",
+                "address": "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
                 "amount_sats": 5_000_u64
             })
             .to_string(),
@@ -1998,7 +2021,7 @@ async fn send_onchain_fee_rate_zero_rejected() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "address": "bc1qfc6qtnlnnw4whjgk9mx8f0d7ksz4mwyde73h2z",
+                "address": "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
                 "amount_sats": 5_000_u64,
                 "fee_rate_sat_per_vb": 0.0
             })
@@ -2024,7 +2047,7 @@ async fn send_onchain_fee_rate_negative_rejected() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "address": "bc1qfc6qtnlnnw4whjgk9mx8f0d7ksz4mwyde73h2z",
+                "address": "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
                 "amount_sats": 5_000_u64,
                 "fee_rate_sat_per_vb": -1.0
             })
@@ -2052,7 +2075,7 @@ async fn send_onchain_fee_rate_below_one_sat_per_vb_rejected() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "address": "bc1qfc6qtnlnnw4whjgk9mx8f0d7ksz4mwyde73h2z",
+                "address": "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
                 "amount_sats": 5_000_u64,
                 "fee_rate_sat_per_vb": 0.5
             })
@@ -2073,7 +2096,7 @@ async fn send_onchain_fee_rate_nan_rejected() {
     let app = build_router(state);
 
     // serde_json doesn't serialize f64::NAN, so build the body literally.
-    let raw_body = r#"{"address":"bc1qfc6qtnlnnw4whjgk9mx8f0d7ksz4mwyde73h2z","amount_sats":5000,"fee_rate_sat_per_vb":NaN}"#;
+    let raw_body = r#"{"address":"bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu","amount_sats":5000,"fee_rate_sat_per_vb":NaN}"#;
 
     let req = Request::builder()
         .method("POST")
@@ -2138,8 +2161,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
             _fee_rate_sat_per_vb: Option<f32>,
         ) -> Result<String, LightningError> {
             Err(LightningError::BroadcastUnconfirmed {
-                txid: "ba91a6ac1234567890abcdef1234567890abcdef1234567890abcdef12345abcd"
-                    .into(),
+                txid: test_txid(),
             })
         }
     }
@@ -2158,12 +2180,14 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         transport: Arc::clone(&base.transport),
         session_manager: Arc::clone(&base.session_manager),
         jwt_secret: base.jwt_secret.clone(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: base.cors_enabled,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: base.ws_broadcast.clone(),
         ws_delivery_broadcast: base.ws_delivery_broadcast.clone(),
         rate_limiter: Arc::clone(&base.rate_limiter),
+        mnemonic_reveal_limiter: Arc::clone(&base.mnemonic_reveal_limiter),
         audit_log: Arc::clone(&base.audit_log),
         started_at: base.started_at,
         content_dir: base.content_dir.clone(),
@@ -2174,6 +2198,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         send_timestamps: Arc::clone(&base.send_timestamps),
         invoice_requests: Arc::clone(&base.invoice_requests),
         data_dir: base.data_dir.clone(),
+        backup_dir: None,
         peer_ln_pubkeys: Arc::clone(&base.peer_ln_pubkeys),
         lightning_backend: base.lightning_backend.clone(),
         chain_backend: base.chain_backend.clone(),
@@ -2189,7 +2214,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "address": "bc1qfc6qtnlnnw4whjgk9mx8f0d7ksz4mwyde73h2z",
+                "address": "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
                 "amount_sats": 5_000_u64,
             })
             .to_string(),
@@ -2208,7 +2233,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(body["broadcast_status"], "unconfirmed");
-    assert!(body["txid"].as_str().unwrap().starts_with("ba91a6ac"));
+    assert_eq!(body["txid"].as_str().unwrap(), test_txid());
 }
 
 /// L0a — rates above the 10_000 sat/vB sanity bound are rejected.
@@ -2225,7 +2250,7 @@ async fn send_onchain_fee_rate_above_max_rejected() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "address": "bc1qfc6qtnlnnw4whjgk9mx8f0d7ksz4mwyde73h2z",
+                "address": "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
                 "amount_sats": 5_000_u64,
                 "fee_rate_sat_per_vb": 50_000.0_f32
             })

@@ -23,6 +23,24 @@ use konsensus_storage::{Storage, StorageError};
 
 const OPERATOR_HOSTING_MEMO_PREFIX: &str = "operator-hosting:";
 const DAILY_PAYMENT_INTERVAL: Duration = Duration::from_secs(86_400);
+const DAY_SECS: u64 = 86_400; // hardened duplicate of core::contracts::hosting DAY_SECS for threshold calcs (scale-ready daily loop)
+pub const HOSTING_CONTRACTS_ENV: &str = "KONSENSUS_HOSTING_CONTRACTS_ENABLED";
+
+/// Pure predicate for the operator-hosting feature gate (see the API-side twin
+/// in `handlers/hosting.rs`). Factored out so the default-OFF / opt-in semantics
+/// are deterministically unit-testable without mutating process env. The daily
+/// payment task early-returns when this is false, so a public/reference node
+/// never runs the keysend billing loop unless the operator opts in.
+fn hosting_flag_enabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw,
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+pub fn hosting_contracts_enabled() -> bool {
+    hosting_flag_enabled(std::env::var(HOSTING_CONTRACTS_ENV).ok().as_deref())
+}
 
 /// Dependencies for the long-running daily payment task.
 pub struct HostingPaymentTaskDeps {
@@ -72,6 +90,14 @@ pub enum HostingPaymentError {
 
 /// Run the hosting payment task until shutdown.
 pub async fn run_daily_payment_task(mut deps: HostingPaymentTaskDeps) {
+    if !hosting_contracts_enabled() {
+        info!(
+            env = HOSTING_CONTRACTS_ENV,
+            "operator hosting payment task disabled"
+        );
+        return;
+    }
+
     if let Err(e) = run_once(
         Arc::clone(&deps.storage),
         Arc::clone(&deps.lightning),
@@ -151,7 +177,21 @@ pub async fn pay_due_contracts_once(
         ..HostingPaymentRunStats::default()
     };
 
+    // Perspective guard: this node only PAYS contracts where it is the TENANT.
+    // A contract whose `operator_pubkey` is OUR own pubkey is one where we are
+    // the operator/payee (e.g. registered via the hosting REST API) — paying it
+    // would be a keysend to ourselves. The incoming-scan side records those
+    // rows; the pay-due pass must skip them (otherwise we attempt a daily
+    // self-keysend and, when it fails, fire false `overdue` events for a
+    // contract where we are the recipient).
+    let our_pubkey = lightning.get_node_pubkey().await;
+
     for contract in contracts {
+        if let Some(ref ours) = our_pubkey {
+            if &contract.operator_pubkey == ours {
+                continue;
+            }
+        }
         let implied_state = contract.state_at(now)?;
         if !contract.payment_due_at(now)? {
             if implied_state != contract.state {
@@ -171,14 +211,11 @@ pub async fn pay_due_contracts_once(
         // written, leaving the next scheduler tick to keysend a second time.
         // See PR #88 review finding #1.
         let expected_memo = contract.keysend_memo();
-        // 24 hours — same DAY_SECS as konsensus-core's hosting contract module.
-        let recent_threshold = now.saturating_sub(86_400);
-        if has_recent_outgoing_for_memo(
-            Arc::clone(&lightning),
-            &expected_memo,
-            recent_threshold,
-        )
-        .await?
+        // 24 hours — same DAY_SECS as konsensus-core's hosting contract module (harden: use const).
+        let recent_threshold = now.saturating_sub(DAY_SECS); // DAILY_PAYMENT_INTERVAL equiv in secs for history scan (no drift)
+
+        if has_recent_outgoing_for_memo(Arc::clone(&lightning), &expected_memo, recent_threshold)
+            .await?
         {
             // Already paid today via Lightning history; just sync our local
             // last_paid_at marker so the next scheduler tick knows.
@@ -385,8 +422,8 @@ fn parse_hosting_memo(memo: &str) -> Result<Uuid, HostingPaymentError> {
     // Accept both legacy `<id>:<tenant>` and current `<id>` shapes during
     // the migration window. Only the contract_id is authoritative.
     let id_part = rest.split(':').next().unwrap_or(rest);
-    let contract_id = Uuid::parse_str(id_part)
-        .map_err(|e| HostingPaymentError::InvalidMemo(e.to_string()))?;
+    let contract_id =
+        Uuid::parse_str(id_part).map_err(|e| HostingPaymentError::InvalidMemo(e.to_string()))?;
     Ok(contract_id)
 }
 
@@ -402,6 +439,76 @@ mod tests {
     use super::*;
     use konsensus_lightning::{MockLightningConfig, MockLightningProvider};
     use konsensus_storage::SqliteStorage;
+
+    /// The hosting payment loop is gated OFF by default: `run_daily_payment_task`
+    /// begins with `if !hosting_contracts_enabled() { return }`, so unless the
+    /// operator sets the flag, no keysend billing runs. This pins the predicate
+    /// that guard reads (default-OFF, explicit truthy opt-in only).
+    #[test]
+    fn hosting_payment_gate_is_off_by_default_and_opts_in_explicitly() {
+        assert!(!hosting_flag_enabled(None), "absent flag must be OFF");
+        assert!(!hosting_flag_enabled(Some("")), "empty flag must be OFF");
+        assert!(!hosting_flag_enabled(Some("0")), "0 must be OFF");
+        assert!(!hosting_flag_enabled(Some("false")), "false must be OFF");
+        assert!(!hosting_flag_enabled(Some("no")), "no must be OFF");
+        for on in ["1", "true", "TRUE", "yes", "YES"] {
+            assert!(hosting_flag_enabled(Some(on)), "{on} must enable the task");
+        }
+    }
+
+    /// Money-adjacent disabled-path guard (#326): with the env flag OFF (default),
+    /// `run_daily_payment_task` must return BEFORE the keysend billing loop and bill
+    /// NOTHING — even with a DUE contract present. This pins the actual call-site
+    /// guard, not just the predicate: if the guard is ever removed while the
+    /// predicate test stays green, a public/reference node would silently bill.
+    #[tokio::test]
+    async fn disabled_task_returns_without_billing_a_due_contract() {
+        std::env::remove_var(HOSTING_CONTRACTS_ENV); // ensure OFF (the default)
+
+        let now = 1_700_086_401;
+        let sqlite = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        // A contract that IS due (started > 1 day ago, never paid).
+        sqlite
+            .upsert_operator_hosting_contract(&contract(now - 86_400))
+            .await
+            .unwrap();
+        let storage: Arc<dyn Storage> = sqlite.clone();
+        let lightning: Arc<dyn LightningProvider> =
+            Arc::new(MockLightningProvider::with_config(MockLightningConfig {
+                initial_balance_msat: 50_000_000,
+            }));
+        let (ws_tx, _ws_rx) = broadcast::channel::<Arc<WsDeliveryStatus>>(4);
+        let (_sd_tx, shutdown_rx) = watch::channel(false);
+
+        let deps = HostingPaymentTaskDeps {
+            storage: Arc::clone(&storage),
+            lightning,
+            ws_delivery_tx: ws_tx,
+            shutdown_rx,
+        };
+
+        // Flag OFF => the task must return promptly (before the billing loop), so a
+        // generous timeout that is NOT reached proves it did not enter the loop.
+        tokio::time::timeout(Duration::from_secs(5), run_daily_payment_task(deps))
+            .await
+            .expect("disabled hosting task must return promptly, not enter the billing loop");
+
+        // And it must have billed NOTHING for the due contract.
+        let payments = storage
+            .list_operator_hosting_payments(&Uuid::nil())
+            .await
+            .unwrap();
+        assert!(
+            payments.is_empty(),
+            "disabled task must record ZERO payments (found {})",
+            payments.len()
+        );
+        let contracts = storage.list_operator_hosting_contracts().await.unwrap();
+        assert!(
+            contracts[0].last_paid_at.is_none(),
+            "disabled task must not mark the due contract paid"
+        );
+    }
 
     fn tenant() -> NodeId {
         NodeId::from_bytes([9u8; 32])
@@ -455,6 +562,38 @@ mod tests {
         assert_eq!(payments[0].amount_msat, 20_000_000);
     }
 
+    /// Perspective guard: a contract whose `operator_pubkey` is THIS node's own
+    /// pubkey (an operator-side row, e.g. created via the hosting REST API) is
+    /// skipped by the pay-due pass — the node never keysends itself.
+    #[tokio::test]
+    async fn operator_perspective_contract_is_not_self_paid() {
+        let now = 1_700_086_401;
+        let sqlite = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        // operator_pubkey == the MockLightningProvider's own node pubkey.
+        let own = format!("02{}", "aa".repeat(32));
+        let c = OperatorHostingContract::new(Uuid::nil(), tenant(), own, 20_000, now - 86_400)
+            .expect("valid hosting contract");
+        sqlite.upsert_operator_hosting_contract(&c).await.unwrap();
+        let storage: Arc<dyn Storage> = sqlite.clone();
+        let lightning: Arc<dyn LightningProvider> =
+            Arc::new(MockLightningProvider::with_config(MockLightningConfig {
+                initial_balance_msat: 50_000_000,
+            }));
+        let (tx, _rx) = broadcast::channel(4);
+
+        let stats = pay_due_contracts_once(Arc::clone(&storage), lightning, tx, now)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.payments_sent, 0, "must not self-keysend");
+        assert_eq!(stats.payments_failed, 0, "skipped, not failed");
+        let payments = storage
+            .list_operator_hosting_payments(&Uuid::nil())
+            .await
+            .unwrap();
+        assert_eq!(payments.len(), 0, "no self-payment recorded");
+    }
+
     #[tokio::test]
     async fn unpaid_contract_emits_overdue_event_after_grace() {
         let now = 1_700_086_400;
@@ -504,11 +643,7 @@ mod tests {
         // that still include the tenant_pubkey field in the memo. Those
         // memos must parse to the same contract_id; the operator ignores
         // the (forgeable) trailing tenant field.
-        let memo = format!(
-            "operator-hosting:{}:{}",
-            Uuid::nil(),
-            tenant().to_hex()
-        );
+        let memo = format!("operator-hosting:{}:{}", Uuid::nil(), tenant().to_hex());
         let contract_id = parse_hosting_memo(&memo).unwrap();
         assert_eq!(contract_id, Uuid::nil());
     }

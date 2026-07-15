@@ -1,5 +1,9 @@
 use super::*;
 
+fn mock_identity_pubkey() -> String {
+    format!("02{}", "ab".repeat(32))
+}
+
 #[test]
 fn config_construction() {
     let config = LndConfig {
@@ -17,10 +21,7 @@ fn api_url_strips_trailing_slash() {
         macaroon_hex: "abc".into(),
         tls_cert_path: None,
     };
-    let provider = LndProvider::with_client(
-        config,
-        Client::new(),
-    );
+    let provider = LndProvider::with_client(config, Client::new());
     assert_eq!(
         provider.api_url("/v1/invoices"),
         "https://localhost:8080/v1/invoices"
@@ -80,8 +81,7 @@ fn parse_u64_handles_various_inputs() {
 fn decode_r_hash_base64() {
     use base64::Engine;
     // 32 zero bytes in base64
-    let b64 = base64::engine::general_purpose::STANDARD
-        .encode([0u8; 32]);
+    let b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
     let hex_str = LndProvider::decode_r_hash(&b64).unwrap();
     assert_eq!(hex_str, "00".repeat(32));
 }
@@ -89,8 +89,8 @@ fn decode_r_hash_base64() {
 #[test]
 fn decode_r_hash_known_value() {
     use base64::Engine;
-    let bytes = hex::decode("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
-        .unwrap();
+    let bytes =
+        hex::decode("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789").unwrap();
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let result = LndProvider::decode_r_hash(&b64).unwrap();
     assert_eq!(
@@ -128,7 +128,7 @@ async fn is_payment_capable_reflects_flag() {
 // ── Mock HTTP server tests ──────────────────────────────────────────
 // These test the full request/response flow against a mock LND REST API.
 
-use axum::{routing::get, routing::post, Json, Router};
+use axum::{Json, Router, routing::get, routing::post};
 use std::net::SocketAddr;
 
 async fn start_mock_lnd() -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -148,7 +148,7 @@ async fn start_mock_lnd() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 
 async fn mock_getinfo() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "identity_pubkey": "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+        "identity_pubkey": mock_identity_pubkey(),
         "synced_to_chain": true,
         "num_active_channels": 3
     }))
@@ -259,10 +259,13 @@ async fn unreachable_lnd_not_available() {
         macaroon_hex: "abc".into(),
         tls_cert_path: None,
     };
-    let provider = LndProvider::with_client(config, Client::builder()
-        .timeout(std::time::Duration::from_millis(100))
-        .build()
-        .unwrap());
+    let provider = LndProvider::with_client(
+        config,
+        Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap(),
+    );
 
     assert!(!provider.is_available().await);
 }
@@ -363,7 +366,7 @@ fn decode_r_hash_url_safe_base64() {
     use base64::Engine;
     let bytes = [0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8];
     // URL-safe base64 uses -_ instead of +/
-    let url_safe = base64::engine::general_purpose::URL_SAFE.encode(&bytes);
+    let url_safe = base64::engine::general_purpose::URL_SAFE.encode(bytes);
     let result = LndProvider::decode_r_hash(&url_safe).unwrap();
     assert_eq!(result, hex::encode(bytes));
 }
@@ -384,7 +387,10 @@ async fn start_mock_lnd_errors() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use axum::http::StatusCode;
 
     async fn error_401() -> (StatusCode, &'static str) {
-        (StatusCode::UNAUTHORIZED, r#"{"message":"permission denied","code":7}"#)
+        (
+            StatusCode::UNAUTHORIZED,
+            r#"{"message":"permission denied","code":7}"#,
+        )
     }
     async fn error_500() -> (StatusCode, &'static str) {
         (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"internal"}"#)
@@ -514,7 +520,10 @@ async fn malformed_invoice_missing_r_hash() {
     let (addr, _handle) = start_mock_lnd_malformed().await;
     let provider = test_provider(addr);
 
-    let err = provider.create_invoice(1000, "test", 3600).await.unwrap_err();
+    let err = provider
+        .create_invoice(1000, "test", 3600)
+        .await
+        .unwrap_err();
     match err {
         LightningError::InvoiceCreation(msg) => {
             assert!(msg.contains("no r_hash"), "got: {msg}");
@@ -605,7 +614,8 @@ async fn start_mock_lnd_payment() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     /// Successful payment with streaming response (multiple lines).
     async fn pay_streaming_success() -> String {
         // Simulates LND's streaming response with intermediate + final status
-        let line1 = serde_json::json!({"result": {"payment_hash": "abc123", "status": "IN_FLIGHT"}});
+        let line1 =
+            serde_json::json!({"result": {"payment_hash": "abc123", "status": "IN_FLIGHT"}});
         let line2 = serde_json::json!({"result": {"payment_hash": "abc123", "payment_preimage": "def456", "status": "SUCCEEDED", "value_msat": "10000", "fee_msat": "5"}});
         format!("{}\n{}\n", line1, line2)
     }
@@ -921,7 +931,10 @@ fn api_url_no_trailing_slash() {
         tls_cert_path: None,
     };
     let provider = LndProvider::with_client(config, Client::new());
-    assert_eq!(provider.api_url("/v1/getinfo"), "https://mynode:8080/v1/getinfo");
+    assert_eq!(
+        provider.api_url("/v1/getinfo"),
+        "https://mynode:8080/v1/getinfo"
+    );
 }
 
 #[test]
@@ -933,7 +946,10 @@ fn api_url_multiple_trailing_slashes() {
     };
     let provider = LndProvider::with_client(config, Client::new());
     // trim_end_matches('/') removes all trailing slashes
-    assert_eq!(provider.api_url("/v1/getinfo"), "https://mynode:8080/v1/getinfo");
+    assert_eq!(
+        provider.api_url("/v1/getinfo"),
+        "https://mynode:8080/v1/getinfo"
+    );
 }
 
 // ── list_payments tests ──────────────────────────────────────────────
@@ -1091,7 +1107,10 @@ async fn keysend_success_returns_payment_details() {
 
     // Valid compressed pubkey (33 bytes = 66 hex chars)
     let dest = "02".to_string() + &"ab".repeat(32);
-    let result = provider.keysend(&dest, 50_000, Some("test keysend")).await.unwrap();
+    let result = provider
+        .keysend(&dest, 50_000, Some("test keysend"))
+        .await
+        .unwrap();
 
     assert_eq!(result.status, PaymentStatus::Settled);
     assert_eq!(result.amount_msat, 50_000);
@@ -1129,7 +1148,10 @@ async fn keysend_invalid_hex_pubkey_returns_error() {
     let (addr, _handle) = start_mock_lnd_keysend().await;
     let provider = test_provider(addr);
 
-    let err = provider.keysend("not_valid_hex", 1_000, None).await.unwrap_err();
+    let err = provider
+        .keysend("not_valid_hex", 1_000, None)
+        .await
+        .unwrap_err();
     match err {
         LightningError::PaymentFailed(msg) => {
             assert!(msg.contains("invalid dest_pubkey hex"), "got: {msg}");
@@ -1202,7 +1224,10 @@ async fn payment_status_falls_through_to_outgoing_payments() {
     let (addr, _handle) = start_mock_lnd_outgoing_payment_status().await;
     let provider = test_provider(addr);
 
-    let details = provider.get_payment_status("target_hash_to_find").await.unwrap();
+    let details = provider
+        .get_payment_status("target_hash_to_find")
+        .await
+        .unwrap();
     assert_eq!(details.status, PaymentStatus::Settled);
     assert_eq!(details.amount_msat, 25_000);
     assert_eq!(details.direction, PaymentDirection::Outgoing);
@@ -1222,7 +1247,10 @@ async fn payment_status_not_found_in_either() {
     };
     let provider = LndProvider::with_client(config, Client::new());
 
-    let err = provider.get_payment_status("nonexistent_hash").await.unwrap_err();
+    let err = provider
+        .get_payment_status("nonexistent_hash")
+        .await
+        .unwrap_err();
     match err {
         LightningError::PaymentNotFound(hash) => {
             assert_eq!(hash, "nonexistent_hash");
@@ -1254,8 +1282,5 @@ async fn get_node_pubkey_from_mock_lnd() {
     let provider = LndProvider::new(config).unwrap();
     let pubkey = provider.get_node_pubkey().await;
     assert!(pubkey.is_some());
-    assert_eq!(
-        pubkey.unwrap(),
-        "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
-    );
+    assert_eq!(pubkey.unwrap(), mock_identity_pubkey());
 }

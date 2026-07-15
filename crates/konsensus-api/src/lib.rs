@@ -27,14 +27,18 @@
 //!
 //! - `GET  /metrics` — Prometheus exposition format. Scrapers do not
 //!   carry JWTs; restrict via network ACL / VPC.
-//! - `GET  /api/v1/health` — liveness probe. Must work without auth so
-//!   deploy tooling and the `NodeOffline` UI can detect a reachable but
-//!   un-tokened node.
+//! - `GET  /api/v1/health` — UNAUTHENTICATED, redacted liveness probe (status
+//!   plus non-sensitive counters/flags only), so deploy tooling and the
+//!   `NodeOffline` UI can detect a reachable but un-tokened node. Identity,
+//!   peer IDs, wallet balance, and LN pubkey are owner-only at `/api/v1/status`.
+//! - `GET  /api/v1/status` — owner-only full node status (behind `AuthUser`).
 //! - `GET  /api/v1/preflight` and `GET /livez` — cheap operator liveness
 //!   probes mounted only when `AppState::operator_probes_enabled` is true.
 //!   They do not query Lightning, chain, storage, peers, or user state.
-//! - `POST /api/v1/auth/token` — JWT bootstrap via Ed25519 signature
-//!   challenge. Cannot require a JWT to issue one.
+//! - `GET  /api/v1/auth/challenge` — emits a short-lived single-use
+//!   Ed25519 challenge. Cannot require a JWT to issue one.
+//! - `POST /api/v1/auth/token` — JWT bootstrap via Ed25519 signature over
+//!   that challenge. Cannot require a JWT to issue one.
 //! - `POST /api/v1/auth/local` — JWT bootstrap restricted to loopback
 //!   callers via `ConnectInfo`. The loopback check is the auth gate.
 //! - `GET  /api/v1/ws` — WebSocket upgrade. Validates the JWT inline
@@ -58,13 +62,13 @@ pub use state::{AppState, InvoiceResponseData, WsMessage};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::http::header;
+use axum::Router;
+use axum::http::{HeaderValue, header};
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use tokio::sync::watch;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -87,9 +91,15 @@ async fn metrics_handler() -> impl IntoResponse {
 pub fn build_router(state: Arc<AppState>) -> Router {
     let cors = if state.cors_enabled {
         CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any)
+            .allow_origin(cors_allowed_origins())
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PUT,
+                axum::http::Method::DELETE,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
     } else {
         CorsLayer::new()
     };
@@ -105,7 +115,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(handlers::identity::routes(
             state.sensitive_identity_routes_enabled,
         ))
-        .merge(handlers::auth_routes::routes())
+        .merge(handlers::auth_routes::routes(
+            state.sensitive_identity_routes_enabled,
+        ))
         .merge(handlers::sessions::routes())
         .merge(handlers::files::routes())
         .merge(handlers::pricing::routes())
@@ -113,6 +125,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(handlers::chain::routes())
         .merge(handlers::calendar::routes())
         .merge(handlers::content::routes())
+        .merge(handlers::export::routes())
+        .merge(handlers::hosting::routes())
         .merge(handlers::invite::routes())
         .merge(handlers::invites::routes())
         .merge(handlers::onboarding::routes())
@@ -127,6 +141,52 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
+}
+
+fn cors_allowed_origins() -> Vec<HeaderValue> {
+    parse_cors_allowed_origins(
+        &std::env::var("KONSENSUS_CORS_ALLOWED_ORIGINS").unwrap_or_else(|_| {
+            [
+                "http://localhost:1420",
+                "http://127.0.0.1:1420",
+                "http://localhost:4173",
+                "http://127.0.0.1:4173",
+            ]
+            .join(",")
+        }),
+    )
+}
+
+fn parse_cors_allowed_origins(raw: &str) -> Vec<HeaderValue> {
+    raw.split(',')
+        .filter_map(|origin| {
+            let origin = origin.trim();
+            if origin.is_empty() {
+                return None;
+            }
+            HeaderValue::from_str(origin).ok()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_cors_origins_are_not_wildcard() {
+        let origins = parse_cors_allowed_origins("http://localhost:1420, https://node.example");
+        assert!(
+            origins
+                .iter()
+                .any(|origin| origin == HeaderValue::from_static("http://localhost:1420"))
+        );
+        assert!(
+            !origins
+                .iter()
+                .any(|origin| origin == HeaderValue::from_static("*"))
+        );
+    }
 }
 
 /// Start the API server.

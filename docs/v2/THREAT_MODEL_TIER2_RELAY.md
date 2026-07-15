@@ -1,6 +1,14 @@
 # Tier-2 Relay — Adversarial Threat Model
 
-> **Status:** Draft (2026-05-14). Adversarial framing. No marketing language.
+> **Status:** Draft (2026-05-14; reconciled 2026-05-29). Adversarial framing. No marketing language.
+> **2026-05-29 (RV-DOC-T2R0a):** the realtime-signalling *payment-gate bypass* is
+> closed in code — kinds 400-499 travel as paid, gated UKM envelopes, and the legacy
+> `CallOffer`/`CallAnswer`/`IceCandidate`/`CallEnd` frames are rejected (dropped with a
+> warn) at both the transport reader (`messaging.rs`) and the session handler
+> (`session_handler.rs`). RealTimeSignaling is priced (`static_pricing.rs`), and gossip
+> is disabled (`GOSSIP_ALLOWED_KINDS = &[]`). **T2R0a is done-in-code.** The
+> *call-presence metadata* a future relay would still see (who/when/SDP-shape) is a
+> separate, open metadata-minimisation concern (padding/TURN), retained below.
 > **Subject:** Operator-run relay peer that does store-and-forward,
 > push-notification bridging, and Lightning routing for user nodes without
 > ever holding user keys or decrypting payloads.
@@ -16,7 +24,7 @@
 | **Malicious operator** | Drop/delay specific recipients. Time-correlate sender↔recipient. Swap itself into the user's whitelist via UX. Sell metadata. | Forge UKMs. Issue payment proofs for users. Decrypt content. Pose as another node without key compromise. |
 | **Compromised operator** | Everything above, plus modify the relay binary to ex­filtrate metadata or future ciphertext. | Break E2EE on stored ciphertext (forward-secret ratchet). Decrypt past media (DTLS-SRTP keys live on endpoints). |
 | **Nation-state observer** | Correlate user IP ↔ relay IP ↔ recipient IP. Time-correlate ratchet sizes against recipient wake-ups. Map LN topology from public gossip. Compel any endpoint legally. | Passively decrypt Noise. Forge UKMs without key material. |
-| **Hostile peer** | Open a whitelisted channel, pay, send crafted UKMs (parser/ratchet/rate-limiter stress). Probe presence via kinds 400-499 which bypass the gate (`wire.rs::is_realtime_signal`). | Anything the operator can do — has no relay role. |
+| **Hostile peer** | Open a whitelisted channel, pay, send crafted UKMs (parser/ratchet/rate-limiter stress). Probe presence via realtime-signal kinds 400-499 — now paid, gated UKMs (legacy `Call*` frames rejected), so no unpaid lane; the residual is the call-presence/timing metadata any relay still sees. | Anything the operator can do — has no relay role. |
 
 ## 2. Leak surfaces — what the relay actually sees
 
@@ -27,7 +35,7 @@ E2EE protects payload + kind (kind is encrypted alongside payload per UNIFIED_PR
 3. **Frame timestamp** — supports timing correlation with off-path captures.
 4. **Payment-proof hash + msat amount** — reveals message-class (chat ≈ 1 msat vs file ≈ 100+ msat) and chains custody to the user's LN node.
 5. **Ciphertext length** — discriminates kind family (64-byte ≈ typing indicator, 4 MB ≈ file). Sizing alone separates chat / call-invite / file / CRDT.
-6. **Signalling kinds 400-499** now travel as paid UKM envelopes; legacy dedicated `Frame` variants (`CallOffer`, `CallAnswer`, `IceCandidate`, `CallEnd`) are decode-compatible but rejected by launch-facing nodes. The relay still sees who is calling whom, when, and SDP/ICE shape unless TURN and padding are used.
+6. **Signalling kinds 400-499** travel as paid, gated UKM envelopes (T2R0a — done in code); the legacy dedicated `Frame` variants (`CallOffer`, `CallAnswer`, `IceCandidate`, `CallEnd`) are decode-compatible but rejected (dropped with a warn) by launch-facing nodes, so there is no unpaid signalling lane. A relay still sees who is calling whom, when, and SDP/ICE shape unless TURN and padding are used — a metadata leak, not a gate bypass.
 7. **TCP source IP** — geolocates the user unless they run Tor.
 8. **Connect/disconnect cadence** — derives sleep schedule, work hours, travel.
 9. **Whitelist membership** — relay knows the user's federation set.
@@ -49,7 +57,7 @@ Items 2, 6, 11 are the loudest.
 ## 4. What Tier-2 Relay does NOT protect
 
 - **Social graph** (§2.2). At 1M nodes, an operator running 1% of relays sees ~10K graphs unaided — enough for cohort analysis and government-of-interest enumeration.
-- **Call presence and call partners** via unpaid signalling frames (§2.6). A subpoena for "did A call B between t1 and t2" is answerable by *any* relay either party used.
+- **Call presence and call partners** via signalling-UKM metadata (§2.6) — the kinds are paid and gated, but the sender/recipient/timing a relay observes still answers "did A call B between t1 and t2." Answerable by *any* relay either party used.
 - **Push side channel** (§2.11). FCM/APNS sees a near-realtime delivery beacon per message. Re-introduces a custodian Signal also has.
 - **LN routing leak** (§2.10). When the relay is also the user's only LN hop, payment hash → recipient pubkey by watching channel updates.
 - **Sleep/work pattern** (§2.8). Survives all crypto changes.
@@ -61,7 +69,7 @@ Items 2, 6, 11 are the loudest.
 | Weakness | Mitigation | At 1M nodes? |
 |---|---|---|
 | Social graph (§2.2) | **Multi-relay fanout, non-overlapping whitelists.** Each outbound frame routed through ≥2 independent relays; no single relay sees the full graph. ~2× bandwidth. | Yes — small vs LN payment cost. |
-| Call presence (§2.6) | **Fold signalling 400-499 inside the payment gate** (e.g., 1 msat). Carry as standard ciphertext UKMs, not parseable `CallOffer` variants. Divergence from `wire.rs`. | Yes; +30-80 ms setup. |
+| Call presence (§2.6) | **Done (T2R0a, 2026-05-29):** signalling 400-499 are folded inside the payment gate (paid UKM), carried as ciphertext UKMs, and the parseable `Call*` frames are rejected. **Residual:** pad signalling to a size bucket + optional TURN to blunt the call-presence/timing metadata a relay still sees. | Yes; +30-80 ms setup. |
 | Push token (§2.11) | **No FCM/APNS in core.** iOS TCP keepalive, Android FCM data-only with empty body, or a user-owned Tor wake-relay. Operator FCM must be opt-in with downgrade warning. | Yes (Android); iOS constrained but viable. |
 | LN routing (§2.10) | **Forbid primary relay from being the user's only LN hop.** Require a second channel. BOLT-12 blinded paths when LDK-ready. | Partial; mesh-hub topology is the near-term answer. |
 | Sleep correlation (§2.8) | **Cover traffic** — random-size heartbeats from every online node; recipient ratchet absorbs silently. | Marginal — only meaningful at >30% participation. |
@@ -81,7 +89,7 @@ Must be cryptographically impossible, not contractually forbidden:
 4. **Pose as the user.** Relay's `Hello` carries its own NodeId. *Current.*
 5. **Silently shadow-ban.** Operator cannot suspend without producing a signed receipt the user can present elsewhere. *Currently policy (ADR-032); needs an architectural signed-receipt protocol — new requirement.*
 6. **See plaintext push bodies.** Only opaque wake-tokens permitted. *Currently policy; must become architectural.*
-7. **Strip or re-route signalling without detection.** Fold signalling into the encrypted gated path, or add end-to-end signed ACKs endpoints can audit. *Divergence from current `wire.rs`.*
+7. **Strip or re-route signalling without detection.** Folding signalling into the encrypted gated path is **done** (paid UKM; legacy `Call*` frames rejected); the remaining delta is end-to-end signed ACKs endpoints can audit so a *relay* cannot drop/re-route signalling unnoticed. *Relay-tier delta, not a current-node gap.*
 
 Items 5/6/7 are deltas. The Five Immutable Principles are silent on them today; tighten as part of accepting Tier-2 Relay.
 
@@ -98,7 +106,7 @@ Items 5/6/7 are deltas. The Five Immutable Principles are silent on them today; 
 | Spam mitigation | Payment gate | Phone number | Apple ID | Captcha |
 | Hostile-operator failure mode | Switch relay, keep identity | Lose history, re-verify | Locked out | Lose history on server |
 
-**Strictly better:** identity portability, kind opacity, multi-relay fanout, payment-gated spam, optional Tor user-leg. **Equivalent:** content E2EE. **Worse without mitigation:** signalling bypasses the gate; LN routing leak is novel; FCM parity is a known Signal weakness we should beat, not match.
+**Strictly better:** identity portability, kind opacity, multi-relay fanout, payment-gated spam (incl. gated signalling), optional Tor user-leg. **Equivalent:** content E2EE. **Worse without mitigation:** LN routing leak is novel; call-presence/timing metadata is visible to a relay even though signalling is now gated (mitigable via padding/TURN); FCM parity is a known Signal weakness we should beat, not match.
 
 ## Cell test
 

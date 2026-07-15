@@ -333,7 +333,6 @@ fn frame_all_capabilities_roundtrip() {
         Capability::X3dh,
         Capability::Mls,
         Capability::FileTransfer,
-        Capability::Relay,
         Capability::Custom("sovereign-browser".to_string()),
     ];
     let frame = Frame::Hello {
@@ -348,10 +347,9 @@ fn frame_all_capabilities_roundtrip() {
     let decoded = Frame::from_bytes(&bytes).unwrap();
     match decoded {
         Frame::Hello { capabilities, .. } => {
-            assert_eq!(capabilities.len(), 6);
+            assert_eq!(capabilities.len(), 5);
             assert!(capabilities.contains(&Capability::Pqxdh));
             assert!(capabilities.contains(&Capability::FileTransfer));
-            assert!(capabilities.contains(&Capability::Relay));
             assert!(capabilities.contains(&Capability::Custom("sovereign-browser".to_string())));
         }
         _ => panic!("expected Hello"),
@@ -539,7 +537,6 @@ fn capability_serde_roundtrip() {
         Capability::X3dh,
         Capability::Mls,
         Capability::FileTransfer,
-        Capability::Relay,
         Capability::Custom("test-cap".to_string()),
     ] {
         let json = serde_json::to_string(&cap).unwrap();

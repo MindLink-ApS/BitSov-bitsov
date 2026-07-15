@@ -29,7 +29,7 @@ use konsensus_api::audit::AuditLog;
 use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use konsensus_api::build_router;
+use common::test_router as build_router;
 
 
 #[tokio::test]

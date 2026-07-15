@@ -107,6 +107,10 @@ pub mod events {
     pub const INVITE_GENERATED: &str = "invite.generated";
     /// Invite token redeemed (peer added from invite).
     pub const INVITE_REDEEMED: &str = "invite.redeemed";
+    /// Mnemonic (recovery seed) read back over the API. The most
+    /// security-sensitive read in the system: this returns the plaintext
+    /// seed phrase, so every attempt (success or failure) is recorded.
+    pub const MNEMONIC_REVEALED: &str = "identity.mnemonic_revealed";
 }
 
 impl AuditLog {

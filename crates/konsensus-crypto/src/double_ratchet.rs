@@ -184,7 +184,7 @@ pub struct DoubleRatchet {
 impl Drop for DoubleRatchet {
     fn drop(&mut self) {
         self.root_key.zeroize();
-        for (_, (key, _)) in self.skipped_keys.iter_mut() {
+        for (key, _) in self.skipped_keys.values_mut() {
             key.zeroize();
         }
     }

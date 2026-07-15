@@ -18,6 +18,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::Argon2;
 use rand::RngCore;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Current format version.
 const FORMAT_VERSION: u8 = 0x01;
@@ -150,16 +151,27 @@ pub fn is_encrypted_path(path: &std::path::Path) -> bool {
 ///
 /// If the file is plaintext (no `.enc` extension), reads it directly.
 /// If encrypted, prompts for the password or uses the provided one.
+///
+/// Returns the phrase wrapped in [`Zeroizing`] so the heap-allocated seed
+/// material is scrubbed from memory when the value is dropped (HARD-9). The
+/// node holds this for its whole process lifetime, so it is the most
+/// important seed string to zeroize.
 pub fn read_mnemonic(
     path: &std::path::Path,
     password: Option<&str>,
-) -> Result<String, MnemonicCryptoError> {
+) -> Result<Zeroizing<String>, MnemonicCryptoError> {
     if is_encrypted_path(path) {
         let encrypted = std::fs::read(path)?;
         let password = password.unwrap_or("");
-        decrypt_mnemonic(&encrypted, password)
+        decrypt_mnemonic(&encrypted, password).map(Zeroizing::new)
     } else {
-        Ok(std::fs::read_to_string(path)?.trim().to_string())
+        // `read_to_string` allocates the full file (incl. the seed) on the
+        // heap. Wrap that buffer in `Zeroizing` immediately so the untrimmed
+        // plaintext is scrubbed on drop, then trim into a second zeroizing
+        // allocation. Both the raw buffer and the trimmed result are wiped —
+        // no residual non-zeroizing seed plaintext (#238).
+        let raw = Zeroizing::new(std::fs::read_to_string(path)?);
+        Ok(Zeroizing::new(raw.trim().to_string()))
     }
 }
 

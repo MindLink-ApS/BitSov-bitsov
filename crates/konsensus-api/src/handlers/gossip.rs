@@ -12,8 +12,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use konsensus_core::types::{PaymentProof, Recipient, Signature};
 use konsensus_core::UkmEnvelopeBuilder;
+use konsensus_core::types::{PaymentProof, Recipient, Signature};
 use konsensus_message::Frame;
 
 use crate::auth::AuthUser;
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn gossip_allowed_kinds_empty_until_paid_broadcast_lands() {
-        assert!(GOSSIP_ALLOWED_KINDS.is_empty());
+        assert_eq!(GOSSIP_ALLOWED_KINDS.len(), 0);
     }
 
     #[test]

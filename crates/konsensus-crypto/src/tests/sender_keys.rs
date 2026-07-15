@@ -492,3 +492,145 @@ fn distribution_for_correct_group_only() {
     assert_eq!(dist.sender, alice_id);
     assert_eq!(dist.generation, 0);
 }
+
+// ─── HARD-10: AEAD associated-data context binding ──────────────────────────
+//
+// The tests below prove that the AEAD *itself* binds a group ciphertext to its
+// (group_id, sender_id, generation, message_number) context, independent of the
+// `process_distribution` group-id check. They do this by forging a distribution
+// that claims the *receiver's* group/sender but carries the *real* chain key —
+// so the receiver derives the correct message key, and the AEAD AAD mismatch is
+// the only thing that can (and must) reject the ciphertext.
+
+/// Re-key a session's view of a sender by injecting a distribution that claims
+/// an arbitrary (group_id, sender) context while carrying a real chain key.
+/// Bypasses the group-id check by stamping the distribution with the receiver
+/// session's own group id, isolating the AEAD layer as the sole defense.
+fn inject_chain_key(
+    receiver: &mut GroupSession,
+    claimed_sender: NodeId,
+    real_chain_key: [u8; 32],
+    signing_key: [u8; 32],
+) {
+    let dist = SenderKeyDistribution {
+        group_id: *receiver.group_id(),
+        sender: claimed_sender,
+        chain_key: real_chain_key,
+        signing_key,
+        generation: 0,
+    };
+    receiver
+        .process_distribution(&dist)
+        .expect("forged-context distribution should register the key");
+}
+
+#[test]
+fn aead_binds_ciphertext_to_group_context() {
+    // Same sender, same chain key, *different group* => AEAD must reject.
+    let group_a = [0xA1; 32];
+    let group_b = [0xB2; 32];
+    let alice_id = make_node_id(1);
+    let bob_id = make_node_id(2);
+
+    // Alice encrypts in group A.
+    let mut alice_a = GroupSession::new(group_a, alice_id);
+    let dist_a = alice_a.our_distribution();
+    let ct = alice_a.encrypt(b"group-a-secret").unwrap();
+
+    // A receiver in group B gets Alice's *real* chain key, but stamped with
+    // group B's id (so the group-id check passes). Only the AEAD AAD differs.
+    let mut bob_b = GroupSession::new(group_b, bob_id);
+    inject_chain_key(&mut bob_b, alice_id, dist_a.chain_key, dist_a.signing_key);
+
+    let result = bob_b.decrypt(&alice_id, &ct);
+    assert!(
+        matches!(result, Err(SenderKeyError::DecryptionFailed(_))),
+        "group A ciphertext must fail to decrypt in group B context, got {result:?}",
+    );
+
+    // Control: in the correct group, the same key/ciphertext decrypts fine.
+    let mut bob_a = GroupSession::new(group_a, bob_id);
+    bob_a.process_distribution(&dist_a).unwrap();
+    assert_eq!(bob_a.decrypt(&alice_id, &ct).unwrap(), b"group-a-secret");
+}
+
+#[test]
+fn aead_binds_ciphertext_to_sender_identity() {
+    // Same group, same chain key, *different claimed sender* => AEAD must reject.
+    let group_id = test_group_id();
+    let alice_id = make_node_id(1);
+    let mallory_id = make_node_id(7);
+    let bob_id = make_node_id(2);
+
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let dist = alice.our_distribution();
+    let ct = alice.encrypt(b"from-alice").unwrap();
+
+    // Bob registers Alice's real chain key but *attributed to Mallory*.
+    let mut bob = GroupSession::new(group_id, bob_id);
+    inject_chain_key(&mut bob, mallory_id, dist.chain_key, dist.signing_key);
+
+    // Decrypting Alice's ciphertext as if it came from Mallory must fail: the
+    // AAD binds the producing sender id, which the receiver re-derives from the
+    // claimed sender. Mallory's id != Alice's id => tag mismatch.
+    let result = bob.decrypt(&mallory_id, &ct);
+    assert!(
+        matches!(result, Err(SenderKeyError::DecryptionFailed(_))),
+        "ciphertext must not decrypt under a different sender identity, got {result:?}",
+    );
+}
+
+#[test]
+fn aead_binds_ciphertext_to_message_number() {
+    // The message_number counter is bound at two layers: the Ed25519 signature
+    // (checked first) and, underneath it, the AEAD AAD. This test confirms a
+    // counter rewrite is rejected; the signature layer fires first, and the AAD
+    // is the defense-in-depth that would still reject even if a valid signature
+    // somehow existed for the wrong counter.
+    let group_id = test_group_id();
+    let alice_id = make_node_id(1);
+    let bob_id = make_node_id(2);
+
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    let dist = alice.our_distribution();
+    bob.process_distribution(&dist).unwrap();
+
+    let ct0 = alice.encrypt(b"message-zero").unwrap();
+    let _ct1 = alice.encrypt(b"message-one").unwrap();
+
+    // Rewrite ct0's counter to a value the receiver can still ratchet to.
+    let mut rewritten = ct0.clone();
+    rewritten.message_number = ct0.message_number + 1;
+
+    let result = bob.decrypt(&alice_id, &rewritten);
+    assert!(
+        result.is_err(),
+        "ciphertext with a rewritten message_number must be rejected, got {result:?}",
+    );
+}
+
+#[test]
+fn aead_roundtrip_same_context_succeeds() {
+    // Sanity: the AAD binding does not break the happy path even across many
+    // messages and a generation rotation.
+    let group_id = test_group_id();
+    let alice_id = make_node_id(1);
+    let bob_id = make_node_id(2);
+
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+
+    for i in 0..10u32 {
+        let txt = format!("ctx-msg-{i}");
+        let ct = alice.encrypt(txt.as_bytes()).unwrap();
+        assert_eq!(bob.decrypt(&alice_id, &ct).unwrap(), txt.as_bytes());
+    }
+
+    // Rotate generation and continue.
+    alice.remove_member(&make_node_id(99));
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+    let ct = alice.encrypt(b"post-rotation").unwrap();
+    assert_eq!(bob.decrypt(&alice_id, &ct).unwrap(), b"post-rotation");
+}

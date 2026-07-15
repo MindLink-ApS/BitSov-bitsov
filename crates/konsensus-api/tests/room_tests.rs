@@ -29,7 +29,7 @@ use konsensus_api::audit::AuditLog;
 use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use konsensus_api::build_router;
+use common::test_router as build_router;
 
 
 #[tokio::test]
@@ -817,4 +817,203 @@ async fn room_metadata_accepts_small_json() {
         StatusCode::OK,
         "small room metadata should be accepted"
     );
+}
+
+// ─── Room fan-out routes pricing through the single discounted choke point ──
+//
+// Regression guard for the HARD-13 single-choke-point money path as applied to
+// the HARD-12 bounded room fan-out. Each room member must be charged its
+// *single* trust-discounted price — never the undiscounted base (no-discount
+// drift) and never the discount applied twice (double-discount drift).
+//
+// We drive a real room compose end-to-end through the HTTP handler. The stub
+// Lightning keysend echoes back exactly the amount it is asked to pay, so the
+// `amount_msat` the handler reports — and the per-member `payment_proof` amounts
+// on the delivered envelopes — equal the prices the fan-out computed. We pick
+// per-member base prices and discounts whose single-, double-, and no-discount
+// totals are all distinct, so the assertion uniquely pins "exactly one discount
+// per member, applied through the choke point."
+#[tokio::test]
+async fn room_fanout_charges_single_discounted_price_per_member() {
+    use konsensus_pricing::apply_trust_discount;
+
+    // ── Two distinct room members, each with a live sender E2EE session ──
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
+    // Distinct mnemonics → distinct NodeIds, neither equal to our own node id
+    // (which is derived from the standard "abandon…about" test mnemonic), so
+    // neither member is skipped as "self".
+    let member_a = setup_e2ee_session_with_mnemonic(
+        &session_manager,
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+    )
+    .await;
+    let member_b = setup_e2ee_session_with_mnemonic(
+        &session_manager,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )
+    .await;
+    assert_ne!(member_a, member_b, "members must be distinct");
+
+    // ── Connected transport so the keysend path (gated on is_connected) fires ──
+    let invoice_requests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let transport = Arc::new(ConnectedStubTransport::new(
+        vec![member_a, member_b],
+        Arc::clone(&invoice_requests),
+    ));
+
+    let identity = Arc::new(test_identity());
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let storage = Arc::new(MemStorage::new());
+
+    let state = Arc::new(AppState {
+        identity: Arc::clone(&identity),
+        storage: storage.clone() as Arc<dyn Storage>,
+        lightning: Arc::new(StubLightning),
+        chain: Arc::new(StubChain),
+        pricing: Arc::new(StubPricing),
+        gate: Arc::new(PaymentGate::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        transport: transport.clone() as Arc<dyn MessageTransport>,
+        session_manager: Arc::clone(&session_manager),
+        jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        cors_enabled: false,
+        operator_probes_enabled: true,
+        sensitive_identity_routes_enabled: true,
+        ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
+        rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
+        audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
+        started_at: std::time::Instant::now(),
+        content_dir: None,
+        web_page_price_msat: None,
+        peer_prices: Arc::new(konsensus_pricing::PeerPriceCache::new()),
+        routing: Arc::new(konsensus_routing::RoutingTable::with_defaults()),
+        plaintext_cipher: None,
+        send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        invoice_requests: Arc::clone(&invoice_requests),
+        data_dir: None,
+        backup_dir: None,
+        peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        lightning_backend: "mock".into(),
+        chain_backend: "mock".into(),
+        gossip_validator: None,
+    });
+
+    // Register Lightning pubkeys so the keysend path (which echoes the amount)
+    // is taken for both members.
+    {
+        let mut pks = state.peer_ln_pubkeys.lock().await;
+        pks.insert(member_a, "02aaaa".repeat(5));
+        pks.insert(member_b, "02bbbb".repeat(5));
+    }
+
+    // ── Announce per-member price tables with distinct base + discount ──
+    //
+    // StubChain reports block height 850_000; tables anchored there with 144
+    // valid blocks are fresh (not stale). Kind 1 maps to the "communication"
+    // category.
+    const KIND: u16 = 1;
+    const BASE_A: u64 = 10_000; // discount 0.5  → single 5_000
+    const DISCOUNT_A: f64 = 0.5;
+    const BASE_B: u64 = 8_000; // discount 0.25 → single 6_000
+    const DISCOUNT_B: f64 = 0.25;
+
+    let mut prices_a = HashMap::new();
+    prices_a.insert("communication".to_string(), BASE_A);
+    state
+        .peer_prices
+        .update(member_a, prices_a, 850_000, 144, DISCOUNT_A)
+        .await;
+
+    let mut prices_b = HashMap::new();
+    prices_b.insert("communication".to_string(), BASE_B);
+    state
+        .peer_prices
+        .update(member_b, prices_b, 850_000, 144, DISCOUNT_B)
+        .await;
+
+    // Expected per-member single-discounted prices (the choke-point value),
+    // floored to the minimum invoice amount the keysend path enforces.
+    const MIN_INVOICE_AMOUNT_MSAT: u64 = 1_000;
+    let expected_a = apply_trust_discount(BASE_A, DISCOUNT_A).max(MIN_INVOICE_AMOUNT_MSAT);
+    let expected_b = apply_trust_discount(BASE_B, DISCOUNT_B).max(MIN_INVOICE_AMOUNT_MSAT);
+    let expected_total = expected_a + expected_b;
+    assert_eq!(expected_a, 5_000);
+    assert_eq!(expected_b, 6_000);
+    assert_eq!(expected_total, 11_000);
+
+    // Sanity: the drift values we are guarding against are all distinct from the
+    // correct total, so the equality assertion below is discriminating.
+    let double_total = apply_trust_discount(apply_trust_discount(BASE_A, DISCOUNT_A), DISCOUNT_A)
+        .max(MIN_INVOICE_AMOUNT_MSAT)
+        + apply_trust_discount(apply_trust_discount(BASE_B, DISCOUNT_B), DISCOUNT_B)
+            .max(MIN_INVOICE_AMOUNT_MSAT);
+    let no_discount_total =
+        BASE_A.max(MIN_INVOICE_AMOUNT_MSAT) + BASE_B.max(MIN_INVOICE_AMOUNT_MSAT);
+    assert_ne!(double_total, expected_total, "double-discount must differ");
+    assert_ne!(no_discount_total, expected_total, "no-discount must differ");
+
+    // ── Create the room and add both members ──
+    let room = Room::new("fanout-pricing".to_string(), *identity.node_id());
+    let room_id = room.id;
+    state.storage.create_room(&room).await.unwrap();
+    state.storage.add_room_member(&room_id, &member_a).await.unwrap();
+    state.storage.add_room_member(&room_id, &member_b).await.unwrap();
+
+    // ── Compose to the room over HTTP ──
+    let auth = auth_header(&state);
+    let app = build_router(Arc::clone(&state));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/messages/compose")
+        .header("authorization", &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "recipient": room_id.to_string(),
+                "is_room": true,
+                "kind": KIND,
+                "plaintext": "fan this out to every member"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "room compose should succeed");
+
+    let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // The summed amount across the fan-out must equal the single-discount total.
+    assert_eq!(
+        json["amount_msat"].as_u64().unwrap(),
+        expected_total,
+        "room fan-out total must be the single-discount sum (no double / no-discount drift)"
+    );
+    assert_eq!(json["delivered"], true, "both connected members delivered");
+
+    // Per-member proof: each delivered envelope's payment proof equals that
+    // member's single-discounted price — proving the discount was applied once
+    // per member through the choke point, not skipped and not compounded.
+    let sent = transport.sent_envelopes.lock().unwrap();
+    assert_eq!(sent.len(), 2, "exactly one envelope per member");
+    for (peer, envelope) in sent.iter() {
+        let want = if *peer == member_a {
+            expected_a
+        } else if *peer == member_b {
+            expected_b
+        } else {
+            panic!("envelope sent to an unexpected peer: {}", peer.to_hex());
+        };
+        assert_eq!(
+            envelope.payment_proof.amount_msat, want,
+            "member {} must be charged its single-discounted price",
+            peer.to_hex()
+        );
+    }
 }

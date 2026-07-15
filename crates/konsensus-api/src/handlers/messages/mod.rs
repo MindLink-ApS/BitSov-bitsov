@@ -34,6 +34,7 @@ pub use send::{SendMessageRequest, SendMessageResponse};
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/messages", post(send::send_message).get(query::list_messages))
+        .route("/api/v1/messages/search", get(query::search_messages))
         .route("/api/v1/messages/compose", post(compose::compose_message))
         .route("/api/v1/messages/resync", post(resync::resync_messages))
         .route(

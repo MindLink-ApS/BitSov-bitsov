@@ -275,14 +275,15 @@ fn kind_category_boundary_values() {
 
 #[test]
 fn kind_category_gap_ranges_are_unknown() {
-    // 600-899 are unassigned — should be Unknown
-    for kind in [600, 700, 800, 899] {
+    // 600-699 is now the relay Storage category (T2R3); 700-899 stays reserved.
+    for kind in [700, 800, 899] {
         assert_eq!(
             KindCategory::from_kind(kind),
             KindCategory::Unknown,
             "kind {kind} should be Unknown"
         );
     }
+    assert_eq!(KindCategory::from_kind(600), KindCategory::Storage);
 }
 
 #[test]

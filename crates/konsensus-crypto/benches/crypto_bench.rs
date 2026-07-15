@@ -5,9 +5,11 @@
 //! 2. Noise encrypt/decrypt (transport layer)
 //! 3. X3DH key agreement (one-time per session)
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use ed25519_dalek::Signer;
 use konsensus_crypto::noise::NoiseSession;
-use konsensus_crypto::x3dh;
+use konsensus_crypto::x3dh::{self, OneTimePreKey, SignedPreKey};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Complete a Noise_XX handshake between two sessions, returning transport-ready sessions.
 fn make_noise_pair() -> (NoiseSession, NoiseSession) {
@@ -108,30 +110,45 @@ fn bench_noise_roundtrip(c: &mut Criterion) {
 fn bench_x3dh_key_agreement(c: &mut Criterion) {
     c.bench_function("X3DH key agreement (initiate + respond)", |b| {
         b.iter(|| {
-            let alice_ik = x3dh::IdentityKeyPair::generate();
-            let bob_ik = x3dh::IdentityKeyPair::generate();
-            let bob_spk = x3dh::SignedPreKeyPair::generate(1);
-            let bob_opk = x3dh::SignedPreKeyPair::generate(2);
+            let alice_identity_secret = StaticSecret::random_from_rng(rand::thread_rng());
+            let alice_identity_public = PublicKey::from(&alice_identity_secret);
+            let bob_identity_secret = StaticSecret::random_from_rng(rand::thread_rng());
+            let bob_identity_public = PublicKey::from(&bob_identity_secret);
+            let bob_signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            let bob_spk = SignedPreKey::generate();
+            let bob_opk = OneTimePreKey::generate(2);
 
+            let signed_prekey_sig = bob_signing_key.sign(bob_spk.public.as_bytes());
             let bob_bundle = x3dh::PrekeyBundle {
-                identity_key: *bob_ik.secret().diffie_hellman(&x25519_dalek::X25519_BASEPOINT_BYTES.into()).as_bytes(),
-                signed_prekey: *bob_spk.secret().diffie_hellman(&x25519_dalek::X25519_BASEPOINT_BYTES.into()).as_bytes(),
-                one_time_prekey: Some(*bob_opk.secret().diffie_hellman(&x25519_dalek::X25519_BASEPOINT_BYTES.into()).as_bytes()),
-                signed_prekey_id: 1,
-                one_time_prekey_id: Some(2),
+                identity_key: bob_identity_public,
+                signed_prekey: bob_spk.public,
+                signed_prekey_sig,
+                identity_verifying_key: bob_signing_key.verifying_key(),
+                one_time_prekey: Some(bob_opk.public),
+                one_time_prekey_id: Some(bob_opk.id),
             };
 
-            // This tests the ECDH computation cost, which is the bottleneck
-            let _alice_ek = x3dh::SignedPreKeyPair::generate(0);
-            black_box(&bob_bundle);
+            let initiation =
+                x3dh::initiate(&alice_identity_secret, &alice_identity_public, &bob_bundle)
+                    .expect("initiate");
+            let response = x3dh::respond(
+                &bob_identity_secret,
+                &bob_identity_public,
+                &bob_spk,
+                Some(&bob_opk),
+                &initiation.identity_key,
+                &initiation.ephemeral_key,
+            )
+            .expect("respond");
+            black_box((initiation.shared_secret, response));
         });
     });
 }
 
 fn bench_x3dh_key_generation(c: &mut Criterion) {
-    c.bench_function("X3DH::IdentityKeyPair::generate", |b| {
+    c.bench_function("X3DH::StaticSecret::random_from_rng", |b| {
         b.iter(|| {
-            black_box(x3dh::IdentityKeyPair::generate());
+            black_box(StaticSecret::random_from_rng(rand::thread_rng()));
         });
     });
 }

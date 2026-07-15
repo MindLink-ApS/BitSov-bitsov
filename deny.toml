@@ -1,0 +1,157 @@
+# cargo-deny configuration for BitSov v2 (PT-5)
+#
+# GOAL: BLOCKING supply-chain advisory scanning. `cargo deny check advisories`
+# fails the build on any known security vulnerability (RUSTSEC) in the locked
+# dependency graph. This closes the prior fail-open gate where cargo-audit ran
+# with `continue-on-error: true` / `|| true` and never gated anything.
+#
+# SCOPE NOTE: This wires *automated advisory blocking* only. It is NOT a manual
+# third-party security audit. ldk-node and snow (and the rest of the crypto /
+# Lightning surface) still require a paid external audit before any GA claim.
+# See docs/security/supply-chain-audit-scope.md.
+#
+# DESIGN: advisories are the gate. [bans] and [licenses] are kept deliberately
+# permissive so they do NOT false-positive the existing dependency tree (the
+# workspace knowingly carries duplicate major versions of thiserror, tungstenite,
+# etc. — see the comments in the root Cargo.toml). We are not running a license
+# crusade here; we are blocking known CVEs.
+#
+# GREEN-BUT-HONEST: trivially-fixable advisories are REMEDIATED, not silenced
+# (rand 0.8.5 → 0.8.6 closed RUSTSEC-2026-0097 in this PR). The handful that are
+# genuinely unfixable today — all gated by the single documented `sqlx = "=0.8.0"`
+# / ldk-node 0.7 rusqlite pin — are listed in `[advisories].ignore` below WITH a
+# per-entry `reason` (crate, path, why-deferred, tracking ref) and mirrored as the
+# explicit known-debt set in docs/security/supply-chain-audit-scope.md. The gate
+# therefore EXITS 0 on current main without hiding anything: the exception policy
+# IS the diff.
+#
+# Schema target: cargo-deny >= 0.14 (the `vulnerability` / `severity-threshold`
+# fields were REMOVED upstream and now emit errors, so they are intentionally
+# absent — vulnerabilities are always hard errors for `check advisories`).
+
+[graph]
+# Evaluate the dependency graph across the platforms BitSov ships binaries for
+# (Linux x86_64/aarch64 CLI + macOS/Windows desktop). Restricting targets keeps
+# the advisory surface focused on code we actually compile and ship.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+# ── Advisories: THE GATE ──────────────────────────────────────────────────────
+# `cargo deny check advisories` errors on any RUSTSEC vulnerability in the graph.
+# That behaviour is not opt-out — it is the whole point of this file.
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# Fail the build only when a *workspace-direct* dependency is flagged
+# unmaintained. Transitive unmaintained crates we cannot control (e.g. pulled in
+# by ldk-node) produce warnings, not hard failures — conservative on purpose so
+# advisory blocking lands without churn from upstream maintenance status.
+unmaintained = "workspace"
+# A transient yank should not red-wall the whole pipeline; warn loudly instead.
+# Real vulnerabilities (the thing we care about) gate regardless of this knob.
+yanked = "warn"
+# Warn (don't silently pass) if an ignore entry below stops matching anything.
+# When the underlying pin (ldk-node 0.7 → rusqlite 0.31 → libsqlite3-sys 0.28,
+# which forces sqlx =0.8.0 and rustls 0.21 → rustls-webpki 0.101.7) is finally
+# bumped, these ignores stop matching and this warning fires so the suppressions
+# do not rot silently.
+unused-ignored-advisory = "warn"
+# Ignore list = the EXPLICIT, REVIEWED known-debt set.
+#
+# Every entry below is (a) genuinely reachable in the locked graph, (b) NOT
+# remediable by a safe lockfile bump today, and (c) gated by a single documented
+# root constraint: the `sqlx = "=0.8.0"` pin in the root Cargo.toml, forced by
+# `ldk-node 0.7.0` → `rusqlite 0.31` → `libsqlite3-sys 0.28` (sqlx 0.8.1+ needs
+# libsqlite3-sys >=0.30). Bumping any of them requires an `ldk-node` upgrade, an
+# architectural change tracked for the third-party audit / dependency-bump
+# follow-up (see docs/security/supply-chain-audit-scope.md), NOT a CI-gate task.
+#
+# Anything trivially fixable was BUMPED instead of ignored (rand 0.8.5 → 0.8.6
+# closed RUSTSEC-2026-0097 in this same PR). We ignore ONLY the unfixable-now set.
+# Each entry carries a `reason` per cargo-deny schema; no bare IDs.
+ignore = [
+    # RUSTSEC-2024-0363 — sqlx 0.8.0: protocol-level SQL smuggling via a length-
+    # prefix overflow on values > 4 GiB. Reaches konsensus-storage. Deferred: the
+    # `=0.8.0` pin is forced by ldk-node 0.7's rusqlite/libsqlite3-sys 0.28
+    # constraint (root Cargo.toml); 0.8.1 is the fix but is currently unbuildable.
+    # Exploit path is the Postgres/MySQL binary protocol; SQLite (our default
+    # backend) is not believed exploitable per the advisory. Inputs >4 GiB are not
+    # reachable in current call sites. Clear when ldk-node bumps rusqlite to >=0.32.
+    # Tracking: docs/security/supply-chain-audit-scope.md (known-debt table).
+    { id = "RUSTSEC-2024-0363", reason = "sqlx =0.8.0 pinned by ldk-node 0.7 rusqlite/libsqlite3-sys 0.28; SQLite backend unaffected (Postgres/MySQL only); fix 0.8.1 needs libsqlite3-sys >=0.30. Tracked in supply-chain-audit-scope.md." },
+
+    # RUSTSEC-2026-0098 — rustls-webpki 0.101.7: URI-name constraints incorrectly
+    # accepted. The 0.101.7 copy rides rustls 0.21 via sqlx-core 0.8.0 (same sqlx
+    # pin above) and dev-only electrsd→minreq. Reachable only AFTER signature
+    # verification and requires a misissued certificate to exploit; this library
+    # exposes no URI-name assertion API to us. A patched webpki 0.103.13 is already
+    # in the tree on the rustls 0.23 path; the old 0.101 cannot move until rustls
+    # 0.21 leaves the graph (sqlx bump). Clear with the sqlx/ldk-node bump.
+    # Tracking: docs/security/supply-chain-audit-scope.md (known-debt table).
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 via rustls 0.21 ← sqlx-core 0.8.0 (pinned) + dev-only electrsd; reachable only post-sig-verify with a misissued cert, no URI-name API used. Fix needs rustls 0.21 out of graph. Tracked in supply-chain-audit-scope.md." },
+
+    # RUSTSEC-2026-0099 — rustls-webpki 0.101.7: DNS-name constraint accepted for a
+    # wildcard cert. Same crate/path/pin as -0098. Reachable only after signature
+    # verification and requires misissuance. Clear with the sqlx/ldk-node bump.
+    # Tracking: docs/security/supply-chain-audit-scope.md (known-debt table).
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 via rustls 0.21 ← sqlx-core 0.8.0 (pinned) + dev-only electrsd; reachable only post-sig-verify with a misissued wildcard cert. Same root pin as RUSTSEC-2026-0098. Tracked in supply-chain-audit-scope.md." },
+
+    # RUSTSEC-2026-0104 — rustls-webpki 0.101.7: reachable panic parsing a CRL with
+    # an empty BIT STRING in onlySomeReasons. Same crate/path/pin as -0098/-0099.
+    # "Applications that do not use CRLs are not affected" — BitSov does not parse
+    # certificate revocation lists. Clear with the sqlx/ldk-node bump.
+    # Tracking: docs/security/supply-chain-audit-scope.md (known-debt table).
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 via rustls 0.21 ← sqlx-core 0.8.0 (pinned) + dev-only electrsd; CRL-parsing panic and BitSov does not parse CRLs. Same root pin as RUSTSEC-2026-0098. Tracked in supply-chain-audit-scope.md." },
+]
+
+# ── Bans: permissive (do NOT false-positive the existing tree) ─────────────────
+# The workspace knowingly carries duplicate major versions (thiserror 1.x + 2.x,
+# tungstenite, displaydoc, etc.) forced by ldk-node 0.7 / sqlx 0.8 / axum 0.7
+# pins documented in the root Cargo.toml. Denying multiple-versions here would
+# false-positive immediately, so we allow it. This file is an advisory gate, not
+# a duplicate-dependency crusade.
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+allow = []
+deny = []
+
+# ── Sources: registry hygiene (conservative) ──────────────────────────────────
+# All current deps come from crates.io. Deny unknown registries/git sources so a
+# supply-chain swap to an untrusted source is caught — without listing any
+# allow-exceptions, since today the tree has none.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# ── Licenses: permissive allow-list (no license crusade) ───────────────────────
+# Only evaluated by `cargo deny check licenses` (NOT by the blocking advisories
+# job). Provided so the file is complete and a future licenses run does not
+# false-positive the permissive licenses the current dependency tree actually
+# uses (MIT / Apache-2.0 / BSD / ISC / Unicode / Zlib family + the few common
+# permissive variants pulled in transitively).
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "0BSD",
+    "MPL-2.0",
+    "BSL-1.0",
+    "OpenSSL",
+]
+exceptions = []

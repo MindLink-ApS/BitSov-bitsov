@@ -79,7 +79,7 @@ fn write_and_read_plaintext() {
     assert_eq!(final_path, path);
 
     let read = read_mnemonic(&final_path, None).unwrap();
-    assert_eq!(read, mnemonic);
+    assert_eq!(read.as_str(), mnemonic);
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn write_and_read_encrypted() {
     assert_eq!(final_path.extension().unwrap(), "enc");
 
     let read = read_mnemonic(&final_path, Some(password)).unwrap();
-    assert_eq!(read, mnemonic);
+    assert_eq!(read.as_str(), mnemonic);
 
     // Wrong password should fail
     let result = read_mnemonic(&final_path, Some("wrong"));

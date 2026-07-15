@@ -63,6 +63,66 @@ impl NoiseTransport {
         Ok(())
     }
 
+    /// M1b promote-on-paid: flip a connection's `privileged` flag to `true`.
+    ///
+    /// Called by the message-plane handler AFTER the PaymentGate accepts a PAID,
+    /// M2-recipient-bound UKM from `peer`. The peer map is keyed by the
+    /// AUTHENTICATED federation NodeId, so passing `envelope.sender` here promotes
+    /// ONLY the connection that authenticated as that sender — a relayer that
+    /// forwards someone else's payment proof cannot promote its own connection
+    /// (the binding `envelope.sender == connection.peer_id`).
+    ///
+    /// Returns `true` if a connection keyed by `peer` existed and was flipped (or
+    /// was already privileged), `false` if no such connection is live. The flip is
+    /// in-memory and effective on the NEXT frame the reader stamps for that
+    /// connection. Durable persistence of the promotion is a follow-up; an
+    /// unprivileged reconnect simply re-runs the one-invoice admission pay-loop.
+    pub async fn promote_to_privileged(&self, peer: &NodeId) -> bool {
+        let conn = {
+            let peers = self.peers.read().await;
+            match peers.get(peer) {
+                Some(c) => Arc::clone(c),
+                None => return false,
+            }
+        };
+        let mut conn = conn.lock().await;
+        if !conn.privileged {
+            conn.privileged = true;
+            info!(peer = %peer, "promoted connection to privileged after settled payment (M1b)");
+        }
+        true
+    }
+
+    /// Connected peers that are currently **privileged** — whitelisted in
+    /// `Whitelist` mode, or promoted by a settled, recipient-bound payment in
+    /// `PriceOpen` (the same `conn.privileged` flag [`promote_to_privileged`]
+    /// flips and the reader stamps onto control events).
+    ///
+    /// The E2EE self-heal loop iterates THIS — never `connected_peers` — so the
+    /// node never proactively ships its X3DH prekey bundle to an unpaid PriceOpen
+    /// stranger. The `PeerConnected` path already withholds the prekey from
+    /// unprivileged peers, but the periodic self-heal would otherwise re-offer it
+    /// to every connected peer regardless of privilege (P2: no free X3DH before
+    /// payment — no prekey before settlement).
+    ///
+    /// [`promote_to_privileged`]: NoiseTransport::promote_to_privileged
+    pub async fn connected_privileged_peers(&self) -> Vec<NodeId> {
+        // Scoped-clone the Arcs first so the `peers` read guard is not held across
+        // each `conn.lock().await` (same lock-ordering discipline as `send_frame`
+        // and `promote_to_privileged`).
+        let conns: Vec<(NodeId, Arc<Mutex<PeerConnection>>)> = {
+            let peers = self.peers.read().await;
+            peers.iter().map(|(id, c)| (*id, Arc::clone(c))).collect()
+        };
+        let mut privileged = Vec::with_capacity(conns.len());
+        for (id, conn) in conns {
+            if conn.lock().await.privileged {
+                privileged.push(id);
+            }
+        }
+        privileged
+    }
+
     /// Send raw bytes to a peer (for testing frame validation budget).
     ///
     /// Encrypts arbitrary bytes through the Noise channel without frame validation.
@@ -161,21 +221,27 @@ pub(super) fn spawn_reader_task(
                         let mut conn = conn.lock().await;
                         let now = Instant::now();
 
-                        // Reset counter if the window has expired
-                        if now.duration_since(conn.invalid_frame_window_start)
-                            >= INVALID_FRAME_WINDOW
-                        {
-                            conn.invalid_frame_count = 0;
-                            conn.invalid_frame_window_start = now;
-                        }
+                        // Decay-only leaky bucket. Drain tokens for the real time
+                        // elapsed since the last update, then add one for this bad
+                        // frame. The level is sticky — valid frames never touch it —
+                        // so interleaving cheap valid frames cannot refill the
+                        // bad-frame allowance (the reset-on-valid bypass).
+                        let leak_per_sec =
+                            INVALID_FRAME_BUDGET as f64 / INVALID_FRAME_WINDOW.as_secs_f64();
+                        let elapsed = now
+                            .duration_since(conn.invalid_frame_last_leak)
+                            .as_secs_f64();
+                        conn.invalid_frame_level =
+                            (conn.invalid_frame_level - leak_per_sec * elapsed).max(0.0);
+                        conn.invalid_frame_last_leak = now;
 
-                        conn.invalid_frame_count += 1;
-                        let count = conn.invalid_frame_count;
+                        conn.invalid_frame_level += 1.0;
+                        let level = conn.invalid_frame_level;
 
-                        if count > INVALID_FRAME_BUDGET {
+                        if level > INVALID_FRAME_BUDGET as f64 {
                             warn!(
                                 peer = %peer_id,
-                                invalid_count = count,
+                                invalid_level = level,
                                 error = %e,
                                 "frame validation budget exceeded — disconnecting and banning peer"
                             );
@@ -183,7 +249,7 @@ pub(super) fn spawn_reader_task(
                         } else {
                             warn!(
                                 peer = %peer_id,
-                                invalid_count = count,
+                                invalid_level = level,
                                 budget = INVALID_FRAME_BUDGET,
                                 error = %e,
                                 "invalid frame (budget warning)"
@@ -204,13 +270,23 @@ pub(super) fn spawn_reader_task(
                 }
             };
 
-            // Valid frame received — reset invalid frame counter
-            {
+            // Valid frame received — record liveness for keepalive. We deliberately
+            // do NOT drain the invalid-frame leaky bucket here: that bucket is
+            // decay-only and falls solely with elapsed real time. Resetting it on a
+            // valid frame would let an attacker interleave one cheap valid frame
+            // between bursts of garbage to keep the bad-frame allowance topped up
+            // forever (the reset-on-valid bypass this fix closes).
+            //
+            // M1b: snapshot `privileged` under the SAME lock so the dangerous
+            // ControlEvent variants below carry the connection's CURRENT privilege.
+            // promote_to_privileged flips this flag; reading it per frame means a
+            // promotion is honoured on the very next frame. In Whitelist mode this
+            // is always `true`, so every stamped arm behaves byte-identically.
+            let privileged = {
                 let mut conn = conn.lock().await;
                 conn.last_recv = Instant::now();
-                conn.invalid_frame_count = 0;
-                conn.invalid_frame_window_start = Instant::now();
-            }
+                conn.privileged
+            };
 
             // Handle frame
             match frame {
@@ -251,6 +327,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::MessageAcked {
                             peer_id,
                             message_id: id,
+                            privileged,
                         })
                         .await
                     {
@@ -264,6 +341,7 @@ pub(super) fn spawn_reader_task(
                             peer_id,
                             message_id: id,
                             reason,
+                            privileged,
                         })
                         .await
                     {
@@ -276,6 +354,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::PrekeyOffer {
                             peer_id,
                             bundle,
+                            privileged,
                         })
                         .await
                     {
@@ -288,6 +367,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::SessionInit {
                             peer_id,
                             init_data,
+                            privileged,
                         })
                         .await
                     {
@@ -297,7 +377,7 @@ pub(super) fn spawn_reader_task(
                 Frame::SessionAck => {
                     debug!(peer = %peer_id, "received session ack");
                     if let Err(e) = control_tx
-                        .send(ControlEvent::SessionAck { peer_id })
+                        .send(ControlEvent::SessionAck { peer_id, privileged })
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send SessionAck control event");
@@ -309,6 +389,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::RatchetInit {
                             peer_id,
                             payload,
+                            privileged,
                         })
                         .await
                     {
@@ -329,6 +410,7 @@ pub(super) fn spawn_reader_task(
                             request_id,
                             amount_msat,
                             purpose,
+                            privileged,
                         })
                         .await
                     {
@@ -365,6 +447,7 @@ pub(super) fn spawn_reader_task(
                             peer_id,
                             request_id,
                             reason,
+                            privileged,
                         })
                         .await
                     {
@@ -383,6 +466,7 @@ pub(super) fn spawn_reader_task(
                             peer_id,
                             ln_pubkey,
                             ln_addr,
+                            privileged,
                         })
                         .await
                     {
@@ -404,6 +488,7 @@ pub(super) fn spawn_reader_task(
                             block_height,
                             valid_blocks,
                             trust_discount,
+                            privileged,
                         })
                         .await
                     {
@@ -416,6 +501,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::PriceQueryReceived {
                             peer_id,
                             kind,
+                            privileged,
                         })
                         .await
                     {
@@ -436,6 +522,7 @@ pub(super) fn spawn_reader_task(
                             kind,
                             price_msat,
                             block_height,
+                            privileged,
                         })
                         .await
                     {
@@ -445,7 +532,7 @@ pub(super) fn spawn_reader_task(
                 Frame::PeerExchangeRequest => {
                     debug!(peer = %peer_id, "received peer exchange request");
                     if let Err(e) = control_tx
-                        .send(ControlEvent::PeerExchangeRequested { peer_id })
+                        .send(ControlEvent::PeerExchangeRequested { peer_id, privileged })
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send PeerExchangeRequested control event");
@@ -457,7 +544,7 @@ pub(super) fn spawn_reader_task(
                     let peers: Vec<_> = peers.into_iter().take(50).collect();
                     debug!(peer = %peer_id, count, "received peer exchange response");
                     if let Err(e) = control_tx
-                        .send(ControlEvent::PeerExchangeReceived { peer_id, peers })
+                        .send(ControlEvent::PeerExchangeReceived { peer_id, peers, privileged })
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send PeerExchangeReceived control event");
@@ -475,6 +562,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::GossipReceived {
                             from_peer: peer_id,
                             envelope,
+                            privileged,
                         })
                         .await
                     {

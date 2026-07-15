@@ -13,6 +13,7 @@ ldk-integration-test = ["dep:electrsd"]
 konsensus-core = { path = "../konsensus-core" }
 tokio.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 thiserror.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -27,6 +28,7 @@ ldk-node.workspace = true
 bip39.workspace = true
 bitcoin.workspace = true
 blake3.workspace = true
+zeroize.workspace = true
 rusqlite = "0.31"
 electrsd = { version = "0.36", features = ["corepc-node_28_2", "esplora_a33e97e1"], optional = true }
 

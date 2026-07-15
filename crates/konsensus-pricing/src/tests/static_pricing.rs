@@ -78,21 +78,50 @@ async fn web_content_price() {
 }
 
 #[tokio::test]
-async fn relay_storage_category_price() {
+async fn unknown_kind_not_priceable() {
     let e = engine();
-    assert_eq!(
-        e.get_category_price_msat(KindCategory::Storage)
-            .await
-            .unwrap(),
-        1
-    );
+    // 600-699 is now the relay Storage category (T2R3); 700-899 stays unknown.
+    assert!(e.get_price_msat(700).await.is_err());
+    assert!(e.get_price_msat(800).await.is_err());
 }
 
 #[tokio::test]
-async fn unknown_kind_not_priceable() {
+async fn content_categories_never_priced_zero() {
+    // SEC3: a content-bearing kind must never be free, or the payment gate would
+    // accept a zero-price / zero-payment message (Principle 2, complements the gate's
+    // accept_zero_price_zero_payment baseline). The default pricing surface must price
+    // every content category > 0. (config::validate() additionally rejects any 0
+    // pricing config; this guards the engine's default output.)
     let e = engine();
-    assert!(e.get_price_msat(600).await.is_err());
-    assert!(e.get_price_msat(800).await.is_err());
+    for cat in [
+        KindCategory::Communication,
+        KindCategory::FilesMedia,
+        KindCategory::Collaboration,
+    ] {
+        let price = e.get_category_price_msat(cat).await.unwrap();
+        assert!(
+            price > 0,
+            "content category {cat:?} must be priced > 0 (Principle 2), got {price}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn relay_storage_price() {
+    let e = engine();
+    // T2R3: relay control kinds (600-699) price as the Storage category — a paid
+    // service, non-zero, separate from the sender→recipient message payment.
+    assert_eq!(e.get_price_msat(KIND_RELAY_REGISTER).await.unwrap(), 100);
+    assert_eq!(e.get_price_msat(KIND_RELAY_DEPOSIT).await.unwrap(), 100);
+    assert_eq!(e.get_price_msat(KIND_RELAY_ACK).await.unwrap(), 100);
+    assert_eq!(e.get_price_msat(KIND_RELAY_DRAIN).await.unwrap(), 100);
+    assert_eq!(e.get_price_msat(KIND_RELAY_UNREGISTER).await.unwrap(), 100);
+    let storage = e
+        .get_category_price_msat(KindCategory::Storage)
+        .await
+        .unwrap();
+    assert_eq!(storage, 100);
+    assert!(storage > 0, "relay storage is a paid service — must be non-zero");
 }
 
 #[tokio::test]
@@ -122,12 +151,6 @@ async fn category_pricing() {
             .unwrap(),
         50
     );
-    assert_eq!(
-        e.get_category_price_msat(KindCategory::Storage)
-            .await
-            .unwrap(),
-        1
-    );
 }
 
 #[tokio::test]
@@ -142,7 +165,7 @@ async fn custom_config() {
         realtime_signal_msat: 90,
         app_ext_msat: 25,
         web_content_msat: 100,
-        relay_storage_msat_per_byte_day: 3,
+        ..Default::default()
     };
     let e = StaticPricingEngine::new(config);
 
@@ -151,12 +174,6 @@ async fn custom_config() {
     assert_eq!(e.get_price_msat(KIND_FILE_REF).await.unwrap(), 500);
     assert_eq!(e.get_price_msat(KIND_TYPING).await.unwrap(), 5);
     assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 90);
-    assert_eq!(
-        e.get_category_price_msat(KindCategory::Storage)
-            .await
-            .unwrap(),
-        3
-    );
 }
 
 #[test]
@@ -168,7 +185,6 @@ fn default_config_matches_toml_example() {
     assert_eq!(config.file_ref_msat, 100);
     assert_eq!(config.control_msat, 1);
     assert_eq!(config.realtime_signal_msat, 50);
-    assert_eq!(config.relay_storage_msat_per_byte_day, 1);
 }
 
 #[test]

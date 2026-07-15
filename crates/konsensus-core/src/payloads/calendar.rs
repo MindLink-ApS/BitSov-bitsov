@@ -3,7 +3,54 @@
 //! These structs are serialized to JSON, E2EE encrypted via Double Ratchet,
 //! and placed in the `ciphertext` field of UKM envelopes.
 
+use std::fmt;
+
+use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+
+/// Maximum `BYDAY` entries accepted on the wire. RFC 5545 weekly BYDAY is a
+/// subset of the 7 weekdays; 16 gives generous slack while bounding the
+/// recurrence expansion. A malicious peer could otherwise send a huge `byday`
+/// list, which `expand_occurrences` iterates once per step (up to the 5000-step
+/// safety cap) — a quadratic-blowup DoS triggered when the recipient views the
+/// event. The cap here rejects it at ingestion, before it is stored or expanded.
+pub const MAX_BYDAY: usize = 16;
+
+/// Deserialize the `byday` list capped at [`MAX_BYDAY`]. The visitor counts as it
+/// pushes and aborts at `cap + 1`, never pre-allocating from the declared length.
+/// Mirrors `envelope::bounded_references`.
+fn bounded_byday<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BydayVisitor;
+
+    impl<'de> Visitor<'de> for BydayVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "a list of at most {MAX_BYDAY} BYDAY weekday codes")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Vec<String>, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out: Vec<String> = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                if out.len() >= MAX_BYDAY {
+                    return Err(de::Error::custom(format!(
+                        "byday list exceeds maximum of {MAX_BYDAY} entries"
+                    )));
+                }
+                out.push(item);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(BydayVisitor)
+}
 
 /// Wire payload for `KIND_CALENDAR_EVENT` (100) and `KIND_CALENDAR_UPDATE` (104).
 ///
@@ -54,7 +101,8 @@ pub struct WireRRule {
     #[serde(default)]
     pub count: Option<u32>,
     /// Days of the week (e.g. ["MO","WE","FR"]). Empty = no constraint.
-    #[serde(default)]
+    /// Capped at [`MAX_BYDAY`] on the wire to bound recurrence expansion.
+    #[serde(default, deserialize_with = "bounded_byday")]
     pub byday: Vec<String>,
 }
 
@@ -91,6 +139,31 @@ pub enum RsvpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A valid weekly BYDAY (<= MAX_BYDAY) round-trips through JSON unchanged.
+    #[test]
+    fn byday_within_cap_roundtrips() {
+        let json = r#"{"freq":"WEEKLY","byday":["MO","WE","FR"]}"#;
+        let rule: WireRRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.byday, vec!["MO", "WE", "FR"]);
+    }
+
+    /// An oversized BYDAY list is rejected at deserialization (DoS guard),
+    /// bounding the recurrence expansion regardless of a hostile peer's input.
+    #[test]
+    fn oversized_byday_is_rejected() {
+        let big: Vec<String> = vec!["MO".to_string(); MAX_BYDAY + 1];
+        let json = serde_json::to_string(&serde_json::json!({
+            "freq": "WEEKLY",
+            "byday": big,
+        }))
+        .unwrap();
+        let err = serde_json::from_str::<WireRRule>(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("byday list exceeds maximum"),
+            "expected cap error, got: {err}"
+        );
+    }
 
     #[test]
     fn event_payload_roundtrip() {

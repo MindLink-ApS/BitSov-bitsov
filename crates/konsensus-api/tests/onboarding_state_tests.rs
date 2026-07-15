@@ -7,7 +7,7 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn onboarding_state_full_start_returns_funding_fields() {
     let state = common::test_state();
-    let app = konsensus_api::build_router(state.clone());
+    let app = common::test_router(state.clone());
 
     let req = Request::builder()
         .method("POST")
@@ -32,7 +32,7 @@ async fn onboarding_state_full_start_returns_funding_fields() {
         .body(Body::empty())
         .unwrap();
 
-    let res_state = konsensus_api::build_router(state).oneshot(req_state).await.unwrap();
+    let res_state = common::test_router(state).oneshot(req_state).await.unwrap();
     assert_eq!(res_state.status(), StatusCode::OK);
     let body_state = axum::body::to_bytes(res_state.into_body(), 4096).await.unwrap();
     let state_json: serde_json::Value = serde_json::from_slice(&body_state).unwrap();
@@ -42,7 +42,7 @@ async fn onboarding_state_full_start_returns_funding_fields() {
 #[tokio::test]
 async fn onboarding_state_rejects_full_without_amount() {
     let state = common::test_state();
-    let app = konsensus_api::build_router(state.clone());
+    let app = common::test_router(state.clone());
 
     let req = Request::builder()
         .method("POST")

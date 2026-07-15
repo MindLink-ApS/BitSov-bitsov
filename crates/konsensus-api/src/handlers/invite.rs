@@ -3,10 +3,18 @@
 //! Invite tokens encode a node's identity, network address, and optional label
 //! in a signed, base58-encoded string. They can be shared as QR codes, links,
 //! or plain text. Recipients redeem them to auto-add the inviter as a peer.
+//!
+//! **Deprecated (ADR-029):** these legacy `InviteToken` routes (`/api/v1/invite`,
+//! `/api/v1/invite/redeem`) are superseded by the canonical, invitee-bound
+//! `BitSovInvite` flow in [`crate::handlers::invites`] (`/api/v1/invites` +
+//! `/api/v1/invites/accept`). They remain fully functional and emit
+//! `Deprecation`/`Sunset` headers; removal is an operator/ADR-029 decision.
 
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -81,12 +89,50 @@ pub struct RedeemInviteResponse {
     pub fingerprint: String,
 }
 
+/// Published **target** sunset for the legacy base58/`konsensus://` InviteToken
+/// routes (`/api/v1/invite`, `/api/v1/invite/redeem`). This is a migration signal,
+/// NOT a hard removal commitment: both routes stay fully functional, and the actual
+/// removal is an operator/ADR-029 decision (the legacy `InviteToken` and the
+/// canonical `BitSovInvite` formats are non-interchangeable, so removal must wait
+/// for a `BitSovInvite` peer-add UX to replace the redeem flow).
+const LEGACY_INVITE_SUNSET: &str = "Sun, 31 Jan 2027 00:00:00 GMT";
+
+/// Wrap a legacy-route JSON body with RFC 8594 / RFC 9745 deprecation signalling
+/// (`Deprecation`, `Sunset`, and a `Link` to the successor route) **without**
+/// changing the HTTP status (200) or the JSON body. Clients see byte-identical
+/// JSON plus headers that let them migrate to `POST /api/v1/invites/accept` ahead
+/// of any removal.
+fn deprecated_response<T: Serialize>(body: T) -> Response {
+    (
+        [
+            (header::HeaderName::from_static("deprecation"), "true"),
+            (header::HeaderName::from_static("sunset"), LEGACY_INVITE_SUNSET),
+            (
+                header::LINK,
+                "</api/v1/invites/accept>; rel=\"successor-version\"",
+            ),
+        ],
+        Json(body),
+    )
+        .into_response()
+}
+
 /// `POST /api/v1/invite` — generate a signed invite token for this node.
+///
+/// **Deprecated (ADR-029, 2026-06-09):** this issues a legacy base58 `InviteToken`.
+/// The canonical Tier-2 onboarding path is `POST /api/v1/invites` (issue) +
+/// `POST /api/v1/invites/accept` (accept) using the invitee-bound `BitSovInvite`.
+/// The route remains fully functional and emits `Deprecation`/`Sunset` headers.
 async fn generate_invite(
     _auth: AuthUser,
     State(state): State<Arc<AppState>>,
     Json(req): Json<GenerateInviteRequest>,
-) -> Result<Json<GenerateInviteResponse>, ApiError> {
+) -> Result<Response, ApiError> {
+    tracing::warn!(
+        route = "/api/v1/invite",
+        deprecated = true,
+        "legacy InviteToken issue endpoint — migrate to POST /api/v1/invites (BitSovInvite)"
+    );
     if req.addr.is_empty() {
         return Err(ApiError::BadRequest("addr is required".into()));
     }
@@ -132,15 +178,31 @@ async fn generate_invite(
         })),
     );
 
-    Ok(Json(GenerateInviteResponse { token, uri, expiry }))
+    Ok(deprecated_response(GenerateInviteResponse {
+        token,
+        uri,
+        expiry,
+    }))
 }
 
 /// `POST /api/v1/invite/redeem` — redeem an invite token, adding the inviter as a peer.
+///
+/// **Deprecated (ADR-029, 2026-06-09):** this consumes a legacy base58 `InviteToken`
+/// (symmetric peer-add, no invitee binding). The canonical Tier-2 onboarding path is
+/// `POST /api/v1/invites/accept` using the invitee-bound `BitSovInvite`. The two token
+/// formats are non-interchangeable, so this route stays fully functional until a
+/// `BitSovInvite` peer-add UX replaces it; removal is an operator/ADR-029 decision. It
+/// emits `Deprecation`/`Sunset` headers for clients to migrate ahead of time.
 async fn redeem_invite(
     _auth: AuthUser,
     State(state): State<Arc<AppState>>,
     Json(req): Json<RedeemInviteRequest>,
-) -> Result<Json<RedeemInviteResponse>, ApiError> {
+) -> Result<Response, ApiError> {
+    tracing::warn!(
+        route = "/api/v1/invite/redeem",
+        deprecated = true,
+        "legacy InviteToken redeem endpoint — migrate to POST /api/v1/invites/accept (BitSovInvite)"
+    );
     // Parse the invite — accept both raw base58 tokens and full URIs
     let parsed = if req.invite.starts_with("konsensus://") {
         InviteToken::parse_uri(&req.invite)
@@ -170,7 +232,7 @@ async fn redeem_invite(
     };
 
     if already_exists {
-        return Ok(Json(RedeemInviteResponse {
+        return Ok(deprecated_response(RedeemInviteResponse {
             node_id: node_id_hex,
             addr: parsed.addr,
             label: parsed.label,
@@ -194,6 +256,19 @@ async fn redeem_invite(
 
     // Add to transport whitelist so the connection succeeds (Principle 3)
     state.transport.add_to_whitelist(&parsed.node_id).await;
+
+    // P3-2: persist so the gate whitelist survives restart. The PeerRegistry
+    // is rebuilt at boot from the durable `peers` table (not just
+    // `config.peers`); without this, a redeemed peer drops off the gate
+    // whitelist on the next restart even though it works at runtime.
+    let mut peer = konsensus_storage::Peer::new(parsed.node_id);
+    peer.address = Some(parsed.addr.clone());
+    peer.display_name = parsed.label.clone();
+    state
+        .storage
+        .upsert_peer(&peer)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to persist redeemed peer: {e}")))?;
 
     state.audit_log.record(
         events::INVITE_REDEEMED,
@@ -224,7 +299,7 @@ async fn redeem_invite(
         });
     }
 
-    Ok(Json(RedeemInviteResponse {
+    Ok(deprecated_response(RedeemInviteResponse {
         node_id: node_id_hex,
         addr: parsed.addr,
         label: parsed.label,

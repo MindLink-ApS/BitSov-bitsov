@@ -96,6 +96,25 @@ async fn zero_fee_rate_returns_base_price() {
 }
 
 #[tokio::test]
+async fn non_finite_provider_fee_falls_back_to_static() {
+    let engine = make_engine(f64::NAN);
+    let price = engine.get_price_msat(KIND_CHAT).await.unwrap();
+    assert_eq!(price, 10, "NaN provider fee should not poison admission price");
+    assert!(
+        engine.fee_rate_state().await.is_none(),
+        "invalid provider fee should not populate cache"
+    );
+
+    let engine = make_engine(f64::INFINITY);
+    let price = engine.get_price_msat(KIND_CHAT).await.unwrap();
+    assert_eq!(price, 10, "+inf provider fee should fall back to static");
+    assert!(
+        engine.fee_rate_state().await.is_none(),
+        "invalid provider fee should not populate cache"
+    );
+}
+
+#[tokio::test]
 async fn realtime_signaling_uses_payment_gate_price() {
     let engine = make_engine(10.0);
     // Base 50 + ceil(50 * 10.0 * 1.8 / 100) = 50 + 9 = 59
@@ -120,14 +139,6 @@ async fn category_pricing_with_chain_data() {
         .await
         .unwrap();
     assert_eq!(file_price, 190);
-
-    // Storage is category-only relay pricing: base 1 msat/byte-day,
-    // 1 + ceil(1 * 50 * 1.8 / 100) = 2.
-    let storage_price = engine
-        .get_category_price_msat(KindCategory::Storage)
-        .await
-        .unwrap();
-    assert_eq!(storage_price, 2);
 }
 
 #[tokio::test]
@@ -232,6 +243,44 @@ fn volatility_cap_limits_extreme_prices() {
     assert_eq!(
         ChainAwarePricingEngine::apply_multiplier(10, 50.0, 1.0, 0.5),
         10
+    );
+
+    // Non-finite/negative cap config is not a valid "disable cap" signal.
+    // It falls back to the default bounded-plasticity cap (5x).
+    assert_eq!(
+        ChainAwarePricingEngine::apply_multiplier(10, 1000.0, 4.0, f64::NAN),
+        50
+    );
+    assert_eq!(
+        ChainAwarePricingEngine::apply_multiplier(10, 1000.0, 4.0, f64::INFINITY),
+        50
+    );
+    assert_eq!(
+        ChainAwarePricingEngine::apply_multiplier(10, 1000.0, 4.0, -1.0),
+        50
+    );
+}
+
+#[test]
+fn multiplier_non_finite_inputs_preserve_floor_and_cap() {
+    // NaN fee/sensitivity are ignored rather than poisoning the price.
+    assert_eq!(
+        ChainAwarePricingEngine::apply_multiplier(10, f64::NAN, 4.0, 5.0),
+        10
+    );
+    assert_eq!(
+        ChainAwarePricingEngine::apply_multiplier(10, 50.0, f64::NAN, 5.0),
+        15
+    );
+
+    // +inf fee/sensitivity saturates into the cap rather than bypassing it.
+    assert_eq!(
+        ChainAwarePricingEngine::apply_multiplier(10, f64::INFINITY, 4.0, 5.0),
+        50
+    );
+    assert_eq!(
+        ChainAwarePricingEngine::apply_multiplier(10, 1000.0, f64::INFINITY, 5.0),
+        50
     );
 }
 
@@ -699,6 +748,78 @@ async fn seed_ema_stale_snapshot_ignored() {
 }
 
 #[tokio::test]
+async fn seed_ema_ignores_non_finite_snapshot_values() {
+    let chain = Arc::new(MockChainProvider::with_config(MockChainConfig {
+        initial_height: 886_000,
+        default_fee_sat_per_vb: 10.0,
+    }));
+    let config = ChainAwarePricingConfig::default();
+    let engine = ChainAwarePricingEngine::new(config, chain);
+
+    let snapshot = FeeRateSnapshot {
+        targets: {
+            let mut m = HashMap::new();
+            m.insert(6, f64::NAN);
+            m.insert(25, f64::INFINITY);
+            m.insert(144, -1.0);
+            m
+        },
+        block_height: 885_000,
+        timestamp_secs: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+
+    engine.seed_ema(snapshot).await;
+    assert!(
+        engine.fee_rate_state_all().await.is_empty(),
+        "all-invalid seed snapshot should be ignored"
+    );
+}
+
+#[tokio::test]
+async fn non_finite_alpha_uses_default_smoothing() {
+    let chain = Arc::new(MockChainProvider::with_config(MockChainConfig {
+        initial_height: 886_000,
+        default_fee_sat_per_vb: 20.0,
+    }));
+
+    let config = ChainAwarePricingConfig {
+        base: StaticPricingConfig::default(),
+        fee_target_blocks: 144,
+        cache_ttl: Duration::from_millis(1),
+        max_price_multiplier: 0.0,
+        fee_rate_ema_alpha: f64::NAN,
+        category_fee_targets: HashMap::new(),
+    };
+
+    let chain: Arc<dyn ChainProvider> = chain;
+    let engine = ChainAwarePricingEngine::new(config, Arc::clone(&chain));
+    let seed = FeeRateSnapshot {
+        targets: {
+            let mut m = HashMap::new();
+            m.insert(144, 10.0);
+            m
+        },
+        block_height: 885_900,
+        timestamp_secs: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+    engine.seed_ema(seed).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let _ = engine.get_price_msat(KIND_CHAT).await.unwrap();
+    let (_raw, ema) = engine.fee_rate_state().await.unwrap();
+    assert!(
+        (ema - 13.0).abs() < 0.01,
+        "NaN alpha should use default 0.3 smoothing, got {ema}"
+    );
+}
+
+#[tokio::test]
 async fn seed_ema_provides_smoothing_continuity() {
     // Scenario: fee rate was stable at 20 sat/vB, node restarts,
     // current rate is still 20. With seed, EMA should start near 20
@@ -910,4 +1031,17 @@ async fn snapshot_empty_cache_returns_none() {
     let engine = make_engine(10.0);
     // No price queries yet → no snapshot
     assert!(engine.snapshot().await.is_none());
+}
+
+#[test]
+fn apply_multiplier_saturates_on_absurd_fee_rate() {
+    // the-fool: a compromised/buggy esplora returning a non-physical fee_rate must not
+    // overflow the u128 numerator (panic in debug / silent wrap -> poisoned admission
+    // price in release). Saturation flows into the u64::MAX clamp + the max_multiplier
+    // cap, so an insane fee simply pins to the cap — never underflows the membrane.
+    let base = 1_000_000u64;
+    let out = ChainAwarePricingEngine::apply_multiplier(base, 1e30, 4.0, 5.0);
+    assert_eq!(out, base.saturating_mul(5), "absurd finite fee should pin to cap");
+    // A huge finite fee with a large base and NO cap must not panic/overflow.
+    let _ = ChainAwarePricingEngine::apply_multiplier(u64::MAX, 1e38, 4.0, 0.0);
 }

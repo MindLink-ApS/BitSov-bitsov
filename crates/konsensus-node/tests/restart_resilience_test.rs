@@ -41,6 +41,8 @@ fn make_transport(identity: &Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Arc<N
         capabilities: vec![Capability::X3dh],
         whitelist,
         version: 2,
+        admission_mode: konsensus_message::ReachabilityMode::Whitelist,
+        cookie_mode: Default::default(),
     };
     Arc::new(NoiseTransport::new(Arc::clone(identity), config))
 }
@@ -82,7 +84,7 @@ async fn run_resilient_session_handler(
                 break;
             };
             match event {
-                ControlEvent::PeerConnected { peer_id } => {
+                ControlEvent::PeerConnected { peer_id, .. } => {
                     let bundle = session_manager.prekey_bundle().await;
                     let bundle_json = serde_json::to_value(&bundle).unwrap();
                     let frame = Frame::PrekeyOffer {
@@ -90,7 +92,7 @@ async fn run_resilient_session_handler(
                     };
                     let _ = transport.send_frame(&peer_id, &frame).await;
                 }
-                ControlEvent::PrekeyOffer { peer_id, bundle } => {
+                ControlEvent::PrekeyOffer { peer_id, bundle, .. } => {
                     if our_node_id.as_bytes() >= peer_id.as_bytes() {
                         continue; // Not the initiator
                     }
@@ -111,7 +113,7 @@ async fn run_resilient_session_handler(
                         Err(e) => eprintln!("X3DH initiation failed: {e}"),
                     }
                 }
-                ControlEvent::SessionInit { peer_id, init_data } => {
+                ControlEvent::SessionInit { peer_id, init_data, .. } => {
                     // Replace stale session if one exists (restart recovery)
                     if session_manager.has_session(&peer_id).await {
                         session_manager.remove_session(&peer_id).await;
@@ -126,7 +128,7 @@ async fn run_resilient_session_handler(
                         Err(e) => eprintln!("session accept failed: {e}"),
                     }
                 }
-                ControlEvent::SessionAck { peer_id } => {
+                ControlEvent::SessionAck { peer_id, .. } => {
                     if let Ok(ratchet_msg) =
                         session_manager.encrypt(&peer_id, b"ratchet-init").await
                     {
@@ -135,7 +137,7 @@ async fn run_resilient_session_handler(
                         let _ = transport.send_frame(&peer_id, &frame).await;
                     }
                 }
-                ControlEvent::RatchetInit { peer_id, payload } => {
+                ControlEvent::RatchetInit { peer_id, payload, .. } => {
                     if let Ok(ratchet_msg) = ratchet_message_from_bytes(&payload) {
                         let _ = session_manager.decrypt(&peer_id, &ratchet_msg).await;
                     }
@@ -287,6 +289,7 @@ async fn session_recovers_after_node_restart() {
         &pricing,
         Some(&whitelist),
         None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+        None,
     )
     .await
     .expect("payment gate should pass after re-negotiation");
@@ -325,12 +328,14 @@ async fn session_recovers_after_node_restart() {
 /// In-memory nonce store for testing.
 struct InMemoryNonceStore {
     seen: tokio::sync::Mutex<HashSet<Vec<u8>>>,
+    seen_payment_hashes: tokio::sync::Mutex<HashSet<[u8; 32]>>,
 }
 
 impl InMemoryNonceStore {
     fn new() -> Self {
         Self {
             seen: tokio::sync::Mutex::new(HashSet::new()),
+            seen_payment_hashes: tokio::sync::Mutex::new(HashSet::new()),
         }
     }
 }
@@ -344,5 +349,15 @@ impl konsensus_core::gate::NonceStore for InMemoryNonceStore {
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let mut seen = self.seen.lock().await;
         Ok(seen.insert(nonce.as_bytes().to_vec()))
+    }
+
+    async fn check_and_store_payment_hash(
+        &self,
+        payment_hash: &[u8; 32],
+        _sender: &NodeId,
+        _message_id: &konsensus_core::MessageId,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let mut seen = self.seen_payment_hashes.lock().await;
+        Ok(seen.insert(*payment_hash))
     }
 }

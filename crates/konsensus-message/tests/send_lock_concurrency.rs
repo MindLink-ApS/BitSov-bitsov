@@ -27,7 +27,7 @@ use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::{NodeId, Nonce, PaymentProof, Recipient, Signature};
 use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_message::wire::{Capability, SovereigntyTier};
-use konsensus_message::{NoiseTransport, TransportConfig};
+use konsensus_message::{ReachabilityMode, NoiseTransport, TransportConfig};
 use sha2::{Digest, Sha256};
 
 const MNEMONIC: &str =
@@ -46,6 +46,8 @@ fn make_config(whitelist: Vec<NodeId>) -> TransportConfig {
         capabilities: vec![Capability::X3dh],
         whitelist,
         version: 2,
+        admission_mode: ReachabilityMode::Whitelist,
+        cookie_mode: Default::default(),
     }
 }
 

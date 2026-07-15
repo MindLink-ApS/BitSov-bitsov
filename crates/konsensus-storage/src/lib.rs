@@ -13,6 +13,7 @@ pub mod reactions;
 pub mod recovery;
 pub mod sqlite;
 pub mod traits;
+pub mod whitelist_backup;
 
 pub use calendar::{CalendarEventRecord, RsvpRecord};
 pub use contacts::{ContactRepo, ContactRow, PostgresContactRepo, SqliteContactRepo};
@@ -31,10 +32,13 @@ pub use recovery::{
 };
 pub use sqlite::SqliteStorage;
 pub use traits::Storage;
+pub use whitelist_backup::WhitelistBackup;
 
 pub mod invites {
     use std::fmt;
     use std::str::FromStr;
+
+    use serde::{Deserialize, Serialize};
 
     /// Lifecycle state for an issued invite.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +113,7 @@ pub mod invites {
     }
 
     /// Persistent record for an accepted BitSov invite (invitee-side).
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AcceptedInviteRecord {
         /// Invite nonce (16 random bytes), unique per invite.
         pub nonce: [u8; 16],
@@ -211,6 +215,18 @@ impl<S: Storage + ?Sized> konsensus_core::gate::NonceStore for StorageNonceAdapt
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         self.inner
             .store_nonce(nonce, sender)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    async fn check_and_store_payment_hash(
+        &self,
+        payment_hash: &[u8; 32],
+        sender: &konsensus_core::NodeId,
+        message_id: &konsensus_core::MessageId,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner
+            .store_payment_receipt(payment_hash, sender, message_id)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
-use tokio::sync::{broadcast, oneshot, RwLock};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 
 use konsensus_core::gate::PaymentGate;
 use konsensus_core::identity::NodeIdentity;
@@ -97,6 +97,13 @@ pub struct AppState {
     /// JWT signing secret.
     pub jwt_secret: String,
 
+    /// Single-use authentication challenges.
+    ///
+    /// `/api/v1/auth/token` must not verify a replayable static string. The
+    /// challenge endpoint writes short-lived challenge strings here and token
+    /// issuance consumes them exactly once.
+    pub auth_challenges: Arc<Mutex<HashMap<String, Instant>>>,
+
     /// Whether CORS is enabled.
     pub cors_enabled: bool,
 
@@ -127,6 +134,16 @@ pub struct AppState {
     /// Per-IP rate limiter.
     pub rate_limiter: Arc<RateLimiter>,
 
+    /// Dedicated strict rate limiter for mnemonic (seed) read-back.
+    ///
+    /// The global `rate_limiter` is tuned for ordinary API traffic (hundreds
+    /// of requests per second) and is keyed per source IP. That is far too
+    /// loose to throttle attempts to exfiltrate the recovery seed. This
+    /// limiter is keyed per authenticated actor and allows only a handful of
+    /// reveal attempts per minute, bounding brute-force of the re-auth gate
+    /// even when the caller already holds a valid JWT (HARD-9).
+    pub mnemonic_reveal_limiter: Arc<RateLimiter>,
+
     /// Audit log for security-relevant events.
     pub audit_log: Arc<AuditLog>,
 
@@ -156,6 +173,13 @@ pub struct AppState {
     /// Used by identity endpoints that need to write config/mnemonic files
     /// (e.g. the recovery/restore flow).
     pub data_dir: Option<PathBuf>,
+
+    /// Durable-backup directory (`backup.scb_dir`) holding the rotated
+    /// `scb-latest.aes` channel-state snapshot and the `whitelist-latest.aes`
+    /// sidecar. Read by the one-click exit-bundle endpoint (X1) to attach the
+    /// node's encrypted channel-state recovery artifact. `None` disables SCB
+    /// attachment (the bundle still carries a freshly-sealed whitelist).
+    pub backup_dir: Option<PathBuf>,
 
     /// Cipher for decrypting cached message plaintext at rest.
     ///
@@ -224,12 +248,12 @@ pub struct InvoiceResponseData {
 
 impl AppState {
     /// Build the whitelist as a HashSet for the payment gate.
+    ///
+    /// Clones the registry's internally cached whitelist set (kept in sync on
+    /// every peer add/remove) rather than rebuilding it from scratch. Callers on
+    /// the per-message hot path should instead borrow the cached set directly via
+    /// `PeerRegistry::whitelist_set` to avoid even this clone (see HARD-11).
     pub async fn whitelist_set(&self) -> HashSet<NodeId> {
-        self.peer_registry
-            .read()
-            .await
-            .whitelist()
-            .into_iter()
-            .collect()
+        self.peer_registry.read().await.whitelist_set().clone()
     }
 }

@@ -351,6 +351,146 @@ fn trust_discount_minimum_1_msat() {
     assert_eq!(apply_trust_discount(1, 0.5), 1);
 }
 
+// ── HARD-13: double-discount / floor post-condition tests ─────────
+
+#[test]
+fn floor_is_max_discount_of_base() {
+    // The floor for a base price is base * (1 - MAX_TRUST_DISCOUNT), ceil'd,
+    // and never below 1 msat.
+    assert_eq!(trust_discount_floor_msat(1000), 500);
+    assert_eq!(trust_discount_floor_msat(3), 2); // ceil(1.5)
+    assert_eq!(trust_discount_floor_msat(1), 1); // ceil(0.5) → 1, min 1
+    assert_eq!(trust_discount_floor_msat(0), 1); // never free
+}
+
+#[test]
+fn no_single_discount_path_falls_below_floor() {
+    // For a representative spread of base prices, NO discount value — including
+    // out-of-range, negative, and the maximum — may produce a price below the
+    // per-base floor. This is the core money-path invariant.
+    let bases = [1u64, 2, 3, 7, 10, 100, 999, 1000, 1_000_000, u64::MAX / 2];
+    let discounts = [
+        -1.0,
+        0.0,
+        0.1,
+        0.25,
+        0.5,
+        0.9, // clamped to MAX_TRUST_DISCOUNT
+        1.0, // clamped
+        100.0, // clamped
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for &base in &bases {
+        let floor = trust_discount_floor_msat(base);
+        for &d in &discounts {
+            let price = apply_trust_discount(base, d);
+            assert!(
+                price >= floor,
+                "base={base} discount={d} price={price} dipped below floor={floor}"
+            );
+            // And never free.
+            assert!(price >= 1, "base={base} discount={d} produced 0 msat");
+        }
+    }
+}
+
+#[test]
+fn discount_applied_once_equals_half_at_max() {
+    // A correct single application at the maximum discount equals the floor.
+    assert_eq!(apply_trust_discount(1000, MAX_TRUST_DISCOUNT), 500);
+    assert_eq!(apply_trust_discount(1000, MAX_TRUST_DISCOUNT), trust_discount_floor_msat(1000));
+}
+
+#[test]
+fn double_applied_discount_breaches_original_floor() {
+    // This is the harm the single-choke-point design prevents. If a caller
+    // applied the discount TWICE on the same logical message (the HARD-13 bug),
+    // the effective price compounds to base * (1 - d)^2, which falls strictly
+    // below the original base's floor of base * (1 - d). We assert that the
+    // compounded value WOULD breach the floor — documenting why no production
+    // path may apply the discount more than once.
+    let base = 1000u64;
+    let floor = trust_discount_floor_msat(base); // 500
+
+    let once = apply_trust_discount(base, MAX_TRUST_DISCOUNT); // 500
+    assert_eq!(once, floor);
+
+    // Compounding: feed the discounted price back through the choke point.
+    let twice = apply_trust_discount(once, MAX_TRUST_DISCOUNT); // 250
+    assert!(
+        twice < floor,
+        "double application ({twice}) must fall below the original floor ({floor}); \
+         the single choke point is what prevents this in production"
+    );
+    assert_eq!(twice, 250);
+}
+
+#[test]
+fn single_application_never_breaches_its_own_floor() {
+    // The post-condition guarantee: for ANY base and ANY discount, a single
+    // application stays at or above that base's floor. Exhaustively checked for
+    // a representative spread; the function's debug_assert + release clamp make
+    // this a hard invariant rather than an incidental property.
+    for base in [1u64, 5, 999, 1000, 7_777, 1_000_000] {
+        let floor = trust_discount_floor_msat(base);
+        for d in [0.0, 0.25, 0.5, 0.499_999, MAX_TRUST_DISCOUNT] {
+            assert!(apply_trust_discount(base, d) >= floor);
+        }
+    }
+}
+
+#[tokio::test]
+async fn bundled_getter_applies_discount_exactly_once() {
+    let cache = PeerPriceCache::new();
+    let peer = test_node_id(1);
+
+    let mut prices = HashMap::new();
+    prices.insert("communication".to_string(), 1000);
+    // Maximum trust discount.
+    cache.update(peer, prices, 886_000, 144, MAX_TRUST_DISCOUNT).await;
+
+    let max_age = std::time::Duration::from_secs(86400);
+
+    // Bundled choke-point getter: base 1000 at 0.5 discount → 500, applied once.
+    let discounted = cache
+        .get_fresh_discounted_peer_price(&peer, 0, 886_100, max_age)
+        .await;
+    assert_eq!(discounted, Some(500));
+
+    // The undiscounted base getter still returns the full price, proving the
+    // discount lives only in the bundled path (no compounding).
+    assert_eq!(
+        cache.get_fresh_peer_price(&peer, 0, 886_100, max_age).await,
+        Some(1000)
+    );
+
+    // The bundled result must never fall below the floor.
+    let floor = trust_discount_floor_msat(1000);
+    assert!(discounted.unwrap() >= floor);
+}
+
+#[tokio::test]
+async fn bundled_getter_stale_table_returns_none() {
+    let cache = PeerPriceCache::new();
+    let peer = test_node_id(1);
+
+    let mut prices = HashMap::new();
+    prices.insert("communication".to_string(), 1000);
+    cache.update(peer, prices, 886_000, 144, MAX_TRUST_DISCOUNT).await;
+
+    let max_age = std::time::Duration::from_secs(86400);
+
+    // Past block-height expiry → stale → None (caller falls back to own pricing).
+    assert_eq!(
+        cache
+            .get_fresh_discounted_peer_price(&peer, 0, 886_145, max_age)
+            .await,
+        None
+    );
+}
+
 // ── compute_trust_discount NaN/Infinity safety tests ──────────────
 
 #[test]

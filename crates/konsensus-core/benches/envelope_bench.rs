@@ -3,7 +3,8 @@
 //! These are the hot-path operations for every message in the mesh.
 //! Target: <1ms per message at scale on commodity hardware.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use ed25519_dalek::Verifier;
 use konsensus_core::{
     NodeId, NodeIdentity, Nonce, PaymentProof, Recipient, Signature, UkmEnvelope,
     UkmEnvelopeBuilder,
@@ -12,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 fn make_test_identity() -> NodeIdentity {
     let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-    NodeIdentity::from_mnemonic(mnemonic).expect("valid mnemonic")
+    NodeIdentity::from_mnemonic(mnemonic, "").expect("valid mnemonic")
 }
 
 fn make_valid_proof(amount_msat: u64) -> PaymentProof {
@@ -28,15 +29,17 @@ fn make_valid_proof(amount_msat: u64) -> PaymentProof {
 fn make_test_envelope(identity: &NodeIdentity) -> UkmEnvelope {
     let ciphertext = vec![0xAB; 256]; // Typical chat message size
     let proof = make_valid_proof(25);
-    UkmEnvelopeBuilder::new(
+    let mut envelope = UkmEnvelopeBuilder::new(
         100, // KIND_CHAT
-        identity.node_id(),
+        *identity.node_id(),
         Recipient::Node(NodeId::from_bytes([0x01; 32])),
         ciphertext,
         proof,
     )
-    .sign(identity)
-    .expect("signing should succeed")
+    .build();
+    let sig = identity.sign(&envelope.signable_bytes());
+    envelope.signature = Signature::from_ed25519(&sig);
+    envelope
 }
 
 fn bench_envelope_sign(c: &mut Criterion) {
@@ -46,14 +49,17 @@ fn bench_envelope_sign(c: &mut Criterion) {
 
     c.bench_function("UkmEnvelope::sign (256B payload)", |b| {
         b.iter(|| {
-            let builder = UkmEnvelopeBuilder::new(
+            let mut envelope = UkmEnvelopeBuilder::new(
                 100,
-                identity.node_id(),
+                *identity.node_id(),
                 Recipient::Node(NodeId::from_bytes([0x01; 32])),
                 ciphertext.clone(),
                 proof.clone(),
-            );
-            black_box(builder.sign(&identity).expect("sign"));
+            )
+            .build();
+            let sig = identity.sign(&envelope.signable_bytes());
+            envelope.signature = Signature::from_ed25519(&sig);
+            black_box(envelope);
         });
     });
 }
@@ -64,7 +70,16 @@ fn bench_envelope_verify(c: &mut Criterion) {
 
     c.bench_function("UkmEnvelope::verify_signature", |b| {
         b.iter(|| {
-            black_box(envelope.verify_signature()).expect("verify");
+            let signable = envelope.signable_bytes();
+            let sig = envelope.signature.to_ed25519();
+            black_box(
+                envelope
+                    .sender
+                    .to_verifying_key()
+                    .expect("valid node id")
+                    .verify(&signable, &sig),
+            )
+            .expect("verify");
         });
     });
 }
@@ -107,15 +122,16 @@ fn bench_envelope_serialize_large(c: &mut Criterion) {
     let identity = make_test_identity();
     let proof = make_valid_proof(100);
     let ciphertext = vec![0xAB; 4096]; // 4KB payload (file transfer)
-    let envelope = UkmEnvelopeBuilder::new(
+    let mut envelope = UkmEnvelopeBuilder::new(
         200, // KIND_FILE_REF
-        identity.node_id(),
+        *identity.node_id(),
         Recipient::Node(NodeId::from_bytes([0x01; 32])),
         ciphertext,
         proof,
     )
-    .sign(&identity)
-    .expect("sign");
+    .build();
+    let sig = identity.sign(&envelope.signable_bytes());
+    envelope.signature = Signature::from_ed25519(&sig);
 
     c.bench_function("UkmEnvelope::serialize (4KB payload)", |b| {
         b.iter(|| {
@@ -139,7 +155,7 @@ fn bench_identity_creation(c: &mut Criterion) {
     c.bench_function("NodeIdentity::from_mnemonic", |b| {
         b.iter(|| {
             let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-            black_box(NodeIdentity::from_mnemonic(mnemonic).expect("valid"));
+            black_box(NodeIdentity::from_mnemonic(mnemonic, "").expect("valid"));
         });
     });
 }

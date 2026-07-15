@@ -35,6 +35,8 @@ use konsensus_api::build_router;
 
 pub struct MemStorage {
     messages: Mutex<HashMap<String, UkmEnvelope>>,
+    /// AES-GCM-encrypted plaintext blobs keyed by message id hex (mirrors prod).
+    message_plaintext: Mutex<HashMap<String, Vec<u8>>>,
     rooms: Mutex<HashMap<String, Room>>,
     room_members: Mutex<HashMap<String, Vec<NodeId>>>,
     peers: Mutex<HashMap<String, Peer>>,
@@ -52,6 +54,7 @@ impl MemStorage {
     pub fn new() -> Self {
         Self {
             messages: Mutex::new(HashMap::new()),
+            message_plaintext: Mutex::new(HashMap::new()),
             rooms: Mutex::new(HashMap::new()),
             room_members: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
@@ -237,6 +240,21 @@ impl Storage for MemStorage {
         Ok(true)
     }
 
+    // Explicitly accept fresh payment hashes. The `Storage` trait default for
+    // `store_payment_receipt` is fail-closed (returns an error) so that real
+    // backends cannot silently skip economic replay protection. This in-memory
+    // test stub mirrors `store_nonce` above and always reports "new"; dedicated
+    // replay-rejection coverage lives against the real SQLite/Postgres backends
+    // and the gate (see konsensus-storage and konsensus-core test suites).
+    async fn store_payment_receipt(
+        &self,
+        _payment_hash: &[u8; 32],
+        _sender: &NodeId,
+        _message_id: &MessageId,
+    ) -> Result<bool, StorageError> {
+        Ok(true)
+    }
+
     async fn has_nonce(&self, _nonce: &Nonce) -> Result<bool, StorageError> {
         Ok(false)
     }
@@ -311,16 +329,20 @@ impl Storage for MemStorage {
     }
     async fn store_message_plaintext(
         &self,
-        _: &konsensus_core::MessageId,
-        _: &[u8],
+        id: &konsensus_core::MessageId,
+        encrypted: &[u8],
     ) -> Result<(), StorageError> {
+        self.message_plaintext
+            .lock()
+            .unwrap()
+            .insert(id.to_hex(), encrypted.to_vec());
         Ok(())
     }
     async fn get_message_plaintext(
         &self,
-        _: &konsensus_core::MessageId,
+        id: &konsensus_core::MessageId,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(None)
+        Ok(self.message_plaintext.lock().unwrap().get(&id.to_hex()).cloned())
     }
 
     async fn add_invite_issued(
@@ -391,6 +413,60 @@ impl Storage for MemStorage {
             .unwrap_or_else(|| Peer::new(node_id));
         peer.metadata["invite_ref"] = serde_json::Value::String(invite_id.to_string());
         peer.metadata["whitelist_source"] = serde_json::Value::String("invite".to_string());
+        peers.insert(node_id.to_hex(), peer);
+        Ok(())
+    }
+
+    async fn add_invite_and_whitelist_with_peer_metadata(
+        &self,
+        invite: &konsensus_storage::InviteIssuedRecord,
+        peer_pubkey: [u8; 32],
+        metadata_json: &str,
+    ) -> Result<(), StorageError> {
+        // Mirror of the real backends' atomic primitive (HARD-3): write the invite
+        // row and the peer row whose metadata_json is taken verbatim — no
+        // server-side invite_ref/whitelist_source merge — rolling the invite back
+        // if the whitelist write fails, so both succeed or both roll back.
+        self.add_invite_issued(invite).await?;
+        if let Err(e) = self
+            .add_whitelisted_peer_with_metadata(peer_pubkey, metadata_json)
+            .await
+        {
+            self.invites_issued.lock().unwrap().remove(&invite.id);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    async fn add_whitelisted_peer_with_metadata(
+        &self,
+        pubkey: [u8; 32],
+        metadata_json: &str,
+    ) -> Result<(), StorageError> {
+        // Honour the same injected-failure hook the invite_ref variant uses so the
+        // atomicity tests can force a whitelist-write failure on this path too.
+        let mut fail = self.fail_next_whitelist_write.lock().unwrap();
+        if *fail {
+            *fail = false;
+            return Err(StorageError::Serialization(
+                "injected whitelist write failure".into(),
+            ));
+        }
+        drop(fail);
+
+        // The caller owns the metadata blob; overwrite the peer's metadata column
+        // wholesale rather than merging individual keys. This matches the real
+        // backends, where the blob is opaque (ciphertext under EncryptedStorage)
+        // and must never be re-parsed or split.
+        let metadata: serde_json::Value = serde_json::from_str(metadata_json).map_err(|e| {
+            StorageError::Serialization(format!("invalid peer metadata_json: {e}"))
+        })?;
+        let node_id = NodeId::from_bytes(pubkey);
+        let mut peers = self.peers.lock().unwrap();
+        let mut peer = peers
+            .remove(&node_id.to_hex())
+            .unwrap_or_else(|| Peer::new(node_id));
+        peer.metadata = metadata;
         peers.insert(node_id.to_hex(), peer);
         Ok(())
     }
@@ -671,6 +747,29 @@ impl MessageTransport for StubTransport {
 
 // ─── Test Helper ────────────────────────────────────────────────────
 
+/// Build the production router for a test, injecting a loopback
+/// `ConnectInfo` so the rate-limit middleware can identify the caller.
+///
+/// In production the router is served with
+/// `into_make_service_with_connect_info::<SocketAddr>()`, which populates
+/// every request with the real peer address. `tower`'s `oneshot` — used by
+/// these integration tests — bypasses that, leaving `ConnectInfo` absent.
+///
+/// HARD-8 makes the rate-limit middleware fail closed on a missing client
+/// IP (a missing address must NOT masquerade as loopback), so tests must
+/// supply an address explicitly. `MockConnectInfo` is axum's sanctioned
+/// mechanism for exactly this. We use loopback because the tests run on the
+/// same host; it carries no special rate-limit exemption.
+pub fn test_router(state: Arc<AppState>) -> axum::Router {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    build_router(state).layer(MockConnectInfo(SocketAddr::new(
+        std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+        50000,
+    )))
+}
+
 pub fn test_identity() -> NodeIdentity {
     NodeIdentity::from_mnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
@@ -695,12 +794,14 @@ pub fn test_state() -> Arc<AppState> {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -711,6 +812,61 @@ pub fn test_state() -> Arc<AppState> {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         data_dir: None,
+        backup_dir: None,
+        peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        lightning_backend: "mock".into(),
+        chain_backend: "mock".into(),
+        gossip_validator: None,
+    })
+}
+
+/// Fixed AES master key for the plaintext cache in cipher-enabled tests.
+pub const TEST_PLAINTEXT_KEY: [u8; 32] = [0x11u8; 32];
+
+/// The plaintext-cache cipher paired with [`TEST_PLAINTEXT_KEY`]; use it to seed
+/// encrypted plaintext that a cipher-enabled `AppState` can decrypt.
+pub fn test_plaintext_cipher() -> konsensus_crypto::PlaintextCacheCipher {
+    konsensus_crypto::PlaintextCacheCipher::new(&TEST_PLAINTEXT_KEY)
+}
+
+/// Like [`test_state_with_storage`] but with the plaintext-cache cipher configured
+/// (keyed by [`TEST_PLAINTEXT_KEY`]), so the message-plaintext and search endpoints
+/// can decrypt cached blobs seeded via [`test_plaintext_cipher`].
+pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppState> {
+    let identity = Arc::new(test_identity());
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+
+    Arc::new(AppState {
+        identity: Arc::clone(&identity),
+        storage,
+        lightning: Arc::new(StubLightning),
+        chain: Arc::new(StubChain),
+        pricing: Arc::new(StubPricing),
+        gate: Arc::new(PaymentGate::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        transport: Arc::new(StubTransport),
+        session_manager,
+        jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        cors_enabled: false,
+        operator_probes_enabled: true,
+        sensitive_identity_routes_enabled: true,
+        ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
+        rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
+        audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
+        started_at: std::time::Instant::now(),
+        content_dir: None,
+        web_page_price_msat: None,
+        peer_prices: Arc::new(konsensus_pricing::PeerPriceCache::new()),
+        routing: Arc::new(konsensus_routing::RoutingTable::with_defaults()),
+        plaintext_cipher: Some(Arc::new(test_plaintext_cipher())),
+        send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -734,12 +890,14 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -750,6 +908,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -780,12 +939,14 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: Some(dir),
@@ -796,6 +957,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -819,12 +981,14 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -835,6 +999,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         data_dir: Some(dir),
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -972,19 +1137,28 @@ pub fn create_test_bolt11(amount_msat: u64) -> String {
 /// Create a peer identity and establish an E2EE session with it in
 /// the given session manager. Returns the peer's NodeId.
 pub async fn setup_e2ee_session(session_manager: &konsensus_crypto::SessionManager) -> NodeId {
-    // Create a peer identity (Bob) from a different mnemonic.
-    let peer_identity = NodeIdentity::from_mnemonic(
+    setup_e2ee_session_with_mnemonic(
+        session_manager,
         "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
     )
-    .unwrap();
+    .await
+}
+
+/// Like [`setup_e2ee_session`], but lets the caller pick the peer's mnemonic so
+/// multiple *distinct* peers can be established against the same session manager
+/// (e.g. the members of a room fan-out). Returns the peer's NodeId.
+pub async fn setup_e2ee_session_with_mnemonic(
+    session_manager: &konsensus_crypto::SessionManager,
+    mnemonic: &str,
+) -> NodeId {
+    let peer_identity = NodeIdentity::from_mnemonic(mnemonic, "").unwrap();
     let peer_id = *peer_identity.node_id();
 
-    // Create Bob's session manager to get a prekey bundle.
+    // Create the peer's session manager to get a prekey bundle.
     let peer_sm = konsensus_crypto::SessionManager::new(Arc::new(peer_identity));
     let peer_bundle = peer_sm.prekey_bundle().await;
 
-    // Alice (our session manager) initiates a session with Bob.
+    // Our session manager initiates a sender session with the peer.
     session_manager
         .initiate_session(&peer_id, &peer_bundle)
         .await
@@ -1010,12 +1184,14 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -1026,6 +1202,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -1060,5 +1237,40 @@ pub async fn store_test_envelope(state: &AppState) -> String {
 
     let msg_id = envelope.id.to_hex();
     state.storage.store_message(&envelope).await.unwrap();
+    msg_id
+}
+
+/// Store a to-self message with a distinct id (varied by `distinct`) plus its
+/// plaintext encrypted under [`test_plaintext_cipher`], so search/plaintext
+/// endpoints on a cipher-enabled state can decrypt it. Returns the message id.
+pub async fn store_test_message_with_plaintext(
+    state: &AppState,
+    distinct: &[u8],
+    plaintext: &str,
+) -> String {
+    use konsensus_core::{PaymentProof, UkmEnvelopeBuilder};
+    use sha2::{Digest, Sha256};
+
+    let sender = *state.identity.node_id();
+    let recipient = Recipient::Node(sender);
+    let preimage = [0xABu8; 32];
+    let hash: [u8; 32] = Sha256::digest(preimage).into();
+    let proof = PaymentProof::new(hash, preimage, 10);
+
+    // `distinct` varies the ciphertext so each message gets a unique id.
+    let mut envelope =
+        UkmEnvelopeBuilder::new(100, sender, recipient, distinct.to_vec(), proof).build();
+    let sig = state.identity.sign(&envelope.signable_bytes());
+    envelope.signature = konsensus_core::Signature::from_ed25519(&sig);
+
+    let msg_id = envelope.id.to_hex();
+    state.storage.store_message(&envelope).await.unwrap();
+
+    let encrypted = test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap();
+    state
+        .storage
+        .store_message_plaintext(&envelope.id, &encrypted)
+        .await
+        .unwrap();
     msg_id
 }

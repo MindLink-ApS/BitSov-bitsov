@@ -14,9 +14,11 @@ use tracing::{debug, info, warn};
 use konsensus_core::traits::chain::ChainProvider;
 use konsensus_core::traits::lightning::{ChannelInfo, LightningError, LightningProvider};
 use konsensus_core::types::NodeId;
-use konsensus_storage::{InviteIssuedRecord, Storage, StorageError};
+use konsensus_storage::{InviteIssuedRecord, InviteState, Storage, StorageError};
 
 use super::notify::{ChannelOpenNotice, NotificationSink};
+
+use crate::config::SubsidyConfig;
 
 const DEFAULT_CHANNEL_SIZE_SATS: u64 = 50_000;
 const DEFAULT_MAX_FEE_RATE_SAT_PER_VB: u32 = 50;
@@ -39,6 +41,8 @@ pub struct AutoChannelDeps {
     pub notifier: Arc<dyn NotificationSink>,
     pub event_rx: mpsc::Receiver<AutoChannelEvent>,
     pub shutdown_rx: watch::Receiver<bool>,
+    /// R1-a onboarding subsidy policy. OFF by default → the worker is inert.
+    pub subsidy: SubsidyConfig,
 }
 
 #[derive(Debug, Error)]
@@ -67,6 +71,7 @@ pub async fn run(mut deps: AutoChannelDeps) {
                     Arc::clone(&deps.lightning),
                     Arc::clone(&deps.chain),
                     Arc::clone(&deps.notifier),
+                    deps.subsidy.clone(),
                 ).await {
                     warn!(error = %e, "auto-channel event failed");
                 }
@@ -85,6 +90,7 @@ pub async fn handle_event(
     lightning: Arc<dyn LightningProvider>,
     chain: Arc<dyn ChainProvider>,
     notifier: Arc<dyn NotificationSink>,
+    subsidy: SubsidyConfig,
 ) -> Result<(), AutoChannelError> {
     match event {
         AutoChannelEvent::PeerLightningInfo {
@@ -93,7 +99,7 @@ pub async fn handle_event(
             ln_addr,
         } => {
             handle_peer_lightning_info(
-                peer_id, ln_pubkey, ln_addr, storage, lightning, chain, notifier,
+                peer_id, ln_pubkey, ln_addr, storage, lightning, chain, notifier, subsidy,
             )
             .await
         }
@@ -109,7 +115,17 @@ pub async fn handle_peer_lightning_info(
     lightning: Arc<dyn LightningProvider>,
     chain: Arc<dyn ChainProvider>,
     notifier: Arc<dyn NotificationSink>,
+    subsidy: SubsidyConfig,
 ) -> Result<(), AutoChannelError> {
+    // R1-a LOAD-BEARING DRIFT-DEATH: the onboarding subsidy is OFF by default, so
+    // on the live mesh an invite's `Pending` membership authorizes ZERO spend —
+    // this worker is inert until an operator explicitly opts in. Payment, never
+    // membership, is what may move sats.
+    if !subsidy.enabled {
+        debug!(peer = %peer_id, "onboarding subsidy disabled; auto-channel noop");
+        return Ok(());
+    }
+
     let Some(invite) = storage
         .find_pending_invite_for_invitee(peer_id.as_bytes())
         .await?
@@ -118,11 +134,43 @@ pub async fn handle_peer_lightning_info(
         return Ok(());
     };
 
-    let amount_sats = u64::from(
+    // R1-a: invite membership is necessary but NOT sufficient — the operator must
+    // also list the peer. An empty allowlist (the default) makes nobody eligible.
+    if !subsidy.is_allowlisted(peer_id.as_bytes()) {
+        debug!(
+            peer = %peer_id,
+            "peer holds a pending invite but is not in onboarding_subsidy.allowlist; auto-channel noop"
+        );
+        return Ok(());
+    }
+
+    // R1-a: the operator's per-channel cap replaces the invitee-supplied hint — a
+    // malicious or generous hint can only ever lower the spend, never raise it.
+    let requested_sats = u64::from(
         invite
             .channel_size_hint_sats
             .unwrap_or(DEFAULT_CHANNEL_SIZE_SATS as u32),
     );
+    let amount_sats = requested_sats.min(subsidy.max_channel_sats);
+    if amount_sats == 0 {
+        notify_abort(
+            notifier.as_ref(),
+            &invite,
+            peer_id,
+            &ln_pubkey,
+            amount_sats,
+            "subsidy_zero_amount".to_string(),
+        )
+        .await;
+        warn!(
+            invite_id = %invite.id,
+            peer = %peer_id,
+            requested_sats,
+            max_channel_sats = subsidy.max_channel_sats,
+            "auto-channel aborted: subsidy cap clamped channel amount to zero"
+        );
+        return Ok(());
+    }
     let max_fee_rate = invite
         .max_fee_rate_sat_per_vb
         .unwrap_or(DEFAULT_MAX_FEE_RATE_SAT_PER_VB);
@@ -209,6 +257,80 @@ pub async fn handle_peer_lightning_info(
             "auto-channel idempotency: existing channel already covers peer"
         );
         return Ok(());
+    }
+
+    // R1-a: gate the actual spend on the operator's per-peer and aggregate caps.
+    // The already-open idempotency path above returns BEFORE this, so a tight
+    // budget never blocks a no-cost re-confirmation. One issued-invite scan
+    // (only when subsidy is enabled) covers both caps.
+    {
+        let issued = storage.list_invites_issued().await?;
+        let peer_opens = issued
+            .iter()
+            .filter(|record| &record.invitee_pubkey == peer_id.as_bytes())
+            .filter(|record| matches!(record.state, InviteState::Opening | InviteState::Accepted))
+            .count() as u32;
+        if peer_opens >= subsidy.per_peer_max_opens {
+            notify_abort(
+                notifier.as_ref(),
+                &invite,
+                peer_id,
+                &ln_pubkey,
+                amount_sats,
+                format!(
+                    "subsidy_per_peer_cap:{peer_opens}>={}",
+                    subsidy.per_peer_max_opens
+                ),
+            )
+            .await;
+            warn!(
+                invite_id = %invite.id,
+                peer = %peer_id,
+                peer_opens,
+                per_peer_max_opens = subsidy.per_peer_max_opens,
+                "auto-channel aborted: per-peer subsidy cap"
+            );
+            return Ok(());
+        }
+
+        // Budget sums CLAMPED amounts over in-flight `Opening` invites ONLY.
+        // `Accepted` includes already-open no-spend confirmations, so counting it
+        // would falsely starve the budget — count only what is actually spending.
+        let committed_sats: u64 = issued
+            .iter()
+            .filter(|record| matches!(record.state, InviteState::Opening))
+            .map(|record| {
+                u64::from(
+                    record
+                        .channel_size_hint_sats
+                        .unwrap_or(DEFAULT_CHANNEL_SIZE_SATS as u32),
+                )
+                .min(subsidy.max_channel_sats)
+            })
+            .fold(0u64, |acc, sats| acc.saturating_add(sats));
+        if committed_sats.saturating_add(amount_sats) > subsidy.max_total_budget_sats {
+            notify_abort(
+                notifier.as_ref(),
+                &invite,
+                peer_id,
+                &ln_pubkey,
+                amount_sats,
+                format!(
+                    "subsidy_budget_exhausted:{committed_sats}+{amount_sats}>{}",
+                    subsidy.max_total_budget_sats
+                ),
+            )
+            .await;
+            warn!(
+                invite_id = %invite.id,
+                peer = %peer_id,
+                committed_sats,
+                amount_sats,
+                max_total_budget_sats = subsidy.max_total_budget_sats,
+                "auto-channel aborted: aggregate subsidy budget exhausted"
+            );
+            return Ok(());
+        }
     }
 
     let balance_msat = lightning.get_balance_msat().await?;
@@ -580,6 +702,19 @@ mod tests {
         )
     }
 
+    /// Enabled subsidy with every test peer (`[1;32]..=[9;32]`) allowlisted and
+    /// generous caps, so the pre-R1-a downstream-guard tests keep exercising the
+    /// same path now that membership alone no longer authorizes a spend.
+    fn test_subsidy() -> SubsidyConfig {
+        SubsidyConfig {
+            enabled: true,
+            max_channel_sats: 1_000_000,
+            max_total_budget_sats: 100_000_000,
+            per_peer_max_opens: 1,
+            allowlist: (1u8..=9u8).map(|n| hex::encode([n; 32])).collect(),
+        }
+    }
+
     #[tokio::test]
     async fn fee_guard_aborts() {
         let peer = NodeId::from_bytes([1u8; 32]);
@@ -600,6 +735,7 @@ mod tests {
             lightning_dyn,
             chain_dyn,
             notifier_dyn,
+            test_subsidy(),
         )
         .await
         .unwrap();
@@ -637,6 +773,7 @@ mod tests {
             lightning_dyn,
             chain_dyn,
             notifier_dyn,
+            test_subsidy(),
         )
         .await
         .unwrap();
@@ -666,6 +803,7 @@ mod tests {
             lightning_dyn,
             chain_dyn,
             notifier_dyn,
+            test_subsidy(),
         )
         .await
         .unwrap();
@@ -700,6 +838,7 @@ mod tests {
             lightning_dyn,
             chain_dyn,
             notifier_dyn,
+            test_subsidy(),
         )
         .await
         .unwrap();
@@ -731,6 +870,7 @@ mod tests {
             lightning_dyn,
             chain_dyn,
             notifier_dyn,
+            test_subsidy(),
         )
         .await
         .unwrap();
@@ -766,6 +906,7 @@ mod tests {
                 lightning_dyn,
                 chain_dyn,
                 notifier_dyn,
+                test_subsidy(),
             )
             .await
             .unwrap();
@@ -798,6 +939,7 @@ mod tests {
             lightning_dyn,
             chain_dyn,
             notifier_dyn,
+            test_subsidy(),
         ));
 
         open_started.notified().await;
@@ -812,6 +954,7 @@ mod tests {
             lightning_dyn,
             chain_dyn,
             notifier_dyn,
+            test_subsidy(),
         )
         .await
         .unwrap();
@@ -822,6 +965,312 @@ mod tests {
         first.await.unwrap().unwrap();
 
         assert_eq!(lightning.opens.lock().await.len(), 1);
+        let invite = storage.list_invites_issued().await.unwrap().remove(0);
+        assert_eq!(invite.state, InviteState::Accepted);
+    }
+
+    #[tokio::test]
+    async fn subsidy_disabled_pending_invite_does_not_open_channel() {
+        // THE R1-a kill: a Pending invite (membership) is present and the peer
+        // would otherwise pass every downstream guard, yet a DISABLED subsidy
+        // (the mesh-wide default) spends nothing and leaves the invite untouched.
+        let peer = NodeId::from_bytes([11u8; 32]);
+        let storage = storage_with_invite(peer, 50, Some(10_000), now_unix() + 60).await;
+        let lightning = Arc::new(TestLightning {
+            balance_msat: 100_000_000,
+            ..Default::default()
+        });
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (storage_dyn, lightning_dyn, chain_dyn, notifier_dyn) =
+            deps(storage.clone(), lightning.clone(), 5.0, notifier.clone());
+
+        handle_peer_lightning_info(
+            peer,
+            LN_PUBKEY.to_string(),
+            Some("127.0.0.1:9735".to_string()),
+            storage_dyn,
+            lightning_dyn,
+            chain_dyn,
+            notifier_dyn,
+            SubsidyConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            lightning.opens.lock().await.is_empty(),
+            "disabled subsidy must not open a channel"
+        );
+        assert!(
+            notifier.notices.lock().await.is_empty(),
+            "disabled subsidy is a silent noop, not an abort"
+        );
+        let invite = storage.list_invites_issued().await.unwrap().remove(0);
+        assert_eq!(
+            invite.state,
+            InviteState::Pending,
+            "invite stays Pending — membership never touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_not_allowlisted_no_open() {
+        // Subsidy enabled with generous caps, but the allowlist is empty → invite
+        // membership is necessary-not-sufficient, so no spend occurs.
+        let peer = NodeId::from_bytes([12u8; 32]);
+        let storage = storage_with_invite(peer, 50, Some(10_000), now_unix() + 60).await;
+        let lightning = Arc::new(TestLightning {
+            balance_msat: 100_000_000,
+            ..Default::default()
+        });
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (storage_dyn, lightning_dyn, chain_dyn, notifier_dyn) =
+            deps(storage.clone(), lightning.clone(), 5.0, notifier.clone());
+
+        handle_peer_lightning_info(
+            peer,
+            LN_PUBKEY.to_string(),
+            Some("127.0.0.1:9735".to_string()),
+            storage_dyn,
+            lightning_dyn,
+            chain_dyn,
+            notifier_dyn,
+            SubsidyConfig {
+                enabled: true,
+                max_channel_sats: 1_000_000,
+                max_total_budget_sats: 100_000_000,
+                per_peer_max_opens: 1,
+                allowlist: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(lightning.opens.lock().await.is_empty());
+        let invite = storage.list_invites_issued().await.unwrap().remove(0);
+        assert_eq!(invite.state, InviteState::Pending);
+    }
+
+    #[tokio::test]
+    async fn amount_clamped_to_operator_max() {
+        // Invitee asks for 500k; the operator cap is 50k → the channel opens for
+        // exactly 50k. The operator, not the invitee, sizes the spend.
+        let peer = NodeId::from_bytes([13u8; 32]);
+        let storage = storage_with_invite(peer, 50, Some(500_000), now_unix() + 60).await;
+        let lightning = Arc::new(TestLightning {
+            balance_msat: 1_000_000_000,
+            ..Default::default()
+        });
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (storage_dyn, lightning_dyn, chain_dyn, notifier_dyn) =
+            deps(storage.clone(), lightning.clone(), 5.0, notifier.clone());
+
+        handle_peer_lightning_info(
+            peer,
+            LN_PUBKEY.to_string(),
+            Some("127.0.0.1:9735".to_string()),
+            storage_dyn,
+            lightning_dyn,
+            chain_dyn,
+            notifier_dyn,
+            SubsidyConfig {
+                enabled: true,
+                max_channel_sats: 50_000,
+                max_total_budget_sats: 100_000_000,
+                per_peer_max_opens: 1,
+                allowlist: vec![hex::encode(peer.as_bytes())],
+            },
+        )
+        .await
+        .unwrap();
+
+        let opens = lightning.opens.lock().await;
+        assert_eq!(opens.len(), 1);
+        assert_eq!(
+            opens[0].2, 50_000,
+            "channel amount must be clamped to the operator max, not the invitee hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_cap_blocks() {
+        // The single open (50k) exceeds the aggregate budget (10k) → aborted.
+        let peer = NodeId::from_bytes([14u8; 32]);
+        let storage = storage_with_invite(peer, 50, Some(50_000), now_unix() + 60).await;
+        let lightning = Arc::new(TestLightning {
+            balance_msat: 1_000_000_000,
+            ..Default::default()
+        });
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (storage_dyn, lightning_dyn, chain_dyn, notifier_dyn) =
+            deps(storage.clone(), lightning.clone(), 5.0, notifier.clone());
+
+        handle_peer_lightning_info(
+            peer,
+            LN_PUBKEY.to_string(),
+            Some("127.0.0.1:9735".to_string()),
+            storage_dyn,
+            lightning_dyn,
+            chain_dyn,
+            notifier_dyn,
+            SubsidyConfig {
+                enabled: true,
+                max_channel_sats: 50_000,
+                max_total_budget_sats: 10_000,
+                per_peer_max_opens: 1,
+                allowlist: vec![hex::encode(peer.as_bytes())],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(lightning.opens.lock().await.is_empty());
+        assert!(
+            notifier.notices.lock().await[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .starts_with("subsidy_budget_exhausted")
+        );
+    }
+
+    #[tokio::test]
+    async fn per_peer_cap_blocks() {
+        // Peer already has one Accepted (consumed) open; per_peer_max_opens = 1,
+        // so a fresh Pending invite for the same peer is refused.
+        let peer = NodeId::from_bytes([15u8; 32]);
+        let storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        storage
+            .add_invite_issued(&InviteIssuedRecord {
+                id: uuid::Uuid::new_v4(),
+                invitee_pubkey: *peer.as_bytes(),
+                expiry_unix: now_unix() + 7200,
+                channel_size_hint_sats: Some(10_000),
+                addr: "inviter.example:9736".to_string(),
+                max_fee_rate_sat_per_vb: Some(50),
+                channel_open_intent_expiry_unix: Some(now_unix() + 3600),
+                nonce: [1u8; 16],
+                state: InviteState::Accepted,
+                created_at: 1,
+                accepted_at: Some(2),
+                revoked_at: None,
+            })
+            .await
+            .unwrap();
+        storage
+            .add_invite_issued(&InviteIssuedRecord {
+                id: uuid::Uuid::new_v4(),
+                invitee_pubkey: *peer.as_bytes(),
+                expiry_unix: now_unix() + 7200,
+                channel_size_hint_sats: Some(10_000),
+                addr: "inviter.example:9736".to_string(),
+                max_fee_rate_sat_per_vb: Some(50),
+                channel_open_intent_expiry_unix: Some(now_unix() + 3600),
+                nonce: [2u8; 16],
+                state: InviteState::Pending,
+                created_at: 3,
+                accepted_at: None,
+                revoked_at: None,
+            })
+            .await
+            .unwrap();
+
+        let lightning = Arc::new(TestLightning {
+            balance_msat: 1_000_000_000,
+            ..Default::default()
+        });
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (storage_dyn, lightning_dyn, chain_dyn, notifier_dyn) =
+            deps(storage.clone(), lightning.clone(), 5.0, notifier.clone());
+
+        handle_peer_lightning_info(
+            peer,
+            LN_PUBKEY.to_string(),
+            Some("127.0.0.1:9735".to_string()),
+            storage_dyn,
+            lightning_dyn,
+            chain_dyn,
+            notifier_dyn,
+            SubsidyConfig {
+                enabled: true,
+                max_channel_sats: 1_000_000,
+                max_total_budget_sats: 100_000_000,
+                per_peer_max_opens: 1,
+                allowlist: vec![hex::encode(peer.as_bytes())],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            lightning.opens.lock().await.is_empty(),
+            "per-peer cap must block a second subsidised open"
+        );
+        assert!(
+            notifier
+                .notices
+                .lock()
+                .await
+                .iter()
+                .any(|n| n
+                    .reason
+                    .as_deref()
+                    .map(|r| r.starts_with("subsidy_per_peer_cap"))
+                    .unwrap_or(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn subsidy_already_open_idempotency_does_not_charge_budget() {
+        // An already-open channel re-confirms the invite at ZERO cost and must NOT
+        // be blocked by a tight budget — the budget counts only `Opening` spends
+        // (the-fool phantom-spend fix).
+        let peer = NodeId::from_bytes([16u8; 32]);
+        let storage = storage_with_invite(peer, 50, Some(50_000), now_unix() + 60).await;
+        let lightning = Arc::new(TestLightning {
+            balance_msat: 100,
+            ..Default::default()
+        });
+        *lightning.channels.lock().await = vec![ChannelInfo {
+            channel_id: "1".to_string(),
+            peer_pubkey: LN_PUBKEY.to_string(),
+            capacity_msat: 50_000_000,
+            local_balance_msat: 25_000_000,
+            remote_balance_msat: 25_000_000,
+            active: true,
+            short_channel_id: Some("100x1x0".to_string()),
+        }];
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (storage_dyn, lightning_dyn, chain_dyn, notifier_dyn) =
+            deps(storage.clone(), lightning.clone(), 5.0, notifier.clone());
+
+        handle_peer_lightning_info(
+            peer,
+            LN_PUBKEY.to_string(),
+            Some("127.0.0.1:9735".to_string()),
+            storage_dyn,
+            lightning_dyn,
+            chain_dyn,
+            notifier_dyn,
+            SubsidyConfig {
+                enabled: true,
+                max_channel_sats: 50_000,
+                max_total_budget_sats: 1,
+                per_peer_max_opens: 1,
+                allowlist: vec![hex::encode(peer.as_bytes())],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            lightning.opens.lock().await.is_empty(),
+            "already-open path must not open a NEW channel"
+        );
+        let notices = notifier.notices.lock().await;
+        assert_eq!(notices[0].status, "opened");
+        assert_eq!(notices[0].channel_id.as_deref(), Some("already_open"));
+        drop(notices);
         let invite = storage.list_invites_issued().await.unwrap().remove(0);
         assert_eq!(invite.state, InviteState::Accepted);
     }

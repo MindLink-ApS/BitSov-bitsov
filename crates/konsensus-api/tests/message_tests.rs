@@ -29,7 +29,7 @@ use konsensus_api::audit::AuditLog;
 use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use konsensus_api::build_router;
+use common::test_router as build_router;
 
 
 #[tokio::test]
@@ -628,6 +628,66 @@ async fn plaintext_requires_auth() {
         .body(Body::empty())
         .unwrap();
 
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─── Search endpoint (on-device, in-memory decrypt) ────────────────
+
+#[tokio::test]
+async fn search_finds_message_by_decrypted_plaintext() {
+    let storage = Arc::new(MemStorage::new());
+    let state = test_state_with_storage_and_cipher(storage);
+    let auth = auth_header(&state);
+    let match_id =
+        store_test_message_with_plaintext(&state, b"aaa", "Let's meet about the QUARTERLY budget review")
+            .await;
+    let _other =
+        store_test_message_with_plaintext(&state, b"bbb", "reminder: dentist appointment tomorrow").await;
+
+    let app = build_router(state);
+    let req = Request::builder()
+        .uri("/api/v1/messages/search?q=quarterly")
+        .header("authorization", &auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "exactly one match expected: {json}");
+    assert_eq!(arr[0]["id"].as_str().unwrap(), match_id);
+    assert!(
+        arr[0]["snippet"].as_str().unwrap().to_lowercase().contains("quarterly"),
+        "snippet must contain the match: {json}"
+    );
+}
+
+#[tokio::test]
+async fn search_empty_query_is_bad_request() {
+    let state = test_state_with_storage_and_cipher(Arc::new(MemStorage::new()));
+    let auth = auth_header(&state);
+    let app = build_router(state);
+    // Whitespace-only query trims to empty.
+    let req = Request::builder()
+        .uri("/api/v1/messages/search?q=%20%20")
+        .header("authorization", &auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn search_requires_auth() {
+    let state = test_state_with_storage_and_cipher(Arc::new(MemStorage::new()));
+    let app = build_router(state);
+    let req = Request::builder()
+        .uri("/api/v1/messages/search?q=hello")
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
@@ -1605,19 +1665,38 @@ async fn messages_peer_query_valid_hex_accepted() {
 // ─── Mnemonic endpoint tests ────────────────────────────────────
 
 #[tokio::test]
-async fn get_mnemonic_returns_plaintext() {
+async fn reveal_mnemonic_returns_plaintext_with_reauth() {
     let dir = tempfile::tempdir().unwrap();
     let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     std::fs::write(dir.path().join("mnemonic.txt"), mnemonic).unwrap();
 
     let state = test_state_with_data_dir(dir.path().to_path_buf());
     let auth = auth_header(&state);
-    let app = build_router(state);
+    let app = build_router(Arc::clone(&state));
+
+    // Re-auth (HARD-9): fetch a fresh challenge and sign it with the node key.
+    let chal_req = Request::builder()
+        .uri("/api/v1/auth/challenge")
+        .body(Body::empty())
+        .unwrap();
+    let chal_resp = app.clone().oneshot(chal_req).await.unwrap();
+    assert_eq!(chal_resp.status(), StatusCode::OK);
+    let chal_body = axum::body::to_bytes(chal_resp.into_body(), 4096).await.unwrap();
+    let chal_json: serde_json::Value = serde_json::from_slice(&chal_body).unwrap();
+    let challenge = chal_json["challenge"].as_str().unwrap().to_owned();
+    let sig = state.identity.sign(challenge.as_bytes());
+    let body = serde_json::json!({
+        "challenge": challenge,
+        "signature": hex::encode(sig.to_bytes()),
+    })
+    .to_string();
 
     let req = Request::builder()
+        .method("POST")
         .uri("/api/v1/identity/mnemonic")
         .header("authorization", &auth)
-        .body(Body::empty())
+        .header("content-type", "application/json")
+        .body(Body::from(body))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
@@ -1811,12 +1890,14 @@ async fn compose_happy_path_keysend() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -1827,6 +1908,7 @@ async fn compose_happy_path_keysend() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::clone(&invoice_requests),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -1929,12 +2011,14 @@ async fn compose_happy_path_invoice_flow() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -1945,6 +2029,7 @@ async fn compose_happy_path_invoice_flow() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::clone(&invoice_requests),
         data_dir: None,
+        backup_dir: None,
         // No peer_ln_pubkeys → forces invoice-request path instead of keysend.
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
@@ -2030,12 +2115,14 @@ async fn compose_rejects_invoice_amount_mismatch() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -2046,6 +2133,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::clone(&invoice_requests),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -2170,12 +2258,14 @@ async fn compose_keysend_fallback_to_invoice() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -2186,6 +2276,7 @@ async fn compose_keysend_fallback_to_invoice() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::clone(&invoice_requests),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -2283,12 +2374,14 @@ async fn compose_queues_when_transport_send_fails() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -2299,6 +2392,7 @@ async fn compose_queues_when_transport_send_fails() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::clone(&invoice_requests),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -2372,12 +2466,14 @@ async fn compose_room_delivers_to_all_connected_members() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -2388,6 +2484,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::clone(&invoice_requests),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -2495,12 +2592,14 @@ async fn compose_broadcasts_to_websocket() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: ws_tx,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -2511,6 +2610,7 @@ async fn compose_broadcasts_to_websocket() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::clone(&invoice_requests),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -2581,12 +2681,14 @@ async fn compose_records_send_timestamp_for_stdp() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -2597,6 +2699,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         send_timestamps: Arc::clone(&send_timestamps),
         invoice_requests: Arc::clone(&invoice_requests),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -2670,12 +2773,14 @@ async fn compose_room_all_members_fail_returns_error() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
         audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
         started_at: std::time::Instant::now(),
         content_dir: None,
@@ -2686,6 +2791,7 @@ async fn compose_room_all_members_fail_returns_error() {
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::clone(&invoice_requests),
         data_dir: None,
+        backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
@@ -2753,6 +2859,134 @@ async fn compose_room_all_members_fail_returns_error() {
     // Verify no envelopes were sent.
     let sent = transport.sent_envelopes.lock().unwrap();
     assert!(sent.is_empty(), "no envelopes should be sent when all members fail");
+}
+
+#[tokio::test]
+async fn compose_room_rejects_oversized_member_count() {
+    // HARD-12: room compose fans out one payment + encrypt + deliver per member.
+    // A room larger than the fan-out cap (MAX_ROOM_FANOUT_MEMBERS = 256) must be
+    // rejected up front with explicit back-pressure (400) BEFORE any per-member
+    // Lightning/payment work runs — otherwise one HTTP request amplifies into an
+    // unbounded number of money-path operations (the latency/amplification cliff).
+    //
+    // The cap is a private constant in the handler; this test pins the public
+    // contract (the 256 boundary). If the cap is intentionally changed, update
+    // OVER_CAP here to match.
+    const OVER_CAP: usize = 300; // strictly greater than MAX_ROOM_FANOUT_MEMBERS (256)
+
+    let invoice_requests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
+
+    // Transport that records sends and FAILS keysend/invoice loudly if reached —
+    // proving the guard short-circuits before any delivery is attempted.
+    let transport = Arc::new(ConnectedStubTransport::new(
+        Vec::new(),
+        Arc::clone(&invoice_requests),
+    ));
+
+    let identity = Arc::new(test_identity());
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let storage = Arc::new(MemStorage::new());
+
+    // Populate a room with OVER_CAP distinct members directly through storage
+    // (faster than OVER_CAP HTTP round-trips and exercises the same read path
+    // the handler uses via get_room_members).
+    let room = Room::new("oversized-room".into(), *identity.node_id());
+    let room_id = room.id;
+    storage.create_room(&room).await.unwrap();
+    for i in 0..OVER_CAP {
+        // Deterministic, distinct NodeIds. Index encoded in the trailing bytes.
+        let mut bytes = [0u8; 32];
+        bytes[28..].copy_from_slice(&(i as u32).to_be_bytes());
+        let member = NodeId::from_bytes(bytes);
+        storage.add_room_member(&room_id, &member).await.unwrap();
+    }
+    assert_eq!(
+        storage.get_room_members(&room_id).await.unwrap().len(),
+        OVER_CAP,
+        "room should be populated above the fan-out cap"
+    );
+
+    let state = Arc::new(AppState {
+        identity: Arc::clone(&identity),
+        storage: Arc::clone(&storage) as Arc<dyn Storage>,
+        lightning: Arc::new(StubLightning),
+        chain: Arc::new(StubChain),
+        pricing: Arc::new(StubPricing),
+        gate: Arc::new(PaymentGate::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        transport: transport.clone() as Arc<dyn MessageTransport>,
+        session_manager: Arc::clone(&session_manager),
+        jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        cors_enabled: false,
+        operator_probes_enabled: true,
+        sensitive_identity_routes_enabled: true,
+        ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
+        rate_limiter: Arc::new(RateLimiter::new(1000)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
+        audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
+        started_at: std::time::Instant::now(),
+        content_dir: None,
+        web_page_price_msat: None,
+        peer_prices: Arc::new(konsensus_pricing::PeerPriceCache::new()),
+        routing: Arc::new(konsensus_routing::RoutingTable::with_defaults()),
+        plaintext_cipher: None,
+        send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        invoice_requests: Arc::clone(&invoice_requests),
+        data_dir: None,
+        backup_dir: None,
+        peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        lightning_backend: "mock".into(),
+        chain_backend: "mock".into(),
+        gossip_validator: None,
+    });
+
+    let auth = auth_header(&state);
+    let app = build_router(Arc::clone(&state));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/messages/compose")
+        .header("authorization", &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "recipient": room_id.to_string(),
+                "is_room": true,
+                "kind": 100,
+                "plaintext": "amplification attempt"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "oversized room compose must be rejected with back-pressure, not processed"
+    );
+
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("too large"),
+        "rejection should explain the room is too large for synchronous fan-out, got: {text}"
+    );
+
+    // The guard must fire BEFORE any per-member work: no envelope delivered, and
+    // no invoice requests were ever issued. This is the amplification protection.
+    assert!(
+        transport.sent_envelopes.lock().unwrap().is_empty(),
+        "no envelopes should be sent when the room exceeds the fan-out cap"
+    );
+    assert!(
+        invoice_requests.lock().await.is_empty(),
+        "no payment/invoice operations should be initiated when over the cap"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════

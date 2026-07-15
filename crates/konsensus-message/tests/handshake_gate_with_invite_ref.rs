@@ -5,7 +5,7 @@ use konsensus_core::identity::NodeIdentity;
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::NodeId;
 use konsensus_message::wire::{Capability, SovereigntyTier};
-use konsensus_message::{NoiseTransport, TransportConfig};
+use konsensus_message::{ReachabilityMode, NoiseTransport, TransportConfig};
 use konsensus_storage::sqlite::SqliteStorage;
 use konsensus_storage::traits::Storage;
 
@@ -25,6 +25,8 @@ fn make_config(whitelist: Vec<NodeId>) -> TransportConfig {
         capabilities: vec![Capability::X3dh],
         whitelist,
         version: 2,
+        admission_mode: ReachabilityMode::Whitelist,
+        cookie_mode: Default::default(),
     }
 }
 

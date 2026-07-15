@@ -3,10 +3,60 @@
 //! One message format for ALL communication. The `kind` field (u16) determines
 //! the payload schema within the encrypted `ciphertext`.
 
+use std::fmt;
+
+use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
 use crate::types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, Signature};
+
+/// Max number of message references (threading / replies / reactions) carried
+/// in a UKM envelope. A handful is all any legitimate thread needs; the cap
+/// stops a hostile 16 MiB `Frame::Message`/`Frame::Gossip` from inflating
+/// `references` into hundreds of thousands of `MessageId` allocations
+/// (HARD-1 / SEC-PEX-WIRE bug class). konsensus-core does not depend on the
+/// `bounded::` module in konsensus-message, so the cap lives here.
+pub const MAX_MESSAGE_REFERENCES: usize = 64;
+
+/// Deserialize `Vec<MessageId>` capped at [`MAX_MESSAGE_REFERENCES`]. The
+/// visitor counts as it pushes and aborts at `cap + 1`, never pre-allocating
+/// from the attacker-declared array length.
+fn bounded_references<'de, D>(deserializer: D) -> Result<Vec<MessageId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct RefVisitor;
+
+    impl<'de> Visitor<'de> for RefVisitor {
+        type Value = Vec<MessageId>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "a list of at most {MAX_MESSAGE_REFERENCES} message references"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Vec<MessageId>, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out: Vec<MessageId> = Vec::new();
+            while let Some(item) = seq.next_element::<MessageId>()? {
+                if out.len() >= MAX_MESSAGE_REFERENCES {
+                    return Err(de::Error::custom(format!(
+                        "references list exceeds maximum of {MAX_MESSAGE_REFERENCES} entries"
+                    )));
+                }
+                out.push(item);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(RefVisitor)
+}
 
 /// The Unified BitSov Message envelope.
 ///
@@ -34,6 +84,7 @@ pub struct UkmEnvelope {
     /// Random nonce for replay protection.
     pub nonce: Nonce,
     /// References to other messages (threading, replies, reactions).
+    #[serde(deserialize_with = "bounded_references")]
     pub references: Vec<MessageId>,
 }
 
@@ -102,6 +153,15 @@ impl UkmEnvelope {
 
         // 3. Payment proof must be valid (Principle 2)
         self.payment_proof.verify_preimage()?;
+
+        // 4. References list must be bounded (defense-in-depth: the wire decoder
+        //    caps this too, but validate() is the gate-side enforcement before
+        //    the envelope is acted upon).
+        if self.references.len() > MAX_MESSAGE_REFERENCES {
+            return Err(CoreError::EnvelopeValidation(format!(
+                "references list exceeds maximum of {MAX_MESSAGE_REFERENCES}"
+            )));
+        }
 
         Ok(())
     }
@@ -237,6 +297,48 @@ mod tests {
             .build();
 
         assert!(envelope.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_too_many_references() {
+        let sender = NodeId::from_bytes([1u8; 32]);
+        let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
+        let proof = make_valid_proof();
+
+        let refs = vec![MessageId::from_bytes([7u8; 32]); MAX_MESSAGE_REFERENCES + 1];
+        let mut envelope =
+            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"data".to_vec(), proof)
+                .timestamp(1_700_000_000_000)
+                .references(refs)
+                .build();
+        assert!(envelope.validate().is_err(), "over-cap references must be rejected");
+
+        // Exactly at the cap is accepted.
+        envelope.references = vec![MessageId::from_bytes([7u8; 32]); MAX_MESSAGE_REFERENCES];
+        assert!(envelope.validate().is_ok());
+    }
+
+    #[test]
+    fn deserialize_rejects_too_many_references() {
+        let sender = NodeId::from_bytes([1u8; 32]);
+        let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
+        let proof = make_valid_proof();
+
+        let refs = vec![MessageId::from_bytes([9u8; 32]); MAX_MESSAGE_REFERENCES + 5];
+        let envelope =
+            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"data".to_vec(), proof)
+                .timestamp(1_700_000_000_000)
+                .references(refs)
+                .build();
+
+        // Serialize (uncapped) then deserialize (capped): the bounded visitor
+        // must abort the parse rather than inflate the references vector.
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        let decoded = serde_json::from_str::<UkmEnvelope>(&json);
+        assert!(
+            decoded.is_err(),
+            "over-cap references must be rejected at decode"
+        );
     }
 
     #[test]

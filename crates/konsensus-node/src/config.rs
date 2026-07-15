@@ -96,6 +96,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub pricing: PricingConfig,
 
+    /// Payment gate enforcement configuration.
+    #[serde(default)]
+    pub payment_gate: PaymentGateConfig,
+
     /// Storage backend configuration.
     pub storage: StorageConfig,
 
@@ -114,6 +118,55 @@ pub struct NodeConfig {
     /// Static peer list.
     #[serde(default)]
     pub peers: Vec<PeerConfigEntry>,
+
+    /// Operator-selectable admission mode. `whitelist` (default, closed mesh) or
+    /// `price_open` (strangers admitted unprivileged; per-message payment is the gate).
+    ///
+    /// The `#[serde(default)]` is MANDATORY: `NodeConfig` carries
+    /// `deny_unknown_fields`, so without a default every existing live-mesh
+    /// `konsensus.toml` that omits this field would fail to parse. Reuses the
+    /// re-exported `konsensus_message::ReachabilityMode` so config and transport
+    /// never diverge.
+    #[serde(default)]
+    pub admission_mode: konsensus_message::ReachabilityMode,
+
+    /// Pre-Noise anti-DoS cookie (doorway hardening #2) — `disabled` (default) or
+    /// `required`. When `required`, this node demands a stateless return-
+    /// routability cookie before it spends a Noise DH on an inbound connection
+    /// (operator opt-in; availability defense, never admission — it changes no
+    /// payment-gate semantics). `#[serde(default)]` is MANDATORY (`NodeConfig` is
+    /// `deny_unknown_fields`) so every existing `konsensus.toml` that omits this
+    /// field keeps parsing. Reuses the re-exported `konsensus_message::CookieMode`
+    /// so config and transport never diverge.
+    #[serde(default)]
+    pub cookie_mode: konsensus_message::CookieMode,
+
+    /// Onboarding channel-open subsidy (R1-a) — OFF by default.
+    ///
+    /// When disabled (the mesh-wide default), an invite's `Pending` membership
+    /// NEVER authorizes the auto-channel worker to spend operator sats: the
+    /// worker is inert. Enabling it requires the operator to ALSO set the
+    /// `max_*` spend caps and a non-empty `allowlist`; any of those left at its
+    /// fail-closed default keeps every open suppressed.
+    ///
+    /// `#[serde(default)]` is MANDATORY (`NodeConfig` is `deny_unknown_fields`):
+    /// every existing live-mesh `konsensus.toml` omits this block and must keep
+    /// parsing.
+    #[serde(default)]
+    pub onboarding_subsidy: SubsidyConfig,
+
+    /// Relay role gate (T2R8 / R3 SEAM-B) — OFF by default.
+    ///
+    /// When enabled, the node advertises `Capability::Relay` and mounts the
+    /// gated kind-600+ relay-control dispatch behind the normal payment gate.
+    /// The backend is operator-selected via `RelayConfig::durable_db_path`:
+    /// set ⇒ the durable `SqliteRelayStore`; unset ⇒ the non-durable in-memory
+    /// store (smoke-test only). On a real (non-Mock) Lightning backend an unset
+    /// path is a fail-closed config error (`validate()`), never a silent
+    /// production fallback that would lose held mail on restart. Either store
+    /// never decrypts relay payloads or holds user keys.
+    #[serde(default)]
+    pub relay: RelayConfig,
 }
 
 /// Identity configuration — where the mnemonic is stored.
@@ -381,8 +434,7 @@ pub struct PricingConfig {
     /// ```
     ///
     /// Category names: "communication", "structured_data", "files_media",
-    /// "collaboration", "realtime_signaling", "web_content", "storage",
-    /// "control", "app_extension".
+    /// "collaboration", "realtime_signaling", "control", "app_extension".
     /// Only used when mode = "chain_aware".
     #[serde(default)]
     pub category_fee_targets: std::collections::HashMap<String, u32>,
@@ -415,11 +467,6 @@ pub struct PricingConfig {
     /// Used by the sovereign browser.
     #[serde(default = "default_web_content_msat")]
     pub web_content_msat: u64,
-    /// Relay storage rate in millisatoshis per byte-day.
-    ///
-    /// Storage is a relay service category, not a UKM kind range.
-    #[serde(default = "default_relay_storage_msat_per_byte_day")]
-    pub relay_storage_msat_per_byte_day: u64,
 }
 
 impl Default for PricingConfig {
@@ -440,9 +487,127 @@ impl Default for PricingConfig {
             realtime_signal_msat: default_realtime_signal_msat(),
             app_ext_msat: default_app_ext_msat(),
             web_content_msat: default_web_content_msat(),
-            relay_storage_msat_per_byte_day: default_relay_storage_msat_per_byte_day(),
         }
     }
+}
+
+/// Payment gate runtime configuration.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentGateConfig {
+    /// Verify each accepted proof against the receiver-side Lightning backend.
+    ///
+    /// `None` means infer from the Lightning backend: enabled for real
+    /// backends and disabled for `mock` so local/dev configs stay ergonomic.
+    #[serde(default)]
+    pub verify_lightning_settlement: Option<bool>,
+
+    /// Absolute minimum admission price in msat — the node's modeled marginal
+    /// cost of processing one inbound paid contact (doorway hardening #4).
+    ///
+    /// `None`/omitted ⇒ `0` (off): no floor, pricing identical to before. Set
+    /// this to your node's measured per-admission cost so an attacker cannot
+    /// pay less than it costs to serve them (pay-to-DoS asymmetry). The floor
+    /// can only ever raise the required price — never admit something the base
+    /// price would reject — so enabling it is strictly fail-closed.
+    #[serde(default)]
+    pub min_admission_cost_msat: Option<u64>,
+}
+
+/// Onboarding channel-open subsidy policy (R1-a). OFF by default — see the doc
+/// on [`NodeConfig::onboarding_subsidy`].
+///
+/// Every field is independently fail-closed: `enabled = false`, zero spend caps,
+/// and an empty `allowlist` each on their own keep the auto-channel worker from
+/// spending a single operator sat. An operator running the ChainBridge subsidy
+/// loop must consciously set `enabled`, the `max_*` caps, AND a non-empty
+/// `allowlist` before any channel opens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubsidyConfig {
+    /// Master switch. When `false` (default), the worker is inert mesh-wide and
+    /// an invite's `Pending` membership never authorizes a channel open. Payment,
+    /// never membership, is what may move sats.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Per-channel spend ceiling (sats). The invitee-supplied `channel_size_hint`
+    /// is clamped DOWN to this value — a larger hint can never raise the spend.
+    /// `0` (default) clamps every open to zero, so nothing opens (fail-closed).
+    #[serde(default)]
+    pub max_channel_sats: u64,
+
+    /// Aggregate ceiling (sats) summed across all in-flight (`Opening`) subsidised
+    /// opens. `0` (default) means the very first open exceeds it (fail-closed).
+    #[serde(default)]
+    pub max_total_budget_sats: u64,
+
+    /// Maximum subsidised channel opens per invited peer. Defaults to 1.
+    #[serde(default = "default_per_peer_max_opens")]
+    pub per_peer_max_opens: u32,
+
+    /// Hex-encoded BitSov NodeIds (64 lowercase hex chars) eligible for subsidy.
+    /// Invite membership is necessary but NOT sufficient — the peer must also be
+    /// listed here. Empty (default) ⇒ nobody is eligible.
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+}
+
+impl Default for SubsidyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_channel_sats: 0,
+            max_total_budget_sats: 0,
+            per_peer_max_opens: default_per_peer_max_opens(),
+            allowlist: Vec::new(),
+        }
+    }
+}
+
+impl SubsidyConfig {
+    /// True iff `pubkey` (a 32-byte BitSov NodeId) is in the operator allowlist.
+    /// Comparison is over the lowercase-hex encoding, case-insensitive; a
+    /// malformed allowlist entry simply never matches (fail-closed).
+    pub fn is_allowlisted(&self, pubkey: &[u8; 32]) -> bool {
+        let want = hex::encode(pubkey);
+        self.allowlist
+            .iter()
+            .any(|entry| entry.trim().eq_ignore_ascii_case(&want))
+    }
+}
+
+fn default_per_peer_max_opens() -> u32 {
+    1
+}
+
+/// Relay role policy.
+///
+/// Fail-closed by default: ordinary nodes do not advertise `Capability::Relay`
+/// and do not construct a relay engine. An operator must explicitly set
+/// `[relay] enabled = true` before the node announces relay support and mounts
+/// the gated kind-600+ relay-control dispatch. The backend is selected by
+/// `durable_db_path`: unset ⇒ the non-durable in-memory store (smoke-test only);
+/// set ⇒ the durable SQLite store. Either way the relay never decrypts payloads
+/// or holds user keys.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayConfig {
+    /// Enable relay advertisement and gated relay-control dispatch.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Path to the durable relay SQLite DB (P8.1 / design SEAM-C). Ignored unless
+    /// `enabled = true`.
+    ///
+    /// `None` (default) ⇒ the non-durable in-memory store: held mail is lost on
+    /// restart (smoke-test only). `Some(path)` ⇒ the durable `SqliteRelayStore`.
+    /// **The node never creates this DB or its schema** — an operator runs the
+    /// `[MANUAL]` `CREATE TABLE` migration (design §4) and points this at the
+    /// resulting file. A missing file/schema is a fail-closed boot error, never a
+    /// silent fallback to the in-memory store.
+    #[serde(default)]
+    pub durable_db_path: Option<PathBuf>,
 }
 
 /// Storage backend selection.
@@ -504,10 +669,14 @@ impl Default for StorageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupConfig {
-    /// Directory for encrypted SCB rotation files.
+    /// Directory for the durable disaster-recovery artifacts — the encrypted SCB
+    /// rotation files and the whitelist sidecar (RV-RESTORE).
     ///
     /// Defaults to `<data_dir>/backups/` when generated by `konsensus init`.
-    /// If omitted in a hand-written config, this falls back to `backups`.
+    /// If omitted in a hand-written config, this falls back to the relative
+    /// `backups`, which [`NodeConfig::load`] then anchors to the config file's
+    /// own directory (never the process CWD) so the only recovery material a node
+    /// holds cannot land in an ephemeral location like `/tmp`.
     #[serde(default = "default_backup_scb_dir")]
     pub scb_dir: String,
     /// Number of timestamped encrypted SCB snapshots to retain.
@@ -651,13 +820,45 @@ impl NodeConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
+        let mut config: Self = toml::from_str(&content)?;
+        config.anchor_relative_backup_dir(path);
         config.validate()?;
         Ok(config)
     }
 
+    /// Anchor a relative `backup.scb_dir` to the config file's own directory
+    /// rather than the process working directory.
+    ///
+    /// `scb_dir` holds the node's durable disaster-recovery artifacts — the SCB
+    /// channel backups and the encrypted whitelist sidecar (RV-RESTORE). The
+    /// serde default (`"backups"`) is *relative*, so a node launched as a service
+    /// from an ephemeral CWD (e.g. `/tmp`) would silently write its only recovery
+    /// material somewhere that vanishes on reboot — defeating recovery while the
+    /// node looks perfectly healthy. `konsensus init` already writes an absolute
+    /// path; this protects hand-written or upgraded configs that omit `[backup]`.
+    /// Absolute paths are left untouched.
+    fn anchor_relative_backup_dir(&mut self, config_path: &Path) {
+        if Path::new(&self.backup.scb_dir).is_absolute() {
+            return;
+        }
+        // The config file exists (we just read it), so canonicalize resolves to an
+        // absolute path; its parent is the node's own directory — durable by
+        // construction (it already holds the config, DB, and mnemonic).
+        let Ok(canonical) = std::fs::canonicalize(config_path) else {
+            return;
+        };
+        if let Some(base) = canonical.parent() {
+            let resolved = base.join(&self.backup.scb_dir);
+            self.backup.scb_dir = resolved.to_string_lossy().into_owned();
+        }
+    }
+
     /// Validate configuration for common errors that would cause startup failures.
-    fn validate(&self) -> anyhow::Result<()> {
+    /// `pub(crate)` so callers that mutate the config AFTER [`NodeConfig::load`]
+    /// (e.g. the `--admission-mode` CLI override in `cmd_start`) can RE-validate
+    /// the final config — `from_config` does not validate, so a post-load mutation
+    /// would otherwise escape the fail-closed guards.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         // Check mnemonic file exists and is readable
         if !self.identity.mnemonic_file.exists() {
             anyhow::bail!(
@@ -698,12 +899,69 @@ impl NodeConfig {
             );
         }
 
+        // Check P2P and Lightning (LDK) ports don't collide.
+        //
+        // A fresh full-tier config leaves BOTH the P2P network listener and the
+        // LDK Lightning listener on 0.0.0.0:9735 (see `default_listen_addr` and
+        // `default_for_tier(Full)`, which sets `listening_address =
+        // Some("0.0.0.0:9735")`). Without this guard the collision passes
+        // validation, then at runtime the LDK node and the P2P transport both
+        // try to bind 9735: the LDK node starts and immediately shuts down, and
+        // `transport.start_listener().await` hangs forever, so the API never
+        // binds — a silent hang with no error. Fail closed with an actionable
+        // message instead (reproduced on 2 hosts during R4.5 staging).
+        //
+        // Only the explicit `Some(addr)` case is guarded: when
+        // `listening_address` is `None`, `LdkProvider::new`
+        // (crates/konsensus-lightning/src/ldk.rs) skips
+        // `set_listening_addresses` entirely, so LDK binds no Lightning P2P
+        // listener and no port collision is possible. Non-LDK backends
+        // (mock/lnd/lnbits) run no embedded P2P listener, so they are exempt.
+        if let LightningConfig::Ldk {
+            listening_address: Some(ln_addr),
+            ..
+        } = &self.lightning
+        {
+            // Accept either a full SocketAddr ("0.0.0.0:9735") or a bare
+            // "host:port"; extract the port and IP the same way the LDK builder
+            // parses it. A value we cannot parse as a SocketAddr is left to
+            // `LdkProvider::new`, which surfaces its own "invalid listening
+            // address" error — we do not want to reject IPv6/hostname forms here.
+            if let Ok(ln_socket) = ln_addr.parse::<SocketAddr>() {
+                if self.network.listen_addr.port() == ln_socket.port()
+                    && (self.network.listen_addr.ip().is_unspecified()
+                        || ln_socket.ip().is_unspecified()
+                        || self.network.listen_addr.ip() == ln_socket.ip())
+                {
+                    anyhow::bail!(
+                        "P2P listen address ({}) and Lightning listening address ({}) use the \
+                         same port; set a different port for one (e.g. P2P 9736, Lightning 9735)",
+                        self.network.listen_addr,
+                        ln_socket
+                    );
+                }
+            }
+        }
+
+        if matches!(self.tier, NodeTier::Cloud) {
+            let encrypted = match &self.storage {
+                StorageConfig::Sqlite { encrypted, .. }
+                | StorageConfig::Postgres { encrypted, .. } => *encrypted,
+            };
+            if !encrypted {
+                anyhow::bail!(
+                    "cloud tier requires encrypted storage (Principle 4: operator-held data must be ciphertext)"
+                );
+            }
+        }
+
         // Validate peer node IDs are valid hex
         for (i, peer) in self.peers.iter().enumerate() {
             if konsensus_core::types::NodeId::from_hex(&peer.node_id).is_err() {
                 anyhow::bail!(
                     "peers[{}]: invalid node_id '{}' — must be 64 hex characters (32 bytes Ed25519 public key)",
-                    i, peer.node_id
+                    i,
+                    peer.node_id
                 );
             }
         }
@@ -718,7 +976,6 @@ impl NodeConfig {
             || self.pricing.realtime_signal_msat == 0
             || self.pricing.app_ext_msat == 0
             || self.pricing.web_content_msat == 0
-            || self.pricing.relay_storage_msat_per_byte_day == 0
         {
             anyhow::bail!(
                 "all pricing values must be > 0 (Principle 2: payment gate is fail-closed)"
@@ -732,7 +989,97 @@ impl NodeConfig {
             anyhow::bail!("backup.scb_dir must not be empty");
         }
 
+        // SEC3: refuse a real (non-Mock) Lightning backend with settlement
+        // verification explicitly disabled. `payment_gate_runtime_config` resolves the
+        // flag via `.unwrap_or(!is_mock)`, so a TOML `Some(false)` against an
+        // Ldk/Lnd/Lnbits backend silently downgrades the gate to preimage-only — a
+        // forged or un-settled payment proof would then pass (Principle 2 fail-open).
+        let resolved_verify_settlement = self
+            .payment_gate
+            .verify_lightning_settlement
+            .unwrap_or(!matches!(self.lightning, LightningConfig::Mock { .. }));
+        if !matches!(self.lightning, LightningConfig::Mock { .. }) && !resolved_verify_settlement {
+            anyhow::bail!(
+                "payment_gate.verify_lightning_settlement = false is not allowed with a non-Mock \
+                 Lightning backend ({}): it downgrades the payment gate to preimage-only and lets \
+                 unsettled proofs pass (Principle 2). Remove the override or set it to true.",
+                self.lightning.backend_name()
+            );
+        }
+
+        // 2d (Codex #3): the ciphertext relay and price-open admission are
+        // SETTLEMENT-GATED — they admit strangers (price_open) or hold paid
+        // deposits (relay) on the strength of a settled, recipient-bound payment.
+        // With settlement verification resolving OFF (the default for a Mock
+        // backend), the gate degrades to preimage-only and a forged or un-settled
+        // proof would admit — "payment is the connection" fails open. So a node
+        // must NOT mount either with settlement off; on a Mock backend that means
+        // the operator must EXPLICITLY opt in (verify_lightning_settlement = true,
+        // the dev/smoke escape) before enabling them. Fail closed.
+        let price_open = matches!(
+            self.admission_mode,
+            konsensus_message::ReachabilityMode::PriceOpen
+        );
+        if (self.relay.enabled || price_open) && !resolved_verify_settlement {
+            anyhow::bail!(
+                "{} require payment_gate.verify_lightning_settlement = true: this admission \
+                 path is settlement-gated, but verification resolves OFF (the default for a \
+                 Mock backend: {}), which would admit unsettled/forged proofs (Principle 2). \
+                 Set verify_lightning_settlement = true to opt in explicitly (dev/smoke mode), \
+                 or disable [relay].enabled / use whitelist admission.",
+                match (self.relay.enabled, price_open) {
+                    (true, true) => "[relay].enabled and admission_mode = price_open",
+                    (true, false) => "[relay].enabled",
+                    _ => "admission_mode = price_open",
+                },
+                self.lightning.backend_name()
+            );
+        }
+
+        // Live-tier relay must be DURABLE. With `[relay].enabled` but no
+        // `durable_db_path`, the node falls back to the in-memory relay store,
+        // which LOSES all held ciphertext mail on restart (main.rs:840 warns but
+        // proceeds). That is acceptable only for a smoke/dev node on the Mock
+        // backend; on a real (non-Mock) Lightning backend it is a silent
+        // production data-loss foot-gun. Require an operator-migrated durable DB
+        // there. Fail closed. (The node still never creates the DB/schema — a
+        // missing file is a separate loud boot error at open time.)
+        if self.relay.enabled
+            && self.relay.durable_db_path.is_none()
+            && !matches!(self.lightning, LightningConfig::Mock { .. })
+        {
+            anyhow::bail!(
+                "[relay].enabled with no relay.durable_db_path on a non-Mock Lightning backend \
+                 ({}): the in-memory relay store loses held mail on every restart and is \
+                 smoke-test only. Point relay.durable_db_path at the operator-migrated SQLite DB \
+                 (run the [MANUAL] CREATE TABLE migration first), or disable [relay].enabled.",
+                self.lightning.backend_name()
+            );
+        }
+        // Reject an explicitly-configured empty or too-short JWT secret
+        // (fail-closed). Omitting api.jwt_secret is fine — the node then
+        // derives a 32-byte secret from its identity at startup. But an
+        // operator who *sets* a weak secret must be stopped, not silently
+        // trusted: an empty or sub-32-byte HMAC key makes token forgery
+        // cheap (Principle 1: the node is the undisputable identity anchor).
+        if let Some(secret) = &self.api.jwt_secret {
+            konsensus_api::auth::validate_jwt_secret(secret)
+                .map_err(|reason| anyhow::anyhow!("api.jwt_secret: {reason}"))?;
+        }
+
         Ok(())
+    }
+
+    /// Build the runtime payment gate config for this node.
+    pub fn payment_gate_runtime_config(&self) -> konsensus_core::gate::GateConfig {
+        konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: self
+                .payment_gate
+                .verify_lightning_settlement
+                .unwrap_or(!matches!(self.lightning, LightningConfig::Mock { .. })),
+            min_admission_cost_msat: self.payment_gate.min_admission_cost_msat.unwrap_or(0),
+            ..Default::default()
+        }
     }
 
     /// Write configuration to a TOML file.
@@ -804,6 +1151,8 @@ impl NodeConfig {
             ),
         };
 
+        let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
+
         Self {
             tier,
             identity: IdentityConfig {
@@ -817,6 +1166,10 @@ impl NodeConfig {
             lightning,
             chain,
             pricing: PricingConfig::default(),
+            payment_gate: PaymentGateConfig {
+                verify_lightning_settlement: Some(verify_lightning_settlement),
+                min_admission_cost_msat: None,
+            },
             storage,
             backup: BackupConfig {
                 scb_dir: backup_path.to_string_lossy().into_owned(),
@@ -828,45 +1181,23 @@ impl NodeConfig {
                 ..ApiConfig::default()
             },
             web: WebConfig::default(),
-            peers: match tier {
-                NodeTier::Cloud => Vec::new(),
-                _ => Self::bootstrap_peers(),
-            },
+            // Boundary invariant (PUB-1): no bootstrap peers are compiled into
+            // the binary. Embedding live node IDs/IPs here would publish the
+            // operator's mesh topology in the open-core repo and make every
+            // downloader auto-dial private infrastructure. Operators supply
+            // peers via config ([[peers]]) or environment at deploy time.
+            peers: Vec::new(),
+            // M1a: closed mesh by default (fail-closed). Operators opt into
+            // price-admission via konsensus.toml or `--admission-mode price-open`.
+            admission_mode: konsensus_message::ReachabilityMode::Whitelist,
+            cookie_mode: konsensus_message::CookieMode::Disabled,
+            // R1-a: onboarding channel-open subsidy OFF by default — generated
+            // configs never auto-spend operator sats on invite membership.
+            onboarding_subsidy: SubsidyConfig::default(),
+            // T2R8: relay advertisement OFF by default — generated configs do
+            // not present this node as a relay.
+            relay: RelayConfig::default(),
         }
-    }
-
-    /// Default bootstrap peers — the BitSov test network.
-    ///
-    /// Light and Full tier configs include these by default so new nodes
-    /// can discover the mesh immediately. Cloud tier doesn't need them
-    /// (the hosted node manages its own peer list).
-    ///
-    /// These are the real Ed25519 node IDs from the live 3-node test network
-    /// running on GCP. Ports match the actual P2P listen addresses.
-    fn bootstrap_peers() -> Vec<PeerConfigEntry> {
-        vec![
-            PeerConfigEntry {
-                node_id: "0dc0122d1a5635ba9c6f31eb206b5fb18993a1272998ca8d108f98389b8ca687"
-                    .to_string(),
-                addr: SocketAddr::from(([35, 188, 185, 67], 9736)),
-                label: Some("BitSov Alpha (bootstrap)".to_string()),
-                auto_connect: true,
-            },
-            PeerConfigEntry {
-                node_id: "6821e99a22b2b4b15c42db766d85769710437c002ff1763518347a47fcdaa1cb"
-                    .to_string(),
-                addr: SocketAddr::from(([35, 224, 118, 190], 9737)),
-                label: Some("BitSov Beta (bootstrap)".to_string()),
-                auto_connect: true,
-            },
-            PeerConfigEntry {
-                node_id: "354597aab1cdcaedb4fd903836735cab9ab508bfbf90406bb9633a6cd8dcb536"
-                    .to_string(),
-                addr: SocketAddr::from(([34, 135, 251, 102], 9737)),
-                label: Some("BitSov Gamma (bootstrap)".to_string()),
-                auto_connect: true,
-            },
-        ]
     }
 }
 
@@ -900,6 +1231,9 @@ fn default_audit_log_path() -> String {
     "audit.jsonl".into()
 }
 
+/// Relative fallback for `backup.scb_dir`. [`NodeConfig::load`] anchors this to
+/// the config file's directory, so the effective path is durable even though the
+/// literal default is relative.
 fn default_backup_scb_dir() -> String {
     "backups".into()
 }
@@ -962,9 +1296,6 @@ fn default_app_ext_msat() -> u64 {
 }
 fn default_web_content_msat() -> u64 {
     50
-}
-fn default_relay_storage_msat_per_byte_day() -> u64 {
-    1
 }
 
 #[cfg(test)]
