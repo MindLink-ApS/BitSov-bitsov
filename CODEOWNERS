@@ -14,3 +14,4 @@ crates/konsensus-crypto/** @BitSov/core-maintainers @BitSov/security-maintainers
 crates/konsensus-message/** @BitSov/core-maintainers @BitSov/security-maintainers
 crates/konsensus-storage/** @BitSov/core-maintainers @BitSov/security-maintainers
 crates/konsensus-lightning/** @BitSov/core-maintainers @BitSov/security-maintainers
+

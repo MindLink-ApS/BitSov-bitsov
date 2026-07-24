@@ -28,6 +28,12 @@ use crate::error::ApiError;
 use crate::handlers::messages::create_payment_proof;
 use crate::state::AppState;
 
+const MAX_CALENDAR_LIST_RECURRING_MASTERS: usize = 512;
+const MIN_CALENDAR_LIST_RECURRING_MASTER_BUDGET: usize = 256;
+const MAX_CALENDAR_LIST_EXPANDED_OCCURRENCES: usize = 10_000;
+const MIN_CALENDAR_LIST_EXPANDED_OCCURRENCE_BUDGET: usize = 1_024;
+const DEFAULT_CALENDAR_LIST_WINDOW_MS: u64 = 30 * 24 * 3600 * 1000;
+
 // ── Request / Response types ────────────────────────────────────────────
 
 /// Query parameters for `GET /api/v1/calendar/events`.
@@ -46,6 +52,72 @@ pub struct ListEventsQuery {
 
 fn default_limit() -> u32 {
     100
+}
+
+fn recurring_master_budget(limit: usize) -> usize {
+    limit
+        .saturating_mul(8)
+        .clamp(
+            MIN_CALENDAR_LIST_RECURRING_MASTER_BUDGET,
+            MAX_CALENDAR_LIST_RECURRING_MASTERS,
+        )
+}
+
+fn expanded_occurrence_budget(limit: usize) -> usize {
+    limit
+        .saturating_mul(64)
+        .clamp(
+            MIN_CALENDAR_LIST_EXPANDED_OCCURRENCE_BUDGET,
+            MAX_CALENDAR_LIST_EXPANDED_OCCURRENCES,
+        )
+}
+
+fn reject_if_recurring_master_budget_exceeded(
+    fetched: usize,
+    budget: usize,
+) -> Result<(), ApiError> {
+    if fetched <= budget {
+        return Ok(());
+    }
+
+    Err(ApiError::TooManyRequests(format!(
+        "calendar recurrence expansion would scan more than {budget} recurring series; narrow the time range"
+    )))
+}
+
+fn add_expanded_occurrences(
+    expanded: &mut usize,
+    added: usize,
+    budget: usize,
+) -> Result<(), ApiError> {
+    *expanded = expanded.saturating_add(added);
+    if *expanded <= budget {
+        return Ok(());
+    }
+
+    Err(ApiError::TooManyRequests(format!(
+        "calendar recurrence expansion would produce more than {budget} candidate occurrences; narrow the time range"
+    )))
+}
+
+fn reject_if_calendar_time_bounds_exceeded(from_ms: u64, to_ms: u64) -> Result<(), ApiError> {
+    if from_ms <= i64::MAX as u64 && to_ms <= i64::MAX as u64 {
+        return Ok(());
+    }
+
+    Err(ApiError::BadRequest(
+        "calendar time range exceeds supported timestamp bounds".into(),
+    ))
+}
+
+fn default_calendar_to_ms(from_ms: u64) -> Result<u64, ApiError> {
+    from_ms
+        .checked_add(DEFAULT_CALENDAR_LIST_WINDOW_MS)
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "calendar default time range exceeds supported timestamp bounds".into(),
+            )
+        })
 }
 
 /// Optional recurrence rule in API requests.
@@ -274,8 +346,15 @@ async fn list_events(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let from_ms = params.from.unwrap_or(now_ms);
-    let to_ms = params.to.unwrap_or(from_ms + 30 * 24 * 3600 * 1000);
+    let to_ms = match params.to {
+        Some(to_ms) => to_ms,
+        None => default_calendar_to_ms(from_ms)?,
+    };
     let limit = params.limit.min(500) as usize;
+    if limit == 0 || from_ms >= to_ms {
+        return Ok(Json(Vec::new()));
+    }
+    reject_if_calendar_time_bounds_exceeded(from_ms, to_ms)?;
 
     // 1. One-off (non-recurring) events in range.
     let one_off = state
@@ -284,12 +363,15 @@ async fn list_events(
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
-    // 2. All recurring master events (expansion is time-windowed in expand_occurrences).
+    // 2. Recurring master events that can affect this window. Fetch `budget + 1`
+    // so the handler can fail closed instead of returning a silent partial view.
+    let master_budget = recurring_master_budget(limit);
     let masters = state
         .storage
-        .list_recurring_master_events()
+        .list_recurring_master_events_before(to_ms, (master_budget + 1) as u32)
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
+    reject_if_recurring_master_budget_exceeded(masters.len(), master_budget)?;
 
     // 3. Exception/override records in range (parent_id IS NOT NULL).
     let exceptions = state
@@ -314,9 +396,16 @@ async fn list_events(
     }
 
     // Expand each recurring master into individual occurrences.
+    let occurrence_budget = expanded_occurrence_budget(limit);
+    let mut expanded_occurrences = 0usize;
     for master in &masters {
         let suppressed = exc_by_parent.get(&master.id);
         let occ_starts = expand_occurrences(master, from_ms as i64, to_ms as i64);
+        add_expanded_occurrences(
+            &mut expanded_occurrences,
+            occ_starts.len(),
+            occurrence_budget,
+        )?;
         let duration_ms = master.end_ms.saturating_sub(master.start_ms);
         let attendees: Vec<String> =
             serde_json::from_str(&master.attendees_json).unwrap_or_default();
@@ -996,5 +1085,47 @@ mod tests {
         let starts = expand_occurrences(&record, start_ms as i64, to);
         assert_eq!(starts.len(), 3);
         assert!(starts.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    #[test]
+    fn calendar_list_recurring_master_budget_fails_closed_on_cap_plus_one() {
+        let budget = recurring_master_budget(1);
+        assert_eq!(budget, MIN_CALENDAR_LIST_RECURRING_MASTER_BUDGET);
+        assert!(reject_if_recurring_master_budget_exceeded(budget, budget).is_ok());
+
+        let err = reject_if_recurring_master_budget_exceeded(budget + 1, budget).unwrap_err();
+        assert!(matches!(err, ApiError::TooManyRequests(_)));
+    }
+
+    #[test]
+    fn calendar_list_expanded_occurrence_budget_fails_closed_before_truncate() {
+        let budget = expanded_occurrence_budget(1);
+        assert_eq!(budget, MIN_CALENDAR_LIST_EXPANDED_OCCURRENCE_BUDGET);
+
+        let mut expanded = 0usize;
+        assert!(add_expanded_occurrences(&mut expanded, budget, budget).is_ok());
+
+        let err = add_expanded_occurrences(&mut expanded, 1, budget).unwrap_err();
+        assert!(matches!(err, ApiError::TooManyRequests(_)));
+    }
+
+    #[test]
+    fn calendar_list_rejects_timestamps_that_would_wrap_i64() {
+        assert!(reject_if_calendar_time_bounds_exceeded(0, i64::MAX as u64).is_ok());
+
+        let err =
+            reject_if_calendar_time_bounds_exceeded(0, i64::MAX as u64 + 1).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn calendar_list_default_window_rejects_u64_overflow() {
+        assert_eq!(
+            default_calendar_to_ms(0).unwrap(),
+            DEFAULT_CALENDAR_LIST_WINDOW_MS
+        );
+
+        let err = default_calendar_to_ms(u64::MAX).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 }

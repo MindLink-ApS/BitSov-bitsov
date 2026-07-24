@@ -489,8 +489,11 @@ async fn accept_invite(
     // Insert accepted_invites row FIRST. The migration declares
     // accepted_invites.nonce as PRIMARY KEY, so:
     //  - First write wins; concurrent attempts hit a unique-constraint
-    //    violation on the second insert → 409 Conflict (closes TOCTOU
-    //    on the pre-check that previously gated the write).
+    //    violation on the second insert. If the duplicate is the same
+    //    authority row, keep going and re-run finalization so a lost
+    //    response or crash after the authority commit can converge.
+    //    A duplicate nonce for a different inviter/expiry still fails
+    //    closed as a conflict.
     //  - If the row insert fails for any reason, no whitelist mutation
     //    has happened yet — the failure is observable to the caller
     //    and retryable.
@@ -504,13 +507,39 @@ async fn accept_invite(
         expiry_unix: invite.expiry_unix,
         accepted_at: now_unix,
     };
-    if let Err(e) = state.storage.add_accepted_invite(&record).await {
-        return match e {
-            StorageError::AlreadyExists(_) => Err(ApiError::Conflict("already accepted".into())),
-            _ => Err(ApiError::Internal(format!(
+    let mut accepted_invite_already_committed = false;
+    match state.storage.add_accepted_invite(&record).await {
+        Ok(()) => {}
+        Err(StorageError::AlreadyExists(_)) => {
+            accepted_invite_already_committed = true;
+            let existing = state
+                .storage
+                .find_accepted_invite(&invite.nonce)
+                .await
+                .map_err(|e| {
+                    ApiError::Internal(format!(
+                        "failed to load accepted invite after duplicate: {e}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    ApiError::Internal(
+                        "accepted invite duplicate reported but row was not found".into(),
+                    )
+                })?;
+
+            if existing.inviter_pubkey != invite.inviter_pubkey
+                || existing.expiry_unix != invite.expiry_unix
+            {
+                return Err(ApiError::Conflict(
+                    "invite nonce already accepted for different invite parameters".into(),
+                ));
+            }
+        }
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
                 "failed to persist accepted invite: {e}"
-            ))),
-        };
+            )));
+        }
     }
 
     // SPEC FIX (AI review PR #84 finding #3):
@@ -553,35 +582,42 @@ async fn accept_invite(
     }
 
     let previous_onboarding = state.storage.get_onboarding_state().await.ok().flatten();
-    let scoped_onboarding = OnboardingStateRecord {
-        invite_id: previous_onboarding.as_ref().and_then(|record| record.invite_id),
-        inviter_pubkey: Some(invite.inviter_pubkey),
-        inviter_ln_pubkey: None,
-        current_step: "connecting".to_string(),
-        tier: previous_onboarding
+    let should_update_onboarding = !accepted_invite_already_committed
+        || previous_onboarding
             .as_ref()
-            .and_then(|record| record.tier.clone())
-            .or_else(|| Some("light".to_string())),
-        funding_address: previous_onboarding
-            .as_ref()
-            .and_then(|record| record.funding_address.clone()),
-        funding_amount_sats_required: previous_onboarding
-            .as_ref()
-            .and_then(|record| record.funding_amount_sats_required),
-        funding_amount_sats_received: previous_onboarding
-            .as_ref()
-            .map(|record| record.funding_amount_sats_received)
-            .unwrap_or(0),
-        last_poll_at: Some(now_unix),
-        funding_evidence: previous_onboarding
-            .as_ref()
-            .and_then(|record| record.funding_evidence.clone()),
-    };
-    state
-        .storage
-        .upsert_onboarding_state(&scoped_onboarding)
-        .await
-        .map_err(|e| ApiError::Internal(format!("failed to persist onboarding scope: {e}")))?;
+            .map(|record| record.current_step == "connecting")
+            .unwrap_or(true);
+    if should_update_onboarding {
+        let scoped_onboarding = OnboardingStateRecord {
+            invite_id: previous_onboarding.as_ref().and_then(|record| record.invite_id),
+            inviter_pubkey: Some(invite.inviter_pubkey),
+            inviter_ln_pubkey: None,
+            current_step: "connecting".to_string(),
+            tier: previous_onboarding
+                .as_ref()
+                .and_then(|record| record.tier.clone())
+                .or_else(|| Some("light".to_string())),
+            funding_address: previous_onboarding
+                .as_ref()
+                .and_then(|record| record.funding_address.clone()),
+            funding_amount_sats_required: previous_onboarding
+                .as_ref()
+                .and_then(|record| record.funding_amount_sats_required),
+            funding_amount_sats_received: previous_onboarding
+                .as_ref()
+                .map(|record| record.funding_amount_sats_received)
+                .unwrap_or(0),
+            last_poll_at: Some(now_unix),
+            funding_evidence: previous_onboarding
+                .as_ref()
+                .and_then(|record| record.funding_evidence.clone()),
+        };
+        state
+            .storage
+            .upsert_onboarding_state(&scoped_onboarding)
+            .await
+            .map_err(|e| ApiError::Internal(format!("failed to persist onboarding scope: {e}")))?;
+    }
 
     Ok((
         StatusCode::ACCEPTED,

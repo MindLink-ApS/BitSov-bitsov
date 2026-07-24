@@ -590,6 +590,22 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Return recurring master events that started before `to_ms`, capped by `limit`.
+    ///
+    /// Calendar list callers use this as a `budget + 1` probe: if the extra row is
+    /// present, the request fails closed instead of silently hiding a recurring
+    /// series. Backends should apply the bound in storage, not by loading all
+    /// recurring masters and truncating in memory.
+    async fn list_recurring_master_events_before(
+        &self,
+        _to_ms: u64,
+        _limit: u32,
+    ) -> Result<Vec<CalendarEventRecord>, StorageError> {
+        Err(StorageError::Unsupported(
+            "calendar storage not implemented for this backend".into(),
+        ))
+    }
+
     /// Return exception/override records whose window overlaps `[from_ms, to_ms)`.
     ///
     /// HARD-4: correctness-complete (range-scoped). Exceptions suppress / override
