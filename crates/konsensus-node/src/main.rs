@@ -681,6 +681,7 @@ async fn cmd_start(
     let replayed_whitelist = replay_accepted_invite_whitelist(
         node.storage().as_ref(),
         node.transport().as_ref(),
+        node.peer_registry().as_ref(),
         now_unix,
     )
     .await
@@ -1191,6 +1192,7 @@ fn current_unix_secs() -> Result<u64> {
 async fn replay_accepted_invite_whitelist(
     storage: &dyn konsensus_storage::Storage,
     transport: &dyn MessageTransport,
+    peer_registry: &tokio::sync::RwLock<konsensus_message::PeerRegistry>,
     now_unix: u64,
 ) -> Result<usize> {
     let records = storage
@@ -1200,6 +1202,34 @@ async fn replay_accepted_invite_whitelist(
 
     for record in &records {
         let inviter = NodeId::from_bytes(record.inviter_pubkey);
+        let peer = match storage.get_peer(&inviter).await? {
+            Some(peer) => peer,
+            None => {
+                let peer = konsensus_storage::Peer::new(inviter);
+                storage
+                    .upsert_peer(&peer)
+                    .await
+                    .with_context(|| format!("upsert accepted-invite peer {}", inviter.to_hex()))?;
+                peer
+            }
+        };
+
+        {
+            let mut registry = peer_registry.write().await;
+            if registry.get(&inviter).is_none() {
+                let addr = peer
+                    .address
+                    .as_deref()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                registry.add(konsensus_message::PeerEntry {
+                    node_id: inviter,
+                    addr,
+                    label: peer.display_name.clone(),
+                    auto_connect: false,
+                });
+            }
+        }
         transport.add_to_whitelist(&inviter).await;
     }
 
@@ -1257,6 +1287,8 @@ mod whitelist_replay_tests {
         let storage = SqliteStorage::in_memory().await.expect("sqlite");
         let active_pubkey = [2u8; 32];
         let expired_pubkey = [3u8; 32];
+        let active_inviter = NodeId::from_bytes(active_pubkey);
+        let expired_inviter = NodeId::from_bytes(expired_pubkey);
 
         storage
             .add_accepted_invite(&AcceptedInviteRecord {
@@ -1278,14 +1310,37 @@ mod whitelist_replay_tests {
             .expect("insert expired invite");
 
         let transport = RecordingTransport::default();
-        let replayed = replay_accepted_invite_whitelist(&storage, &transport, 100)
+        let registry = tokio::sync::RwLock::new(konsensus_message::PeerRegistry::new());
+        let replayed = replay_accepted_invite_whitelist(&storage, &transport, &registry, 100)
             .await
             .expect("replay whitelist");
 
         let whitelist = transport.whitelist.lock().await;
         assert_eq!(replayed, 1);
-        assert!(whitelist.contains(&NodeId::from_bytes(active_pubkey)));
-        assert!(!whitelist.contains(&NodeId::from_bytes(expired_pubkey)));
+        assert!(whitelist.contains(&active_inviter));
+        assert!(!whitelist.contains(&expired_inviter));
+        drop(whitelist);
+
+        assert!(
+            storage
+                .get_peer(&active_inviter)
+                .await
+                .expect("active accepted-invite peer")
+                .is_some(),
+            "startup replay must repair the durable peer row"
+        );
+        assert!(
+            registry.read().await.whitelist().contains(&active_inviter),
+            "startup replay must repair the gate PeerRegistry"
+        );
+        assert!(
+            storage
+                .get_peer(&expired_inviter)
+                .await
+                .expect("expired accepted-invite peer")
+                .is_none(),
+            "expired accepted invites must not be replayed into peers"
+        );
     }
 
     async fn make_storage(path: &str, encrypted: bool, key: &[u8; 32]) -> Arc<dyn Storage> {
@@ -1370,12 +1425,23 @@ mod whitelist_replay_tests {
         );
 
         // Invite-only half: the accepted-invite inviter is replayed into the
-        // transport whitelist at boot — the relationship the SCB alone lost.
+        // gate registry and transport whitelist at boot — the relationship the
+        // SCB alone lost.
         let transport = RecordingTransport::default();
-        let replayed = replay_accepted_invite_whitelist(b.as_ref(), &transport, 1_900_000_000)
-            .await
-            .expect("replay invites");
+        let registry = tokio::sync::RwLock::new(registry);
+        let replayed = replay_accepted_invite_whitelist(
+            b.as_ref(),
+            &transport,
+            &registry,
+            1_900_000_000,
+        )
+        .await
+        .expect("replay invites");
         assert_eq!(replayed, 1, "the accepted invite is replayed");
+        assert!(
+            registry.read().await.whitelist().contains(&inviter),
+            "invite-only peer must recover into the gate whitelist (encrypted={encrypted})"
+        );
         assert!(
             transport.whitelist.lock().await.contains(&inviter),
             "invite-only peer must recover into the transport whitelist (encrypted={encrypted})"

@@ -804,6 +804,30 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.list_calendar_events_in_range(from_ms, to_ms, limit).await
     }
 
+    async fn list_recurring_master_events(&self) -> Result<Vec<CalendarEventRecord>, StorageError> {
+        self.inner.list_recurring_master_events().await
+    }
+
+    async fn list_recurring_master_events_before(
+        &self,
+        to_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<CalendarEventRecord>, StorageError> {
+        self.inner
+            .list_recurring_master_events_before(to_ms, limit)
+            .await
+    }
+
+    async fn list_calendar_exceptions_in_range(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<CalendarEventRecord>, StorageError> {
+        self.inner
+            .list_calendar_exceptions_in_range(from_ms, to_ms)
+            .await
+    }
+
     async fn delete_calendar_event(&self, id: &str) -> Result<bool, StorageError> {
         self.inner.delete_calendar_event(id).await
     }

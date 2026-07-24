@@ -1166,11 +1166,21 @@ impl LightningProvider for LdkProvider {
     }
 
     async fn get_node_pubkey(&self) -> Option<String> {
-        if self.node.status().is_running {
-            Some(self.node.node_id().to_string())
-        } else {
-            None
-        }
+        // The node's Lightning public key is a stable identity, valid whenever the
+        // node object exists (it was built successfully or this provider would not
+        // exist). It must NOT gate on the transient `status().is_running` flag:
+        // that flag can read `false` on an otherwise fully operational,
+        // payment-capable node. Observed live on mainnet 2026-07-15 — a single
+        // `/health` response reported `lightning_available = true` (which also reads
+        // `status().is_running`, via `is_available`) yet `lightning_node_pubkey =
+        // null` here, i.e. `status().is_running` flapped between the two reads in the
+        // same request. Report the pubkey unconditionally so `/health`'s
+        // `lightning_node_pubkey` and hosting's operator pubkey are reliable.
+        //
+        // NOTE: the same flap also affects `is_available()` (which returns
+        // `status().is_running` directly); that is a more sensitive operational gate
+        // and is left for separate review rather than widened here.
+        Some(self.node.node_id().to_string())
     }
 
     async fn get_funding_address(&self) -> Option<String> {

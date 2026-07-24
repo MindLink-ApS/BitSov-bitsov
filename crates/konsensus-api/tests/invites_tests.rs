@@ -21,7 +21,9 @@ use tower::ServiceExt;
 use common::test_router as build_router;
 use konsensus_core::invite::{BitSovInvite, UnsignedBitSovInvite};
 use konsensus_core::NodeId;
-use konsensus_storage::{InviteIssuedRecord, InviteState, SqliteStorage, Storage};
+use konsensus_storage::{
+    InviteIssuedRecord, InviteState, OnboardingStateRecord, SqliteStorage, Storage,
+};
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -665,7 +667,7 @@ async fn invites_accept_rejects_wrong_invitee() {
 }
 
 #[tokio::test]
-async fn invites_accept_replay_returns_409() {
+async fn invites_accept_replay_is_convergent_and_restores_derived_state() {
     let state = test_state();
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -688,14 +690,111 @@ async fn invites_accept_replay_returns_409() {
 
     let resp1 = app.clone().oneshot(mk_req()).await.unwrap();
     assert_eq!(resp1.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(resp1.into_body(), 65536)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let inviter = NodeId::from_hex(json["inviter_pubkey"].as_str().expect("inviter_pubkey"))
+        .expect("valid inviter hex");
 
-    let resp2 = app.oneshot(mk_req()).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::CONFLICT);
+    // Simulate a crash/lost response after the authority row committed but
+    // before all derived runtime state was finalized.
+    state.storage.delete_peer(&inviter).await.expect("delete peer");
+    {
+        let mut registry = state.peer_registry.write().await;
+        registry.remove(&inviter);
+    }
+    state
+        .storage
+        .upsert_onboarding_state(&OnboardingStateRecord {
+            invite_id: None,
+            inviter_pubkey: None,
+            inviter_ln_pubkey: None,
+            current_step: "connecting".into(),
+            tier: None,
+            funding_address: None,
+            funding_amount_sats_required: None,
+            funding_amount_sats_received: 0,
+            last_poll_at: None,
+            funding_evidence: None,
+        })
+        .await
+        .expect("overwrite onboarding state");
+    assert!(state
+        .storage
+        .get_peer(&inviter)
+        .await
+        .expect("get peer")
+        .is_none());
+    assert!(!state
+        .peer_registry
+        .read()
+        .await
+        .whitelist()
+        .contains(&inviter));
+
+    let resp2 = app.clone().oneshot(mk_req()).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::ACCEPTED);
     let body = axum::body::to_bytes(resp2.into_body(), 65536)
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["error"], "already accepted");
+    assert_eq!(
+        json["inviter_pubkey"].as_str().expect("inviter_pubkey"),
+        inviter.to_hex()
+    );
+    assert!(state
+        .storage
+        .get_peer(&inviter)
+        .await
+        .expect("get peer")
+        .is_some());
+    assert!(state
+        .peer_registry
+        .read()
+        .await
+        .whitelist()
+        .contains(&inviter));
+    assert_eq!(
+        state
+            .storage
+            .get_onboarding_state()
+            .await
+            .expect("get onboarding")
+            .expect("onboarding state")
+            .inviter_pubkey,
+        Some(*inviter.as_bytes())
+    );
+
+    let advanced_onboarding = OnboardingStateRecord {
+        invite_id: None,
+        inviter_pubkey: Some(*inviter.as_bytes()),
+        inviter_ln_pubkey: Some("ln-node".into()),
+        current_step: "funding".into(),
+        tier: Some("full".into()),
+        funding_address: Some("bcrt1testfundingaddress".into()),
+        funding_amount_sats_required: Some(25_000),
+        funding_amount_sats_received: 12_345,
+        last_poll_at: Some(123),
+        funding_evidence: Some("operator-observed".into()),
+    };
+    state
+        .storage
+        .upsert_onboarding_state(&advanced_onboarding)
+        .await
+        .expect("advance onboarding state");
+
+    let resp3 = app.oneshot(mk_req()).await.unwrap();
+    assert_eq!(resp3.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        state
+            .storage
+            .get_onboarding_state()
+            .await
+            .expect("get onboarding")
+            .expect("onboarding state"),
+        advanced_onboarding
+    );
 }
 
 #[tokio::test]

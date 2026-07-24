@@ -345,6 +345,17 @@ const RECURRING_MASTER_EVENTS_SELECT: &str =
      WHERE recurrence_json IS NOT NULL AND parent_id IS NULL
      ORDER BY start_ms ASC";
 
+/// `list_recurring_master_events_before` — bounded API read probe. The caller
+/// passes `budget + 1` and fails closed if the extra row exists, so this LIMIT
+/// does not silently hide recurring series.
+const RECURRING_MASTER_EVENTS_BEFORE_SELECT: &str =
+    "SELECT id, message_id, organizer, title, description, start_ms, end_ms, tz,
+            location, attendees_json, recurrence_json, color, created_at, parent_id
+     FROM calendar_events
+     WHERE recurrence_json IS NOT NULL AND parent_id IS NULL AND start_ms < ?1
+     ORDER BY start_ms ASC
+     LIMIT ?2";
+
 /// `list_calendar_exceptions_in_range` — correctness-complete. Exceptions
 /// suppress / override expanded occurrences in the calendar view. A cap would
 /// silently let a deleted or moved occurrence reappear. Range-scoped by
@@ -2178,6 +2189,58 @@ impl Storage for SqliteStorage {
             String,
             Option<String>,
         )> = sqlx::query_as(RECURRING_MASTER_EVENTS_SELECT)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, message_id, organizer, title, description, start_ms, end_ms, tz,
+                  location, attendees_json, recurrence_json, color, created_at, parent_id)| {
+                    CalendarEventRecord {
+                        id,
+                        message_id,
+                        organizer,
+                        title,
+                        description,
+                        start_ms: start_ms as u64,
+                        end_ms: end_ms as u64,
+                        tz,
+                        location,
+                        attendees_json,
+                        recurrence_json,
+                        color,
+                        created_at,
+                        parent_id,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    async fn list_recurring_master_events_before(
+        &self,
+        to_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<CalendarEventRecord>, StorageError> {
+        let rows: Vec<(
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(RECURRING_MASTER_EVENTS_BEFORE_SELECT)
+            .bind(to_ms as i64)
+            .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?;
 
