@@ -1,0 +1,50 @@
+[package]
+name = "konsensus-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Default (production) builds do NOT compile the legacy plaintext-session
+# migration path. A non-encrypted session-state blob is unconditionally
+# rejected at runtime because the plaintext-accepting code does not exist in
+# the binary. To run a one-shot migration of pre-ADR-019 plaintext sessions
+# you must BOTH (1) build a dedicated binary with
+# `--features legacy-session-migration` AND (2) set
+# `KONSENSUS_LEGACY_SESSION_MIGRATION=1` for a single boot. The env var alone
+# is inert in a default build — defense in depth against an attacker who can
+# only influence the process environment but not the build.
+default = []
+legacy-session-migration = []
+
+[dependencies]
+konsensus-core = { path = "../konsensus-core" }
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+snow.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+serde.workspace = true
+hex.workspace = true
+blake3.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+mockall.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+criterion.workspace = true
+rand.workspace = true
+
+[[bench]]
+name = "crypto_bench"
+harness = false

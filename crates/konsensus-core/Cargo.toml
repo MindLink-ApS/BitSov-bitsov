@@ -1,0 +1,42 @@
+[package]
+name = "konsensus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+sha2.workspace = true
+blake3.workspace = true
+bitcoin.workspace = true
+bip39.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+hex.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+bs58.workspace = true
+base64.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+mockall.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "envelope_bench"
+harness = false

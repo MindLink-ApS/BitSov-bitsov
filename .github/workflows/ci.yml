@@ -1,0 +1,262 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  # 2026-04-30: paths-ignore REMOVED from pull_request. Branch protection on
+  # main requires Rust Check & Test + Semgrep to report
+  # status; if a PR matches paths-ignore the workflow is skipped, the
+  # required checks never report, and the PR is permanently blocked
+  # (deadlock). Cost of running CI on doc-only PRs is ~10 min compute,
+  # acceptable. The push trigger keeps paths-ignore so daily-merged docs
+  # don't waste CI minutes on main itself.
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Protocol repo has no frontend
+        run: |
+          test ! -d frontend
+          echo "BitSov-bitsov is protocol-only; frontend build is intentionally satisfied by the absence of frontend/."
+
+  check:
+    name: Rust Check & Test
+    runs-on: ubuntu-latest
+    env:
+      # Keep the hosted runner below disk/linker pressure during the core test
+      # phase. The workspace check builds heavy Lightning dependencies first;
+      # the test step then links many binaries. Lower parallelism and no
+      # incremental artifacts are slower but much less likely to exhaust
+      # ubuntu-latest.
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      # Keep Linux GUI/WebKit headers available for optional/transitive crates
+      # that still probe these libraries on CI runners.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Check disk space
+        run: df -h /
+
+      - name: cargo check
+        run: cargo check --workspace
+
+      # Clean debug artifacts before test to free disk — ldk-node is ~5GB compiled
+      - name: Clean before test
+        run: |
+          rm -rf target/debug/build/ldk-node-* target/debug/deps/libldk_node-* target/debug/incremental/ 2>/dev/null || true
+          df -h /
+
+      - name: cargo test (core crates only — ldk-node too large for CI runner)
+        run: |
+          cargo test -p konsensus-core -p konsensus-crypto -p konsensus-storage \
+            -p konsensus-message -p konsensus-pricing -p konsensus-chain \
+            -p konsensus-routing -p konsensus-gossip -p konsensus-bsx \
+            -p konsensus-lightning -p konsensus-api -p konsensus-node
+
+      - name: cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-audit
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+
+      - name: cargo audit
+        run: cargo audit
+
+  semgrep:
+    name: Semgrep Security Rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install semgrep
+        run: pip install semgrep
+
+      # Two-pass scan:
+      #   Pass 1 — full report (no --error), all findings visible in CI log.
+      #   Pass 2 — ERROR-severity only with --error; blocks the build if any found.
+      # Rules exclude test/, mock*, *_test.rs, benches/ — see semgrep-rules.yml.
+      # To suppress a specific false positive: add `# nosemgrep: <rule-id>` inline.
+      - name: Run BitSov security rules
+        run: |
+          semgrep --config docs/qa/semgrep-rules.yml \
+            --exclude 'target/' \
+            --exclude 'vendor/' \
+            . || true
+          semgrep --config docs/qa/semgrep-rules.yml \
+            --severity ERROR --error \
+            --exclude 'target/' \
+            --exclude 'vendor/' \
+            .
+
+  # Build CLI server binary for headless/VPS deployments
+  release-cli:
+    name: Release CLI (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, audit, semgrep]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: bitsov-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: bitsov-linux-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install release signing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+
+      - name: Build release binary
+        run: cargo build --release -p konsensus-node --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/konsensus artifacts/${{ matrix.artifact }}
+          chmod +x artifacts/${{ matrix.artifact }}
+          (cd artifacts && sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256)
+
+      - name: Require release signing key
+        env:
+          MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+        run: |
+          test -n "$MINISIGN_PRIVATE_KEY" || {
+            echo "MINISIGN_PRIVATE_KEY is required for public release tags" >&2
+            exit 1
+          }
+
+      - name: Sign checksum
+        env:
+          MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+        run: |
+          key_file="$(mktemp)"
+          printf '%s' "$MINISIGN_PRIVATE_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          minisign -S -W \
+            -s "$key_file" \
+            -m artifacts/${{ matrix.artifact }}.sha256 \
+            -x artifacts/${{ matrix.artifact }}.sha256.minisig
+          rm -f "$key_file"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: artifacts/${{ matrix.artifact }}
+          format: spdx-json
+          output-file: artifacts/${{ matrix.artifact }}.sbom.spdx.json
+
+      - name: Attest binary provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: artifacts/${{ matrix.artifact }}
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/${{ matrix.artifact }}
+            artifacts/${{ matrix.artifact }}.sha256
+            artifacts/${{ matrix.artifact }}.sha256.minisig
+            artifacts/${{ matrix.artifact }}.sbom.spdx.json

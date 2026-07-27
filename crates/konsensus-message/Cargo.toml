@@ -1,0 +1,30 @@
+[package]
+name = "konsensus-message"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+konsensus-core = { path = "../konsensus-core" }
+konsensus-crypto = { path = "../konsensus-crypto" }
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+snow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+mockall.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+konsensus-storage = { path = "../konsensus-storage" }
+uuid.workspace = true

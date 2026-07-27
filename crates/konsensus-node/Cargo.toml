@@ -1,0 +1,56 @@
+[package]
+name = "konsensus-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "konsensus"
+path = "src/main.rs"
+
+[dependencies]
+konsensus-core = { path = "../konsensus-core" }
+konsensus-chain = { path = "../konsensus-chain" }
+konsensus-fiat = { path = "../konsensus-fiat" }
+konsensus-lightning = { path = "../konsensus-lightning" }
+konsensus-pricing = { path = "../konsensus-pricing" }
+konsensus-message = { path = "../konsensus-message" }
+konsensus-crypto = { path = "../konsensus-crypto" }
+konsensus-storage = { path = "../konsensus-storage" }
+konsensus-api = { path = "../konsensus-api" }
+konsensus-routing = { path = "../konsensus-routing" }
+konsensus-gossip = { path = "../konsensus-gossip" }
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+toml.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+rand.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+blake3.workspace = true
+ed25519-dalek.workspace = true
+aes-gcm.workspace = true
+argon2.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+rpassword.workspace = true
+sha2.workspace = true
+reqwest.workspace = true
+zeroize.workspace = true
+# P8.1 D-place (A): the durable SqliteRelayStore (relay/store.rs) is colocated with
+# the trait + InMemory impl in konsensus-node, so this crate takes a direct sqlx dep
+# (already pulled transitively via konsensus-storage). Off-by-default: InMemoryRelayStore
+# stays the wired store until an operator flips a relay to the durable backend.
+sqlx.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+async-trait.workspace = true
+tempfile = "3"

@@ -1,0 +1,10 @@
+# Ownership assigned to real MindLink-ApS maintainers so CODEOWNERS resolves and
+# branch protection's "require code-owner review" actually enforces.
+* @RaslaTL19
+CHARTER.md            @RaslaTL19
+SECURITY.md           @RaslaTL19
+.github/**            @RaslaTL19
+Cargo.lock            @RaslaTL19
+crates/konsensus-core/**       @RaslaTL19
+crates/konsensus-crypto/**     @RaslaTL19
+crates/konsensus-lightning/**  @RaslaTL19

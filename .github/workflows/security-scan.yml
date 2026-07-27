@@ -1,0 +1,239 @@
+name: Weekly Security Scan
+
+on:
+  schedule:
+    - cron: '0 9 * * 3'  # Wednesdays 09:00 UTC
+  workflow_dispatch:      # manual trigger for ad-hoc runs
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  OSV_VERSION: v1.8.5
+  GITLEAKS_VERSION: v8.21.2
+
+jobs:
+  security-scan:
+    name: cargo-audit + osv-scanner + gitleaks
+    runs-on: ubuntu-latest
+
+    steps:
+      # Full history needed so gitleaks can scan commit log for leaked secrets.
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-audit-
+
+      # ── Install tools ──────────────────────────────────────────────────────
+
+      - name: Install cargo-audit
+        run: |
+          if ! command -v cargo-audit &>/dev/null; then
+            cargo install cargo-audit --locked
+          fi
+
+      - name: Install osv-scanner
+        run: |
+          curl -fsSL \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64" \
+            -o /tmp/osv-scanner
+          chmod +x /tmp/osv-scanner
+          sudo mv /tmp/osv-scanner /usr/local/bin/osv-scanner
+
+      - name: Install gitleaks
+        run: |
+          VER="${GITLEAKS_VERSION#v}"
+          curl -fsSL \
+            "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${VER}_linux_x64.tar.gz" \
+            | tar -xz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+
+      # ── Run scans ──────────────────────────────────────────────────────────
+      # Each scanner runs with continue-on-error so a single scanner failure
+      # does not abort the entire workflow — we still want the report.
+
+      - name: Run cargo-audit
+        id: cargo_audit
+        continue-on-error: true
+        run: |
+          cargo audit --json 2>/dev/null > /tmp/cargo-audit.json || true
+          cargo audit 2>&1 > /tmp/cargo-audit.txt || true
+
+      - name: Run osv-scanner
+        id: osv_scan
+        continue-on-error: true
+        run: |
+          osv-scanner --recursive --config osv-scanner.toml --format json . \
+            > /tmp/osv-scan.json 2>/dev/null || true
+
+      # gitleaks --exit-code 0 means it always exits cleanly; findings appear
+      # only in the JSON report which we parse below.
+      - name: Run gitleaks
+        id: gitleaks
+        continue-on-error: true
+        run: |
+          gitleaks detect \
+            --source . \
+            --no-banner \
+            --report-format json \
+            --report-path /tmp/gitleaks.json \
+            --exit-code 0
+
+      # ── Ensure label exists in repository ─────────────────────────────────
+
+      - name: Ensure security-scanning label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "security-scanning" \
+            --color "D93F0B" \
+            --description "Automated weekly security scan findings" \
+            --repo "${{ github.repository }}" 2>/dev/null || true
+
+      # ── Generate markdown report ───────────────────────────────────────────
+
+      - name: Generate security report
+        id: report
+        run: |
+          SCAN_DATE=$(date -u +"%Y-%m-%d")
+          SCAN_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          REPORT_DIR="docs/security/reports"
+          REPORT_FILE="${REPORT_DIR}/${SCAN_DATE}.md"
+          mkdir -p "$REPORT_DIR"
+
+          # ── Parse cargo-audit ──
+          CARGO_VULN_COUNT=0
+          CARGO_WARN_COUNT=0
+          if [ -f /tmp/cargo-audit.json ] && [ -s /tmp/cargo-audit.json ]; then
+            CARGO_VULN_COUNT=$(jq '.vulnerabilities.count // 0' /tmp/cargo-audit.json 2>/dev/null || echo 0)
+            CARGO_WARN_COUNT=$(jq '
+              .warnings
+              | if type == "object" then to_entries | map(.value | length) | add // 0
+                else 0 end
+            ' /tmp/cargo-audit.json 2>/dev/null || echo 0)
+          fi
+
+          # ── Parse osv-scanner ──
+          OSV_COUNT=0
+          if [ -f /tmp/osv-scan.json ] && [ -s /tmp/osv-scan.json ]; then
+            OSV_COUNT=$(jq '[.results[]?.packages[]?.vulnerabilities[]?] | length' \
+              /tmp/osv-scan.json 2>/dev/null || echo 0)
+          fi
+
+          # ── Parse gitleaks ──
+          LEAK_COUNT=0
+          if [ -f /tmp/gitleaks.json ] && [ -s /tmp/gitleaks.json ]; then
+            LEAK_COUNT=$(jq 'if type == "array" then length else 0 end' \
+              /tmp/gitleaks.json 2>/dev/null || echo 0)
+          fi
+
+          # ── Overall status ──
+          HAS_FINDINGS=false
+          [ "${CARGO_VULN_COUNT}" -gt 0 ] && HAS_FINDINGS=true
+          [ "${OSV_COUNT}"        -gt 0 ] && HAS_FINDINGS=true
+          [ "${LEAK_COUNT}"       -gt 0 ] && HAS_FINDINGS=true
+
+          cargo_status=$([ "${CARGO_VULN_COUNT}" -gt 0 ] && echo "FINDINGS (${CARGO_VULN_COUNT})" || echo "clean")
+          osv_status=$([ "${OSV_COUNT}"           -gt 0 ] && echo "FINDINGS (${OSV_COUNT})"        || echo "clean")
+          leak_status=$([ "${LEAK_COUNT}"         -gt 0 ] && echo "FINDINGS (${LEAK_COUNT})"       || echo "clean")
+          overall=$([ "${HAS_FINDINGS}" = "true" ]         && echo "REQUIRES REVIEW"               || echo "ALL CLEAR")
+
+          # ── Build cargo-audit detail section ──
+          CARGO_DETAIL="No vulnerabilities found."
+          if [ "${CARGO_VULN_COUNT}" -gt 0 ] && [ -f /tmp/cargo-audit.json ] && [ -s /tmp/cargo-audit.json ]; then
+            CARGO_DETAIL=$(jq -r '
+              .vulnerabilities.list[]
+              | "- **\(.advisory.id)** [\(.advisory.severity)] `\(.package.name) \(.package.version)`  \n  \(.advisory.title)  \n  <\(.advisory.url)>"
+            ' /tmp/cargo-audit.json 2>/dev/null || echo "Error parsing cargo-audit output.")
+          fi
+          if [ "${CARGO_WARN_COUNT}" -gt 0 ]; then
+            CARGO_WARN_DETAIL=$(jq -r '
+              .warnings | to_entries[]
+              | .key as $kind
+              | .value[]
+              | "- [\($kind)] `\(.package.name) \(.package.version)`"
+            ' /tmp/cargo-audit.json 2>/dev/null || echo "")
+            CARGO_DETAIL=$(printf '%s\n\n**Warnings (%s):**\n%s' "${CARGO_DETAIL}" "${CARGO_WARN_COUNT}" "${CARGO_WARN_DETAIL}")
+          fi
+
+          # ── Build osv-scanner detail section ──
+          OSV_DETAIL="No vulnerabilities found."
+          if [ "${OSV_COUNT}" -gt 0 ] && [ -f /tmp/osv-scan.json ] && [ -s /tmp/osv-scan.json ]; then
+            OSV_DETAIL=$(jq -r '
+              .results[]?.packages[]?
+              | . as $pkg
+              | .vulnerabilities[]?
+              | "- **\(.id)** [\(.database_specific.severity // "UNKNOWN")] `\($pkg.package.name) \($pkg.package.version)`  \n  \(.summary // "")"
+            ' /tmp/osv-scan.json 2>/dev/null || echo "Error parsing osv-scanner output.")
+          fi
+
+          # ── Build gitleaks detail section ──
+          LEAK_DETAIL="No secrets found."
+          if [ "${LEAK_COUNT}" -gt 0 ] && [ -f /tmp/gitleaks.json ] && [ -s /tmp/gitleaks.json ]; then
+            LEAK_DETAIL="Potential secrets found. Details are intentionally withheld from generated reports; triage the restricted runner output and rotate before publishing any public summary."
+          fi
+
+          # ── Write report ──
+          {
+            printf '# Security Scan Report — %s\n\n' "${SCAN_DATE}"
+            printf '**Generated:** %s  \n' "${SCAN_TIME}"
+            printf '**Commit:** `%s`  \n' "${GITHUB_SHA:0:8}"
+            printf '**Overall status:** %s\n\n' "${overall}"
+            printf '%s\n\n' '---'
+            printf '## Summary\n\n'
+            printf '| Scanner | Status |\n'
+            printf '|---------|--------|\n'
+            printf '| cargo-audit | %s |\n' "${cargo_status}"
+            printf '| osv-scanner | %s |\n' "${osv_status}"
+            printf '| gitleaks | %s |\n\n' "${leak_status}"
+            printf '%s\n\n' '---'
+            printf '## cargo-audit\n\n'
+            printf '%s\n\n' "${CARGO_DETAIL}"
+            printf '%s\n\n' '---'
+            printf '## osv-scanner\n\n'
+            printf '%s\n\n' "${OSV_DETAIL}"
+            printf '%s\n\n' '---'
+            printf '## gitleaks\n\n'
+            printf '%s\n\n' "${LEAK_DETAIL}"
+            printf '%s\n\n' '---'
+            printf '_Automated report. Generated by `.github/workflows/security-scan.yml`._\n'
+          } > "${REPORT_FILE}"
+
+          echo "has_findings=${HAS_FINDINGS}"          >> "$GITHUB_OUTPUT"
+          echo "report_file=${REPORT_FILE}"            >> "$GITHUB_OUTPUT"
+          echo "scan_date=${SCAN_DATE}"                >> "$GITHUB_OUTPUT"
+          echo "cargo_vuln_count=${CARGO_VULN_COUNT}"  >> "$GITHUB_OUTPUT"
+          echo "osv_count=${OSV_COUNT}"                >> "$GITHUB_OUTPUT"
+          echo "leak_count=${LEAK_COUNT}"              >> "$GITHUB_OUTPUT"
+
+      # ── Upload report as artifact (always) ────────────────────────────────
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report-${{ steps.report.outputs.scan_date }}
+          path: ${{ steps.report.outputs.report_file }}
+          retention-days: 90
+
+      # ── Fail when findings exist ───────────────────────────────────────────
+      # Do not commit leak metadata or open public PRs with confirmed file paths.
+
+      - name: Fail on security findings
+        if: steps.report.outputs.has_findings == 'true'
+        run: |
+          echo "Security scan found issues. Triage privately; do not publish leak metadata in a PR."
+          exit 1

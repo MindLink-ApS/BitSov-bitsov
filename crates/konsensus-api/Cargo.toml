@@ -1,0 +1,49 @@
+[package]
+name = "konsensus-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+konsensus-core = { path = "../konsensus-core" }
+konsensus-message = { path = "../konsensus-message" }
+konsensus-lightning = { path = "../konsensus-lightning" }
+konsensus-chain = { path = "../konsensus-chain" }
+konsensus-pricing = { path = "../konsensus-pricing" }
+konsensus-crypto = { path = "../konsensus-crypto" }
+konsensus-storage = { path = "../konsensus-storage" }
+konsensus-routing = { path = "../konsensus-routing" }
+konsensus-gossip = { path = "../konsensus-gossip" }
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+hmac.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+rand.workspace = true
+blake3.workspace = true
+base64.workspace = true
+lightning-invoice.workspace = true
+futures.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+mockall.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+tower = { workspace = true, features = ["util"] }
+futures.workspace = true
+bitcoin.workspace = true
+secp256k1 = "0.29"

@@ -1,0 +1,43 @@
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "Unmaintained paste 1.0.15 is transitive through sqlx-core 0.8.0; tracked as known dependency-island debt until the sqlx/ldk-node bump."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+reason = "rsa 0.9.10 is present through sqlx-mysql; MySQL is not an enabled BitSov storage backend. Mirrored from .cargo/audit.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0134"
+reason = "Unmaintained rustls-pemfile 1.0.4 is transitive through sqlx-core 0.8.0; tracked as known dependency-island debt until the sqlx/ldk-node bump."
+
+[[IgnoredVulns]]
+id = "GHSA-82j2-j2ch-gfr8"
+reason = "Duplicate OSV advisory for the rustls-webpki 0.101.7 legacy island; same risk acceptance as RUSTSEC-2026-0104 in deny.toml."
+
+[[IgnoredVulns]]
+id = "GHSA-965h-392x-2mh5"
+reason = "Duplicate OSV advisory for the rustls-webpki 0.101.7 legacy island; same risk acceptance as RUSTSEC-2026-0098 in deny.toml."
+
+[[IgnoredVulns]]
+id = "GHSA-xgp8-3hg3-c2mh"
+reason = "Duplicate OSV advisory for the rustls-webpki 0.101.7 legacy island; same risk acceptance as RUSTSEC-2026-0099 in deny.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0098"
+reason = "rustls-webpki 0.101.7 via rustls 0.21/sqlx-core 0.8.0; documented known debt in deny.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0099"
+reason = "rustls-webpki 0.101.7 via rustls 0.21/sqlx-core 0.8.0; documented known debt in deny.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0104"
+reason = "rustls-webpki 0.101.7 via rustls 0.21/sqlx-core 0.8.0; BitSov does not parse CRLs; documented known debt in deny.toml."
+
+[[IgnoredVulns]]
+id = "GHSA-xmrp-424f-vfpx"
+reason = "Duplicate OSV advisory for sqlx 0.8.0; same risk acceptance as RUSTSEC-2024-0363 in deny.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0363"
+reason = "sqlx 0.8.0 pinned by ldk-node 0.7 rusqlite/libsqlite3-sys dependency island; documented known debt in deny.toml."
