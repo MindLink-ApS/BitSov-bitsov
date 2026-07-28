@@ -29,15 +29,16 @@ Encrypt your report using our PGP key (see [`SECURITY_KEY.asc`](./SECURITY_KEY.a
 Key ID:          8407155EC7A1F376A910C509CFFC76C3AE3803C4
 Fingerprint:     8407 155E C7A1 F376 A910  C509 CFFC 76C3 AE38 03C4
 Email:           security@mindlink.tech
+Key UID:         security@bitsov.io (legacy UID; a re-issue with the mindlink.tech UID is planned — the key is identified by the fingerprint above)
 Expires:         2028-04-20
 ```
 
-Import and verify before encrypting:
+Import and verify by **fingerprint** (the key's embedded UID still reads the legacy address; trust the fingerprint, not the UID):
 
 ```bash
 gpg --import SECURITY_KEY.asc
-gpg --fingerprint security@mindlink.tech
-# Verify fingerprint matches above before trusting
+gpg --fingerprint 8407155EC7A1F376A910C509CFFC76C3AE3803C4
+# Confirm the printed fingerprint matches the one above before encrypting.
 ```
 
 ### What to Include
