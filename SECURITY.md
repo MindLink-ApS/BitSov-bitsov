@@ -21,14 +21,14 @@ We do not backport security patches. Users should always run the latest build.
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-Report privately to: **security@mindlink.tech**
+Report privately to: **info@mindlink.tech**
 
 Encrypt your report using our PGP key (see [`SECURITY_KEY.asc`](./SECURITY_KEY.asc)):
 
 ```
 Key ID:          8407155EC7A1F376A910C509CFFC76C3AE3803C4
 Fingerprint:     8407 155E C7A1 F376 A910  C509 CFFC 76C3 AE38 03C4
-Email:           security@mindlink.tech
+Email:           info@mindlink.tech
 Key UID:         security@bitsov.io (legacy UID; a re-issue with the mindlink.tech UID is planned — the key is identified by the fingerprint above)
 Expires:         2028-04-20
 ```
@@ -136,7 +136,7 @@ We respect anonymity — if you prefer not to be listed, say so in your report.
 
 BitSov follows **coordinated vulnerability disclosure**:
 
-1. Reporter submits encrypted report to security@mindlink.tech
+1. Reporter submits encrypted report to info@mindlink.tech
 2. BitSov acknowledges within 48 hours
 3. BitSov investigates, confirms, and assigns severity
 4. BitSov develops and tests a fix — reporter may review draft patch on request
