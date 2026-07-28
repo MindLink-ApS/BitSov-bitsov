@@ -202,7 +202,7 @@ jobs:
             ${{ runner.os }}-${{ matrix.target }}-cargo-release-
 
       - name: Build release binary
-        run: cargo build --release -p konsensus-node --target ${{ matrix.target }}
+        run: cargo build --locked --release -p konsensus-node --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
