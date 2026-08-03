@@ -225,6 +225,15 @@ jobs:
           output-file: artifacts/${{ matrix.artifact }}.sbom.spdx.json
 
       - name: Attest binary provenance
+        # GitHub build-provenance attestation requires a public (or paid) repo. The
+        # developer debut builds while the repo is still PRIVATE (to stage a draft
+        # release before the visibility flip), so skip attestation here — it fails
+        # closed on private repos and is a bonus, not the trust anchor (the GPG
+        # signature over SHA256SUMS is). It runs automatically on public releases
+        # once the repo is flipped public. continue-on-error is a belt-and-suspenders
+        # backstop so this step can never fail the release build.
+        if: ${{ !github.event.repository.private }}
+        continue-on-error: true
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: artifacts/${{ matrix.artifact }}
