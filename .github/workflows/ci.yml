@@ -216,7 +216,11 @@ jobs:
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          path: artifacts/${{ matrix.artifact }}
+          # The artifact is a single binary FILE, not a directory. `path:` makes
+          # sbom-action invoke `syft scan dir:<path>`, which fails on a file
+          # ("not a directory source"). `file:` uses the file: scheme so syft
+          # scans the binary itself.
+          file: artifacts/${{ matrix.artifact }}
           format: spdx-json
           output-file: artifacts/${{ matrix.artifact }}.sbom.spdx.json
 
