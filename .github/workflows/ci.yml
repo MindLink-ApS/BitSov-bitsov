@@ -223,6 +223,11 @@ jobs:
           file: artifacts/${{ matrix.artifact }}
           format: spdx-json
           output-file: artifacts/${{ matrix.artifact }}.sbom.spdx.json
+          # Do not upload the SBOM as a workflow artifact. sbom-action's upload path
+          # calls the download-an-artifact API (needs actions:read, not granted) and
+          # failed order-dependently on the 2nd matrix job. We only need the SBOM FILE
+          # attached to the release (Upload to Release below), not a workflow artifact.
+          upload-artifact: false
 
       - name: Attest binary provenance
         # GitHub build-provenance attestation requires a public (or paid) repo. The
