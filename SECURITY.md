@@ -26,14 +26,20 @@ Report privately to: **info@mindlink.tech**
 Encrypt your report using our PGP key (see [`SECURITY_KEY.asc`](./SECURITY_KEY.asc)):
 
 ```
-Key ID:          8407155EC7A1F376A910C509CFFC76C3AE3803C4
+Contact:         info@mindlink.tech
 Fingerprint:     8407 155E C7A1 F376 A910  C509 CFFC 76C3 AE38 03C4
-Email:           info@mindlink.tech
-Key UID:         security@bitsov.io (legacy UID; a re-issue with the mindlink.tech UID is planned — the key is identified by the fingerprint above)
+Encryption:      subkey C6FB 80C6 D322 62C5 EA64  459D 27AA 6449 981D 4865
 Expires:         2028-04-20
 ```
 
-Import and verify by **fingerprint** (the key's embedded UID still reads the legacy address; trust the fingerprint, not the UID):
+This key encrypts inbound reports only. Release artifacts are signed with a
+**separate** release key (`info@mindlink.tech`, fingerprint
+`B299 274C 2003 0171 4DC6  F51A 7C2D 6F8A C842 EF6E`) — verify downloads against
+that key, published on the release page and as `RELEASE_KEY.asc`.
+
+Import and verify by **fingerprint** before encrypting. The key's embedded UID
+reads `security@bitsov.io` — an early project address; the current and only
+contact is **info@mindlink.tech**. Trust the fingerprint, not the embedded UID:
 
 ```bash
 gpg --import SECURITY_KEY.asc
