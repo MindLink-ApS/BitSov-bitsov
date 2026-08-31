@@ -176,6 +176,15 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             artifact: bitsov-linux-aarch64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            artifact: bitsov-darwin-aarch64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            artifact: bitsov-darwin-x86_64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            artifact: bitsov-windows-x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -206,12 +215,35 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
-      - name: Prepare artifact
+      # Unix (Linux + macOS): build output is `konsensus`. Linux keeps sha256sum (identical to
+      # before); macOS has no sha256sum, so fall back to `shasum -a 256`, which emits the SAME
+      # "<hash>  <file>" GNU format — so SHA256SUMS assembly and `sha256sum -c` stay identical
+      # across every Unix artifact.
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p artifacts
           cp target/${{ matrix.target }}/release/konsensus artifacts/${{ matrix.artifact }}
           chmod +x artifacts/${{ matrix.artifact }}
-          (cd artifacts && sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256)
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd artifacts && sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256)
+          else
+            (cd artifacts && shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256)
+          fi
+
+      # Windows: build output is `konsensus.exe`; there is no sha256sum/chmod. Emit the SAME GNU
+      # "<hash>  <file>" line (lowercase hex, two spaces, LF, no BOM) so the checksum file is
+      # byte-compatible with the Linux/macOS ones for SHA256SUMS + `sha256sum -c`. The artifact
+      # keeps the os-arch name `bitsov-windows-x86_64` (no .exe); only the SOURCE binary is .exe.
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/konsensus.exe" "artifacts/${{ matrix.artifact }}"
+          $hash = (Get-FileHash -Algorithm SHA256 "artifacts/${{ matrix.artifact }}").Hash.ToLower()
+          $line = "$hash  ${{ matrix.artifact }}`n"
+          [System.IO.File]::WriteAllText("artifacts/${{ matrix.artifact }}.sha256", $line, (New-Object System.Text.UTF8Encoding($false)))
 
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
