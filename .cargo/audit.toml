@@ -14,4 +14,6 @@ ignore = [
   "RUSTSEC-2026-0098", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
   "RUSTSEC-2026-0099", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
   "RUSTSEC-2026-0104", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
+  "RUSTSEC-2025-0134", # rustls-pemfile 1.0.4 UNMAINTAINED via sqlx-core 0.8.0 island (same pin); no known vuln. Remove on sqlx bump (#59).
+  "RUSTSEC-2026-0221", # event-listener 5.4.1 UNSOUND via sqlx-core 0.8.0 island (same pin). Remove on sqlx bump (#59).
 ]
