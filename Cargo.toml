@@ -67,7 +67,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # Cryptography
 ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
 x25519-dalek = { version = "2.0", features = ["serde", "static_secrets"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 argon2 = "0.5"
 snow = "0.9"
 rand = "0.8"
