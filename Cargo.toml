@@ -107,7 +107,7 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.9", features = ["serde"] }
 
 # Testing
-mockall = "0.13"
+mockall = "0.15"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 
