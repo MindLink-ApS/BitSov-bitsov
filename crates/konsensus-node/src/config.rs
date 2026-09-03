@@ -904,7 +904,9 @@ impl NodeConfig {
         // A fresh full-tier config leaves BOTH the P2P network listener and the
         // LDK Lightning listener on 0.0.0.0:9735 (see `default_listen_addr` and
         // `default_for_tier(Full)`, which sets `listening_address =
-        // Some("0.0.0.0:9735")`). Without this guard the collision passes
+        // Some("0.0.0.0:9735")`).
+        // Since #56 the P2P default is 9736, so fresh defaults no longer collide; the
+        // guard stays for hand-edited configs. Without this guard the collision passes
         // validation, then at runtime the LDK node and the P2P transport both
         // try to bind 9735: the LDK node starts and immediately shuts down, and
         // `transport.start_listener().await` hangs forever, so the API never
@@ -1207,8 +1209,12 @@ fn default_tier() -> SovereigntyTier {
     SovereigntyTier::T1
 }
 
+/// Default BitSov P2P listener. 9736, not 9735: 9735 is the Lightning P2P convention and
+/// is what `default_for_tier(Full)` gives the LDK listener, and `validate` fail-closes on a
+/// shared port — so a 9735 default made every fresh `init --tier full` unbootable without
+/// a manual edit (genome issue #56).
 fn default_listen_addr() -> SocketAddr {
-    SocketAddr::from(([0, 0, 0, 0], 9735))
+    SocketAddr::from(([0, 0, 0, 0], 9736))
 }
 
 fn default_api_addr() -> SocketAddr {
