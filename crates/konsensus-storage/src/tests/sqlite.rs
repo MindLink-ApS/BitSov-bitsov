@@ -1620,3 +1620,82 @@ fn hard4_sqlite_select_consts_have_no_limit() {
         );
     }
 }
+
+/// Genome #57: the schema embedded in the binary must be byte-identical to `migrations/`,
+/// so sqlx's applied-migration checksum (SHA-384 of the SQL) matches databases migrated by
+/// earlier releases — and so nobody adds a migration file without embedding it.
+#[test]
+fn embedded_migrations_match_migrations_dir() {
+    let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"));
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().map(|e| e == "sql").unwrap_or(false))
+        .collect();
+    files.sort();
+    let embedded = crate::sqlite::EmbeddedMigrations::migrations();
+    assert_eq!(embedded.len(), files.len(), "embed every migrations/*.sql");
+    for (m, path) in embedded.iter().zip(files.iter()) {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let (version, rest) = name.split_once('_').unwrap();
+        let version: i64 = version.parse().unwrap();
+        assert_eq!(m.version, version, "{name}: version");
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert_eq!(m.sql.as_ref(), contents.as_str(), "{name}: SQL bytes differ");
+        let expected_desc = rest.trim_end_matches(".sql").replace('_', " ");
+        assert_eq!(m.description.as_ref(), expected_desc.as_str(), "{name}: description");
+    }
+}
+
+/// Genome #57: a released binary migrates a fresh database with no files on disk, and a
+/// second run against the same database applies nothing and raises no checksum complaint.
+#[tokio::test]
+async fn embedded_migrations_apply_and_are_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+    std::env::remove_var("KONSENSUS_SQLITE_MIGRATIONS_DIR");
+    let db = SqliteStorage::in_memory().await?;
+    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(
+        applied as usize,
+        crate::sqlite::EmbeddedMigrations::migrations().len()
+    );
+    sqlx::migrate::Migrator::new(crate::sqlite::EmbeddedMigrations)
+        .await?
+        .run(db.pool())
+        .await?;
+    let again: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(applied, again);
+    Ok(())
+}
+
+/// Genome #57 compatibility: a database migrated by the FILE source (what rc4/rc5 did on
+/// the build host) must be accepted by the EMBEDDED source without a checksum mismatch.
+#[tokio::test]
+async fn db_migrated_from_files_is_accepted_by_embedded_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"));
+    let path = std::env::temp_dir().join(format!(
+        "konsensus-migration-parity-{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(dir).await?.run(&pool).await?;
+    sqlx::migrate::Migrator::new(crate::sqlite::EmbeddedMigrations)
+        .await?
+        .run(&pool)
+        .await?;
+    pool.close().await;
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
