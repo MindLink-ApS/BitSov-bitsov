@@ -1,7 +1,11 @@
 //! SQLite storage backend using sqlx.
 
 use async_trait::async_trait;
+use sqlx::migrate::{Migration, MigrationSource, MigrationType, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use std::borrow::Cow;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 
 use konsensus_core::{
@@ -68,15 +72,17 @@ impl SqliteStorage {
         Ok(storage)
     }
 
-    /// Run embedded migrations.
+    /// Run the schema migrations embedded in the binary (genome #57).
+    ///
+    /// `KONSENSUS_SQLITE_MIGRATIONS_DIR` remains a development override for running
+    /// migrations from a directory; a released binary needs no files on disk.
     async fn run_migrations(&self) -> Result<(), StorageError> {
-        // Use a runtime migration source to avoid the sqlx `macros` feature
-        // (which pulls in MySQL support and the vulnerable `rsa` crate).
-        // Deployed binaries can set KONSENSUS_SQLITE_MIGRATIONS_DIR because
-        // CARGO_MANIFEST_DIR points at the build host, not the target node.
-        let migrations_dir = std::env::var("KONSENSUS_SQLITE_MIGRATIONS_DIR")
-            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/migrations").to_string());
-        let migrator = sqlx::migrate::Migrator::new(std::path::Path::new(&migrations_dir)).await?;
+        // Runtime sources on purpose: the sqlx `macros` feature (`sqlx::migrate!`) pulls
+        // in MySQL support and the vulnerable `rsa` crate.
+        let migrator = match std::env::var("KONSENSUS_SQLITE_MIGRATIONS_DIR") {
+            Ok(dir) => Migrator::new(std::path::Path::new(&dir)).await?,
+            Err(_) => Migrator::new(EmbeddedMigrations).await?,
+        };
         migrator.run(&self.pool).await?;
         Ok(())
     }
@@ -84,6 +90,82 @@ impl SqliteStorage {
     /// Get a reference to the connection pool.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+}
+
+/// The SQLite schema, embedded in the binary so a released node is self-sufficient
+/// (genome issue #57): rc4/rc5 shipped no migrations and resolved them from the build
+/// host's `CARGO_MANIFEST_DIR`, which does not exist on a user's machine.
+///
+/// Version and SQL bytes are exactly what sqlx's file source produces for the same files,
+/// so the applied-migration checksum (SHA-384 of the SQL) matches databases migrated by
+/// earlier releases. Keep this table in sync with `migrations/`; the
+/// `embedded_migrations_match_migrations_dir` test enforces it.
+#[derive(Debug)]
+pub(crate) struct EmbeddedMigrations;
+
+/// `(version, description, sql)` — description mirrors sqlx's filename parsing
+/// (`NNN_some_name.sql` → "some name").
+const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "initial", include_str!("../migrations/001_initial.sql")),
+    (2, "sessions", include_str!("../migrations/002_sessions.sql")),
+    (3, "pending deliveries", include_str!("../migrations/003_pending_deliveries.sql")),
+    (4, "files", include_str!("../migrations/004_files.sql")),
+    (5, "message plaintext", include_str!("../migrations/005_message_plaintext.sql")),
+    (6, "pending deliveries fk", include_str!("../migrations/006_pending_deliveries_fk.sql")),
+    (7, "fiat rate snapshots", include_str!("../migrations/007_fiat_rate_snapshots.sql")),
+    (8, "recovery", include_str!("../migrations/008_recovery.sql")),
+    (9, "contacts", include_str!("../migrations/009_contacts.sql")),
+    (10, "invites issued", include_str!("../migrations/010_invites_issued.sql")),
+    (11, "accepted invites", include_str!("../migrations/011_accepted_invites.sql")),
+    (12, "onboarding state", include_str!("../migrations/012_onboarding_state.sql")),
+    (
+        13,
+        "operator hosting contracts",
+        include_str!("../migrations/013_operator_hosting_contracts.sql"),
+    ),
+    (14, "invite v2 fields", include_str!("../migrations/014_invite_v2_fields.sql")),
+    (15, "invite expired state", include_str!("../migrations/015_invite_expired_state.sql")),
+    (16, "invite opening state", include_str!("../migrations/016_invite_opening_state.sql")),
+    (
+        17,
+        "onboarding state funding evidence",
+        include_str!("../migrations/017_onboarding_state_funding_evidence.sql"),
+    ),
+    (18, "onboarding state scope", include_str!("../migrations/018_onboarding_state_scope.sql")),
+    (19, "payment receipts", include_str!("../migrations/019_payment_receipts.sql")),
+];
+
+impl EmbeddedMigrations {
+    /// The embedded schema as sqlx migrations, in version order.
+    pub(crate) fn migrations() -> Vec<Migration> {
+        EMBEDDED_MIGRATIONS
+            .iter()
+            .map(|(version, description, sql)| {
+                Migration::new(
+                    *version,
+                    Cow::Borrowed(*description),
+                    MigrationType::Simple,
+                    Cow::Borrowed(*sql),
+                    sql.starts_with("-- no-transaction"),
+                )
+            })
+            .collect()
+    }
+}
+
+impl MigrationSource<'static> for EmbeddedMigrations {
+    fn resolve(
+        self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<Migration>, Box<dyn std::error::Error + Send + Sync + 'static>>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(async move { Ok(Self::migrations()) })
     }
 }
 

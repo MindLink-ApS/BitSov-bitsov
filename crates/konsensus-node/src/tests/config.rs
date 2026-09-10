@@ -837,12 +837,12 @@ fn validate_port_collision() {
     assert!(err.to_string().contains("same port"), "got: {err}");
 }
 
-/// A fresh full-tier node leaves BOTH the P2P network listener and the LDK
-/// Lightning listener on 0.0.0.0:9735 (that is exactly what
-/// `default_for_tier(Full)` produces). Validation must reject the collision —
-/// at runtime it silently hangs the node (LDK shuts down + the transport
-/// listener never returns + the API never binds). Reproduced on 2 hosts during
-/// R4.5 staging.
+/// An operator who hand-edits BOTH the P2P network listener and the LDK Lightning
+/// listener onto 0.0.0.0:9735 must be rejected at validation — at runtime the
+/// collision silently hangs the node (LDK shuts down + the transport listener never
+/// returns + the API never binds). Reproduced on 2 hosts during R4.5 staging. Until
+/// genome #56 this was also what `default_for_tier(Full)` produced; the defaults no
+/// longer collide (see `default_for_tier_defaults_validate_for_every_tier`).
 #[test]
 fn validate_p2p_lightning_port_collision() {
     let mut config = NodeConfig::default_for_tier(
@@ -850,13 +850,16 @@ fn validate_p2p_lightning_port_collision() {
         PathBuf::from("/dev/null"),
         Path::new("/tmp"),
     );
-    // Both default to 0.0.0.0:9735 — assert the precondition so this test still
-    // exercises the collision if the defaults ever change.
-    assert_eq!(config.network.listen_addr, "0.0.0.0:9735".parse().unwrap());
-    assert!(matches!(
-        &config.lightning,
-        LightningConfig::Ldk { listening_address: Some(a), .. } if a == "0.0.0.0:9735"
-    ));
+    // Force the collision explicitly (the defaults are distinct since #56).
+    config.network.listen_addr = "0.0.0.0:9735".parse().unwrap();
+    if let LightningConfig::Ldk {
+        listening_address, ..
+    } = &mut config.lightning
+    {
+        *listening_address = Some("0.0.0.0:9735".to_string());
+    } else {
+        panic!("full tier should default to an LDK Lightning backend");
+    }
     // Keep the API off 9735 so this test isolates the P2P-vs-Lightning guard.
     config.api.listen_addr = "127.0.0.1:3141".parse().unwrap();
 
@@ -889,6 +892,37 @@ fn validate_p2p_lightning_distinct_ports_ok() {
     config
         .validate()
         .expect("distinct P2P/Lightning ports must validate");
+}
+
+/// Genome #56: a fresh `init` for every tier must produce a config that `start` accepts
+/// with zero edits — the P2P, API and (Full tier) Lightning listeners all default to
+/// distinct ports.
+#[test]
+fn default_for_tier_defaults_validate_for_every_tier() {
+    for tier in [NodeTier::Cloud, NodeTier::Light, NodeTier::Full] {
+        let config =
+            NodeConfig::default_for_tier(tier, PathBuf::from("/dev/null"), Path::new("/tmp"));
+        assert_ne!(
+            config.network.listen_addr.port(),
+            config.api.listen_addr.port(),
+            "{tier:?}: P2P and API defaults must differ"
+        );
+        if let LightningConfig::Ldk {
+            listening_address: Some(addr),
+            ..
+        } = &config.lightning
+        {
+            let ln_port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+            assert_ne!(
+                config.network.listen_addr.port(),
+                ln_port,
+                "{tier:?}: P2P and Lightning defaults must differ"
+            );
+        }
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("{tier:?}: fresh defaults must validate: {e}"));
+    }
 }
 
 #[test]

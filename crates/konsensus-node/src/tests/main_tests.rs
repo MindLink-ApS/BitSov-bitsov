@@ -46,19 +46,26 @@ fn init_full_tier_creates_config() -> Result<()> {
     let config_path = dir.join("konsensus.toml");
     assert!(config_path.exists(), "full-tier config file must be written");
 
-    // A fresh full-tier default leaves BOTH the P2P network listener and the LDK
-    // Lightning listener on 0.0.0.0:9735. `NodeConfig::load` runs `validate()`,
-    // which now rejects that collision with a loud, actionable error instead of
-    // letting the node boot and silently hang at runtime (LDK shuts down + the
-    // transport listener never returns + the API never binds — reproduced on 2
-    // hosts during R4.5 staging). The operator resolves it by giving P2P and
-    // Lightning distinct ports (e.g. alpha runs P2P 9736 / Lightning 9735).
-    let err = crate::config::NodeConfig::load(&config_path).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("same port"), "got: {msg}");
-    assert!(msg.contains("Lightning listening address"), "got: {msg}");
+    // Genome #56: a fresh full-tier init must LOAD — `NodeConfig::load` runs
+    // `validate()`, which fail-closes on a P2P/Lightning port collision. Until #56
+    // the defaults put both listeners on 0.0.0.0:9735 and this test asserted the
+    // rejection; the P2P default is now 9736, so a zero-edit config boots.
+    let config = crate::config::NodeConfig::load(&config_path)?;
+    assert_eq!(config.tier, crate::config::NodeTier::Full);
+    let p2p_port = config.network.listen_addr.port();
+    assert_ne!(p2p_port, config.api.listen_addr.port(), "P2P vs API");
+    match &config.lightning {
+        crate::config::LightningConfig::Ldk {
+            listening_address: Some(addr),
+            ..
+        } => {
+            let ln_port: u16 = addr.rsplit(':').next().unwrap().parse()?;
+            assert_ne!(p2p_port, ln_port, "P2P vs Lightning must not collide (#56)");
+        }
+        other => panic!("full tier must default to an LDK listener, got {other:?}"),
+    }
 
-    // The raw TOML still parses to a Full-tier config; only validation rejects it.
+    // The raw TOML parses to a Full-tier config too.
     let raw = std::fs::read_to_string(&config_path)?;
     let parsed: crate::config::NodeConfig = toml::from_str(&raw)?;
     assert_eq!(parsed.tier, crate::config::NodeTier::Full);
