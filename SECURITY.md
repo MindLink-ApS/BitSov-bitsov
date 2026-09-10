@@ -27,8 +27,8 @@ Encrypt your report using our PGP key (see [`SECURITY_KEY.asc`](./SECURITY_KEY.a
 
 ```
 Contact:         info@mindlink.tech
-Fingerprint:     8407 155E C7A1 F376 A910  C509 CFFC 76C3 AE38 03C4
-Encryption:      subkey C6FB 80C6 D322 62C5 EA64  459D 27AA 6449 981D 4865
+Fingerprint:     B279 C1F4 EA9B 93DC 834E  97E6 3192 99EA BD6D 3B39
+Encryption:      subkey 2DF2 C497 4353 EAAD 3961  BFEC 35EF 7A02 0144 2124
 Expires:         2028-04-20
 ```
 
@@ -37,15 +37,19 @@ This key encrypts inbound reports only. Release artifacts are signed with a
 `B299 274C 2003 0171 4DC6  F51A 7C2D 6F8A C842 EF6E`) — verify downloads against
 that key, published on the release page and as `RELEASE_KEY.asc`.
 
-Import and verify by **fingerprint** before encrypting. The key's embedded UID
-reads `security@bitsov.io` — an early project address; the current and only
-contact is **info@mindlink.tech**. Trust the fingerprint, not the embedded UID:
+Import and verify by **fingerprint** before encrypting. Trust the fingerprint, not the UID:
 
 ```bash
 gpg --import SECURITY_KEY.asc
-gpg --fingerprint 8407155EC7A1F376A910C509CFFC76C3AE3803C4
+gpg --fingerprint B279C1F4EA9B93DC834E97E6319299EABD6D3B39
 # Confirm the printed fingerprint matches the one above before encrypting.
 ```
+
+> **Retired key (2026-09-10):** the previous disclosure key
+> `8407 155E C7A1 F376 A910  C509 CFFC 76C3 AE38 03C4` (`security@bitsov.io`) is no longer usable —
+> its private key is unavailable, so reports encrypted to it cannot be read, and it cannot be
+> cryptographically revoked. **Do not encrypt to it.** If you sent a report to it, please
+> re-encrypt to the key above and resend; we will honour the original submission date.
 
 ### What to Include
 
@@ -165,7 +169,7 @@ The full public key is in [`SECURITY_KEY.asc`](./SECURITY_KEY.asc) at the root o
 (see SECURITY_KEY.asc)
 -----END PGP PUBLIC KEY BLOCK-----
 
-Fingerprint: 8407 155E C7A1 F376 A910  C509 CFFC 76C3 AE38 03C4
+Fingerprint: B279 C1F4 EA9B 93DC 834E  97E6 3192 99EA BD6D 3B39
 ```
 
 Always verify the fingerprint before encrypting sensitive reports.
