@@ -29,7 +29,7 @@ Encrypt your report using our PGP key (see [`SECURITY_KEY.asc`](./SECURITY_KEY.a
 Contact:         info@mindlink.tech
 Fingerprint:     B279 C1F4 EA9B 93DC 834E  97E6 3192 99EA BD6D 3B39
 Encryption:      subkey 2DF2 C497 4353 EAAD 3961  BFEC 35EF 7A02 0144 2124
-Expires:         2028-04-20
+Expires:         2030-09-10
 ```
 
 This key encrypts inbound reports only. Release artifacts are signed with a
