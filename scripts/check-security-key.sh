@@ -24,11 +24,15 @@
 # The key is parsed in a throwaway GNUPGHOME — the user's keyring is never touched.
 #
 # Usage: scripts/check-security-key.sh [repo-root]   (default: parent of scripts/)
+#
+# Test hooks (default: unset — behaviour unchanged): SECURITY_KEY_FILE and
+# SECURITY_MD_FILE override the two paths so scripts/test-security-key.sh can
+# point the guard at generated fixtures instead of the repo files.
 set -euo pipefail
 
 ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-KEY_FILE="$ROOT/SECURITY_KEY.asc"
-POLICY="$ROOT/SECURITY.md"
+KEY_FILE="${SECURITY_KEY_FILE:-$ROOT/SECURITY_KEY.asc}"
+POLICY="${SECURITY_MD_FILE:-$ROOT/SECURITY.md}"
 WARN_DAYS=90
 
 fail() { echo "SECURITY-KEY: FAIL $*" >&2; exit 1; }

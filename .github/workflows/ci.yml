@@ -109,7 +109,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Security key ↔ policy consistency
-        run: bash scripts/check-security-key.sh
+        run: bash scripts/test-security-key.sh && bash scripts/check-security-key.sh
 
       - uses: dtolnay/rust-toolchain@stable
 
