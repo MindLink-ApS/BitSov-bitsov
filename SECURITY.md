@@ -39,6 +39,10 @@ This key encrypts inbound reports only. Release artifacts are signed with a
 `B299 274C 2003 0171 4DC6  F51A 7C2D 6F8A C842 EF6E`) — verify downloads against
 that key, published on the release page and as `RELEASE_KEY.asc`.
 
+The disclosure key is **certified by the release key**: after importing both keys,
+`gpg --check-sigs B279C1F4EA9B93DC834E97E6319299EABD6D3B39` shows a good signature from
+`B299 274C … C842 EF6E`. A disclosure key without that certification is not ours.
+
 Import and verify by **fingerprint** before encrypting. Trust the fingerprint, not the UID:
 
 ```bash
