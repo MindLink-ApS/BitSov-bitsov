@@ -79,11 +79,14 @@ ignore = [
     # prefix overflow on values > 4 GiB. Reaches konsensus-storage. Deferred: the
     # `=0.8.0` pin is forced by ldk-node 0.7's rusqlite/libsqlite3-sys 0.28
     # constraint (root Cargo.toml); 0.8.1 is the fix but is currently unbuildable.
-    # Exploit path is the Postgres/MySQL binary protocol; SQLite (our default
-    # backend) is not believed exploitable per the advisory. Inputs >4 GiB are not
-    # reachable in current call sites. Clear when ldk-node bumps rusqlite to >=0.32.
+    # Exploit path is the Postgres/MySQL binary protocol. Note this is NOT "we are
+    # SQLite so it cannot apply": the `postgres` feature is enabled, sqlx-postgres
+    # links into konsensus-node, and StorageConfig::Postgres is a supported backend
+    # (2026-09-14 triage, #59). What makes it unreachable is that inputs >4 GiB
+    # cannot occur — wire frames cap at 16 MiB, the REST API at 2 MiB. Recheck if
+    # either cap changes. Clear when ldk-node bumps rusqlite to >=0.32.
     # Tracking: docs/security/supply-chain-audit-scope.md (known-debt table).
-    { id = "RUSTSEC-2024-0363", reason = "sqlx =0.8.0 pinned by ldk-node 0.7 rusqlite/libsqlite3-sys 0.28; SQLite backend unaffected (Postgres/MySQL only); fix 0.8.1 needs libsqlite3-sys >=0.30. Tracked in supply-chain-audit-scope.md." },
+    { id = "RUSTSEC-2024-0363", reason = "sqlx =0.8.0 pinned by ldk-node 0.7 rusqlite/libsqlite3-sys 0.28. NOT \"SQLite so unaffected\": sqlx-postgres ships in the binary and StorageConfig::Postgres is a supported backend. Unreachable because the exploit needs a bound parameter >4 GiB and inputs cap at 16 MiB (wire) / 2 MiB (API) — recheck if those caps change. Fix 0.8.1 needs libsqlite3-sys >=0.30. Tracked in supply-chain-audit-scope.md." },
 
     # RUSTSEC-2026-0098 — rustls-webpki 0.101.7: URI-name constraints incorrectly
     # accepted. The 0.101.7 copy rides rustls 0.21 via sqlx-core 0.8.0 (same sqlx
