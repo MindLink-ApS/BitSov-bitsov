@@ -379,9 +379,11 @@ impl ChainConfig {
 
 impl Default for ChainConfig {
     fn default() -> Self {
+        // Construction-only path (`chain` has no serde default — the stanza is
+        // required), so the fresh pair is safe here. #66.
         Self::Esplora {
-            api_url: default_esplora_url(),
-            esplora_url_fallback: default_esplora_fallback(),
+            api_url: FRESH_CHAIN_PRIMARY.to_string(),
+            esplora_url_fallback: Some(FRESH_CHAIN_FALLBACK.to_string()),
         }
     }
 }
@@ -1145,11 +1147,12 @@ impl NodeConfig {
             NodeTier::Full => (
                 LightningConfig::Ldk {
                     network: default_ldk_network(),
-                    esplora_url: default_ldk_esplora(),
-                    // #66: a fresh node ships with two chain providers. Written
+                    // #66: a fresh node ships with two chain providers, written
                     // into the generated konsensus.toml so the operator can see
-                    // and change it; never injected into an existing config.
-                    esplora_url_fallback: default_ldk_esplora_fallback(),
+                    // and change them. Never injected into an existing config —
+                    // the serde defaults above stay on the legacy provider.
+                    esplora_url: FRESH_LDK_PRIMARY.to_string(),
+                    esplora_url_fallback: Some(FRESH_LDK_FALLBACK.to_string()),
                     rgs_url: None,
                     lsp_node_id: None,
                     lsp_address: None,
@@ -1235,24 +1238,37 @@ fn default_api_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 3141))
 }
 
-/// genome #66: the shipped default must be an endpoint that answers with a
-/// usable fee-estimate map from ordinary hosting, and it must ship WITH a
-/// fallback. mempool.space alone refused to boot nodes on datacenter/VPS IPs
-/// (observed on GitHub-hosted runners, 2026-09-13) — it answered 2xx while its
-/// payload was unusable to LDK, so the node died on its startup fee fetch.
+/// DESERIALIZATION default — frozen. An existing `[chain]` stanza that omits
+/// `api_url` must keep resolving to what it resolved to before, or upgrading
+/// the binary silently moves that operator to a different provider. #66 changes
+/// what `init` WRITES (see `FRESH_CHAIN_PRIMARY`), never what an existing
+/// configuration means.
 fn default_esplora_url() -> String {
-    "https://blockstream.info".into()
+    "https://mempool.space".into()
 }
 
-/// genome #66: `init` now writes a fallback instead of `none`, so a single
-/// unreachable or degraded provider cannot stop a fresh node from starting.
-fn default_esplora_fallback() -> Option<String> {
-    Some("https://mempool.space".into())
+/// DESERIALIZATION default — frozen, same reason as [`default_esplora_url`].
+fn default_ldk_esplora() -> String {
+    "https://mempool.space/api".to_string()
 }
 
-fn default_ldk_esplora_fallback() -> Option<String> {
-    Some("https://mempool.space/api".into())
-}
+// --- genome #66: the provider pair `init` WRITES into a fresh config ---------
+//
+// A fresh node ships with two chain providers. mempool.space alone refused to
+// boot nodes on datacenter/VPS IPs (observed on GitHub-hosted runners,
+// 2026-09-13): it answered 2xx while its payload was unusable to LDK, so the
+// node died on its startup fee fetch. These constants are used ONLY by
+// construction paths — `default_for_tier` and `ChainConfig::default` — and are
+// deliberately NOT wired to any `#[serde(default = ...)]`.
+
+/// Base URL (no `/api`; the chain client appends it).
+const FRESH_CHAIN_PRIMARY: &str = "https://blockstream.info";
+/// Base URL (no `/api`).
+const FRESH_CHAIN_FALLBACK: &str = "https://mempool.space";
+/// LDK takes the full API URL, `/api` included.
+const FRESH_LDK_PRIMARY: &str = "https://blockstream.info/api";
+/// LDK takes the full API URL, `/api` included.
+const FRESH_LDK_FALLBACK: &str = "https://mempool.space/api";
 
 fn default_sqlite_path() -> String {
     "konsensus.db".into()
@@ -1287,10 +1303,6 @@ fn default_mock_balance() -> u64 {
 
 fn default_ldk_network() -> String {
     "bitcoin".to_string()
-}
-
-fn default_ldk_esplora() -> String {
-    "https://blockstream.info/api".to_string()
 }
 
 fn default_fee_target_blocks() -> u32 {

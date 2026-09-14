@@ -1484,6 +1484,12 @@ fn convert_payment_details(details: &ldk_node::payment::PaymentDetails) -> Payme
 /// carrying no usable fee rate. Caller treats `Err` as "endpoint unusable" and
 /// may try the fallback. The timeout is intentionally tight (4 s) so node
 /// startup doesn't stall on a single slow endpoint.
+///
+/// LIMIT, deliberately not addressed here: this probe is a SEPARATE request from
+/// the fetch LDK makes moments later. It selects an endpoint at startup; it is
+/// not continuous failover, and an endpoint that degrades between the probe and
+/// LDK's fetch will still fail startup. Runtime failover is a distinct change,
+/// out of scope for #66.
 pub async fn probe_esplora_fee_estimates(esplora_url: &str) -> Result<(), String> {
     let trimmed = esplora_url.trim_end_matches('/');
     let url = format!("{trimmed}/fee-estimates");
@@ -1505,23 +1511,30 @@ pub async fn probe_esplora_fee_estimates(esplora_url: &str) -> Result<(), String
         .text()
         .await
         .map_err(|e| format!("reading body of {url}: {e}"))?;
-    let estimates: std::collections::HashMap<String, f64> =
+    // Deserialize into LDK's OWN type. esplora-client 0.12.3 (pinned via ldk-node
+    // 0.7) parses the whole response as `HashMap<u16, f64>` (`src/async.rs:526`),
+    // so a single key LDK cannot represent fails the WHOLE fetch. Accepting "at
+    // least one usable entry" against a looser `HashMap<String, f64>` would let
+    // `{"1":10.0,"invalid":1.0}` or `{"1":10.0,"65536":1.0}` pass here and still
+    // kill LDK startup — the exact defect #66 is about, one layer in. Mirror the
+    // consumer's contract: if LDK cannot parse it, neither do we.
+    let estimates: std::collections::HashMap<u16, f64> =
         serde_json::from_str(&body).map_err(|e| {
             let preview: String = body.chars().take(120).collect();
             format!(
-                "{url} returned {status} but the body is not an Esplora fee-estimate map \
+                "{url} returned {status} but LDK cannot deserialize the body as an Esplora fee-estimate map \
                  (confirmation target -> sat/vB): {e}; first 120 bytes: {preview:?}"
             )
         })?;
     let usable = estimates
-        .iter()
-        .filter(|(target, rate)| target.parse::<u16>().is_ok() && rate.is_finite() && **rate > 0.0)
+        .values()
+        .filter(|rate| rate.is_finite() && **rate > 0.0)
         .count();
     if usable == 0 {
         return Err(format!(
             "{url} returned {status} with a parsable but unusable fee-estimate map \
-             ({} entries, none of them a positive finite rate for a numeric confirmation \
-             target) — LDK would fail its startup fee fetch against this endpoint",
+             ({} entries, none of them a positive finite rate) — LDK would fail its \
+             startup fee fetch against this endpoint",
             estimates.len()
         ));
     }
@@ -1563,9 +1576,18 @@ pub async fn select_esplora_endpoint(primary: &str, fallback: Option<&str>) -> S
                         fallback = %fb,
                         primary_error = %primary_err,
                         fallback_error = %fallback_err,
-                        remedy = "set [lightning.ldk] esplora_url / esplora_url_fallback \
-                                  (and [chain] api_url / esplora_url_fallback) to Esplora \
-                                  endpoints reachable from this host, then restart",
+                        // LightningConfig is internally tagged: the table is
+                        // [lightning] with backend = "ldk", NOT [lightning.ldk]
+                        // — and the config denies unknown fields, so following
+                        // the old text would fail to parse. LDK takes the full
+                        // API URL including /api; [chain] api_url is a BASE URL
+                        // and appends /api itself.
+                        remedy = "in konsensus.toml set [lightning] (backend = \"ldk\") \
+                                  esplora_url / esplora_url_fallback — full API URLs \
+                                  including /api — and [chain] api_url / \
+                                  esplora_url_fallback — base URLs, /api is appended \
+                                  — to Esplora endpoints reachable from this host, \
+                                  then restart",
                         "both esplora endpoints returned unusable fee data — the node will \
                          refuse to start (genome #66). Neither endpoint answered with a \
                          usable confirmation-target -> sat/vB map."

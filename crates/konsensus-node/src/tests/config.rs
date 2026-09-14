@@ -1939,6 +1939,73 @@ esplora_url_fallback = "https://fallback.example.com"
     }
 }
 
+/// genome #66 round 2 (Codex R2): an EXISTING config that omits the primary URL
+/// must keep resolving to the provider it resolved to before. The first attempt
+/// at #66 changed the `#[serde(default = ...)]` helpers, which would have moved
+/// every such config from mempool.space to Blockstream on upgrade — the same
+/// silent-provider-change the fallback decision was written to prevent, one line
+/// away. The deserialization defaults are frozen; only construction paths carry
+/// the new pair.
+#[test]
+fn issue66_existing_config_omitting_primary_keeps_its_provider() {
+    // [chain] stanza present, api_url omitted -> legacy default, no fallback.
+    let chain: ChainConfig = toml::from_str("backend = \"esplora\"\n").unwrap();
+    match chain {
+        ChainConfig::Esplora {
+            api_url,
+            esplora_url_fallback,
+        } => {
+            assert_eq!(
+                api_url, "https://mempool.space",
+                "upgrading the binary must not move an existing config's chain provider"
+            );
+            assert_eq!(
+                esplora_url_fallback, None,
+                "and must not inject a third-party fallback it never chose"
+            );
+        }
+        ChainConfig::Mock => panic!("expected esplora"),
+    }
+
+    // [lightning] backend = "ldk", esplora_url omitted -> legacy default, no fallback.
+    let ldk: LightningConfig = toml::from_str("backend = \"ldk\"\n").unwrap();
+    match ldk {
+        LightningConfig::Ldk {
+            esplora_url,
+            esplora_url_fallback,
+            ..
+        } => {
+            assert_eq!(
+                esplora_url, "https://mempool.space/api",
+                "upgrading the binary must not move an existing config's LDK provider"
+            );
+            assert_eq!(esplora_url_fallback, None);
+        }
+        other => panic!("expected ldk, got {other:?}"),
+    }
+}
+
+/// An explicit primary is always honoured, with or without a fallback.
+#[test]
+fn issue66_explicit_primary_is_never_overridden() {
+    let chain: ChainConfig =
+        toml::from_str("backend = \"esplora\"\napi_url = \"https://esplora.mine.internal\"\n")
+            .unwrap();
+    match chain {
+        ChainConfig::Esplora {
+            api_url,
+            esplora_url_fallback,
+        } => {
+            assert_eq!(api_url, "https://esplora.mine.internal");
+            assert_eq!(
+                esplora_url_fallback, None,
+                "an operator running their own Esplora must not silently gain a public one"
+            );
+        }
+        ChainConfig::Mock => panic!("expected esplora"),
+    }
+}
+
 /// genome #66, half one: a node created by `init` ships with TWO chain
 /// providers, written into its own config where the operator can see and edit
 /// them. A single unreachable or degraded provider must not stop a fresh node

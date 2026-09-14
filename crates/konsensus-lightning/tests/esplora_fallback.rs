@@ -311,3 +311,96 @@ async fn issue66_unusable_primary_falls_over_to_healthy_fallback() {
     primary_mock.assert_async().await;
     fallback_mock.assert_async().await;
 }
+
+// ---------------------------------------------------------------------------
+// #66 round 2 (Codex R1): the probe must mirror LDK's CONCRETE type.
+// esplora-client 0.12.3 parses the whole body as HashMap<u16, f64>, so one key
+// LDK cannot represent fails its entire fetch. A probe that accepts "at least
+// one usable entry" would pass these and still kill startup — same defect, one
+// layer in.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn issue66_probe_err_on_mixed_valid_and_invalid_keys() {
+    for (label, body) in [
+        (
+            "non-numeric key beside a valid one",
+            "{\"1\":10.0,\"invalid\":1.0}",
+        ),
+        (
+            "u16-overflow key beside a valid one",
+            "{\"1\":10.0,\"65536\":1.0}",
+        ),
+        ("negative key beside a valid one", "{\"1\":10.0,\"-1\":1.0}"),
+    ] {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let mock = server
+            .mock("GET", "/fee-estimates")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let result = probe_esplora_fee_estimates(&url).await;
+        assert!(
+            result.is_err(),
+            "{label}: LDK deserializes the WHOLE map into HashMap<u16, f64>, so this \
+             body fails its fetch — the probe must reject it too, or the fallback is \
+             suppressed and startup dies anyway (#66)"
+        );
+        mock.assert_async().await;
+    }
+}
+
+/// The boundary itself: 65535 is representable, 65536 is not.
+#[tokio::test]
+async fn issue66_probe_u16_key_boundary() {
+    for (body, want_ok) in [("{\"65535\":1.5}", true), ("{\"65536\":1.5}", false)] {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let mock = server
+            .mock("GET", "/fee-estimates")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        assert_eq!(
+            probe_esplora_fee_estimates(&url).await.is_ok(),
+            want_ok,
+            "u16 boundary: {body} should be ok={want_ok}"
+        );
+        mock.assert_async().await;
+    }
+}
+
+/// Selection must reach the fallback when the primary carries a key LDK rejects.
+#[tokio::test]
+async fn issue66_mixed_key_primary_falls_over_to_healthy_fallback() {
+    let mut primary = mockito::Server::new_async().await;
+    let primary_url = primary.url();
+    let primary_mock = primary
+        .mock("GET", "/fee-estimates")
+        .with_status(200)
+        .with_body("{\"1\":10.0,\"invalid\":1.0}")
+        .create_async()
+        .await;
+
+    let mut fallback = mockito::Server::new_async().await;
+    let fallback_url = fallback.url();
+    let fallback_mock = fallback
+        .mock("GET", "/fee-estimates")
+        .with_status(200)
+        .with_body("{\"1\":25.0,\"6\":10.0}")
+        .create_async()
+        .await;
+
+    let chosen = select_esplora_endpoint(&primary_url, Some(&fallback_url)).await;
+    assert_eq!(
+        chosen, fallback_url,
+        "a primary whose map LDK cannot deserialize must not win (#66)"
+    );
+    primary_mock.assert_async().await;
+    fallback_mock.assert_async().await;
+}
