@@ -22,8 +22,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use ldk_node::config::EsploraSyncConfig;
 use ldk_node::lightning_invoice::{
-    Bolt11InvoiceDescription as LdkInvoiceDescription,
-    Description as LdkDescription,
+    Bolt11InvoiceDescription as LdkInvoiceDescription, Description as LdkDescription,
 };
 use ldk_node::payment::PaymentKind as LdkPaymentKind;
 use ldk_node::payment::PaymentStatus as LdkPaymentStatus;
@@ -32,13 +31,13 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, instrument, warn};
 use zeroize::Zeroizing;
 
+use crate::scb_export::write_monitor_store_scb;
+use crate::scb_rotate::{rotate_scb_backup, ScbRotationConfig};
 use konsensus_core::fee_rate::validate_fee_rate_sat_per_vb;
 use konsensus_core::traits::lightning::{
     ChannelInfo, InboundPayment, Invoice, LightningError, LightningProvider, PaymentDetails,
     PaymentDirection, PaymentStatus,
 };
-use crate::scb_export::write_monitor_store_scb;
-use crate::scb_rotate::{rotate_scb_backup, ScbRotationConfig};
 
 /// Configuration for the embedded LDK Lightning provider.
 #[derive(Debug, Clone)]
@@ -271,7 +270,10 @@ impl std::fmt::Debug for LdkProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LdkProvider")
             .field("running", &self.node.status().is_running)
-            .field("payment_capable", &self.payment_capable.load(Ordering::Relaxed))
+            .field(
+                "payment_capable",
+                &self.payment_capable.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -292,9 +294,8 @@ impl LdkProvider {
         // The parsed `bip39::Mnemonic` (built with the `zeroize` feature) is
         // itself `ZeroizeOnDrop`.
         let mnemonic_phrase = Zeroizing::new(std::mem::take(&mut config.mnemonic));
-        let mnemonic = Mnemonic::from_str(&mnemonic_phrase).map_err(|e| {
-            LightningError::Backend(format!("invalid mnemonic: {e}"))
-        })?;
+        let mnemonic = Mnemonic::from_str(&mnemonic_phrase)
+            .map_err(|e| LightningError::Backend(format!("invalid mnemonic: {e}")))?;
 
         // Derive BIP-39 seed (64 bytes) from mnemonic + passphrase.
         //
@@ -345,14 +346,15 @@ impl LdkProvider {
         // crash-loop the node if its esplora endpoint is unreachable
         // (root cause of the 2026-04-23 alpha incident). We probe the
         // primary; on failure, log INFO and switch to the fallback.
-        let chosen_esplora_url = select_esplora_endpoint(
-            &config.esplora_url,
-            config.esplora_url_fallback.as_deref(),
-        )
-        .await;
+        let chosen_esplora_url =
+            select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref())
+                .await;
 
         // Chain data source — Esplora (same as BitSov ChainProvider default)
-        builder.set_chain_source_esplora(chosen_esplora_url.clone(), Some(EsploraSyncConfig::default()));
+        builder.set_chain_source_esplora(
+            chosen_esplora_url.clone(),
+            Some(EsploraSyncConfig::default()),
+        );
 
         // Gossip source — RGS if configured, otherwise P2P
         if let Some(ref rgs_url) = config.rgs_url {
@@ -362,9 +364,7 @@ impl LdkProvider {
         }
 
         // LSPS2 liquidity source — automatic inbound channels from LSP
-        if let (Some(ref lsp_id), Some(ref lsp_addr)) =
-            (&config.lsp_node_id, &config.lsp_address)
-        {
+        if let (Some(ref lsp_id), Some(ref lsp_addr)) = (&config.lsp_node_id, &config.lsp_address) {
             let pubkey = lsp_id
                 .parse()
                 .map_err(|e| LightningError::Backend(format!("invalid LSP node ID: {e}")))?;
@@ -381,7 +381,9 @@ impl LdkProvider {
                 .map_err(|e| LightningError::Backend(format!("invalid listening address: {e}")))?;
             builder
                 .set_listening_addresses(vec![socket_addr])
-                .map_err(|e| LightningError::Backend(format!("failed to set listening address: {e}")))?;
+                .map_err(|e| {
+                    LightningError::Backend(format!("failed to set listening address: {e}"))
+                })?;
         }
 
         let node = builder
@@ -689,9 +691,7 @@ impl LdkProvider {
                 );
             }
             ldk_node::Event::PaymentFailed {
-                payment_id,
-                reason,
-                ..
+                payment_id, reason, ..
             } => {
                 warn!(
                     payment_id = ?payment_id,
@@ -711,9 +711,7 @@ impl LdkProvider {
                 );
             }
             ldk_node::Event::ChannelClosed {
-                channel_id,
-                reason,
-                ..
+                channel_id, reason, ..
             } => {
                 warn!(
                     channel_id = %channel_id,
@@ -745,11 +743,9 @@ impl LdkProvider {
     /// because each invocation stalled a tokio runtime worker thread
     /// during the synchronous LDK event drain (which fsync's
     /// `ChannelMonitor` updates — tens of ms under disk pressure).
-    #[deprecated(
-        note = "L0g: events are drained by the dedicated event-drainer \
+    #[deprecated(note = "L0g: events are drained by the dedicated event-drainer \
                 task spawned at LdkProvider::new(). This method is now \
-                a no-op kept for API back-compat."
-    )]
+                a no-op kept for API back-compat.")]
     pub fn process_events(&self) {
         // No-op. See doc comment + spawn_event_drainer.
     }
@@ -857,12 +853,8 @@ impl LightningProvider for LdkProvider {
         let node = Arc::clone(&self.node);
         tokio::task::spawn_blocking(move || node.stop())
             .await
-            .map_err(|e| {
-                LightningError::Backend(format!("LDK shutdown join error: {e}"))
-            })?
-            .map_err(|e| {
-                LightningError::Backend(format!("LDK node.stop() failed: {e}"))
-            })?;
+            .map_err(|e| LightningError::Backend(format!("LDK shutdown join error: {e}")))?
+            .map_err(|e| LightningError::Backend(format!("LDK node.stop() failed: {e}")))?;
         info!("LDK node stopped cleanly");
         Ok(())
     }
@@ -874,7 +866,6 @@ impl LightningProvider for LdkProvider {
         description: &str,
         expiry_secs: u32,
     ) -> Result<Invoice, LightningError> {
-
         let desc_inner = LdkDescription::new(description.to_string())
             .map_err(|e| LightningError::InvoiceCreation(format!("invalid description: {e}")))?;
         let desc = LdkInvoiceDescription::Direct(desc_inner);
@@ -901,7 +892,6 @@ impl LightningProvider for LdkProvider {
 
     #[instrument(skip(self), fields(bolt11))]
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
-
         let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11
             .parse()
             .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
@@ -952,7 +942,6 @@ impl LightningProvider for LdkProvider {
         &self,
         payment_hash: &str,
     ) -> Result<PaymentDetails, LightningError> {
-
         let hash_bytes = hex::decode(payment_hash).map_err(|e| {
             LightningError::PaymentNotFound(format!("invalid payment hash hex: {e}"))
         })?;
@@ -967,14 +956,11 @@ impl LightningProvider for LdkProvider {
             }
         }
 
-        Err(LightningError::PaymentNotFound(
-            payment_hash.to_string(),
-        ))
+        Err(LightningError::PaymentNotFound(payment_hash.to_string()))
     }
 
     #[instrument(skip(self))]
     async fn get_balance_msat(&self) -> Result<u64, LightningError> {
-
         let balances = self.node.list_balances();
         // Return Lightning balance (spendable across channels) in msat
         let lightning_msat = balances.total_lightning_balance_sats * 1000;
@@ -985,7 +971,6 @@ impl LightningProvider for LdkProvider {
 
     #[instrument(skip(self), fields(limit))]
     async fn list_payments(&self, limit: u32) -> Result<Vec<PaymentDetails>, LightningError> {
-
         let mut payments: Vec<PaymentDetails> = self
             .node
             .list_payments()
@@ -1004,7 +989,6 @@ impl LightningProvider for LdkProvider {
 
     #[instrument(skip(self))]
     async fn list_channels(&self) -> Result<Vec<ChannelInfo>, LightningError> {
-
         let channels = self
             .node
             .list_channels()
@@ -1046,7 +1030,6 @@ impl LightningProvider for LdkProvider {
         amount_msat: u64,
         _memo: Option<&str>,
     ) -> Result<PaymentDetails, LightningError> {
-
         let pubkey: bitcoin::secp256k1::PublicKey = dest_pubkey
             .parse()
             .map_err(|e| LightningError::Backend(format!("invalid destination pubkey: {e}")))?;
@@ -1308,7 +1291,8 @@ impl LightningProvider for LdkProvider {
         };
 
         // Open channel (connect + open in one call)
-        let user_channel_id = self.node
+        let user_channel_id = self
+            .node
             .open_channel(node_pubkey, ldk_addr, amount_sats, None, None)
             .map_err(|e| LightningError::Backend(format!("open_channel failed: {e}")))?;
 
@@ -1340,7 +1324,9 @@ impl LightningProvider for LdkProvider {
             .find(|ch| ch.user_channel_id == user_channel_id)
             .map(|ch| ch.counterparty_node_id)
             .ok_or_else(|| {
-                LightningError::Backend(format!("channel not found for user_channel_id {channel_id}"))
+                LightningError::Backend(format!(
+                    "channel not found for user_channel_id {channel_id}"
+                ))
             })?;
 
         if force {
@@ -1391,9 +1377,7 @@ fn parse_network(network: &str) -> Result<bitcoin::Network, LightningError> {
         "testnet" | "testnet3" => Ok(bitcoin::Network::Testnet),
         "signet" => Ok(bitcoin::Network::Signet),
         "regtest" => Ok(bitcoin::Network::Regtest),
-        other => Err(LightningError::Backend(format!(
-            "unknown network: {other}"
-        ))),
+        other => Err(LightningError::Backend(format!("unknown network: {other}"))),
     }
 }
 
@@ -1435,9 +1419,7 @@ fn convert_status(status: LdkPaymentStatus) -> PaymentStatus {
 }
 
 /// Convert LDK PaymentDirection to BitSov PaymentDirection.
-fn convert_direction(
-    direction: ldk_node::payment::PaymentDirection,
-) -> PaymentDirection {
+fn convert_direction(direction: ldk_node::payment::PaymentDirection) -> PaymentDirection {
     match direction {
         ldk_node::payment::PaymentDirection::Inbound => PaymentDirection::Incoming,
         ldk_node::payment::PaymentDirection::Outbound => PaymentDirection::Outgoing,
@@ -1445,9 +1427,7 @@ fn convert_direction(
 }
 
 /// Convert an LDK PaymentDetails to a BitSov PaymentDetails.
-fn convert_payment_details(
-    details: &ldk_node::payment::PaymentDetails,
-) -> PaymentDetails {
+fn convert_payment_details(details: &ldk_node::payment::PaymentDetails) -> PaymentDetails {
     let payment_hash = payment_hash_from_kind(&details.kind)
         .map(|h| hex::encode(h.0))
         .unwrap_or_default();
@@ -1487,10 +1467,23 @@ fn convert_payment_details(
 /// primary BEFORE handing the URL to LDK, and fall over to the optional
 /// secondary endpoint.
 ///
-/// Returns `Ok(())` on HTTP 2xx, `Err(_)` on any non-2xx status, transport
-/// error, or timeout. Caller treats `Err` as "endpoint unreachable" and
-/// may try the fallback. The timeout is intentionally tight (4 s) so
-/// node startup doesn't stall on a single slow endpoint.
+/// Returns `Ok(())` only when the endpoint answers with **fee data LDK can
+/// actually use**: HTTP 2xx *and* a JSON object of confirmation-target →
+/// fee-rate (sat/vB) with at least one finite, positive entry.
+///
+/// genome #66: the original probe accepted any 2xx without reading the body.
+/// An endpoint can answer 200/203 with a payload LDK cannot consume — a
+/// deprecation notice, a rate-limit document, an HTML error page, or an empty
+/// object — the probe passed, LDK was handed that endpoint, and LDK's own
+/// fetch then failed with `Failed to update fee rate estimates`, refusing to
+/// start. The fallback was never consulted, because as far as the probe was
+/// concerned the primary was healthy. Validating the payload is what makes the
+/// fallback reachable at all.
+///
+/// `Err(_)` on transport error, timeout, non-2xx, unparsable body, or a body
+/// carrying no usable fee rate. Caller treats `Err` as "endpoint unusable" and
+/// may try the fallback. The timeout is intentionally tight (4 s) so node
+/// startup doesn't stall on a single slow endpoint.
 pub async fn probe_esplora_fee_estimates(esplora_url: &str) -> Result<(), String> {
     let trimmed = esplora_url.trim_end_matches('/');
     let url = format!("{trimmed}/fee-estimates");
@@ -1504,11 +1497,35 @@ pub async fn probe_esplora_fee_estimates(esplora_url: &str) -> Result<(), String
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;
     let status = resp.status();
-    if status.is_success() {
-        Ok(())
-    } else {
-        Err(format!("non-2xx status {status} from {url}"))
+    if !status.is_success() {
+        return Err(format!("non-2xx status {status} from {url}"));
     }
+    // Read and validate the payload — a 2xx alone proves nothing (#66).
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("reading body of {url}: {e}"))?;
+    let estimates: std::collections::HashMap<String, f64> =
+        serde_json::from_str(&body).map_err(|e| {
+            let preview: String = body.chars().take(120).collect();
+            format!(
+                "{url} returned {status} but the body is not an Esplora fee-estimate map \
+                 (confirmation target -> sat/vB): {e}; first 120 bytes: {preview:?}"
+            )
+        })?;
+    let usable = estimates
+        .iter()
+        .filter(|(target, rate)| target.parse::<u16>().is_ok() && rate.is_finite() && **rate > 0.0)
+        .count();
+    if usable == 0 {
+        return Err(format!(
+            "{url} returned {status} with a parsable but unusable fee-estimate map \
+             ({} entries, none of them a positive finite rate for a numeric confirmation \
+             target) — LDK would fail its startup fee fetch against this endpoint",
+            estimates.len()
+        ));
+    }
+    Ok(())
 }
 
 /// L4b (2026-05-11): Select between primary and fallback Esplora endpoints.
@@ -1546,7 +1563,12 @@ pub async fn select_esplora_endpoint(primary: &str, fallback: Option<&str>) -> S
                         fallback = %fb,
                         primary_error = %primary_err,
                         fallback_error = %fallback_err,
-                        "esplora fallback also unreachable — LDK startup likely to fail"
+                        remedy = "set [lightning.ldk] esplora_url / esplora_url_fallback \
+                                  (and [chain] api_url / esplora_url_fallback) to Esplora \
+                                  endpoints reachable from this host, then restart",
+                        "both esplora endpoints returned unusable fee data — the node will \
+                         refuse to start (genome #66). Neither endpoint answered with a \
+                         usable confirmation-target -> sat/vB map."
                     );
                 }
                 fb.to_string()

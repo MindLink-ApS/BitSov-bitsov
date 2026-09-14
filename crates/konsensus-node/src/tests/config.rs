@@ -1939,6 +1939,52 @@ esplora_url_fallback = "https://fallback.example.com"
     }
 }
 
+/// genome #66, half one: a node created by `init` ships with TWO chain
+/// providers, written into its own config where the operator can see and edit
+/// them. A single unreachable or degraded provider must not stop a fresh node
+/// from starting.
+#[test]
+fn issue66_fresh_full_tier_config_ships_a_chain_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let config =
+        NodeConfig::default_for_tier(NodeTier::Full, dir.path().join("mnemonic.txt"), dir.path());
+
+    match &config.lightning {
+        LightningConfig::Ldk {
+            esplora_url,
+            esplora_url_fallback,
+            ..
+        } => {
+            let fallback = esplora_url_fallback
+                .as_deref()
+                .expect("init must write an LDK esplora fallback (#66)");
+            assert_ne!(
+                fallback, esplora_url,
+                "a fallback identical to the primary is not a fallback"
+            );
+        }
+        other => panic!("full tier must use LDK, got {other:?}"),
+    }
+
+    match &config.chain {
+        ChainConfig::Esplora {
+            api_url,
+            esplora_url_fallback,
+        } => {
+            let fallback = esplora_url_fallback
+                .as_deref()
+                .expect("init must write a chain esplora fallback (#66)");
+            assert_ne!(fallback, api_url, "fallback must differ from the primary");
+        }
+        other => panic!("full tier must use esplora chain, got {other:?}"),
+    }
+}
+
+/// genome #66, half two: parsing an EXISTING config that names no fallback must
+/// leave it unset. Injecting one would silently point an operator's node at a
+/// third-party endpoint they never chose, disclosing its existence and query
+/// pattern to a public service behind their back. Resilience is offered at
+/// `init`, never imposed on a configuration already in service.
 #[test]
 fn chain_config_backcompat_api_url_only() {
     let toml = r#"
@@ -2038,25 +2084,37 @@ fn validate_allows_settlement_off_on_mock_backend() {
 // would admit unsettled/forged proofs.
 #[test]
 fn validate_rejects_relay_enabled_with_mock_settlement_off() {
-    let mut config =
-        NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
     config.peers.clear();
     assert!(matches!(config.lightning, LightningConfig::Mock { .. }));
     config.relay.enabled = true; // settlement defaults OFF for Mock → must bail
     let err = config.validate().unwrap_err();
-    assert!(err.to_string().contains("verify_lightning_settlement"), "got: {err}");
+    assert!(
+        err.to_string().contains("verify_lightning_settlement"),
+        "got: {err}"
+    );
     assert!(err.to_string().contains("relay"), "got: {err}");
 }
 
 #[test]
 fn validate_rejects_price_open_with_mock_settlement_off() {
-    let mut config =
-        NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
     config.peers.clear();
     assert!(matches!(config.lightning, LightningConfig::Mock { .. }));
     config.admission_mode = konsensus_message::ReachabilityMode::PriceOpen;
     let err = config.validate().unwrap_err();
-    assert!(err.to_string().contains("verify_lightning_settlement"), "got: {err}");
+    assert!(
+        err.to_string().contains("verify_lightning_settlement"),
+        "got: {err}"
+    );
     assert!(err.to_string().contains("price_open"), "got: {err}");
 }
 
@@ -2065,8 +2123,11 @@ fn validate_allows_relay_on_mock_with_explicit_settlement_on() {
     // The explicit dev/smoke escape: setting verify_lightning_settlement = true
     // on a Mock backend opts into the settlement-verification path (the mock's
     // own settled-keysend path), so relay/price-open may be mounted for testing.
-    let mut config =
-        NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
     config.peers.clear();
     assert!(matches!(config.lightning, LightningConfig::Mock { .. }));
     config.relay.enabled = true;

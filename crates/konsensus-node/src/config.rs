@@ -259,8 +259,16 @@ pub enum LightningConfig {
         #[serde(default = "default_ldk_esplora")]
         esplora_url: String,
         /// Optional fallback Esplora URL. Used by `LdkProvider::new` (L4b)
-        /// when the primary endpoint fails its startup fee-fetch probe —
-        /// the root cause of the 2026-04-23 alpha crash-loop.
+        /// when the primary endpoint fails its startup fee-fetch probe — the
+        /// root cause of the 2026-04-23 alpha crash-loop.
+        ///
+        /// #66: `init` WRITES a fallback into fresh configs (see the `Default`
+        /// impl), but parsing deliberately leaves this `None` when a config
+        /// omits it. Injecting a default here would silently point an existing
+        /// operator's node at a third-party endpoint they never chose — the
+        /// node would disclose its existence and query pattern to a public
+        /// service behind the operator's back. Resilience is offered at `init`,
+        /// never imposed on an existing configuration.
         #[serde(default)]
         esplora_url_fallback: Option<String>,
         /// Optional RapidGossipSync server URL for faster network graph sync.
@@ -345,7 +353,10 @@ pub enum ChainConfig {
         /// Backward compatibility: accepts legacy `api_url`.
         #[serde(default = "default_esplora_url", alias = "esplora_url_primary")]
         api_url: String,
-        /// Optional fallback Esplora base URL used if primary is unavailable.
+        /// Optional fallback Esplora base URL used if the primary is
+        /// unavailable or returns unusable data. #66: written by `init` for
+        /// fresh configs; never injected when parsing an existing one (see the
+        /// LDK field above for why).
         #[serde(default)]
         esplora_url_fallback: Option<String>,
     },
@@ -370,7 +381,7 @@ impl Default for ChainConfig {
     fn default() -> Self {
         Self::Esplora {
             api_url: default_esplora_url(),
-            esplora_url_fallback: None,
+            esplora_url_fallback: default_esplora_fallback(),
         }
     }
 }
@@ -1135,7 +1146,10 @@ impl NodeConfig {
                 LightningConfig::Ldk {
                     network: default_ldk_network(),
                     esplora_url: default_ldk_esplora(),
-                    esplora_url_fallback: None,
+                    // #66: a fresh node ships with two chain providers. Written
+                    // into the generated konsensus.toml so the operator can see
+                    // and change it; never injected into an existing config.
+                    esplora_url_fallback: default_ldk_esplora_fallback(),
                     rgs_url: None,
                     lsp_node_id: None,
                     lsp_address: None,
@@ -1221,8 +1235,23 @@ fn default_api_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 3141))
 }
 
+/// genome #66: the shipped default must be an endpoint that answers with a
+/// usable fee-estimate map from ordinary hosting, and it must ship WITH a
+/// fallback. mempool.space alone refused to boot nodes on datacenter/VPS IPs
+/// (observed on GitHub-hosted runners, 2026-09-13) — it answered 2xx while its
+/// payload was unusable to LDK, so the node died on its startup fee fetch.
 fn default_esplora_url() -> String {
-    "https://mempool.space".into()
+    "https://blockstream.info".into()
+}
+
+/// genome #66: `init` now writes a fallback instead of `none`, so a single
+/// unreachable or degraded provider cannot stop a fresh node from starting.
+fn default_esplora_fallback() -> Option<String> {
+    Some("https://mempool.space".into())
+}
+
+fn default_ldk_esplora_fallback() -> Option<String> {
+    Some("https://mempool.space/api".into())
 }
 
 fn default_sqlite_path() -> String {
@@ -1261,7 +1290,7 @@ fn default_ldk_network() -> String {
 }
 
 fn default_ldk_esplora() -> String {
-    "https://mempool.space/api".to_string()
+    "https://blockstream.info/api".to_string()
 }
 
 fn default_fee_target_blocks() -> u32 {

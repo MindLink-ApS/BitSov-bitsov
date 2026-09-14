@@ -48,7 +48,10 @@ async fn esplora_fallback_probe_err_on_http_5xx() {
         .await;
 
     let result = probe_esplora_fee_estimates(&url).await;
-    assert!(result.is_err(), "5xx should produce Err so caller can fall over");
+    assert!(
+        result.is_err(),
+        "5xx should produce Err so caller can fall over"
+    );
     mock.assert_async().await;
 }
 
@@ -74,8 +77,7 @@ async fn esplora_fallback_probe_err_on_http_404() {
 async fn esplora_fallback_probe_err_on_unreachable_host() {
     // Reserved-for-documentation TLD that never resolves — produces a
     // transport-layer error, which is what we want to exercise.
-    let result =
-        probe_esplora_fee_estimates("http://nonexistent-host.invalid").await;
+    let result = probe_esplora_fee_estimates("http://nonexistent-host.invalid").await;
     assert!(result.is_err(), "transport error must surface as Err");
 }
 
@@ -86,7 +88,11 @@ async fn esplora_fallback_probe_normalizes_trailing_slash() {
     let mock = server
         .mock("GET", "/fee-estimates")
         .with_status(200)
-        .with_body("{}")
+        // #66: fixture updated from `{}` to a real fee map. An empty map used to
+        // pass because the probe never read the body; it is now correctly a
+        // failure, so this test must serve a healthy endpoint to test the
+        // trailing-slash normalisation it is actually about.
+        .with_body("{\"1\":25.0,\"6\":10.0}")
         .create_async()
         .await;
 
@@ -109,7 +115,8 @@ async fn esplora_fallback_select_returns_primary_when_primary_healthy() {
     let mock = server
         .mock("GET", "/fee-estimates")
         .with_status(200)
-        .with_body("{}")
+        // #66: "healthy" now means usable fee data, not merely HTTP 200.
+        .with_body("{\"1\":25.0,\"6\":10.0}")
         .create_async()
         .await;
 
@@ -129,11 +136,8 @@ async fn esplora_fallback_select_switches_to_fallback_when_primary_fails() {
         .create_async()
         .await;
 
-    let chosen = select_esplora_endpoint(
-        "http://nonexistent-host.invalid",
-        Some(&fallback_url),
-    )
-    .await;
+    let chosen =
+        select_esplora_endpoint("http://nonexistent-host.invalid", Some(&fallback_url)).await;
     assert_eq!(chosen, fallback_url, "must switch to fallback");
     fallback_mock.assert_async().await;
 }
@@ -175,6 +179,135 @@ async fn esplora_fallback_select_switches_when_primary_returns_5xx() {
 
     let chosen = select_esplora_endpoint(&primary_url, Some(&fallback_url)).await;
     assert_eq!(chosen, fallback_url);
+    primary_mock.assert_async().await;
+    fallback_mock.assert_async().await;
+}
+
+// ---------------------------------------------------------------------------
+// genome #66 — a 2xx is not evidence. The probe must validate the fee payload,
+// or the fallback is unreachable: LDK is handed a "healthy" endpoint whose body
+// it cannot use and refuses to start with `Failed to update fee rate estimates`.
+// ---------------------------------------------------------------------------
+
+/// The exact production shape: a rate-limited primary answering 429.
+#[tokio::test]
+async fn issue66_probe_err_on_rate_limited_primary() {
+    let mut server = mockito::Server::new_async().await;
+    let url = server.url();
+    let mock = server
+        .mock("GET", "/fee-estimates")
+        .with_status(429)
+        .with_body("{\"error\":\"rate limited\"}")
+        .create_async()
+        .await;
+
+    let err = probe_esplora_fee_estimates(&url).await.unwrap_err();
+    assert!(err.contains("429"), "error should name the status: {err}");
+    mock.assert_async().await;
+}
+
+/// 200 with a body LDK cannot consume — the #66 case that used to pass.
+#[tokio::test]
+async fn issue66_probe_err_on_malformed_success_body() {
+    for (label, body) in [
+        (
+            "html error page",
+            "<!doctype html><h1>Service Unavailable</h1>",
+        ),
+        (
+            "deprecation notice",
+            "{\"message\":\"endpoint deprecated, use /v1/fees/precise\"}",
+        ),
+        ("wrong value type", "{\"1\":\"fast\",\"6\":\"slow\"}"),
+    ] {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let mock = server
+            .mock("GET", "/fee-estimates")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let result = probe_esplora_fee_estimates(&url).await;
+        assert!(
+            result.is_err(),
+            "{label}: HTTP 200 with an unusable body must fail the probe, else the \
+             fallback is never consulted and LDK dies on its own fee fetch (#66)"
+        );
+        mock.assert_async().await;
+    }
+}
+
+/// Parsable, well-typed, but carries no usable rate.
+#[tokio::test]
+async fn issue66_probe_err_on_empty_or_nonpositive_estimates() {
+    for (label, body) in [
+        ("empty map", "{}"),
+        ("zero rates", "{\"1\":0.0,\"6\":0.0}"),
+        ("non-numeric targets", "{\"fastestFee\":12.0}"),
+    ] {
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let mock = server
+            .mock("GET", "/fee-estimates")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let result = probe_esplora_fee_estimates(&url).await;
+        assert!(
+            result.is_err(),
+            "{label}: no usable fee rate must fail the probe"
+        );
+        mock.assert_async().await;
+    }
+}
+
+/// A real Esplora map still passes — the fix must not reject healthy endpoints.
+#[tokio::test]
+async fn issue66_probe_ok_on_real_esplora_shape() {
+    let mut server = mockito::Server::new_async().await;
+    let url = server.url();
+    let mock = server
+        .mock("GET", "/fee-estimates")
+        .with_status(200)
+        .with_body("{\"1\":41.2,\"2\":30.0,\"6\":12.5,\"144\":2.0,\"1008\":1.0}")
+        .create_async()
+        .await;
+
+    assert!(probe_esplora_fee_estimates(&url).await.is_ok());
+    mock.assert_async().await;
+}
+
+/// The end-to-end #66 claim: primary answers 200-but-unusable, and selection
+/// now reaches the healthy fallback instead of pinning the node to the primary.
+#[tokio::test]
+async fn issue66_unusable_primary_falls_over_to_healthy_fallback() {
+    let mut primary = mockito::Server::new_async().await;
+    let primary_url = primary.url();
+    let primary_mock = primary
+        .mock("GET", "/fee-estimates")
+        .with_status(200)
+        .with_body("{\"message\":\"endpoint deprecated\"}")
+        .create_async()
+        .await;
+
+    let mut fallback = mockito::Server::new_async().await;
+    let fallback_url = fallback.url();
+    let fallback_mock = fallback
+        .mock("GET", "/fee-estimates")
+        .with_status(200)
+        .with_body("{\"1\":25.0,\"6\":10.0}")
+        .create_async()
+        .await;
+
+    let chosen = select_esplora_endpoint(&primary_url, Some(&fallback_url)).await;
+    assert_eq!(
+        chosen, fallback_url,
+        "a primary that answers 2xx with unusable fee data must not win (#66)"
+    );
     primary_mock.assert_async().await;
     fallback_mock.assert_async().await;
 }
