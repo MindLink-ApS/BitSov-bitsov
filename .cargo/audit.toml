@@ -8,9 +8,34 @@
 #   fail CI, while this known island remains explicit and reviewable.
 # - Revisit before the first public release candidate, and remove once ldk-node
 #   or the storage backend dependency graph can move forward.
+#
+# Applicability triage 2026-09-14 (issue #59). What this file must NOT be read as
+# saying: "we only use SQLite, so the Postgres advisory cannot apply." That is
+# false for the artifact we ship. The workspace enables the `postgres` feature,
+# `sqlx-postgres 0.8.0` links into konsensus-node via konsensus-storage, and
+# StorageConfig::Postgres is a fully implemented, documented backend. An operator
+# running Postgres runs the affected code.
+#
+# What actually makes RUSTSEC-2024-0363 unreachable is the INPUT SIZE CAPS: the
+# advisory needs a bound parameter larger than 4 GiB to overflow the protocol
+# length prefix, and every input path is capped far below that —
+#   * wire frames: MAX_FRAME_BYTES = 16 MiB (konsensus-message/src/wire.rs),
+#     enforced in the decoder and in transport/mod.rs;
+#   * REST API: axum's default 2 MiB body limit, never raised or disabled.
+# 4 GiB is 256x the wire cap.
+#
+# RECHECK TRIGGER — this deferral rests on those caps, not on the sqlx version:
+# re-run the triage if MAX_FRAME_BYTES is raised, if the axum body limit is
+# changed, or if a new storage backend is added.
 ignore = [
-  "RUSTSEC-2023-0071", # rsa via sqlx-mysql; MySQL is not an enabled BitSov storage backend.
-  "RUSTSEC-2024-0363", # sqlx 0.8.0; pinned by libsqlite3-sys conflict documented in Cargo.toml.
+  # In Cargo.lock but NEVER COMPILED (the `mysql` feature is off, and neither rsa
+  # nor sqlx-mysql appears in `cargo tree -e normal`). The ignore is still needed
+  # because cargo-audit reads Cargo.lock and performs no feature resolution.
+  "RUSTSEC-2023-0071",
+  # sqlx 0.8.0, pinned by the libsqlite3-sys conflict documented in Cargo.toml.
+  # Postgres IS compiled and selectable — see the size-cap reasoning above for why
+  # the >4 GiB precondition cannot be met. Not "unaffected because SQLite".
+  "RUSTSEC-2024-0363",
   "RUSTSEC-2026-0098", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
   "RUSTSEC-2026-0099", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
   "RUSTSEC-2026-0104", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
