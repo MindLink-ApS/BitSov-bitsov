@@ -24,9 +24,32 @@
 #   * REST API: axum's default 2 MiB body limit, never raised or disabled.
 # 4 GiB is 256x the wire cap.
 #
-# RECHECK TRIGGER — this deferral rests on those caps, not on the sqlx version:
+# RECHECK TRIGGER — that deferral rests on those caps, not on the sqlx version:
 # re-run the triage if MAX_FRAME_BYTES is raised, if the axum body limit is
 # changed, or if a new storage backend is added.
+#
+# SCOPE OF THE SIZE-CAP ARGUMENT — it covers RUSTSEC-2024-0363 ONLY.
+# Correcting the first triage (2026-09-14), which closed too broadly with "no
+# advisory in this island is reachable". Request size limits bound how much data
+# reaches a query; they say nothing about CERTIFICATE VALIDATION. The three
+# rustls-webpki 0.101.7 entries below are cert-path bugs and the size-cap
+# reasoning must not be read as covering them.
+#
+# Those three have their own, narrower arguments — recorded per-advisory in
+# deny.toml, which is the authoritative analysis and is more specific than a
+# blanket claim in either direction:
+#   * -0098 URI-name constraints: this library exposes no URI-name assertion API
+#     to us, and exploitation needs a misissued cert, post-signature-verify;
+#   * -0099 wildcard DNS-name constraint: same path, also requires misissuance
+#     post-signature-verify;
+#   * -0104 CRL parsing panic: BitSov does not parse CRLs at all.
+# Additionally, SQLite deployments — the default, and every deployment we ship
+# today — open no database TLS connection, so sqlx's rustls stack is never
+# exercised there. A Postgres-over-TLS deployment would exercise it, and the
+# narrow arguments above are what carry the risk then, not the size caps.
+#
+# BEFORE Postgres-over-TLS is supported or recommended, re-read those three
+# arguments against that configuration rather than inheriting this waiver.
 ignore = [
   # In Cargo.lock but NEVER COMPILED (the `mysql` feature is off, and neither rsa
   # nor sqlx-mysql appears in `cargo tree -e normal`). The ignore is still needed
@@ -36,9 +59,12 @@ ignore = [
   # Postgres IS compiled and selectable — see the size-cap reasoning above for why
   # the >4 GiB precondition cannot be met. Not "unaffected because SQLite".
   "RUSTSEC-2024-0363",
-  "RUSTSEC-2026-0098", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
-  "RUSTSEC-2026-0099", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
-  "RUSTSEC-2026-0104", # rustls-webpki 0.101.7 via sqlx/minreq legacy island.
+  # rustls-webpki 0.101.7 via the sqlx/minreq legacy island — CERTIFICATE
+  # VALIDATION bugs. Unreachable for SQLite deployments (no database TLS
+  # connection is ever opened); EXPOSED for Postgres-over-TLS. See the scope
+  # note above — the size-cap reasoning does not apply to these.
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2026-0104",
   "RUSTSEC-2025-0134", # rustls-pemfile 1.0.4 UNMAINTAINED via sqlx-core 0.8.0 island (same pin); no known vuln. Remove on sqlx bump (#59).
-  "RUSTSEC-2026-0221", # event-listener 5.4.1 UNSOUND via sqlx-core 0.8.0 island (same pin). Remove on sqlx bump (#59).
 ]
