@@ -48,8 +48,16 @@
 # exercised there. A Postgres-over-TLS deployment would exercise it, and the
 # narrow arguments above are what carry the risk then, not the size caps.
 #
-# BEFORE Postgres-over-TLS is supported or recommended, re-read those three
-# arguments against that configuration rather than inheriting this waiver.
+# NOTE the Postgres backend is ALREADY SELECTABLE — `StorageConfig::Postgres`
+# is implemented and documented, not a future capability. So this is not a
+# "before we add Postgres" note: anyone standing up a Postgres-over-TLS
+# deployment today must re-read the three per-advisory arguments in deny.toml
+# against that configuration rather than inheriting this waiver wholesale.
+#
+# OPEN #59 FOLLOW-UPS (operator decisions, not resolvable here): state the
+# supported deployment scope, name a risk owner and a revisit date for the
+# remaining island, and assess the SQL encoded-size argument. This file records
+# what is known; it does not stand in for those decisions.
 ignore = [
   # In Cargo.lock but NEVER COMPILED (the `mysql` feature is off, and neither rsa
   # nor sqlx-mysql appears in `cargo tree -e normal`). The ignore is still needed
@@ -60,9 +68,12 @@ ignore = [
   # the >4 GiB precondition cannot be met. Not "unaffected because SQLite".
   "RUSTSEC-2024-0363",
   # rustls-webpki 0.101.7 via the sqlx/minreq legacy island — CERTIFICATE
-  # VALIDATION bugs. Unreachable for SQLite deployments (no database TLS
-  # connection is ever opened); EXPOSED for Postgres-over-TLS. See the scope
-  # note above — the size-cap reasoning does not apply to these.
+  # VALIDATION bugs. A SQLite deployment opens no database TLS connection, so
+  # this stack is never exercised there. Postgres TLS DOES exercise it;
+  # applicability then differs per advisory and per configuration — see the
+  # per-advisory reasoning in deny.toml (no URI-name API exposed, misissuance
+  # required post-signature-verify, no CRL parsing). The size-cap reasoning
+  # above does not apply to any of these.
   "RUSTSEC-2026-0098",
   "RUSTSEC-2026-0099",
   "RUSTSEC-2026-0104",
