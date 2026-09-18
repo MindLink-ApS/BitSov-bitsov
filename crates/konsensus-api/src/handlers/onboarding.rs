@@ -1,4 +1,5 @@
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::Scope;
+use crate::auth::scoped::{ScopedAuth, Read, Receive};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -137,12 +138,34 @@ async fn spawn_funding_poll_if_needed(state: Arc<AppState>) {
     });
 }
 
+/// `POST /api/v1/onboarding/start`.
+///
+/// Scope is per tier, because the two tiers are different operations wearing one route:
+///
+/// - `full` is a **funding** operation. It asks the Lightning backend for a funding
+///   address and records how much is expected — literally "create the means to be paid",
+///   which is what `receive` is for. This is the path the shipped app uses, so requiring
+///   `admin` here would have broken the funding flow this ticket claims to preserve.
+/// - `light` is an **administrative** operation: it records an inviter and an invite as
+///   the beginning of a relationship. That keeps requiring `admin`, checked below rather
+///   than in the extractor because the tier is only known from the body.
+///
+/// The extractor therefore states the floor (`receive`) and the administrative branch
+/// raises it. `/auth/local` is unchanged — it still mints `read` + `receive` and cannot
+/// reach the `light` path.
 async fn start_onboarding(
-    _auth: ScopedAuth<Admin>,
+    auth: ScopedAuth<Receive>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<StartOnboardingRequest>,
 ) -> Result<Json<OnboardingStateResponse>, ApiError> {
     let tier = req.tier.to_lowercase();
+    if tier == "light" && !auth.has(Scope::Admin) {
+        return Err(ApiError::Forbidden(
+            "token lacks required scope: admin (invite-based onboarding establishes a \
+             relationship; funding-only onboarding requires the receive scope)"
+                .into(),
+        ));
+    }
     let inviter_pubkey = parse_optional_pubkey_hex(req.inviter_pubkey, "inviter_pubkey")?;
     match tier.as_str() {
         "light" => {

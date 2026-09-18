@@ -1278,3 +1278,147 @@ pub async fn store_test_message_with_plaintext(
         .unwrap();
     msg_id
 }
+
+/// A `LightningProvider` that counts every money-moving call, delegating the rest to
+/// [`StubLightning`].
+///
+/// Exists so a test can assert *no payment was dispatched* rather than merely that a
+/// request returned 403. A status code alone does not distinguish "refused before the
+/// handler ran" from "ran, paid, then failed".
+#[derive(Default)]
+pub struct CountingLightning {
+    /// Incremented by `pay_invoice`, `keysend`, `send_onchain` and `open_channel`.
+    pub money_calls: std::sync::atomic::AtomicUsize,
+    /// Incremented by `create_invoice` — a receive-side action, counted separately.
+    pub invoice_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingLightning {
+    pub fn money(&self) -> usize {
+        self.money_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn invoices(&self) -> usize {
+        self.invoice_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn bump(counter: &std::sync::atomic::AtomicUsize) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl LightningProvider for CountingLightning {
+    async fn create_invoice(
+        &self,
+        amount_msat: u64,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<Invoice, LightningError> {
+        Self::bump(&self.invoice_calls);
+        StubLightning
+            .create_invoice(amount_msat, description, expiry_secs)
+            .await
+    }
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+        Self::bump(&self.money_calls);
+        StubLightning.pay_invoice(bolt11).await
+    }
+    async fn get_payment_status(&self, hash: &str) -> Result<PaymentDetails, LightningError> {
+        StubLightning.get_payment_status(hash).await
+    }
+    async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+        StubLightning.get_balance_msat().await
+    }
+    async fn list_payments(&self, limit: u32) -> Result<Vec<PaymentDetails>, LightningError> {
+        StubLightning.list_payments(limit).await
+    }
+    async fn keysend(
+        &self,
+        dest_pubkey: &str,
+        amount_msat: u64,
+        memo: Option<&str>,
+    ) -> Result<PaymentDetails, LightningError> {
+        Self::bump(&self.money_calls);
+        StubLightning.keysend(dest_pubkey, amount_msat, memo).await
+    }
+    async fn is_available(&self) -> bool {
+        StubLightning.is_available().await
+    }
+    async fn get_funding_address(&self) -> Option<String> {
+        StubLightning.get_funding_address().await
+    }
+    async fn send_onchain(
+        &self,
+        address: &str,
+        amount_sats: u64,
+        fee_rate_sat_per_vb: Option<f32>,
+    ) -> Result<String, LightningError> {
+        Self::bump(&self.money_calls);
+        StubLightning
+            .send_onchain(address, amount_sats, fee_rate_sat_per_vb)
+            .await
+    }
+    async fn open_channel(
+        &self,
+        peer_pubkey: &str,
+        peer_addr: &str,
+        amount_sats: u64,
+        announce: bool,
+        fee_rate_sat_per_vb: Option<f32>,
+    ) -> Result<String, LightningError> {
+        Self::bump(&self.money_calls);
+        StubLightning
+            .open_channel(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb)
+            .await
+    }
+    async fn close_channel(
+        &self,
+        channel_id: &str,
+        force: bool,
+    ) -> Result<Option<String>, LightningError> {
+        StubLightning.close_channel(channel_id, force).await
+    }
+}
+
+/// `test_state()` with a caller-supplied Lightning provider, so a test can count
+/// money-moving calls. Mirrors the literal above; keep the two in step.
+pub fn test_state_with_lightning(lightning: Arc<dyn LightningProvider>) -> Arc<AppState> {
+    let identity = Arc::new(test_identity());
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+
+    Arc::new(AppState {
+        identity: Arc::clone(&identity),
+        storage: Arc::new(MemStorage::new()),
+        lightning,
+        chain: Arc::new(StubChain),
+        pricing: Arc::new(StubPricing),
+        gate: Arc::new(PaymentGate::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        transport: Arc::new(StubTransport),
+        session_manager,
+        jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        cors_enabled: false,
+        operator_probes_enabled: true,
+        sensitive_identity_routes_enabled: true,
+        ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
+        rate_limiter: Arc::new(RateLimiter::new(100)),
+        mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
+        audit_log: Arc::new(AuditLog::open(tmp.path()).unwrap()),
+        started_at: std::time::Instant::now(),
+        content_dir: None,
+        web_page_price_msat: None,
+        peer_prices: Arc::new(konsensus_pricing::PeerPriceCache::new()),
+        routing: Arc::new(konsensus_routing::RoutingTable::with_defaults()),
+        plaintext_cipher: None,
+        send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        data_dir: None,
+        backup_dir: None,
+        peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        lightning_backend: "mock".into(),
+        chain_backend: "mock".into(),
+        gossip_validator: None,
+    })
+}

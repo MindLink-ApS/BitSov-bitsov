@@ -60,7 +60,15 @@ list/read/manifest, file download/list, hosting contracts list + ledger, calenda
 deliberate and is the main residual exposure of loopback issuance — see the closing section.
 
 ### receive
-`GET /payments/funding-address` · `POST /payments/invoice`
+`GET /payments/funding-address` · `POST /payments/invoice` ·
+`POST /onboarding/start` with `tier: "full"`
+
+`/onboarding/start` is scoped per tier, because one route carries two different
+operations. `full` asks the Lightning backend for a funding address and records the amount
+expected — that is "create the means to be paid", which is `receive`, and it is the path
+the shipped app uses. `light` records an inviter and an invite, which begins a
+relationship, so it still requires `admin`. The extractor states the `receive` floor and
+the administrative branch raises it, because the tier is only known from the body.
 
 ### spend
 `POST /payments/pay` · `/payments/keysend` · `/payments/send-onchain` · `/payments/open-channel` ·
@@ -74,7 +82,7 @@ Anything that changes configuration, relationships, or stored content:
 `POST /gossip/publish` · `/invite` · `/invite/redeem` · `/invites` · `/invites/accept` ·
 `DELETE` an invite (revoke) · `POST /rooms` (create) · `DELETE /rooms/:id` ·
 `POST /rooms/:id/members` · `DELETE` a room member · calendar event create/update/delete +
-`/calendar/events/:id/rsvp` · `/onboarding/start` · `POST|PUT|DELETE /content/pages/*` ·
+`/calendar/events/:id/rsvp` ·  `POST|PUT|DELETE /content/pages/*` ·
 `POST /files` (upload) · `DELETE` a file · `/messages/resync` · `DELETE` a message ·
 hosting contract creation · session initiate/accept.
 
@@ -85,8 +93,23 @@ Session initiate/accept are `admin` rather than `read` because they establish du
 relationship state with a peer. This is the local owner API, not the wire admission path —
 inbound packets remain governed by settled payment at the gate, unchanged by this ticket.
 
+### spend, additionally
+
+Three calendar handlers require `spend` **as well as** `admin`: event create, event update,
+and RSVP. Each calls `create_payment_proof`, which at a nonzero price dispatches a keysend
+or an invoice payment. Admin is the mutation; spend is the money. Requiring only the first
+would let a token that cannot spend move value.
+
 ### identity
 `POST /identity/mnemonic` (reveal) · `/identity/restore` · `/identity/verify-mnemonic`
+
+### WebSocket
+
+`GET /ws` requires `read`, checked before the upgrade, for both the subprotocol and the
+legacy query-parameter form. The socket subscribes immediately to plaintext message and
+delivery broadcasts, so admitting a token the REST routes would refuse would hand it the
+message stream. This endpoint authenticates itself rather than using the extractor, which
+is exactly why it was missed on the first pass.
 
 ### unauthenticated (unchanged)
 `GET /auth/challenge` · `POST /auth/local` · `POST /auth/token` · `GET /livez` · `/metrics`
@@ -118,11 +141,20 @@ continues to work on `read` + `receive`.
 bare `AuthUser`. A bare `AuthUser` authenticates but does not authorize: it accepts any valid
 token, loopback included.
 
-This matters because the hand-written lists were twice insufficient during this ticket. A
-first pass missed three spend routes whose parameter happened to be named `_user`; a second
-missed every handler declared `pub(super) async fn` — 45 authenticated handlers still took an
-unscoped token while the targeted tests were green. The exhaustive check admits no allowlist,
-so a new route cannot ship unscoped.
+This matters because the hand-written lists were repeatedly insufficient. A first pass
+missed three spend routes whose parameter happened to be named `_user`. A second missed
+every handler declared `pub(super) async fn` — 45 authenticated handlers still took an
+unscoped token while the targeted tests were green. Review then found three more classes
+the guard could not see at all:
+
+| defect | why the guard missed it | invariant that now catches it |
+|---|---|---|
+| `/ws` upgraded any valid token | the guard walked only `src/handlers`; `/ws` authenticates itself | `self_authenticating_endpoints_also_check_scope`, and the walk now covers all of `src/` |
+| three calendar handlers could pay with `admin` alone | the spend list did not name them | `every_function_that_can_pay_demands_spend` — any function reaching `create_payment_proof` must demand `spend` |
+| `/onboarding/start` demanded `admin`, breaking the app's funding flow | nothing checked that the *preserved* paths still worked | a behavioural test posting the app's exact body, asserting the funding address and the state it then polls |
+
+The pattern in all three: a rule stated as a list of names proves only what someone
+remembered to list. Each is now stated as an invariant over the source instead.
 
 ## What the tests can and cannot show
 

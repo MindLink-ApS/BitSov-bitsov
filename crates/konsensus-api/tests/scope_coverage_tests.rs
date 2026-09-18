@@ -37,7 +37,21 @@ fn handlers_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers")
 }
 
-fn handler_sources() -> Vec<(String, String)> {
+fn src_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+/// Every `.rs` file in the crate, not just `src/handlers`.
+///
+/// The first version of this guard walked only `src/handlers`, which made
+/// `src/ws.rs` structurally invisible to it: that endpoint authenticates itself
+/// rather than using an extractor, so it was silently exempt from the whole
+/// authorization migration while every coverage test stayed green.
+fn all_sources() -> Vec<(String, String)> {
+    walk_rs(&src_dir())
+}
+
+fn walk_rs(root: &Path) -> Vec<(String, String)> {
     fn walk(dir: &Path, out: &mut Vec<(String, String)>) {
         for entry in std::fs::read_dir(dir).expect("read handlers dir").flatten() {
             let path = entry.path();
@@ -52,9 +66,35 @@ fn handler_sources() -> Vec<(String, String)> {
         }
     }
     let mut out = Vec::new();
-    walk(&handlers_dir(), &mut out);
-    assert!(!out.is_empty(), "no handler sources found");
+    walk(root, &mut out);
+    assert!(!out.is_empty(), "no sources found under {}", root.display());
     out
+}
+
+fn handler_sources() -> Vec<(String, String)> {
+    walk_rs(&handlers_dir())
+}
+
+/// `fn name(...)` through to the end of its body, by brace balance.
+fn function_body(src: &str, at: usize) -> String {
+    let rest = &src[at..];
+    let Some(open) = rest.find('{') else {
+        return rest.to_string();
+    };
+    let mut depth = 0usize;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest[..open + i + 1].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    rest.to_string()
 }
 
 /// `fn name(` up to the closing paren of the parameter list.
@@ -120,11 +160,17 @@ fn representative_admin_routes_demand_admin_scope() {
 #[test]
 fn no_handler_accepts_an_unscoped_token() {
     let mut bad = Vec::new();
-    for (file, src) in handler_sources() {
+    for (file, src) in all_sources() {
+        // `auth.rs` defines both `AuthUser` and the `ScopedAuth` that wraps it, so its own
+        // field declarations are not handler extractors.
+        if file.ends_with("src/auth.rs") {
+            continue;
+        }
         for (n, line) in src.lines().enumerate() {
             let t = line.trim();
-            // An extractor parameter, e.g. `_auth: AuthUser,` — not a use/doc/type line.
-            if t.ends_with(": AuthUser,") && !t.starts_with("//") {
+            // An extractor parameter, e.g. `_auth: AuthUser,`. A `pub` prefix makes it a
+            // struct field instead, and `//` a comment.
+            if t.ends_with(": AuthUser,") && !t.starts_with("//") && !t.starts_with("pub ") {
                 bad.push(format!("{file}:{}: {t}", n + 1));
             }
         }
@@ -173,4 +219,79 @@ fn function_text(src: &str, name: &str) -> String {
         .map(|i| i + 1)
         .unwrap_or(rest.len());
     rest[..end].to_string()
+}
+
+/// Generalizes the calendar defect rather than listing its three handlers.
+///
+/// `create_event`, `update_event` and `create_rsvp` required only `admin` while calling
+/// `create_payment_proof`, which at a nonzero price dispatches a keysend or an invoice
+/// payment. An admin-without-spend token therefore passed authorization for an operation
+/// that moves value. The list-driven spend check did not name those handlers, so it saw
+/// nothing.
+///
+/// The rule is the invariant, not the list: if a function can reach the payment helper, it
+/// must demand `spend`.
+#[test]
+fn every_function_that_can_pay_demands_spend() {
+    let mut bad = Vec::new();
+    for (file, src) in all_sources() {
+        let mut from = 0;
+        while let Some(rel) = src[from..].find("async fn ") {
+            let at = from + rel;
+            let body = function_body(&src, at);
+            from = at + body.len().max(1);
+
+            if !body.contains("create_payment_proof(") {
+                continue;
+            }
+            let name = body
+                .trim_start_matches("async fn ")
+                .split('(')
+                .next()
+                .unwrap_or("<unknown>")
+                .trim()
+                .to_string();
+            // Only the signature, so a `Spend` mentioned deep in the body cannot satisfy it.
+            let sig = body.split_once(") ->").map(|(s, _)| s).unwrap_or(&body);
+            // Route handlers take axum extractors, so they receive `State<Arc<AppState>>`.
+            // Internal machinery (the payment helper itself, the per-member room fanout)
+            // takes `&AppState` and is only reachable through a handler that IS checked
+            // here. Excluding by shape rather than by filename keeps the rest of each
+            // module covered — `compose.rs` also holds the paid message handlers.
+            if !sig.contains("State<Arc<AppState>>") {
+                continue;
+            }
+            if !sig.contains("ScopedAuth<Spend>") {
+                bad.push(format!("{file}: {name}"));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} function(s) can dispatch a payment without demanding the spend scope:\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
+}
+
+/// Any endpoint that validates a token itself, instead of going through `ScopedAuth`, must
+/// also authorize it. `src/ws.rs` did the first and not the second: a token the REST routes
+/// refused was upgraded and subscribed to plaintext message broadcasts.
+#[test]
+fn self_authenticating_endpoints_also_check_scope() {
+    let mut bad = Vec::new();
+    for (file, src) in all_sources() {
+        if file.ends_with("auth.rs") || !src.contains("validate_token(") {
+            continue;
+        }
+        if !src.contains("Scope::") {
+            bad.push(file);
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} file(s) validate a token without ever consulting its scopes:\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
 }

@@ -25,6 +25,16 @@ pub enum ApiError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    /// Authenticated, but the token does not carry the scope this operation needs.
+    ///
+    /// Distinct from [`ApiError::Unauthorized`] on purpose (#72): the caller proved who
+    /// it is and simply may not do this. Answering 401 would invite a client to
+    /// re-authenticate in a loop for authority its issuer can never grant. Mirrors the
+    /// 403 that `ScopedAuth` returns, for the cases where the required scope depends on
+    /// the request body and cannot be stated in the extractor.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     /// Payment gate rejected the message.
     #[error("payment required: {0}")]
     PaymentRequired(String),
@@ -64,6 +74,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             ApiError::PaymentRequired(msg) => (StatusCode::PAYMENT_REQUIRED, msg.clone()),
             ApiError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             ApiError::Transport(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),

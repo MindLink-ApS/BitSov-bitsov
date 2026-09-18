@@ -4,7 +4,7 @@
 //! RSVPs use KIND_RSVP (101) and updates use KIND_CALENDAR_UPDATE (104).
 //! All messages pass through the payment gate (Principle 2).
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::auth::scoped::{ScopedAuth, Admin, Read, Spend};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -455,7 +455,11 @@ async fn list_events(
 
 /// `POST /api/v1/calendar/events` — create an event and send to attendees.
 async fn create_event(
+    // Admin for the mutation, Spend because the fanout below calls
+    // `create_payment_proof`: at a nonzero price this dispatches a keysend or an
+    // invoice payment. Admin alone would let a token that cannot spend move value.
     auth: ScopedAuth<Admin>,
+    _spend: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateEventRequest>,
 ) -> Result<Json<EventActionResponse>, ApiError> {
@@ -635,7 +639,11 @@ async fn create_event(
 
 /// `PUT /api/v1/calendar/events/:id` — update an event and notify attendees.
 async fn update_event(
+    // Admin for the mutation, Spend because the fanout below calls
+    // `create_payment_proof`: at a nonzero price this dispatches a keysend or an
+    // invoice payment. Admin alone would let a token that cannot spend move value.
     auth: ScopedAuth<Admin>,
+    _spend: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<String>,
     Json(req): Json<UpdateEventRequest>,
@@ -823,7 +831,11 @@ async fn delete_event(
 
 /// `POST /api/v1/calendar/events/:id/rsvp` — RSVP to an event.
 async fn create_rsvp(
+    // Admin for the mutation, Spend because the fanout below calls
+    // `create_payment_proof`: at a nonzero price this dispatches a keysend or an
+    // invoice payment. Admin alone would let a token that cannot spend move value.
     auth: ScopedAuth<Admin>,
+    _spend: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<String>,
     Json(req): Json<CreateRsvpRequest>,
