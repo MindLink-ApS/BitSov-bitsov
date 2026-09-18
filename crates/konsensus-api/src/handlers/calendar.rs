@@ -4,6 +4,7 @@
 //! RSVPs use KIND_RSVP (101) and updates use KIND_CALENDAR_UPDATE (104).
 //! All messages pass through the payment gate (Principle 2).
 
+use crate::auth::scoped::{ScopedAuth, Admin, Read, Spend};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -23,7 +24,6 @@ use konsensus_crypto::ratchet_message_to_bytes;
 use konsensus_storage::{CalendarEventRecord, RsvpRecord};
 
 use crate::audit::events;
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::handlers::messages::create_payment_proof;
 use crate::state::AppState;
@@ -337,7 +337,7 @@ fn expand_occurrences(event: &CalendarEventRecord, from: i64, to: i64) -> Vec<i6
 /// with a `parent_id`) suppress the matching computed occurrence and are
 /// included verbatim in the response instead.
 async fn list_events(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListEventsQuery>,
 ) -> Result<Json<Vec<EventResponse>>, ApiError> {
@@ -455,7 +455,11 @@ async fn list_events(
 
 /// `POST /api/v1/calendar/events` — create an event and send to attendees.
 async fn create_event(
-    auth: AuthUser,
+    // Admin for the mutation, Spend because the fanout below calls
+    // `create_payment_proof`: at a nonzero price this dispatches a keysend or an
+    // invoice payment. Admin alone would let a token that cannot spend move value.
+    auth: ScopedAuth<Admin>,
+    _spend: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateEventRequest>,
 ) -> Result<Json<EventActionResponse>, ApiError> {
@@ -635,7 +639,11 @@ async fn create_event(
 
 /// `PUT /api/v1/calendar/events/:id` — update an event and notify attendees.
 async fn update_event(
-    auth: AuthUser,
+    // Admin for the mutation, Spend because the fanout below calls
+    // `create_payment_proof`: at a nonzero price this dispatches a keysend or an
+    // invoice payment. Admin alone would let a token that cannot spend move value.
+    auth: ScopedAuth<Admin>,
+    _spend: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<String>,
     Json(req): Json<UpdateEventRequest>,
@@ -797,7 +805,7 @@ async fn update_event(
 
 /// `DELETE /api/v1/calendar/events/:id` — delete a local event record.
 async fn delete_event(
-    auth: AuthUser,
+    auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -823,7 +831,11 @@ async fn delete_event(
 
 /// `POST /api/v1/calendar/events/:id/rsvp` — RSVP to an event.
 async fn create_rsvp(
-    auth: AuthUser,
+    // Admin for the mutation, Spend because the fanout below calls
+    // `create_payment_proof`: at a nonzero price this dispatches a keysend or an
+    // invoice payment. Admin alone would let a token that cannot spend move value.
+    auth: ScopedAuth<Admin>,
+    _spend: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<String>,
     Json(req): Json<CreateRsvpRequest>,

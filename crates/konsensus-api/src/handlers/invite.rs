@@ -10,6 +10,7 @@
 //! `/api/v1/invites/accept`). They remain fully functional and emit
 //! `Deprecation`/`Sunset` headers; removal is an operator/ADR-029 decision.
 
+use crate::auth::scoped::{ScopedAuth, Admin};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -23,7 +24,6 @@ use konsensus_core::invite::InviteToken;
 use konsensus_message::PeerEntry;
 
 use crate::audit::events;
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -124,7 +124,7 @@ fn deprecated_response<T: Serialize>(body: T) -> Response {
 /// `POST /api/v1/invites/accept` (accept) using the invitee-bound `BitSovInvite`.
 /// The route remains fully functional and emits `Deprecation`/`Sunset` headers.
 async fn generate_invite(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<GenerateInviteRequest>,
 ) -> Result<Response, ApiError> {
@@ -194,7 +194,7 @@ async fn generate_invite(
 /// `BitSovInvite` peer-add UX replaces it; removal is an operator/ADR-029 decision. It
 /// emits `Deprecation`/`Sunset` headers for clients to migrate ahead of time.
 async fn redeem_invite(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<RedeemInviteRequest>,
 ) -> Result<Response, ApiError> {

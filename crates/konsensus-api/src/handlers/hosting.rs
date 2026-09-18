@@ -19,7 +19,8 @@
 //! per day. It is not, and must not be marketed as, "a node we run that holds
 //! your keys."
 //!
-//! All routes are gated behind [`AuthUser`] (the node owner / operator).
+//! All routes are gated behind [`ScopedAuth`] — reads require `read`, contract
+//! creation requires `admin` (the node owner / operator).
 
 use std::sync::Arc;
 
@@ -32,7 +33,7 @@ use uuid::Uuid;
 use konsensus_core::types::NodeId;
 use konsensus_core::{HostingContractState, OperatorHostingContract, OperatorHostingPayment};
 
-use crate::auth::AuthUser;
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -121,7 +122,7 @@ fn contract_view(c: &OperatorHostingContract, now: u64) -> Result<ContractView, 
 
 /// `POST /api/v1/hosting/contracts` — operator creates a hosting contract.
 async fn create_contract(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateContractRequest>,
 ) -> Result<Json<ContractView>, ApiError> {
@@ -177,7 +178,7 @@ async fn create_contract(
 
 /// `GET /api/v1/hosting/contracts` — list contracts with live state.
 async fn list_contracts(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ContractView>>, ApiError> {
     let now = unix_now();
@@ -195,7 +196,7 @@ async fn list_contracts(
 
 /// `GET /api/v1/hosting/contracts/:id/ledger` — that contract's payment ledger.
 async fn contract_ledger(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<OperatorHostingPayment>>, ApiError> {
@@ -209,7 +210,7 @@ async fn contract_ledger(
     Ok(Json(payments))
 }
 
-/// Mounts the operator-hosting routes (all [`AuthUser`]-gated).
+/// Mounts the operator-hosting routes (all [`ScopedAuth`]-gated).
 pub fn routes() -> Router<Arc<AppState>> {
     if !hosting_contracts_enabled() {
         return Router::new();

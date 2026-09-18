@@ -4,13 +4,13 @@
 //! a time window at 50% `RESYNC_DISCOUNT`) and fulfill (broadcasts stored
 //! messages via WebSocket so the frontend can restore conversation history).
 
+use crate::auth::scoped::{ScopedAuth, Admin};
 use std::sync::Arc;
 use axum::extract::State;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use konsensus_core::types::{MessageId, NodeId};
 use crate::audit::events;
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -54,7 +54,7 @@ pub struct ResyncFulfillResponse {
 }
 
 pub(super) async fn resync_messages(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ResyncRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

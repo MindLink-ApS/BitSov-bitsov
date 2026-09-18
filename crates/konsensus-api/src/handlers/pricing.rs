@@ -17,7 +17,7 @@ use konsensus_core::kind::KindCategory;
 use konsensus_core::traits::chain::TrustLevel;
 use konsensus_pricing::peer_prices::{category_to_string, compute_valid_blocks};
 
-use crate::auth::AuthUser;
+use crate::auth::scoped::{ScopedAuth, Read};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -84,7 +84,7 @@ pub struct PeerPriceResponse {
 
 /// `GET /api/v1/pricing` — get this node's current pricing.
 async fn get_own_pricing(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<OwnPricingResponse>, ApiError> {
     let block_height = state.chain.get_block_height().await.unwrap_or(0);
@@ -206,7 +206,7 @@ async fn get_own_pricing(
 
 /// `GET /api/v1/pricing/peers` — list all cached peer price tables.
 async fn list_peer_pricing(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<PeerPriceResponse>>, ApiError> {
     let block_height = state.chain.get_block_height().await.unwrap_or(0);
@@ -233,7 +233,7 @@ async fn list_peer_pricing(
 
 /// `GET /api/v1/pricing/peers/:id` — get a specific peer's price table.
 async fn get_peer_pricing(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(peer_id_hex): Path<String>,
 ) -> Result<Json<PeerPriceResponse>, ApiError> {

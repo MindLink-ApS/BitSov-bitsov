@@ -128,7 +128,7 @@ async fn issue_token(
     }
 
     // Issue token
-    let token = auth::create_token(&node_id_hex, &state.jwt_secret)
+    let token = auth::create_token(&node_id_hex, &state.jwt_secret, auth::Scope::all())
         .map_err(|e| ApiError::Internal(format!("token creation failed: {e}")))?;
 
     let claims = auth::validate_token(&token, &state.jwt_secret)
@@ -199,7 +199,7 @@ async fn issue_local_token(
 
     let node_id_hex = state.identity.node_id().to_hex();
 
-    let token = auth::create_token(&node_id_hex, &state.jwt_secret)
+    let token = auth::create_token(&node_id_hex, &state.jwt_secret, auth::Scope::loopback_only())
         .map_err(|e| ApiError::Internal(format!("token creation failed: {e}")))?;
 
     let claims = auth::validate_token(&token, &state.jwt_secret)

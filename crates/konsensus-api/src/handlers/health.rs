@@ -3,7 +3,7 @@
 //! `GET /api/v1/health` is **unauthenticated** and returns only liveness +
 //! non-sensitive operational counters. The full node status — identity, peer
 //! list, wallet balance, and Lightning pubkey — is owner-only and lives behind
-//! [`AuthUser`] at `GET /api/v1/status`. Exposing identity/topology/funds on an
+//! [`ScopedAuth<Read>`] at `GET /api/v1/status`. Exposing identity/topology/funds on an
 //! unauthenticated endpoint links the node's IP to its NodeID, social graph,
 //! and wallet, and is precisely the kind of free, unpaid disclosure the
 //! payment-is-the-connection invariant forbids (see CODEX.md).
@@ -15,10 +15,10 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
-use crate::auth::AuthUser;
+use crate::auth::scoped::{ScopedAuth, Read};
 use crate::state::AppState;
 
-/// Full node status response (owner-only, behind [`AuthUser`]).
+/// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
     /// Always "ok" if the node is running.
@@ -132,11 +132,11 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<PublicHealthResponse
     })
 }
 
-/// `GET /api/v1/status` — owner-only full node status (behind [`AuthUser`]).
+/// `GET /api/v1/status` — owner-only full node status (behind [`ScopedAuth<Read>`]).
 ///
 /// Includes identity, connected peer IDs, wallet balance, and LN pubkey — the
 /// fields redacted from the public `/health` endpoint.
-async fn status(_auth: AuthUser, State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let connected = state.transport.connected_peers().await;
     let ln_available = state.lightning.is_available().await;
     let ln_payment_capable = state.lightning.is_payment_capable().await;
@@ -214,7 +214,7 @@ async fn preflight(State(state): State<Arc<AppState>>) -> Json<PreflightResponse
 /// Registers the health/status routes for node monitoring.
 ///
 /// `/api/v1/health` is unauthenticated (public, redacted); `/api/v1/status` is
-/// owner-only (behind `AuthUser`).
+/// owner-only (behind `ScopedAuth<Read>`).
 pub fn routes(operator_probes_enabled: bool) -> Router<Arc<AppState>> {
     let router = Router::new()
         .route("/api/v1/health", get(health))

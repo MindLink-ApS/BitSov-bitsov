@@ -1,5 +1,6 @@
 //! Identity endpoints — node identity information and recovery.
 
+use crate::auth::scoped::{ScopedAuth, Identity, Read};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,7 +11,6 @@ use serde::{Deserialize, Serialize, Serializer};
 use zeroize::Zeroizing;
 
 use crate::audit::events;
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -59,7 +59,7 @@ pub struct RestoreResponse {
 
 /// `GET /api/v1/identity` — get the node's public identity.
 async fn get_identity(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Json<IdentityResponse> {
     Json(IdentityResponse {
@@ -75,12 +75,12 @@ async fn get_identity(
 /// would produce before committing to a restore. This is a stateless operation —
 /// it does not modify any node state.
 ///
-/// Gated behind `AuthUser` (L7b): the companion `restore_identity` endpoint
+/// Gated behind `ScopedAuth<Identity>` (L7b): the companion `restore_identity` endpoint
 /// already requires auth, so the wizard always runs from an authenticated
 /// context. Gating closes an oracle that an unauthenticated caller could
 /// otherwise use to enumerate node IDs from candidate mnemonics.
 async fn verify_mnemonic(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Identity>,
     Json(req): Json<VerifyMnemonicRequest>,
 ) -> Result<Json<VerifyMnemonicResponse>, ApiError> {
     validate_mnemonic_word_count(&req.mnemonic)?;
@@ -98,7 +98,7 @@ async fn verify_mnemonic(
 /// must be restarted for the new identity to take effect. If the data directory
 /// is not configured, returns an error.
 async fn restore_identity(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Identity>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>, ApiError> {
@@ -128,7 +128,7 @@ async fn restore_identity(
 /// Request body for the mnemonic read-back (seed reveal).
 ///
 /// Revealing the recovery seed requires explicit re-authentication on top of
-/// the JWT carried by [`AuthUser`]: the caller must present a fresh,
+/// the JWT carried by [`ScopedAuth`]: the caller must present a fresh,
 /// single-use challenge (from `GET /api/v1/auth/challenge`) together with its
 /// Ed25519 signature, proving live possession of the node signing key at the
 /// moment of the reveal. A stolen long-lived JWT alone is therefore not
@@ -222,7 +222,7 @@ async fn consume_challenge(state: &AppState, challenge: &str) -> Result<(), ApiE
 /// user to the CLI. Intended for the onboarding wizard / settings to display
 /// the recovery phrase for backup.
 async fn reveal_mnemonic(
-    auth: AuthUser,
+    auth: ScopedAuth<Identity>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<RevealMnemonicRequest>,
 ) -> Result<Json<MnemonicResponse>, ApiError> {

@@ -1,5 +1,6 @@
 //! Room management endpoints.
 
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -11,7 +12,6 @@ use konsensus_core::types::{NodeId, RoomId};
 use konsensus_storage::Room;
 
 use crate::audit::events;
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -68,7 +68,7 @@ const MAX_ROOM_METADATA_SIZE: usize = 64 * 1024;
 
 /// `POST /api/v1/rooms` — create a new room.
 async fn create_room(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateRoomRequest>,
 ) -> Result<Json<RoomResponse>, ApiError> {
@@ -118,7 +118,7 @@ async fn create_room(
 
 /// `GET /api/v1/rooms` — list all rooms.
 async fn list_rooms(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<RoomResponse>>, ApiError> {
     let rooms = state
@@ -133,7 +133,7 @@ async fn list_rooms(
 
 /// `GET /api/v1/rooms/:id` — get a room.
 async fn get_room(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(id_str): Path<String>,
 ) -> Result<Json<RoomResponse>, ApiError> {
@@ -152,7 +152,7 @@ async fn get_room(
 
 /// `DELETE /api/v1/rooms/:id` — delete a room and its memberships.
 async fn delete_room(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(id_str): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -180,7 +180,7 @@ async fn delete_room(
 
 /// `GET /api/v1/rooms/:id/members` — list room members.
 async fn list_members(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(id_str): Path<String>,
 ) -> Result<Json<Vec<String>>, ApiError> {
@@ -199,7 +199,7 @@ async fn list_members(
 
 /// `POST /api/v1/rooms/:id/members` — add a member to a room.
 async fn add_member(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(id_str): Path<String>,
     Json(req): Json<MemberRequest>,
@@ -227,7 +227,7 @@ async fn add_member(
 
 /// `DELETE /api/v1/rooms/:id/members/:node_id` — remove a member from a room.
 async fn remove_member(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path((id_str, member_hex)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

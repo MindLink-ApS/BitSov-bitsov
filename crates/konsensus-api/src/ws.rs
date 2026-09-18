@@ -46,6 +46,20 @@ async fn ws_handler(
     // Validate JWT before upgrading — reject with 401 if invalid
     match auth::validate_token(&token, &state.jwt_secret) {
         Ok(claims) => {
+            // This endpoint authenticates itself rather than going through the
+            // `ScopedAuth` extractor, so it was silently exempt from the #72
+            // authorization migration: a token the REST routes refused was still
+            // upgraded here and then subscribed to plaintext message and delivery
+            // broadcasts. Authorize explicitly, before the upgrade, for both the
+            // subprotocol and the legacy query-parameter form.
+            if !claims.scp.contains(&auth::Scope::Read) {
+                warn!(
+                    node_id = %claims.sub,
+                    "WebSocket rejected: token lacks the read scope"
+                );
+                return (StatusCode::FORBIDDEN, "token lacks required scope: read")
+                    .into_response();
+            }
             debug!(node_id = %claims.sub, "WebSocket authenticated");
             ws.protocols([WS_PROTOCOL])
                 .on_upgrade(move |socket| handle_ws(socket, state))

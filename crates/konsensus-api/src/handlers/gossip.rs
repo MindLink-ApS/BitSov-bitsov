@@ -4,6 +4,7 @@
 //! kept to provide an explicit fail-closed response instead of silently
 //! creating a payment-gate bypass.
 
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -16,7 +17,6 @@ use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::types::{PaymentProof, Recipient, Signature};
 use konsensus_message::Frame;
 
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::handlers::utils::generate_valid_proof;
 use crate::state::AppState;
@@ -80,7 +80,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// Currently returns an explicit fail-closed error for every kind. Paid
 /// broadcast/gossip must be implemented on the normal UKM payment-gated path.
 async fn publish_gossip(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<PublishGossipRequest>,
 ) -> Result<Json<PublishGossipResponse>, ApiError> {
@@ -181,7 +181,7 @@ async fn publish_gossip(
 /// Returns the current state of the gossip validator (dedup store size,
 /// tracked senders, configuration).
 async fn gossip_status(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<GossipStatusResponse>, ApiError> {
     let validator = state

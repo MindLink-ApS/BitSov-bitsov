@@ -9,7 +9,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
-use crate::auth::AuthUser;
+use crate::auth::scoped::{ScopedAuth, Read};
 use crate::state::AppState;
 
 /// Chain status response — block height, fee rates, halving data.
@@ -36,7 +36,7 @@ pub struct ChainStatusResponse {
 /// backend health and current fee estimates, both of which leak information
 /// about the operator's setup. Callers must present a valid JWT.
 async fn chain_status(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Json<ChainStatusResponse> {
     let mut block_height = 0u64;

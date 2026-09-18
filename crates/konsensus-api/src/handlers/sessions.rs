@@ -16,7 +16,7 @@ use konsensus_core::types::NodeId;
 use konsensus_crypto::{SerializablePrekeyBundle, SerializableSessionInit};
 
 use crate::audit::events;
-use crate::auth::AuthUser;
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -63,7 +63,7 @@ pub struct SessionStatusResponse {
 
 /// `GET /api/v1/sessions/prekey` — get our prekey bundle for distribution.
 async fn get_prekey_bundle(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PrekeyBundleResponse>, ApiError> {
     let bundle = state.session_manager.prekey_bundle().await;
@@ -72,7 +72,7 @@ async fn get_prekey_bundle(
 
 /// `POST /api/v1/sessions/:peer_id/initiate` — initiate E2EE session with a peer.
 async fn initiate_session(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(peer_id_hex): Path<String>,
     Json(req): Json<InitiateSessionRequest>,
@@ -105,7 +105,7 @@ async fn initiate_session(
 
 /// `POST /api/v1/sessions/:peer_id/accept` — accept E2EE session from a peer.
 async fn accept_session(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(peer_id_hex): Path<String>,
     Json(req): Json<AcceptSessionRequest>,
@@ -135,7 +135,7 @@ async fn accept_session(
 
 /// `GET /api/v1/sessions/:peer_id` — check E2EE session status with a peer.
 async fn get_session_status(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(peer_id_hex): Path<String>,
 ) -> Result<Json<SessionStatusResponse>, ApiError> {
@@ -152,7 +152,7 @@ async fn get_session_status(
 
 /// `GET /api/v1/sessions` — list all active E2EE sessions.
 async fn list_sessions(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<SessionStatusResponse>>, ApiError> {
     let sessions = state.session_manager.active_sessions().await;

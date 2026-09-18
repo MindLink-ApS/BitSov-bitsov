@@ -25,12 +25,15 @@
 //! - Honest scope: recovers the peer whitelist + accepted invites + LDK channel
 //!   state, **not** message history (`konsensus.db` messages/rooms/calendar/
 //!   content, and pending/outgoing invites, are in neither artifact).
-//! - Gated behind [`AuthUser`] (loopback JWT) — only the node owner. Available on
+//! - Gated behind [`ScopedAuth<Admin>`] — bulk export of the relationship graph is a
+//!   different exposure from reading one record, so a loopback-issued token cannot
+//!   reach it; it requires a token proving possession of the node key. Available on
 //!   every tier because the response is inert ciphertext without the seed, so it
 //!   adds no operator-readable surface; this lets a user always pull their
 //!   encrypted recovery set out. It does NOT by itself make hosted operation
 //!   sovereign (a hosted operator still holds the runtime keys + metadata).
 
+use crate::auth::scoped::{ScopedAuth, Admin};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -42,7 +45,6 @@ use serde::Serialize;
 
 use konsensus_storage::{Storage, WhitelistBackup};
 
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -101,7 +103,7 @@ pub struct ExitManifest {
 
 /// `GET /api/v1/export/bundle` — authenticated owner-only export.
 async fn export_bundle(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ExitBundle>, ApiError> {
     let now_unix = std::time::SystemTime::now()
