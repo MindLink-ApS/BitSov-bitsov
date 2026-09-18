@@ -10,7 +10,7 @@ use uuid::Uuid;
 use konsensus_core::types::{MessageId, Recipient};
 
 use crate::audit::events;
-use crate::auth::AuthUser;
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -110,7 +110,7 @@ impl MessageResponse {
 
 /// `GET /api/v1/messages/:id` — get a specific message.
 pub(super) async fn get_message(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(id_hex): Path<String>,
 ) -> Result<Json<MessageResponse>, ApiError> {
@@ -141,7 +141,7 @@ pub(super) async fn get_message(
 /// derived key. Returns 404 if no cached plaintext exists (e.g., the message
 /// could not be decrypted on receive, or predates the plaintext cache).
 pub(super) async fn get_message_plaintext(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(id_hex): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -190,7 +190,7 @@ pub(super) async fn get_message_plaintext(
 /// With `peer` param: returns both sent and received messages for that
 /// conversation, enabling full conversation history including outgoing messages.
 pub(super) async fn list_messages(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListMessagesQuery>,
 ) -> Result<Json<Vec<MessageResponse>>, ApiError> {
@@ -316,7 +316,7 @@ fn search_snippet(text: &str, needle_lower: &str, ctx: usize) -> String {
 /// are silently skipped. Without `peer`, searches received messages (mirrors
 /// `list_messages`); with `peer`, searches that conversation.
 pub(super) async fn search_messages(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchMessagesQuery>,
 ) -> Result<Json<Vec<SearchResult>>, ApiError> {
@@ -400,7 +400,7 @@ pub(super) async fn search_messages(
 
 /// `DELETE /api/v1/messages/:id` — delete a message.
 pub(super) async fn delete_message(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(id_hex): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

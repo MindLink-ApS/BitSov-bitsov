@@ -8,6 +8,7 @@
 //! on the user's own node — it is encrypted before storage or transport
 //! (Principle 4: data sovereignty).
 
+use crate::auth::scoped::{ScopedAuth, Spend};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,6 @@ use konsensus_crypto::ratchet_message_to_bytes;
 use konsensus_message::wire::Frame;
 
 use crate::audit::events;
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::handlers::utils::generate_valid_proof;
 use crate::state::{AppState, InvoiceResponseData};
@@ -1554,7 +1554,7 @@ async fn compose_room_member(
 /// 5. Sign with Ed25519
 /// 6. Store, deliver via transport, broadcast to WebSocket
 pub(super) async fn compose_message(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ComposeRequest>,
 ) -> Result<Json<ComposeResponse>, ApiError> {

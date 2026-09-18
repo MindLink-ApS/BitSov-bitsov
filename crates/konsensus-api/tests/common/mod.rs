@@ -916,9 +916,13 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
     })
 }
 
+/// A full-authority token, equivalent to what the key-proof issuer (`POST /auth/token`)
+/// mints. The pre-existing suite exercises route behaviour, not authorization, so it keeps
+/// the strongest token; scope *restriction* is proved separately in
+/// `scope_enforcement_tests.rs` against a loopback-shaped token.
 pub fn auth_header(state: &AppState) -> String {
     let node_id_hex = state.identity.node_id().to_hex();
-    let token = auth::create_token(&node_id_hex, &state.jwt_secret).unwrap();
+    let token = auth::create_token(&node_id_hex, &state.jwt_secret, auth::Scope::all()).unwrap();
     format!("Bearer {token}")
 }
 

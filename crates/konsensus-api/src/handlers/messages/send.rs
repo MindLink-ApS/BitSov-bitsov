@@ -4,6 +4,7 @@
 //! stores, and delivers the envelope. Use `compose` if you want the node
 //! to handle E2EE encryption and Lightning payment automatically.
 
+use crate::auth::scoped::{ScopedAuth, Spend};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -14,7 +15,6 @@ use konsensus_core::types::{NodeId, Recipient};
 use konsensus_storage::StorageNonceAdapter;
 
 use crate::audit::events;
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -50,7 +50,7 @@ pub struct SendMessageResponse {
 
 /// `POST /api/v1/messages` — send a message.
 pub(super) async fn send_message(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>, ApiError> {

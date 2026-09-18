@@ -1,3 +1,4 @@
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,7 +12,6 @@ use tracing::warn;
 
 use konsensus_storage::OnboardingStateRecord;
 
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -138,7 +138,7 @@ async fn spawn_funding_poll_if_needed(state: Arc<AppState>) {
 }
 
 async fn start_onboarding(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<StartOnboardingRequest>,
 ) -> Result<Json<OnboardingStateResponse>, ApiError> {
@@ -192,7 +192,7 @@ async fn start_onboarding(
 }
 
 async fn onboarding_state(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<OnboardingStateResponse>, ApiError> {
     let record = state

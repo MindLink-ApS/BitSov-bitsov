@@ -7,7 +7,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
-use crate::auth::AuthUser;
+use crate::auth::scoped::{ScopedAuth, Read};
 use crate::state::AppState;
 
 /// Routing table summary response.
@@ -44,7 +44,7 @@ pub struct PeerRoutingInfo {
 
 /// `GET /api/v1/routing` — get routing table metrics and weight dump.
 async fn get_routing(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Json<RoutingResponse> {
     let total_peers = state.routing.peer_count().await;

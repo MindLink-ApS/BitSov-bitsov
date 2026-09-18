@@ -8,6 +8,7 @@
 //! File transfer uses `KIND_FILE_REF` (200) UKM envelopes. The plaintext
 //! payload is a JSON `FilePayload` containing metadata + base64 file data.
 
+use crate::auth::scoped::{ScopedAuth, Admin, Read, Spend};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -23,7 +24,6 @@ use konsensus_crypto::ratchet_message_to_bytes;
 use konsensus_storage::FileRecord;
 
 use crate::audit::events;
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::handlers::messages::create_payment_proof;
 use crate::state::AppState;
@@ -197,7 +197,7 @@ fn validate_filename(name: &str) -> Result<(), ApiError> {
 
 /// `POST /api/v1/files` — upload a file to the local node.
 async fn upload_file(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<UploadRequest>,
 ) -> Result<Json<UploadResponse>, ApiError> {
@@ -283,7 +283,7 @@ async fn upload_file(
 
 /// `GET /api/v1/files/:id` — download a file (metadata + data).
 async fn download_file(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
 ) -> Result<Json<DownloadResponse>, ApiError> {
@@ -309,7 +309,7 @@ async fn download_file(
 
 /// `GET /api/v1/files` — list file metadata.
 async fn list_files(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListFilesQuery>,
 ) -> Result<Json<Vec<FileResponse>>, ApiError> {
@@ -324,7 +324,7 @@ async fn list_files(
 
 /// `DELETE /api/v1/files/:id` — delete a file.
 async fn delete_file(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -351,7 +351,7 @@ async fn delete_file(
 /// encrypts it via Double Ratchet, creates a UKM envelope with KIND_FILE_REF,
 /// and delivers it. Same pipeline as compose_message but for files.
 async fn send_file(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
     Json(req): Json<SendFileRequest>,

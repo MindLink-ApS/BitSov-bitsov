@@ -11,6 +11,7 @@
 //! invitee's pubkey. Until then, share invite links only over
 //! confidential channels.
 
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +33,6 @@ use konsensus_storage::{
     OnboardingStateRecord, Peer, StorageError,
 };
 
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -181,7 +181,7 @@ fn invite_capabilities_response(
 }
 
 async fn invite_capabilities(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<InviteCapabilitiesResponse>, ApiError> {
     let storage_caps = state
@@ -195,7 +195,7 @@ async fn invite_capabilities(
 
 /// `GET /api/v1/invites` — list all invites issued by this node.
 async fn list_invites(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<InviteListEntry>>, ApiError> {
     let records = state
@@ -248,7 +248,7 @@ async fn list_invites(
 
 /// `DELETE /api/v1/invites/:id` — revoke an issued invite.
 async fn revoke_invite(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -277,7 +277,7 @@ async fn revoke_invite(
 
 /// `POST /api/v1/invites` — issue an invite bound to a specific invitee pubkey.
 async fn issue_invite(
-    auth: AuthUser,
+    auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<IssueInviteRequest>,
 ) -> Result<Json<IssueInviteResponse>, ApiError> {
@@ -448,7 +448,7 @@ async fn issue_invite(
 
 /// `POST /api/v1/invites/accept` — accept a signed invite token as invitee.
 async fn accept_invite(
-    auth: AuthUser,
+    auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<AcceptInviteRequest>,
 ) -> Result<Response, ApiError> {

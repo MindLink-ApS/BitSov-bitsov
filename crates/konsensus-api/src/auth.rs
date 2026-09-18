@@ -130,6 +130,67 @@ fn sign_claims(claims: &Claims, secret: &str) -> Result<String, TokenError> {
     Ok(format!("{header_b64}.{payload_b64}.{sig_b64}"))
 }
 
+/// A capability carried by a token (genome #72).
+///
+/// Authority used to be all-or-nothing: every authenticated route was equivalent, so
+/// reading a balance and spending it were the same grant. Scopes exist so the ISSUER can
+/// be constrained — a caller proving only that it reached loopback must not be able to
+/// obtain spend, identity or credential authority at all. A caller politely requesting
+/// less would achieve nothing, because a malicious caller simply would not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// Observe state: status, identity, balances, history, peers, rooms, pricing.
+    Read,
+    /// Create the means to be paid: funding address, invoice.
+    Receive,
+    /// Move value: pay, keysend, on-chain send, channel open/close — and paid
+    /// messaging, which settles a payment per message. Under "payment IS the
+    /// connection" a message send IS a spend; classing it as messaging would reopen
+    /// the hole by another door.
+    Spend,
+    /// Change node configuration and relationships: peers, pricing, gossip, invites,
+    /// content, bulk export of the relationship graph.
+    Admin,
+    /// Key material and identity replacement: reveal mnemonic, restore, verify.
+    Identity,
+    /// Mint credentials at least as strong as one's own.
+    Credential,
+}
+
+impl Scope {
+    /// Wire form, used in the `scp` claim.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Read => "read",
+            Scope::Receive => "receive",
+            Scope::Spend => "spend",
+            Scope::Admin => "admin",
+            Scope::Identity => "identity",
+            Scope::Credential => "credential",
+        }
+    }
+
+    /// Every scope. Granted only to a caller that proved possession of the node's
+    /// identity key.
+    pub fn all() -> Vec<Scope> {
+        vec![
+            Scope::Read,
+            Scope::Receive,
+            Scope::Spend,
+            Scope::Admin,
+            Scope::Identity,
+            Scope::Credential,
+        ]
+    }
+
+    /// What loopback presence alone may obtain. Deliberately NOT a subset that can be
+    /// widened by the caller: this is the complete set `/auth/local` can mint.
+    pub fn loopback_only() -> Vec<Scope> {
+        vec![Scope::Read, Scope::Receive]
+    }
+}
+
 /// JWT claims.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
@@ -139,18 +200,39 @@ pub struct Claims {
     pub iat: i64,
     /// Expiration (Unix timestamp).
     pub exp: i64,
+    /// Granted capabilities (#72).
+    ///
+    /// NOT optional, and deliberately without a serde default: a token minted before
+    /// scopes existed fails claims parsing and is rejected outright. Defaulting it to
+    /// anything would either silently grant full authority to legacy tokens or silently
+    /// downgrade them to keep a screen green — both are the hidden fallback this ticket
+    /// exists to avoid. Callers re-authenticate; tokens live 24h.
+    pub scp: Vec<Scope>,
+}
+
+impl Claims {
+    /// Does this token carry `scope`?
+    pub fn has(&self, scope: Scope) -> bool {
+        self.scp.contains(&scope)
+    }
 }
 
 /// Token validity duration: 24 hours.
 const TOKEN_VALIDITY_SECS: i64 = 86400;
 
-/// Create a JWT token for the node.
-pub fn create_token(node_id_hex: &str, secret: &str) -> Result<String, TokenError> {
+/// Create a JWT token carrying exactly `scopes`.
+///
+/// Every issuer names its own scope set at the call site. Both issuers previously shared
+/// one no-argument `create_token`, so a change made for the loopback path would silently
+/// have altered the key-proof path too; requiring the set here makes that impossible to
+/// do by accident (#72).
+pub fn create_token(node_id_hex: &str, secret: &str, scopes: Vec<Scope>) -> Result<String, TokenError> {
     let now = Utc::now().timestamp();
     let claims = Claims {
         sub: node_id_hex.to_string(),
         iat: now,
         exp: now + TOKEN_VALIDITY_SECS,
+        scp: scopes,
     };
     sign_claims(&claims, secret)
 }
@@ -224,6 +306,15 @@ pub fn validate_token(token: &str, secret: &str) -> Result<Claims, TokenError> {
 pub struct AuthUser {
     /// The authenticated node ID (hex).
     pub node_id: String,
+    /// Capabilities this token carries (#72).
+    pub scopes: Vec<Scope>,
+}
+
+impl AuthUser {
+    /// Does this caller hold `scope`?
+    pub fn has(&self, scope: Scope) -> bool {
+        self.scopes.contains(&scope)
+    }
 }
 
 #[axum::async_trait]
@@ -258,7 +349,95 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
 
         Ok(AuthUser {
             node_id: claims.sub,
+            scopes: claims.scp,
         })
+    }
+}
+
+/// Scope-enforcing extractors (#72).
+///
+/// A handler names the authority it needs in its own signature, so enforcement is a
+/// property of the type system rather than a habit: `ScopedAuth<Spend>` cannot be
+/// satisfied by a token that lacks `spend`, and a handler cannot silently skip the
+/// check the way an `if auth.has(..)` line can be forgotten or deleted.
+pub mod scoped {
+    use super::{AuthUser, Scope};
+    use axum::extract::FromRequestParts;
+    use axum::http::request::Parts;
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use std::sync::Arc;
+
+    /// Marker trait: which scope an extractor demands.
+    pub trait RequiredScope {
+        const SCOPE: Scope;
+    }
+
+    macro_rules! scope_marker {
+        ($name:ident, $scope:expr, $doc:expr) => {
+            #[doc = $doc]
+            pub struct $name;
+            impl RequiredScope for $name {
+                const SCOPE: Scope = $scope;
+            }
+        };
+    }
+
+    scope_marker!(Read, Scope::Read, "Requires `read`.");
+    scope_marker!(Receive, Scope::Receive, "Requires `receive`.");
+    scope_marker!(Spend, Scope::Spend, "Requires `spend`.");
+    scope_marker!(Admin, Scope::Admin, "Requires `admin`.");
+    scope_marker!(Identity, Scope::Identity, "Requires `identity`.");
+    scope_marker!(Credential, Scope::Credential, "Requires `credential`.");
+
+    /// An authenticated caller that has been checked for `S`.
+    pub struct ScopedAuth<S: RequiredScope> {
+        pub user: AuthUser,
+        _scope: std::marker::PhantomData<S>,
+    }
+
+    /// Deref to the inner [`AuthUser`] so existing handlers keep using `auth.node_id`
+    /// unchanged. The scope check has already happened by the time a handler holds one
+    /// of these — the type is the proof, the fields are just the payload.
+    impl<S: RequiredScope> std::ops::Deref for ScopedAuth<S> {
+        type Target = AuthUser;
+        fn deref(&self) -> &AuthUser {
+            &self.user
+        }
+    }
+
+    #[axum::async_trait]
+    impl<S> FromRequestParts<Arc<crate::AppState>> for ScopedAuth<S>
+    where
+        S: RequiredScope + Send,
+    {
+        type Rejection = Response;
+
+        async fn from_request_parts(
+            parts: &mut Parts,
+            state: &Arc<crate::AppState>,
+        ) -> Result<Self, Self::Rejection> {
+            let user = AuthUser::from_request_parts(parts, state).await?;
+            if !user.has(S::SCOPE) {
+                metrics::counter!(crate::metrics::AUTH_FAILURES).increment(1);
+                tracing::warn!(
+                    required = S::SCOPE.as_str(),
+                    "token lacks the required scope"
+                );
+                // 403, not 401: the caller authenticated successfully and simply is not
+                // permitted. Returning 401 would invite a client to re-authenticate in a
+                // loop for authority it can never obtain from its issuer.
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("token lacks required scope: {}", S::SCOPE.as_str()),
+                )
+                    .into_response());
+            }
+            Ok(ScopedAuth {
+                user,
+                _scope: std::marker::PhantomData,
+            })
+        }
     }
 }
 
@@ -271,7 +450,7 @@ mod tests {
         let secret = "test-secret-key";
         let node_id = "aabbccdd";
 
-        let token = create_token(node_id, secret).unwrap();
+        let token = create_token(node_id, secret, Scope::all()).unwrap();
         let claims = validate_token(&token, secret).unwrap();
 
         assert_eq!(claims.sub, node_id);
@@ -280,7 +459,7 @@ mod tests {
 
     #[test]
     fn invalid_secret_rejected() {
-        let token = create_token("node1", "secret1").unwrap();
+        let token = create_token("node1", "secret1", Scope::all()).unwrap();
         let result = validate_token(&token, "wrong-secret");
         assert!(result.is_err());
     }
@@ -292,6 +471,7 @@ mod tests {
             sub: "node1".into(),
             iat: 1_000_000,
             exp: 1_000_001, // expired long ago
+            scp: Scope::all(),
         };
         // Signed through the exact production signing path — only the claims differ.
         let token = sign_claims(&claims, secret).unwrap();
@@ -377,6 +557,7 @@ mod tests {
             sub: "node1".into(),
             iat: now,
             exp: now + TOKEN_VALIDITY_SECS,
+            scp: Scope::all(),
         }
     }
 
@@ -430,7 +611,7 @@ mod tests {
     #[test]
     fn four_segment_token_rejected() {
         let secret = "a".repeat(MIN_JWT_SECRET_BYTES);
-        let token = create_token("node1", &secret).unwrap();
+        let token = create_token("node1", &secret, Scope::all()).unwrap();
         assert!(matches!(
             validate_token(&format!("{token}.extra"), &secret),
             Err(TokenError::Malformed)
@@ -442,7 +623,7 @@ mod tests {
         // A prefix of the real signature must fail (verify_slice rejects
         // length mismatches; nothing accepts a "close enough" MAC).
         let secret = "a".repeat(MIN_JWT_SECRET_BYTES);
-        let token = create_token("node1", &secret).unwrap();
+        let token = create_token("node1", &secret, Scope::all()).unwrap();
         let mut parts: Vec<&str> = token.split('.').collect();
         let sig = parts[2];
         let truncated = &sig[..sig.len() - 8];
@@ -450,28 +631,55 @@ mod tests {
         assert!(validate_token(&parts.join("."), &secret).is_err());
     }
 
+    /// #72 reversed half of this fixture's original contract, deliberately.
+    ///
+    /// The fixture below is byte-for-byte what jsonwebtoken 9 emitted, and it carries no
+    /// `scp` claim. It used to assert "a node upgrade must not sever existing owner
+    /// sessions". That is now exactly the wrong outcome: a token minted before scopes
+    /// existed conveys no authorization, and honouring it would mean either granting it
+    /// everything or quietly reinterpreting it as `read`. Both are the hidden fallback the
+    /// ticket exists to remove, so it is rejected and the caller re-authenticates.
+    ///
+    /// Note the MAC still verifies — this fails at claims parsing, not at the signature.
     #[test]
-    fn legacy_jsonwebtoken_hs256_token_still_validates() {
-        // Continuity fixture: byte-for-byte what jsonwebtoken 9 emits — note the
-        // LEGACY header field order {"typ":"JWT","alg":"HS256"} (typ first),
-        // where this module emits alg first. The verifier never re-serializes
-        // (it verifies the raw segments), so field order must not matter and a
-        // node upgrade must not sever existing owner sessions. Fixture exp is
-        // far-future (year 2286) so this test never rots.
+    fn legacy_scopeless_token_is_now_rejected() {
         const LEGACY_SECRET: &str = "legacy-fixture-secret-0123456789abcdef";
-        // Stored as separate segments and joined at runtime: gitleaks' JWT rule
-        // matches a contiguous `eyJ*.eyJ*` literal and would flag this fabricated
-        // test vector as a leaked credential in the public-export scan. Splitting
-        // keeps the scanner strict repo-wide (no allowlist entry) while the joined
-        // value stays byte-for-byte the jsonwebtoken-9 output.
         const LEGACY_HEADER_B64: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9";
         const LEGACY_CLAIMS_B64: &str =
             "eyJzdWIiOiJsZWdhY3ktbm9kZSIsImlhdCI6MTAwMDAwMCwiZXhwIjo5OTk5OTk5OTk5fQ";
         const LEGACY_SIG_B64: &str = "7S1JtUNsZQt5jDql3oo0o9eILAheqKWRJ5n3rKD-Ot0";
         let legacy_token = format!("{LEGACY_HEADER_B64}.{LEGACY_CLAIMS_B64}.{LEGACY_SIG_B64}");
-        let claims = validate_token(&legacy_token, LEGACY_SECRET).unwrap();
-        assert_eq!(claims.sub, "legacy-node");
-        assert_eq!(claims.exp, 9_999_999_999);
+
+        // Sanity: the MAC is genuinely good, so the rejection below is about the missing
+        // scope claim and not an unrelated signature failure.
+        assert_eq!(
+            hs256_signature(LEGACY_HEADER_B64, LEGACY_CLAIMS_B64, LEGACY_SECRET).unwrap(),
+            LEGACY_SIG_B64,
+            "fixture MAC should still verify — otherwise this test proves nothing about scopes"
+        );
+
+        assert!(
+            validate_token(&legacy_token, LEGACY_SECRET).is_err(),
+            "a pre-scope token must be rejected, never granted authority by default"
+        );
+    }
+
+    /// The half of the original fixture that still holds: the verifier checks the raw
+    /// segments and never re-serializes, so legacy header field order
+    /// (`{"typ":"JWT","alg":"HS256"}`, typ first, where this module emits alg first) must
+    /// remain acceptable. Built at runtime rather than hardcoded so no contiguous
+    /// `eyJ*.eyJ*` literal exists for gitleaks' JWT rule to flag.
+    #[test]
+    fn legacy_header_field_order_still_validates() {
+        let secret = "a".repeat(MIN_JWT_SECRET_BYTES);
+        let h = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"HS256"}"#);
+        let p = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&fresh_claims()).unwrap());
+        let s = hs256_signature(&h, &p, &secret).unwrap();
+
+        let claims = validate_token(&format!("{h}.{p}.{s}"), &secret)
+            .expect("legacy header field order must still verify");
+        assert_eq!(claims.sub, "node1");
+        assert_eq!(claims.scp, Scope::all());
     }
 
     #[test]
@@ -542,7 +750,7 @@ mod tests {
     #[test]
     fn token_with_empty_node_id() {
         let secret = "test-secret";
-        let token = create_token("", secret).unwrap();
+        let token = create_token("", secret, Scope::all()).unwrap();
         let claims = validate_token(&token, secret).unwrap();
         assert_eq!(claims.sub, "");
     }
@@ -551,7 +759,7 @@ mod tests {
     fn token_with_long_node_id() {
         let secret = "test-secret";
         let long_id = "a".repeat(1024);
-        let token = create_token(&long_id, secret).unwrap();
+        let token = create_token(&long_id, secret, Scope::all()).unwrap();
         let claims = validate_token(&token, secret).unwrap();
         assert_eq!(claims.sub, long_id);
     }
@@ -559,7 +767,7 @@ mod tests {
     #[test]
     fn token_with_unicode_node_id() {
         let secret = "test-secret";
-        let token = create_token("n\u{00f6}de-\u{1f600}", secret).unwrap();
+        let token = create_token("n\u{00f6}de-\u{1f600}", secret, Scope::all()).unwrap();
         let claims = validate_token(&token, secret).unwrap();
         assert_eq!(claims.sub, "n\u{00f6}de-\u{1f600}");
     }
@@ -567,7 +775,7 @@ mod tests {
     #[test]
     fn token_claims_have_24h_expiry() {
         let secret = "test-secret";
-        let token = create_token("node1", secret).unwrap();
+        let token = create_token("node1", secret, Scope::all()).unwrap();
         let claims = validate_token(&token, secret).unwrap();
         assert_eq!(claims.exp - claims.iat, 86400);
     }
@@ -578,8 +786,8 @@ mod tests {
         // In practice they may be identical if generated within the same second,
         // but the structure should be consistent
         let secret = "test-secret";
-        let t1 = create_token("node1", secret).unwrap();
-        let t2 = create_token("node1", secret).unwrap();
+        let t1 = create_token("node1", secret, Scope::all()).unwrap();
+        let t2 = create_token("node1", secret, Scope::all()).unwrap();
         // Both should validate
         assert!(validate_token(&t1, secret).is_ok());
         assert!(validate_token(&t2, secret).is_ok());
@@ -589,7 +797,7 @@ mod tests {
     fn base64_padding_in_token_rejected() {
         // Tamper with a valid token by adding padding characters
         let secret = "test-secret";
-        let token = create_token("node1", secret).unwrap();
+        let token = create_token("node1", secret, Scope::all()).unwrap();
         let tampered = format!("{token}===");
         let result = validate_token(&tampered, secret);
         assert!(result.is_err());
@@ -598,7 +806,7 @@ mod tests {
     #[test]
     fn token_with_modified_payload_rejected() {
         let secret = "test-secret";
-        let token = create_token("node1", secret).unwrap();
+        let token = create_token("node1", secret, Scope::all()).unwrap();
         // Flip a character in the middle (payload section)
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);

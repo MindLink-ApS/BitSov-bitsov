@@ -276,7 +276,8 @@ async fn issue_invite_rate_limited_per_auth_user() {
         "Bearer {}",
         konsensus_api::auth::create_token(
             &format!("rate-limit-user-{}", uuid::Uuid::new_v4()),
-            &state.jwt_secret
+            &state.jwt_secret,
+            konsensus_api::auth::Scope::all(),
         )
         .expect("token")
     );
@@ -804,7 +805,8 @@ async fn invites_accept_rate_limit() {
         "Bearer {}",
         konsensus_api::auth::create_token(
             &format!("accept-rate-limit-user-{}", uuid::Uuid::new_v4()),
-            &state.jwt_secret
+            &state.jwt_secret,
+            konsensus_api::auth::Scope::all(),
         )
         .expect("token")
     );

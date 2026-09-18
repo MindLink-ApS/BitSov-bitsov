@@ -1,5 +1,6 @@
 //! Peer management endpoints — list, add, remove, connect.
 
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -11,7 +12,6 @@ use konsensus_core::types::NodeId;
 use konsensus_message::PeerEntry;
 
 use crate::audit::events;
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -144,7 +144,7 @@ fn peer_response(
 
 /// `GET /api/v1/peers` — list all known peers with connection status.
 async fn list_peers(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<PeerResponse>> {
     let registry = state.peer_registry.read().await;
@@ -167,7 +167,7 @@ async fn list_peers(
 
 /// `GET /api/v1/peers/connected` — list currently connected peers.
 async fn connected_peers(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<String>> {
     let connected = state.transport.connected_peers().await;
@@ -177,7 +177,7 @@ async fn connected_peers(
 
 /// `POST /api/v1/peers` — add a peer to the registry.
 async fn add_peer(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddPeerRequest>,
 ) -> Result<Json<PeerResponse>, ApiError> {
@@ -246,7 +246,7 @@ async fn add_peer(
 
 /// `DELETE /api/v1/peers/:node_id` — remove a peer from the registry.
 async fn remove_peer(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(node_id_hex): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -281,7 +281,7 @@ async fn remove_peer(
 
 /// `GET /api/v1/peers/:node_id` — get a specific peer.
 async fn get_peer(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(node_id_hex): Path<String>,
 ) -> Result<Json<PeerResponse>, ApiError> {
@@ -306,7 +306,7 @@ async fn get_peer(
 
 /// `PUT /api/v1/peers/:node_id` — update a peer's label, address, or auto-connect.
 async fn update_peer(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(node_id_hex): Path<String>,
     Json(req): Json<UpdatePeerRequest>,
@@ -397,7 +397,7 @@ async fn update_peer(
 /// exchange are in the registry but not whitelisted — this endpoint makes the
 /// explicit user decision to whitelist and connect.
 async fn connect_peer(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(node_id_hex): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -443,7 +443,7 @@ async fn connect_peer(
 /// with its known peers, which are added to the local registry (but not
 /// auto-whitelisted — Principle 3: closed mesh).
 async fn discover_peers(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(node_id_hex): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -464,7 +464,7 @@ async fn discover_peers(
 
 /// `GET /api/v1/peers/export` — export all peers as a JSON backup.
 async fn export_peers(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
 ) -> Json<PeerBackup> {
     let registry = state.peer_registry.read().await;
@@ -502,7 +502,7 @@ const MAX_IMPORT_PEERS: usize = 1000;
 
 /// `POST /api/v1/peers/import` — import peers from a JSON backup.
 async fn import_peers(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ImportPeersRequest>,
 ) -> Result<Json<ImportPeersResponse>, ApiError> {

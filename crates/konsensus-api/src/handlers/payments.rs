@@ -1,5 +1,6 @@
 //! Payment endpoints — Lightning invoices, balances, status.
 
+use crate::auth::scoped::{ScopedAuth, Read, Receive, Spend};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -10,7 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use konsensus_core::fee_rate::validate_fee_rate_sat_per_vb;
 
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -85,7 +85,7 @@ const MAX_INVOICE_AMOUNT_MSAT: u64 = 100_000_000_000;
 
 /// `POST /api/v1/payments/invoice` — create a Lightning invoice.
 async fn create_invoice(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Receive>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateInvoiceRequest>,
 ) -> Result<Json<InvoiceResponse>, ApiError> {
@@ -132,7 +132,7 @@ async fn create_invoice(
 
 /// `GET /api/v1/payments/:hash` — check payment status.
 async fn payment_status(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
 ) -> Result<Json<PaymentStatusResponse>, ApiError> {
@@ -152,7 +152,7 @@ async fn payment_status(
 
 /// `GET /api/v1/payments/balance` — get Lightning wallet balance.
 async fn get_balance(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<BalanceResponse>, ApiError> {
     let balance = state
@@ -190,7 +190,7 @@ const MAX_BOLT11_LEN: usize = 2048;
 
 /// `POST /api/v1/payments/pay` — pay a BOLT11 invoice.
 async fn pay_invoice(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<PayInvoiceRequest>,
 ) -> Result<Json<PayInvoiceResponse>, ApiError> {
@@ -263,7 +263,7 @@ const MAX_KEYSEND_AMOUNT_MSAT: u64 = 100_000_000_000;
 /// generates the preimage and pushes it via a TLV record. Requires the
 /// destination node's compressed public key.
 async fn keysend(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<KeysendRequest>,
 ) -> Result<Json<KeysendResponse>, ApiError> {
@@ -325,7 +325,7 @@ pub struct ChannelResponse {
 
 /// `GET /api/v1/payments/channels` — list Lightning channels.
 async fn list_channels(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ChannelResponse>>, ApiError> {
     let channels = state
@@ -352,7 +352,7 @@ async fn list_channels(
 
 /// `GET /api/v1/payments/price/:kind` — check the price for a message kind.
 async fn get_price(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(kind): Path<u16>,
 ) -> Result<Json<PriceResponse>, ApiError> {
@@ -403,7 +403,7 @@ pub struct PaymentListEntry {
 
 /// `GET /api/v1/payments` — list recent Lightning payments.
 async fn list_payments(
-    _auth: AuthUser,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PaymentListQuery>,
 ) -> Result<Json<Vec<PaymentListEntry>>, ApiError> {
@@ -465,7 +465,7 @@ pub struct CloseChannelRequest {
 
 async fn open_channel(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    _user: ScopedAuth<Spend>,
     Json(req): Json<OpenChannelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // L0a: shared validator rejects NaN/Inf and enforces 1.0–10_000.0 sat/vB.
@@ -497,7 +497,7 @@ async fn open_channel(
 
 async fn close_channel(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    _user: ScopedAuth<Spend>,
     Json(req): Json<CloseChannelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if req.channel_id.trim().is_empty() {
@@ -533,7 +533,7 @@ pub struct SendOnchainRequest {
 
 async fn send_onchain(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    _user: ScopedAuth<Spend>,
     Json(req): Json<SendOnchainRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // L0a: see open_channel above for the same validation rationale.
@@ -583,7 +583,7 @@ async fn send_onchain(
 /// Other backends (LNbits, LND) manage their own on-chain wallets.
 async fn get_funding_address(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    _user: ScopedAuth<Receive>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match state.lightning.get_funding_address().await {
         Some(address) => Ok(Json(serde_json::json!({

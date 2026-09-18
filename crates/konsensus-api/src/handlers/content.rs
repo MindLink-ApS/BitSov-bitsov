@@ -4,6 +4,7 @@
 //! ContentServer. Pages are markdown files stored in the node's content
 //! directory. All endpoints require authentication.
 
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -12,7 +13,6 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -184,7 +184,7 @@ fn content_type_for(filename: &str) -> &'static str {
 
 /// List all pages in the content directory.
 async fn list_pages(
-    _user: AuthUser,
+    _user: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PageListResponse>, ApiError> {
     let content_dir = match &state.content_dir {
@@ -277,7 +277,7 @@ async fn list_pages(
 
 /// Read a single page's content.
 async fn read_page(
-    _user: AuthUser,
+    _user: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(page_path): Path<String>,
 ) -> Result<Json<PageReadResponse>, ApiError> {
@@ -306,7 +306,7 @@ async fn read_page(
 
 /// Create or update a page.
 async fn write_page(
-    _user: AuthUser,
+    _user: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(page_path): Path<String>,
     Json(body): Json<PageWriteRequest>,
@@ -343,7 +343,7 @@ async fn write_page(
 
 /// Delete a page.
 async fn delete_page(
-    _user: AuthUser,
+    _user: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Path(page_path): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -369,7 +369,7 @@ async fn delete_page(
 /// This is the same data that remote peers receive via KIND_WEB_MANIFEST (510).
 /// Useful for content publishers to preview what visitors will see.
 async fn get_manifest(
-    _user: AuthUser,
+    _user: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ManifestResponse>, ApiError> {
     let content_dir = match &state.content_dir {
