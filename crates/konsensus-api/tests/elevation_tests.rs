@@ -71,6 +71,11 @@ fn ctx(service: &Arc<PairingService>, data_dir: &std::path::Path) -> ControlCont
         identity_fingerprint: current_fingerprint(),
         data_dir: data_dir.to_path_buf(),
         mnemonic_path: data_dir.join("mnemonic.txt"),
+        replacement_guard: control::ReplacementGuard {
+            layout: konsensus_api::bootstrap::DataDirLayout::new(data_dir),
+            uses_identity_derived_keys: false,
+            has_identity_passphrase: false,
+        },
     }
 }
 
@@ -806,4 +811,139 @@ fn replacement_approval_requires_owner_console_entropy() {
         ),
         Err(PairingError::ConfirmationMismatch)
     ));
+}
+
+#[test]
+fn replacement_refuses_retained_state_before_approval_or_identity_write() {
+    for artifact in [
+        "nested-ldk",
+        "external-ldk",
+        "external-store",
+        "scb",
+        "whitelist",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let (service, _, op_id, console) = pending_replacement(tmp.path());
+        let approval = service.replacement_approval(&op_id).unwrap();
+        let mut context = ctx(&service, tmp.path());
+        let identity_dir = if artifact == "nested-ldk" {
+            tmp.path().join("identity")
+        } else {
+            external.path().join("keys")
+        };
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        context.mnemonic_path = identity_dir.join("mnemonic.txt");
+        std::fs::write(&context.mnemonic_path, CURRENT_MNEMONIC).unwrap();
+        let store_path = external.path().join("messages.sqlite");
+        let backups = external.path().join("backups");
+        context.replacement_guard.layout = konsensus_api::bootstrap::DataDirLayout::new(tmp.path())
+            .with_configured_paths(
+                context.mnemonic_path.clone(),
+                Some(store_path.clone()),
+                backups.clone(),
+            );
+        assert!(
+            context.replacement_guard.ensure_replaceable().is_ok(),
+            "empty positive control"
+        );
+        let state_file = match artifact {
+            "nested-ldk" | "external-ldk" => identity_dir.join("ldk").join("channel-monitor"),
+            "external-store" => store_path,
+            "scb" => backups.join("scb-latest.aes"),
+            _ => backups.join("whitelist-latest.aes"),
+        };
+        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        std::fs::write(&state_file, b"retained state fixture").unwrap();
+        let before = serde_json::to_value(service.reload_from_disk().unwrap()).unwrap();
+        let response = control::handle(
+            &context,
+            ControlRequest::ApproveReplacement {
+                op_id,
+                confirmation: console
+                    .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+                mnemonic: REPLACEMENT_MNEMONIC.into(),
+            },
+        );
+        assert!(
+            matches!(response, ControlResponse::Error { .. }),
+            "{artifact}: {response:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&context.mnemonic_path).unwrap(),
+            CURRENT_MNEMONIC
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            b"retained state fixture"
+        );
+        assert_eq!(
+            serde_json::to_value(service.reload_from_disk().unwrap()).unwrap(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn replacement_refusal_preserves_decryptable_history() {
+    use konsensus_storage::Storage;
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _, op_id, console) = pending_replacement(tmp.path());
+    let approval = service.replacement_approval(&op_id).unwrap();
+    let mut context = ctx(&service, tmp.path());
+    std::fs::write(&context.mnemonic_path, CURRENT_MNEMONIC).unwrap();
+    let path = tmp.path().join("konsensus.db");
+    let identity = konsensus_core::NodeIdentity::from_mnemonic(CURRENT_MNEMONIC, "").unwrap();
+    let sqlite = konsensus_storage::SqliteStorage::open(path.to_str().unwrap())
+        .await
+        .unwrap();
+    let encrypted = konsensus_storage::EncryptedStorage::new(sqlite, identity.aes_key());
+    let envelope = konsensus_core::UkmEnvelopeBuilder::new(
+        100,
+        *identity.node_id(),
+        konsensus_core::types::Recipient::Node(*identity.node_id()),
+        b"retained encrypted history".to_vec(),
+        konsensus_core::PaymentProof::new([0; 32], [0; 32], 0),
+    )
+    .build();
+    encrypted.store_message(&envelope).await.unwrap();
+    context.replacement_guard.uses_identity_derived_keys = true;
+    let before = serde_json::to_value(service.reload_from_disk().unwrap()).unwrap();
+    let response = control::handle(
+        &context,
+        ControlRequest::ApproveReplacement {
+            op_id,
+            confirmation: console
+                .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+            mnemonic: REPLACEMENT_MNEMONIC.into(),
+        },
+    );
+    assert!(matches!(response, ControlResponse::Error { .. }));
+    assert_eq!(
+        std::fs::read_to_string(&context.mnemonic_path).unwrap(),
+        CURRENT_MNEMONIC
+    );
+    assert_eq!(
+        serde_json::to_value(service.reload_from_disk().unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(
+        encrypted
+            .get_message(&envelope.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .ciphertext,
+        envelope.ciphertext
+    );
+    // The replacement key demonstrably cannot decrypt the retained record.
+    let replacement =
+        konsensus_core::NodeIdentity::from_mnemonic(REPLACEMENT_MNEMONIC, "").unwrap();
+    let wrong_key = konsensus_storage::EncryptedStorage::new(
+        konsensus_storage::SqliteStorage::open(path.to_str().unwrap())
+            .await
+            .unwrap(),
+        replacement.aes_key(),
+    );
+    assert!(wrong_key.get_message(&envelope.id).await.is_err());
 }

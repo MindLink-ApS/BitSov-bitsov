@@ -194,6 +194,43 @@ pub struct ControlContext {
     pub data_dir: PathBuf,
     /// Actual configured identity path, including the bootstrap identity directory.
     pub mnemonic_path: PathBuf,
+    /// Resolved node storage/key dependencies; never supplied by the requester.
+    pub replacement_guard: ReplacementGuard,
+}
+
+/// Refuse phrase-file replacement when it would strand wallet or storage keys.
+/// This is a refusal policy, not a channel-close or database migration procedure.
+pub struct ReplacementGuard {
+    /// Same resolved layout used by startup, including external state paths.
+    pub layout: crate::bootstrap::DataDirLayout,
+    /// LDK entropy or encrypted storage uses the running identity's seed.
+    pub uses_identity_derived_keys: bool,
+    /// The replacement fingerprint API does not support a BIP-39 passphrase.
+    pub has_identity_passphrase: bool,
+}
+
+impl ReplacementGuard {
+    /// Check before approval or consumption; never consult balance.
+    pub fn ensure_replaceable(&self) -> Result<(), String> {
+        if self.has_identity_passphrase {
+            return Err("identity replacement with a BIP-39 passphrase is unsupported; no approval consumed".into());
+        }
+        if self.uses_identity_derived_keys {
+            return Err(Self::refusal());
+        }
+        let probe = crate::bootstrap::DataDirProbe::inspect(&self.layout).map_err(|_| {
+            "cannot establish that existing wallet/store state is absent; no approval consumed"
+                .to_string()
+        })?;
+        if probe.wallet_or_channel_state_present || !probe.store_readable {
+            return Err(Self::refusal());
+        }
+        Ok(())
+    }
+
+    fn refusal() -> String {
+        "identity replacement refused: changing the mnemonic can strand Lightning channel monitors and make encrypted history unreadable. This command cannot close channels or migrate/rekey storage. Preserve the existing identity and backups; an explicit operator recovery/migration procedure is required. No approval consumed and no files changed".into()
+    }
 }
 
 /// Handle one control request.
@@ -324,6 +361,9 @@ fn approve_and_execute_replacement(
     mnemonic: &str,
 ) -> ControlResponse {
     let service: &PairingService = &ctx.service;
+    if let Err(message) = ctx.replacement_guard.ensure_replaceable() {
+        return ControlResponse::Error { message };
+    }
     if ctx
         .mnemonic_path
         .extension()
@@ -427,7 +467,10 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
              current id:   {}\n  replacement:  {}\n  expires at:   {}\n\nThis REPLACES the \
              identity of a node that may hold funds and relationships. The destination \
              identity above was computed from the recovery phrase the client supplied — \
-             approving binds this operation to that one identity and nothing else.",
+             approving binds this operation to that one identity and nothing else.\n\n\
+             WARNING: replacing a mnemonic changes Lightning and storage keys. This command \
+             refuses nodes using LDK/encrypted storage or carrying existing state; it does \
+             not close channels or migrate/rekey history.",
             a.op_id,
             a.client_name,
             a.client_id,

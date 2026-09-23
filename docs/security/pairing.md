@@ -91,6 +91,17 @@ failed attempt does not burn the owner's approval. The approval record never
 stores the recovery phrase; successful replacement writes the configured identity
 file.
 
+That write is unavailable on nodes using LDK or encrypted storage, even if their
+current balance is zero or their next persistence write has not happened yet.
+Existing database, channel or backup state also causes refusal, using the resolved
+configuration paths. A remote store cannot be proven empty by this filesystem
+check and is refused. These checks run before approval and consumption. BIP-39
+passphrase identities are refused because the destination-binding API does not
+yet support that passphrase. There is no channel-close or storage migration in
+this command: replacing the seed without such a procedure can lose access to
+funds and encrypted history. Fresh identity-free bootstrap restore is separate
+and remains supported.
+
 ## Identity-free bootstrap
 
 On a truly empty install, `konsensus start --config <data-dir>/konsensus.toml`

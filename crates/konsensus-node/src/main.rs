@@ -1052,6 +1052,7 @@ async fn cmd_start(
                 identity_fingerprint: identity_fingerprint.clone(),
                 data_dir: data_dir.clone(),
                 mnemonic_path: config.identity.mnemonic_file.clone(),
+                replacement_guard: owner_cmd::replacement_guard(&data_dir, &config),
             });
             let server = konsensus_api::control::ControlServer::bind(&data_dir, ctx)
                 .with_context(|| {

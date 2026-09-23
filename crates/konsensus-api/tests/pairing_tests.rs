@@ -406,6 +406,11 @@ async fn http_elevation_write_paths_absent() {
         identity_fingerprint: service.bound_fingerprint(),
         data_dir: tmp.path().to_path_buf(),
         mnemonic_path: tmp.path().join("mnemonic.txt"),
+        replacement_guard: control::ReplacementGuard {
+            layout: konsensus_api::bootstrap::DataDirLayout::new(tmp.path()),
+            uses_identity_derived_keys: false,
+            has_identity_passphrase: false,
+        },
     };
     let op = service
         .snapshot()
@@ -501,6 +506,11 @@ async fn http_restore_after_owner_approval_has_no_effect() {
         identity_fingerprint: service.bound_fingerprint(),
         data_dir: tmp.path().to_path_buf(),
         mnemonic_path: tmp.path().join("mnemonic.txt"),
+        replacement_guard: control::ReplacementGuard {
+            layout: konsensus_api::bootstrap::DataDirLayout::new(tmp.path()),
+            uses_identity_derived_keys: false,
+            has_identity_passphrase: false,
+        },
     };
     let resp = control::handle(
         &ctx,
@@ -537,6 +547,11 @@ async fn owner_control_socket_permissions() {
         identity_fingerprint: service.bound_fingerprint(),
         data_dir: tmp.path().to_path_buf(),
         mnemonic_path: tmp.path().join("mnemonic.txt"),
+        replacement_guard: control::ReplacementGuard {
+            layout: konsensus_api::bootstrap::DataDirLayout::new(tmp.path()),
+            uses_identity_derived_keys: false,
+            has_identity_passphrase: false,
+        },
     });
 
     let server = control::ControlServer::bind(tmp.path(), Arc::clone(&ctx)).unwrap();
@@ -592,6 +607,11 @@ async fn same_uid_socket_client_cannot_self_grant_from_public_information() {
         identity_fingerprint: service.bound_fingerprint(),
         data_dir: tmp.path().to_path_buf(),
         mnemonic_path: tmp.path().join("mnemonic.txt"),
+        replacement_guard: control::ReplacementGuard {
+            layout: konsensus_api::bootstrap::DataDirLayout::new(tmp.path()),
+            uses_identity_derived_keys: false,
+            has_identity_passphrase: false,
+        },
     });
     let server = control::ControlServer::bind(tmp.path(), context).unwrap();
     let path = server.path().to_path_buf();

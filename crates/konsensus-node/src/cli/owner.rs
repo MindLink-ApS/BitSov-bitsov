@@ -71,6 +71,23 @@ fn configured_layout(data_dir: &Path, config: &NodeConfig) -> DataDirLayout {
     )
 }
 
+#[cfg(unix)]
+pub fn replacement_guard(data_dir: &Path, config: &NodeConfig) -> control::ReplacementGuard {
+    let encrypted = match &config.storage {
+        StorageConfig::Sqlite { encrypted, .. } | StorageConfig::Postgres { encrypted, .. } => {
+            *encrypted
+        }
+    };
+    control::ReplacementGuard {
+        layout: configured_layout(data_dir, config),
+        // Do not race a running LDK node's next persistence write or assume an
+        // empty encrypted database makes rotating its key harmless.
+        uses_identity_derived_keys: encrypted
+            || matches!(config.lightning, crate::config::LightningConfig::Ldk { .. }),
+        has_identity_passphrase: !config.identity.passphrase.is_empty(),
+    }
+}
+
 /// The data directory is the config file's directory, matching `AppState::data_dir`.
 fn data_dir_of(config_path: &Path) -> PathBuf {
     config_path
@@ -235,7 +252,7 @@ pub async fn cmd_approve_replacement(
         None => {
             println!(
                 "\nEnter the recovery phrase of the destination identity (input hidden).\n\
-                 It is checked against the identity shown above and is not stored by the node."
+                 It is checked against the identity shown above; only an accepted replacement writes it to the identity file."
             );
             rpassword::read_password().context("failed to read the recovery phrase")?
         }
@@ -388,6 +405,55 @@ pub async fn serve_bootstrap_mode(data_dir: &Path, api_addr: std::net::SocketAdd
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_policy_uses_actual_node_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default_for_tier(
+            NodeTier::Full,
+            dir.path().join("mnemonic.txt"),
+            dir.path(),
+        );
+        assert!(replacement_guard(dir.path(), &config)
+            .ensure_replaceable()
+            .is_err());
+        // LDK alone is enough, even before its next write creates state.
+        if let StorageConfig::Sqlite { encrypted, .. } = &mut config.storage {
+            *encrypted = false;
+        }
+        assert!(replacement_guard(dir.path(), &config)
+            .ensure_replaceable()
+            .is_err());
+        config.lightning = crate::config::LightningConfig::Mock {
+            initial_balance_msat: 0,
+        };
+        assert!(replacement_guard(dir.path(), &config)
+            .ensure_replaceable()
+            .is_ok());
+        if let StorageConfig::Sqlite { encrypted, .. } = &mut config.storage {
+            *encrypted = true;
+        }
+        assert!(replacement_guard(dir.path(), &config)
+            .ensure_replaceable()
+            .is_err());
+        if let StorageConfig::Sqlite { encrypted, .. } = &mut config.storage {
+            *encrypted = false;
+        }
+        config.identity.passphrase = "public test passphrase".into();
+        assert!(replacement_guard(dir.path(), &config)
+            .ensure_replaceable()
+            .is_err());
+        config.identity.passphrase.clear();
+        config.storage = StorageConfig::Postgres {
+            url: "postgres://unused.invalid/test".into(),
+            encrypted: false,
+            retention_days: 0,
+        };
+        assert!(replacement_guard(dir.path(), &config)
+            .ensure_replaceable()
+            .is_err());
+    }
 
     #[test]
     fn empty_install_prepares_bootstrap_without_identity_or_config() {
