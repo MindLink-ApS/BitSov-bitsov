@@ -208,12 +208,81 @@ pub struct Claims {
     /// downgrade them to keep a screen green — both are the hidden fallback this ticket
     /// exists to avoid. Callers re-authenticate; tokens live 24h.
     pub scp: Vec<Scope>,
+
+    /// Paired client id (#76). Present only on tokens issued to a paired client.
+    ///
+    /// Absent on `/auth/local` and key-proof tokens, which is why it is an
+    /// `Option` — but a token that carries `cid` must also carry `epc` and
+    /// `idf`, and all three are re-checked against the live pairing record on
+    /// every request. See [`PairingBinding::from_claims`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+
+    /// Pairing revocation epoch (#76). Bumping the pairing's epoch invalidates
+    /// every outstanding token for that client immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epc: Option<u64>,
+
+    /// Fingerprint of the identity this token was issued against (#76).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idf: Option<String>,
+
+    /// Marks a token minted during identity-free bootstrap (#76).
+    ///
+    /// Bootstrap runs on an ephemeral in-memory signing secret, so these
+    /// tokens stop verifying the instant the identity-derived secret takes
+    /// over. This claim is a second, independent gate: the live router rejects
+    /// any token that carries it, so even a bootstrap token re-signed with the
+    /// live secret conveys nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bst: Option<bool>,
 }
 
 impl Claims {
     /// Does this token carry `scope`?
     pub fn has(&self, scope: Scope) -> bool {
         self.scp.contains(&scope)
+    }
+}
+
+/// The pairing binding a token asserts (#76).
+///
+/// Extracted as a unit so the three fields cannot drift apart: a token that
+/// carries any one of them must carry all three, and a token that carries none
+/// is a non-paired token (loopback or key-proof) which is checked by its own
+/// issuer's rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingBinding {
+    /// Paired client id.
+    pub client_id: String,
+    /// Pairing epoch.
+    pub epoch: u64,
+    /// Identity fingerprint.
+    pub fingerprint: String,
+}
+
+impl PairingBinding {
+    /// Read the binding out of `claims`.
+    ///
+    /// `Ok(None)` means "not a paired token". `Err` means the token claims a
+    /// partial binding, which is rejected outright rather than interpreted:
+    /// half a binding is not a weaker grant, it is a malformed one.
+    pub fn from_claims(claims: &Claims) -> Result<Option<Self>, TokenError> {
+        match (
+            claims.cid.as_deref(),
+            claims.epc,
+            claims.idf.as_deref(),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(cid), Some(epoch), Some(idf)) if !cid.is_empty() && !idf.is_empty() => {
+                Ok(Some(PairingBinding {
+                    client_id: cid.to_string(),
+                    epoch,
+                    fingerprint: idf.to_string(),
+                }))
+            }
+            _ => Err(TokenError::InvalidClaims),
+        }
     }
 }
 
@@ -233,6 +302,70 @@ pub fn create_token(node_id_hex: &str, secret: &str, scopes: Vec<Scope>) -> Resu
         iat: now,
         exp: now + TOKEN_VALIDITY_SECS,
         scp: scopes,
+        cid: None,
+        epc: None,
+        idf: None,
+        bst: None,
+    };
+    sign_claims(&claims, secret)
+}
+
+/// Paired-client token lifetime: 10 minutes (#76).
+///
+/// Minutes rather than the 24 hours a loopback token gets. The durable secret
+/// is the client key the app holds, so a leaked token must stop being useful
+/// quickly; the app re-signs a fresh challenge to get another one.
+pub const PAIRED_TOKEN_VALIDITY_SECS: i64 = 600;
+
+/// Create a short-lived token for a paired client, bound to its pairing (#76).
+///
+/// The binding travels in the token and is re-checked against the durable
+/// pairing record on every request, so revocation (an epoch bump) and identity
+/// replacement both take effect immediately rather than at expiry.
+pub fn create_paired_token(
+    subject: &str,
+    secret: &str,
+    scopes: Vec<Scope>,
+    client_id: &str,
+    epoch: u64,
+    identity_fingerprint: &str,
+) -> Result<String, TokenError> {
+    let now = Utc::now().timestamp();
+    let claims = Claims {
+        sub: subject.to_string(),
+        iat: now,
+        exp: now + PAIRED_TOKEN_VALIDITY_SECS,
+        scp: scopes,
+        cid: Some(client_id.to_string()),
+        epc: Some(epoch),
+        idf: Some(identity_fingerprint.to_string()),
+        bst: None,
+    };
+    sign_claims(&claims, secret)
+}
+
+/// Create a token for a paired client during identity-free bootstrap (#76).
+///
+/// Marked `bst` and signed with the bootstrap process's ephemeral secret.
+/// There is deliberately no identity fingerprint to bind to yet — the pairing
+/// is stamped with the committed identity's fingerprint as part of the
+/// transition, and every token minted here stops verifying at the same instant.
+pub fn create_bootstrap_token(
+    secret: &str,
+    scopes: Vec<Scope>,
+    client_id: &str,
+    epoch: u64,
+) -> Result<String, TokenError> {
+    let now = Utc::now().timestamp();
+    let claims = Claims {
+        sub: "bootstrap".to_string(),
+        iat: now,
+        exp: now + PAIRED_TOKEN_VALIDITY_SECS,
+        scp: scopes,
+        cid: Some(client_id.to_string()),
+        epc: Some(epoch),
+        idf: Some(String::new()),
+        bst: Some(true),
     };
     sign_claims(&claims, secret)
 }
@@ -308,6 +441,12 @@ pub struct AuthUser {
     pub node_id: String,
     /// Capabilities this token carries (#72).
     pub scopes: Vec<Scope>,
+    /// The pairing this token was issued to, if any (#76).
+    ///
+    /// `None` for `/auth/local` and key-proof tokens. When `Some`, the binding
+    /// has already been verified against the durable pairing record — the
+    /// presence of this value in a handler is proof the check ran.
+    pub pairing: Option<PairingBinding>,
 }
 
 impl AuthUser {
@@ -347,11 +486,64 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
             (StatusCode::UNAUTHORIZED, "invalid token").into_response()
         })?;
 
+        let pairing = check_pairing_binding(state, &claims).map_err(|reason| {
+            metrics::counter!(crate::metrics::AUTH_FAILURES).increment(1);
+            tracing::warn!(reason = %reason, "paired token rejected");
+            (StatusCode::UNAUTHORIZED, "invalid token").into_response()
+        })?;
+
         Ok(AuthUser {
             node_id: claims.sub,
             scopes: claims.scp,
+            pairing,
         })
     }
+}
+
+/// Re-check a token's pairing binding against the durable record (#76).
+///
+/// Every authenticated request pays this cost, which is the point: an epoch
+/// bump from the CLI, a deleted pairing, or a replaced identity must invalidate
+/// outstanding tokens *now*, not when they expire.
+///
+/// Rejection is outright in every failure case. There is no path here that
+/// downgrades a token to a weaker scope set to keep a caller working — the
+/// same discipline #72 applied to the scope-less legacy token.
+fn check_pairing_binding(
+    state: &Arc<AppState>,
+    claims: &Claims,
+) -> Result<Option<PairingBinding>, String> {
+    // A bootstrap token has no business on the live router. Bootstrap uses an
+    // ephemeral secret so these normally die at the signature check; this is
+    // the independent second gate.
+    if claims.bst == Some(true) {
+        return Err("token was minted during identity-free bootstrap".into());
+    }
+
+    let binding = PairingBinding::from_claims(claims)
+        .map_err(|_| "token carries a partial pairing binding".to_string())?;
+
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+
+    // A paired token on a node with no pairing service cannot be checked, so it
+    // is refused. Failing open here would make the binding advisory.
+    let service = state
+        .pairing
+        .as_ref()
+        .ok_or_else(|| "pairing is not configured on this node".to_string())?;
+
+    service
+        .verify_token_binding(
+            &binding.client_id,
+            binding.epoch,
+            &binding.fingerprint,
+            &claims.scp,
+        )
+        .map_err(|e| e.to_string())?;
+
+    Ok(Some(binding))
 }
 
 /// Scope-enforcing extractors (#72).
@@ -472,6 +664,10 @@ mod tests {
             iat: 1_000_000,
             exp: 1_000_001, // expired long ago
             scp: Scope::all(),
+            cid: None,
+            epc: None,
+            idf: None,
+            bst: None,
         };
         // Signed through the exact production signing path — only the claims differ.
         let token = sign_claims(&claims, secret).unwrap();
@@ -558,6 +754,10 @@ mod tests {
             iat: now,
             exp: now + TOKEN_VALIDITY_SECS,
             scp: Scope::all(),
+            cid: None,
+            epc: None,
+            idf: None,
+            bst: None,
         }
     }
 

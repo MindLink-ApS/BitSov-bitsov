@@ -840,7 +840,17 @@ async fn auth_token_rejects_unknown_fields() {
 // ─── Identity endpoint auth tests ──────────────────────────────────
 
 #[tokio::test]
-async fn restore_identity_without_auth_returns_401() {
+async fn restore_identity_is_absent_from_the_http_router() {
+    // #76 reversed this test's original contract, deliberately.
+    //
+    // It used to assert that `POST /api/v1/identity/restore` requires
+    // authentication. Requiring auth is now the WRONG outcome: replacing the
+    // identity of a live node is executed only over the owner control socket,
+    // so the route is ABSENT rather than protected. A 401 would mean the route
+    // still exists and is one stolen token away from being reachable.
+    //
+    // The effect assertions (no consumption, no identity write) live in
+    // `pairing_tests::http_restore_after_owner_approval_has_no_effect`.
     let state = test_state();
     let app = build_router(state);
 
@@ -859,8 +869,8 @@ async fn restore_identity_without_auth_returns_401() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "restore endpoint must require authentication"
+        StatusCode::NOT_FOUND,
+        "live-identity replacement must not exist as an HTTP route"
     );
 }
 
@@ -938,7 +948,15 @@ async fn verify_mnemonic_invalid_returns_400() {
 }
 
 #[tokio::test]
-async fn restore_identity_with_auth_and_data_dir_succeeds() {
+async fn full_key_proof_token_cannot_write_identity_material_over_http() {
+    // #76: this test asserted the opposite before — that a token with identity
+    // scope could POST a mnemonic and have it written to the data directory.
+    // That was the live-identity replacement path, and it is now impossible
+    // over HTTP at any scope.
+    //
+    // The token here is the STRONGEST one the node issues (key-proof, all
+    // scopes), so this is the worst case: even proving possession of the node
+    // signing key does not reach the write.
     let tmp = tempfile::tempdir().unwrap();
     let state = test_state_with_data_dir(tmp.path().to_path_buf());
     let auth = auth_header(&state);
@@ -958,22 +976,25 @@ async fn restore_identity_with_auth_and_data_dir_succeeds() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the identity-replacement route must not exist on the HTTP router"
+    );
 
-    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["node_id"].is_string());
-    assert_eq!(json["restart_required"], true);
-
-    // Verify the mnemonic was written to disk
-    let mnemonic_path = tmp.path().join("mnemonic.txt");
-    assert!(mnemonic_path.exists());
-    let written = std::fs::read_to_string(&mnemonic_path).unwrap();
-    assert!(written.starts_with("abandon"));
+    // The effect, not just the status code: nothing was written.
+    assert!(
+        !tmp.path().join("mnemonic.txt").exists(),
+        "no identity material may be written through an HTTP request"
+    );
 }
 
 #[tokio::test]
-async fn restore_identity_invalid_mnemonic_returns_400() {
+async fn verify_mnemonic_invalid_mnemonic_returns_400() {
+    // Replaces the old `restore_identity_invalid_mnemonic_returns_400`: the
+    // restore route is gone (#76), but the word-count/validity rejection it
+    // covered still matters on the stateless verification route the recovery
+    // wizard actually calls.
     let tmp = tempfile::tempdir().unwrap();
     let state = test_state_with_data_dir(tmp.path().to_path_buf());
     let auth = auth_header(&state);
@@ -981,7 +1002,7 @@ async fn restore_identity_invalid_mnemonic_returns_400() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/identity/restore")
+        .uri("/api/v1/identity/verify-mnemonic")
         .header("content-type", "application/json")
         .header("authorization", &auth)
         .body(Body::from(

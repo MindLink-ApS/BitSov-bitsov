@@ -21,7 +21,10 @@ const SPEND: &[&str] = &[
 ];
 
 /// Key material and identity replacement — what loopback presence must never reach.
-const IDENTITY: &[&str] = &["reveal_mnemonic", "restore_identity", "verify_mnemonic"];
+// `restore_identity` was removed from the HTTP handlers by #76: replacing a live
+// identity is executed only over the owner control socket, so there is no
+// handler left to enforce a scope on.
+const IDENTITY: &[&str] = &["reveal_mnemonic", "verify_mnemonic"];
 
 const ADMIN: &[&str] = &[
     "import_peers",

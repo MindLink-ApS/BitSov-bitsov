@@ -19,6 +19,8 @@ mod session_handler;
 mod scb_restore;
 #[path = "cli/whitelist.rs"]
 mod whitelist_cmd;
+#[path = "cli/owner.rs"]
+mod owner_cmd;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,7 +33,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::NodeId;
-use crate::cli::{Cli, Command, ScbCommand, WhitelistCommand};
+use crate::cli::{Cli, Command, RepairCommand, ScbCommand, WhitelistCommand};
 use crate::config::{NodeConfig, NodeTier};
 use crate::node::KonsensusNode;
 
@@ -115,9 +117,29 @@ async fn main() -> Result<()> {
         Command::Init { dir, non_interactive, tier, encrypt } => {
             cmd_init(&dir, non_interactive, tier.as_deref(), encrypt)?;
         }
-        Command::Start { config, password, admission_mode } => {
-            cmd_start(&config, password.as_deref(), admission_mode.as_deref()).await?;
+        Command::Start { config, password, admission_mode, owner_control } => {
+            cmd_start(&config, password.as_deref(), admission_mode.as_deref(), owner_control).await?;
         }
+        Command::PairStatus { config } => {
+            owner_cmd::cmd_pair_status(&config).await?;
+        }
+        Command::Grant { op_id, config } => {
+            owner_cmd::cmd_grant(&config, &op_id).await?;
+        }
+        Command::ApproveReplacement { op_id, mnemonic, config } => {
+            owner_cmd::cmd_approve_replacement(&config, &op_id, mnemonic.as_deref()).await?;
+        }
+        Command::PairRevoke { client_id, keep_pairing, config } => {
+            owner_cmd::cmd_pair_revoke(&config, &client_id, keep_pairing).await?;
+        }
+        Command::PairWindow { seconds, config } => {
+            owner_cmd::cmd_pair_window(&config, seconds).await?;
+        }
+        Command::Repair { command } => match command {
+            RepairCommand::MarkInitialized { dir, confirm } => {
+                owner_cmd::cmd_repair_mark_initialized(&dir, confirm)?;
+            }
+        },
         Command::Restore { dir, mnemonic, tier, encrypt } => {
             cmd_restore(&dir, mnemonic.as_deref(), tier.as_deref(), encrypt)?;
         }
@@ -243,6 +265,22 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
     config
         .save(&config_path)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
+
+    // #76: the marker is the sole authority signal for "this directory is
+    // initialized". `init` writes it last, after the identity and config exist,
+    // so a node created here is never mistaken for a fresh install — and never
+    // reopens first-run pairing.
+    let marker = konsensus_api::bootstrap::DataDirLayout::new(dir).marker();
+    konsensus_api::pairing::write_protected(
+        &marker,
+        serde_json::json!({
+            "initialized_at": chrono::Utc::now().timestamp(),
+            "initialized_by": "konsensus init",
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .with_context(|| format!("failed to write {}", marker.display()))?;
 
     println!();
     println!("Node initialized successfully!");
@@ -571,10 +609,33 @@ async fn cmd_start(
     config_path: &Path,
     password: Option<&str>,
     admission_mode: Option<&str>,
+    owner_control: bool,
 ) -> Result<()> {
-    // Load configuration
-    let mut config = NodeConfig::load(config_path)
-        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let (startup_mode, mut config) = owner_cmd::prepare_start(config_path)
+        .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
+
+    // ── First-run / partial-state gate (#76) ───────────────────────
+    // Before any component is built, classify the data directory from file
+    // facts alone. Three outcomes: serve identity-free bootstrap, start
+    // normally, or REFUSE with the concrete repair action. A refusal is never
+    // answered by reopening first-run authority, because "no mnemonic on a node
+    // holding channel state" is a deleted key, not a fresh install.
+    //
+    // Balance is not consulted, here or in `classify`: an initialized node with
+    // no funds is initialized.
+    let data_dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    match startup_mode {
+        konsensus_api::bootstrap::StartupMode::Bootstrap => {
+            return owner_cmd::serve_bootstrap_mode(&data_dir, config.api.listen_addr).await;
+        }
+        konsensus_api::bootstrap::StartupMode::Initialized => {}
+        // `prepare_start` has already turned this into an error.
+        konsensus_api::bootstrap::StartupMode::Refuse(_) => unreachable!(),
+    }
 
     // M1a: apply the optional `--admission-mode` CLI override BEFORE building the
     // node, so the configured mode reaches every wall (gate carrier + handshake +
@@ -777,8 +838,27 @@ async fn cmd_start(
         konsensus_gossip::GossipConfig::default(),
     ));
 
+    // ── Pairing (#76) ──────────────────────────────────────────────
+    // Bound to the running identity's fingerprint, so a pairing made against a
+    // different identity is rejected outright at token issuance rather than
+    // downgraded. `owner_control` decides whether elevation can EVER be
+    // written on this node: with the flag off there is no control socket, and
+    // every grant-writing call refuses. There is no config key, debug mode or
+    // trusted-client list that widens it.
+    let identity_fingerprint =
+        konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
+    let pairing_service = Arc::new(
+        konsensus_api::pairing::PairingService::open(
+            &data_dir,
+            identity_fingerprint.clone(),
+            owner_control,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?,
+    );
+
     let api_state = Arc::new(konsensus_api::AppState {
         identity: Arc::clone(node.identity()),
+        pairing: Some(Arc::clone(&pairing_service)),
         storage: Arc::clone(node.storage()),
         lightning: Arc::clone(node.lightning()),
         chain: Arc::clone(node.chain()),
@@ -954,6 +1034,51 @@ async fn cmd_start(
         auto_channel_tx,
         shutdown_rx: node.shutdown_rx(),
     }));
+
+    // ── Owner control socket (#76) ──────────────────────────────────
+    // Started ONLY under `--owner-control`. This is the single channel that can
+    // write a spend grant or execute a live-identity replacement, and it is a
+    // Unix socket at mode 0600 rather than an HTTP route precisely because the
+    // requesting app could call an HTTP route.
+    //
+    // A failure to bind is fatal rather than a silent downgrade: an owner who
+    // asked for the channel must not end up running without it and discover
+    // later that nothing can be approved.
+    if owner_control {
+        #[cfg(unix)]
+        {
+            let ctx = Arc::new(konsensus_api::control::ControlContext {
+                service: Arc::clone(&pairing_service),
+                identity_fingerprint: identity_fingerprint.clone(),
+                data_dir: data_dir.clone(),
+                mnemonic_path: config.identity.mnemonic_file.clone(),
+            });
+            let server = konsensus_api::control::ControlServer::bind(&data_dir, ctx)
+                .with_context(|| {
+                    format!(
+                        "failed to bind the owner control socket at {}",
+                        data_dir.join(konsensus_api::control::SOCKET_FILE).display()
+                    )
+                })?;
+            info!(
+                socket = %server.path().display(),
+                "owner-run mode: elevation can be granted at this socket"
+            );
+            tokio::spawn(server.serve(node.shutdown_rx()));
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!(
+                "--owner-control requires Unix domain sockets, which this platform does not \
+                 provide. Elevation is unavailable here rather than served over a weaker channel."
+            );
+        }
+    } else {
+        info!(
+            "no owner control socket (start with --owner-control to enable one). Paired clients \
+             may request elevation and cannot obtain it in this deployment."
+        );
+    }
 
     // API server — fatal error if it fails (node is unusable without API)
     let api_addr = config.api.listen_addr;

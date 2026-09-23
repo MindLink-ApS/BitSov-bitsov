@@ -832,10 +832,16 @@ pub struct PeerConfigEntry {
 impl NodeConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let config = Self::load_before_identity_validation(path)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Bootstrap must inspect configured paths before requiring an identity.
+    pub(crate) fn load_before_identity_validation(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&content)?;
         config.anchor_relative_backup_dir(path);
-        config.validate()?;
         Ok(config)
     }
 

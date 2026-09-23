@@ -52,6 +52,18 @@ pub enum Command {
         /// When omitted, the config-file value (default `whitelist`) is used.
         #[arg(long, value_parser = ["whitelist", "price-open"])]
         admission_mode: Option<String>,
+
+        /// Run in OWNER mode: create `<data-dir>/control.sock` (mode 0600), the
+        /// only channel that can grant `spend` or replace a live identity (#76).
+        ///
+        /// Off by default, and deliberately explicit. A packaged sidecar app
+        /// launches the node without this flag and is therefore a
+        /// `read` + `receive` client that may request elevation and can never
+        /// obtain it — the app owns the node's stdout and data directory, so no
+        /// node-emitted secret could exclude it anyway. To spend from a client,
+        /// run the node yourself with this flag and grant deliberately.
+        #[arg(long)]
+        owner_control: bool,
     },
 
     /// Print the node ID derived from a mnemonic file.
@@ -125,6 +137,110 @@ pub enum Command {
     Whitelist {
         #[command(subcommand)]
         command: WhitelistCommand,
+    },
+
+    /// Show paired clients and anything awaiting the owner's decision (#76).
+    ///
+    /// Talks to `<data-dir>/control.sock`, which exists only when the node was
+    /// started with `--owner-control`.
+    PairStatus {
+        /// Path to the configuration file (its directory is the data directory).
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+
+    /// Grant an elevation a client requested, after typing the confirmation (#76).
+    ///
+    /// The owner channel. The requesting app can create the pending request and
+    /// read its status over HTTP; only this command can write the grant.
+    Grant {
+        /// Pending operation id from the app's elevation request.
+        #[arg(long = "op")]
+        op_id: String,
+
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+
+    /// Approve and execute replacement of this node's LIVE identity (#76).
+    ///
+    /// Destructive: it replaces the identity of a node that may hold funds and
+    /// relationships. The recovery phrase is supplied here, by you, and is
+    /// checked against the destination identity the requesting client was
+    /// bound to. The node must be restarted afterwards — this command never
+    /// starts or stops one.
+    ApproveReplacement {
+        /// Pending operation id from the client's replacement request.
+        #[arg(long = "op")]
+        op_id: String,
+
+        /// The 24-word recovery phrase of the destination identity.
+        /// Prompted for if omitted, so it need not appear in shell history.
+        #[arg(long)]
+        mnemonic: Option<String>,
+
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+
+    /// Revoke a pairing, or bump its epoch to kill its outstanding tokens (#76).
+    ///
+    /// Reachable from the CLI as well as from an `admin`-holding client,
+    /// because the client being revoked may be the compromised one.
+    PairRevoke {
+        /// Client to revoke.
+        #[arg(long)]
+        client_id: String,
+
+        /// Keep the pairing and bump its epoch instead of deleting it.
+        #[arg(long)]
+        keep_pairing: bool,
+
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+
+    /// Open a pairing window so another client can pair (#76).
+    ///
+    /// Without a window, pairing is accepted only while no client is paired.
+    PairWindow {
+        /// Window length in seconds.
+        #[arg(long, default_value_t = 300)]
+        seconds: u64,
+
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+
+    /// Repair a data directory the node refused to start from (#76).
+    Repair {
+        #[command(subcommand)]
+        command: RepairCommand,
+    },
+}
+
+/// Repair actions a refusal can name.
+#[derive(Subcommand)]
+pub enum RepairCommand {
+    /// Finish an interrupted first-run transition by writing the marker.
+    ///
+    /// Named by the refusal a node emits when identity material exists but
+    /// `NODE_INITIALIZED` does not — a crash between the rename and the marker.
+    /// It writes the marker and nothing else. The node will not do this on its
+    /// own, because doing it silently would make a crashed transition
+    /// indistinguishable from a completed one.
+    MarkInitialized {
+        /// The data directory to repair.
+        #[arg(short, long, default_value = ".")]
+        dir: PathBuf,
+
+        /// Required: this changes how the node classifies the directory.
+        #[arg(long)]
+        confirm: bool,
     },
 }
 

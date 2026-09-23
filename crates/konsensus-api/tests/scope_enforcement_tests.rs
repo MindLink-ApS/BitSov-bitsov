@@ -39,9 +39,13 @@ const PAID_MESSAGE_ROUTES: &[Route] = &[
 
 /// Key material and identity replacement — the operations that must never follow from
 /// merely being a process on the machine.
+/// `/api/v1/identity/restore` is deliberately NOT in this list: #76 removed it
+/// from the HTTP router entirely. Replacing a live identity executes only over
+/// the owner control socket, so there is no route here to scope-check —
+/// `pairing_tests::http_elevation_write_paths_absent` and
+/// `http_restore_after_owner_approval_has_no_effect` assert its absence instead.
 const IDENTITY_ROUTES: &[Route] = &[
     ("POST", "/api/v1/identity/mnemonic", "{}"),
-    ("POST", "/api/v1/identity/restore", r#"{"mnemonic":"x"}"#),
     ("POST", "/api/v1/identity/verify-mnemonic", r#"{"mnemonic":"x"}"#),
 ];
 
