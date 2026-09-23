@@ -9,6 +9,10 @@
 
 use std::sync::Arc;
 
+#[path = "common/owner_console.rs"]
+mod owner_console;
+use owner_console::OwnerConsole;
+
 use ed25519_dalek::{Signer, SigningKey};
 
 use konsensus_api::auth::Scope;
@@ -40,12 +44,15 @@ fn pair(service: &PairingService, key: &SigningKey, name: &str) -> PairedClient 
 }
 
 /// An owner-run node: a control socket exists, so grants can be written.
-fn owner_run_service(dir: &std::path::Path) -> Arc<PairingService> {
-    Arc::new(
+fn owner_run_service(dir: &std::path::Path) -> (Arc<PairingService>, OwnerConsole) {
+    let console = OwnerConsole::default();
+    let service = Arc::new(
         PairingService::open(dir, current_fingerprint(), true)
             .unwrap()
+            .with_owner_console(Box::new(console.clone()))
             .without_stdout_code(),
-    )
+    );
+    (service, console)
 }
 
 fn current_fingerprint() -> String {
@@ -71,7 +78,7 @@ fn ctx(service: &Arc<PairingService>, data_dir: &std::path::Path) -> ControlCont
 ///
 /// The durable file is the source of truth, so ageing the record on disk is the
 /// honest way to reach the expiry branch — no production test seam needed.
-fn expire_approvals_on_disk(dir: &std::path::Path) -> Arc<PairingService> {
+fn expire_approvals_on_disk(dir: &std::path::Path) -> (Arc<PairingService>, OwnerConsole) {
     let path = dir.join("pairing").join("clients.json");
     let mut file: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -91,7 +98,7 @@ fn expire_approvals_on_disk(dir: &std::path::Path) -> Arc<PairingService> {
 #[test]
 fn spend_grant_binding_enforced() {
     let tmp = tempfile::tempdir().unwrap();
-    let service = owner_run_service(tmp.path());
+    let (service, console) = owner_run_service(tmp.path());
     let key_a = client_key(1);
     let key_b = client_key(2);
     let a = pair(&service, &key_a, "client A");
@@ -118,7 +125,7 @@ fn spend_grant_binding_enforced() {
 
     // POSITIVE CONTROL: the owner's typed confirmation writes the grant, and it
     // reaches the client's token.
-    let phrase = pairing::grant_confirmation_phrase(&op);
+    let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
     let grant = service.grant_elevation(&op.op_id, &phrase).unwrap();
     assert_eq!(grant.client_id, a.client_id);
     assert_eq!(grant.granted_by, "cli");
@@ -203,13 +210,16 @@ fn sidecar_elevation_unavailable() {
     // POSITIVE CONTROL: the very same request succeeds on an owner-run node,
     // so the refusal above is the deployment lock and not a broken code path.
     let tmp2 = tempfile::tempdir().unwrap();
-    let owner = owner_run_service(tmp2.path());
+    let (owner, owner_console) = owner_run_service(tmp2.path());
     let owner_client = pair(&owner, &key, "owner-run app");
     let op2 = owner
         .create_elevation_request(&owner_client.client_id, vec![Scope::Spend])
         .unwrap();
     owner
-        .grant_elevation(&op2.op_id, &pairing::grant_confirmation_phrase(&op2))
+        .grant_elevation(
+            &op2.op_id,
+            &owner_console.confirmation(&pairing::grant_confirmation_phrase(&op2)),
+        )
         .unwrap();
     assert_eq!(owner.reload_from_disk().unwrap().grants.len(), 1);
 }
@@ -219,7 +229,7 @@ fn owner_cli_confirmation_succeeds() {
     // The control-socket request/response path the CLI drives, including the
     // rendered summary and the exact phrase the owner must type.
     let tmp = tempfile::tempdir().unwrap();
-    let service = owner_run_service(tmp.path());
+    let (service, console) = owner_run_service(tmp.path());
     let key = client_key(4);
     let client = pair(&service, &key, "desktop app");
     let op = service
@@ -236,15 +246,15 @@ fn owner_cli_confirmation_succeeds() {
     let phrase = match described {
         ControlResponse::Describe {
             summary,
-            confirmation_phrase,
+            confirmation_label,
         } => {
             assert!(summary.contains(&client.client_id));
             assert!(summary.contains("desktop app"));
             assert!(
-                confirmation_phrase.contains(&op.op_id),
+                confirmation_label.contains(&op.op_id),
                 "the phrase must name the operation"
             );
-            confirmation_phrase
+            console.confirmation(&confirmation_label)
         }
         other => panic!("expected a description, got {other:?}"),
     };
@@ -286,8 +296,10 @@ fn owner_cli_confirmation_succeeds() {
 
 /// Set up an owner-run node with one paired client and a pending, owner-
 /// approved-by-phrase replacement bound to `REPLACEMENT_MNEMONIC`.
-fn pending_replacement(dir: &std::path::Path) -> (Arc<PairingService>, PairedClient, String) {
-    let service = owner_run_service(dir);
+fn pending_replacement(
+    dir: &std::path::Path,
+) -> (Arc<PairingService>, PairedClient, String, OwnerConsole) {
+    let (service, console) = owner_run_service(dir);
     let key = client_key(7);
     let client = pair(&service, &key, "recovery wizard");
     let approval = service
@@ -297,13 +309,13 @@ fn pending_replacement(dir: &std::path::Path) -> (Arc<PairingService>, PairedCli
             REPLACEMENT_MNEMONIC,
         )
         .unwrap();
-    (service, client, approval.op_id)
+    (service, client, approval.op_id, console)
 }
 
 #[test]
 fn replacement_five_field_binding_enforced() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, client, op_id) = pending_replacement(tmp.path());
+    let (service, client, op_id, console) = pending_replacement(tmp.path());
     let approval = service.replacement_approval(&op_id).unwrap();
 
     // The destination is fixed at request time, computed from the phrase
@@ -321,7 +333,10 @@ fn replacement_five_field_binding_enforced() {
     // POSITIVE CONTROL: all five fields matching, after the owner's typed
     // confirmation, consumes exactly once.
     service
-        .approve_replacement(&op_id, &pairing::replacement_confirmation_phrase(&approval))
+        .approve_replacement(
+            &op_id,
+            &console.confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+        )
         .unwrap();
     let consumed = service
         .consume_replacement_approval(
@@ -345,7 +360,7 @@ fn replacement_five_field_binding_enforced() {
 #[test]
 fn no_approval_no_effect() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, client, op_id) = pending_replacement(tmp.path());
+    let (service, client, op_id, console) = pending_replacement(tmp.path());
 
     // Created but never confirmed by the owner.
     let err = service
@@ -372,7 +387,10 @@ fn no_approval_no_effect() {
     // POSITIVE CONTROL: with the owner's confirmation, the same call succeeds.
     let approval = service.replacement_approval(&op_id).unwrap();
     service
-        .approve_replacement(&op_id, &pairing::replacement_confirmation_phrase(&approval))
+        .approve_replacement(
+            &op_id,
+            &console.confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+        )
         .unwrap();
     assert!(service
         .consume_replacement_approval(
@@ -387,10 +405,13 @@ fn no_approval_no_effect() {
 #[test]
 fn wrong_client_no_effect() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, client, op_id) = pending_replacement(tmp.path());
+    let (service, client, op_id, console) = pending_replacement(tmp.path());
     let approval = service.replacement_approval(&op_id).unwrap();
     service
-        .approve_replacement(&op_id, &pairing::replacement_confirmation_phrase(&approval))
+        .approve_replacement(
+            &op_id,
+            &console.confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+        )
         .unwrap();
 
     // Approval issued for client A, consumed by client B.
@@ -426,10 +447,13 @@ fn wrong_client_no_effect() {
 #[test]
 fn wrong_current_identity_no_effect() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, client, op_id) = pending_replacement(tmp.path());
+    let (service, client, op_id, console) = pending_replacement(tmp.path());
     let approval = service.replacement_approval(&op_id).unwrap();
     service
-        .approve_replacement(&op_id, &pairing::replacement_confirmation_phrase(&approval))
+        .approve_replacement(
+            &op_id,
+            &console.confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+        )
         .unwrap();
 
     let err = service
@@ -461,10 +485,13 @@ fn wrong_current_identity_no_effect() {
 #[test]
 fn wrong_replacement_identity_no_effect() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, client, op_id) = pending_replacement(tmp.path());
+    let (service, client, op_id, console) = pending_replacement(tmp.path());
     let approval = service.replacement_approval(&op_id).unwrap();
     service
-        .approve_replacement(&op_id, &pairing::replacement_confirmation_phrase(&approval))
+        .approve_replacement(
+            &op_id,
+            &console.confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+        )
         .unwrap();
 
     // Substituting the destination identity: the owner approved ONE identity.
@@ -490,7 +517,8 @@ fn wrong_replacement_identity_no_effect() {
         &ctx(&service, tmp.path()),
         ControlRequest::ApproveReplacement {
             op_id: op_id.clone(),
-            confirmation: pairing::replacement_confirmation_phrase(&approval),
+            confirmation: console
+                .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
             mnemonic: CURRENT_MNEMONIC.into(),
         },
     );
@@ -507,7 +535,8 @@ fn wrong_replacement_identity_no_effect() {
         &ctx(&service, tmp.path()),
         ControlRequest::ApproveReplacement {
             op_id,
-            confirmation: pairing::replacement_confirmation_phrase(&approval),
+            confirmation: console
+                .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
             mnemonic: REPLACEMENT_MNEMONIC.into(),
         },
     );
@@ -519,10 +548,13 @@ fn wrong_replacement_identity_no_effect() {
 #[test]
 fn replay_no_second_effect() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, client, op_id) = pending_replacement(tmp.path());
+    let (service, client, op_id, console) = pending_replacement(tmp.path());
     let approval = service.replacement_approval(&op_id).unwrap();
     service
-        .approve_replacement(&op_id, &pairing::replacement_confirmation_phrase(&approval))
+        .approve_replacement(
+            &op_id,
+            &console.confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+        )
         .unwrap();
 
     // POSITIVE CONTROL first: one consumption succeeds.
@@ -556,7 +588,7 @@ fn replay_no_second_effect() {
 #[test]
 fn replacement_uses_configured_identity_path() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, _, op_id) = pending_replacement(tmp.path());
+    let (service, _, op_id, console) = pending_replacement(tmp.path());
     let approval = service.replacement_approval(&op_id).unwrap();
     let mut context = ctx(&service, tmp.path());
     let identity_dir = tmp.path().join("identity");
@@ -567,7 +599,8 @@ fn replacement_uses_configured_identity_path() {
         &context,
         ControlRequest::ApproveReplacement {
             op_id,
-            confirmation: pairing::replacement_confirmation_phrase(&approval),
+            confirmation: console
+                .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
             mnemonic: REPLACEMENT_MNEMONIC.into(),
         },
     );
@@ -585,7 +618,7 @@ fn replacement_uses_configured_identity_path() {
 #[test]
 fn encrypted_replacement_refuses_without_consuming_approval() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, _, op_id) = pending_replacement(tmp.path());
+    let (service, _, op_id, console) = pending_replacement(tmp.path());
     let approval = service.replacement_approval(&op_id).unwrap();
     let mut context = ctx(&service, tmp.path());
     context.mnemonic_path = tmp.path().join("mnemonic.enc");
@@ -595,7 +628,8 @@ fn encrypted_replacement_refuses_without_consuming_approval() {
         &context,
         ControlRequest::ApproveReplacement {
             op_id,
-            confirmation: pairing::replacement_confirmation_phrase(&approval),
+            confirmation: console
+                .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
             mnemonic: REPLACEMENT_MNEMONIC.into(),
         },
     );
@@ -611,10 +645,13 @@ fn encrypted_replacement_refuses_without_consuming_approval() {
 #[test]
 fn concurrent_consume_exactly_once() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, client, op_id) = pending_replacement(tmp.path());
+    let (service, client, op_id, console) = pending_replacement(tmp.path());
     let approval = service.replacement_approval(&op_id).unwrap();
     service
-        .approve_replacement(&op_id, &pairing::replacement_confirmation_phrase(&approval))
+        .approve_replacement(
+            &op_id,
+            &console.confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+        )
         .unwrap();
 
     let mut outcomes = Vec::new();
@@ -658,15 +695,18 @@ fn concurrent_consume_exactly_once() {
 #[test]
 fn expired_approval_no_effect() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, client, op_id) = pending_replacement(tmp.path());
+    let (service, client, op_id, console) = pending_replacement(tmp.path());
     let approval = service.replacement_approval(&op_id).unwrap();
     service
-        .approve_replacement(&op_id, &pairing::replacement_confirmation_phrase(&approval))
+        .approve_replacement(
+            &op_id,
+            &console.confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+        )
         .unwrap();
 
     // Age the durable record past its window. Expiry is enforced at
     // consumption, not only at creation.
-    let aged = expire_approvals_on_disk(tmp.path());
+    let (aged, _aged_console) = expire_approvals_on_disk(tmp.path());
     let err = aged
         .consume_replacement_approval(
             &op_id,
@@ -683,7 +723,7 @@ fn expired_approval_no_effect() {
         .create_elevation_request(&client.client_id, vec![Scope::Spend])
         .unwrap();
     let phrase = pairing::grant_confirmation_phrase(&op);
-    let aged2 = expire_approvals_on_disk(tmp.path());
+    let (aged2, console2) = expire_approvals_on_disk(tmp.path());
     let err = aged2.grant_elevation(&op.op_id, &phrase).unwrap_err();
     assert!(matches!(err, PairingError::Expired), "{err}");
     assert!(
@@ -697,7 +737,10 @@ fn expired_approval_no_effect() {
         .create_elevation_request(&client.client_id, vec![Scope::Spend])
         .unwrap();
     aged2
-        .grant_elevation(&fresh.op_id, &pairing::grant_confirmation_phrase(&fresh))
+        .grant_elevation(
+            &fresh.op_id,
+            &console2.confirmation(&pairing::grant_confirmation_phrase(&fresh)),
+        )
         .unwrap();
     assert_eq!(aged2.reload_from_disk().unwrap().grants.len(), 1);
 }
@@ -718,4 +761,49 @@ fn assert_no_authority_or_identity_effect(service: &PairingService, dir: &std::p
     }
     assert!(!dir.join("mnemonic.txt").exists());
     assert!(!dir.join("identity").exists());
+}
+
+#[test]
+fn replacement_approval_requires_owner_console_entropy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, client, op_id, console) = pending_replacement(tmp.path());
+    let approval = service.replacement_approval(&op_id).unwrap();
+    let label = pairing::replacement_confirmation_phrase(&approval);
+    let before = serde_json::to_value(service.snapshot()).unwrap();
+    assert!(matches!(
+        service.approve_replacement(&op_id, &label),
+        Err(PairingError::ConfirmationMismatch)
+    ));
+    assert_eq!(
+        serde_json::to_value(service.reload_from_disk().unwrap()).unwrap(),
+        before
+    );
+    assert_no_authority_or_identity_effect(&service, tmp.path());
+    let phrase = console.confirmation(&label);
+    let other = service
+        .create_replacement_request(
+            &client.client_id,
+            &current_fingerprint(),
+            REPLACEMENT_MNEMONIC,
+        )
+        .unwrap();
+    assert!(matches!(
+        service.approve_replacement(&other.op_id, &phrase),
+        Err(PairingError::ConfirmationMismatch)
+    ));
+    assert!(
+        service
+            .approve_replacement(&op_id, &phrase)
+            .unwrap()
+            .approved
+    );
+    // A restart cannot recover a nonce from the client-readable durable file.
+    let (restarted, _console) = owner_run_service(tmp.path());
+    assert!(matches!(
+        restarted.approve_replacement(
+            &other.op_id,
+            &console.confirmation(&pairing::replacement_confirmation_phrase(&other))
+        ),
+        Err(PairingError::ConfirmationMismatch)
+    ));
 }

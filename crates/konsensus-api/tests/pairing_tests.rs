@@ -1,10 +1,14 @@
 //! The pairing ceremony on the live router, and the absence of every HTTP path
 //! that could write a grant or consume an approval (#76).
 //!
-//! Ports are never bound: the router is driven with `oneshot`. Data
-//! directories are disposable temp dirs.
+//! HTTP cases use `oneshot`; WebSocket cases use disposable loopback port 0
+//! listeners and socket cases use temp directories. No live node is started.
 
 mod common;
+
+#[path = "common/owner_console.rs"]
+mod owner_console;
+use owner_console::OwnerConsole;
 
 use std::sync::Arc;
 
@@ -26,19 +30,21 @@ const REPLACEMENT_MNEMONIC: &str =
 fn state_with_pairing(
     dir: &std::path::Path,
     owner_control: bool,
-) -> (Arc<AppState>, Arc<PairingService>) {
+) -> (Arc<AppState>, Arc<PairingService>, OwnerConsole) {
+    let console = OwnerConsole::default();
     let base = test_state_with_data_dir(dir.to_path_buf());
     let fingerprint = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
     let service = Arc::new(
         PairingService::open(dir, fingerprint, owner_control)
             .unwrap()
+            .with_owner_console(Box::new(console.clone()))
             .without_stdout_code(),
     );
     let state = Arc::new(AppState {
         pairing: Some(Arc::clone(&service)),
         ..(*base).clone()
     });
-    (state, service)
+    (state, service, console)
 }
 
 async fn post(
@@ -129,7 +135,7 @@ async fn pair_and_token(
 #[tokio::test]
 async fn ceremony_pairs_and_issues_a_bound_token() {
     let tmp = tempfile::tempdir().unwrap();
-    let (state, service) = state_with_pairing(tmp.path(), false);
+    let (state, service, _console) = state_with_pairing(tmp.path(), false);
     let app = test_router(state);
     let key = SigningKey::from_bytes(&[21u8; 32]);
 
@@ -185,7 +191,7 @@ async fn ceremony_pairs_and_issues_a_bound_token() {
 async fn loopback_attacker_without_data_dir_read_cannot_pair() {
     // The in-scope attacker: it can reach loopback but cannot read `data_dir`.
     let tmp = tempfile::tempdir().unwrap();
-    let (state, service) = state_with_pairing(tmp.path(), false);
+    let (state, service, _console) = state_with_pairing(tmp.path(), false);
     let app = test_router(state);
     let key = SigningKey::from_bytes(&[33u8; 32]);
     let pubkey = hex::encode(key.verifying_key().to_bytes());
@@ -270,7 +276,7 @@ async fn loopback_attacker_without_data_dir_read_cannot_pair() {
 #[tokio::test]
 async fn pairing_is_closed_once_a_client_is_paired() {
     let tmp = tempfile::tempdir().unwrap();
-    let (state, service) = state_with_pairing(tmp.path(), false);
+    let (state, service, _console) = state_with_pairing(tmp.path(), false);
     let app = test_router(state);
     let key = SigningKey::from_bytes(&[44u8; 32]);
     pair_and_token(&app, &service, &key).await;
@@ -308,7 +314,7 @@ async fn pairing_is_closed_once_a_client_is_paired() {
 #[tokio::test]
 async fn http_elevation_write_paths_absent() {
     let tmp = tempfile::tempdir().unwrap();
-    let (state, service) = state_with_pairing(tmp.path(), true);
+    let (state, service, console) = state_with_pairing(tmp.path(), true);
     let app = test_router(state);
     let key = SigningKey::from_bytes(&[55u8; 32]);
     let (client_id, token) = pair_and_token(&app, &service, &key).await;
@@ -411,7 +417,7 @@ async fn http_elevation_write_paths_absent() {
         &ctx,
         control::ControlRequest::Grant {
             op_id: op_id.clone(),
-            confirmation: pairing::grant_confirmation_phrase(&op),
+            confirmation: console.confirmation(&pairing::grant_confirmation_phrase(&op)),
         },
     );
     assert!(
@@ -430,7 +436,7 @@ async fn http_restore_after_owner_approval_has_no_effect() {
     // identity material. Not with a paired token, not with the strongest
     // key-proof token the node issues, not unauthenticated.
     let tmp = tempfile::tempdir().unwrap();
-    let (state, service) = state_with_pairing(tmp.path(), true);
+    let (state, service, console) = state_with_pairing(tmp.path(), true);
     let app = test_router(Arc::clone(&state));
     let key = SigningKey::from_bytes(&[66u8; 32]);
     let (client_id, token) = pair_and_token(&app, &service, &key).await;
@@ -449,7 +455,10 @@ async fn http_restore_after_owner_approval_has_no_effect() {
     // The OWNER approves it at the control socket.
     let approval = service.replacement_approval(&op_id).unwrap();
     service
-        .approve_replacement(&op_id, &pairing::replacement_confirmation_phrase(&approval))
+        .approve_replacement(
+            &op_id,
+            &console.confirmation(&pairing::replacement_confirmation_phrase(&approval)),
+        )
         .unwrap();
     assert!(service.replacement_approval(&op_id).unwrap().approved);
 
@@ -497,7 +506,8 @@ async fn http_restore_after_owner_approval_has_no_effect() {
         &ctx,
         control::ControlRequest::ApproveReplacement {
             op_id: op_id.clone(),
-            confirmation: pairing::replacement_confirmation_phrase(&approval),
+            confirmation: console
+                .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
             mnemonic: REPLACEMENT_MNEMONIC.into(),
         },
     );
@@ -521,7 +531,7 @@ async fn http_restore_after_owner_approval_has_no_effect() {
 #[tokio::test]
 async fn owner_control_socket_permissions() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_state, service) = state_with_pairing(tmp.path(), true);
+    let (_state, service, _console) = state_with_pairing(tmp.path(), true);
     let ctx = Arc::new(control::ControlContext {
         service: Arc::clone(&service),
         identity_fingerprint: service.bound_fingerprint(),
@@ -558,4 +568,237 @@ async fn owner_control_socket_permissions() {
     std::fs::write(&path, b"stale").ok();
     let reborn = control::ControlServer::bind(tmp.path(), ctx).unwrap();
     assert_eq!(reborn.path(), path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn same_uid_socket_client_cannot_self_grant_from_public_information() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, service, console) = state_with_pairing(tmp.path(), true);
+    let app = test_router(Arc::clone(&state));
+    let (client_id, token) =
+        pair_and_token(&app, &service, &SigningKey::from_bytes(&[61; 32])).await;
+    let (status, response) = post(
+        &app,
+        "/api/v1/pair/elevation-request",
+        serde_json::json!({"scopes": ["spend"]}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let op_id = response["op_id"].as_str().unwrap().to_owned();
+    let context = Arc::new(control::ControlContext {
+        service: Arc::clone(&service),
+        identity_fingerprint: service.bound_fingerprint(),
+        data_dir: tmp.path().to_path_buf(),
+        mnemonic_path: tmp.path().join("mnemonic.txt"),
+    });
+    let server = control::ControlServer::bind(tmp.path(), context).unwrap();
+    let path = server.path().to_path_buf();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let description = control::send(
+        &path,
+        &control::ControlRequest::Describe {
+            op_id: op_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let label = match &description {
+        control::ControlResponse::Describe {
+            confirmation_label, ..
+        } => confirmation_label.clone(),
+        other => panic!("{other:?}"),
+    };
+    let phrase = console.confirmation(&label);
+    let nonce = phrase.split(" CODE ").nth(1).unwrap();
+    let socket_status = control::send(&path, &control::ControlRequest::Status)
+        .await
+        .unwrap();
+    for public in [
+        response.to_string(),
+        serde_json::to_string(&description).unwrap(),
+        serde_json::to_string(&socket_status).unwrap(),
+        std::fs::read_to_string(service.dir().join("clients.json")).unwrap(),
+    ] {
+        assert!(
+            !public.contains(nonce),
+            "owner nonce leaked to a client-readable surface"
+        );
+    }
+    for guessed in [label.clone(), format!("{label} CODE {}", "00".repeat(32))] {
+        let denied = control::send(
+            &path,
+            &control::ControlRequest::Grant {
+                op_id: op_id.clone(),
+                confirmation: guessed,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(denied, control::ControlResponse::Error { .. }));
+        let durable = service.reload_from_disk().unwrap();
+        assert!(durable.grants.is_empty());
+        assert_eq!(durable.clients[0].scopes, pairing::default_pairing_scopes());
+        assert!(!tmp.path().join("mnemonic.txt").exists());
+    }
+    let approved = control::send(
+        &path,
+        &control::ControlRequest::Grant {
+            op_id: op_id.clone(),
+            confirmation: phrase.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(approved, control::ControlResponse::Ok { .. }));
+    assert_eq!(
+        service.reload_from_disk().unwrap().grants[0].client_id,
+        client_id
+    );
+    let replay = control::send(
+        &path,
+        &control::ControlRequest::Grant {
+            op_id,
+            confirmation: phrase,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(replay, control::ControlResponse::Error { .. }));
+    assert_eq!(service.reload_from_disk().unwrap().grants.len(), 1);
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+
+async fn ws_connect(
+    addr: std::net::SocketAddr,
+    token: &str,
+    subprotocol: bool,
+) -> (u16, tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (query, header) = if subprotocol {
+        (
+            String::new(),
+            format!("Sec-WebSocket-Protocol: bitsov.v1, bitsov.jwt.{token}\r\n"),
+        )
+    } else {
+        (format!("?token={token}"), String::new())
+    };
+    stream.write_all(format!("GET /api/v1/ws{query} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{header}\r\n").as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !response.ends_with(b"\r\n\r\n") {
+            response.push(stream.read_u8().await.unwrap());
+            assert!(response.len() < 8192);
+        }
+    })
+    .await
+    .unwrap();
+    let status = std::str::from_utf8(&response)
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    (status, stream)
+}
+
+async fn read_ws_text(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        assert_eq!(stream.read_u8().await.unwrap(), 0x81);
+        let size = stream.read_u8().await.unwrap();
+        assert!(size <= 126, "unmasked, bounded fixture frame");
+        let size = if size == 126 {
+            stream.read_u16().await.unwrap() as usize
+        } else {
+            size as usize
+        };
+        let mut bytes = vec![0; size];
+        stream.read_exact(&mut bytes).await.unwrap();
+        String::from_utf8(bytes).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn websocket_pairing_binding_blocks_upgrade_and_post_revocation_plaintext() {
+    use tokio::io::AsyncReadExt;
+    for mutation in ["revoke", "epoch", "identity"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, service, _console) = state_with_pairing(tmp.path(), false);
+        let app = test_router(Arc::clone(&state));
+        let (client_id, token) =
+            pair_and_token(&app, &service, &SigningKey::from_bytes(&[62; 32])).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let (status, mut socket) = ws_connect(addr, &token, false).await;
+        assert_eq!(
+            status, 101,
+            "positive control must reach the real upgrade handler"
+        );
+        let (status, subprotocol_socket) = ws_connect(addr, &token, true).await;
+        assert_eq!(status, 101);
+        drop(subprotocol_socket);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while state.ws_broadcast.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let envelope = konsensus_core::UkmEnvelopeBuilder::new(
+            100,
+            *state.identity.node_id(),
+            konsensus_core::types::Recipient::Node(*state.identity.node_id()),
+            vec![],
+            konsensus_core::PaymentProof::new([0; 32], [0; 32], 0),
+        )
+        .build();
+        let message = Arc::new(konsensus_api::state::WsMessage {
+            envelope,
+            plaintext: Some("plaintext-before-revocation".into()),
+        });
+        state.ws_broadcast.send(Arc::clone(&message)).unwrap();
+        assert!(read_ws_text(&mut socket)
+            .await
+            .contains("plaintext-before-revocation"));
+        match mutation {
+            "revoke" => service.revoke(&client_id).unwrap(),
+            "epoch" => {
+                service.bump_epoch(&client_id).unwrap();
+            }
+            _ => service
+                .rebind_to_identity("replacement-fingerprint")
+                .unwrap(),
+        }
+        for subprotocol in [false, true] {
+            assert_eq!(
+                ws_connect(addr, &token, subprotocol).await.0,
+                401,
+                "{mutation}"
+            );
+        }
+        state.ws_broadcast.send(message).unwrap();
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(3), socket.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "revoked stream received a frame: {read:?}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
 }

@@ -393,12 +393,12 @@ pub fn short_code(challenge: &[u8]) -> String {
     out
 }
 
-/// The exact phrase the owner must type to write a spend grant.
+/// Public operation label. Authorization also needs the owner-console nonce.
 pub fn grant_confirmation_phrase(op: &PendingElevation) -> String {
     format!("GRANT {} TO {}", scope_list(&op.scopes), op.op_id)
 }
 
-/// The exact phrase the owner must type to approve a live-identity replacement.
+/// Public operation label. This is not proof of owner approval by itself.
 pub fn replacement_confirmation_phrase(approval: &ReplacementApproval) -> String {
     format!("REPLACE IDENTITY {}", approval.op_id)
 }
@@ -428,6 +428,7 @@ pub struct PairingService {
     /// Whether the short code is echoed to stdout. Off in tests so a test run
     /// does not scribble on the harness's output.
     print_short_code: bool,
+    owner_console: Mutex<Box<dyn std::io::Write + Send>>,
 }
 
 struct Inner {
@@ -436,6 +437,37 @@ struct Inner {
     token_challenges: HashMap<String, (String, Instant)>,
     window_until: Option<Instant>,
     identity_fingerprint: String,
+    // Never serialized or returned by HTTP/control status. Restart invalidates
+    // pending console challenges; the owner must request a new operation.
+    owner_confirmations: HashMap<String, (blake3::Hash, i64)>,
+}
+
+struct OwnerTerminal;
+
+impl std::io::Write for OwnerTerminal {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            // A dedicated owner terminal, never tracing, stdout capture, or a
+            // file under data_dir. No terminal means no elevation challenge.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/tty")?
+                .write(bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = bytes;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "owner terminal unavailable",
+            ))
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl PairingService {
@@ -493,10 +525,69 @@ impl PairingService {
                 token_challenges: HashMap::new(),
                 window_until: None,
                 identity_fingerprint,
+                owner_confirmations: HashMap::new(),
             }),
             owner_control_enabled,
             print_short_code: true,
+            owner_console: Mutex::new(Box::new(OwnerTerminal)),
         })
+    }
+
+    /// Supply a trusted owner-console transport (also used by disposable test
+    /// fixtures). This is not a request field or a configuration override.
+    pub fn with_owner_console(mut self, console: Box<dyn std::io::Write + Send>) -> Self {
+        self.owner_console = Mutex::new(console);
+        self
+    }
+
+    fn console_challenge(
+        &self,
+        inner: &mut Inner,
+        op_id: &str,
+        label: &str,
+        expires_at: i64,
+    ) -> Result<(), PairingError> {
+        if !self.owner_control_enabled {
+            return Ok(());
+        }
+        let mut nonce = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let phrase = format!("{label} CODE {}", hex::encode(nonce));
+        let mut console = self
+            .owner_console
+            .lock()
+            .map_err(|_| PairingError::Io("owner console unavailable".into()))?;
+        console.write_all(
+            format!("\nOwner approval (expires {expires_at}):\n{phrase}\n").as_bytes(),
+        )?;
+        console.flush()?;
+        inner
+            .owner_confirmations
+            .retain(|_, (_, expiry)| *expiry > chrono::Utc::now().timestamp());
+        inner.owner_confirmations.insert(
+            op_id.to_owned(),
+            (blake3::hash(phrase.as_bytes()), expires_at),
+        );
+        Ok(())
+    }
+
+    fn verify_owner_confirmation(
+        inner: &Inner,
+        op_id: &str,
+        confirmation: &str,
+    ) -> Result<(), PairingError> {
+        let valid = inner
+            .owner_confirmations
+            .get(op_id)
+            .is_some_and(|(digest, expiry)| {
+                *expiry > chrono::Utc::now().timestamp()
+                    && *digest == blake3::hash(confirmation.trim().as_bytes())
+            });
+        if valid {
+            Ok(())
+        } else {
+            Err(PairingError::ConfirmationMismatch)
+        }
     }
 
     /// Test/bootstrap helper: suppress the stdout tripwire print.
@@ -1057,6 +1148,7 @@ impl PairingService {
         inner.file.grants.clear();
         inner.file.pending_elevations.clear();
         inner.file.replacement_approvals.clear();
+        inner.owner_confirmations.clear();
         self.persist(&inner.file)?;
         Ok(())
     }
@@ -1095,6 +1187,12 @@ impl PairingService {
             created_at: now,
             expires_at: now + ELEVATION_TTL_SECS,
         };
+        self.console_challenge(
+            &mut inner,
+            &op.op_id,
+            &grant_confirmation_phrase(&op),
+            op.expires_at,
+        )?;
         inner.file.pending_elevations.retain(|e| e.expires_at > now);
         inner.file.pending_elevations.push(op.clone());
         self.persist(&inner.file)?;
@@ -1139,9 +1237,8 @@ impl PairingService {
 
     /// Write a spend grant. **Owner CLI only.**
     ///
-    /// `confirmation` must be exactly [`grant_confirmation_phrase`] for this
-    /// operation: a message arriving on the socket is not consent by itself, it
-    /// has to name the specific pending operation.
+    /// Requires the operation-bound random confirmation printed only to the
+    /// owner console. The public operation label is insufficient.
     pub fn grant_elevation(
         &self,
         op_id: &str,
@@ -1164,9 +1261,7 @@ impl PairingService {
             self.persist(&inner.file)?;
             return Err(PairingError::Expired);
         }
-        if confirmation.trim() != grant_confirmation_phrase(&op) {
-            return Err(PairingError::ConfirmationMismatch);
-        }
+        Self::verify_owner_confirmation(&inner, op_id, confirmation)?;
         let client = inner
             .file
             .clients
@@ -1188,6 +1283,7 @@ impl PairingService {
         inner.file.grants.retain(|g| g.client_id != grant.client_id);
         inner.file.grants.push(grant.clone());
         self.persist(&inner.file)?;
+        inner.owner_confirmations.remove(op_id);
         Ok(grant)
     }
 
@@ -1225,6 +1321,12 @@ impl PairingService {
             expires_at: now + ELEVATION_TTL_SECS,
             approved: false,
         };
+        self.console_challenge(
+            &mut inner,
+            &approval.op_id,
+            &replacement_confirmation_phrase(&approval),
+            approval.expires_at,
+        )?;
         inner
             .file
             .replacement_approvals
@@ -1260,9 +1362,7 @@ impl PairingService {
             self.persist(&inner.file)?;
             return Err(PairingError::Expired);
         }
-        if confirmation.trim() != replacement_confirmation_phrase(&existing) {
-            return Err(PairingError::ConfirmationMismatch);
-        }
+        Self::verify_owner_confirmation(&inner, op_id, confirmation)?;
         let approved = ReplacementApproval {
             approved: true,
             ..existing

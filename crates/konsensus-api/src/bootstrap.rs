@@ -67,6 +67,10 @@ pub const IDENTITY_DIR: &str = "identity";
 pub struct DataDirLayout {
     /// The node data directory.
     pub data_dir: PathBuf,
+    mnemonic_path: Option<PathBuf>,
+    storage_path: Option<PathBuf>,
+    backup_dir: Option<PathBuf>,
+    external_store: bool,
 }
 
 impl DataDirLayout {
@@ -74,7 +78,26 @@ impl DataDirLayout {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            mnemonic_path: None,
+            storage_path: None,
+            backup_dir: None,
+            external_store: false,
         }
+    }
+
+    /// Use the same configured paths as the running node. A remote store cannot
+    /// be proven empty by a filesystem probe, so it never permits bootstrap.
+    pub fn with_configured_paths(
+        mut self,
+        mnemonic: PathBuf,
+        sqlite: Option<PathBuf>,
+        backup_dir: PathBuf,
+    ) -> Self {
+        self.mnemonic_path = Some(mnemonic);
+        self.external_store = sqlite.is_none();
+        self.storage_path = sqlite;
+        self.backup_dir = Some(backup_dir);
+        self
     }
 
     /// The initialization marker.
@@ -90,28 +113,39 @@ impl DataDirLayout {
     /// Every place a mnemonic may live. `init` writes the top-level file; the
     /// bootstrap transition writes the one under `identity/`.
     pub fn mnemonic_candidates(&self) -> Vec<PathBuf> {
-        vec![
+        let mut paths = vec![
             self.data_dir.join("mnemonic.txt"),
             self.data_dir.join("mnemonic.enc"),
             self.identity_dir().join("mnemonic.txt"),
             self.identity_dir().join("mnemonic.enc"),
-        ]
+            self.identity_dir().join("identity.json"),
+        ];
+        paths.extend(self.mnemonic_path.iter().cloned());
+        paths
     }
 
     /// Wallet, channel and store state. Any of these on a marker-less node
     /// means "deleted key", not "fresh install".
     pub fn state_candidates(&self) -> Vec<PathBuf> {
-        vec![
+        let mut paths = vec![
             self.data_dir.join("konsensus.db"),
             self.data_dir.join("ldk"),
-            self.data_dir.join("scb-latest.aes"),
-            self.data_dir.join("whitelist-latest.aes"),
-        ]
+            self.identity_dir().join("ldk"),
+            self.data_dir.join("backups"),
+        ];
+        if let Some(mnemonic) = &self.mnemonic_path {
+            paths.push(mnemonic.parent().unwrap_or(Path::new(".")).join("ldk"));
+        }
+        paths.extend(self.storage_path.iter().cloned());
+        paths.extend(self.backup_dir.iter().cloned());
+        paths
     }
 
     /// The storage database, whose readability is checked on an initialized node.
     pub fn store(&self) -> PathBuf {
-        self.data_dir.join("konsensus.db")
+        self.storage_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("konsensus.db"))
     }
 
     /// The config file `konsensus init` writes and the transition does not.
@@ -142,12 +176,18 @@ pub struct DataDirProbe {
 impl DataDirProbe {
     /// Probe `layout` on disk.
     pub fn inspect(layout: &DataDirLayout) -> io::Result<Self> {
-        let marker_present = layout.marker().exists();
-        let identity_material_present = layout.mnemonic_candidates().iter().any(|p| p.exists());
-        let wallet_or_channel_state_present = layout.state_candidates().iter().any(|p| p.exists());
+        let marker_present = layout.marker().try_exists()?;
+        let mut identity_material_present = false;
+        for path in layout.mnemonic_candidates() {
+            identity_material_present |= path.try_exists()?;
+        }
+        let mut wallet_or_channel_state_present = layout.external_store;
+        for path in layout.state_candidates() {
+            wallet_or_channel_state_present |= path.try_exists()?;
+        }
 
         let store = layout.store();
-        let store_readable = if store.exists() {
+        let store_readable = if store.try_exists()? {
             is_readable_sqlite(&store)
         } else {
             true
@@ -187,11 +227,8 @@ fn is_readable_sqlite(path: &Path) -> bool {
     };
     let mut header = [0u8; 16];
     match f.read_exact(&mut header) {
-        // An empty file is what `File::create` leaves behind before sqlx
-        // initialises it; treat it as readable rather than corrupt.
-        Err(_) => std::fs::metadata(path)
-            .map(|m| m.len() == 0)
-            .unwrap_or(false),
+        // A truncated existing store is not a fresh database.
+        Err(_) => false,
         Ok(()) => &header == b"SQLite format 3\0",
     }
 }
@@ -466,10 +503,10 @@ pub struct BootstrapState {
     /// Pairing service, bound to the empty fingerprint until the commit.
     pub pairing: Arc<PairingService>,
     /// **Ephemeral** signing secret, generated at start and held only in
-    /// memory. At transition the live node switches to the identity-derived
-    /// secret, so every bootstrap-issued token stops verifying at the same
-    /// instant. There is no window in which a bootstrap token outlives
-    /// bootstrap.
+    /// memory. This value does not rotate in this process. Commit rebinds the
+    /// pairing fingerprint and strips identity authority, invalidating the
+    /// bootstrap binding. A separately started live node uses its own
+    /// identity-derived secret and also rejects the `bst` claim explicitly.
     pub jwt_secret: String,
     /// Single-flight guard: one transition attempt per process.
     transition: Mutex<()>,
@@ -670,7 +707,9 @@ pub struct PairTokenResponse {
     pub scopes: Vec<Scope>,
 }
 
-fn pairing_error_response(e: PairingError) -> Response {
+type BootstrapError = (StatusCode, String);
+
+fn pairing_error_response(e: PairingError) -> BootstrapError {
     let status = match e {
         PairingError::Closed => StatusCode::CONFLICT,
         PairingError::TooManyPending => StatusCode::TOO_MANY_REQUESTS,
@@ -681,13 +720,13 @@ fn pairing_error_response(e: PairingError) -> Response {
         PairingError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::FORBIDDEN,
     };
-    (status, e.to_string()).into_response()
+    (status, e.to_string())
 }
 
 async fn pair_request(
     State(state): State<Arc<BootstrapState>>,
     Json(body): Json<PairRequestBody>,
-) -> Result<Json<PairRequestResponse>, Response> {
+) -> Result<Json<PairRequestResponse>, BootstrapError> {
     let outcome = state
         .pairing
         .request_pairing(&body.client_name, &body.client_pubkey)
@@ -707,7 +746,7 @@ async fn pair_request(
 async fn pair_confirm(
     State(state): State<Arc<BootstrapState>>,
     Json(body): Json<PairConfirmBody>,
-) -> Result<Json<PairConfirmResponse>, Response> {
+) -> Result<Json<PairConfirmResponse>, BootstrapError> {
     // First-run pairings carry `identity` — and only while no identity exists.
     // `rebind_to_identity` strips it as part of the transition commit.
     let record = state
@@ -733,7 +772,7 @@ struct ChallengeQuery {
 async fn pair_challenge(
     State(state): State<Arc<BootstrapState>>,
     axum::extract::Query(q): axum::extract::Query<ChallengeQuery>,
-) -> Result<Json<serde_json::Value>, Response> {
+) -> Result<Json<serde_json::Value>, BootstrapError> {
     let challenge = state
         .pairing
         .issue_token_challenge(&q.client_id)
@@ -744,7 +783,7 @@ async fn pair_challenge(
 async fn pair_token(
     State(state): State<Arc<BootstrapState>>,
     Json(body): Json<PairTokenBody>,
-) -> Result<Json<PairTokenResponse>, Response> {
+) -> Result<Json<PairTokenResponse>, BootstrapError> {
     // Bootstrap tokens are minted against the ephemeral secret and marked
     // `bst`, so they cannot be replayed against the live node after commit.
     let issued = state
@@ -783,27 +822,26 @@ pub struct FirstRunResponse {
     pub mnemonic: Option<String>,
 }
 
-fn commit_error_response(e: CommitError) -> Response {
+fn commit_error_response(e: CommitError) -> BootstrapError {
     let status = match e {
         CommitError::Conflict => StatusCode::CONFLICT,
         CommitError::InvalidMnemonic(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (status, e.to_string()).into_response()
+    (status, e.to_string())
 }
 
 async fn first_run_restore(
     _auth: BootstrapAuth,
     State(state): State<Arc<BootstrapState>>,
     Json(body): Json<FirstRunRestoreBody>,
-) -> Result<Json<FirstRunResponse>, Response> {
+) -> Result<Json<FirstRunResponse>, BootstrapError> {
     let words = body.mnemonic.split_whitespace().count();
     if words != 12 && words != 24 {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("mnemonic must be 12 or 24 words, got {words}"),
-        )
-            .into_response());
+        ));
     }
     let outcome = state
         .transition(&body.mnemonic, CommitFault::None)
@@ -818,9 +856,9 @@ async fn first_run_restore(
 async fn first_run_create(
     _auth: BootstrapAuth,
     State(state): State<Arc<BootstrapState>>,
-) -> Result<Json<FirstRunResponse>, Response> {
+) -> Result<Json<FirstRunResponse>, BootstrapError> {
     let (mnemonic, _identity) = konsensus_core::NodeIdentity::generate()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let outcome = state
         .transition(&mnemonic, CommitFault::None)
         .map_err(commit_error_response)?;

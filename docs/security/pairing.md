@@ -68,8 +68,14 @@ Therefore, per the operator lock:
 - OS user-presence (Touch ID, Windows Hello) would close the sidecar case
   properly. Out of scope for this step; not approximated by anything weaker.
 
-Consent is the **typed phrase**, not the connection: every mutating control
-request must carry a confirmation that names the specific pending operation id.
+Elevation consent requires an operation-bound **256-bit random nonce** printed
+only to the owner node's controlling terminal (`/dev/tty`), never stdout,
+tracing, HTTP, socket status/description, or a file under `data_dir`. The CLI
+asks for that full confirmation. Knowing the public operation id/label or
+connecting as the same uid is insufficient. Without an owner terminal,
+elevation fails closed. Pending challenges are memory-only and lost on restart;
+the owner must request a new operation. Arbitrary access to the owner's terminal
+or process memory remains outside this tier's threat model.
 
 ### Live-identity replacement binds five fields
 
@@ -131,9 +137,10 @@ The transition is one commit, **marker last**: stage into `.init-<uuid>/`,
 fsync, `rename()` into place, rebind pairings to the committed identity, then
 write the marker and fsync the parent. Single-flight — a concurrent second
 attempt gets `409` and writes nothing. Bootstrap runs on an **ephemeral**
-in-memory signing secret, so every bootstrap token stops verifying the instant
-the identity-derived secret takes over; bootstrap tokens are additionally marked
-and refused by the live router. A crash before the rename leaves a staging
+in-memory signing secret which does not rotate inside the bootstrap process.
+Commit rebinds the pairing fingerprint and strips identity authority, so old
+bootstrap bindings fail immediately. The separately started live node derives
+its own secret and also rejects tokens marked `bst`. A crash before the rename leaves a staging
 directory that startup reports and never consumes; a crash after it refuses and
 demands repair. The node is never auto-started into live operation by an API
 call.

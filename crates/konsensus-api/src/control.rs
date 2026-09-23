@@ -36,8 +36,9 @@
 //! # Consent is the typed phrase, not the connection
 //!
 //! The node never treats "a message arrived on the socket" as consent. Each
-//! mutating request must carry a confirmation phrase that **names the specific
-//! pending operation id**; a mismatch is a refusal that writes nothing.
+//! elevation/replacement request must carry an operation-bound random nonce
+//! printed only to the owner node's terminal. HTTP, socket status, and files
+//! expose no nonce. Same-uid socket access alone is insufficient.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -113,12 +114,12 @@ pub enum ControlResponse {
         /// Pending replacement approvals awaiting the owner.
         pending_replacements: Vec<ReplacementSummary>,
     },
-    /// A rendered pending operation plus the exact phrase to type.
+    /// A rendered pending operation and public label, never its secret nonce.
     Describe {
         /// Human-readable summary the CLI prints verbatim.
         summary: String,
-        /// The phrase the owner must type, exactly.
-        confirmation_phrase: String,
+        /// Public label to match against the owner node's console.
+        confirmation_label: String,
     },
     /// The operation succeeded.
     Ok {
@@ -416,7 +417,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             op.expires_at
         );
         return ControlResponse::Describe {
-            confirmation_phrase: grant_confirmation_phrase(op),
+            confirmation_label: grant_confirmation_phrase(op),
             summary,
         };
     }
@@ -435,7 +436,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             a.expires_at
         );
         return ControlResponse::Describe {
-            confirmation_phrase: replacement_confirmation_phrase(a),
+            confirmation_label: replacement_confirmation_phrase(a),
             summary,
         };
     }

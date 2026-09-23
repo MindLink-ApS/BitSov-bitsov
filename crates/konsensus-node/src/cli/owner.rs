@@ -8,16 +8,16 @@
 //! port-forward).
 //!
 //! A message arriving on that socket is not consent by itself. Each mutating
-//! command renders the pending operation, requires the human to type a
-//! confirmation phrase that **names the specific operation id**, and sends what
-//! they typed for the node to verify.
+//! elevation/replacement command renders the pending operation and requires a
+//! confirmation containing the random nonce printed only to the owner node's
+//! controlling terminal. The public operation id alone is not consent.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::config::{NodeConfig, NodeTier};
+use crate::config::{NodeConfig, NodeTier, StorageConfig};
 use konsensus_api::bootstrap::{self, DataDirLayout, StartupMode};
 use konsensus_api::control::{self, ControlRequest, ControlResponse};
 use konsensus_api::pairing::PairingService;
@@ -35,9 +35,8 @@ pub fn prepare_start(config_path: &Path) -> Result<(StartupMode, NodeConfig)> {
             &data_dir,
         )
     };
-    let mut probe = bootstrap::DataDirProbe::inspect(&layout)?;
-    // A configured identity outside the default layout is still existing state.
-    probe.identity_material_present |= config.identity.mnemonic_file.try_exists()?;
+    let layout = configured_layout(&data_dir, &config);
+    let probe = bootstrap::DataDirProbe::inspect(&layout)?;
     for stray in &probe.stray_staging {
         tracing::warn!(path = %stray.display(), "ignoring interrupted bootstrap staging");
     }
@@ -58,6 +57,18 @@ pub fn prepare_start(config_path: &Path) -> Result<(StartupMode, NodeConfig)> {
         anyhow::bail!("bootstrap requires a loopback API listen address");
     }
     Ok((mode, config))
+}
+
+fn configured_layout(data_dir: &Path, config: &NodeConfig) -> DataDirLayout {
+    let sqlite = match &config.storage {
+        StorageConfig::Sqlite { path, .. } => Some(PathBuf::from(path)),
+        StorageConfig::Postgres { .. } => None,
+    };
+    DataDirLayout::new(data_dir).with_configured_paths(
+        config.identity.mnemonic_file.clone(),
+        sqlite,
+        PathBuf::from(&config.backup.scb_dir),
+    )
 }
 
 /// The data directory is the config file's directory, matching `AppState::data_dir`.
@@ -167,8 +178,8 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
 
 /// Render a pending operation and read the owner's typed confirmation.
 ///
-/// The phrase is shown and must be typed back exactly. The node checks it again
-/// server-side: this prompt is the human step, not the enforcement.
+/// Only the public label comes from the socket. The unpredictable confirmation
+/// must be copied from the owner-run node's terminal, never this API response.
 async fn confirm_interactively(config_path: &Path, op_id: &str) -> Result<String> {
     let described = send(
         config_path,
@@ -180,13 +191,13 @@ async fn confirm_interactively(config_path: &Path, op_id: &str) -> Result<String
     let (summary, phrase) = match described {
         ControlResponse::Describe {
             summary,
-            confirmation_phrase,
-        } => (summary, confirmation_phrase),
+            confirmation_label,
+        } => (summary, confirmation_label),
         other => return report(other).map(|()| String::new()),
     };
 
     println!("\n{summary}\n");
-    println!("To proceed, type this phrase exactly:\n\n  {phrase}\n");
+    println!("On the owner node's console, find {phrase}.\nType its full confirmation, including CODE and the random nonce.\n");
     print!("> ");
     std::io::stdout().flush().ok();
 
@@ -411,5 +422,77 @@ mod startup_tests {
         let (mode, config) = prepare_start(&dir.path().join("konsensus.toml")).unwrap();
         assert_eq!(mode, StartupMode::Initialized);
         assert_eq!(config.identity.mnemonic_file, outcome.mnemonic_path);
+    }
+
+    #[test]
+    fn bootstrap_probes_nested_and_configured_channel_state() {
+        for external in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let other = tempfile::tempdir().unwrap();
+            let identity_dir = if external {
+                other.path().to_path_buf()
+            } else {
+                dir.path().join("identity")
+            };
+            let config = NodeConfig::default_for_tier(
+                NodeTier::Full,
+                identity_dir.join("mnemonic.txt"),
+                dir.path(),
+            );
+            let path = dir.path().join("konsensus.toml");
+            config.save(&path).unwrap();
+            assert_eq!(prepare_start(&path).unwrap().0, StartupMode::Bootstrap);
+            let ldk = identity_dir.join("ldk");
+            std::fs::create_dir_all(&ldk).unwrap();
+            let monitor = ldk.join("channel-monitor-fixture");
+            std::fs::write(&monitor, b"retained channel state").unwrap();
+            assert!(prepare_start(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("state_without_identity"));
+            assert_eq!(std::fs::read(&monitor).unwrap(), b"retained channel state");
+            assert!(!dir.path().join("NODE_INITIALIZED").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_probes_configured_store_and_backup_paths() {
+        for artifact in ["sqlite", "scb-latest.aes", "whitelist-latest.aes"] {
+            let dir = tempfile::tempdir().unwrap();
+            let other = tempfile::tempdir().unwrap();
+            let mut config = NodeConfig::default_for_tier(
+                NodeTier::Full,
+                dir.path().join("mnemonic.txt"),
+                dir.path(),
+            );
+            let store_path = other.path().join("messages.sqlite");
+            config.storage = StorageConfig::Sqlite {
+                path: store_path.to_string_lossy().into_owned(),
+                encrypted: true,
+                retention_days: 0,
+            };
+            let backup_dir = other.path().join("recovery");
+            config.backup.scb_dir = backup_dir.to_string_lossy().into_owned();
+            let path = dir.path().join("konsensus.toml");
+            config.save(&path).unwrap();
+            assert_eq!(prepare_start(&path).unwrap().0, StartupMode::Bootstrap);
+            let _store = if artifact == "sqlite" {
+                Some(
+                    konsensus_storage::SqliteStorage::open(store_path.to_str().unwrap())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                std::fs::create_dir(&backup_dir).unwrap();
+                std::fs::write(backup_dir.join(artifact), b"encrypted backup fixture").unwrap();
+                None
+            };
+            assert!(prepare_start(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("state_without_identity"));
+            assert!(!dir.path().join("NODE_INITIALIZED").exists());
+            assert!(!dir.path().join("identity").exists());
+        }
     }
 }

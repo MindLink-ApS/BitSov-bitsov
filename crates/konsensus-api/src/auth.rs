@@ -509,7 +509,7 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
 /// Rejection is outright in every failure case. There is no path here that
 /// downgrades a token to a weaker scope set to keep a caller working — the
 /// same discipline #72 applied to the scope-less legacy token.
-fn check_pairing_binding(
+pub(crate) fn check_pairing_binding(
     state: &Arc<AppState>,
     claims: &Claims,
 ) -> Result<Option<PairingBinding>, String> {

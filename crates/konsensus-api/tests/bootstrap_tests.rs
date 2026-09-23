@@ -150,8 +150,8 @@ fn bootstrap_partial_state_refuses() {
     );
 }
 
-#[test]
-fn bootstrap_ignores_balance() {
+#[tokio::test]
+async fn bootstrap_ignores_balance() {
     // Balance is not an authorization input. It is not a field of
     // `DataDirProbe`, so `classify` CANNOT consult it — the compiler enforces
     // that, and these two cases show the consequence at runtime.
@@ -161,8 +161,11 @@ fn bootstrap_ignores_balance() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("mnemonic.txt"), MNEMONIC).unwrap();
     std::fs::write(tmp.path().join("NODE_INITIALIZED"), "{}").unwrap();
-    // An empty wallet database: zero funds by any measure.
-    std::fs::write(tmp.path().join("konsensus.db"), b"").unwrap();
+    // A valid, newly initialized store, not a zero-byte corrupt file.
+    let _store =
+        konsensus_storage::SqliteStorage::open(tmp.path().join("konsensus.db").to_str().unwrap())
+            .await
+            .unwrap();
     assert_eq!(
         bootstrap::classify(&probe(tmp.path())),
         StartupMode::Initialized,
