@@ -60,8 +60,14 @@ pub fn prepare_start(config_path: &Path) -> Result<(StartupMode, NodeConfig)> {
 }
 
 fn configured_layout(data_dir: &Path, config: &NodeConfig) -> DataDirLayout {
+    // The configured store is a connection string, not a path: the runtime
+    // hands it to sqlx, which strips a `sqlite:` / `sqlite://` scheme and any
+    // query parameters before opening the file. Resolve it the same way, so the
+    // retained-state probe looks at the file the runtime actually created. An
+    // unresolvable string (in-memory, or one the runtime would reject) is
+    // treated like a remote store: it cannot be proven empty, so no bootstrap.
     let sqlite = match &config.storage {
-        StorageConfig::Sqlite { path, .. } => Some(PathBuf::from(path)),
+        StorageConfig::Sqlite { path, .. } => konsensus_storage::sqlite::sqlite_file_path(path),
         StorageConfig::Postgres { .. } => None,
     };
     DataDirLayout::new(data_dir).with_configured_paths(
@@ -518,6 +524,69 @@ mod startup_tests {
                 .contains("state_without_identity"));
             assert_eq!(std::fs::read(&monitor).unwrap(), b"retained channel state");
             assert!(!dir.path().join("NODE_INITIALIZED").exists());
+        }
+    }
+
+    /// P1-3: a store configured as a `sqlite://` URI is probed at the file the
+    /// runtime opens, not at a literal path spelled `sqlite:///...`. With a
+    /// real runtime-created database retained, deleting the mnemonic and the
+    /// marker is a deleted key, and must refuse rather than reopen bootstrap.
+    #[tokio::test]
+    async fn sqlite_uri_store_cannot_bypass_retained_state_detection() {
+        for spelling in ["uri", "literal"] {
+            let dir = tempfile::tempdir().unwrap();
+            let other = tempfile::tempdir().unwrap();
+            let store_file = other.path().join("external.sqlite");
+            let configured = match spelling {
+                "uri" => format!("sqlite://{}", store_file.display()),
+                _ => store_file.to_string_lossy().into_owned(),
+            };
+            if spelling == "uri" {
+                assert!(configured.starts_with("sqlite:///"), "{configured}");
+            }
+            let layout = DataDirLayout::new(dir.path());
+            let mut config = NodeConfig::default_for_tier(
+                NodeTier::Full,
+                layout.identity_dir().join("mnemonic.txt"),
+                dir.path(),
+            );
+            config.storage = StorageConfig::Sqlite {
+                path: configured.clone(),
+                encrypted: true,
+                retention_days: 0,
+            };
+            let path = dir.path().join("konsensus.toml");
+            config.save(&path).unwrap();
+            assert_eq!(prepare_start(&path).unwrap().0, StartupMode::Bootstrap);
+
+            // A committed identity, then the database the runtime creates
+            // through the very same connection string.
+            let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+            let outcome = bootstrap::commit_first_run(&layout, phrase, None).unwrap();
+            let _store = konsensus_storage::SqliteStorage::open(&configured)
+                .await
+                .unwrap();
+            assert!(store_file.exists(), "{spelling}: runtime store not created");
+            assert_eq!(
+                prepare_start(&path).unwrap().0,
+                StartupMode::Initialized,
+                "{spelling}"
+            );
+
+            // Delete the key and the marker; the store stays behind.
+            std::fs::remove_file(&outcome.mnemonic_path).unwrap();
+            std::fs::remove_dir_all(layout.identity_dir()).unwrap();
+            std::fs::remove_file(layout.marker()).unwrap();
+            let err = prepare_start(&path)
+                .expect_err("retained store with no identity must refuse")
+                .to_string();
+            assert!(
+                err.contains("state_without_identity"),
+                "{spelling}: expected a retained-state refusal, got: {err}"
+            );
+            assert!(!layout.marker().exists());
+            assert!(!layout.identity_dir().exists());
+            assert!(store_file.exists(), "{spelling}: the probe must not touch the store");
         }
     }
 

@@ -175,6 +175,122 @@ fn spend_grant_binding_enforced() {
 }
 
 #[test]
+fn sidecar_reopen_does_not_inherit_owner_granted_spend() {
+    // P1-2: the grant file is shared by every process that opens the data
+    // directory. An owner grants `spend` with the control socket up; a packaged
+    // sidecar later reopens the same directory. The sidecar is read+receive by
+    // design, so the persisted grant must reach neither a freshly issued token
+    // nor the per-request binding check on a token minted in owner mode.
+    let tmp = tempfile::tempdir().unwrap();
+    let key = client_key(5);
+    let secret = "test-secret-at-least-32-bytes-long!";
+    let (client, owner_token_scopes) = {
+        let (owner, console) = owner_run_service(tmp.path());
+        let client = pair(&owner, &key, "desktop app");
+        let op = owner
+            .create_elevation_request(&client.client_id, vec![Scope::Spend])
+            .unwrap();
+        owner
+            .grant_elevation(
+                &op.op_id,
+                &console.confirmation(&pairing::grant_confirmation_phrase(&op)),
+            )
+            .unwrap();
+        // POSITIVE CONTROL: in owner mode the grant reaches the token.
+        let challenge = owner.issue_token_challenge(&client.client_id).unwrap();
+        let sig = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
+        let issued = owner
+            .issue_token("node", secret, &client.client_id, &challenge, &sig)
+            .unwrap();
+        assert!(issued.scopes.contains(&Scope::Spend));
+        owner
+            .verify_token_binding(
+                &client.client_id,
+                client.epoch,
+                &current_fingerprint(),
+                &issued.scopes,
+            )
+            .unwrap();
+        (client, issued.scopes)
+    };
+
+    // Reopen the SAME directory without owner control: the sidecar deployment.
+    let sidecar = Arc::new(
+        PairingService::open(tmp.path(), current_fingerprint(), false)
+            .unwrap()
+            .without_stdout_code(),
+    );
+    assert_eq!(
+        sidecar.reload_from_disk().unwrap().grants.len(),
+        1,
+        "the owner's grant stays on disk — it is ignored, not erased"
+    );
+
+    // A fresh token must not carry spend.
+    let challenge = sidecar.issue_token_challenge(&client.client_id).unwrap();
+    let sig = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
+    let issued = sidecar
+        .issue_token("node", secret, &client.client_id, &challenge, &sig)
+        .unwrap();
+    assert!(
+        !issued.scopes.contains(&Scope::Spend),
+        "a sidecar token must not carry an owner-granted spend: {:?}",
+        issued.scopes
+    );
+    assert_eq!(issued.scopes, pairing::default_pairing_scopes());
+    let claims = konsensus_api::auth::validate_token(&issued.token, secret).unwrap();
+    assert!(
+        !claims.scp.contains(&Scope::Spend),
+        "the signed claims must not carry spend either: {:?}",
+        claims.scp
+    );
+
+    // A token minted in owner mode that still claims spend fails the binding
+    // check on the sidecar, so the spend path is closed for it too.
+    let err = sidecar
+        .verify_token_binding(
+            &client.client_id,
+            client.epoch,
+            &current_fingerprint(),
+            &owner_token_scopes,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, PairingError::PairingInvalid(_)),
+        "expected a binding refusal for spend on a sidecar, got: {err}"
+    );
+    // ...while the read+receive part of the same pairing still verifies.
+    sidecar
+        .verify_token_binding(
+            &client.client_id,
+            client.epoch,
+            &current_fingerprint(),
+            &pairing::default_pairing_scopes(),
+        )
+        .unwrap();
+
+    // The sidecar must not report the grant as in effect either.
+    let durable = sidecar.reload_from_disk().unwrap();
+    assert_eq!(
+        sidecar.elevation_status(&durable.grants[0].op_id),
+        pairing::ElevationStatus::Absent
+    );
+
+    // POSITIVE CONTROL: reopening with owner control honours the same grant
+    // again, so the refusal above is the deployment lock, not a lost grant.
+    drop(sidecar);
+    let (owner_again, _) = owner_run_service(tmp.path());
+    let challenge = owner_again
+        .issue_token_challenge(&client.client_id)
+        .unwrap();
+    let sig = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
+    let issued = owner_again
+        .issue_token("node", secret, &client.client_id, &challenge, &sig)
+        .unwrap();
+    assert!(issued.scopes.contains(&Scope::Spend));
+}
+
+#[test]
 fn sidecar_elevation_unavailable() {
     // The packaged sidecar deployment: no owner control socket, so elevation
     // can be REQUESTED and never obtained. This is the operator lock, asserted

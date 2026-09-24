@@ -41,6 +41,12 @@
 //! reachable only from the owner CLI over `<data_dir>/control.sock`
 //! (see [`crate::control`]) and refuses outright unless owner-run mode was
 //! explicitly enabled.
+//!
+//! The same rule governs grants that already exist on disk. A grant the owner
+//! wrote while running the node with the control socket is **not honoured** by
+//! a sidecar that later opens the same data directory: token issuance and
+//! per-request binding verification both compute the effective scopes from the
+//! deployment mode, so `spend` never reaches a sidecar token.
 
 use std::collections::HashMap;
 use std::io;
@@ -932,20 +938,7 @@ impl PairingService {
             .verify_strict(challenge.as_bytes(), &sig)
             .map_err(|_| PairingError::BadProof)?;
 
-        let mut scopes = record.scopes.clone();
-        for grant in &inner.file.grants {
-            if grant.client_id == client_id
-                && grant.expires_at > now_unix
-                && grant.epoch == record.epoch
-                && grant.identity_fingerprint == fingerprint
-            {
-                for s in &grant.scopes {
-                    if !scopes.contains(s) {
-                        scopes.push(*s);
-                    }
-                }
-            }
-        }
+        let scopes = self.effective_scopes(&inner, &record, now_unix);
 
         let token = match &kind {
             TokenKind::Live { subject } => auth::create_paired_token(
@@ -1015,27 +1008,56 @@ impl PairingService {
                 "pairing is bound to a different identity".into(),
             ));
         }
-        let mut permitted = record.scopes.clone();
-        for grant in &inner.file.grants {
-            if grant.client_id == client_id
-                && grant.expires_at > now_unix
-                && grant.epoch == record.epoch
-                && grant.identity_fingerprint == fingerprint
-            {
-                for s in &grant.scopes {
-                    if !permitted.contains(s) {
-                        permitted.push(*s);
-                    }
-                }
-            }
-        }
+        let permitted = self.effective_scopes(&inner, record, now_unix);
         if let Some(extra) = scopes.iter().find(|s| !permitted.contains(s)) {
             return Err(PairingError::PairingInvalid(format!(
-                "token claims scope `{}` the pairing no longer holds",
+                "token claims scope `{}` the pairing does not hold in this deployment",
                 extra.as_str()
             )));
         }
         Ok(())
+    }
+
+    /// The scopes a pairing actually carries **in this deployment**, computed
+    /// identically at issuance and at per-request verification.
+    ///
+    /// A durable grant is honoured only while an owner control socket exists.
+    /// The grant file is shared by every process that opens the same data
+    /// directory, so an owner-run node that granted `spend` and a packaged
+    /// sidecar reopening that directory afterwards see the same record; the
+    /// sidecar must not honour it (elevation lock: a sidecar is read+receive
+    /// only). The grant is left on disk untouched — it is the owner's, and it
+    /// applies again the next time the owner runs the node with the control
+    /// socket — it simply never reaches a sidecar token.
+    ///
+    /// Belt and braces: in sidecar mode every grantable scope is stripped from
+    /// the result even if a hand-edited pairing record carries one, because the
+    /// only way such a scope can legitimately exist is an owner grant.
+    fn effective_scopes(
+        &self,
+        inner: &Inner,
+        record: &PairedClient,
+        now_unix: i64,
+    ) -> Vec<Scope> {
+        let mut scopes = record.scopes.clone();
+        if !self.owner_control_enabled {
+            scopes.retain(|s| !grantable_scopes().contains(s));
+            return scopes;
+        }
+        for grant in &inner.file.grants {
+            if grant.client_id == record.client_id
+                && grant.expires_at > now_unix
+                && grant.epoch == record.epoch
+                && grant.identity_fingerprint == inner.identity_fingerprint
+            {
+                for s in &grant.scopes {
+                    if !scopes.contains(s) {
+                        scopes.push(*s);
+                    }
+                }
+            }
+        }
+        scopes
     }
 
     /// List paired clients (behind `read` on the HTTP surface).
@@ -1200,9 +1222,25 @@ impl PairingService {
     }
 
     /// Read the status of a pending elevation. A read, never a consumption.
+    ///
+    /// On a sidecar a grant is never in effect (see `effective_scopes`), so it
+    /// is never reported as granted either: the status must not claim an
+    /// authority the token will not carry.
     pub fn elevation_status(&self, op_id: &str) -> ElevationStatus {
         let now = chrono::Utc::now().timestamp();
         let inner = self.lock();
+        if !self.owner_control_enabled {
+            return match inner
+                .file
+                .pending_elevations
+                .iter()
+                .find(|e| e.op_id == op_id)
+            {
+                Some(op) if op.expires_at <= now => ElevationStatus::Expired,
+                Some(_) => ElevationStatus::Pending,
+                None => ElevationStatus::Absent,
+            };
+        }
         if let Some(op) = inner
             .file
             .pending_elevations
