@@ -104,6 +104,15 @@ pub struct AppState {
     /// issuance consumes them exactly once.
     pub auth_challenges: Arc<Mutex<HashMap<String, Instant>>>,
 
+    /// Client pairing and owner-approved elevation (#76).
+    ///
+    /// `None` on a node with no data directory (and in tests that do not
+    /// exercise pairing): the `/pair/*` routes are then **absent** from the
+    /// router rather than mounted-and-failing, and a token carrying a pairing
+    /// binding is refused because nothing can verify it. Never a fallback to
+    /// "binding not checked".
+    pub pairing: Option<Arc<crate::pairing::PairingService>>,
+
     /// Whether CORS is enabled.
     pub cors_enabled: bool,
 

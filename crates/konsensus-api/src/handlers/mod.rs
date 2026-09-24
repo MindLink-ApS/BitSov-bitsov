@@ -14,6 +14,7 @@ pub mod invite;
 pub mod invites;
 pub mod messages;
 pub mod onboarding;
+pub mod pairing_routes;
 pub mod payments;
 pub mod peers;
 pub mod pricing;
