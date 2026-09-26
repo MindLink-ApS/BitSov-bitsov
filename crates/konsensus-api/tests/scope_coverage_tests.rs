@@ -21,7 +21,10 @@ const SPEND: &[&str] = &[
 ];
 
 /// Key material and identity replacement — what loopback presence must never reach.
-const IDENTITY: &[&str] = &["reveal_mnemonic", "restore_identity", "verify_mnemonic"];
+// `restore_identity` was removed from the HTTP handlers by #76: replacing a live
+// identity is executed only over the owner control socket, so there is no
+// handler left to enforce a scope on.
+const IDENTITY: &[&str] = &["reveal_mnemonic", "verify_mnemonic"];
 
 const ADMIN: &[&str] = &[
     "import_peers",
@@ -284,13 +287,15 @@ fn self_authenticating_endpoints_also_check_scope() {
         if file.ends_with("auth.rs") || !src.contains("validate_token(") {
             continue;
         }
-        if !src.contains("Scope::") {
+        if !src.contains("Scope::")
+            || !(src.contains("verify_token_binding(") || src.contains("check_pairing_binding("))
+        {
             bad.push(file);
         }
     }
     assert!(
         bad.is_empty(),
-        "{} file(s) validate a token without ever consulting its scopes:\n  {}",
+        "{} file(s) validate a token without checking scopes and pairing bindings:\n  {}",
         bad.len(),
         bad.join("\n  ")
     );

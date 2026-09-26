@@ -879,6 +879,7 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,

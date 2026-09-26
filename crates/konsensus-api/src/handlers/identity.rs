@@ -40,22 +40,26 @@ pub struct VerifyMnemonicResponse {
     pub node_id: String,
 }
 
-/// Request body for identity restore.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RestoreRequest {
-    /// BIP-39 mnemonic phrase (12 or 24 words, space-separated).
-    pub mnemonic: String,
-}
-
-/// Response from identity restore.
-#[derive(Serialize)]
-pub struct RestoreResponse {
-    /// The node ID derived from the restored mnemonic.
-    pub node_id: String,
-    /// Whether the node must be restarted for the new identity to take effect.
-    pub restart_required: bool,
-}
+// There is deliberately NO restore request/response type and no restore handler
+// in this module (#76).
+//
+// Replacing the identity of a LIVE node is destructive, so it executes only
+// through the owner control socket: `konsensus approve-replacement` renders the
+// five bound fields, takes a typed confirmation, consumes the approval by
+// atomic compare-and-delete, and writes the identity material — all on the
+// owner's side of `<data_dir>/control.sock` (mode `0600`), which is not
+// reachable over loopback TCP.
+//
+// The HTTP surface may create a pending request
+// (`POST /api/v1/identity/replacement-request`, see
+// `handlers::pairing_routes`) and read its status. It can never write a grant
+// or consume an approval — not with `identity` scope, not with a full
+// key-proof token, not with a paired token that was granted anything. The
+// route is **absent**, not scope-gated, because a route that exists is a route
+// that can be reached.
+//
+// Fresh-install restore is a different operation on a node with nothing to
+// destroy, and lives on the separate bootstrap router (`crate::bootstrap`).
 
 /// `GET /api/v1/identity` — get the node's public identity.
 async fn get_identity(
@@ -89,39 +93,6 @@ async fn verify_mnemonic(
 
     Ok(Json(VerifyMnemonicResponse {
         node_id: identity.node_id().to_hex(),
-    }))
-}
-
-/// `POST /api/v1/identity/restore` — write a recovery mnemonic to the data directory.
-///
-/// Saves the mnemonic to the node's data directory as `mnemonic.txt`. The node
-/// must be restarted for the new identity to take effect. If the data directory
-/// is not configured, returns an error.
-async fn restore_identity(
-    _auth: ScopedAuth<Identity>,
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<RestoreRequest>,
-) -> Result<Json<RestoreResponse>, ApiError> {
-    // Validate the mnemonic first
-    validate_mnemonic_word_count(&req.mnemonic)?;
-    let identity = konsensus_core::NodeIdentity::from_mnemonic(&req.mnemonic, "")
-        .map_err(|e| ApiError::BadRequest(format!("invalid mnemonic: {e}")))?;
-
-    let data_dir = state
-        .data_dir
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("node data directory not configured".into()))?;
-
-    let mnemonic_path = data_dir.join("mnemonic.txt");
-
-    // Write the mnemonic as plaintext. Users can encrypt it later via
-    // `konsensus init --encrypt` or the CLI password prompt.
-    std::fs::write(&mnemonic_path, &req.mnemonic)
-        .map_err(|e| ApiError::Internal(format!("failed to write mnemonic: {e}")))?;
-
-    Ok(Json(RestoreResponse {
-        node_id: identity.node_id().to_hex(),
-        restart_required: true,
     }))
 }
 
@@ -388,7 +359,6 @@ pub fn routes(sensitive_identity_routes_enabled: bool) -> Router<Arc<AppState>> 
             // API. See `reveal_mnemonic` (HARD-9).
             .route("/api/v1/identity/mnemonic", post(reveal_mnemonic))
             .route("/api/v1/identity/verify-mnemonic", post(verify_mnemonic))
-            .route("/api/v1/identity/restore", post(restore_identity))
     } else {
         router
     }

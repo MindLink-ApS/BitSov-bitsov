@@ -28,6 +28,30 @@ pub struct SqliteStorage {
     pool: SqlitePool,
 }
 
+/// The on-disk file a SQLite connection string names, resolved with the same
+/// parser [`SqliteStorage::open`] uses, so a filesystem probe and the runtime
+/// agree on which file holds the store.
+///
+/// `open` accepts a bare path, `sqlite:<path>`, `sqlite://<path>` (so
+/// `sqlite:///abs/store.sqlite` is `/abs/store.sqlite`), and trailing query
+/// parameters such as `?mode=rwc`. A caller that treated the connection string
+/// as a literal path would probe a file named `sqlite:///abs/store.sqlite`,
+/// find nothing, and conclude the node holds no state.
+///
+/// Returns `None` when the string names no durable file — an in-memory
+/// database, or a string `open` would itself reject — so the caller can fail
+/// closed instead of probing a path that does not correspond to the store.
+pub fn sqlite_file_path(connection: &str) -> Option<std::path::PathBuf> {
+    let options = SqliteConnectOptions::from_str(connection).ok()?;
+    let filename = options.get_filename();
+    // `:memory:` is rewritten by sqlx to a synthetic `file:sqlx-in-memory-<n>`
+    // name that never exists on disk.
+    if filename.to_string_lossy().starts_with("file:") {
+        return None;
+    }
+    Some(filename.to_path_buf())
+}
+
 impl SqliteStorage {
     /// Open (or create) a SQLite database at the given path.
     pub async fn open(path: &str) -> Result<Self, StorageError> {
@@ -2747,6 +2771,70 @@ mod dbh1_guard {
             "sqlite PEERS_SELECT must not contain LIMIT (DBH1 fail-open guard): {}",
             super::PEERS_SELECT
         );
+    }
+}
+
+#[cfg(test)]
+mod sqlite_file_path_tests {
+    use super::sqlite_file_path;
+    use std::path::Path;
+
+    /// The bootstrap probe must look at the file `open` creates, whatever
+    /// spelling the operator used for the connection string (#76 P1-3).
+    #[test]
+    fn resolves_every_spelling_open_accepts_to_the_same_file() {
+        let expected = Path::new("/var/lib/bitsov/external.sqlite");
+        for spelling in [
+            "/var/lib/bitsov/external.sqlite",
+            "sqlite:/var/lib/bitsov/external.sqlite",
+            "sqlite:///var/lib/bitsov/external.sqlite",
+            "sqlite:///var/lib/bitsov/external.sqlite?mode=rwc",
+        ] {
+            assert_eq!(
+                sqlite_file_path(spelling).as_deref(),
+                Some(expected),
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            sqlite_file_path("konsensus.db").as_deref(),
+            Some(Path::new("konsensus.db"))
+        );
+        assert_eq!(
+            sqlite_file_path("sqlite://relative/store.db").as_deref(),
+            Some(Path::new("relative/store.db"))
+        );
+    }
+
+    #[test]
+    fn in_memory_names_no_file() {
+        assert_eq!(sqlite_file_path("sqlite::memory:"), None);
+    }
+
+    /// The literal-path reading and the runtime reading must never disagree:
+    /// a real database created through `open` sits exactly where the resolver
+    /// says it does.
+    #[tokio::test]
+    async fn resolved_path_is_where_open_creates_the_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "konsensus-sqlite-file-path-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("external.sqlite");
+        let uri = format!("sqlite://{}", file.display());
+        assert!(uri.starts_with("sqlite:///"), "{uri}");
+        assert!(!Path::new(&uri).exists());
+        {
+            let _store = super::SqliteStorage::open(&uri).await.unwrap();
+            assert!(file.exists());
+            assert_eq!(sqlite_file_path(&uri).as_deref(), Some(file.as_path()));
+            assert!(
+                !Path::new(&uri).exists(),
+                "the literal connection string is not a path on disk"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

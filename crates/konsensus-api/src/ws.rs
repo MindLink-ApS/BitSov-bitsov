@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
-use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::Router;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -46,6 +46,9 @@ async fn ws_handler(
     // Validate JWT before upgrading — reject with 401 if invalid
     match auth::validate_token(&token, &state.jwt_secret) {
         Ok(claims) => {
+            if auth::check_pairing_binding(&state, &claims).is_err() {
+                return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+            }
             // This endpoint authenticates itself rather than going through the
             // `ScopedAuth` extractor, so it was silently exempt from the #72
             // authorization migration: a token the REST routes refused was still
@@ -57,12 +60,11 @@ async fn ws_handler(
                     node_id = %claims.sub,
                     "WebSocket rejected: token lacks the read scope"
                 );
-                return (StatusCode::FORBIDDEN, "token lacks required scope: read")
-                    .into_response();
+                return (StatusCode::FORBIDDEN, "token lacks required scope: read").into_response();
             }
             debug!(node_id = %claims.sub, "WebSocket authenticated");
             ws.protocols([WS_PROTOCOL])
-                .on_upgrade(move |socket| handle_ws(socket, state))
+                .on_upgrade(move |socket| handle_ws(socket, state, claims))
                 .into_response()
         }
         Err(e) => {
@@ -101,7 +103,7 @@ const WS_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Subscribes to the broadcast channel and forwards messages (with decrypted
 /// plaintext when available) to the client as JSON. Sends periodic keepalive
 /// pings to prevent idle connection timeouts.
-async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
+async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Claims) {
     let mut rx = state.ws_broadcast.subscribe();
     let mut delivery_rx = state.ws_delivery_broadcast.subscribe();
     let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
@@ -114,6 +116,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             result = rx.recv() => {
                 match result {
                     Ok(ws_msg) => {
+                        if !stream_authorized(&state, &claims) { break; }
                         // Serialize WsMessage to JSON for the client
                         match serde_json::to_string(ws_msg.as_ref()) {
                             Ok(json) => {
@@ -141,6 +144,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             result = delivery_rx.recv() => {
                 match result {
                     Ok(status) => {
+                        if !stream_authorized(&state, &claims) { break; }
                         match serde_json::to_string(status.as_ref()) {
                             Ok(json) => {
                                 if socket.send(Message::Text(json)).await.is_err() {
@@ -196,6 +200,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
 
             // Send keepalive pings to prevent idle connection timeouts
             _ = keepalive.tick() => {
+                if !stream_authorized(&state, &claims) { break; }
                 if socket.send(Message::Ping(vec![0x6b, 0x61])).await.is_err() {
                     debug!("WebSocket client disconnected during keepalive");
                     break;
@@ -203,6 +208,14 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             }
         }
     }
+}
+
+// Re-check before each plaintext/delivery send, not just at upgrade: already
+// connected clients lose access when their pairing is revoked or rebound.
+fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims) -> bool {
+    claims.exp > chrono::Utc::now().timestamp()
+        && claims.scp.contains(&auth::Scope::Read)
+        && auth::check_pairing_binding(state, claims).is_ok()
 }
 
 /// Registers the WebSocket upgrade route for real-time event streaming.

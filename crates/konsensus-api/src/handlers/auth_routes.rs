@@ -133,6 +133,7 @@ async fn issue_token(
 
     let claims = auth::validate_token(&token, &state.jwt_secret)
         .map_err(|e| ApiError::Internal(format!("token validation failed: {e}")))?;
+    auth::check_pairing_binding(&state, &claims).map_err(ApiError::Internal)?;
 
     state
         .audit_log
@@ -204,6 +205,7 @@ async fn issue_local_token(
 
     let claims = auth::validate_token(&token, &state.jwt_secret)
         .map_err(|e| ApiError::Internal(format!("token validation failed: {e}")))?;
+    auth::check_pairing_binding(&state, &claims).map_err(ApiError::Internal)?;
 
     state.audit_log.record(
         events::AUTH_TOKEN_ISSUED,

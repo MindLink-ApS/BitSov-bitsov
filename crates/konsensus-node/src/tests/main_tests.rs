@@ -216,6 +216,26 @@ fn restore_with_encryption() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn restore_into_empty_dir_prepares_initialized_start() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let dir = tmp.path().join("node");
+
+    cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None)?;
+
+    assert!(
+        dir.join("NODE_INITIALIZED").exists(),
+        "restore must write NODE_INITIALIZED so start does not need a separate repair"
+    );
+    let (mode, _config) = owner_cmd::prepare_start(&dir.join("konsensus.toml"))?;
+    assert_eq!(
+        mode,
+        konsensus_api::bootstrap::StartupMode::Initialized,
+        "CLI restore into an empty directory must classify as Initialized"
+    );
+    Ok(())
+}
+
 // ── cmd_node_id tests ──────────────────────────────────────────────
 
 #[test]

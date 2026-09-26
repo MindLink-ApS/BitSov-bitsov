@@ -11,6 +11,22 @@ use std::path::{Path, PathBuf};
 use konsensus_message::wire::SovereigntyTier;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+thread_local! {
+    /// When set, the next [`NodeConfig::save`] fails after the atomic rename
+    /// and before the parent-directory fsync, simulating a sync failure.
+    static FAIL_CONFIG_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm a one-shot failure of the config parent-directory sync in [`NodeConfig::save`].
+///
+/// Used by bootstrap regressions to prove a non-durable alignment cannot publish
+/// `NODE_INITIALIZED`.
+#[cfg(test)]
+pub(crate) fn fail_next_config_dir_sync() {
+    FAIL_CONFIG_DIR_SYNC.set(true);
+}
+
 /// User-facing onboarding tier.
 ///
 /// This determines the default configuration and UI presentation.
@@ -832,10 +848,16 @@ pub struct PeerConfigEntry {
 impl NodeConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let config = Self::load_before_identity_validation(path)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Bootstrap must inspect configured paths before requiring an identity.
+    pub(crate) fn load_before_identity_validation(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&content)?;
         config.anchor_relative_backup_dir(path);
-        config.validate()?;
         Ok(config)
     }
 
@@ -1098,9 +1120,63 @@ impl NodeConfig {
     }
 
     /// Write configuration to a TOML file.
+    ///
+    /// Durable atomic replace: serialize, write a temporary sibling at mode
+    /// `0600`, fsync that file, rename over `path`, then fsync the parent
+    /// directory. Bootstrap alignment relies on this completing before
+    /// `NODE_INITIALIZED` is published — a plain `fs::write` is not enough.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        Self::write_atomic(path, content.as_bytes())
+    }
+
+    /// Atomically replace `path` with `bytes`, fsyncing the file and its
+    /// parent directory. Failures propagate so callers can refuse to publish a
+    /// success marker against a non-durable config.
+    fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        // Sibling temp in the same directory so rename is atomic on the volume.
+        let tmp = path.with_extension("toml.tmp");
+        let _ = std::fs::remove_file(&tmp);
+
+        konsensus_api::pairing::write_protected(&tmp, bytes).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::anyhow!("failed to write temporary config {}: {e}", tmp.display())
+        })?;
+
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::bail!("failed to publish config {}: {e}", path.display());
+        }
+
+        // Injected sync failure (tests only): rename already happened; the
+        // caller must still treat this as a failed durable save so bootstrap
+        // does not publish NODE_INITIALIZED.
+        #[cfg(test)]
+        {
+            if FAIL_CONFIG_DIR_SYNC.replace(false) {
+                anyhow::bail!(
+                    "failed to sync config directory {}: injected sync failure",
+                    parent.display()
+                );
+            }
+        }
+
+        let dir = std::fs::File::open(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to open config directory {} for sync: {e}",
+                parent.display()
+            )
+        })?;
+        dir.sync_all().map_err(|e| {
+            anyhow::anyhow!(
+                "failed to sync config directory {}: {e}",
+                parent.display()
+            )
+        })?;
         Ok(())
     }
 

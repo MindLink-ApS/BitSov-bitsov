@@ -41,6 +41,13 @@
 //!   that challenge. Cannot require a JWT to issue one.
 //! - `POST /api/v1/auth/local` — JWT bootstrap restricted to loopback
 //!   callers via `ConnectInfo`. The loopback check is the auth gate.
+//! - `POST /api/v1/pair/request`, `POST /api/v1/pair/confirm`,
+//!   `GET /api/v1/pair/challenge`, `POST /api/v1/pair/token`,
+//!   `POST /api/v1/pair/rotate` — the pairing ceremony (#76). A client cannot
+//!   hold a token before it is paired, so the gate is not authentication but
+//!   **read access to the node's data directory**: confirming a pairing
+//!   requires signing a 32-byte challenge that exists only in a `0600` file
+//!   under `data_dir`. See `pairing.rs`.
 //! - `GET  /api/v1/ws` — WebSocket upgrade. Validates the JWT inline
 //!   from the `?token=<jwt>` query parameter inside `ws_handler`
 //!   (browsers cannot set `Authorization` on the WS handshake).
@@ -48,9 +55,12 @@
 
 pub mod audit;
 pub mod auth;
+pub mod bootstrap;
+pub mod control;
 pub mod error;
 pub mod handlers;
 pub mod metrics;
+pub mod pairing;
 pub mod rate_limit;
 pub mod state;
 pub mod ws;
@@ -118,6 +128,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(handlers::auth_routes::routes(
             state.sensitive_identity_routes_enabled,
         ))
+        .merge(handlers::pairing_routes::routes(state.pairing.is_some()))
         .merge(handlers::sessions::routes())
         .merge(handlers::files::routes())
         .merge(handlers::pricing::routes())

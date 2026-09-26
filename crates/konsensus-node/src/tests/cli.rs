@@ -53,9 +53,10 @@ fn parse_init_all_flags() {
 fn parse_start_default_config() {
     let cli = Cli::parse_from(["konsensus", "start"]);
     match cli.command {
-        Command::Start { config, password, admission_mode } => {
+        Command::Start { config, password, admission_mode, owner_control } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert!(password.is_none());
+            assert!(!owner_control);
             // M1a: off-by-default — absence of the flag leaves the override None,
             // so cmd_start falls back to the config-file value (default Whitelist).
             assert!(admission_mode.is_none());
@@ -68,9 +69,10 @@ fn parse_start_default_config() {
 fn parse_start_custom_config() {
     let cli = Cli::parse_from(["konsensus", "start", "--config", "/etc/konsensus.toml"]);
     match cli.command {
-        Command::Start { config, password, admission_mode } => {
+        Command::Start { config, password, admission_mode, owner_control } => {
             assert_eq!(config, PathBuf::from("/etc/konsensus.toml"));
             assert!(password.is_none());
+            assert!(!owner_control);
             assert!(admission_mode.is_none());
         }
         _ => panic!("expected Start command"),
@@ -81,9 +83,10 @@ fn parse_start_custom_config() {
 fn parse_start_with_password() {
     let cli = Cli::parse_from(["konsensus", "start", "--password", "secret123"]);
     match cli.command {
-        Command::Start { config, password, admission_mode } => {
+        Command::Start { config, password, admission_mode, owner_control } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert_eq!(password.as_deref(), Some("secret123"));
+            assert!(!owner_control);
             assert!(admission_mode.is_none());
         }
         _ => panic!("expected Start command"),
@@ -96,13 +99,20 @@ fn parse_start_admission_mode_price_open() {
     // cmd_start maps it to ReachabilityMode::PriceOpen before building the node.
     let cli = Cli::parse_from(["konsensus", "start", "--admission-mode", "price-open"]);
     match cli.command {
-        Command::Start { config, password, admission_mode } => {
+        Command::Start { config, password, admission_mode, owner_control } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert!(password.is_none());
+            assert!(!owner_control);
             assert_eq!(admission_mode.as_deref(), Some("price-open"));
         }
         _ => panic!("expected Start command"),
     }
+}
+
+#[test]
+fn parse_start_owner_control_is_explicit() {
+    let cli = Cli::parse_from(["konsensus", "start", "--owner-control"]);
+    assert!(matches!(cli.command, Command::Start { owner_control: true, .. }));
 }
 
 #[test]
