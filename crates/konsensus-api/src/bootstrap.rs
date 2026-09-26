@@ -368,7 +368,8 @@ pub struct CommitOutcome {
 }
 
 /// Hook after rebind and before `NODE_INITIALIZED` (clippy::type_complexity).
-type BeforeMarkerHook = dyn Fn(&CommitOutcome) -> Result<(), CommitError>;
+type BeforeMarkerHook<'a> =
+    dyn Fn(&CommitOutcome) -> Result<(), CommitError> + 'a;
 
 /// Owned, thread-safe [`BeforeMarkerHook`] for [`BootstrapState`].
 type BeforeMarkerHookOwned =
@@ -440,7 +441,7 @@ pub fn commit_first_run_with_before_marker(
     mnemonic: &str,
     pairing: Option<&PairingService>,
     fault: CommitFault,
-    before_marker: Option<&BeforeMarkerHook>,
+    before_marker: Option<&BeforeMarkerHook<'_>>,
 ) -> Result<CommitOutcome, CommitError> {
     let identity = konsensus_core::NodeIdentity::from_mnemonic(mnemonic, "")
         .map_err(|e| CommitError::InvalidMnemonic(e.to_string()))?;
