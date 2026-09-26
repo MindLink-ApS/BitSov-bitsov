@@ -1587,6 +1587,56 @@ fn config_save_to_readonly_dir_fails() {
     assert!(result.is_err());
 }
 
+#[test]
+fn config_save_atomic_replace_leaves_no_tmp_and_survives_reread() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("custom.toml");
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Full,
+        dir.path().join("first-mnemonic.txt"),
+        dir.path(),
+    );
+    config.save(&path).unwrap();
+
+    config.identity.mnemonic_file = dir.path().join("aligned-mnemonic.txt");
+    config.save(&path).unwrap();
+
+    assert!(
+        !path.with_extension("toml.tmp").exists(),
+        "durable save must not leave a sibling temp file after publish"
+    );
+    let loaded = NodeConfig::load_before_identity_validation(&path).unwrap();
+    assert_eq!(
+        loaded.identity.mnemonic_file,
+        dir.path().join("aligned-mnemonic.txt")
+    );
+}
+
+#[test]
+fn config_save_dir_sync_failure_propagates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("custom.toml");
+    let config = NodeConfig::default_for_tier(
+        NodeTier::Full,
+        dir.path().join("mnemonic.txt"),
+        dir.path(),
+    );
+    config.save(&path).unwrap();
+
+    super::fail_next_config_dir_sync();
+    let err = config
+        .save(&path)
+        .expect_err("injected directory sync failure must surface");
+    assert!(
+        err.to_string().contains("sync"),
+        "expected sync error, got: {err}"
+    );
+    assert!(
+        !path.with_extension("toml.tmp").exists(),
+        "failed sync after rename must not leave a temp sibling"
+    );
+}
+
 // ── Validation edge cases ──────────────────────────────────────────
 
 #[test]

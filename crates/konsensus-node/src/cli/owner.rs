@@ -374,6 +374,9 @@ pub fn cmd_repair_mark_initialized(config_path: &Path, confirm: bool) -> Result<
 }
 
 /// Align a node config's mnemonic path with the identity a transition just wrote.
+///
+/// Uses [`NodeConfig::save`]'s atomic durable replace so the aligned config
+/// reaches stable storage before the caller publishes `NODE_INITIALIZED`.
 fn align_config_mnemonic(config_path: &Path, mnemonic_path: &Path) -> Result<()> {
     if !config_path.try_exists()? {
         return Ok(());
@@ -785,6 +788,46 @@ mod startup_tests {
             loaded.identity.mnemonic_file,
             dir.path().join("custom-mnemonic.txt")
         );
+    }
+
+    #[test]
+    fn failed_config_dir_sync_does_not_publish_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom_mnemonic = dir.path().join("custom-mnemonic.txt");
+        let mut config =
+            NodeConfig::default_for_tier(NodeTier::Full, custom_mnemonic.clone(), dir.path());
+        config.api.listen_addr = "127.0.0.1:0".parse().unwrap();
+        let path = dir.path().join("custom.toml");
+        config.save(&path).unwrap();
+
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let pairing = std::sync::Arc::new(
+            PairingService::open(dir.path(), String::new(), false)
+                .unwrap()
+                .without_stdout_code(),
+        );
+        let align_path = path.clone();
+        let state = bootstrap::BootstrapState::new(configured_layout(dir.path(), &config), pairing)
+            .with_before_marker(move |outcome| {
+                crate::config::fail_next_config_dir_sync();
+                align_config_mnemonic(&align_path, &outcome.mnemonic_path).map_err(|e| {
+                    bootstrap::CommitError::Io(format!("{e:#}"))
+                })
+            });
+
+        let err = state
+            .transition(phrase, bootstrap::CommitFault::None)
+            .expect_err("a failed config directory sync must abort before the marker");
+        assert!(
+            matches!(&err, bootstrap::CommitError::Io(msg) if msg.contains("sync")),
+            "expected sync failure, got: {err:?}"
+        );
+        assert!(
+            !DataDirLayout::new(dir.path()).marker().exists(),
+            "NODE_INITIALIZED must not publish when config sync fails"
+        );
+        // No leftover temp sibling from the durable save path.
+        assert!(!path.with_extension("toml.tmp").exists());
     }
 
     #[test]
