@@ -325,9 +325,9 @@ pub fn classify(probe: &DataDirProbe) -> StartupMode {
 }
 
 fn repair_mark_initialized() -> String {
-    "run `konsensus repair mark-initialized --dir <data-dir> --confirm` to finish the \
-     interrupted transition (it writes the marker and nothing else), or move the data \
-     directory aside to start over. The node will not write the marker for you, because \
+    "run `konsensus repair mark-initialized --config <path-to-konsensus.toml> --confirm` to \
+     finish the interrupted transition (it writes the marker and nothing else), or move the \
+     data directory aside to start over. The node will not write the marker for you, because \
      doing so silently would make a crashed transition indistinguishable from a completed one."
         .to_string()
 }
@@ -421,6 +421,20 @@ pub fn commit_first_run_with_fault(
     pairing: Option<&PairingService>,
     fault: CommitFault,
 ) -> Result<CommitOutcome, CommitError> {
+    commit_first_run_with_before_marker(layout, mnemonic, pairing, fault, None)
+}
+
+/// Like [`commit_first_run_with_fault`], but runs `before_marker` after rebind
+/// and **before** publishing `NODE_INITIALIZED`. Used to durably align the
+/// operator's config with the committed mnemonic path so a completed marker
+/// never points at a missing identity file.
+pub fn commit_first_run_with_before_marker(
+    layout: &DataDirLayout,
+    mnemonic: &str,
+    pairing: Option<&PairingService>,
+    fault: CommitFault,
+    before_marker: Option<&dyn Fn(&CommitOutcome) -> Result<(), CommitError>>,
+) -> Result<CommitOutcome, CommitError> {
     let identity = konsensus_core::NodeIdentity::from_mnemonic(mnemonic, "")
         .map_err(|e| CommitError::InvalidMnemonic(e.to_string()))?;
     let node_id = identity.node_id().to_hex();
@@ -473,6 +487,19 @@ pub fn commit_first_run_with_fault(
             .map_err(|e| CommitError::Pairing(e.to_string()))?;
     }
 
+    let outcome = CommitOutcome {
+        node_id,
+        identity_fingerprint: fingerprint.clone(),
+        mnemonic_path: target.join("mnemonic.txt"),
+    };
+
+    // Align any operator config with the committed mnemonic *before* the
+    // marker. A completed marker with an unusable config is not recoverable by
+    // `prepare_start` without a separate repair of the config itself.
+    if let Some(hook) = before_marker {
+        hook(&outcome)?;
+    }
+
     // 4. Marker last.
     pairing::write_protected(
         &layout.marker(),
@@ -485,11 +512,7 @@ pub fn commit_first_run_with_fault(
     )?;
     pairing::fsync_dir(&layout.data_dir)?;
 
-    Ok(CommitOutcome {
-        node_id,
-        identity_fingerprint: fingerprint,
-        mnemonic_path: target.join("mnemonic.txt"),
-    })
+    Ok(outcome)
 }
 
 /// State for the bootstrap HTTP surface.
@@ -516,6 +539,9 @@ pub struct BootstrapState {
     outcome: Mutex<Option<CommitOutcome>>,
     /// Startup instant, for `/livez`.
     pub started_at: Instant,
+    /// Optional durable work that must complete before the marker is published
+    /// (e.g. aligning the operator's config file with the committed mnemonic).
+    before_marker: Option<Arc<dyn Fn(&CommitOutcome) -> Result<(), CommitError> + Send + Sync>>,
 }
 
 impl BootstrapState {
@@ -532,7 +558,17 @@ impl BootstrapState {
             committed: AtomicBool::new(false),
             outcome: Mutex::new(None),
             started_at: Instant::now(),
+            before_marker: None,
         }
+    }
+
+    /// Run `hook` after identity rebind and before writing `NODE_INITIALIZED`.
+    pub fn with_before_marker<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(&CommitOutcome) -> Result<(), CommitError> + Send + Sync + 'static,
+    {
+        self.before_marker = Some(Arc::new(hook));
+        self
     }
 
     /// Has the transition committed?
@@ -561,8 +597,18 @@ impl BootstrapState {
         if self.committed.load(Ordering::SeqCst) {
             return Err(CommitError::Conflict);
         }
-        let outcome =
-            commit_first_run_with_fault(&self.layout, mnemonic, Some(&self.pairing), fault)?;
+        let outcome = match &self.before_marker {
+            Some(hook) => commit_first_run_with_before_marker(
+                &self.layout,
+                mnemonic,
+                Some(&self.pairing),
+                fault,
+                Some(hook.as_ref()),
+            )?,
+            None => {
+                commit_first_run_with_fault(&self.layout, mnemonic, Some(&self.pairing), fault)?
+            }
+        };
         self.committed.store(true, Ordering::SeqCst);
         if let Ok(mut slot) = self.outcome.lock() {
             *slot = Some(outcome.clone());

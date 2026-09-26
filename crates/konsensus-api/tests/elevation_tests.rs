@@ -1214,3 +1214,107 @@ fn revoked_jwt_stays_rejected_after_repair_of_same_key() {
         repaired.epoch
     );
 }
+
+/// Finding 2 (rotation): a revoked destination JWT must stay rejected after
+/// rotation into that key, and after rotation away plus same-key re-pair,
+/// including across a service restart that reopens the durable last_epoch map.
+#[test]
+fn revoked_jwt_stays_rejected_after_rotation_into_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let secret = "test-secret-at-least-32-bytes-long!";
+    let key_a = client_key(31);
+    let key_b = client_key(32);
+    let key_c = client_key(33);
+    let fingerprint = current_fingerprint();
+
+    let (service, _console) = owner_run_service(tmp.path());
+
+    // Pair B, re-pair to raise its epoch, mint a JWT, then revoke B.
+    let b1 = pair(&service, &key_b, "phone-b");
+    service.open_pairing_window(std::time::Duration::from_secs(60));
+    let b2 = pair(&service, &key_b, "phone-b-again");
+    assert!(b2.epoch > b1.epoch);
+    let challenge = service.issue_token_challenge(&b2.client_id).unwrap();
+    let sig = hex::encode(key_b.sign(challenge.as_bytes()).to_bytes());
+    let issued = service
+        .issue_token("node", secret, &b2.client_id, &challenge, &sig)
+        .unwrap();
+    let claims = konsensus_api::auth::validate_token(&issued.token, secret).unwrap();
+    let revoked_epoch = claims.epc.unwrap();
+    assert_eq!(revoked_epoch, b2.epoch);
+    service.revoke(&b2.client_id).unwrap();
+    assert!(service
+        .verify_token_binding(&b2.client_id, revoked_epoch, &fingerprint, &claims.scp)
+        .is_err());
+
+    // Pair A at a lower epoch and rotate A → B's public key. The rotated
+    // record must allocate above B's historical epoch so the revoked JWT
+    // cannot bind.
+    service.open_pairing_window(std::time::Duration::from_secs(60));
+    let a = pair(&service, &key_a, "phone-a");
+    assert!(a.epoch < revoked_epoch);
+    let new_pubkey = hex::encode(key_b.verifying_key().to_bytes());
+    let rotate_msg = format!("bitsov-pair-rotate-v1:{}:{new_pubkey}", a.client_id);
+    let rotate_sig = hex::encode(key_a.sign(rotate_msg.as_bytes()).to_bytes());
+    let rotated_into_b = service
+        .rotate_client_key(&a.client_id, &new_pubkey, &rotate_sig)
+        .unwrap();
+    assert_eq!(rotated_into_b.client_id, b2.client_id);
+    assert!(
+        rotated_into_b.epoch > revoked_epoch,
+        "rotation must allocate above the destination history, got {} vs revoked {}",
+        rotated_into_b.epoch,
+        revoked_epoch
+    );
+    assert!(
+        service
+            .verify_token_binding(&b2.client_id, revoked_epoch, &fingerprint, &claims.scp)
+            .is_err(),
+        "revoked JWT must stay rejected after rotation into that key"
+    );
+
+    // Rotate B → C, then re-pair B. History for B must never have been lowered,
+    // so the re-pair cannot recreate the revoked epoch.
+    let c_pubkey = hex::encode(key_c.verifying_key().to_bytes());
+    let rotate_away = format!(
+        "bitsov-pair-rotate-v1:{}:{c_pubkey}",
+        rotated_into_b.client_id
+    );
+    let rotate_away_sig = hex::encode(key_b.sign(rotate_away.as_bytes()).to_bytes());
+    let _rotated_to_c = service
+        .rotate_client_key(&rotated_into_b.client_id, &c_pubkey, &rotate_away_sig)
+        .unwrap();
+
+    service.open_pairing_window(std::time::Duration::from_secs(60));
+    let repaired_b = pair(&service, &key_b, "phone-b-repair");
+    assert_eq!(repaired_b.client_id, b2.client_id);
+    assert!(
+        repaired_b.epoch > revoked_epoch,
+        "re-pair after rotation away must still advance past the revoked epoch"
+    );
+    assert!(
+        service
+            .verify_token_binding(&b2.client_id, revoked_epoch, &fingerprint, &claims.scp)
+            .is_err(),
+        "revoked JWT must stay rejected after rotation away and same-key re-pair"
+    );
+
+    let restarted = PairingService::open(tmp.path(), fingerprint.clone(), true)
+        .unwrap()
+        .without_stdout_code();
+    assert!(
+        restarted
+            .verify_token_binding(&b2.client_id, revoked_epoch, &fingerprint, &claims.scp)
+            .is_err(),
+        "revoked JWT must stay rejected after reopening persisted state"
+    );
+    assert_eq!(
+        restarted
+            .list_clients()
+            .iter()
+            .find(|c| c.client_id == b2.client_id)
+            .unwrap()
+            .epoch,
+        repaired_b.epoch
+    );
+}

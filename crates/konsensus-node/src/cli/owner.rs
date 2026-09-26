@@ -317,13 +317,17 @@ pub async fn cmd_pair_window(config_path: &Path, seconds: u64) -> Result<()> {
 /// actually present. This is the repair the refusal names; it is an operator
 /// action precisely because a node doing it silently would make a crashed
 /// transition indistinguishable from a completed one.
-pub fn cmd_repair_mark_initialized(dir: &Path, confirm: bool) -> Result<()> {
-    let config_path = dir.join("konsensus.toml");
+///
+/// `config_path` is the same path `konsensus start -c` uses: the data directory
+/// is derived from it, and a present config supplies the configured identity
+/// layout (including a custom mnemonic path outside the data directory).
+pub fn cmd_repair_mark_initialized(config_path: &Path, confirm: bool) -> Result<()> {
+    let dir = data_dir_of(config_path);
     let layout = if config_path.try_exists()? {
-        let config = NodeConfig::load_before_identity_validation(&config_path)?;
-        configured_layout(dir, &config)
+        let config = NodeConfig::load_before_identity_validation(config_path)?;
+        configured_layout(&dir, &config)
     } else {
-        DataDirLayout::new(dir)
+        DataDirLayout::new(&dir)
     };
     let probe = bootstrap::DataDirProbe::inspect(&layout)
         .with_context(|| format!("failed to inspect {}", dir.display()))?;
@@ -369,12 +373,32 @@ pub fn cmd_repair_mark_initialized(dir: &Path, confirm: bool) -> Result<()> {
     Ok(())
 }
 
+/// Align a node config's mnemonic path with the identity a transition just wrote.
+fn align_config_mnemonic(config_path: &Path, mnemonic_path: &Path) -> Result<()> {
+    if !config_path.try_exists()? {
+        return Ok(());
+    }
+    let mut updated = NodeConfig::load_before_identity_validation(config_path)?;
+    if updated.identity.mnemonic_file != mnemonic_path {
+        updated.identity.mnemonic_file = mnemonic_path.to_path_buf();
+        updated
+            .save(config_path)
+            .with_context(|| format!("failed to update {}", config_path.display()))?;
+    }
+    Ok(())
+}
+
 /// Serve the identity-free bootstrap API.
 ///
 /// Returns the committed identity when a first-run create or restore lands. The
 /// caller does **not** continue into live operation with it: the node is never
 /// auto-started off the back of an API call, the operator starts it.
-pub async fn serve_bootstrap_mode(data_dir: &Path, config: &NodeConfig) -> Result<()> {
+///
+/// `config_path` is the real `-c` path the operator started with. The transition
+/// durably aligns that file with the committed mnemonic **before** publishing
+/// the success marker, so a completed bootstrap is always restartable with the
+/// same filename.
+pub async fn serve_bootstrap_mode(config_path: &Path, config: &NodeConfig) -> Result<()> {
     if !config.identity.passphrase.is_empty() {
         anyhow::bail!(
             "bootstrap does not support identity.passphrase: first-run commit derives with an \
@@ -384,8 +408,9 @@ pub async fn serve_bootstrap_mode(data_dir: &Path, config: &NodeConfig) -> Resul
         );
     }
     let api_addr = config.api.listen_addr;
-    let layout = configured_layout(data_dir, config);
-    std::fs::create_dir_all(data_dir)
+    let data_dir = data_dir_of(config_path);
+    let layout = configured_layout(&data_dir, config);
+    std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("failed to create {}", data_dir.display()))?;
 
     // No identity exists, so the pairing service binds to the empty
@@ -393,12 +418,19 @@ pub async fn serve_bootstrap_mode(data_dir: &Path, config: &NodeConfig) -> Resul
     // identity. Owner control is off: there is nothing to elevate on a node
     // with no keys, and first-run authority is already scoped to bootstrap.
     let pairing = std::sync::Arc::new(
-        PairingService::open(data_dir, String::new(), false)
+        PairingService::open(&data_dir, String::new(), false)
             .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?,
     );
-    let state = std::sync::Arc::new(konsensus_api::bootstrap::BootstrapState::new(
-        layout, pairing,
-    ));
+    let align_path = config_path.to_path_buf();
+    let state = std::sync::Arc::new(
+        konsensus_api::bootstrap::BootstrapState::new(layout, pairing).with_before_marker(
+            move |outcome| {
+                align_config_mnemonic(&align_path, &outcome.mnemonic_path).map_err(|e| {
+                    konsensus_api::bootstrap::CommitError::Io(e.to_string())
+                })
+            },
+        ),
+    );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
@@ -418,18 +450,6 @@ pub async fn serve_bootstrap_mode(data_dir: &Path, config: &NodeConfig) -> Resul
 
     match outcome {
         Some(o) => {
-            // Keep an existing config's mnemonic path aligned with the identity
-            // the transition just wrote, so the next `prepare_start` finds it.
-            let config_path = data_dir.join("konsensus.toml");
-            if config_path.try_exists()? {
-                let mut updated = NodeConfig::load_before_identity_validation(&config_path)?;
-                if updated.identity.mnemonic_file != o.mnemonic_path {
-                    updated.identity.mnemonic_file = o.mnemonic_path.clone();
-                    updated
-                        .save(&config_path)
-                        .with_context(|| format!("failed to update {}", config_path.display()))?;
-                }
-            }
             println!(
                 "identity committed: node {} (fingerprint {}).\n\
                  Mnemonic written to {}.\n\
@@ -450,7 +470,6 @@ pub async fn serve_bootstrap_mode(data_dir: &Path, config: &NodeConfig) -> Resul
 #[cfg(test)]
 mod startup_tests {
     use super::*;
-    use konsensus_api::pairing;
 
     #[cfg(unix)]
     #[test]
@@ -690,45 +709,93 @@ mod startup_tests {
     }
 
     #[test]
-    fn bootstrap_commit_aligns_existing_config_mnemonic_path() {
+    fn bootstrap_commit_aligns_custom_config_filename_before_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let custom = dir.path().join("custom-mnemonic.txt");
-        let mut config = NodeConfig::default_for_tier(NodeTier::Full, custom.clone(), dir.path());
+        let custom_mnemonic = dir.path().join("custom-mnemonic.txt");
+        let mut config =
+            NodeConfig::default_for_tier(NodeTier::Full, custom_mnemonic.clone(), dir.path());
         config.api.listen_addr = "127.0.0.1:0".parse().unwrap();
-        let path = dir.path().join("konsensus.toml");
+        let path = dir.path().join("custom.toml");
         config.save(&path).unwrap();
         assert_eq!(prepare_start(&path).unwrap().0, StartupMode::Bootstrap);
 
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let layout = configured_layout(dir.path(), &config);
-        let outcome = bootstrap::commit_first_run(&layout, phrase, None).unwrap();
-        // Same alignment serve_bootstrap_mode performs after a successful commit.
-        let mut updated = NodeConfig::load_before_identity_validation(&path).unwrap();
-        updated.identity.mnemonic_file = outcome.mnemonic_path.clone();
-        updated.save(&path).unwrap();
+        let pairing = std::sync::Arc::new(
+            PairingService::open(dir.path(), String::new(), false)
+                .unwrap()
+                .without_stdout_code(),
+        );
+        let align_path = path.clone();
+        let state = bootstrap::BootstrapState::new(configured_layout(dir.path(), &config), pairing)
+            .with_before_marker(move |outcome| {
+                align_config_mnemonic(&align_path, &outcome.mnemonic_path)
+                    .map_err(|e| bootstrap::CommitError::Io(e.to_string()))
+            });
+
+        let outcome = state.transition(phrase, bootstrap::CommitFault::None).unwrap();
+        assert!(
+            DataDirLayout::new(dir.path()).marker().exists(),
+            "marker must publish only after config alignment"
+        );
+        assert_ne!(custom_mnemonic, outcome.mnemonic_path);
+        assert!(!custom_mnemonic.exists());
+
+        let aligned = NodeConfig::load_before_identity_validation(&path).unwrap();
+        assert_eq!(aligned.identity.mnemonic_file, outcome.mnemonic_path);
 
         let (mode, started) = prepare_start(&path).unwrap();
         assert_eq!(mode, StartupMode::Initialized);
         assert_eq!(started.identity.mnemonic_file, outcome.mnemonic_path);
-        let expected = pairing::fingerprint_for_mnemonic(phrase).unwrap();
-        let identity = konsensus_core::NodeIdentity::from_mnemonic(phrase, "").unwrap();
-        assert_eq!(
-            pairing::identity_fingerprint(&identity.node_id().to_hex()),
-            expected
-        );
-        assert_ne!(custom, outcome.mnemonic_path);
-        assert!(!custom.exists());
     }
 
     #[test]
-    fn repair_mark_initialized_finds_custom_configured_identity() {
+    fn failed_config_alignment_does_not_publish_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default_for_tier(
+            NodeTier::Full,
+            dir.path().join("custom-mnemonic.txt"),
+            dir.path(),
+        );
+        config.api.listen_addr = "127.0.0.1:0".parse().unwrap();
+        let path = dir.path().join("custom.toml");
+        config.save(&path).unwrap();
+
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let pairing = std::sync::Arc::new(
+            PairingService::open(dir.path(), String::new(), false)
+                .unwrap()
+                .without_stdout_code(),
+        );
+        let state = bootstrap::BootstrapState::new(configured_layout(dir.path(), &config), pairing)
+            .with_before_marker(|_| Err(bootstrap::CommitError::Io("align failed".into())));
+
+        let err = state
+            .transition(phrase, bootstrap::CommitFault::None)
+            .expect_err("alignment failure must abort the transition");
+        assert!(matches!(err, bootstrap::CommitError::Io(_)));
+        assert!(
+            !DataDirLayout::new(dir.path()).marker().exists(),
+            "a failed alignment must not leave a completed marker"
+        );
+        // Identity material may exist (rename already happened); config must
+        // still be the pre-align custom path so prepare_start refuses rather
+        // than claiming Initialized with a missing mnemonic.
+        let loaded = NodeConfig::load_before_identity_validation(&path).unwrap();
+        assert_eq!(
+            loaded.identity.mnemonic_file,
+            dir.path().join("custom-mnemonic.txt")
+        );
+    }
+
+    #[test]
+    fn repair_mark_initialized_finds_identity_via_custom_config() {
         let dir = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let custom = other.path().join("sole-identity.txt");
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         std::fs::write(&custom, phrase).unwrap();
         let config = NodeConfig::default_for_tier(NodeTier::Full, custom.clone(), dir.path());
-        let path = dir.path().join("konsensus.toml");
+        let path = dir.path().join("custom.toml");
         config.save(&path).unwrap();
 
         let err = prepare_start(&path)
@@ -736,8 +803,8 @@ mod startup_tests {
             .to_string();
         assert!(err.contains("identity_without_marker") || err.contains("refusing to start"));
 
-        // Without config awareness this repair incorrectly reports no identity.
-        cmd_repair_mark_initialized(dir.path(), true).unwrap();
+        // Default-name repair cannot see custom.toml; the start -c path can.
+        cmd_repair_mark_initialized(&path, true).unwrap();
         assert!(DataDirLayout::new(dir.path()).marker().exists());
         let (mode, started) = prepare_start(&path).unwrap();
         assert_eq!(mode, StartupMode::Initialized);

@@ -234,9 +234,13 @@ pub enum RepairCommand {
     /// own, because doing it silently would make a crashed transition
     /// indistinguishable from a completed one.
     MarkInitialized {
-        /// The data directory to repair.
-        #[arg(short, long, default_value = ".")]
-        dir: PathBuf,
+        /// Path to the node config (same `-c` as `konsensus start`).
+        ///
+        /// The data directory is the config file's parent. When the file exists,
+        /// its configured identity path is used so repair finds the same
+        /// mnemonic startup would.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
 
         /// Required: this changes how the node classifies the directory.
         #[arg(long)]

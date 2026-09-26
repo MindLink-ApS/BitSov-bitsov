@@ -1167,7 +1167,23 @@ impl PairingService {
             .map_err(|_| PairingError::BadProof)?;
 
         let new_id = client_id_from_pubkey(&new_pubkey_hex.to_ascii_lowercase());
-        let rotated_epoch = old.epoch.checked_add(1).ok_or(PairingError::Closed)?;
+        // Allocate above the source epoch *and* any destination history or
+        // live record. `old.epoch + 1` alone can recreate a revoked destination
+        // binding, or overwrite a higher last_epoch when rotating away later.
+        let destination_last = inner.file.last_epoch.get(&new_id).copied().unwrap_or(0);
+        let destination_current = inner
+            .file
+            .clients
+            .iter()
+            .find(|c| c.client_id == new_id)
+            .map(|c| c.epoch)
+            .unwrap_or(0);
+        let rotated_epoch = old
+            .epoch
+            .max(destination_last)
+            .max(destination_current)
+            .checked_add(1)
+            .ok_or(PairingError::Closed)?;
         let rotated = PairedClient {
             client_id: new_id.clone(),
             client_pubkey: new_pubkey_hex.to_ascii_lowercase(),
@@ -1176,10 +1192,13 @@ impl PairingService {
             epoch: rotated_epoch,
             ..old.clone()
         };
-        inner
+        // Never decrease either historical record.
+        let source_tracked = inner
             .file
             .last_epoch
-            .insert(client_id.to_string(), old.epoch);
+            .entry(client_id.to_string())
+            .or_insert(0);
+        *source_tracked = (*source_tracked).max(old.epoch);
         let new_tracked = inner.file.last_epoch.entry(new_id.clone()).or_insert(0);
         *new_tracked = (*new_tracked).max(rotated_epoch);
         inner

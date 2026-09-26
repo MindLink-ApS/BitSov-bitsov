@@ -136,8 +136,8 @@ async fn main() -> Result<()> {
             owner_cmd::cmd_pair_window(&config, seconds).await?;
         }
         Command::Repair { command } => match command {
-            RepairCommand::MarkInitialized { dir, confirm } => {
-                owner_cmd::cmd_repair_mark_initialized(&dir, confirm)?;
+            RepairCommand::MarkInitialized { config, confirm } => {
+                owner_cmd::cmd_repair_mark_initialized(&config, confirm)?;
             }
         },
         Command::Restore { dir, mnemonic, tier, encrypt } => {
@@ -640,7 +640,7 @@ async fn cmd_start(
         .unwrap_or_else(|| PathBuf::from("."));
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
-            return owner_cmd::serve_bootstrap_mode(&data_dir, &config).await;
+            return owner_cmd::serve_bootstrap_mode(config_path, &config).await;
         }
         konsensus_api::bootstrap::StartupMode::Initialized => {}
         // `prepare_start` has already turned this into an error.
