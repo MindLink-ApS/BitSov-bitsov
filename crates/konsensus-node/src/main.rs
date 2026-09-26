@@ -270,17 +270,7 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
     // initialized". `init` writes it last, after the identity and config exist,
     // so a node created here is never mistaken for a fresh install — and never
     // reopens first-run pairing.
-    let marker = konsensus_api::bootstrap::DataDirLayout::new(dir).marker();
-    konsensus_api::pairing::write_protected(
-        &marker,
-        serde_json::json!({
-            "initialized_at": chrono::Utc::now().timestamp(),
-            "initialized_by": "konsensus init",
-        })
-        .to_string()
-        .as_bytes(),
-    )
-    .with_context(|| format!("failed to write {}", marker.display()))?;
+    finalize_initialized_directory(dir, "konsensus init")?;
 
     println!();
     println!("Node initialized successfully!");
@@ -416,6 +406,10 @@ fn cmd_restore(dir: &Path, mnemonic_arg: Option<&str>, tier_arg: Option<&str>, e
         .save(&config_path)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
 
+    // Same marker-last finalization as `init`: restore into a fresh directory
+    // must be classifiable as Initialized by `prepare_start` without a repair.
+    finalize_initialized_directory(dir, "konsensus restore")?;
+
     println!();
     println!("Node restored successfully!");
     println!();
@@ -430,6 +424,22 @@ fn cmd_restore(dir: &Path, mnemonic_arg: Option<&str>, tier_arg: Option<&str>, e
     println!("Run: konsensus start -c {}", config_path.display());
     println!();
 
+    Ok(())
+}
+
+/// Write `NODE_INITIALIZED` last, after identity and config are on disk.
+fn finalize_initialized_directory(dir: &Path, initialized_by: &str) -> Result<()> {
+    let marker = konsensus_api::bootstrap::DataDirLayout::new(dir).marker();
+    konsensus_api::pairing::write_protected(
+        &marker,
+        serde_json::json!({
+            "initialized_at": chrono::Utc::now().timestamp(),
+            "initialized_by": initialized_by,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .with_context(|| format!("failed to write {}", marker.display()))?;
     Ok(())
 }
 
@@ -630,7 +640,7 @@ async fn cmd_start(
         .unwrap_or_else(|| PathBuf::from("."));
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
-            return owner_cmd::serve_bootstrap_mode(&data_dir, config.api.listen_addr).await;
+            return owner_cmd::serve_bootstrap_mode(&data_dir, &config).await;
         }
         konsensus_api::bootstrap::StartupMode::Initialized => {}
         // `prepare_start` has already turned this into an error.

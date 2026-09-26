@@ -53,8 +53,20 @@ pub fn prepare_start(config_path: &Path) -> Result<(StartupMode, NodeConfig)> {
     };
     if mode == StartupMode::Initialized {
         config.validate()?;
-    } else if !config.api.listen_addr.ip().is_loopback() {
-        anyhow::bail!("bootstrap requires a loopback API listen address");
+    } else {
+        // Bootstrap: passphrase layouts disagree with first-run commit (empty
+        // passphrase), and the bootstrap API is loopback-only.
+        if !config.identity.passphrase.is_empty() {
+            anyhow::bail!(
+                "bootstrap does not support identity.passphrase: first-run commit derives with an \
+                 empty passphrase, so a configured passphrase would produce a different live \
+                 identity. Clear identity.passphrase, or initialize with `konsensus init` / \
+                 `konsensus restore`."
+            );
+        }
+        if !config.api.listen_addr.ip().is_loopback() {
+            anyhow::bail!("bootstrap requires a loopback API listen address");
+        }
     }
     Ok((mode, config))
 }
@@ -306,7 +318,13 @@ pub async fn cmd_pair_window(config_path: &Path, seconds: u64) -> Result<()> {
 /// action precisely because a node doing it silently would make a crashed
 /// transition indistinguishable from a completed one.
 pub fn cmd_repair_mark_initialized(dir: &Path, confirm: bool) -> Result<()> {
-    let layout = DataDirLayout::new(dir);
+    let config_path = dir.join("konsensus.toml");
+    let layout = if config_path.try_exists()? {
+        let config = NodeConfig::load_before_identity_validation(&config_path)?;
+        configured_layout(dir, &config)
+    } else {
+        DataDirLayout::new(dir)
+    };
     let probe = bootstrap::DataDirProbe::inspect(&layout)
         .with_context(|| format!("failed to inspect {}", dir.display()))?;
 
@@ -356,8 +374,17 @@ pub fn cmd_repair_mark_initialized(dir: &Path, confirm: bool) -> Result<()> {
 /// Returns the committed identity when a first-run create or restore lands. The
 /// caller does **not** continue into live operation with it: the node is never
 /// auto-started off the back of an API call, the operator starts it.
-pub async fn serve_bootstrap_mode(data_dir: &Path, api_addr: std::net::SocketAddr) -> Result<()> {
-    let layout = DataDirLayout::new(data_dir);
+pub async fn serve_bootstrap_mode(data_dir: &Path, config: &NodeConfig) -> Result<()> {
+    if !config.identity.passphrase.is_empty() {
+        anyhow::bail!(
+            "bootstrap does not support identity.passphrase: first-run commit derives with an \
+             empty passphrase, so a configured passphrase would produce a different live \
+             identity. Clear identity.passphrase, or initialize with `konsensus init` / \
+             `konsensus restore`."
+        );
+    }
+    let api_addr = config.api.listen_addr;
+    let layout = configured_layout(data_dir, config);
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("failed to create {}", data_dir.display()))?;
 
@@ -391,6 +418,18 @@ pub async fn serve_bootstrap_mode(data_dir: &Path, api_addr: std::net::SocketAdd
 
     match outcome {
         Some(o) => {
+            // Keep an existing config's mnemonic path aligned with the identity
+            // the transition just wrote, so the next `prepare_start` finds it.
+            let config_path = data_dir.join("konsensus.toml");
+            if config_path.try_exists()? {
+                let mut updated = NodeConfig::load_before_identity_validation(&config_path)?;
+                if updated.identity.mnemonic_file != o.mnemonic_path {
+                    updated.identity.mnemonic_file = o.mnemonic_path.clone();
+                    updated
+                        .save(&config_path)
+                        .with_context(|| format!("failed to update {}", config_path.display()))?;
+                }
+            }
             println!(
                 "identity committed: node {} (fingerprint {}).\n\
                  Mnemonic written to {}.\n\
@@ -411,6 +450,7 @@ pub async fn serve_bootstrap_mode(data_dir: &Path, api_addr: std::net::SocketAdd
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+    use konsensus_api::pairing;
 
     #[cfg(unix)]
     #[test]
@@ -629,5 +669,78 @@ mod startup_tests {
             assert!(!dir.path().join("NODE_INITIALIZED").exists());
             assert!(!dir.path().join("identity").exists());
         }
+    }
+
+    #[test]
+    fn bootstrap_rejects_configured_passphrase_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default_for_tier(
+            NodeTier::Full,
+            dir.path().join("mnemonic.txt"),
+            dir.path(),
+        );
+        config.identity.passphrase = "public test passphrase".into();
+        let path = dir.path().join("konsensus.toml");
+        config.save(&path).unwrap();
+        let err = prepare_start(&path).expect_err("passphrase layout must fail closed");
+        assert!(
+            err.to_string().contains("passphrase"),
+            "expected passphrase refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_commit_aligns_existing_config_mnemonic_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("custom-mnemonic.txt");
+        let mut config = NodeConfig::default_for_tier(NodeTier::Full, custom.clone(), dir.path());
+        config.api.listen_addr = "127.0.0.1:0".parse().unwrap();
+        let path = dir.path().join("konsensus.toml");
+        config.save(&path).unwrap();
+        assert_eq!(prepare_start(&path).unwrap().0, StartupMode::Bootstrap);
+
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let layout = configured_layout(dir.path(), &config);
+        let outcome = bootstrap::commit_first_run(&layout, phrase, None).unwrap();
+        // Same alignment serve_bootstrap_mode performs after a successful commit.
+        let mut updated = NodeConfig::load_before_identity_validation(&path).unwrap();
+        updated.identity.mnemonic_file = outcome.mnemonic_path.clone();
+        updated.save(&path).unwrap();
+
+        let (mode, started) = prepare_start(&path).unwrap();
+        assert_eq!(mode, StartupMode::Initialized);
+        assert_eq!(started.identity.mnemonic_file, outcome.mnemonic_path);
+        let expected = pairing::fingerprint_for_mnemonic(phrase).unwrap();
+        let identity = konsensus_core::NodeIdentity::from_mnemonic(phrase, "").unwrap();
+        assert_eq!(
+            pairing::identity_fingerprint(&identity.node_id().to_hex()),
+            expected
+        );
+        assert_ne!(custom, outcome.mnemonic_path);
+        assert!(!custom.exists());
+    }
+
+    #[test]
+    fn repair_mark_initialized_finds_custom_configured_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let custom = other.path().join("sole-identity.txt");
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        std::fs::write(&custom, phrase).unwrap();
+        let config = NodeConfig::default_for_tier(NodeTier::Full, custom.clone(), dir.path());
+        let path = dir.path().join("konsensus.toml");
+        config.save(&path).unwrap();
+
+        let err = prepare_start(&path)
+            .expect_err("markerless custom identity must refuse")
+            .to_string();
+        assert!(err.contains("identity_without_marker") || err.contains("refusing to start"));
+
+        // Without config awareness this repair incorrectly reports no identity.
+        cmd_repair_mark_initialized(dir.path(), true).unwrap();
+        assert!(DataDirLayout::new(dir.path()).marker().exists());
+        let (mode, started) = prepare_start(&path).unwrap();
+        assert_eq!(mode, StartupMode::Initialized);
+        assert_eq!(started.identity.mnemonic_file, custom);
     }
 }

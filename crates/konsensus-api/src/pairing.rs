@@ -48,7 +48,7 @@
 //! per-request binding verification both compute the effective scopes from the
 //! deployment mode, so `spend` never reaches a sidecar token.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -301,6 +301,12 @@ pub struct PairingFile {
     pub pending_elevations: Vec<PendingElevation>,
     /// Pending / approved replacement approvals.
     pub replacement_approvals: Vec<ReplacementApproval>,
+    /// Highest pairing epoch ever assigned per client id.
+    ///
+    /// Survives [`PairingService::revoke`] so a re-pair of the same key cannot
+    /// recreate an earlier `(client_id, epoch)` and resurrect a revoked JWT.
+    #[serde(default)]
+    pub last_epoch: BTreeMap<String, u64>,
 }
 
 /// Current durable schema version.
@@ -795,14 +801,27 @@ impl PairingService {
         let client_id = client_id_from_pubkey(&pending.client_pubkey);
 
         let mut inner = self.lock();
+        // Enforce under the final insertion lock: a pending ceremony may already
+        // have been removed from the map before `rebind_to_identity` runs, so
+        // clearing pending alone cannot close the race. Identity authority is
+        // bootstrap-only — refuse it once an identity fingerprint is bound.
+        if scopes.contains(&Scope::Identity) && !inner.identity_fingerprint.is_empty() {
+            return Err(PairingError::Closed);
+        }
         let fingerprint = inner.identity_fingerprint.clone();
-        let epoch = inner
-            .file
-            .clients
-            .iter()
-            .find(|c| c.client_id == client_id)
-            .map(|c| c.epoch)
-            .unwrap_or(0);
+        let epoch = {
+            let prior = inner
+                .file
+                .clients
+                .iter()
+                .find(|c| c.client_id == client_id)
+                .map(|c| c.epoch)
+                .unwrap_or(0);
+            let entry = inner.file.last_epoch.entry(client_id.clone()).or_insert(0);
+            *entry = (*entry).max(prior);
+            *entry = entry.checked_add(1).ok_or(PairingError::Closed)?;
+            *entry
+        };
         let record = PairedClient {
             client_id: client_id.clone(),
             name: pending.name.clone(),
@@ -1076,6 +1095,7 @@ impl PairingService {
             .ok_or(PairingError::UnknownClient)?;
         record.epoch += 1;
         let epoch = record.epoch;
+        inner.file.last_epoch.insert(client_id.to_string(), epoch);
         // A grant is pinned to the epoch it was written against, so a
         // revocation drops the elevation with it rather than leaving a stale
         // `spend` waiting for the next pairing of the same key.
@@ -1087,9 +1107,23 @@ impl PairingService {
     /// Remove a pairing entirely (and any grant bound to it).
     pub fn revoke(&self, client_id: &str) -> Result<(), PairingError> {
         let mut inner = self.lock();
-        if !inner.file.clients.iter().any(|c| c.client_id == client_id) {
+        let Some(existing) = inner
+            .file
+            .clients
+            .iter()
+            .find(|c| c.client_id == client_id)
+            .cloned()
+        else {
             return Err(PairingError::UnknownClient);
-        }
+        };
+        // Retain the generation across deletion so a later re-pair cannot
+        // recreate the revoked `(client_id, epoch)` binding.
+        let tracked = inner
+            .file
+            .last_epoch
+            .entry(client_id.to_string())
+            .or_insert(0);
+        *tracked = (*tracked).max(existing.epoch);
         inner.file.clients.retain(|c| c.client_id != client_id);
         inner.file.grants.retain(|g| g.client_id != client_id);
         inner
@@ -1133,14 +1167,21 @@ impl PairingService {
             .map_err(|_| PairingError::BadProof)?;
 
         let new_id = client_id_from_pubkey(&new_pubkey_hex.to_ascii_lowercase());
+        let rotated_epoch = old.epoch.checked_add(1).ok_or(PairingError::Closed)?;
         let rotated = PairedClient {
             client_id: new_id.clone(),
             client_pubkey: new_pubkey_hex.to_ascii_lowercase(),
             // The epoch advances on rotation: tokens minted for the old key
             // must stop working the moment the key they prove is retired.
-            epoch: old.epoch + 1,
+            epoch: rotated_epoch,
             ..old.clone()
         };
+        inner
+            .file
+            .last_epoch
+            .insert(client_id.to_string(), old.epoch);
+        let new_tracked = inner.file.last_epoch.entry(new_id.clone()).or_insert(0);
+        *new_tracked = (*new_tracked).max(rotated_epoch);
         inner
             .file
             .clients
@@ -1166,7 +1207,10 @@ impl PairingService {
             client.identity_fingerprint = fingerprint.to_string();
             client.scopes = default_pairing_scopes();
         }
-        // Nothing pending from bootstrap carries into the live node.
+        // Nothing pending from bootstrap carries into the live node. Pending
+        // ceremonies are also cleared, but that alone is not the identity
+        // authority gate — see the final-lock check in `confirm_pairing`.
+        inner.pending.clear();
         inner.file.grants.clear();
         inner.file.pending_elevations.clear();
         inner.file.replacement_approvals.clear();

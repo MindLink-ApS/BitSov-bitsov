@@ -1063,3 +1063,154 @@ async fn replacement_refusal_preserves_decryptable_history() {
     );
     assert!(wrong_key.get_message(&envelope.id).await.is_err());
 }
+
+/// Finding 1: a late/concurrent bootstrap confirmation must never persist
+/// identity authority after the identity is rebound.
+#[test]
+fn late_bootstrap_confirm_cannot_persist_identity_after_rebind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let service = PairingService::open(tmp.path(), String::new(), false)
+        .unwrap()
+        .without_stdout_code();
+
+    let key_a = client_key(11);
+    let key_b = client_key(12);
+    let pubkey_a = hex::encode(key_a.verifying_key().to_bytes());
+    let pubkey_b = hex::encode(key_b.verifying_key().to_bytes());
+
+    // Queue two pairing requests while bootstrap is empty.
+    let req_a = service.request_pairing("client-a", &pubkey_a).unwrap();
+    let req_b = service.request_pairing("client-b", &pubkey_b).unwrap();
+
+    let challenge_a =
+        std::fs::read(service.dir().join(format!("challenge-{}", req_a.pair_id))).unwrap();
+    let sig_a = hex::encode(
+        key_a
+            .sign(&PairingService::proof_message(
+                &req_a.pair_id,
+                &pubkey_a,
+                &challenge_a,
+            ))
+            .to_bytes(),
+    );
+    service
+        .confirm_pairing(
+            &req_a.pair_id,
+            &sig_a,
+            pairing::bootstrap_pairing_scopes(),
+        )
+        .unwrap();
+
+    // Commit/rebind: identity exists. Pending B is cleared, but clearing alone
+    // is not the gate — confirm with bootstrap scopes must still refuse once
+    // a fingerprint is bound (covers the concurrent "already removed from
+    // pending" path via the same final-lock check).
+    let fingerprint = current_fingerprint();
+    service.rebind_to_identity(&fingerprint).unwrap();
+    assert!(
+        service
+            .confirm_pairing(
+                &req_b.pair_id,
+                "00",
+                pairing::bootstrap_pairing_scopes(),
+            )
+            .is_err(),
+        "pending B must not survive rebind"
+    );
+
+    service.open_pairing_window(std::time::Duration::from_secs(60));
+    let late = service.request_pairing("client-b-late", &pubkey_b).unwrap();
+    let late_challenge =
+        std::fs::read(service.dir().join(format!("challenge-{}", late.pair_id))).unwrap();
+    let late_sig = hex::encode(
+        key_b
+            .sign(&PairingService::proof_message(
+                &late.pair_id,
+                &pubkey_b,
+                &late_challenge,
+            ))
+            .to_bytes(),
+    );
+    let err = service
+        .confirm_pairing(
+            &late.pair_id,
+            &late_sig,
+            pairing::bootstrap_pairing_scopes(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, PairingError::Closed),
+        "expected Closed after rebind, got {err:?}"
+    );
+
+    let durable = service.reload_from_disk().unwrap();
+    assert!(
+        !durable
+            .clients
+            .iter()
+            .any(|c| c.scopes.contains(&Scope::Identity)),
+        "identity authority must never persist after rebind: {:?}",
+        durable.clients
+    );
+}
+
+/// Finding 2: a JWT from a deleted pairing must stay rejected after re-pairing
+/// the same key, including across a service restart.
+#[test]
+fn revoked_jwt_stays_rejected_after_repair_of_same_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let secret = "test-secret-at-least-32-bytes-long!";
+    let key = client_key(21);
+    let fingerprint = current_fingerprint();
+
+    let (service, _console) = owner_run_service(tmp.path());
+    let client = pair(&service, &key, "phone");
+    let challenge = service.issue_token_challenge(&client.client_id).unwrap();
+    let sig = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
+    let issued = service
+        .issue_token("node", secret, &client.client_id, &challenge, &sig)
+        .unwrap();
+    let claims = konsensus_api::auth::validate_token(&issued.token, secret).unwrap();
+    let old_epoch = claims.epc.unwrap();
+    assert_eq!(old_epoch, client.epoch);
+
+    service.revoke(&client.client_id).unwrap();
+    assert!(service
+        .verify_token_binding(&client.client_id, old_epoch, &fingerprint, &claims.scp)
+        .is_err());
+
+    // Re-pair the same public key before the old JWT would expire.
+    service.open_pairing_window(std::time::Duration::from_secs(60));
+    let repaired = pair(&service, &key, "phone-again");
+    assert_eq!(repaired.client_id, client.client_id);
+    assert_ne!(
+        repaired.epoch, old_epoch,
+        "re-pair must advance the generation so the revoked JWT cannot bind"
+    );
+    assert!(
+        service
+            .verify_token_binding(&client.client_id, old_epoch, &fingerprint, &claims.scp)
+            .is_err(),
+        "revoked JWT must remain rejected after re-pairing the same key"
+    );
+
+    // Across restart: reopen from disk and re-check.
+    let restarted = PairingService::open(tmp.path(), fingerprint.clone(), true)
+        .unwrap()
+        .without_stdout_code();
+    assert!(
+        restarted
+            .verify_token_binding(&client.client_id, old_epoch, &fingerprint, &claims.scp)
+            .is_err(),
+        "revoked JWT must remain rejected after restart"
+    );
+    assert_eq!(
+        restarted
+            .list_clients()
+            .iter()
+            .find(|c| c.client_id == client.client_id)
+            .unwrap()
+            .epoch,
+        repaired.epoch
+    );
+}
