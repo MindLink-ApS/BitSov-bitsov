@@ -367,6 +367,13 @@ pub struct CommitOutcome {
     pub mnemonic_path: PathBuf,
 }
 
+/// Hook after rebind and before `NODE_INITIALIZED` (clippy::type_complexity).
+type BeforeMarkerHook = dyn Fn(&CommitOutcome) -> Result<(), CommitError>;
+
+/// Owned, thread-safe [`BeforeMarkerHook`] for [`BootstrapState`].
+type BeforeMarkerHookOwned =
+    Arc<dyn Fn(&CommitOutcome) -> Result<(), CommitError> + Send + Sync>;
+
 /// Errors from the transition.
 #[derive(Debug, thiserror::Error)]
 pub enum CommitError {
@@ -433,7 +440,7 @@ pub fn commit_first_run_with_before_marker(
     mnemonic: &str,
     pairing: Option<&PairingService>,
     fault: CommitFault,
-    before_marker: Option<&dyn Fn(&CommitOutcome) -> Result<(), CommitError>>,
+    before_marker: Option<&BeforeMarkerHook>,
 ) -> Result<CommitOutcome, CommitError> {
     let identity = konsensus_core::NodeIdentity::from_mnemonic(mnemonic, "")
         .map_err(|e| CommitError::InvalidMnemonic(e.to_string()))?;
@@ -541,7 +548,7 @@ pub struct BootstrapState {
     pub started_at: Instant,
     /// Optional durable work that must complete before the marker is published
     /// (e.g. aligning the operator's config file with the committed mnemonic).
-    before_marker: Option<Arc<dyn Fn(&CommitOutcome) -> Result<(), CommitError> + Send + Sync>>,
+    before_marker: Option<BeforeMarkerHookOwned>,
 }
 
 impl BootstrapState {
