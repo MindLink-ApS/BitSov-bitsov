@@ -47,6 +47,7 @@ fn convert_direction_mapping() {
 #[test]
 fn ldk_config_construction() {
     let config = LdkConfig {
+        liquidity: Default::default(),
         storage_dir: PathBuf::from("/tmp/ldk_test"),
         scb_backup_dir: None,
         scb_rotation_count: 24,
@@ -137,6 +138,7 @@ fn ldk_entropy_is_64_bytes() {
 #[tokio::test]
 async fn invalid_mnemonic_errors() {
     let config = LdkConfig {
+        liquidity: Default::default(),
         storage_dir: PathBuf::from("/tmp/ldk_test"),
         scb_backup_dir: None,
         scb_rotation_count: 24,
@@ -748,4 +750,35 @@ fn wallet_sync_is_never_synced_until_both_wallets_have_synced() {
         wallet_sync_from_timestamps(None, Some(1_700_000_000)),
         WalletSync::NeverSynced
     );
+}
+
+#[test]
+fn jit_purpose_fee_and_net_survive_ldk_serialization_without_admission_proof() {
+    use ldk_node::lightning::ln::channelmanager::PaymentId;
+    use ldk_node::lightning::util::ser::{Readable, Writeable};
+    use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
+    use ldk_node::payment::{LSPFeeLimits, PaymentDetails as LdkDetails};
+    for fee in [None, Some(2_000)] {
+        let details = LdkDetails {
+            id: PaymentId([70; 32]),
+            kind: LdkPaymentKind::Bolt11Jit {
+                hash: PaymentHash([70; 32]), preimage: Some(PaymentPreimage([71; 32])),
+                secret: Some(PaymentSecret([72; 32])), counterparty_skimmed_fee_msat: fee,
+                lsp_fee_limits: LSPFeeLimits { max_total_opening_fee_msat: Some(2_000), max_proportional_opening_fee_ppm_msat: None },
+            },
+            amount_msat: Some(100_000 - fee.unwrap_or(0)), fee_paid_msat: None,
+            direction: ldk_node::payment::PaymentDirection::Inbound,
+            status: LdkPaymentStatus::Succeeded, latest_update_timestamp: 1_700_000_000,
+        };
+        let bytes = details.encode();
+        let restored = LdkDetails::read(&mut &bytes[..]).unwrap();
+        assert!(matches!(restored.kind, LdkPaymentKind::Bolt11Jit { .. }));
+        let receipt = jit_receipt(&restored).unwrap().unwrap();
+        assert_eq!(receipt.gross_msat, 100_000);
+        assert_eq!(receipt.net_received_msat, 100_000 - fee.unwrap_or(0));
+        assert_eq!(receipt.lsp_fee_msat, fee.unwrap_or(0));
+        let public = convert_payment_details(&restored);
+        assert!(public.preimage.is_none());
+        assert!(!is_admittable_inbound_payment(&public));
+    }
 }

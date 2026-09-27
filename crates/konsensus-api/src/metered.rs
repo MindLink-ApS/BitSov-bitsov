@@ -98,6 +98,15 @@ impl MeteredSpend {
     /// Returns a [`Debit`] the handler resolves once each outcome is known.
     /// Zero amounts retain their recipient so resolution still consumes the reservation.
     pub fn debit(&self, state: &AppState, charges: Vec<Charge>) -> Result<Debit, ApiError> {
+        self.debit_purpose(state, charges, false)
+    }
+
+    /// Reserve an explicitly approved LSP fee under total/call/recipient bounds.
+    pub fn debit_liquidity(&self, state: &AppState, charge: Charge) -> Result<Debit, ApiError> {
+        self.debit_purpose(state, vec![charge], true)
+    }
+
+    fn debit_purpose(&self, state: &AppState, charges: Vec<Charge>, liquidity: bool) -> Result<Debit, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else {
             return Ok(Debit::unmetered());
         };
@@ -105,9 +114,11 @@ impl MeteredSpend {
             .pairing
             .as_ref()
             .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-        let reservation = service
-            .reserve_spend(client_id, *epoch, charges)
-            .map_err(ApiError::BudgetExceeded)?;
+        let reservation = if liquidity {
+            service.reserve_liquidity_fee(client_id, *epoch, charges)
+        } else {
+            service.reserve_spend(client_id, *epoch, charges)
+        }.map_err(ApiError::BudgetExceeded)?;
         tracing::debug!(
             client = %client_id,
             reserved_msat = reservation.charges.iter().map(|c| c.amount_msat).sum::<u64>(),

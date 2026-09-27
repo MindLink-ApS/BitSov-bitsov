@@ -176,6 +176,7 @@ impl KonsensusNode {
                 }))
             }
             LightningConfig::Ldk {
+                liquidity,
                 network,
                 esplora_url,
                 esplora_url_fallback,
@@ -197,6 +198,7 @@ impl KonsensusNode {
                     });
                 let ldk_storage_dir = data_dir.join("ldk");
                 let ldk_config = LdkConfig {
+                    liquidity: liquidity.clone(),
                     storage_dir: ldk_storage_dir,
                     scb_backup_dir: Some(std::path::PathBuf::from(&config.backup.scb_dir)),
                     scb_rotation_count: config.backup.rotation_count,

@@ -125,8 +125,8 @@ async fn main() -> Result<()> {
         Command::PairStatus { config } => {
             owner_cmd::cmd_pair_status(&config).await?;
         }
-        Command::Grant { op_id, budget, for_, per_call, recipient, yes, config } => {
-            let flags = owner_cmd::GrantFlags { budget_sats: budget, window: for_, per_call_sats: per_call, recipients: recipient, yes };
+        Command::Grant { op_id, budget, for_, per_call, recipient, yes, config, allow_liquidity_fees } => {
+            let flags = owner_cmd::GrantFlags { allow_liquidity_fees, budget_sats: budget, window: for_, per_call_sats: per_call, recipients: recipient, yes };
             owner_cmd::cmd_grant(&config, &op_id, flags).await?;
         }
         Command::GrantRevoke { client_id, all, config } => {

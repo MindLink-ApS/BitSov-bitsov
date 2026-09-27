@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 const SPEND: &[&str] = &[
     "pay_invoice",
+    "accept_liquidity",
     "keysend",
     "send_onchain",
     "open_channel",
