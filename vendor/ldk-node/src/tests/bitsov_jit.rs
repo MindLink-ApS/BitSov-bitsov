@@ -221,3 +221,47 @@ async fn mpp_parts_wait_for_aggregate_and_partial_total_fails_the_jit_minimum() 
             if expected_claim { PaymentStatus::Pending } else { PaymentStatus::Failed });
     }
 }
+
+
+// Replay the handler's reachable event sequence using the real payment store.
+// Pinned LDK claim_funds rejects unknown even TLVs after PaymentClaimable,
+// without emitting PaymentClaimed. A fresh attempt may reuse the same invoice.
+#[tokio::test]
+async fn zero_fee_retry_replaces_failed_attempt_skim_and_survives_restart() {
+    let (_dir, builder, _log) = setup();
+    let node = builder.build_with_fs_store().unwrap();
+    let receive = handler(&node);
+    let (hash, purpose) = register(&node, Some(100_000), 2_000);
+    let mut first = claimable(hash, purpose.clone(), 98_000, 2_000);
+    if let LdkEvent::PaymentClaimable { onion_fields, .. } = &mut first {
+        let secret = match &purpose {
+            PaymentPurpose::Bolt11InvoicePayment { payment_secret, .. } => *payment_secret,
+            _ => unreachable!(),
+        };
+        *onion_fields = Some(lightning::ln::channelmanager::RecipientOnionFields::secret_only(secret)
+            .with_custom_tlvs(vec![(5482373482, vec![1, 2, 3, 4])]).unwrap());
+    }
+    receive.handle_event(first).await.unwrap();
+    assert_eq!(node.payment(&PaymentId(hash.0)).unwrap().status, PaymentStatus::Pending);
+    assert!(node.next_event().is_none());
+    receive.handle_event(claimable(hash, purpose.clone(), 100_000, 0)).await.unwrap();
+    receive.handle_event(LdkEvent::PaymentClaimed {
+        payment_hash: hash, purpose: purpose.clone(), amount_msat: 100_000,
+        receiver_node_id: None, htlcs: vec![], sender_intended_total_msat: Some(100_000),
+        onion_fields: None, payment_id: Some(PaymentId(hash.0)),
+    }).await.unwrap();
+    drop(receive);
+    drop(node);
+    let node = builder.build_with_fs_store().unwrap();
+    // A late positive-skim attempt must not alter the successful zero-fee receipt.
+    handler(&node).handle_event(claimable(hash, purpose, 98_000, 2_000)).await.unwrap();
+    let receipt = node.payment(&PaymentId(hash.0)).unwrap();
+    assert_eq!(receipt.status, PaymentStatus::Succeeded);
+    assert_eq!(receipt.amount_msat, Some(100_000));
+    let fee = match receipt.kind {
+        PaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } => counterparty_skimmed_fee_msat.expect("successful JIT attempt records its skim, including zero"),
+        _ => panic!("lost funding purpose"),
+    };
+    assert_eq!(fee, 0, "zero-fee settlement must not report the failed attempt's skim");
+    assert_eq!(receipt.amount_msat.unwrap() + fee, 100_000, "gross funding excludes the failed attempt's fee");
+}

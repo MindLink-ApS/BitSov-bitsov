@@ -1765,8 +1765,8 @@ impl JitBackend for LdkJitBackend {
 fn jit_receipt(p: &ldk_node::payment::PaymentDetails) -> Result<Option<LiquidityReceipt>, LightningError> {
     if let LdkPaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } = p.kind {
         if p.status == LdkPaymentStatus::Succeeded {
-            // LDK 0.7 only writes a skim entry when nonzero. All JIT payments in
-            // this genome are created with >=0.7, so None on success means zero.
+            // The vendored handler records each eligible JIT attempt's skim,
+            // including zero. Older zero-fee receipts may still contain None.
             let fee = counterparty_skimmed_fee_msat.unwrap_or(0);
             let net = p.amount_msat.ok_or_else(|| LightningError::Backend("missing settled JIT amount".into()))?;
             let gross = net.checked_add(fee).ok_or_else(|| LightningError::Backend("JIT amount overflow".into()))?;

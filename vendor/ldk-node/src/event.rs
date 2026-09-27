@@ -743,8 +743,11 @@ where
 						};
 					}
 
-					// If the LSP skimmed anything, update our stored payment.
-					if counterparty_skimmed_fee_msat > 0 {
+					// Replace the skim for every eligible JIT attempt, including zero:
+					// claim_funds can fail after a positive skim has been persisted.
+					// The successful-payment guard above keeps late attempts from
+					// overwriting an already settled receipt.
+					if counterparty_skimmed_fee_msat > 0 || matches!(info.kind, PaymentKind::Bolt11Jit { .. }) {
 						match info.kind {
 							PaymentKind::Bolt11Jit { .. } => {
 								let update = PaymentDetailsUpdate {
