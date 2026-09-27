@@ -625,6 +625,20 @@ pub mod scoped {
                 )
                     .into_response());
             }
+            // G1: a paired client's `spend` is a metered budget grant. A route
+            // that takes `ScopedAuth<Spend>` does not debit a budget, so it
+            // refuses paired callers rather than let them spend unmetered.
+            // Budgeted paid paths take `crate::metered::MeteredSpend` instead.
+            if S::SCOPE == Scope::Spend && user.pairing.is_some() {
+                metrics::counter!(crate::metrics::AUTH_FAILURES).increment(1);
+                tracing::warn!("paired spend refused on an unmetered money route");
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "a paired client's spend grant is budget-scoped and does not cover this \
+                     route; only metered paid paths (messages, files, pay, keysend) accept it",
+                )
+                    .into_response());
+            }
             Ok(ScopedAuth {
                 user,
                 _scope: std::marker::PhantomData,

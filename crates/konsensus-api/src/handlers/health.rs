@@ -184,6 +184,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
             super::messages::caps::ROOM_CAPABILITY,
             super::organism::ENERGY_CAPABILITY,
             crate::membrane::CAPABILITY,
+            crate::spend_budget::CAPABILITY,
         ],
         status: "ok",
         node_id: state.identity.node_id().to_hex(),

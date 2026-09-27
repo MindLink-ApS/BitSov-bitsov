@@ -8,7 +8,9 @@
 //! File transfer uses `KIND_FILE_REF` (200) UKM envelopes. The plaintext
 //! payload is a JSON `FilePayload` containing metadata + base64 file data.
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read, Spend};
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::metered::MeteredSpend;
+use crate::spend_budget::Charge;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -25,7 +27,7 @@ use konsensus_storage::FileRecord;
 
 use crate::audit::events;
 use crate::error::ApiError;
-use crate::handlers::messages::create_payment_proof;
+use crate::handlers::messages::create_metered_payment_proof;
 use crate::state::AppState;
 
 /// Maximum file size: 4 MiB (fits within 16 MiB wire frame with overhead).
@@ -353,7 +355,7 @@ async fn delete_file(
 /// encrypts it via Double Ratchet, creates a UKM envelope with KIND_FILE_REF,
 /// and delivers it. Same pipeline as compose_message but for files.
 async fn send_file(
-    _auth: ScopedAuth<Spend>,
+    auth: MeteredSpend,
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
     Json(req): Json<SendFileRequest>,
@@ -391,12 +393,23 @@ async fn send_file(
     let payload_json = serde_json::to_vec(&payload)
         .map_err(|e| ApiError::Internal(format!("payload serialization: {e}")))?;
 
+    // Reject budget limits before advancing the ratchet or requesting an invoice.
+    let peer_key = peer_id.to_hex();
+    let debit = auth.debit(
+        &state,
+        vec![Charge {
+            recipient: peer_key.clone(),
+            amount_msat: super::messages::caps::payable(price_msat),
+        }],
+    )?;
+
     // E2EE encrypt via Double Ratchet
     let ratchet_msg = state
         .session_manager
         .encrypt(&peer_id, &payload_json)
         .await
         .map_err(|e| {
+            debit.released(&peer_key);
             ApiError::BadRequest(format!(
                 "E2EE encryption failed (session may not be established): {e}"
             ))
@@ -404,8 +417,9 @@ async fn send_file(
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
     // Create real payment proof — requests invoice from recipient (Principle 2).
-    let (payment_hash, preimage, amount_msat) =
-        create_payment_proof(&state, price_msat, &peer_id).await?;
+    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit).await;
+    debit.resolve_proof(&peer_key, &paid);
+    let (payment_hash, preimage, amount_msat) = paid?;
     let proof =
         konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
 

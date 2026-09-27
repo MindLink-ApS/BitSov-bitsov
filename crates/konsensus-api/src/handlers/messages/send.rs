@@ -4,7 +4,7 @@
 //! stores, and delivers the envelope. Use `compose` if you want the node
 //! to handle E2EE encryption and Lightning payment automatically.
 
-use crate::auth::scoped::{ScopedAuth, Spend};
+use crate::metered::MeteredSpend;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -53,8 +53,13 @@ pub struct SendMessageResponse {
 }
 
 /// `POST /api/v1/messages` — send a message.
+///
+/// G1: accepts a budget grant but debits nothing. This route requests no
+/// invoice and dispatches no payment — it carries a proof the caller already
+/// paid, and a proof paid by this node through `/payments/pay` or
+/// `/payments/keysend` was debited there. Debiting again would double-count.
 pub(super) async fn send_message(
-    _auth: ScopedAuth<Spend>,
+    _auth: MeteredSpend,
     State(state): State<Arc<AppState>>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>, ApiError> {

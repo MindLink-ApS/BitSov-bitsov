@@ -19,7 +19,7 @@ use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use crate::auth::scoped::{ScopedAuth, Spend};
+use crate::metered::MeteredSpend;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -31,6 +31,7 @@ mod resync;
 mod send;
 
 pub use compose::{create_payment_proof, ComposeRequest, ComposeResponse};
+pub(crate) use compose::create_metered_payment_proof;
 pub use query::{ListMessagesQuery, MessageResponse};
 pub use send::{SendMessageRequest, SendMessageResponse};
 
@@ -40,7 +41,7 @@ pub use send::{SendMessageRequest, SendMessageResponse};
 // Observed here, around the handlers, so the send paths stay untouched.
 
 async fn compose_observed(
-    auth: ScopedAuth<Spend>,
+    auth: MeteredSpend,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ComposeRequest>,
 ) -> Result<Json<ComposeResponse>, ApiError> {
@@ -53,7 +54,7 @@ async fn compose_observed(
 }
 
 async fn send_observed(
-    auth: ScopedAuth<Spend>,
+    auth: MeteredSpend,
     State(state): State<Arc<AppState>>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>, ApiError> {

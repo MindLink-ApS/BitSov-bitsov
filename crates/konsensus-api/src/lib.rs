@@ -60,9 +60,11 @@ pub mod control;
 pub mod error;
 pub mod freshness;
 pub mod handlers;
+pub mod metered;
 pub mod metrics;
 pub mod pairing;
 pub mod rate_limit;
+pub mod spend_budget;
 pub mod state;
 pub mod ws;
 // N2 membrane ring (declared last to stay clear of neighbouring module additions).
@@ -212,6 +214,13 @@ pub async fn serve(
     state: Arc<AppState>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Opening the pairing store already purges expired grants. Recheck here
+    // in case a deadline passed during startup, and fail before binding any
+    // listener if durable cleanup cannot complete.
+    if let Some(pairing) = &state.pairing {
+        pairing.prune_expired_grants()?;
+    }
+
     // Initialise Prometheus metrics recorder (idempotent — safe if called twice).
     if let Err(e) = metrics::init() {
         tracing::warn!(error = %e, "Prometheus metrics recorder init failed — /metrics endpoint will return empty");

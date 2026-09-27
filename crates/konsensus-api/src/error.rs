@@ -12,6 +12,11 @@ pub enum ApiError {
     #[error("price cap exceeded: {0}")]
     PriceCapExceeded(String),
 
+    /// A paired client's budget grant refused the debit (G1). Nothing was
+    /// reserved and no invoice was requested or paid.
+    #[error("budget exceeded: {0}")]
+    BudgetExceeded(crate::spend_budget::BudgetRefusal),
+
     /// A dispatch may have happened, but no terminal payment evidence is available.
     #[error("payment outcome unknown: {0}")]
     PaymentUnresolved(String),
@@ -84,8 +89,23 @@ impl IntoResponse for ApiError {
                 "error": message, "code": "price_cap_exceeded"
             }))).into_response();
         }
+        if let ApiError::BudgetExceeded(refusal) = &self {
+            let remaining = match refusal {
+                crate::spend_budget::BudgetRefusal::Total { remaining_msat }
+                | crate::spend_budget::BudgetRefusal::Recipient { remaining_msat, .. } => {
+                    Some(*remaining_msat)
+                }
+                _ => None,
+            };
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": refusal.to_string(),
+                "code": "budget_exceeded",
+                "reason": refusal.reason(),
+                "remaining_msat": remaining,
+            }))).into_response();
+        }
         let (status, message) = match &self {
-            ApiError::PriceCapExceeded(_) => unreachable!(),
+            ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
