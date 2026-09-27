@@ -1211,6 +1211,9 @@ async fn reservation_resolution_is_idempotent_across_restart() {
 #[path = "budget_grant/first_contact.rs"]
 mod first_contact;
 
+#[path = "budget_grant/sponsor.rs"]
+mod sponsor;
+
 #[tokio::test]
 async fn zero_charge_resolution_consumes_its_durable_reservation() {
     let fx = fixture().await;

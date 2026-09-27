@@ -103,6 +103,16 @@ async fn get_introduction(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let card = issue_card(&state).await?;
+    let link = card.to_link();
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(IntroductionResponse { card, link }),
+    ))
+}
+
+/// Sign a fresh card for this node (also used by the sponsor kit's offer).
+pub(crate) async fn issue_card(state: &AppState) -> Result<Introduction, ApiError> {
     let settings = &state.introduction;
     let network = settings.network.clone().ok_or_else(|| {
         ApiError::Conflict(
@@ -136,16 +146,15 @@ async fn get_introduction(
         },
     )
     .map_err(|e| ApiError::Conflict(format!("introduction_unavailable: {e}")))?;
-    let link = card.to_link();
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(IntroductionResponse { card, link }),
-    ))
+    Ok(card)
 }
 
-fn verified_card(state: &AppState, text: &str) -> Result<Introduction, ApiError> {
+pub(crate) fn verified_card(state: &AppState, text: &str) -> Result<Introduction, ApiError> {
     let invalid = |e| ApiError::BadRequest(format!("introduction_invalid: {e}"));
-    let card = Introduction::parse(text).map_err(invalid)?;
+    // A sponsor offer may ride after the card (`<card>.<offer>`, K1 slice 2);
+    // the card is read and verified on its own. Opening never uses the offer.
+    let (card_text, _offer) = konsensus_core::sponsor::split_introduction_link(text);
+    let card = Introduction::parse(&card_text).map_err(invalid)?;
     let network = state.introduction.network.as_deref().ok_or_else(|| {
         ApiError::Conflict(
             "introduction_unavailable: this node's Lightning backend does not state a Bitcoin network".into(),

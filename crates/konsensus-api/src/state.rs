@@ -251,6 +251,9 @@ pub struct AppState {
     /// K1: the network and peer endpoint this node signs into its
     /// introduction (`GET /api/v1/introduction`). Default: none offered.
     pub introduction: crate::handlers::introduction::IntroductionSettings,
+
+    /// K1 slice 2: the owner's sponsoring policy (`[sponsor]`). Off by default.
+    pub sponsor: crate::handlers::sponsor::SponsorPolicy,
 }
 
 /// Authenticated terminal result of an invoice request.

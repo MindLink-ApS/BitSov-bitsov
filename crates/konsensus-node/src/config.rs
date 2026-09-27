@@ -171,6 +171,14 @@ pub struct NodeConfig {
     #[serde(default)]
     pub onboarding_subsidy: SubsidyConfig,
 
+    /// K1 slice 2: sponsor a newcomer's start with a small, capped gift of
+    /// this node's own bitcoin. OFF by default; only the owner turns it on,
+    /// here. Clamped to the spec's ceilings (50,000 sats per kit with fees,
+    /// 100,000 sats per rolling 24 h, two kits a day). `#[serde(default)]`
+    /// is mandatory for the same reason as `onboarding_subsidy`.
+    #[serde(default)]
+    pub sponsor: SponsorConfig,
+
     /// Relay role gate (T2R8 / R3 SEAM-B) — OFF by default.
     ///
     /// When enabled, the node advertises `Capability::Relay` and mounts the
@@ -937,6 +945,7 @@ impl NodeConfig {
     /// the final config — `from_config` does not validate, so a post-load mutation
     /// would otherwise escape the fail-closed guards.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?;
         // Check mnemonic file exists and is readable
         if !self.identity.mnemonic_file.exists() {
             anyhow::bail!(
@@ -1333,6 +1342,7 @@ impl NodeConfig {
             // R1-a: onboarding channel-open subsidy OFF by default — generated
             // configs never auto-spend operator sats on invite membership.
             onboarding_subsidy: SubsidyConfig::default(),
+            sponsor: SponsorConfig::default(),
             // T2R8: relay advertisement OFF by default — generated configs do
             // not present this node as a relay.
             relay: RelayConfig::default(),
@@ -1468,3 +1478,54 @@ fn default_web_content_msat() -> u64 {
 #[cfg(test)]
 #[path = "tests/config.rs"]
 mod tests;
+
+/// `[sponsor]`: the owner's sponsoring policy (K1 slice 2). See
+/// `konsensus_api::handlers::sponsor`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SponsorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The fixed gift per kit, sats.
+    #[serde(default = "default_sponsor_gift_sats")]
+    pub gift_sats: u64,
+    /// Route-fee ceiling reserved on top of each gift, sats.
+    #[serde(default = "default_sponsor_fee_sats")]
+    pub fee_sats: u64,
+    /// Rolling 24-hour purse, gifts + fees + unresolved, sats.
+    #[serde(default = "default_sponsor_purse_sats")]
+    pub purse_sats: u64,
+    #[serde(default = "default_sponsor_kits_per_day")]
+    pub kits_per_day: u32,
+}
+
+fn default_sponsor_gift_sats() -> u64 { 20_000 }
+fn default_sponsor_fee_sats() -> u64 { 100 }
+fn default_sponsor_purse_sats() -> u64 { 100_000 }
+fn default_sponsor_kits_per_day() -> u32 { 2 }
+
+impl Default for SponsorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gift_sats: default_sponsor_gift_sats(),
+            fee_sats: default_sponsor_fee_sats(),
+            purse_sats: default_sponsor_purse_sats(),
+            kits_per_day: default_sponsor_kits_per_day(),
+        }
+    }
+}
+
+impl SponsorConfig {
+    /// The policy the API enforces; refuses anything above a spec ceiling.
+    pub fn policy(&self) -> Result<konsensus_api::handlers::sponsor::SponsorPolicy, String> {
+        let msat = |sats: u64| sats.checked_mul(1000).ok_or_else(|| "[sponsor] amount too large".to_string());
+        konsensus_api::handlers::sponsor::SponsorPolicy::new(
+            self.enabled,
+            msat(self.gift_sats)?,
+            msat(self.fee_sats)?,
+            msat(self.purse_sats)?,
+            self.kits_per_day,
+        )
+    }
+}
