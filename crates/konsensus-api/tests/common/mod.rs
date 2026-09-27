@@ -1037,13 +1037,13 @@ pub struct ConnectedStubTransport {
     pub invoice_responder: Option<Box<dyn Fn(String, u64) -> Option<konsensus_api::state::InvoiceResponseData> + Send + Sync>>,
     /// Shared reference to the invoice_requests map so the transport can
     /// fulfill pending requests (simulating the peer responding).
-    pub invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>>,
+    pub invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
 }
 
 impl ConnectedStubTransport {
     pub fn new(
         connected_peers: Vec<NodeId>,
-        invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>>,
+        invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
     ) -> Self {
         Self {
             connected: std::sync::Mutex::new(connected_peers.into_iter().collect()),
@@ -1106,7 +1106,7 @@ impl MessageTransport for ConnectedStubTransport {
                             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                             let mut map = invoice_requests.lock().await;
                             if let Some(tx) = map.remove(&req_id) {
-                                let _ = tx.send(response_data);
+                                let _ = tx.send(Ok(response_data));
                             }
                         });
                     }

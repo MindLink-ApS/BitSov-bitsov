@@ -28,7 +28,7 @@ use konsensus_message::wire::Frame;
 use crate::audit::events;
 use crate::error::ApiError;
 use crate::handlers::utils::generate_valid_proof;
-use crate::state::{AppState, InvoiceResponseData};
+use crate::state::{AppState, InvoiceRequestOutcome};
 
 /// Request to compose and send a message (node handles encryption + payment).
 ///
@@ -388,7 +388,7 @@ async fn create_payment_proof_via_invoice(
     let request_id = uuid::Uuid::new_v4().to_string();
 
     // Create a oneshot channel for the response.
-    let (tx, rx) = oneshot::channel::<InvoiceResponseData>();
+    let (tx, rx) = oneshot::channel::<InvoiceRequestOutcome>();
 
     // Register the pending request BEFORE sending the frame.
     // Reject if too many requests are already in-flight (defense-in-depth).
@@ -446,7 +446,8 @@ async fn create_payment_proof_via_invoice(
             ApiError::Lightning(
                 "Recipient could not create invoice — their Lightning wallet may be unavailable".into(),
             )
-        })?;
+        })?
+        .map_err(|error| ApiError::Lightning(format!("recipient invoice refused: {}", error.reason)))?;
 
     tracing::info!(
         peer = %peer_id,
@@ -1430,7 +1431,7 @@ async fn first_contact_admission(
         peer_id, state.identity.node_id(), std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
     );
-    let (tx, rx) = oneshot::channel::<InvoiceResponseData>();
+    let (tx, rx) = oneshot::channel::<InvoiceRequestOutcome>();
     {
         let mut requests = state.invoice_requests.lock().await;
         if requests.len() >= MAX_PENDING_INVOICE_REQUESTS {
@@ -1468,7 +1469,14 @@ async fn first_contact_admission(
                 "admission invoice request timed out — target did not respond".into(),
             )
         })?
-        .map_err(|_| ApiError::Lightning("target could not create an admission invoice".into()))?;
+        .map_err(|_| ApiError::Lightning("target could not create an admission invoice".into()))?
+        .map_err(|error| {
+            if error.recipient == *peer_id && error.reason == "stateless_quote_unsupported" {
+                ApiError::StatelessQuoteUnsupported
+            } else {
+                ApiError::Lightning("target refused admission quote".into())
+            }
+        })?;
 
     // The Noise session authenticates the target that authorized this invoice.
     // Do not trust the UUID alone: a different peer cannot redirect payment.

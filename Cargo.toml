@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/ldk-node"]
 members = [
     "crates/konsensus-core",
     "crates/konsensus-chain",
@@ -123,3 +124,6 @@ bytes = "1"
 hex = "0.4"
 base64 = "0.22"
 unicode-normalization = "0.1"
+
+[patch.crates-io]
+ldk-node = { path = "vendor/ldk-node" }

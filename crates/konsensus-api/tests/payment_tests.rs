@@ -777,7 +777,7 @@ async fn invoice_request_oneshot_channel_works() {
     let state = test_state();
     let request_id = "test-req-001".to_string();
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<konsensus_api::state::InvoiceResponseData>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<konsensus_api::state::InvoiceRequestOutcome>();
 
     // Insert into the invoice_requests map.
     state
@@ -800,10 +800,10 @@ async fn invoice_request_oneshot_channel_works() {
         .await
         .remove(&request_id)
         .expect("request should be in map");
-    sender.send(data).expect("should send");
+    sender.send(Ok(data)).expect("should send");
 
     // Receive on the other end.
-    let response = rx.await.expect("should receive");
+    let response = rx.await.expect("should receive").expect("invoice success");
     assert!(response.bolt11.starts_with("lnbc"));
     assert_eq!(response.payment_hash.len(), 64);
 }
@@ -814,7 +814,7 @@ async fn invoice_request_timeout_cleanup() {
     let state = test_state();
     let request_id = "test-timeout-001".to_string();
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<konsensus_api::state::InvoiceResponseData>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<konsensus_api::state::InvoiceRequestOutcome>();
 
     state
         .invoice_requests
@@ -838,7 +838,7 @@ async fn invoice_request_timeout_cleanup() {
         bolt11: "lnbc...".into(),
         payment_hash: "ab".repeat(32),
     };
-    assert!(sender.send(data).is_err(), "send should fail when receiver is dropped");
+    assert!(sender.send(Ok(data)).is_err(), "send should fail when receiver is dropped");
 }
 
 #[tokio::test]

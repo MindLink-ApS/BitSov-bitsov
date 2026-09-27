@@ -1977,7 +1977,7 @@ async fn compose_happy_path_keysend() {
 async fn compose_happy_path_invoice_flow() {
     // Full pipeline with invoice-request/response round-trip.
     // This tests the path when no Lightning pubkey is known for the peer.
-    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>> =
+    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
@@ -2087,7 +2087,7 @@ async fn compose_happy_path_invoice_flow() {
 async fn compose_rejects_invoice_amount_mismatch() {
     // Security: If a peer responds with an invoice for a different amount
     // than requested, the compose must reject it to prevent overcharging.
-    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>> =
+    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
@@ -2188,7 +2188,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
 async fn compose_keysend_fallback_to_invoice() {
     // When keysend fails (peer doesn't support it), the handler should
     // fall back to the invoice-request flow.
-    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>> =
+    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(

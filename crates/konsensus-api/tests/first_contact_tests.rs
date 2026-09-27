@@ -411,3 +411,37 @@ async fn admission_invoice_future_timestamp_is_rejected_before_dispatch() {
 async fn admission_invoice_absolute_expiry_cannot_extend_attempt() {
     admission_invoice_time_case(false).await;
 }
+
+#[tokio::test]
+async fn unsupported_quote_surfaces_code_without_payment() {
+    use konsensus_api::state::InvoiceResponseError;
+    let mut state = common::test_state();
+    let peer = NodeId::from_bytes([87; 32]);
+    Arc::get_mut(&mut state).unwrap().transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    let requests = state.invoice_requests.clone();
+    let refused = tokio::spawn(async move {
+        loop {
+            let mut pending = requests.lock().await;
+            if let Some(id) = pending.keys().next().cloned() {
+                pending.remove(&id).unwrap().send(Err(InvoiceResponseError {
+                    recipient: peer, reason: "stateless_quote_unsupported".into(),
+                })).unwrap();
+                break;
+            }
+            drop(pending);
+            tokio::task::yield_now().await;
+        }
+    });
+    let balance = state.lightning.get_balance_msat().await.unwrap();
+    let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
+    let response = common::test_router(state.clone()).oneshot(Request::builder().method("POST")
+        .uri("/api/v1/messages/compose").header("authorization",format!("Bearer {token}"))
+        .header("content-type","application/json")
+        .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"hello","max_total_msat":4000}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["code"], "stateless_quote_unsupported");
+    assert_eq!(state.lightning.get_balance_msat().await.unwrap(), balance);
+    refused.await.unwrap();
+}

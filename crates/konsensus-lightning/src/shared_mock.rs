@@ -50,6 +50,14 @@ impl SharedMockProvider {
             signing_key: SecretKey::from_slice(&key).map_err(err)?,
         })
     }
+    // Deliberately insecure mock-only derivation. The signed invoice carries
+    // the nonce; no pending row is needed to reconstruct a settled preimage.
+    fn quote_preimage(key: &SecretKey, secret: &PaymentSecret) -> [u8; 32] {
+        let mut material = b"INSECURE SHARED MOCK STATELESS QUOTE:".to_vec();
+        material.extend_from_slice(&key.secret_bytes());
+        material.extend_from_slice(&secret.0);
+        sha256::Hash::hash(&material).to_byte_array()
+    }
     fn details(db: &Connection, owner: &str, hash: &str) -> Result<PaymentDetails, LightningError> {
         db.query_row("SELECT recipient,payer,preimage,amount,created,memo FROM invoices WHERE hash=?1 AND (recipient=?2 OR payer=?2)", params![hash, owner], |r| {
             let recipient: String = r.get(0)?;
@@ -105,6 +113,28 @@ impl LightningProvider for SharedMockProvider {
             created_at,
         })
     }
+    async fn create_stateless_invoice(
+        &self, amount: u64, description: &str, expiry: u32,
+    ) -> Result<Invoice, LightningError> {
+        let secret = PaymentSecret(rand::random());
+        let preimage = Self::quote_preimage(&self.signing_key, &secret);
+        let hash = sha256::Hash::hash(&preimage);
+        let signed = InvoiceBuilder::new(Currency::Regtest)
+            .description(description.into())
+            .payment_hash(hash)
+            .payment_secret(secret)
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(18)
+            .amount_milli_satoshis(amount)
+            .expiry_time(Duration::from_secs(expiry.into()))
+            .build_signed(|h| Secp256k1::new().sign_ecdsa_recoverable(h, &self.signing_key))
+            .map_err(err)?;
+        Ok(Invoice {
+            bolt11: signed.to_string(), payment_hash: hash.to_string(), amount_msat: amount,
+            description: description.into(), expiry_secs: expiry,
+            created_at: signed.duration_since_epoch().as_secs(),
+        })
+    }
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         let invoice: Bolt11Invoice = bolt11.parse().map_err(err)?;
         if invoice.currency() != Currency::Regtest || invoice.is_expired() {
@@ -117,13 +147,41 @@ impl LightningProvider for SharedMockProvider {
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(err)?;
-        let (recipient, payer, stored, amount): (String, Option<String>, String, i64) = tx
+        let existing: Option<(String, Option<String>, String, i64)> = tx
             .query_row(
                 "SELECT recipient,payer,bolt11,amount FROM invoices WHERE hash=?1",
                 [&hash],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .map_err(err)?;
+            ).optional().map_err(err)?;
+        let mut stateless_preimage = None;
+        let (recipient, payer, stored, amount) = if let Some(record) = existing {
+            record
+        } else {
+            let payee = invoice.recover_payee_pub_key();
+            let owners = tx.prepare("SELECT owner FROM accounts").map_err(err)?
+                .query_map([], |r| r.get::<_, String>(0)).map_err(err)?
+                .collect::<Result<Vec<_>, _>>().map_err(err)?;
+            let mut recipient = None;
+            for owner in owners {
+                let bytes = sha256::Hash::hash(format!("INSECURE SHARED MOCK:{owner}").as_bytes()).to_byte_array();
+                let key = SecretKey::from_slice(&bytes).map_err(err)?;
+                if key.public_key(&Secp256k1::new()) == payee {
+                    let preimage = Self::quote_preimage(&key, invoice.payment_secret());
+                    if sha256::Hash::hash(&preimage).to_string() != hash {
+                        return Err(LightningError::PaymentNotDispatched("unknown mock invoice".into()));
+                    }
+                    stateless_preimage = Some(hex::encode(preimage));
+                    recipient = Some(owner);
+                    break;
+                }
+            }
+            let recipient = recipient.ok_or_else(|| LightningError::PaymentNotDispatched("unknown mock payee".into()))?;
+            let amount = invoice.amount_milli_satoshis()
+                .filter(|amount| *amount > 0)
+                .and_then(|amount| i64::try_from(amount).ok())
+                .ok_or_else(|| LightningError::PaymentNotDispatched("invalid mock quote amount".into()))?;
+            (recipient, None, bolt11.to_owned(), amount)
+        };
         if stored != bolt11 || recipient == self.owner {
             return Err(LightningError::PaymentNotDispatched(
                 "invoice does not name another shared mock recipient".into(),
@@ -153,11 +211,18 @@ impl LightningProvider for SharedMockProvider {
                 params![amount, recipient],
             )
             .map_err(err)?;
-            tx.execute(
-                "UPDATE invoices SET payer=?1 WHERE hash=?2",
-                params![self.owner, hash],
-            )
-            .map_err(err)?;
+            if let Some(preimage) = stateless_preimage {
+                // Atomically materialize the receipt with settlement, never a
+                // pending record. Failed payments roll the entire transaction back.
+                tx.execute("INSERT INTO invoices VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![hash, recipient, self.owner, preimage, bolt11, amount,
+                        invoice.duration_since_epoch().as_secs(), invoice.description().to_string()]).map_err(err)?;
+            } else {
+                tx.execute(
+                    "UPDATE invoices SET payer=?1 WHERE hash=?2",
+                    params![self.owner, hash],
+                ).map_err(err)?;
+            }
         }
         let details = Self::details(&tx, &self.owner, &hash)?;
         tx.commit().map_err(err)?;

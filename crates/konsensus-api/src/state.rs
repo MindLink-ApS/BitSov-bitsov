@@ -246,7 +246,15 @@ pub struct AppState {
     /// removes the matching entry and sends the bolt11 string through the
     /// oneshot channel, unblocking the compose handler.
     pub invoice_requests:
-        Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<InvoiceResponseData>>>>,
+        Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<InvoiceRequestOutcome>>>>,
+}
+
+/// Authenticated terminal result of an invoice request.
+pub type InvoiceRequestOutcome = Result<InvoiceResponseData, InvoiceResponseError>;
+#[derive(Debug)]
+pub struct InvoiceResponseError {
+    pub recipient: NodeId,
+    pub reason: String,
 }
 
 /// Data returned via the invoice request oneshot channel.

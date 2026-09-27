@@ -30,6 +30,7 @@ use konsensus_pricing::PeerPriceCache;
 use konsensus_api::audit::AuditLog;
 use konsensus_api::state::WsDeliveryStatus;
 use konsensus_api::InvoiceResponseData;
+use konsensus_api::state::{InvoiceRequestOutcome, InvoiceResponseError};
 
 use crate::onboarding::auto_channel::AutoChannelEvent;
 use crate::onboarding::funding_poll;
@@ -51,7 +52,7 @@ pub(crate) struct SessionHandlerDeps {
     pub send_timestamps: Arc<tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>>,
     pub lightning: Arc<dyn LightningProvider>,
     pub lightning_addr: Option<String>,
-    pub invoice_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>>,
+    pub invoice_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>>,
     pub peer_ln_pubkeys: Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, String>>>,
     pub ws_broadcast: broadcast::Sender<Arc<konsensus_api::state::WsMessage>>,
     pub ws_delivery_tx: broadcast::Sender<Arc<WsDeliveryStatus>>,
@@ -980,9 +981,17 @@ async fn handle_invoice_requested_gated(
         }
         let invoice = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            lightning.create_invoice(price.max(1000), &description, expiry),
+            lightning.create_stateless_invoice(price.max(1000), &description, expiry),
         )
         .await;
+        if matches!(&invoice, Ok(Err(konsensus_core::traits::lightning::LightningError::StatelessQuoteUnsupported))) {
+            let refusal = Frame::InvoiceError {
+                request_id: request_id.into(),
+                reason: "stateless_quote_unsupported".into(),
+            };
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), transport.send_frame(peer_id, &refusal)).await;
+            return;
+        }
         if let Ok(Ok(invoice)) = invoice {
             let Ok(signed) = invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>() else {
                 return;
@@ -1077,9 +1086,11 @@ async fn handle_invoice_error_received(
     request_id: &str,
     reason: &str,
     privileged: bool,
-    invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>,
+    invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>,
 ) {
-    if !privileged {
+    let bound_quote = request_id.starts_with(&format!("v1:{peer_id}:"))
+        && reason == "stateless_quote_unsupported";
+    if !privileged && !bound_quote {
         warn!(peer = %peer_id, "DROP InvoiceError from unprivileged peer (P2: no pending-invoice bookkeeping drive before payment)");
         return;
     }
@@ -1088,9 +1099,14 @@ async fn handle_invoice_error_received(
         "peer reported invoice creation error — failing compose"
     );
     let mut requests = invoice_requests.lock().await;
-    // Remove and drop the sender — the compose handler's rx.await will return
-    // Err (channel closed).
-    requests.remove(request_id);
+    // First-contact IDs embed the intended recipient. A different connected
+    // peer cannot cancel that request, even if it knows the correlation ID.
+    if request_id.starts_with("v1:") && !request_id.starts_with(&format!("v1:{peer_id}:")) {
+        return;
+    }
+    if let Some(sender) = requests.remove(request_id) {
+        let _ = sender.send(Err(InvoiceResponseError { recipient: *peer_id, reason: reason.into() }));
+    }
 }
 
 async fn handle_invoice_response(
@@ -1098,13 +1114,13 @@ async fn handle_invoice_response(
     request_id: &str,
     bolt11: String,
     payment_hash: String,
-    invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>,
+    invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>,
 ) {
     info!(peer = %peer_id, %request_id, "received invoice response from peer");
     let mut requests = invoice_requests.lock().await;
     if let Some(sender) = requests.remove(request_id) {
         let data = InvoiceResponseData { recipient: *peer_id, bolt11, payment_hash };
-        if sender.send(data).is_err() {
+        if sender.send(Ok(data)).is_err() {
             warn!(%request_id, "invoice response receiver already dropped (timeout?)");
         }
     } else {

@@ -58,9 +58,10 @@ this exception: here the floor includes only the bounded payment-preparation
 quote needed to offer that payment. This is an explicit protocol clarification,
 not a claim that creating an invoice is already settled work.
 
-The stranger path returns only a signed invoice and its chat price (the signed
-message-price field), never a price table, prekeys, peer information, session,
-file quote, arbitrary invoice, or application response. Even signed unpaid UKMs
+The stranger path returns a signed invoice and its chat price (the signed
+message-price field), or the fixed `stateless_quote_unsupported` refusal. It never
+returns a price table, prekeys, peer information, session, file quote, arbitrary
+invoice, or application response. Even signed unpaid UKMs
 receive no detailed rejection or corrective price table. Durable nonce records
 are written only after price and settlement checks; rejected strangers do not
 create application audit records.
@@ -82,16 +83,35 @@ replay/rate guards are bounded and refused rather than evicted. Pricing and
 invoice creation each have five-second deadlines; failures consume their quota
 and produce no fallback service.
 
-**Meaning of stateless:** before settlement there are no BitSov peer, contact,
-session, application message, nonce, or stored quote records. The membrane
-necessarily retains the transient connection plus bounded volatile source
-counters and request-ID digests. A standard Lightning backend necessarily
-creates its own pending invoice bookkeeping; expiry limits payment validity,
-not historical backend record retention. This is the explicit, rate-bounded
-payment-preparation exception required by the invoice keystone. Zero records
-inside the Lightning backend itself would require a different backend contract.
-Operator transport logs/counters are not peer admission. The requester’s own
-payment-recovery journal is separate from target-side stranger state.
+**Stateless backend requirement:** before settlement there are no BitSov peer,
+contact, session, message, nonce, quote or pending-invoice records, including in
+Lightning payment storage. The membrane retains only its transient connection
+and bounded volatile source counters/request-ID digests. Operator transport logs
+are not admission records. The requester’s own authorized payment-recovery journal
+is separate from target-side stranger state.
+
+Production first-contact quotes are **LDK-only**. The vendored LDK Node 0.7.0
+extension calls `ChannelManager::create_bolt11_invoice` with `payment_hash=None`,
+which uses `create_inbound_payment`: the hash/secret use the node's expanded inbound
+key, so the preimage is reconstructible on HTLC receipt without a pending record.
+The ordinary `receive` API is not used. The event handler inserts an incoming
+successful receipt only on `PaymentClaimed`, before exposing `PaymentReceived`.
+LDK's necessary channel/HTLC safety persistence is unchanged. Unknown stateless
+BOLT11 payments have no fee-skimming allowance, and duplicate attempts cannot
+change the successful receipt or reopen it.
+
+LND, LNbits and other backends without this capability fail closed without an
+invoice RPC or payment. The rate-limited quote refusal carries
+`stateless_quote_unsupported`; the sender's compose API returns HTTP 503 with
+that code. It authenticates the recipient before accepting a refusal. There is
+no fallback to ordinary stateful invoice creation. Established-peer invoice
+payments continue to use the normal backend API.
+
+The explicitly configured shared mock models the same storage invariant:
+quotes are signed without a row; its atomic payment transaction first inserts
+an already-settled receipt. Unpaid/failed quotes leave no row, and settled
+replays cannot debit twice. This remains a no-funds local test backend, not a
+production Lightning implementation.
 
 ## Temporary file staging
 

@@ -184,8 +184,8 @@ async fn invoice_response_delivers_to_waiting_sender() {
     let peer_id = test_peer_id();
     let request_id = "req-001".to_string();
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceResponseData>();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>> =
+    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
+    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
@@ -196,7 +196,7 @@ async fn invoice_response_delivers_to_waiting_sender() {
         &map,
     ).await;
 
-    let data = rx.await.unwrap();
+    let data = rx.await.unwrap().unwrap();
     assert_eq!(data.bolt11, "lnbc100n1...");
     assert_eq!(data.payment_hash, "abc123hash");
     // Request should be removed from map
@@ -206,7 +206,7 @@ async fn invoice_response_delivers_to_waiting_sender() {
 #[tokio::test]
 async fn invoice_response_unknown_request_id_is_noop() {
     let peer_id = test_peer_id();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>> =
+    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // No request registered — should log warning but not panic
@@ -225,8 +225,8 @@ async fn invoice_response_dropped_receiver_is_handled() {
     let peer_id = test_peer_id();
     let request_id = "req-dropped".to_string();
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceResponseData>();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>> =
+    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
+    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
@@ -250,15 +250,15 @@ async fn invoice_error_drops_sender_channel() {
     let request_id = "req-error".to_string();
     let peer_id = test_peer_id();
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceResponseData>();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>> =
+    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
+    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
     handle_invoice_error_received(&peer_id, &request_id, "invoice failed", true, &map).await;
 
     // Receiver should get Err (channel closed)
-    assert!(rx.await.is_err());
+    assert!(rx.await.unwrap().is_err());
     assert!(map.lock().await.is_empty());
 }
 
@@ -267,8 +267,8 @@ async fn unprivileged_invoice_error_does_not_drop_sender_channel() {
     let request_id = "req-error-unprivileged".to_string();
     let peer_id = test_peer_id();
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceResponseData>();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>> =
+    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
+    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
@@ -281,11 +281,11 @@ async fn unprivileged_invoice_error_does_not_drop_sender_channel() {
         .expect("unprivileged invoice error must not remove pending request");
     assert!(
         sender
-            .send(InvoiceResponseData {
+            .send(Ok(InvoiceResponseData {
                 recipient: peer_id,
                 bolt11: "lnbc100n1...".to_string(),
                 payment_hash: "hash".to_string(),
-            })
+            }))
             .is_ok(),
         "receiver should still be open after unprivileged invoice error"
     );
@@ -295,11 +295,11 @@ async fn unprivileged_invoice_error_does_not_drop_sender_channel() {
 #[tokio::test]
 async fn invoice_response_concurrent_requests_isolated() {
     let peer_id = test_peer_id();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>> =
+    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-    let (tx1, rx1) = tokio::sync::oneshot::channel::<InvoiceResponseData>();
-    let (tx2, rx2) = tokio::sync::oneshot::channel::<InvoiceResponseData>();
+    let (tx1, rx1) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
+    let (tx2, rx2) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
     map.lock().await.insert("req-1".to_string(), tx1);
     map.lock().await.insert("req-2".to_string(), tx2);
 
@@ -315,8 +315,8 @@ async fn invoice_response_concurrent_requests_isolated() {
         "bolt11-for-1".to_string(), "hash-1".to_string(), &map,
     ).await;
 
-    let data1 = rx1.await.unwrap();
-    let data2 = rx2.await.unwrap();
+    let data1 = rx1.await.unwrap().unwrap();
+    let data2 = rx2.await.unwrap().unwrap();
     assert_eq!(data1.bolt11, "bolt11-for-1");
     assert_eq!(data2.bolt11, "bolt11-for-2");
     assert!(map.lock().await.is_empty());
@@ -1269,43 +1269,6 @@ async fn unprivileged_non_admission_invoice_request_is_dropped() {
     assert!(payments.is_empty(), "no invoice may be created for an unprivileged non-admission request");
 }
 
-#[tokio::test]
-async fn unprivileged_admission_invoice_is_issued_and_repriced() {
-    // The single bootstrap carve-out: the reserved admission purpose yields ONE
-    // invoice, RE-PRICED from our engine (KIND_CHAT floor). The caller's bogus
-    // huge amount is IGNORED — a stranger cannot dictate the invoice amount.
-    let peer_id = test_peer_id();
-    let transport = make_gossip_test_transport();
-    let dir=tempfile::tempdir().unwrap();
-    let lightning: Arc<dyn LightningProvider> = Arc::new(konsensus_lightning::shared_mock::SharedMockProvider::new(&dir.path().join("mock.db"),"b",0).unwrap());
-    let pricing = admission_pricing();
-
-    let chat_floor = pricing
-        .get_price_msat(konsensus_core::kind::KIND_CHAT)
-        .await
-        .unwrap();
-
-    let mut quotes=crate::admission_quotes::AdmissionQuotes::default();
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    handle_invoice_requested_gated(
-        &peer_id, &konsensus_core::admission_quote::request_id(&test_peer_id(), &peer_id,
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
-        9_999_999, konsensus_core::admission_quote::PURPOSE, false,
-        &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut quotes,
-    ).await;
-
-    let payments = lightning.list_payments(10).await.unwrap();
-    assert_eq!(payments.len(), 1, "admission carve-out must create exactly one invoice");
-    assert_eq!(
-        payments[0].amount_msat, chat_floor.max(1000),
-        "admission invoice must be re-priced from the engine, not the caller's amount"
-    );
-    assert_ne!(
-        payments[0].amount_msat, 9_999_999,
-        "the caller-supplied amount must be IGNORED"
-    );
-}
-
 // ── Price query handler tests ──────────────────────────────
 
 #[tokio::test]
@@ -1464,7 +1427,6 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
 #[tokio::test]
 async fn stranger_quote_over_noise_creates_no_application_state() {
     use konsensus_core::admission_quote;
-    use konsensus_core::traits::lightning::PaymentStatus;
     use konsensus_message::{ReachabilityMode, TransportConfig};
     use std::time::Duration;
     let dir = tempfile::tempdir().unwrap();
@@ -1590,8 +1552,7 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
         "a repeated attempt receives no second quote or service"
     );
     let invoices = provider.list_payments(10).await.unwrap();
-    assert_eq!(invoices.len(), 1);
-    assert_eq!(invoices[0].status, PaymentStatus::Pending);
+    assert!(invoices.is_empty(), "stranger quote wrote pending backend state");
     assert_eq!(provider.get_balance_msat().await.unwrap(), 0);
     assert!(registry.read().await.is_empty());
     assert!(storage.list_peers().await.unwrap().is_empty());
@@ -1611,6 +1572,64 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
     assert!(target.connected_privileged_peers().await.is_empty());
     shutdown.send(true).unwrap();
     worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
+}
+
+#[tokio::test]
+async fn bound_unsupported_quote_error_preserves_provenance() {
+    let recipient = NodeId::from_bytes([1; 32]);
+    let sender = NodeId::from_bytes([2; 32]);
+    let wrong = NodeId::from_bytes([3; 32]);
+    let id = konsensus_core::admission_quote::request_id(&recipient, &sender, 100);
+    let map = tokio::sync::Mutex::new(std::collections::HashMap::new());
+    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
+    map.lock().await.insert(id.clone(), tx);
+    for privileged in [false, true] {
+        handle_invoice_error_received(&wrong, &id, "stateless_quote_unsupported", privileged, &map).await;
+        assert_eq!(map.lock().await.len(), 1, "wrong recipient cancelled quote");
+    }
+    handle_invoice_error_received(&recipient, &id, "stateless_quote_unsupported", false, &map).await;
+    let error = rx.await.unwrap().unwrap_err();
+    assert_eq!(error.recipient, recipient);
+    assert_eq!(error.reason, "stateless_quote_unsupported");
+    assert!(map.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
+    use konsensus_message::{ReachabilityMode, TransportConfig};
+    use konsensus_lightning::lnd::{LndConfig, LndProvider};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let (_, a) = NodeIdentity::generate().unwrap();
+    let (_, b) = NodeIdentity::generate().unwrap();
+    let peer = *a.node_id();
+    let recipient = *b.node_id();
+    let make = |id| Arc::new(NoiseTransport::new(Arc::new(id), TransportConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        admission_mode: ReachabilityMode::PriceOpen, whitelist: vec![], ..Default::default()
+    }));
+    let source = make(a);
+    let target = make(b);
+    target.start_listener().await.unwrap();
+    source.connect(&recipient, &target.listen_addr().unwrap().to_string()).await.unwrap();
+    assert!(matches!(source.recv_control().await, Some(ControlEvent::PeerConnected { .. })));
+    // An accidental create_invoice fallback would hit this unreachable endpoint,
+    // return a different error and fail the expected stateless refusal assertion.
+    let provider: Arc<dyn LightningProvider> = Arc::new(LndProvider::new(LndConfig {
+        api_url: "http://127.0.0.1:1".into(), macaroon_hex: "00".into(), tls_cert_path: None,
+    }).unwrap());
+    let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let request_id = konsensus_core::admission_quote::request_id(&recipient, &peer,
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+    handle_invoice_requested_gated(&peer, &request_id, 1,
+        konsensus_core::admission_quote::PURPOSE, false, &admission_pricing(), &provider,
+        &target, &recipient, "127.0.0.1".parse().unwrap(), &mut quotes).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await.unwrap().unwrap();
+    assert!(matches!(event, ControlEvent::InvoiceErrorReceived { peer_id, request_id: id, reason, .. }
+        if peer_id == recipient && id == request_id && reason == "stateless_quote_unsupported"));
+    assert!(target.connected_privileged_peers().await.is_empty());
     source.shutdown();
     target.shutdown();
 }
