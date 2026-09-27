@@ -33,6 +33,7 @@ use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use crate::auth::Scope;
 use crate::error::ApiError;
 use crate::pairing::{self, ElevationStatus, PairingError, PairingService};
+use crate::spend_budget::GrantTerms;
 use crate::state::AppState;
 
 /// Map a pairing failure onto the API's error type.
@@ -360,6 +361,41 @@ async fn open_window(
 pub struct ElevationRequestBody {
     /// Scopes requested. Only `spend` is ever grantable to a pairing.
     pub scopes: Vec<Scope>,
+    /// The budget window the client proposes (G1). A suggestion rendered to
+    /// the owner, who sets the actual terms at the control socket.
+    #[serde(default)]
+    pub budget: Option<BudgetProposal>,
+}
+
+/// A proposed budget window, in millisatoshis like every other money field.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetProposal {
+    /// Total for the window.
+    pub budget_msat: u64,
+    /// Most one call may spend. Defaults to the whole budget.
+    #[serde(default)]
+    pub per_call_max_msat: Option<u64>,
+    /// Per-recipient budgets (node id or Lightning pubkey, hex).
+    #[serde(default)]
+    pub per_recipient_msat: std::collections::BTreeMap<String, u64>,
+    /// Window length in seconds. Defaults to, and may not exceed, 24 h.
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
+}
+
+impl BudgetProposal {
+    fn into_terms(self) -> GrantTerms {
+        let mut terms = GrantTerms::new(self.budget_msat);
+        if let Some(max) = self.per_call_max_msat {
+            terms = terms.per_call(max);
+        }
+        if let Some(ttl) = self.ttl_secs {
+            terms = terms.for_secs(ttl);
+        }
+        terms.per_recipient_msat = self.per_recipient_msat;
+        terms
+    }
 }
 
 /// `POST /api/v1/pair/elevation-request` response.
@@ -392,7 +428,11 @@ async fn elevation_request(
     })?;
     let svc = service(&state)?;
     let op = svc
-        .create_elevation_request(&binding.client_id, body.scopes)
+        .create_budget_elevation_request(
+            &binding.client_id,
+            body.scopes,
+            body.budget.map(BudgetProposal::into_terms),
+        )
         .map_err(map_err)?;
     let owner_action = if svc.owner_control_enabled() {
         format!("konsensus grant --op {}", op.op_id)
@@ -421,6 +461,22 @@ async fn elevation_status(
         "status": status,
         "owner_confirmation_required": matches!(status, ElevationStatus::Pending),
     })))
+}
+
+/// `GET /api/v1/pair/grant` — the caller's own live budget grant (G1).
+///
+/// A read, never a write: what is left, the per-call maximum, per-recipient
+/// budgets and the absolute expiry. `{"grant": null}` when there is none —
+/// never granted, spent-and-expired, revoked, or a sidecar deployment.
+async fn own_grant(
+    auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let binding = auth.pairing.as_ref().ok_or_else(|| {
+        ApiError::Forbidden("only a paired client holds a budget grant".into())
+    })?;
+    let grant = service(&state)?.grant_view_for(&binding.client_id);
+    Ok(Json(serde_json::json!({ "grant": grant })))
 }
 
 /// `POST /api/v1/identity/replacement-request` body.
@@ -518,6 +574,7 @@ pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
         .route("/api/v1/pair/window", post(open_window))
         .route("/api/v1/pair/elevation-request", post(elevation_request))
         .route("/api/v1/pair/elevation/:op_id", get(elevation_status))
+        .route("/api/v1/pair/grant", get(own_grant))
         .route(
             "/api/v1/identity/replacement-request",
             post(replacement_request),

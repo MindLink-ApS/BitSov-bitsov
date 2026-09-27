@@ -423,6 +423,7 @@ async fn http_elevation_write_paths_absent() {
         control::ControlRequest::Grant {
             op_id: op_id.clone(),
             confirmation: console.confirmation(&pairing::grant_confirmation_phrase(&op)),
+            terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000),
         },
     );
     assert!(
@@ -653,6 +654,7 @@ async fn same_uid_socket_client_cannot_self_grant_from_public_information() {
             &control::ControlRequest::Grant {
                 op_id: op_id.clone(),
                 confirmation: guessed,
+                terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000),
             },
         )
         .await
@@ -668,6 +670,7 @@ async fn same_uid_socket_client_cannot_self_grant_from_public_information() {
         &control::ControlRequest::Grant {
             op_id: op_id.clone(),
             confirmation: phrase.clone(),
+            terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000),
         },
     )
     .await
@@ -682,6 +685,7 @@ async fn same_uid_socket_client_cannot_self_grant_from_public_information() {
         &control::ControlRequest::Grant {
             op_id,
             confirmation: phrase,
+            terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000),
         },
     )
     .await

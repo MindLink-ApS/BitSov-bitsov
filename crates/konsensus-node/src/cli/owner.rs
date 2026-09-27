@@ -21,6 +21,7 @@ use crate::config::{NodeConfig, NodeTier, StorageConfig};
 use konsensus_api::bootstrap::{self, DataDirLayout, StartupMode};
 use konsensus_api::control::{self, ControlRequest, ControlResponse};
 use konsensus_api::pairing::PairingService;
+use konsensus_api::spend_budget::{self, GrantTerms};
 
 /// Prepare startup without constructing a wallet, node or listener.
 pub fn prepare_start(config_path: &Path) -> Result<(StartupMode, NodeConfig)> {
@@ -165,6 +166,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             clients,
             pending_elevations,
             pending_replacements,
+            grants,
         } => {
             if clients.is_empty() {
                 println!("no paired clients");
@@ -176,6 +178,18 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                     c.name,
                     c.scopes.join("+"),
                     c.epoch
+                );
+            }
+            for g in &grants {
+                println!(
+                    "SPEND GRANT client={}  {} of {} sats left  per-call<={} sats  \
+                     expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
+                    g.client_id,
+                    spend_budget::sats(g.remaining_msat),
+                    spend_budget::sats(g.budget_msat),
+                    spend_budget::sats(g.per_call_max_msat),
+                    g.expires_at,
+                    g.client_id
                 );
             }
             for e in &pending_elevations {
@@ -211,27 +225,47 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
     }
 }
 
-/// Render a pending operation and read the owner's typed confirmation.
-///
-/// Only the public label comes from the socket. The unpredictable confirmation
-/// must be copied from the owner-run node's terminal, never this API response.
-async fn confirm_interactively(config_path: &Path, op_id: &str) -> Result<String> {
-    let described = send(
+/// A pending operation as the socket describes it.
+struct Described {
+    summary: String,
+    label: String,
+    proposed_terms: Option<GrantTerms>,
+}
+
+async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
+    match send(
         config_path,
         ControlRequest::Describe {
             op_id: op_id.to_string(),
         },
     )
-    .await?;
-    let (summary, phrase) = match described {
+    .await?
+    {
         ControlResponse::Describe {
             summary,
             confirmation_label,
-        } => (summary, confirmation_label),
-        other => return report(other).map(|()| String::new()),
-    };
+            proposed_terms,
+        } => Ok(Described {
+            summary,
+            label: confirmation_label,
+            proposed_terms,
+        }),
+        ControlResponse::Error { message } => anyhow::bail!("refused: {message}"),
+        other => anyhow::bail!("unexpected control response: {other:?}"),
+    }
+}
 
-    println!("\n{summary}\n");
+/// Render a pending operation and read the owner's typed confirmation.
+///
+/// Only the public label comes from the socket. The unpredictable confirmation
+/// must be copied from the owner-run node's terminal, never this API response.
+async fn confirm_interactively(config_path: &Path, op_id: &str) -> Result<String> {
+    let described = describe(config_path, op_id).await?;
+    println!("\n{}\n", described.summary);
+    read_confirmation(&described.label)
+}
+
+fn read_confirmation(phrase: &str) -> Result<String> {
     println!("On the owner node's console, find {phrase}.\nType its full confirmation, including CODE and the random nonce.\n");
     print!("> ");
     std::io::stdout().flush().ok();
@@ -243,15 +277,121 @@ async fn confirm_interactively(config_path: &Path, op_id: &str) -> Result<String
     Ok(typed.trim().to_string())
 }
 
-/// `konsensus grant --op <id>` — write an owner-approved elevation.
-pub async fn cmd_grant(config_path: &Path, op_id: &str) -> Result<()> {
-    let confirmation = confirm_interactively(config_path, op_id).await?;
+/// The owner's flags for `konsensus grant`.
+#[derive(Debug, Default)]
+pub struct GrantFlags {
+    /// `--budget <sats>`.
+    pub budget_sats: Option<u64>,
+    /// `--for <duration>`.
+    pub window: Option<String>,
+    /// `--per-call <sats>`.
+    pub per_call_sats: Option<u64>,
+    /// `--recipient <key>=<sats>`, repeatable.
+    pub recipients: Vec<String>,
+    /// `--yes`: skip the terms question (never the console code).
+    pub yes: bool,
+}
+
+fn sats_to_msat(sats: u64, what: &str) -> Result<u64> {
+    sats.checked_mul(1000)
+        .with_context(|| format!("{what} of {sats} sats is too large"))
+}
+
+/// Resolve the terms the owner is granting: each flag overrides the client's
+/// proposal field by field; with neither, `--budget` is required.
+pub fn resolve_terms(flags: &GrantFlags, proposal: Option<&GrantTerms>) -> Result<GrantTerms> {
+    let budget_msat = match (flags.budget_sats, proposal) {
+        (Some(sats), _) => sats_to_msat(sats, "--budget")?,
+        (None, Some(p)) => p.budget_msat,
+        (None, None) => anyhow::bail!(
+            "the client proposed no budget; pass --budget <sats> (and optionally --for 24h)"
+        ),
+    };
+    let ttl_secs = match (&flags.window, proposal) {
+        (Some(w), _) => spend_budget::parse_duration(w).map_err(anyhow::Error::msg)?,
+        (None, Some(p)) => p.ttl_secs,
+        (None, None) => spend_budget::MAX_SPEND_GRANT_TTL_SECS,
+    };
+    let per_call_max_msat = match (flags.per_call_sats, proposal) {
+        (Some(sats), _) => sats_to_msat(sats, "--per-call")?,
+        (None, Some(p)) => p.per_call_max_msat.min(budget_msat),
+        (None, None) => budget_msat,
+    };
+    let per_recipient_msat = if flags.recipients.is_empty() {
+        proposal
+            .map(|p| p.per_recipient_msat.clone())
+            .unwrap_or_default()
+    } else {
+        let mut map = std::collections::BTreeMap::new();
+        for entry in &flags.recipients {
+            let (key, sats) = entry
+                .split_once('=')
+                .with_context(|| format!("--recipient {entry:?} must be <key>=<sats>"))?;
+            let sats: u64 = sats
+                .trim()
+                .parse()
+                .with_context(|| format!("--recipient {entry:?}: {sats:?} is not a whole number of sats"))?;
+            map.insert(key.trim().to_string(), sats_to_msat(sats, "--recipient")?);
+        }
+        map
+    };
+    GrantTerms {
+        budget_msat,
+        per_call_max_msat,
+        per_recipient_msat,
+        ttl_secs,
+    }
+    .normalized()
+    .map_err(anyhow::Error::msg)
+}
+
+/// `konsensus grant --op <id> [--budget <sats>] [--for 24h]` — write one
+/// budget-scoped spend window.
+pub async fn cmd_grant(config_path: &Path, op_id: &str, flags: GrantFlags) -> Result<()> {
+    let described = describe(config_path, op_id).await?;
+    let terms = resolve_terms(&flags, described.proposed_terms.as_ref())?;
+    println!("\n{}\n", described.summary);
+    println!(
+        "YOU ARE GRANTING (the node debits every paid call before paying and refuses \
+         with budget_exceeded when it runs out):\n{}\n",
+        spend_budget::describe_terms(&terms)
+    );
+    if !flags.yes {
+        print!("Grant these terms? [y/N] ");
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("failed to read the answer from stdin")?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("not granted");
+            return Ok(());
+        }
+    }
+    let confirmation = read_confirmation(&described.label)?;
     report(
         send(
             config_path,
             ControlRequest::Grant {
                 op_id: op_id.to_string(),
                 confirmation,
+                terms,
+            },
+        )
+        .await?,
+    )
+}
+
+/// `konsensus grant-revoke --client-id <id> | --all` — stop spend now.
+pub async fn cmd_grant_revoke(config_path: &Path, client_id: Option<&str>, all: bool) -> Result<()> {
+    if client_id.is_none() && !all {
+        anyhow::bail!("pass --client-id <id> or --all");
+    }
+    report(
+        send(
+            config_path,
+            ControlRequest::RevokeGrant {
+                client_id: client_id.map(str::to_string),
             },
         )
         .await?,
@@ -852,5 +992,51 @@ mod startup_tests {
         let (mode, started) = prepare_start(&path).unwrap();
         assert_eq!(mode, StartupMode::Initialized);
         assert_eq!(started.identity.mnemonic_file, custom);
+    }
+
+    // ── G1: `konsensus grant` terms ─────────────────────────────────
+
+    fn flags(budget: Option<u64>, window: Option<&str>) -> GrantFlags {
+        GrantFlags {
+            budget_sats: budget,
+            window: window.map(str::to_string),
+            ..GrantFlags::default()
+        }
+    }
+
+    #[test]
+    fn grant_terms_default_to_24h_and_the_whole_budget_per_call() {
+        let t = resolve_terms(&flags(Some(2_000), None), None).unwrap();
+        assert_eq!(t.budget_msat, 2_000_000);
+        assert_eq!(t.per_call_max_msat, 2_000_000);
+        assert_eq!(t.ttl_secs, 24 * 3600);
+        assert!(t.per_recipient_msat.is_empty());
+    }
+
+    #[test]
+    fn grant_needs_a_budget_from_the_owner_or_the_proposal() {
+        let err = resolve_terms(&flags(None, Some("1h")), None).unwrap_err();
+        assert!(err.to_string().contains("--budget"), "{err}");
+        let proposal = GrantTerms::new(5_000_000).per_call(100_000).for_secs(3600);
+        let t = resolve_terms(&flags(None, None), Some(&proposal)).unwrap();
+        assert_eq!(t, proposal.clone().normalized().unwrap());
+        // Owner flags override field by field; a smaller budget also narrows
+        // the proposal's per-call maximum rather than failing.
+        let t = resolve_terms(&flags(Some(50), Some("30m")), Some(&proposal)).unwrap();
+        assert_eq!((t.budget_msat, t.per_call_max_msat, t.ttl_secs), (50_000, 50_000, 1800));
+    }
+
+    #[test]
+    fn grant_refuses_windows_over_24h_and_malformed_recipients() {
+        assert!(resolve_terms(&flags(Some(10), Some("25h")), None).is_err());
+        assert!(resolve_terms(&flags(Some(10), Some("2d")), None).is_err());
+        let mut f = flags(Some(100), None);
+        f.recipients = vec!["nothex=5".into()];
+        assert!(resolve_terms(&f, None).is_err());
+        f.recipients = vec![format!("{}=5", "ab".repeat(32))];
+        let t = resolve_terms(&f, None).unwrap();
+        assert_eq!(t.per_recipient_msat[&"ab".repeat(32)], 5_000);
+        f.per_call_sats = Some(101);
+        assert!(resolve_terms(&f, None).is_err(), "per-call above the budget");
     }
 }
