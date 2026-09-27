@@ -1,7 +1,7 @@
 //! The node's own physiology, read locally (O1 v2): energy (N1) and membrane (N2).
 //!
-//! Both are this node's ledger of itself. They are read scope, loopback clients
-//! only in practice, never gossiped, and describe no one else's traffic: there is
+//! Both are this node's ledger of itself. They are paired read scope, loopback clients
+//! only, never gossiped, and describe no one else's traffic: there is
 //! no global graph here and no route that exports one. Counterparty ids are the
 //! ones this node already stores for its own conversations.
 
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use konsensus_storage::{EnergyRow, StorageError};
 
-use crate::auth::scoped::{Read, ScopedAuth};
+use crate::local_read::LocalPairedRead;
 use crate::error::ApiError;
 use crate::membrane::{MembraneEvent, Totals, MEMBRANE_CAPACITY};
 use crate::state::AppState;
@@ -151,7 +151,7 @@ pub fn aggregate(
     let mut totals = EnergyTotals::default();
 
     for row in rows {
-        if row.timestamp_ms < since_ms || row.amount_msat == 0 {
+        if row.timestamp_ms < since_ms || row.timestamp_ms > as_of_ms || row.amount_msat == 0 {
             continue;
         }
         let is_room = row.recipient_type == "room";
@@ -222,7 +222,7 @@ fn now_ms() -> u64 {
 /// `GET /api/v1/energy?window=1h|24h|7d` — sats in and out, per counterparty
 /// and per bucket, from this node's own stored paid messages. Read scope.
 async fn energy(
-    _auth: ScopedAuth<Read>,
+    _auth: LocalPairedRead,
     State(state): State<Arc<AppState>>,
     Query(q): Query<EnergyQuery>,
 ) -> Result<Json<EnergyResponse>, ApiError> {
@@ -269,7 +269,7 @@ pub struct MembraneResponse {
 /// `GET /api/v1/membrane?since=&limit=` — recent admission decisions from the
 /// bounded in-memory ring. Read scope. No export, no persistence.
 async fn membrane(
-    _auth: ScopedAuth<Read>,
+    _auth: LocalPairedRead,
     State(state): State<Arc<AppState>>,
     Query(q): Query<MembraneQuery>,
 ) -> Json<MembraneResponse> {

@@ -22,8 +22,8 @@
 //!   words in someone else's mouth.
 //!
 //! The ring lives on [`AuditLog`](crate::audit::AuditLog) because it is emitted
-//! at exactly the places the audit entries are written, and so every component
-//! that already holds the audit log (API state, the node's receive loop) can emit
+//! shared by the API state and receive loop. Gate outcomes are emitted before
+//! post-gate routing/storage, and every component holding the audit log can emit
 //! without a new dependency being threaded through.
 
 use std::collections::VecDeque;
@@ -61,7 +61,7 @@ pub enum Direction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
-    /// Passed every gate check; stored and acknowledged.
+    /// Passed every gate check. Downstream storage/delivery may still fail.
     Admitted,
     /// Refused; nothing stored.
     Refused,
@@ -185,6 +185,7 @@ pub fn classify(rejection: &GateRejection) -> (Code, Option<u64>, bool) {
 pub fn outbound_code(err: &ApiError) -> Option<Code> {
     match err {
         ApiError::PriceCapExceeded(_) => Some(Code::PriceCapExceeded),
+        ApiError::BudgetExceeded(_) => Some(Code::BudgetExceeded),
         _ => None,
     }
 }
@@ -297,8 +298,8 @@ impl Membrane {
     pub fn outbound_refused(
         &self,
         err: &ApiError,
-        recipient: &str,
-        kind: u16,
+        recipient: Option<&Recipient>,
+        kind: Option<u16>,
         cap_msat: Option<u64>,
     ) -> Option<Arc<MembraneEvent>> {
         let code = outbound_code(err)?;
@@ -309,8 +310,8 @@ impl Membrane {
             direction: Direction::Outbound,
             verdict: Verdict::Refused,
             code,
-            kind: Some(kind),
-            counterparty: Some(recipient.to_owned()),
+            kind,
+            counterparty: recipient.and_then(recipient_label),
             first_contact: false,
             required_msat: None,
             paid_msat: None,
@@ -365,6 +366,22 @@ impl Membrane {
             .cloned()
             .collect();
         (events, ring.totals)
+    }
+}
+
+/// Parse only bounded canonical identifier forms. Never retain failed input.
+#[must_use]
+pub fn parse_recipient(raw: &str, is_room: bool) -> Option<Recipient> {
+    if is_room {
+        (raw.len() == 36)
+            .then(|| konsensus_core::RoomId::parse(raw).ok())
+            .flatten()
+            .map(Recipient::Room)
+    } else {
+        (raw.len() == 64)
+            .then(|| konsensus_core::types::NodeId::from_hex(raw).ok())
+            .flatten()
+            .map(Recipient::Node)
     }
 }
 
@@ -555,13 +572,13 @@ mod tests {
     fn outbound_only_for_membrane_errors() {
         let m = Membrane::with_capacity(10);
         assert!(m
-            .outbound_refused(&ApiError::BadRequest("x".into()), "ab", 1, None)
+            .outbound_refused(&ApiError::BadRequest("x".into()), None, Some(1), None)
             .is_none());
         let e = m
             .outbound_refused(
                 &ApiError::PriceCapExceeded("x".into()),
-                "ab",
-                1,
+                None,
+                Some(1),
                 Some(30_000),
             )
             .unwrap();
@@ -584,5 +601,39 @@ mod tests {
         assert_eq!(v["code"], "settled");
         assert_eq!(v["first_contact"], true);
         assert_eq!(v["paid_msat"], 20_000);
+    }
+    #[test]
+    fn outbound_identity_and_all_serialized_fields_are_bounded() {
+        let node = "AB".repeat(32);
+        let room = "B32630F5-90F3-4664-B88C-97E701AAEE49";
+        let m = Membrane::default();
+        for (raw, is_room, expected) in [
+            (node.as_str(), false, Some(node.to_lowercase())),
+            (room, true, Some(room.to_lowercase())),
+            ("lnbc1-invoice-secret", false, None),
+            ("private words", true, None),
+        ] {
+            let recipient = parse_recipient(raw, is_room);
+            let e = m
+                .outbound_refused(
+                    &ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::Unpriced(
+                        "SECRET IN ERROR".into(),
+                    )),
+                    recipient.as_ref(),
+                    Some(u16::MAX),
+                    Some(u64::MAX),
+                )
+                .unwrap();
+            assert_eq!(e.counterparty, expected);
+            let value = serde_json::to_value(e.as_ref()).unwrap();
+            assert!(serde_json::to_vec(e.as_ref()).unwrap().len() < 1024);
+            for v in value.as_object().unwrap().values() {
+                if let Some(s) = v.as_str() {
+                    assert!(s.len() <= 64);
+                }
+            }
+            assert!(!value.to_string().contains("SECRET IN ERROR"));
+        }
+        assert!(parse_recipient(&"x".repeat(100_000), false).is_none());
     }
 }

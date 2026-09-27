@@ -1498,6 +1498,7 @@ async fn compose_room_member(
                     error = %e,
                     "skipping room member: payment proof unavailable (offline?)"
                 );
+                state.audit_log.membrane().outbound_refused(&e, Some(&Recipient::Node(member)), Some(ctx.kind), None);
                 return match e {
                     ApiError::PaymentUnresolved(_) => RoomMemberOutcome::stopped(member, "unknown", price_msat, "Payment outcome unresolved; do not retry".into()),
                     ApiError::PaymentProofUnavailable { amount_msat, reason } => RoomMemberOutcome::stopped(member, "settled", amount_msat, reason),

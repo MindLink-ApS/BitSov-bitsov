@@ -45,10 +45,17 @@ async fn compose_observed(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ComposeRequest>,
 ) -> Result<Json<ComposeResponse>, ApiError> {
-    let (recipient, kind, cap) = (req.recipient.clone(), req.kind, req.max_total_msat);
+    let (recipient, kind, cap) = (
+        crate::membrane::parse_recipient(&req.recipient, req.is_room),
+        req.kind,
+        req.max_total_msat,
+    );
     let out = compose::compose_message(auth, State(Arc::clone(&state)), Json(req)).await;
     if let Err(e) = &out {
-        state.audit_log.membrane().outbound_refused(e, &recipient, kind, cap);
+        state
+            .audit_log
+            .membrane()
+            .outbound_refused(e, recipient.as_ref(), Some(kind), cap);
     }
     out
 }
@@ -58,10 +65,17 @@ async fn send_observed(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>, ApiError> {
-    let (recipient, kind, cap) = (req.recipient.clone(), req.kind, req.max_total_msat);
+    let (recipient, kind, cap) = (
+        crate::membrane::parse_recipient(&req.recipient, req.is_room),
+        req.kind,
+        req.max_total_msat,
+    );
     let out = send::send_message(auth, State(Arc::clone(&state)), Json(req)).await;
     if let Err(e) = &out {
-        state.audit_log.membrane().outbound_refused(e, &recipient, kind, cap);
+        state
+            .audit_log
+            .membrane()
+            .outbound_refused(e, recipient.as_ref(), Some(kind), cap);
     }
     out
 }

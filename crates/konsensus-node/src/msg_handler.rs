@@ -83,6 +83,7 @@ pub(crate) struct MsgHandlerDeps {
 #[allow(clippy::too_many_arguments)]
 async fn whitelist_then_verify(
     envelope: &konsensus_core::UkmEnvelope,
+    membrane: &konsensus_api::membrane::Membrane,
     peer_registry: &tokio::sync::RwLock<PeerRegistry>,
     gate: &PaymentGate,
     nonce_store: &dyn konsensus_core::gate::NonceStore,
@@ -110,7 +111,7 @@ async fn whitelist_then_verify(
             konsensus_message::ReachabilityMode::Whitelist => Some(&whitelist),
             konsensus_message::ReachabilityMode::PriceOpen => None,
         };
-    gate.verify(
+    let result = gate.verify(
         envelope,
         nonce_store,
         pricing,
@@ -119,7 +120,15 @@ async fn whitelist_then_verify(
         trust_discount,
         our_node_id,
     )
-    .await
+    .await;
+    // Emit exactly once at the gate boundary, before relay dispatch, storage,
+    // decryption or ACK can take an early exit. Membership is the same snapshot
+    // used for this decision; never take another registry lock to classify it.
+    match &result {
+        Ok(()) => { membrane.admitted(envelope, !whitelist.contains(&envelope.sender)); }
+        Err(rejection) => { membrane.refused(envelope, rejection); }
+    }
+    result
 }
 
 /// Cooldown between corrective price-table resends to the SAME peer. Long enough
@@ -233,6 +242,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // unit-testable (tests::whitelist_read_guard_released_*).
                         let gate_result = whitelist_then_verify(
                             &envelope,
+                            audit_for_recv.membrane(),
                             peer_registry_for_recv.as_ref(),
                             gate_for_recv.as_ref(),
                             nonce_adapter.as_ref(),
@@ -285,10 +295,6 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     "kind": envelope.kind,
                                 })),
                             );
-                            // N2: the same decision, bounded and in memory, for the
-                            // owner's client. Names the sender only if the gate had
-                            // verified its signature before refusing.
-                            audit_for_recv.membrane().refused(&envelope, &rejection);
                             // Send MessageReject back to sender
                             let reject = Frame::MessageReject {
                                 id: msg_id,
@@ -399,15 +405,6 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                             continue;
                         }
-
-                        // N2: admitted by settlement. A sender that is not a
-                        // contact is a first contact; it is NOT added as one.
-                        let first_contact = !peer_registry_for_recv
-                            .read()
-                            .await
-                            .whitelist_arc()
-                            .contains(&sender);
-                        audit_for_recv.membrane().admitted(&envelope, first_contact);
 
                         // Attempt to decrypt ciphertext via Double Ratchet session
                         let plaintext = decrypt_and_process(

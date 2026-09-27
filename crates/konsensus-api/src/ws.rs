@@ -33,6 +33,7 @@ const WS_JWT_PROTOCOL_PREFIX: &str = "bitsov.jwt.";
 
 /// `GET /api/v1/ws` — WebSocket connection.
 async fn ws_handler(
+    _local: crate::local_read::LocalConnection,
     State(state): State<Arc<AppState>>,
     Query(params): Query<WsParams>,
     headers: HeaderMap,
@@ -46,8 +47,10 @@ async fn ws_handler(
     // Validate JWT before upgrading — reject with 401 if invalid
     match auth::validate_token(&token, &state.jwt_secret) {
         Ok(claims) => {
-            if auth::check_pairing_binding(&state, &claims).is_err() {
-                return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+            match auth::check_pairing_binding(&state, &claims) {
+                Ok(Some(_)) => {}
+                Ok(None) => return (StatusCode::FORBIDDEN, "local paired read required").into_response(),
+                Err(_) => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
             }
             // This endpoint authenticates itself rather than going through the
             // `ScopedAuth` extractor, so it was silently exempt from the #72
@@ -241,7 +244,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
 fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims) -> bool {
     claims.exp > chrono::Utc::now().timestamp()
         && claims.scp.contains(&auth::Scope::Read)
-        && auth::check_pairing_binding(state, claims).is_ok()
+        && matches!(auth::check_pairing_binding(state, claims), Ok(Some(_)))
 }
 
 /// Registers the WebSocket upgrade route for real-time event streaming.

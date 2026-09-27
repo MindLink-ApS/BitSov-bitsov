@@ -69,6 +69,7 @@ pub mod state;
 pub mod ws;
 // N2 membrane ring (declared last to stay clear of neighbouring module additions).
 pub mod membrane;
+mod local_read;
 
 pub use audit::AuditLog;
 pub use rate_limit::RateLimiter;

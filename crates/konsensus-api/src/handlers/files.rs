@@ -349,6 +349,26 @@ async fn delete_file(
     Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
 
+async fn send_file_observed(
+    auth: MeteredSpend,
+    State(state): State<Arc<AppState>>,
+    Path(file_id): Path<String>,
+    Json(req): Json<SendFileRequest>,
+) -> Result<Json<SendFileResponse>, ApiError> {
+    let recipient = crate::membrane::parse_recipient(&req.recipient, false);
+    let cap = req.max_total_msat;
+    let result = send_file(auth, State(Arc::clone(&state)), Path(file_id), Json(req)).await;
+    if let Err(e) = &result {
+        state.audit_log.membrane().outbound_refused(
+            e,
+            recipient.as_ref(),
+            Some(KIND_FILE_REF),
+            cap,
+        );
+    }
+    result
+}
+
 /// `POST /api/v1/files/:id/send` — send a file to a peer.
 ///
 /// The node reads the file from local storage, builds a `FilePayload` JSON,
@@ -501,7 +521,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/v1/files/:id",
             get(download_file).delete(delete_file),
         )
-        .route("/api/v1/files/:id/send", post(send_file))
+        .route("/api/v1/files/:id/send", post(send_file_observed))
 }
 
 #[cfg(test)]
