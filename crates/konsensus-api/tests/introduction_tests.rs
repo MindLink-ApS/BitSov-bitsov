@@ -148,7 +148,7 @@ async fn no_card_without_a_dialable_endpoint_or_network() {
 }
 
 #[tokio::test]
-async fn introduction_routes_need_a_token_and_open_needs_spend() {
+async fn introduction_routes_need_a_token_and_read_is_enough() {
     let state = state_with(Arc::default(), settings(Some("node.example.org:9000")));
     let resp = test_router(state.clone())
         .oneshot(Request::builder().uri("/api/v1/introduction").body(Body::empty()).unwrap())
@@ -156,9 +156,14 @@ async fn introduction_routes_need_a_token_and_open_needs_spend() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let card = stranger_card("127.0.0.1:9735", "regtest", now());
-    let (status, _, _) = call(&state, "POST", "/api/v1/introduction/open", bearer(&state, vec![auth::Scope::Read]),
-        Some(json!({ "card": card.to_link() }))).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let open = |bearer: String| {
+        let state = state.clone();
+        let body = json!({ "card": card.to_link() });
+        async move { call(&state, "POST", "/api/v1/introduction/open", bearer, Some(body)).await.0 }
+    };
+    // A paired app holds read + receive before any budget: that is enough to dial.
+    assert_eq!(open(bearer(&state, vec![auth::Scope::Read])).await, StatusCode::OK);
+    assert_eq!(open(bearer(&state, vec![auth::Scope::Receive])).await, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -166,7 +171,7 @@ async fn open_dials_unprivileged_and_admits_nothing() {
     let transport = Arc::new(Recorder::default());
     let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
     let card = stranger_card("127.0.0.1:9735", "regtest", now());
-    let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open", bearer(&state, vec![auth::Scope::Spend]),
+    let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open", bearer(&state, vec![auth::Scope::Read]),
         Some(json!({ "card": card.to_link() }))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["node_id"], card.node_id);
@@ -183,7 +188,7 @@ async fn open_dials_unprivileged_and_admits_nothing() {
 async fn open_refuses_bad_cards_before_dialing() {
     let transport = Arc::new(Recorder::default());
     let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
-    let spend = || bearer(&state, vec![auth::Scope::Spend]);
+    let spend = || bearer(&state, vec![auth::Scope::Read]);
 
     let mut tampered = stranger_card("127.0.0.1:9735", "regtest", now());
     tampered.admission_msat = 1;
@@ -217,7 +222,7 @@ async fn a_closed_mesh_node_refuses_rather_than_whitelisting() {
     let transport = Arc::new(Recorder { closed: true, ..Default::default() });
     let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
     let card = stranger_card("127.0.0.1:9735", "regtest", now());
-    let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open", bearer(&state, vec![auth::Scope::Spend]),
+    let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open", bearer(&state, vec![auth::Scope::Read]),
         Some(json!({ "card": card.to_link() }))).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.to_string().contains("introduction_closed_mesh"), "{body}");

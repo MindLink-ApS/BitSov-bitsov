@@ -25,7 +25,7 @@ use konsensus_core::introduction::{
 };
 use konsensus_core::traits::transport::TransportError;
 
-use crate::auth::scoped::{Read, ScopedAuth, Spend};
+use crate::auth::scoped::{Read, ScopedAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -169,10 +169,12 @@ async fn pin_endpoint(card: &Introduction) -> Result<SocketAddr, ApiError> {
 /// signature, not ourselves, and the endpoint's pinned resolution against the
 /// card's reach (never link-local/metadata; private only for a local card).
 /// Then an unprivileged dial whose Noise handshake must authenticate the
-/// card's key. Nothing is stored, whitelisted or paid. Spend scope: dialing
-/// is the first step of a paid first contact, not an observation.
+/// card's key. Nothing is stored, whitelisted or paid. Read scope, like the
+/// card itself: a paired app holds read before its owner grants any budget,
+/// and a dial moves no value. Paying still needs the budget grant and the
+/// owner's one-time first-contact OK.
 async fn open_introduction(
-    _auth: ScopedAuth<Spend>,
+    _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenIntroductionRequest>,
 ) -> Result<Json<OpenIntroductionResponse>, ApiError> {
