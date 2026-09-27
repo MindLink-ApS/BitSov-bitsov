@@ -360,7 +360,13 @@ impl LightningConfig {
     /// backends are regtest; LND and LNbits do not say.
     pub fn bitcoin_network(&self) -> Option<String> {
         match self {
-            Self::Ldk { network, .. } => Some(network.clone()),
+            Self::Ldk { network, .. } => match network.to_ascii_lowercase().as_str() {
+                "bitcoin" | "mainnet" => Some("bitcoin".into()),
+                "testnet" | "testnet3" => Some("testnet".into()),
+                "signet" => Some("signet".into()),
+                "regtest" => Some("regtest".into()),
+                _ => None,
+            },
             Self::Mock { .. } | Self::SharedMock { .. } => Some("regtest".into()),
             Self::Lnbits { .. } | Self::Lnd { .. } => None,
         }

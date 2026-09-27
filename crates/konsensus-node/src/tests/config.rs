@@ -2287,3 +2287,16 @@ fn introduction_endpoint_prefers_advertised_and_skips_wildcards() {
     let toml_net: NetworkConfig = toml::from_str("advertised_addr = \"n.example:1\"").unwrap();
     assert_eq!(toml_net.advertised_addr.as_deref(), Some("n.example:1"));
 }
+
+#[test]
+fn introduction_network_normalizes_ldk_names() {
+    for (configured, canonical) in [
+        ("mainnet", Some("bitcoin")), ("BITCOIN", Some("bitcoin")),
+        ("testnet3", Some("testnet")), ("Testnet", Some("testnet")),
+        ("Signet", Some("signet")), ("Regtest", Some("regtest")),
+        ("unknown", None),
+    ] {
+        let config: LightningConfig = toml::from_str(&format!("backend = \"ldk\"\nnetwork = \"{configured}\"\n")).unwrap();
+        assert_eq!(config.bitcoin_network().as_deref(), canonical, "{configured}");
+    }
+}

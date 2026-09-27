@@ -36,7 +36,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -265,7 +265,7 @@ impl Introduction {
         let key = decode_fixed::<32>(&self.node_id).ok_or(IntroductionError::InvalidKey)?;
         let key = VerifyingKey::from_bytes(&key).map_err(|_| IntroductionError::InvalidKey)?;
         let sig = decode_fixed::<64>(&self.sig).ok_or(IntroductionError::InvalidSignature)?;
-        key.verify(&self.digest()?, &Signature::from_bytes(&sig))
+        key.verify_strict(&self.digest()?, &Signature::from_bytes(&sig))
             .map_err(|_| IntroductionError::InvalidSignature)
     }
 
@@ -316,10 +316,10 @@ impl Introduction {
     /// Parse a scanned or pasted introduction: the link, its bare fragment,
     /// or the JSON card. Bounded before any decoding. Does not verify.
     pub fn parse(text: &str) -> Result<Self, IntroductionError> {
-        let text = text.trim();
         if text.len() > MAX_ENCODED_LEN {
             return Err(IntroductionError::TooLarge(text.len()));
         }
+        let text = text.trim();
         if text.starts_with('{') {
             return serde_json::from_str(text).map_err(|e| IntroductionError::Malformed(e.to_string()));
         }
@@ -353,6 +353,9 @@ pub fn split_endpoint(endpoint: &str) -> Result<(String, u16), IntroductionError
         return Err(bad("must be host:port, not a URL"));
     }
     let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| bad("missing port"))?;
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad("bad port"));
+    }
     let port: u16 = port.parse().map_err(|_| bad("bad port"))?;
     if port == 0 {
         return Err(bad("bad port"));
@@ -423,6 +426,14 @@ pub fn ip_reach(ip: IpAddr) -> Option<Reach> {
                 None
             } else if v6.is_loopback() || (seg[0] & 0xfe00) == 0xfc00 {
                 Some(Reach::Local)
+            } else if (seg[0] & 0xe000) != 0x2000
+                || seg[0] == 0x2002
+                || (seg[0] == 0x2001 && seg[1] <= 0x01ff)
+                || seg[0] == 0x3fff
+            {
+                // Fail closed for special-use and transition addresses:
+                // an embedded IPv4 destination must not bypass local policy.
+                None
             } else {
                 Some(Reach::Public)
             }
@@ -605,5 +616,67 @@ mod tests {
         assert_eq!(first_contact_prices(0), (1000, 0));
         assert_eq!(first_contact_prices(1), (1000, 1000));
         assert_eq!(first_contact_prices(10_000), (10_000, 10_000));
+    }
+
+    #[test]
+    fn weak_key_forgery_and_tampering_are_rejected() {
+        let mut c = card();
+        let mut weak_key = [0u8; 32];
+        weak_key[0] = 1;
+        let mut forged_sig = [0u8; 64];
+        forged_sig[0] = 1;
+        c.node_id = hex::encode(weak_key);
+        c.sig = hex::encode(forged_sig);
+        for tampered in [false, true] {
+            if tampered {
+                c.endpoint = "other.example.org:9001".into();
+                c.admission_msat = 1;
+                c.message_msat = 2;
+                c.expires_at = NOW + 1;
+            }
+            let parsed = Introduction::parse(&c.to_link()).unwrap();
+            assert_eq!(parsed.verify(NOW, "regtest"), Err(IntroductionError::InvalidSignature));
+        }
+    }
+
+    #[test]
+    fn noncanonical_signatures_are_rejected() {
+        let mut c = card();
+        let mut sig = decode_fixed::<64>(&c.sig).unwrap();
+        // Add the Ed25519 group order to S: the group equation is unchanged,
+        // but the signature's scalar encoding is no longer canonical.
+        let order = hex::decode("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010").unwrap();
+        let mut carry = 0u16;
+        for (s, l) in sig[32..].iter_mut().zip(order) {
+            let sum = u16::from(*s) + u16::from(l) + carry;
+            *s = sum as u8;
+            carry = sum >> 8;
+        }
+        c.sig = hex::encode(sig);
+        assert_eq!(c.verify(NOW, "regtest"), Err(IntroductionError::InvalidSignature));
+        // Noncanonical encoding of the identity point (y = p + 1) as R.
+        sig = decode_fixed::<64>(&card().sig).unwrap();
+        sig[..32].fill(0xff);
+        sig[0] = 0xee;
+        sig[31] = 0x7f;
+        c.sig = hex::encode(sig);
+        assert_eq!(c.verify(NOW, "regtest"), Err(IntroductionError::InvalidSignature));
+    }
+
+    #[test]
+    fn parse_bounds_include_surrounding_whitespace() {
+        let padded = format!("{}{}", " ".repeat(MAX_ENCODED_LEN), card().to_link());
+        assert!(matches!(Introduction::parse(&padded), Err(IntroductionError::TooLarge(_))));
+    }
+
+    #[test]
+    fn endpoint_port_and_ipv6_transition_ranges_fail_closed() {
+        for endpoint in ["node.example:0", "node.example:65536", "node.example:+9000", "node.example:-1"] {
+            assert!(split_endpoint(endpoint).is_err(), "{endpoint}");
+        }
+        assert_eq!(split_endpoint("node.example:65535").unwrap().1, 65535);
+        for ip in ["::127.0.0.1", "64:ff9b::7f00:1", "2002:7f00:1::1", "fec0::1"] {
+            assert!(!dial_allowed(Reach::Public, ip.parse().unwrap()), "{ip}");
+        }
     }
 }

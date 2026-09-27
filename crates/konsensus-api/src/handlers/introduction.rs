@@ -21,7 +21,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use konsensus_core::introduction::{
-    dial_allowed, first_contact_prices, split_endpoint, Introduction, IntroductionFields,
+    dial_allowed, first_contact_prices, split_endpoint, Introduction, IntroductionFields, Reach,
 };
 use konsensus_core::traits::transport::TransportError;
 
@@ -29,7 +29,7 @@ use crate::auth::scoped::{Read, ScopedAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Advertised on `/api/v1/status` when this build serves both routes.
+/// Advertised on `/api/v1/status` when this build serves introduction routes.
 pub const CAPABILITY: &str = "introduction_v1";
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,6 +60,18 @@ pub struct IntroductionResponse {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenIntroductionRequest {
+    /// The scanned link, its fragment, or the pasted JSON card.
+    pub card: String,
+    /// The reader explicitly approved the displayed local-network endpoint.
+    /// A sender's signed `reach=local` never grants this permission.
+    #[serde(default)]
+    pub allow_local: bool,
+}
+
+/// `POST /api/v1/introduction/verify`: validate for display without DNS or dialing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyIntroductionRequest {
     /// The scanned link, its fragment, or the pasted JSON card.
     pub card: String,
 }
@@ -131,6 +143,32 @@ async fn get_introduction(
     ))
 }
 
+fn verified_card(state: &AppState, text: &str) -> Result<Introduction, ApiError> {
+    let invalid = |e| ApiError::BadRequest(format!("introduction_invalid: {e}"));
+    let card = Introduction::parse(text).map_err(invalid)?;
+    let network = state.introduction.network.as_deref().ok_or_else(|| {
+        ApiError::Conflict(
+            "introduction_unavailable: this node's Lightning backend does not state a Bitcoin network".into(),
+        )
+    })?;
+    card.verify(now_unix()?, network).map_err(invalid)?;
+    Ok(card)
+}
+
+/// Stateless read-only verification: no resolution, connection, payment or storage.
+async fn verify_introduction(
+    _auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerifyIntroductionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let card = verified_card(&state, &req.card)?;
+    let link = card.to_link();
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(IntroductionResponse { card, link }),
+    ))
+}
+
 /// Resolve `endpoint` once, refuse it unless every address is allowed for
 /// the card's reach, and return one pinned socket address. DNS rebinding
 /// between this check and the dial cannot move the connection: the dial uses
@@ -167,7 +205,8 @@ async fn pin_endpoint(card: &Introduction) -> Result<SocketAddr, ApiError> {
 ///
 /// Checks: size, format, version, this node's network, expiry, the node-key
 /// signature, not ourselves, and the endpoint's pinned resolution against the
-/// card's reach (never link-local/metadata; private only for a local card).
+/// card's reach (never link-local/metadata; private only for a local card
+/// with the reader's explicit `allow_local` consent).
 /// Then an unprivileged dial whose Noise handshake must authenticate the
 /// card's key. Nothing is stored, whitelisted or paid. Read scope, like the
 /// card itself: a paired app holds read before its owner grants any budget,
@@ -181,16 +220,15 @@ async fn open_introduction(
     let invalid = |e: konsensus_core::introduction::IntroductionError| {
         ApiError::BadRequest(format!("introduction_invalid: {e}"))
     };
-    let card = Introduction::parse(&req.card).map_err(invalid)?;
-    let network = state.introduction.network.as_deref().ok_or_else(|| {
-        ApiError::Conflict(
-            "introduction_unavailable: this node's Lightning backend does not state a Bitcoin network".into(),
-        )
-    })?;
-    card.verify(now_unix()?, network).map_err(invalid)?;
+    let card = verified_card(&state, &req.card)?;
     let node = card.node().map_err(invalid)?;
     if node == *state.identity.node_id() {
         return Err(ApiError::BadRequest("introduction_invalid: this is your own introduction".into()));
+    }
+    if card.reach == Reach::Local && !req.allow_local {
+        return Err(ApiError::BadRequest(
+            "introduction_local_consent_required: approve the displayed local peer endpoint before opening".into(),
+        ));
     }
     let pinned = pin_endpoint(&card).await?;
     match tokio::time::timeout(DIAL_TIMEOUT, state.transport.connect(&node, &pinned.to_string())).await {
@@ -211,5 +249,6 @@ async fn open_introduction(
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/introduction", get(get_introduction))
+        .route("/api/v1/introduction/verify", post(verify_introduction))
         .route("/api/v1/introduction/open", post(open_introduction))
 }

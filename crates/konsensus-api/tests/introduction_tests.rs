@@ -158,7 +158,7 @@ async fn introduction_routes_need_a_token_and_read_is_enough() {
     let card = stranger_card("127.0.0.1:9735", "regtest", now());
     let open = |bearer: String| {
         let state = state.clone();
-        let body = json!({ "card": card.to_link() });
+        let body = json!({ "card": card.to_link(), "allow_local": true });
         async move { call(&state, "POST", "/api/v1/introduction/open", bearer, Some(body)).await.0 }
     };
     // A paired app holds read + receive before any budget: that is enough to dial.
@@ -172,7 +172,7 @@ async fn open_dials_unprivileged_and_admits_nothing() {
     let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
     let card = stranger_card("127.0.0.1:9735", "regtest", now());
     let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open", bearer(&state, vec![auth::Scope::Read]),
-        Some(json!({ "card": card.to_link() }))).await;
+        Some(json!({ "card": card.to_link(), "allow_local": true }))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["node_id"], card.node_id);
     assert_eq!(body["dialed"], "127.0.0.1:9735");
@@ -223,7 +223,7 @@ async fn a_closed_mesh_node_refuses_rather_than_whitelisting() {
     let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
     let card = stranger_card("127.0.0.1:9735", "regtest", now());
     let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open", bearer(&state, vec![auth::Scope::Read]),
-        Some(json!({ "card": card.to_link() }))).await;
+        Some(json!({ "card": card.to_link(), "allow_local": true }))).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.to_string().contains("introduction_closed_mesh"), "{body}");
     assert!(transport.whitelisted.lock().unwrap().is_empty());
@@ -235,4 +235,116 @@ async fn status_advertises_introduction_v1() {
     let (status, body, _) = call(&state, "GET", "/api/v1/status", auth_header(&state), None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["api_capabilities"].as_array().unwrap().iter().any(|c| c == "introduction_v1"), "{body}");
+}
+
+#[tokio::test]
+async fn verify_is_read_only_and_never_dials_or_stores() {
+    let transport = Arc::new(Recorder::default());
+    let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
+    // A nonexistent DNS name also verifies: verification must never resolve it.
+    let card = stranger_card("unresolved.invalid:9000", "regtest", now());
+    let (status, body, cache) = call(&state, "POST", "/api/v1/introduction/verify",
+        bearer(&state, vec![auth::Scope::Read]), Some(json!({"card": card.to_link()}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(cache.as_deref(), Some("no-store"));
+    assert_eq!(body["card"]["node_id"], card.node_id);
+    assert!(transport.connects.lock().unwrap().is_empty());
+    assert!(transport.whitelisted.lock().unwrap().is_empty());
+    assert!(transport.supervised.lock().unwrap().is_empty());
+    assert!(state.storage.list_peers().await.unwrap().is_empty());
+    assert!(state.peer_registry.read().await.get(&card.node().unwrap()).is_none());
+    let (status, _, _) = call(&state, "POST", "/api/v1/introduction/verify",
+        bearer(&state, vec![auth::Scope::Receive]), Some(json!({"card": card.to_link()}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn local_dial_requires_reader_consent() {
+    let transport = Arc::new(Recorder::default());
+    let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
+    for endpoint in ["127.0.0.1:9735", "10.0.0.1:9000", "[::1]:9000", "[::ffff:192.168.1.1]:9000"] {
+        let card = stranger_card(endpoint, "regtest", now());
+        for body in [json!({"card": card.to_link()}), json!({"card": card.to_link(), "allow_local": false})] {
+            let (status, response, _) = call(&state, "POST", "/api/v1/introduction/open",
+                bearer(&state, vec![auth::Scope::Read]), Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {response}");
+            assert!(response.to_string().contains("local_consent_required"), "{response}");
+            assert!(transport.connects.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn forged_weak_key_and_malformed_endpoints_never_dial() {
+    use ed25519_dalek::Signer;
+    let transport = Arc::new(Recorder::default());
+    let state = state_with(transport.clone(), settings(Some("node.example.org:9000")));
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    let mut weak = stranger_card("127.0.0.1:9735", "regtest", now());
+    let mut point = [0u8; 32];
+    point[0] = 1;
+    let mut sig = [0u8; 64];
+    sig[0] = 1;
+    weak.node_id = hex::encode(point);
+    weak.sig = hex::encode(sig);
+    let mut inputs = vec![weak.to_link()];
+    weak.endpoint = "127.0.0.1:9999".into();
+    weak.message_msat = 1;
+    inputs.push(weak.to_link());
+    inputs.push(stranger_card("127.0.0.1:9735", "regtest", now() - 601).to_link());
+    let mut tampered = stranger_card("127.0.0.1:9735", "regtest", now());
+    tampered.message_msat += 1;
+    inputs.push(tampered.to_link());
+    for endpoint in ["127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:+9000", "user@127.0.0.1:9000",
+        "169.254.169.254:80", "[fe80::1]:9000", "http://127.0.0.1:9000", "127.0.0.1:9000/admin"] {
+        let mut card = stranger_card("127.0.0.1:9735", "regtest", now());
+        card.endpoint = endpoint.into();
+        card.sig = hex::encode(key.sign(blake3::hash(&card.canonical_bytes().unwrap()).as_bytes()).to_bytes());
+        inputs.push(card.to_link());
+    }
+    let mut too_long = stranger_card("127.0.0.1:9735", "regtest", now());
+    too_long.endpoint = format!("{}:9000", "a".repeat(256));
+    inputs.push(serde_json::to_string(&too_long).unwrap());
+    for input in inputs {
+        for route in ["/api/v1/introduction/verify", "/api/v1/introduction/open"] {
+            let body = if route.ends_with("/open") { json!({"card": input, "allow_local": true}) } else { json!({"card": input}) };
+            let (status, response, _) = call(&state, "POST", route,
+                bearer(&state, vec![auth::Scope::Read]), Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {response}");
+        }
+    }
+    assert!(transport.connects.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn paired_read_client_can_verify_and_explicitly_open_without_a_spend_grant() {
+    use ed25519_dalek::Signer;
+    use konsensus_api::pairing::{identity_fingerprint, PairingService};
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(Recorder::default());
+    let base = state_with(transport.clone(), settings(Some("node.example.org:9000")));
+    let service = Arc::new(PairingService::open(
+        dir.path(), identity_fingerprint(&base.identity.node_id().to_hex()), false,
+    ).unwrap().without_stdout_code());
+    let key = ed25519_dalek::SigningKey::from_bytes(&[53; 32]);
+    let public = hex::encode(key.verifying_key().to_bytes());
+    let request = service.request_pairing("introduction reader", &public).unwrap();
+    let challenge = std::fs::read(service.dir().join(format!("challenge-{}", request.pair_id))).unwrap();
+    let proof = key.sign(&PairingService::proof_message(&request.pair_id, &public, &challenge));
+    let client = service.confirm_pairing(&request.pair_id, &hex::encode(proof.to_bytes()),
+        vec![auth::Scope::Read, auth::Scope::Receive]).unwrap();
+    let token = auth::create_paired_token(&base.identity.node_id().to_hex(), &base.jwt_secret,
+        client.scopes, &client.client_id, client.epoch, &service.bound_fingerprint()).unwrap();
+    let state = Arc::new(AppState { pairing: Some(service), ..(*base).clone() });
+    let card = stranger_card("127.0.0.1:9735", "regtest", now());
+    let (status, body, _) = call(&state, "POST", "/api/v1/introduction/verify",
+        format!("Bearer {token}"), Some(json!({"card": card.to_link()}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(transport.connects.lock().unwrap().is_empty());
+    let (status, body, _) = call(&state, "POST", "/api/v1/introduction/open",
+        format!("Bearer {token}"), Some(json!({"card": card.to_link(), "allow_local": true}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(transport.connects.lock().unwrap().len(), 1);
+    assert!(transport.whitelisted.lock().unwrap().is_empty());
+    assert!(state.storage.list_peers().await.unwrap().is_empty());
 }
