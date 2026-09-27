@@ -393,15 +393,18 @@ impl ChainAwarePricingEngine {
         // Fee targets are fetched sequentially (typically 1-3 targets, each
         // is a single HTTP call with sub-second latency). The cache TTL (60s)
         // ensures this runs at most once per minute, not per message.
+        let height_read_at = Instant::now();
         let height_result = self.chain.get_block_height().await;
         let mut fee_results = Vec::with_capacity(unique_targets.len());
         for &target in &unique_targets {
-            fee_results.push(self.chain.estimate_fee(target).await);
+            // Capture before this read, not after later reads have completed.
+            let read_at = Instant::now();
+            fee_results.push((read_at, self.chain.estimate_fee(target).await));
         }
         let now = Instant::now();
 
         let (height, block_height_fetched_at) = match height_result {
-            Ok(h) => (h, now),
+            Ok(h) => (h, height_read_at),
             Err(e) => {
                 debug!(
                     error = %e,
@@ -417,7 +420,7 @@ impl ChainAwarePricingEngine {
         let mut new_targets = HashMap::new();
         let mut any_succeeded = false;
 
-        for (i, result) in fee_results.into_iter().enumerate() {
+        for (i, (read_at, result)) in fee_results.into_iter().enumerate() {
             let target = unique_targets[i];
             match result {
                 Ok(estimate) => {
@@ -453,7 +456,7 @@ impl ChainAwarePricingEngine {
                         TargetFeeState {
                             raw_sat_per_vbyte: raw_rate,
                             ema_sat_per_vbyte: ema_rate,
-                            fetched_at: now,
+                            fetched_at: read_at,
                         },
                     );
                     any_succeeded = true;

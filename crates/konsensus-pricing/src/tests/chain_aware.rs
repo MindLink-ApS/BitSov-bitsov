@@ -1102,12 +1102,16 @@ async fn seeded_chain_state_reports_an_expired_fetch_time() {
 /// Synced provider whose `estimate_fee` fails for the targets in `failing`.
 struct FlakyFeeChain {
     failing: std::sync::Mutex<Vec<u32>>,
+    delay: Duration,
+    reads: std::sync::Mutex<Vec<(Option<u32>, Instant)>>,
 }
 
 impl FlakyFeeChain {
     fn new() -> Self {
         Self {
             failing: std::sync::Mutex::new(Vec::new()),
+            delay: Duration::ZERO,
+            reads: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1122,6 +1126,7 @@ impl ChainProvider for FlakyFeeChain {
         konsensus_core::traits::chain::TrustLevel::ServerTrust
     }
     async fn get_block_height(&self) -> Result<u64, konsensus_core::traits::chain::ChainError> {
+        self.reads.lock().unwrap().push((None, Instant::now()));
         Ok(886_000)
     }
     async fn get_block_header(
@@ -1138,6 +1143,13 @@ impl ChainProvider for FlakyFeeChain {
         target_blocks: u32,
     ) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError>
     {
+        self.reads
+            .lock()
+            .unwrap()
+            .push((Some(target_blocks), Instant::now()));
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
         if self.failing.lock().unwrap().contains(&target_blocks) {
             return Err(konsensus_core::traits::chain::ChainError::NotAvailable(
                 "fee estimate unavailable".into(),
@@ -1161,6 +1173,52 @@ impl ChainProvider for FlakyFeeChain {
 }
 
 const FLAKY_TTL: Duration = Duration::from_millis(100);
+
+#[tokio::test]
+async fn sequential_chain_reads_keep_their_own_timestamps() {
+    let chain = Arc::new(FlakyFeeChain {
+        delay: Duration::from_secs(1),
+        ..FlakyFeeChain::new()
+    });
+    let config = ChainAwarePricingConfig {
+        fee_target_blocks: 6,
+        category_fee_targets: [("files_media".to_string(), 144)].into_iter().collect(),
+        ..ChainAwarePricingConfig::default()
+    };
+    let engine = ChainAwarePricingEngine::new(config, chain.clone());
+    let before = Instant::now();
+    engine.get_price_msat(KIND_CHAT).await.unwrap();
+    assert!(before.elapsed() >= Duration::from_secs(2));
+
+    let cache = engine.cached_state.read().await;
+    let cached = cache.as_ref().unwrap();
+    let reads = chain.reads.lock().unwrap().clone();
+    assert_eq!(reads.len(), 3);
+    for &(target, read_at) in reads.iter() {
+        let stamped = match target {
+            Some(target) => cached.targets[&target].fetched_at,
+            None => cached.block_height_fetched_at,
+        };
+        assert!(stamped >= before);
+        assert!(
+            stamped <= read_at,
+            "{target:?}: timestamp inflated by {:?}",
+            stamped.duration_since(read_at)
+        );
+    }
+    // The second fee read must not inherit the first read's timestamp either.
+    let first = cached.targets[&reads[1].0.unwrap()].fetched_at;
+    let second = cached.targets[&reads[2].0.unwrap()].fetched_at;
+    assert!(second.duration_since(first) >= chain.delay);
+    drop(cache);
+    let advertised = engine.chain_state_fetched_at().await.unwrap();
+    assert!(
+        std::time::SystemTime::now()
+            .duration_since(advertised)
+            .unwrap()
+            >= Duration::from_secs(2)
+    );
+}
 
 /// Two fee targets (6 for chat, 144 for files) and a short TTL.
 fn make_flaky_engine() -> (Arc<FlakyFeeChain>, ChainAwarePricingEngine) {
