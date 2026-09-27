@@ -385,6 +385,9 @@ async fn queued_room_members_stop_on_revoke() {
     let (status, receipt) = task.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["member_outcomes"].as_array().unwrap().len(), 10);
+    let events = fx.state.audit_log.membrane().read(None, 500).0;
+    assert_eq!(events.len(), 2, "only the two not-yet-dispatched members are definite budget refusals");
+    assert!(events.iter().all(|e| e.code == konsensus_api::membrane::Code::BudgetExceeded));
     assert_eq!(
         fx.wallet.money(),
         0,

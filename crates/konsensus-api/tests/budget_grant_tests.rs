@@ -1130,3 +1130,67 @@ mod lifecycle;
 
 #[path = "budget_grant/expiry.rs"]
 mod expiry;
+
+#[tokio::test]
+async fn membrane_observes_budget_refusals_on_compose_and_file() {
+    let fx = fixture().await;
+    let token = fx.grant(None, GrantTerms::new(10_000).per_call(999)).await;
+    assert_eq!(fx.compose(&token).await.0, StatusCode::CONFLICT);
+    let owner = auth_header(&fx.state);
+    let (_, file) = fx
+        .call(
+            "POST",
+            "/api/v1/files",
+            Some(json!({"filename":"hi.txt","mime_type":"text/plain","data_b64":"aGk="})),
+            Some(owner.trim_start_matches("Bearer ")),
+        )
+        .await;
+    let path = format!("/api/v1/files/{}/send", file["file_id"].as_str().unwrap());
+    assert_eq!(
+        fx.call(
+            "POST",
+            &path,
+            Some(json!({"recipient":fx.peer.to_hex()})),
+            Some(&token)
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let (events, totals) = fx.state.audit_log.membrane().read(None, 500);
+    assert_eq!(events.len(), 2);
+    assert!(events
+        .iter()
+        .all(|e| e.code == konsensus_api::membrane::Code::BudgetExceeded));
+    assert_eq!(totals.outbound_refused, 2);
+    assert_eq!(fx.wallet.money(), 0);
+}
+
+#[tokio::test]
+async fn membrane_observes_direct_payment_budget_denials_without_invoice_data() {
+    let fx = fixture().await;
+    let token = fx.grant(None, GrantTerms::new(1000)).await;
+    assert_eq!(
+        fx.keysend(&token, OTHER_LN, 2000).await.0,
+        StatusCode::CONFLICT
+    );
+    let invoice = amountless_bolt11();
+    assert_eq!(
+        fx.call(
+            "POST",
+            "/api/v1/payments/pay",
+            Some(json!({"bolt11":invoice})),
+            Some(&token)
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let (events, totals) = fx.state.audit_log.membrane().read(None, 500);
+    assert_eq!(totals.outbound_refused, 2);
+    assert!(events.iter().all(|e| e.counterparty.is_none()
+        && e.kind.is_none()
+        && e.code == konsensus_api::membrane::Code::BudgetExceeded));
+    assert!(!serde_json::to_string(&events).unwrap().contains(&invoice));
+    assert_eq!(fx.wallet.money(), 0);
+}

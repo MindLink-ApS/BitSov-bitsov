@@ -540,6 +540,37 @@ async fn list_payments(
     ))
 }
 
+// Budget refusals on direct payments carry no invoice, memo or Lightning key.
+async fn pay_invoice_observed(
+    auth: MeteredSpend,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PayInvoiceRequest>,
+) -> Result<Json<PayInvoiceResponse>, ApiError> {
+    let result = pay_invoice(auth, State(Arc::clone(&state)), Json(req)).await;
+    if let Err(e) = &result {
+        state
+            .audit_log
+            .membrane()
+            .outbound_refused(e, None, None, None);
+    }
+    result
+}
+
+async fn keysend_observed(
+    auth: MeteredSpend,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<KeysendRequest>,
+) -> Result<Json<KeysendResponse>, ApiError> {
+    let result = keysend(auth, State(Arc::clone(&state)), Json(req)).await;
+    if let Err(e) = &result {
+        state
+            .audit_log
+            .membrane()
+            .outbound_refused(e, None, None, None);
+    }
+    result
+}
+
 /// Registers payment routes for invoices, payments, balance, channels, and pricing queries.
 /// Open a Lightning channel to a peer.
 #[derive(Deserialize)]
@@ -710,8 +741,8 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/payments", get(list_payments))
         .route("/api/v1/payments/invoice", post(create_invoice))
-        .route("/api/v1/payments/pay", post(pay_invoice))
-        .route("/api/v1/payments/keysend", post(keysend))
+        .route("/api/v1/payments/pay", post(pay_invoice_observed))
+        .route("/api/v1/payments/keysend", post(keysend_observed))
         .route("/api/v1/payments/balance", get(get_balance))
         .route("/api/v1/payments/channels", get(list_channels))
         .route("/api/v1/payments/price/:kind", get(get_price))

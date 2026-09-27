@@ -182,6 +182,8 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         api_capabilities: vec![
             super::messages::caps::CAPABILITY,
             super::messages::caps::ROOM_CAPABILITY,
+            super::organism::ENERGY_CAPABILITY,
+            crate::membrane::CAPABILITY,
             crate::spend_budget::CAPABILITY,
         ],
         status: "ok",

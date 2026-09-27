@@ -15,9 +15,12 @@
 
 use std::sync::Arc;
 
+use axum::extract::State;
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Json, Router};
 
+use crate::metered::MeteredSpend;
+use crate::error::ApiError;
 use crate::state::AppState;
 
 pub(crate) mod caps;
@@ -32,12 +35,57 @@ pub(crate) use compose::create_metered_payment_proof;
 pub use query::{ListMessagesQuery, MessageResponse};
 pub use send::{SendMessageRequest, SendMessageResponse};
 
+// Membrane (N2), outbound side: a paid send this node refused before any
+// payment left (price above the confirmed cap, budget grant exhausted) is a
+// decision at the other node's door, recorded for the owner's own client.
+// Observed here, around the handlers, so the send paths stay untouched.
+
+async fn compose_observed(
+    auth: MeteredSpend,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ComposeRequest>,
+) -> Result<Json<ComposeResponse>, ApiError> {
+    let (recipient, kind, cap) = (
+        crate::membrane::parse_recipient(&req.recipient, req.is_room),
+        req.kind,
+        req.max_total_msat,
+    );
+    let out = compose::compose_message(auth, State(Arc::clone(&state)), Json(req)).await;
+    if let Err(e) = &out {
+        state
+            .audit_log
+            .membrane()
+            .outbound_refused(e, recipient.as_ref(), Some(kind), cap);
+    }
+    out
+}
+
+async fn send_observed(
+    auth: MeteredSpend,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SendMessageRequest>,
+) -> Result<Json<SendMessageResponse>, ApiError> {
+    let (recipient, kind, cap) = (
+        crate::membrane::parse_recipient(&req.recipient, req.is_room),
+        req.kind,
+        req.max_total_msat,
+    );
+    let out = send::send_message(auth, State(Arc::clone(&state)), Json(req)).await;
+    if let Err(e) = &out {
+        state
+            .audit_log
+            .membrane()
+            .outbound_refused(e, recipient.as_ref(), Some(kind), cap);
+    }
+    out
+}
+
 /// Registers message routes for sending, composing, listing, reading, and deleting messages.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/v1/messages", post(send::send_message).get(query::list_messages))
+        .route("/api/v1/messages", post(send_observed).get(query::list_messages))
         .route("/api/v1/messages/search", get(query::search_messages))
-        .route("/api/v1/messages/compose", post(compose::compose_message))
+        .route("/api/v1/messages/compose", post(compose_observed))
         .route("/api/v1/messages/resync", post(resync::resync_messages))
         .route(
             "/api/v1/messages/:id",

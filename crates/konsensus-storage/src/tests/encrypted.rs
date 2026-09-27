@@ -1259,3 +1259,37 @@ impl Storage for () {
         Ok(None)
     }
 }
+
+// ── Energy read (N1): metadata only, through the encryption layer ────────
+
+#[tokio::test]
+async fn energy_rows_since_returns_payment_metadata_only() {
+    let sqlite = SqliteStorage::in_memory().await.unwrap();
+    let store = EncryptedStorage::new(sqlite, &[7u8; 32]);
+    let me = NodeId::from_bytes([1u8; 32]);
+    let peer = NodeId::from_bytes([2u8; 32]);
+    let room = RoomId::new();
+
+    for (sender, recipient, ts) in [
+        (peer, Recipient::Node(me), 1_000_000u64),
+        (me, Recipient::Node(peer), 2_000_000),
+        (me, Recipient::Room(room), 3_000_000),
+        (peer, Recipient::Node(me), 500), // before the window
+    ] {
+        let env = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"sealed".to_vec(), make_proof())
+            .timestamp(ts)
+            .build();
+        store.store_message(&env).await.unwrap();
+    }
+
+    let rows = store.energy_rows_since(1_000, 10).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].timestamp_ms, 1_000_000, "oldest first");
+    assert_eq!((rows[0].sender.as_str(), rows[0].recipient_type.as_str()), (peer.to_hex().as_str(), "node"));
+    assert_eq!(rows[0].recipient_id, me.to_hex());
+    assert_eq!(rows[2].recipient_type, "room");
+    assert_eq!(rows[2].recipient_id, room.to_string());
+    assert!(rows.iter().all(|r| r.amount_msat == make_proof().amount_msat));
+
+    assert_eq!(store.energy_rows_since(1_000, 2).await.unwrap().len(), 2, "limit applies");
+}
