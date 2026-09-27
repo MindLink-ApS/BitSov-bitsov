@@ -22,6 +22,10 @@ use crate::state::AppState;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendMessageRequest {
+    #[serde(default)]
+    pub max_total_msat: Option<u64>,
+    #[serde(default)]
+    pub max_recipient_msat: Option<std::collections::HashMap<String, u64>>,
     /// Recipient node ID (hex) or room ID (UUID).
     pub recipient: String,
     /// Whether the recipient is a room (true) or node (false).
@@ -54,6 +58,21 @@ pub(super) async fn send_message(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>, ApiError> {
+    super::caps::check(req.amount_msat, req.max_total_msat)?;
+    if let Some(per) = &req.max_recipient_msat {
+        if req.is_room {
+            let room = konsensus_core::RoomId::parse(&req.recipient)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            let members = state.storage.get_room_members(&room).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+            for member in members.iter().filter(|m| *m != state.identity.node_id()) {
+                let cap = per.get(&member.to_hex()).ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
+                super::caps::check(req.amount_msat, Some(*cap))?;
+            }
+        } else {
+            let cap = per.get(&req.recipient).ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
+            super::caps::check(req.amount_msat, Some(*cap))?;
+        }
+    }
     // Parse recipient
     let recipient = if req.is_room {
         let room_id = konsensus_core::RoomId::parse(&req.recipient)

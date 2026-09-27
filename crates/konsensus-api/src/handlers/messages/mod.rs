@@ -20,6 +20,7 @@ use axum::Router;
 
 use crate::state::AppState;
 
+pub(crate) mod caps;
 mod compose;
 mod query;
 mod receive;

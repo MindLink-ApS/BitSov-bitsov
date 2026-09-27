@@ -22,6 +22,7 @@ use crate::state::AppState;
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
+    pub api_capabilities: Vec<&'static str>,
     /// Always "ok" if the node is running.
     pub status: &'static str,
     /// Node ID (Ed25519 public key, hex).
@@ -178,6 +179,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
     };
 
     Json(HealthResponse {
+        api_capabilities: vec![super::messages::caps::CAPABILITY, super::messages::caps::ROOM_CAPABILITY],
         status: "ok",
         node_id: state.identity.node_id().to_hex(),
         connected_peers: connected.len(),

@@ -9,6 +9,16 @@ use thiserror::Error;
 /// API errors — converted to appropriate HTTP status codes.
 #[derive(Debug, Error)]
 pub enum ApiError {
+    #[error("price cap exceeded: {0}")]
+    PriceCapExceeded(String),
+
+    /// A dispatch may have happened, but no terminal payment evidence is available.
+    #[error("payment outcome unknown: {0}")]
+    PaymentUnresolved(String),
+    /// Payment settled, but an envelope proof could not be constructed.
+    #[error("payment settled but proof unavailable: {reason}")]
+    PaymentProofUnavailable { amount_msat: u64, reason: String },
+
     /// Resource not found.
     #[error("not found: {0}")]
     NotFound(String),
@@ -69,7 +79,13 @@ struct ErrorBody {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::PriceCapExceeded(message) = &self {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": message, "code": "price_cap_exceeded"
+            }))).into_response();
+        }
         let (status, message) = match &self {
+            ApiError::PriceCapExceeded(_) => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
@@ -78,6 +94,8 @@ impl IntoResponse for ApiError {
             ApiError::PaymentRequired(msg) => (StatusCode::PAYMENT_REQUIRED, msg.clone()),
             ApiError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             ApiError::Transport(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
+            ApiError::PaymentUnresolved(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
+            ApiError::PaymentProofUnavailable { reason, .. } => (StatusCode::BAD_GATEWAY, reason.clone()),
             ApiError::Lightning(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             ApiError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
