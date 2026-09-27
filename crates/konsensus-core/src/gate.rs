@@ -6,9 +6,9 @@
 //! 1. **Envelope integrity** — ID matches, ciphertext non-empty, preimage valid
 //! 2. **Whitelist check** — sender must be in the federation whitelist (Principle 3)
 //! 3. **Signature verification** — Ed25519 signature is valid for sender's key
-//! 4. **Nonce replay protection** — nonce has never been seen before
-//! 5. **Price verification** — payment amount meets the required price for this kind
-//! 6. **Payment settlement** — optionally verify settlement via Lightning backend
+//! 4. **Price verification** — payment amount meets the required price for this kind
+//! 5. **Payment settlement** — optionally verify settlement via Lightning backend
+//! 6. **Durable replay protection** — nonce and settled payment hash are single-use
 //!
 //! **FAIL-CLOSED**: Any verification failure results in rejection. If the
 //! Lightning backend is unreachable, the message is rejected. If the pricing
@@ -336,19 +336,6 @@ impl PaymentGate {
 
         debug!("signature verification: OK");
 
-        // ── Step 4: Nonce replay protection ────────────────────────────
-        let is_new = nonce_store
-            .check_and_store(&envelope.nonce, &envelope.sender)
-            .await
-            .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
-
-        if !is_new {
-            warn!("rejected: nonce replay detected");
-            return Err(GateRejection::ReplayDetected);
-        }
-
-        debug!("nonce replay check: OK");
-
         // ── Step 5: Price verification ─────────────────────────────────
         // Determine the required price for this message kind and verify
         // the payment amount meets or exceeds it. Plasticity pricing
@@ -377,6 +364,23 @@ impl PaymentGate {
                 ));
             }
         }
+
+        // Persist replay guards only after price and settlement validation.
+        // A signed, self-generated hash/preimage is not payment: recording it
+        // earlier gives unpaid strangers a durable storage primitive.
+        // Nonce and payment-hash insert-or-reject checks still run before any
+        // accepted envelope is delivered, including concurrent replays.
+        let is_new = nonce_store
+            .check_and_store(&envelope.nonce, &envelope.sender)
+            .await
+            .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
+
+        if !is_new {
+            warn!("rejected: nonce replay detected");
+            return Err(GateRejection::ReplayDetected);
+        }
+
+        debug!("nonce replay check: OK");
 
         // ── Step 7: Payment proof replay protection ────────────────────
         // This must run for every accepted paid envelope, even when
@@ -1103,6 +1107,31 @@ mod tests {
                 assert_eq!(paid_msat, 5);
             }
             other => panic!("expected InsufficientPayment, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unpaid_envelopes_do_not_persist_nonce_or_payment_receipt() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let gate = PaymentGate::with_config(GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        });
+        let pricing = MockPricing { price_msat: 10 };
+        // Both an underpriced proof and a sufficiently priced but unsettled
+        // proof must fail before any durable replay record is created.
+        for amount in [5, 100] {
+            let envelope = make_signed_envelope(&identity, amount);
+            let nonces = MockNonceStore::new();
+            let result = gate.verify(
+                &envelope, &nonces, &pricing, None,
+                Some(&MockLightning::pending()), 0.0, None,
+            ).await;
+            assert!(matches!(result,
+                Err(GateRejection::InsufficientPayment { .. }) |
+                Err(GateRejection::PaymentNotSettled(_))));
+            assert!(nonces.seen.lock().unwrap().is_empty(), "unpaid nonce persisted for amount {amount}");
+            assert!(nonces.seen_payment_hashes.lock().unwrap().is_empty());
         }
     }
 

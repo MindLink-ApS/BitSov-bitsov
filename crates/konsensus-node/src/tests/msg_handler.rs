@@ -864,3 +864,93 @@ async fn corrective_price_table_is_per_peer_cooldown_throttled() {
         t0 + CORRECTIVE_PRICE_TABLE_COOLDOWN + std::time::Duration::from_secs(1)
     ));
 }
+
+
+#[tokio::test]
+async fn unpaid_stranger_envelope_is_silent_and_creates_no_records() {
+    rejected_envelope_disclosures(false).await;
+}
+
+#[tokio::test]
+async fn whitelisted_price_open_peer_keeps_detailed_rejection() {
+    rejected_envelope_disclosures(true).await;
+}
+
+async fn rejected_envelope_disclosures(privileged: bool) {
+    use konsensus_core::traits::pricing::{PricingEngine, PricingError};
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::time::Duration;
+
+    struct ObservedPricing(Arc<tokio::sync::Notify>);
+    #[async_trait::async_trait]
+    impl PricingEngine for ObservedPricing {
+        fn as_any(&self) -> &dyn std::any::Any { self }
+        async fn get_price_msat(&self, _: u16) -> Result<u64, PricingError> {
+            self.0.notify_one();
+            Ok(2000)
+        }
+        async fn get_category_price_msat(&self, _: konsensus_core::kind::KindCategory) -> Result<u64, PricingError> {
+            Ok(2000)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let make_open_transport = |id: Arc<NodeIdentity>| Arc::new(NoiseTransport::new(id, TransportConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        admission_mode: ReachabilityMode::PriceOpen,
+        whitelist: if privileged { vec![*alice.node_id(), *bob.node_id()] } else { vec![] },
+        ..Default::default()
+    }));
+    let source = make_open_transport(alice.clone());
+    let target = make_open_transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let sessions = Arc::new(SessionManager::new(bob.clone()));
+    let registry = Arc::new(tokio::sync::RwLock::new(PeerRegistry::new()));
+    let audit_path = dir.path().join("audit.jsonl");
+    let checked_price = Arc::new(tokio::sync::Notify::new());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, _ws_rx) = broadcast::channel(8);
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(), transport_ack: target.clone(), storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true, ..Default::default()
+        })),
+        pricing: Arc::new(ObservedPricing(checked_price.clone())),
+        lightning: Arc::new(konsensus_lightning::MockLightningProvider::new()),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: registry.clone(), session_manager: sessions.clone(),
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage.clone())),
+        content_server: None, routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(), plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx, audit_log: Arc::new(AuditLog::open(&audit_path).unwrap()),
+        admission_mode: ReachabilityMode::PriceOpen, relay_engine: None, shutdown_rx,
+    }));
+    source.connect(bob.node_id(), &target.listen_addr().unwrap().to_string()).await.unwrap();
+    assert!(matches!(source.recv_control().await.unwrap(), ControlEvent::PeerConnected { privileged: actual, .. } if actual == privileged));
+    // A correctly signed envelope with a self-generated hash/preimage is not
+    // evidence of payment. File kind also probes the arbitrary-kind price leak.
+    let envelope = make_envelope(&alice, *bob.node_id(), 200, b"unpaid".to_vec());
+    source.send_frame(bob.node_id(), &Frame::Message(Box::new(envelope.clone()))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), checked_price.notified()).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_millis(200), source.recv_control()).await;
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
+    if privileged {
+        assert!(matches!(response, Ok(Some(ControlEvent::MessageRejected { .. }))), "privileged peer lost detailed rejection: {response:?}");
+        assert!(!std::fs::read(&audit_path).unwrap().is_empty());
+    } else {
+        assert!(response.is_err(), "unpaid stranger received a response: {response:?}");
+        assert_eq!(std::fs::read(&audit_path).unwrap(), b"");
+    }
+    assert!(!storage.has_nonce(&envelope.nonce).await.unwrap());
+    assert!(storage.get_message(&envelope.id).await.unwrap().is_none());
+    assert!(storage.list_peers().await.unwrap().is_empty());
+    assert!(storage.list_sessions().await.unwrap().is_empty());
+    assert!(registry.read().await.is_empty());
+    assert!(!sessions.has_session(alice.node_id()).await);
+}

@@ -89,6 +89,11 @@ impl IntoResponse for ApiError {
                 "error": message, "code": "price_cap_exceeded"
             }))).into_response();
         }
+        if let ApiError::PaymentProofUnavailable { amount_msat, reason } = &self {
+            return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": reason, "code": "payment_settled_send_incomplete", "amount_msat": amount_msat
+            }))).into_response();
+        }
         if let ApiError::BudgetExceeded(refusal) = &self {
             let remaining = match refusal {
                 crate::spend_budget::BudgetRefusal::Total { remaining_msat }

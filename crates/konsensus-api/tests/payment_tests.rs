@@ -251,6 +251,7 @@ async fn pricing_own_chain_aware_reports_mode() {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -787,6 +788,7 @@ async fn invoice_request_oneshot_channel_works() {
 
     // Simulate receiving an InvoiceResponse (what main.rs would do).
     let data = konsensus_api::state::InvoiceResponseData {
+                recipient: *state.identity.node_id(),
         bolt11: "lnbc250n1pj...test".into(),
         payment_hash: "ab".repeat(32),
     };
@@ -832,6 +834,7 @@ async fn invoice_request_timeout_cleanup() {
         .expect("should be in map");
 
     let data = konsensus_api::state::InvoiceResponseData {
+                recipient: *state.identity.node_id(),
         bolt11: "lnbc...".into(),
         payment_hash: "ab".repeat(32),
     };
@@ -1256,6 +1259,7 @@ async fn health_lightning_unavailable_shows_null_balance() {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -1753,6 +1757,7 @@ async fn chain_status_with_failing_provider() {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -1863,6 +1868,7 @@ async fn chain_status_partial_failure() {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2184,6 +2190,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         transport: Arc::clone(&base.transport),
         session_manager: Arc::clone(&base.session_manager),
         jwt_secret: base.jwt_secret.clone(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: base.cors_enabled,

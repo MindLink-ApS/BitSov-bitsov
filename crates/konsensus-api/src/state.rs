@@ -102,6 +102,9 @@ pub struct AppState {
     /// `/api/v1/auth/token` must not verify a replayable static string. The
     /// challenge endpoint writes short-lived challenge strings here and token
     /// issuance consumes them exactly once.
+    /// Volatile, quota-limited uploads; never persisted before send.
+    pub file_staging: Arc<std::sync::Mutex<crate::file_staging::FileStaging>>,
+
     pub auth_challenges: Arc<Mutex<HashMap<String, Instant>>>,
 
     /// Client pairing and owner-approved elevation (#76).
@@ -249,6 +252,8 @@ pub struct AppState {
 /// Data returned via the invoice request oneshot channel.
 #[derive(Debug)]
 pub struct InvoiceResponseData {
+    /// Authenticated Noise peer that supplied this invoice.
+    pub recipient: NodeId,
     /// BOLT11 payment request string from the recipient's wallet.
     pub bolt11: String,
     /// Payment hash (hex) from the recipient's invoice.

@@ -21,6 +21,7 @@ use axum::Router;
 use crate::state::AppState;
 
 pub(crate) mod caps;
+mod admission_journal;
 mod compose;
 mod query;
 mod receive;

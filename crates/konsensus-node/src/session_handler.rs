@@ -73,16 +73,6 @@ const SESSION_SELF_HEAL_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// PeerExchange requests/responses to trigger expensive registry writes.
 const PEER_EXCHANGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Per-peer cooldown on the UNPRIVILEGED admission-invoice path. An unpaid
-/// stranger may request the one reserved admission invoice
-/// (`handle_invoice_requested_gated` calls `lightning.create_invoice` for it
-/// pre-payment so the stranger can *pay* to join), but must not loop that
-/// request to spam wallet RPCs. This is a DoS guard on the only unpaid *service*
-/// reachable under PriceOpen — unpaid control-plane *state* is already
-/// `privileged`-gated (privileged is granted only by a settled, recipient-bound,
-/// single-use payment). Privileged (already-paid) peers are unthrottled.
-const ADMISSION_INVOICE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// Maximum number of peer exchange entries we process from a single response.
 const MAX_PEER_EXCHANGE_ENTRIES: usize = 50;
 
@@ -134,8 +124,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         std::collections::HashMap::new();
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
-    let mut last_admission_invoice: std::collections::HashMap<NodeId, tokio::time::Instant> =
-        std::collections::HashMap::new();
+    let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
     let mut cooldown_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -261,31 +250,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged } => {
-                        // DoS guard (P2): an unprivileged peer may request the one
-                        // reserved admission invoice (the handler calls
-                        // lightning.create_invoice for it pre-payment), but must not
-                        // loop it to spam wallet RPCs. Rate-limit ONLY the unpaid
-                        // admission path; privileged (paid) peers and non-admission
-                        // purposes (dropped by the handler) are unaffected.
-                        if !privileged
-                            && purpose == ADMISSION_INVOICE_PURPOSE
-                            && admission_invoice_rate_limited(
-                                &mut last_admission_invoice,
-                                &peer_id,
-                                tokio::time::Instant::now(),
-                            )
-                        {
-                            warn!(
-                                peer = %peer_id,
-                                cooldown_secs = ADMISSION_INVOICE_COOLDOWN.as_secs(),
-                                "DROP admission-invoice request from unprivileged peer within cooldown (P2 DoS guard: unpaid create_invoice rate-limit)"
-                            );
-                            continue;
-                        }
+                    ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
                         handle_invoice_requested_gated(
                             &peer_id, &request_id, amount_msat, &purpose, privileged,
-                            &pricing, &lightning, &transport,
+                            &pricing, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
                         ).await;
                     }
 
@@ -415,8 +383,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 last_negotiation.retain(|_, ts| now.duration_since(*ts) < SESSION_NEGOTIATION_COOLDOWN * 6);
                 let before_pex = last_peer_exchange.len();
                 last_peer_exchange.retain(|_, ts| now.duration_since(*ts) < PEER_EXCHANGE_COOLDOWN * 6);
-                let before_adm = last_admission_invoice.len();
-                last_admission_invoice.retain(|_, ts| now.duration_since(*ts) < ADMISSION_INVOICE_COOLDOWN * 6);
                 // Defense-in-depth: if maps still exceed cap after TTL eviction,
                 // force-clear to prevent unbounded growth from a burst of unique peer IDs.
                 if last_negotiation.len() > MAX_COOLDOWN_ENTRIES {
@@ -427,18 +393,12 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     warn!(len = last_peer_exchange.len(), cap = MAX_COOLDOWN_ENTRIES, "peer exchange cooldown map exceeded cap, clearing");
                     last_peer_exchange.clear();
                 }
-                if last_admission_invoice.len() > MAX_COOLDOWN_ENTRIES {
-                    warn!(len = last_admission_invoice.len(), cap = MAX_COOLDOWN_ENTRIES, "admission invoice cooldown map exceeded cap, clearing");
-                    last_admission_invoice.clear();
-                }
                 let removed_neg = before_neg - last_negotiation.len();
                 let removed_pex = before_pex - last_peer_exchange.len();
-                let removed_adm = before_adm - last_admission_invoice.len();
-                if removed_neg > 0 || removed_pex > 0 || removed_adm > 0 {
+                if removed_neg > 0 || removed_pex > 0 {
                     debug!(
                         removed_negotiation = removed_neg,
                         removed_peer_exchange = removed_pex,
-                        removed_admission_invoice = removed_adm,
                         "pruned stale cooldown map entries"
                     );
                 }
@@ -957,18 +917,11 @@ async fn handle_price_response_received(
     peer_prices.update_kind_price(peer_id, kind, price_msat, block_height).await;
 }
 
-/// M1b: privilege-gated invoice dispatch (the bootstrap carve-out).
-///
-/// * `privileged == true` (whitelisted peer, or one already promoted by a settled
-///   payment): unchanged behaviour — the caller's `amount_msat`/`purpose` are
-///   honoured exactly as pre-M1b (Whitelist mode is byte-identical).
-/// * `privileged == false` (PriceOpen stranger): the ONLY issuable invoice is the
-///   single reserved admission invoice (`purpose == ADMISSION_INVOICE_PURPOSE`).
-///   Its amount is re-derived from OUR [`PricingEngine`] at
-///   [`ADMISSION_INVOICE_KIND`]; the caller's `amount_msat` is IGNORED so a
-///   stranger cannot mint a zero-value or attacker-chosen invoice on our wallet.
-///   Any other unprivileged invoice request is dropped (P2: no free Lightning
-///   invoice before payment).
+/// Privilege-gated invoice dispatch. Strangers get only the bounded,
+/// recipient-bound first-contact chat quote. Its amount comes from our pricing
+/// engine; the requester cannot choose a price or a different kind. All other
+/// invoice services require an already privileged connection. Legacy admission
+/// requests fail closed even on privileged connections.
 #[allow(clippy::too_many_arguments)]
 async fn handle_invoice_requested_gated(
     peer_id: &NodeId,
@@ -979,57 +932,102 @@ async fn handle_invoice_requested_gated(
     pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
+    recipient: &NodeId,
+    source_ip: std::net::IpAddr,
+    quotes: &mut crate::admission_quotes::AdmissionQuotes,
 ) {
-    if privileged {
-        handle_invoice_requested(peer_id, request_id, amount_msat, purpose, lightning, transport).await;
-        return;
-    }
-
-    if purpose != ADMISSION_INVOICE_PURPOSE {
-        warn!(peer = %peer_id, %request_id, %purpose, "DROP invoice request from unprivileged peer (P2: only the reserved admission invoice is issuable pre-payment)");
-        return;
-    }
-
-    let admission_msat = match pricing.get_price_msat(ADMISSION_INVOICE_KIND).await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(peer = %peer_id, %request_id, error = %e, "cannot price admission invoice — refusing");
-            let error_frame = Frame::InvoiceError {
-                request_id: request_id.to_string(),
-                reason: "admission pricing unavailable".to_string(),
-            };
-            if let Err(se) = transport.send_frame(peer_id, &error_frame).await {
-                warn!(peer = %peer_id, %request_id, error = %se, "failed to send admission InvoiceError");
-            }
+    use konsensus_core::admission_quote;
+    if purpose == admission_quote::PURPOSE {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if !quotes.permit(
+            source_ip,
+            recipient,
+            peer_id,
+            request_id,
+            tokio::time::Instant::now(),
+            unix,
+        ) {
             return;
         }
-    };
-    info!(peer = %peer_id, %request_id, admission_msat, "issuing reserved admission invoice to unprivileged peer (caller amount ignored)");
-    // The reserved purpose is preserved verbatim so the description stays
-    // attributable; the AMOUNT is the engine-derived admission floor.
-    handle_invoice_requested(peer_id, request_id, admission_msat, purpose, lightning, transport).await;
-}
-
-/// DoS guard for the unpaid admission-invoice path. Returns `true` (drop the
-/// request) if `peer` requested within [`ADMISSION_INVOICE_COOLDOWN`] of its
-/// last allowed request; otherwise records `now` and returns `false` (allow).
-///
-/// Pure + unit-testable (the `now` is injected) so the rate-limit is provable
-/// without driving the full handler loop. Per-peer, keyed by the authenticated
-/// federation NodeId — a stranger throttles only itself, and a 1-msat keysend
-/// flood cannot loop free `create_invoice` wallet RPCs.
-fn admission_invoice_rate_limited(
-    last_admission_invoice: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
-    peer: &NodeId,
-    now: tokio::time::Instant,
-) -> bool {
-    if let Some(last) = last_admission_invoice.get(peer) {
-        if now.duration_since(*last) < ADMISSION_INVOICE_COOLDOWN {
-            return true;
+        // Exactly the first-contact chat price. Neither kind nor amount is
+        // requester-selected. No peer/storage/session dependency is present.
+        let Ok(Ok(price)) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pricing.get_price_msat(ADMISSION_INVOICE_KIND),
+        )
+        .await
+        else {
+            return;
+        };
+        let message = if price == 0 { 0 } else { price.max(1000) };
+        let description = format!("konsensus:{request_id}:message={message}");
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let Some(attempt_end) = admission_quote::expires_at(request_id, recipient, peer_id, unix)
+        else {
+            return;
+        };
+        // Reserve the entire backend RPC budget, since its invoice timestamp
+        // may be assigned near the end of that call, not at our request time.
+        let expiry = attempt_end.saturating_sub(unix).saturating_sub(5) as u32;
+        if expiry == 0 {
+            return;
         }
+        let invoice = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lightning.create_invoice(price.max(1000), &description, expiry),
+        )
+        .await;
+        if let Ok(Ok(invoice)) = invoice {
+            let Ok(signed) = invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>() else {
+                return;
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            if signed.duration_since_epoch() > now
+                || signed.is_expired()
+                || signed
+                    .expires_at()
+                    .is_none_or(|end| end.as_secs() > attempt_end)
+                || signed.amount_milli_satoshis() != Some(price.max(1000))
+                || signed.description().to_string() != description
+                || signed.payment_hash().to_string() != invoice.payment_hash
+            {
+                return;
+            }
+            // The only response is the recipient's price (inside BOLT11) and
+            // invoice. An unpaid quote never promotes the connection.
+            let response = Frame::InvoiceResponse {
+                request_id: request_id.into(),
+                bolt11: invoice.bolt11,
+                payment_hash: invoice.payment_hash,
+            };
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                transport.send_frame(peer_id, &response),
+            )
+            .await;
+        }
+        return;
     }
-    last_admission_invoice.insert(*peer, now);
-    false
+    // Old arbitrary-kind/legacy admission requests fail closed, even if paid.
+    if privileged && !purpose.starts_with(ADMISSION_INVOICE_PURPOSE) {
+        handle_invoice_requested(
+            peer_id,
+            request_id,
+            amount_msat,
+            purpose,
+            lightning,
+            transport,
+        )
+        .await;
+    }
 }
 
 async fn handle_invoice_requested(
@@ -1105,7 +1103,7 @@ async fn handle_invoice_response(
     info!(peer = %peer_id, %request_id, "received invoice response from peer");
     let mut requests = invoice_requests.lock().await;
     if let Some(sender) = requests.remove(request_id) {
-        let data = InvoiceResponseData { bolt11, payment_hash };
+        let data = InvoiceResponseData { recipient: *peer_id, bolt11, payment_hash };
         if sender.send(data).is_err() {
             warn!(%request_id, "invoice response receiver already dropped (timeout?)");
         }

@@ -589,13 +589,13 @@ async fn per_call_and_per_recipient_budgets_hold() {
 async fn file_send_is_debited_and_refused_when_spent() {
     let fx = fixture().await;
     let token = fx.grant(None, GrantTerms::new(1_500)).await;
-    let owner = auth_header(&fx.state);
+    // F1: the paired client stages its own file under its live grant.
     let (status, file) = fx
         .call(
             "POST",
             "/api/v1/files",
             Some(json!({"filename": "hi.txt", "mime_type": "text/plain", "data_b64": "aGk="})),
-            Some(owner.trim_start_matches("Bearer ")),
+            Some(&token),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{file}");
@@ -606,6 +606,17 @@ async fn file_send_is_debited_and_refused_when_spent() {
         .await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(fx.used(), 1_000);
+    // F1 consumes a staged file on send; stage a second one for the refusal.
+    let (status, again) = fx
+        .call(
+            "POST",
+            "/api/v1/files",
+            Some(json!({"filename": "hi.txt", "mime_type": "text/plain", "data_b64": "aGk="})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    let path = format!("/api/v1/files/{}/send", again["file_id"].as_str().unwrap());
     let (status, err) = fx.call("POST", &path, Some(body), Some(&token)).await;
     assert_budget_exceeded(status, &err, "total");
     assert_eq!(fx.wallet.money(), 1);

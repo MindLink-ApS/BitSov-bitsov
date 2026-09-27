@@ -252,6 +252,13 @@ pub enum LightningConfig {
         #[serde(default = "default_mock_balance")]
         initial_balance_msat: u64,
     },
+    /// Local-only, no-funds integration backend with a shared settlement ledger.
+    #[serde(rename = "shared_mock")]
+    SharedMock {
+        ledger_path: PathBuf,
+        #[serde(default = "default_mock_balance")]
+        initial_balance_msat: u64,
+    },
     /// LND direct REST API — no LNbits middleman, direct LND communication.
     /// For Full tier nodes running their own LND daemon.
     #[serde(rename = "lnd")]
@@ -316,7 +323,7 @@ pub enum LightningConfig {
 impl LightningConfig {
     /// Check if this is the mock provider.
     pub fn is_mock(&self) -> bool {
-        matches!(self, Self::Mock { .. })
+        matches!(self, Self::Mock { .. } | Self::SharedMock { .. })
     }
 
     /// Human-readable backend name for diagnostics.
@@ -325,6 +332,7 @@ impl LightningConfig {
             Self::Lnbits { .. } => "lnbits",
             Self::Lnd { .. } => "lnd",
             Self::Mock { .. } => "mock",
+            Self::SharedMock { .. } => "shared_mock",
             Self::Ldk { .. } => "ldk",
         }
     }
