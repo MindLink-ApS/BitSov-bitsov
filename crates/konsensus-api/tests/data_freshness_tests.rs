@@ -548,6 +548,94 @@ async fn pricing_chain_aware_with_chain_down_and_expired_cache_is_as_of_that_cac
     assert_eq!(r.stale.as_deref(), Some("1"));
 }
 
+/// Synced chain whose fee estimates fail for the listed targets only.
+struct FeeFailsFor(Vec<u32>);
+
+#[async_trait]
+impl ChainProvider for FeeFailsFor {
+    fn trust_level(&self) -> TrustLevel {
+        TrustLevel::ServerTrust
+    }
+    async fn get_block_height(&self) -> Result<u64, ChainError> {
+        Ok(850_000)
+    }
+    async fn get_block_header(&self, h: u64) -> Result<BlockHeader, ChainError> {
+        StubChain.get_block_header(h).await
+    }
+    async fn estimate_fee(&self, t: u32) -> Result<FeeEstimate, ChainError> {
+        if self.0.contains(&t) {
+            return Err(ChainError::NotAvailable("fee estimate down".into()));
+        }
+        Ok(FeeEstimate {
+            sat_per_vbyte: 9.0,
+            target_blocks: t,
+        })
+    }
+    async fn is_tx_confirmed(&self, _txid: &str, _c: u32) -> Result<bool, ChainError> {
+        Ok(false)
+    }
+    async fn is_synced(&self) -> bool {
+        true
+    }
+}
+
+/// Seed targets 6 and 144 (already `cache_ttl` old), then serve `/pricing`
+/// from a synced chain whose fee estimate fails for `failing`.
+async fn pricing_with_seed_and_fee_failures(failing: Vec<u32>) -> Reply {
+    let chain: Arc<dyn ChainProvider> = Arc::new(FeeFailsFor(failing));
+    let config = ChainAwarePricingConfig {
+        cache_ttl: Duration::from_secs(120),
+        category_fee_targets: [("files_media".to_string(), 144u32)].into_iter().collect(),
+        ..ChainAwarePricingConfig::default()
+    };
+    let engine = ChainAwarePricingEngine::new(config, Arc::clone(&chain));
+    engine
+        .seed_ema(FeeRateSnapshot {
+            targets: [(6u32, 5.0f64), (144u32, 2.0f64)].into_iter().collect(),
+            block_height: 850_000,
+            timestamp_secs: unix_now(),
+        })
+        .await;
+    get(
+        with_chain_aware_pricing(engine, chain),
+        "/api/v1/pricing",
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pricing_synced_chain_with_all_fee_estimates_failing_keeps_the_old_as_of() {
+    let r = pricing_with_seed_and_fee_failures(vec![6, 144]).await;
+
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json["ema_fee_rate"], 5.0, "seeded value reused");
+    let as_of = parse_as_of(r.as_of.as_deref().unwrap());
+    assert!(
+        as_of <= Utc::now() - chrono::Duration::seconds(119),
+        "reused values must not get a fresh as-of: {as_of}"
+    );
+    assert_eq!(r.stale.as_deref(), Some("1"));
+}
+
+#[tokio::test]
+async fn pricing_synced_chain_with_one_fee_estimate_failing_keeps_the_old_as_of() {
+    let r = pricing_with_seed_and_fee_failures(vec![144]).await;
+
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json["fee_rates_by_target"]["6"]["raw_sat_per_vbyte"], 9.0);
+    assert_eq!(
+        r.json["fee_rates_by_target"]["144"]["ema_sat_per_vbyte"], 2.0,
+        "seeded value reused for the failing target"
+    );
+    let as_of = parse_as_of(r.as_of.as_deref().unwrap());
+    assert!(
+        as_of <= Utc::now() - chrono::Duration::seconds(119),
+        "as-of is the oldest served value, not the fresh one: {as_of}"
+    );
+    assert_eq!(r.stale.as_deref(), Some("1"));
+}
+
 #[tokio::test]
 async fn pricing_unauthenticated_is_still_401_without_headers() {
     let r = get(test_state(), "/api/v1/pricing", false).await;

@@ -37,7 +37,7 @@ not turn stale data into an error; that is the client's decision.
 | `GET /api/v1/payments/channels` | Wallet sync time (below) | wallet sync ≥ 10 min old, or never synced |
 | `GET /api/v1/health` | Time the chain backend was queried for `block_height` (a live query per request). **Absent** when `block_height` is null (query failed) | never |
 | `GET /api/v1/messages` | Time the local message store was read for this response. The store is the node's own and authoritative, so this is "read just now", present for uniformity | never |
-| `GET /api/v1/pricing` | Chain-aware engine: time of the chain fetch (fee rates + height) the cached state was built from. Static engine: time of the read (static prices do not depend on chain data) | chain-aware only: the cached chain state is at or past the engine's `cache_ttl` (default 60 s), or there is none |
+| `GET /api/v1/pricing` | Chain-aware engine: the oldest real chain fetch among the values being served (each per-target fee rate and the block height); a value reused after a failed fetch keeps its old time. Static engine: time of the read (static prices do not depend on chain data) | chain-aware only: that oldest fetch is at or past the engine's `cache_ttl` (default 60 s), or there is no cached state |
 
 ### Wallet sync time (`/payments/balance`, `/payments/channels`)
 
@@ -65,6 +65,14 @@ body still show the last cached values, if any. `Stale: 1` marks that
 situation. `As-Of` is then the time of that last cache fetch, or the read time
 if there has never been one. Cached state seeded from a snapshot at startup is
 reported as already `cache_ttl` old, never as "now".
+
+The same holds for a partial failure on a synced backend. When `estimate_fee`
+fails for one or all confirmation targets, the engine keeps charging the last
+value for those targets, and a cache refresh does not make that value any
+newer. Each fee rate and the block height carry the time the chain really
+answered for them. `As-Of` is the oldest of those times, and `Stale: 1` is set
+once it is at or past `cache_ttl`. A block height that could not be fetched
+(prices then use base halving sensitivity) counts as already `cache_ttl` old.
 
 ## Error responses
 
