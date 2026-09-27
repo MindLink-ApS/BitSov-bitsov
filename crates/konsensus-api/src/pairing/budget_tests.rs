@@ -1,7 +1,6 @@
 use super::*;
 
-#[test]
-fn expiry_during_reservation_persistence_refuses_the_debit() {
+fn expiry_during_reservation_persistence(live_reads: usize) {
     let dir = tempfile::tempdir().unwrap();
     let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
     let now = chrono::Utc::now().timestamp();
@@ -41,7 +40,7 @@ fn expiry_during_reservation_persistence_refuses_the_debit() {
         }],
         || {
             reads += 1;
-            if reads == 1 {
+            if reads <= live_reads {
                 expiry - 1
             } else {
                 expiry
@@ -54,4 +53,19 @@ fn expiry_during_reservation_persistence_refuses_the_debit() {
         Err(BudgetRefusal::NoGrant),
         "expired reservation must not authorize dispatch"
     );
+}
+
+#[test]
+fn expiry_during_reservation_persistence_refuses_the_debit() {
+    expiry_during_reservation_persistence(1);
+}
+
+#[test]
+fn expiry_during_temp_file_sync_is_pruned_before_publish() {
+    expiry_during_reservation_persistence(2);
+}
+
+#[test]
+fn expiry_during_rename_sync_is_pruned_before_return() {
+    expiry_during_reservation_persistence(3);
 }

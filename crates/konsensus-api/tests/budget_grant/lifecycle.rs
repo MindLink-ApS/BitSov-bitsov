@@ -232,8 +232,8 @@ async fn expiry_cleanup_retries_after_transient_write_failure() {
     assert_eq!(after_failure["grants"].as_array().unwrap().len(), 1);
     assert_eq!(
         service.snapshot().grants.len(),
-        1,
-        "failed durable deletion must remain retryable"
+        0,
+        "failed durable deletion must never expose an expired grant"
     );
 
     // The filesystem has recovered, so the next sweep should remove the

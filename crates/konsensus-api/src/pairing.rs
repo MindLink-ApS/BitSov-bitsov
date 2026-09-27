@@ -457,6 +457,7 @@ pub struct PairingService {
     dir: PathBuf,
     file_path: PathBuf,
     inner: Mutex<Inner>,
+    grant_changes: tokio::sync::Notify,
     /// Whether the owner control socket exists in this deployment. When false,
     /// every grant-writing and approval-consuming call refuses outright
     /// (`OwnerChannelUnavailable`) — there is no debug flag, config switch or
@@ -553,6 +554,15 @@ impl PairingService {
             }
         };
 
+        // A crash before rename can leave grant data in the temporary file,
+        // even when the authoritative file has no grants to prune. Never
+        // promote that uncommitted transaction or retain its expired records.
+        match std::fs::remove_file(file_path.with_extension("json.tmp")) {
+            Ok(()) => fsync_dir(&dir)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
         let service = Self {
             dir,
             file_path,
@@ -564,6 +574,7 @@ impl PairingService {
                 identity_fingerprint,
                 owner_confirmations: HashMap::new(),
             }),
+            grant_changes: tokio::sync::Notify::new(),
             owner_control_enabled,
             print_short_code: true,
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
@@ -649,12 +660,20 @@ impl PairingService {
 
     /// Snapshot of the durable state, read through the same lock writers use.
     pub fn snapshot(&self) -> PairingFile {
-        self.lock().file.clone()
+        let inner = self.lock();
+        let mut snapshot = inner.file.clone();
+        // Cleanup failures stay retryable internally, never visible as grants.
+        snapshot
+            .grants
+            .retain(|g| g.is_live(chrono::Utc::now().timestamp()));
+        snapshot
     }
 
     /// Re-read the durable state from disk. Used by tests and by the CLI to
     /// assert effects rather than trust an in-memory copy.
     pub fn reload_from_disk(&self) -> Result<PairingFile, PairingError> {
+        let mut inner = self.lock_without_cleanup();
+        self.prune_expired_locked(&mut inner.file)?;
         if !self.file_path.exists() {
             return Ok(PairingFile {
                 version: PAIRING_FILE_VERSION,
@@ -662,7 +681,12 @@ impl PairingService {
             });
         }
         let raw = std::fs::read(&self.file_path)?;
-        serde_json::from_slice(&raw).map_err(|e| PairingError::Io(e.to_string()))
+        let mut file: PairingFile =
+            serde_json::from_slice(&raw).map_err(|e| PairingError::Io(e.to_string()))?;
+        // Reading/parsing can itself cross the deadline. Do not return stale
+        // records or merely hide them while retaining the raw file.
+        self.prune_expired_locked(&mut file)?;
+        Ok(file)
     }
 
     /// The identity this service currently binds pairings to.
@@ -671,6 +695,16 @@ impl PairingService {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        let mut inner = self.lock_without_cleanup();
+        // Reads are also cleanup boundaries, including auth and owner status.
+        // Keep failed deletions in the private state so the next access retries.
+        if let Err(e) = self.prune_expired_locked(&mut inner.file) {
+            tracing::warn!(error = %e, "expired spend grant cleanup failed");
+        }
+        inner
+    }
+
+    fn lock_without_cleanup(&self) -> std::sync::MutexGuard<'_, Inner> {
         // A poisoned lock means a previous holder panicked mid-update. The
         // durable file is only ever replaced atomically, so the on-disk state
         // is still consistent; recovering the guard is preferable to
@@ -944,8 +978,8 @@ impl PairingService {
         let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
             .map_err(|e| PairingError::Malformed(format!("invalid signature: {e}")))?;
 
-        let now_unix = chrono::Utc::now().timestamp();
         let mut inner = self.lock();
+        let now_unix = chrono::Utc::now().timestamp();
 
         let (owner, expires) = inner
             .token_challenges
@@ -1033,8 +1067,8 @@ impl PairingService {
         fingerprint: &str,
         scopes: &[Scope],
     ) -> Result<(), PairingError> {
-        let now_unix = chrono::Utc::now().timestamp();
         let inner = self.lock();
+        let now_unix = chrono::Utc::now().timestamp();
         if inner.identity_fingerprint != fingerprint {
             return Err(PairingError::PairingInvalid(
                 "token was issued against a different identity".into(),
@@ -1331,8 +1365,8 @@ impl PairingService {
     /// is never reported as granted either: the status must not claim an
     /// authority the token will not carry.
     pub fn elevation_status(&self, op_id: &str) -> ElevationStatus {
-        let now = chrono::Utc::now().timestamp();
         let inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
         if !self.owner_control_enabled {
             return match inner
                 .file
@@ -1393,8 +1427,8 @@ impl PairingService {
             return Err(PairingError::OwnerChannelUnavailable);
         }
         let terms = terms.normalized().map_err(PairingError::Malformed)?;
-        let now = chrono::Utc::now().timestamp();
         let mut inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
         let op = inner
             .file
             .pending_elevations
@@ -1431,6 +1465,9 @@ impl PairingService {
         inner.file.grants.push(grant.clone());
         self.persist(&mut inner.file)?;
         inner.owner_confirmations.remove(op_id);
+        if !grant.is_live(chrono::Utc::now().timestamp()) {
+            return Err(PairingError::Expired);
+        }
         Ok(grant)
     }
 
@@ -1644,7 +1681,7 @@ impl PairingService {
             .as_mut()
             .ok_or(BudgetRefusal::NoGrant)?
             .reserve(&charges)?;
-        if let Err(e) = self.persist_at(&mut inner.file, clock()) {
+        if let Err(e) = self.persist_with_clock(&mut inner.file, &mut clock) {
             if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
                 g.budget = before;
             }
@@ -1746,22 +1783,46 @@ impl PairingService {
     }
 
     /// Drop grants that can no longer authorise anything and persist, if any
-    /// were found. Called at open and by the node's periodic sweep, so an
-    /// expired grant does not wait for the next unrelated write to leave disk.
+    /// were found. Reads, startup and the deadline scheduler use the same
+    /// cleanup transaction; errors keep deletion queued for a later retry.
     pub fn prune_expired_grants(&self) -> Result<usize, PairingError> {
-        let now = chrono::Utc::now().timestamp();
-        let mut inner = self.lock();
-        let stale = inner.file.grants.iter().filter(|g| !g.is_live(now)).count();
-        if stale > 0 {
-            self.persist(&mut inner.file)?;
-        }
-        Ok(stale)
+        let mut inner = self.lock_without_cleanup();
+        self.prune_expired_locked(&mut inner.file)
     }
 
-    /// The live grants, as the owner sees them.
-    pub fn grant_views(&self) -> Vec<GrantView> {
+    fn prune_expired_locked(&self, file: &mut PairingFile) -> Result<usize, PairingError> {
         let now = chrono::Utc::now().timestamp();
-        self.lock()
+        let before = file.grants.len();
+        if file.grants.iter().any(|g| !g.is_live(now)) {
+            self.persist(file)?;
+        }
+        Ok(before - file.grants.len())
+    }
+
+    /// Delay to the next absolute expiry. Recheck wall-clock changes at least
+    /// once a second; a new grant also wakes the scheduler immediately.
+    pub(crate) fn grant_cleanup_delay(&self) -> Duration {
+        let inner = self.lock_without_cleanup();
+        let now = chrono::Utc::now().timestamp_millis();
+        let millis = inner
+            .file
+            .grants
+            .iter()
+            .map(|g| g.expires_at.saturating_mul(1000).saturating_sub(now).max(0) as u64)
+            .min()
+            .unwrap_or(1000);
+        Duration::from_millis(millis.min(1000))
+    }
+
+    pub(crate) async fn grant_changed(&self) {
+        self.grant_changes.notified().await;
+    }
+
+    /// The live grants, as the owner sees them. The read purges disk first.
+    pub fn grant_views(&self) -> Vec<GrantView> {
+        let inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
+        inner
             .file
             .grants
             .iter()
@@ -1790,26 +1851,50 @@ impl PairingService {
     /// directory, fsync it, then rename over the target. A reader never sees a
     /// half-written store, and a crash mid-write leaves the previous state.
     ///
-    /// Every write also drops grants that can no longer authorise anything, so
-    /// no grant is persisted beyond its expiry.
+    /// Recheck expiry after file synchronization and publication, so a slow
+    /// write cannot return success with an expired grant in the durable file.
     fn persist(&self, file: &mut PairingFile) -> Result<(), PairingError> {
-        self.persist_at(file, chrono::Utc::now().timestamp())
+        self.persist_with_clock(file, || chrono::Utc::now().timestamp())
     }
 
-    fn persist_at(&self, file: &mut PairingFile, now: i64) -> Result<(), PairingError> {
-        // Do not forget a failed deletion: subsequent sweeps must still see
-        // the expired grant until its removal is durable.
+    fn persist_with_clock(
+        &self,
+        file: &mut PairingFile,
+        mut clock: impl FnMut() -> i64,
+    ) -> Result<(), PairingError> {
+        // Do not forget a failed deletion: subsequent accesses and the expiry
+        // scheduler must still see it until removal is durable.
         let mut candidate = file.clone();
-        candidate.grants.retain(|g| g.is_live(now));
         candidate.version = PAIRING_FILE_VERSION;
-        let bytes = serde_json::to_vec_pretty(&candidate)
-            .map_err(|e| PairingError::Io(format!("serializing pairing store: {e}")))?;
         let tmp = self.file_path.with_extension("json.tmp");
-        write_protected(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.file_path)?;
-        fsync_dir(&self.dir)?;
-        *file = candidate;
-        Ok(())
+        loop {
+            let now = clock();
+            candidate.grants.retain(|g| g.is_live(now));
+            let bytes = serde_json::to_vec_pretty(&candidate)
+                .map_err(|e| PairingError::Io(format!("serializing pairing store: {e}")))?;
+            if let Err(e) = write_protected(&tmp, &bytes) {
+                // A partial temporary file must not become a second retained
+                // grant store. The authoritative file is still unchanged.
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            let now = clock();
+            if candidate.grants.iter().any(|g| !g.is_live(now)) {
+                continue;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &self.file_path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            fsync_dir(&self.dir)?;
+            let now = clock();
+            if candidate.grants.iter().any(|g| !g.is_live(now)) {
+                continue;
+            }
+            *file = candidate;
+            self.grant_changes.notify_one();
+            return Ok(());
+        }
     }
 }
 

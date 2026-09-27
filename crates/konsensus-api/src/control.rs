@@ -614,26 +614,33 @@ impl ControlServer {
     }
 }
 
-/// Periodically drop expired spend grants from disk until shutdown (G1).
-///
-/// Expired grants are already inert — binding verification ignores them — and
-/// every write prunes them. This sweep bounds how long an expired grant can
-/// sit on disk when nothing else writes.
+/// Delete expired grants at their next deadline, on startup and after changes.
+/// Reads independently purge expired records. Failed deletions remain queued
+/// and are retried, including when no API request arrives.
 pub async fn sweep_expired_grants(
     service: Arc<PairingService>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    let every = std::time::Duration::from_secs(60);
     loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        let delay = match service.prune_expired_grants() {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::info!(removed = n, "expired spend grants removed");
+                }
+                service.grant_cleanup_delay()
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "expired spend grant cleanup failed");
+                std::time::Duration::from_secs(1)
+            }
+        };
         tokio::select! {
             _ = shutdown_rx.changed() => break,
-            _ = tokio::time::sleep(every) => {
-                match service.prune_expired_grants() {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(removed = n, "expired spend grants removed"),
-                    Err(e) => tracing::warn!(error = %e, "expired spend grant sweep failed"),
-                }
-            }
+            _ = service.grant_changed() => {},
+            _ = tokio::time::sleep(delay) => {},
         }
     }
 }

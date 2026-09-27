@@ -1127,3 +1127,6 @@ fn concurrent_reservations_on_the_ledger_are_atomic() {
 
 #[path = "budget_grant/lifecycle.rs"]
 mod lifecycle;
+
+#[path = "budget_grant/expiry.rs"]
+mod expiry;

@@ -1080,12 +1080,6 @@ async fn cmd_start(
                 "owner-run mode: elevation can be granted at this socket"
             );
             tokio::spawn(server.serve(node.shutdown_rx()));
-            // G1: an expired spend grant leaves disk within a minute, not at
-            // the next unrelated write.
-            tokio::spawn(konsensus_api::control::sweep_expired_grants(
-                Arc::clone(&pairing_service),
-                node.shutdown_rx(),
-            ));
         }
         #[cfg(not(unix))]
         {
@@ -1100,6 +1094,13 @@ async fn cmd_start(
              may request elevation and cannot obtain it in this deployment."
         );
     }
+
+    // G1: inherited owner grants need expiry cleanup in sidecar mode too.
+    // Reads/startup also purge; failed deletions remain retryable.
+    tokio::spawn(konsensus_api::control::sweep_expired_grants(
+        Arc::clone(&pairing_service),
+        node.shutdown_rx(),
+    ));
 
     // API server — fatal error if it fails (node is unusable without API)
     let api_addr = config.api.listen_addr;

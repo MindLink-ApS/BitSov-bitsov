@@ -92,10 +92,26 @@ test fails if a `MeteredSpend` handler can pay before it debits.
 
 The budget, what has been used and the absolute expiry live in
 `pairing/clients.json` (0600, write-then-rename). A restart keeps the tally and
-cannot extend the window. Expired grants are removed on every store write, at
-open, and by a 60-second sweep. A hand-edited expiry more than 24 h after
-`granted_at` is treated as expired. Granting a new window for a client replaces
-its previous grant and tally.
+cannot extend the window. Store reads and writes purge expired grants under
+one mutex. Opening the store must finish the purge before startup can proceed.
+Startup also deletes abandoned `clients.json.tmp` files from interrupted writes;
+these uncommitted records are never promoted over the authoritative file.
+The running node schedules cleanup for the earliest absolute expiry, waking
+when grants change; it also rechecks the wall clock at least once a second.
+A hand-edited expiry more than 24 h after `granted_at` is treated as expired.
+Granting a new window for a client replaces its previous grant and tally.
+
+Expiry is rechecked after synchronizing a temporary file and after publishing
+it. If a write crosses a deadline, the expired grant is removed and the write
+is repeated before success is returned. Reads never expose expired records;
+a fallible disk read reports a cleanup failure instead of returning stale data.
+Failed deletions stay queued and the scheduler retries them once a second.
+
+Deletion requires a running process and writable storage. While the process is
+stopped, suspended, or unable to write, physical bytes can remain on disk;
+they confer no authority. Restart purges them before opening the service, and
+read/scheduler retries finish cleanup once storage recovers. Deadline scheduling
+is not a guarantee of physical erasure while the process cannot execute.
 
 An expiry that occurs while the debit is persisted refuses dispatch rather than
 returning a reservation that was pruned. Failed expiry deletions remain in
