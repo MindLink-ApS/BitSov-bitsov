@@ -1742,12 +1742,20 @@ impl PairingService {
     /// budget and, if set, the recipient's budget. Nothing is reserved here;
     /// the send debits the budget grant once, before any invoice or payment.
     /// Replaces any earlier unused first-contact grant of this client.
+    ///
+    /// `contact_budget_msat` is the per-contact budget the owner chose with this
+    /// confirmation. If the grant has no cap for this recipient yet, it becomes
+    /// one (bounded by the grant's total). That only narrows the grant, and it
+    /// is what makes the contact *budgeted*: a later re-admission after a
+    /// reconnect may then be paid from the budget without asking again (see
+    /// [`Self::reserve_readmission`]).
     pub fn grant_first_contact(
         &self,
         client_id: &str,
         epoch: u64,
         recipient: &str,
         max_total_msat: u64,
+        contact_budget_msat: Option<u64>,
     ) -> Result<crate::spend_budget::FirstContactGrant, BudgetRefusal> {
         use crate::spend_budget::{
             canonical_recipient, FirstContactGrant, FIRST_CONTACT_GRANT_TTL_SECS,
@@ -1810,6 +1818,27 @@ impl PairingService {
             expires_at: (now + FIRST_CONTACT_GRANT_TTL_SECS).min(grant.expires_at),
         };
         let budget_op_id = grant.op_id.clone();
+        if let Some(contact_budget) = contact_budget_msat.filter(|b| *b > 0) {
+            let idx = inner
+                .file
+                .grants
+                .iter()
+                .position(|g| g.op_id == budget_op_id)
+                .ok_or(BudgetRefusal::NoGrant)?;
+            let before = inner.file.grants[idx].budget.clone();
+            if let Some(budget) = inner.file.grants[idx].budget.as_mut() {
+                if !budget.per_recipient_msat.contains_key(&issued.recipient) {
+                    let cap = contact_budget.min(budget.budget_msat);
+                    budget.per_recipient_msat.insert(issued.recipient.clone(), cap);
+                }
+            }
+            if inner.file.grants[idx].budget != before {
+                if let Err(e) = self.persist(&mut inner.file) {
+                    inner.file.grants[idx].budget = before;
+                    return Err(BudgetRefusal::Ledger(e.to_string()));
+                }
+            }
+        }
         inner.first_contact.insert(
             client_id.to_string(),
             PendingFirstContact {
@@ -1819,6 +1848,106 @@ impl PairingService {
             },
         );
         Ok(issued)
+    }
+
+    /// Whether the grant behind `parent` may pay admission to `recipient`
+    /// again (after a reconnect), and for at most how much. `Ok(None)` for a
+    /// contact the grant already budgets (a per-contact cap bounds it);
+    /// `Ok(Some(max))` when the owner's one-time confirmation for exactly this
+    /// contact is pending. A stranger to this grant, with neither, is refused.
+    fn readmission_basis(
+        inner: &Inner,
+        parent: &Reservation,
+        recipient: &str,
+        now: i64,
+    ) -> Result<(u64, Option<u64>), BudgetRefusal> {
+        let grant = inner
+            .file
+            .grants
+            .iter()
+            .find(|g| {
+                g.op_id == parent.op_id
+                    && g.client_id == parent.client_id
+                    && g.identity_fingerprint == inner.identity_fingerprint
+                    && g.is_live(now)
+            })
+            .ok_or(BudgetRefusal::NoGrant)?;
+        let confirmed = inner.first_contact.get(&parent.client_id).filter(|p| {
+            p.grant.recipient == recipient
+                && p.epoch == grant.epoch
+                && p.budget_op_id == grant.op_id
+                && p.grant.expires_at > now
+        });
+        if let Some(pending) = confirmed {
+            return Ok((grant.epoch, Some(pending.grant.max_total_msat)));
+        }
+        let budgeted = grant
+            .budget
+            .as_ref()
+            .is_some_and(|b| b.per_recipient_msat.contains_key(recipient));
+        if !budgeted {
+            return Err(BudgetRefusal::FirstContact(
+                "this contact has no budget in your grant, so paying admission to them again \
+                 needs your one-time confirmation (POST /api/v1/pair/first-contact-grant) — \
+                 nothing was requested or paid"
+                    .into(),
+            ));
+        }
+        Ok((grant.epoch, None))
+    }
+
+    /// Check, without reserving, that the grant behind `parent` may pay a
+    /// re-admission to `recipient` (see [`Self::reserve_readmission`]). Lets a
+    /// send refuse before it asks the recipient for a quote.
+    pub fn readmission_allowed(&self, parent: &Reservation, recipient: &str) -> Result<(), BudgetRefusal> {
+        let recipient = crate::spend_budget::canonical_recipient(recipient)
+            .ok_or(BudgetRefusal::NoGrant)?;
+        let inner = self.lock();
+        Self::readmission_basis(&inner, parent, &recipient, chrono::Utc::now().timestamp()).map(|_| ())
+    }
+
+    /// Reserve a re-admission to `recipient` of exactly `amount_msat` (the
+    /// recipient's signed quote) against the grant behind `parent`.
+    ///
+    /// CoS decision (2026-09-27): a budget may pay re-admission for a contact
+    /// the owner already budgeted — the grant caps that contact, and the
+    /// reservation must fit the cap, the per-call maximum and what is left.
+    /// Never for a stranger to the grant without the owner's one-time
+    /// confirmation for exactly that contact, which this consumes (single use)
+    /// and which bounds the amount. There is no durable admission object: the
+    /// admission is re-proven by a new settled payment, debited like any other.
+    pub fn reserve_readmission(
+        &self,
+        parent: &Reservation,
+        recipient: &str,
+        amount_msat: u64,
+    ) -> Result<Reservation, BudgetRefusal> {
+        let recipient = crate::spend_budget::canonical_recipient(recipient)
+            .ok_or(BudgetRefusal::NoGrant)?;
+        let epoch = {
+            let mut inner = self.lock();
+            let (epoch, confirmed) =
+                Self::readmission_basis(&inner, parent, &recipient, chrono::Utc::now().timestamp())?;
+            if let Some(max_msat) = confirmed {
+                // Single use, whatever happens next (fail closed).
+                inner.first_contact.remove(&parent.client_id);
+                if amount_msat > max_msat {
+                    return Err(BudgetRefusal::FirstContact(format!(
+                        "the recipient asks {amount_msat} msat to admit you again, more than the \
+                         {max_msat} msat you confirmed — nothing was paid"
+                    )));
+                }
+            }
+            epoch
+        };
+        self.reserve_spend(
+            &parent.client_id,
+            epoch,
+            vec![Charge {
+                recipient,
+                amount_msat,
+            }],
+        )
     }
 
     /// Consume this client's first-contact grant for `recipient`, returning

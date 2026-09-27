@@ -68,6 +68,12 @@ pub struct ComposeResponse {
     pub delivered: bool,
     /// Settled principal plus reserved principal for unknown room members.
     pub amount_msat: u64,
+    /// Admission paid again during this send because a reconnect left the
+    /// recipient's connection unpaid, msat. Not part of `amount_msat`: a paired
+    /// caller's confirmed cap covers the message, and the contact's budget in
+    /// the grant bounds this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readmission_msat: Option<u64>,
 }
 
 /// One room recipient's payment result. Unknown is never retry permission.
@@ -262,23 +268,30 @@ pub async fn create_payment_proof(
     price_msat: u64,
     peer_id: &NodeId,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
-    create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), Readmission::Allowed).await
+    create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), &Readmission::for_cap(false)).await
 }
 
-/// Whether a paid send may pay admission again when the recipient refuses it
-/// with `admission_required` (a reconnect starts every connection unpaid).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Readmission {
-    /// No confirmed cap: pay admission again, then the message.
-    Allowed,
-    /// The caller confirmed a price cap that covers the message only, so the
-    /// admission is refused like an uncapped first contact (nothing is paid).
-    Capped,
+/// How a paid send may pay admission again when the recipient refuses it with
+/// `admission_required` (a reconnect starts every connection unpaid), and what
+/// it paid for that.
+#[derive(Debug, Default)]
+pub(crate) struct Readmission {
+    /// The caller confirmed a price cap, which covers the message only. The
+    /// owner's own key then has nothing else bounding the admission and is
+    /// refused; a paired caller's re-admission is bounded by its grant.
+    capped: bool,
+    /// Admission paid again during this send, msat.
+    paid_msat: std::sync::atomic::AtomicU64,
 }
 
 impl Readmission {
     pub(crate) fn for_cap(capped: bool) -> Self {
-        if capped { Self::Capped } else { Self::Allowed }
+        Self { capped, ..Self::default() }
+    }
+
+    /// Admission paid again during this send, if any, msat.
+    pub(crate) fn paid_msat(&self) -> Option<u64> {
+        Some(self.paid_msat.load(std::sync::atomic::Ordering::Relaxed)).filter(|m| *m > 0)
     }
 }
 
@@ -288,7 +301,7 @@ pub(crate) async fn create_metered_payment_proof(
     price_msat: u64,
     peer_id: &NodeId,
     debit: &Debit,
-    readmission: Readmission,
+    readmission: &Readmission,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     // Zero-price messages get a valid cryptographic proof with zero amount.
     // The payment gate accepts these for kind-0 (control) messages.
@@ -394,31 +407,28 @@ fn invoice_refused(peer_id: &NodeId, reason: &str) -> ApiError {
 /// admission invoice and its signed proof), then ask for the message invoice
 /// again. The E2EE session is untouched; both sides still hold it.
 ///
-/// Neither a budget grant nor a confirmed price cap pays this on its own: the
-/// admission is priced by the recipient at invoice time, so those callers get
-/// an explicit refusal, as for a first contact.
+/// A confirmed price cap covers the message only, so a capped caller gets an
+/// explicit refusal. A budget grant pays it (CoS decision, 2026-09-27) only for
+/// a contact the owner already budgeted, or with the owner's one-time
+/// confirmation for exactly this contact: the recipient's signed quote is
+/// reserved against the grant (per-contact cap, per-call maximum, what is left)
+/// before anything is paid, and the payment is an N2 membrane event.
 async fn readmit_then_pay(
     state: &AppState,
     amount_msat: u64,
     peer_id: &NodeId,
     debit: &Debit,
-    readmission: Readmission,
+    readmission: &Readmission,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
-    if readmission == Readmission::Capped {
+    if readmission.capped && !debit.is_metered() {
         return Err(ApiError::PriceCapExceeded(format!(
             "{peer_id} requires admission again on a new connection, and the confirmed cap \
              covers the message only; no invoice was paid. Send without a cap to pay admission."
         )));
     }
-    if debit.is_metered() {
-        return Err(ApiError::BudgetExceeded(
-            crate::spend_budget::BudgetRefusal::Unpriced(format!(
-                "{peer_id} requires admission again on a new connection, and admission is \
-                 priced by the recipient at invoice time; a budget grant only pays amounts \
-                 known before dispatch — nothing was paid"
-            )),
-        ));
-    }
+    // Refuse a stranger to the grant before asking the recipient for a quote.
+    let peer_key = peer_id.to_hex();
+    debit.readmission_allowed(&peer_key)?;
     tracing::info!(
         peer = %peer_id,
         "recipient requires admission on this connection — paying admission again"
@@ -428,12 +438,30 @@ async fn readmit_then_pay(
     loop {
         attempts += 1;
         let mut charge = FirstContactCharge::default();
-        match first_contact_admission(
-            state, peer_id, konsensus_core::kind::KIND_CHAT, None, &mut charge, &Debit::unmetered(),
-            Some(connected_since),
+        let mut readmit = Readmit { connected_since, parent: debit, reserved: None };
+        let result = first_contact_admission(
+            state, peer_id, konsensus_core::kind::KIND_CHAT, None, &mut charge, debit,
+            Some(&mut readmit),
         )
-        .await
-        {
+        .await;
+        // Resolve the re-admission's own reservation once: what settled, or
+        // nothing if it was never dispatched. An unknown outcome stays reserved.
+        if let Some(reserved) = &readmit.reserved {
+            if result.is_ok() || charge.reserved_msat <= charge.settled_msat {
+                reserved.settled(&peer_key, charge.settled_msat);
+            }
+        }
+        if charge.settled_msat > 0 {
+            readmission
+                .paid_msat
+                .fetch_add(charge.settled_msat, std::sync::atomic::Ordering::Relaxed);
+            state.audit_log.membrane().readmission_paid(
+                peer_id,
+                charge.settled_msat,
+                debit.contact_budget(&peer_key),
+            );
+        }
+        match result {
             Ok(()) => break,
             // Nothing was requested on our wallet or paid: wait out the
             // target's quote window once.
@@ -793,6 +821,18 @@ enum PriorAdmission {
     /// envelope (e.g. the Lightning backend returned a malformed preimage).
     /// Still do NOT pay again — money moved once; never twice for one admission.
     SettledNoProof,
+}
+
+/// A re-admission after the recipient refused us with `admission_required`.
+struct Readmit<'a> {
+    /// When our current connection to the recipient was established (`None`
+    /// if the transport does not say, which never pays twice).
+    connected_since: Option<Instant>,
+    /// The message's debit: a paired caller's re-admission is reserved
+    /// against the same grant.
+    parent: &'a Debit,
+    /// The re-admission's own reservation, once the signed quote is known.
+    reserved: Option<Debit>,
 }
 
 /// A settled admission, seen from a re-admission on the current connection.
@@ -1552,6 +1592,13 @@ fn cache_quote(peer: NodeId, request_id: String, response: InvoiceResponseData, 
     cache.insert(peer, (request_id, response, expires_at_unix));
 }
 
+/// A cached, still-valid quote for `peer`, left in the cache.
+fn peek_cached_quote(peer: &NodeId) -> Option<(String, InvoiceResponseData)> {
+    let cache = quote_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let (request_id, response, until) = cache.get(peer)?;
+    (*until > now_unix()).then(|| (request_id.clone(), response.clone()))
+}
+
 fn take_cached_quote(peer: &NodeId) -> Option<(String, InvoiceResponseData)> {
     let mut cache = quote_cache().lock().unwrap_or_else(|e| e.into_inner());
     let (request_id, response, until) = cache.remove(peer)?;
@@ -1597,18 +1644,32 @@ pub(super) async fn first_contact_quote(
     }
     let peer_id = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
-    if state.session_manager.has_session(&peer_id).await {
-        return Err(ApiError::Conflict(
-            "already in contact with this node: messages use its message price, not a first contact".into(),
-        ));
-    }
     if !state.transport.is_connected(&peer_id).await {
         return Err(ApiError::BadRequest(
             "Recipient is offline. A first-contact quote needs a connected node.".into(),
         ));
     }
-    if !matches!(lock_admission_ledger().prior_admission(&peer_id, Instant::now()), PriorAdmission::None)
-        || super::admission_journal::load(&state, &peer_id)?.is_some()
+    // A contact we already hold a session with needs this quote only to be
+    // admitted again after a reconnect (its connection starts unpaid). Its
+    // earlier admission is spent, so the paid/in-flight check below does not
+    // apply; the send re-checks the ledger before paying anything.
+    let contact = state.session_manager.has_session(&peer_id).await;
+    if let Some((request_id, response)) = contact.then(|| peek_cached_quote(&peer_id)).flatten() {
+        // Reuse the quote the refused send already fetched: the target
+        // rate-limits quotes, and the send pays exactly this invoice.
+        let quote = validate_admission_invoice(&state, &peer_id, &request_id, &response).await?;
+        let total_msat = super::caps::first_contact_total(quote.admission_msat, quote.message_price, None)?;
+        return Ok(Json(FirstContactQuoteResponse {
+            recipient: peer_id.to_hex(),
+            admission_msat: quote.admission_msat,
+            message_msat: quote.message_price,
+            total_msat,
+            expires_at: quote.expires_at_unix,
+        }));
+    }
+    if !contact
+        && (!matches!(lock_admission_ledger().prior_admission(&peer_id, Instant::now()), PriorAdmission::None)
+            || super::admission_journal::load(&state, &peer_id)?.is_some())
     {
         return Err(ApiError::Conflict(
             "a first contact to this node is already paid or in flight; sending resumes it without paying again".into(),
@@ -1631,12 +1692,11 @@ pub(super) async fn first_contact_quote(
 
 /// Pay admission to `peer_id` and deliver the signed proof envelope.
 ///
-/// `readmit` is set when the peer refused us with `admission_required`, and
-/// carries when our current connection to it was established (`None` if the
-/// transport does not say). A settled admission from before that connection
-/// paid for an older one, which the peer has already consumed, so it is
-/// forgotten (ledger and journal) and admission is paid again. One settled on
-/// this connection means the peer has not promoted us yet: nothing more is paid.
+/// `readmit` is set when the peer refused us with `admission_required` (see
+/// [`Readmit`]). A settled admission from before the current connection paid
+/// for an older one, which the peer has already consumed, so it is forgotten
+/// (ledger and journal) and admission is paid again. One settled on this
+/// connection means the peer has not promoted us yet: nothing more is paid.
 async fn first_contact_admission(
     state: &AppState,
     peer_id: &NodeId,
@@ -1644,7 +1704,7 @@ async fn first_contact_admission(
     cap: Option<u64>,
     charge: &mut FirstContactCharge,
     debit: &Debit,
-    readmit: Option<Option<Instant>>,
+    readmit: Option<&mut Readmit<'_>>,
 ) -> Result<(), ApiError> {
     // 0a. Serialize per peer FIRST: without this, two concurrent composes to
     //     the same no-session peer both read `PriorAdmission::None` below and
@@ -1706,7 +1766,7 @@ async fn first_contact_admission(
             }
         }
     }
-    if let Some(connected_since) = readmit {
+    if let Some(connected_since) = readmit.as_ref().map(|r| r.connected_since) {
         let prior = lock_admission_ledger().settled_on_connection(peer_id, connected_since, Instant::now());
         match prior {
             SettledOnConnection::Covered => {
@@ -1929,6 +1989,13 @@ async fn first_contact_admission(
         cap.or(Some(ADMISSION_MAX_MSAT)),
     )?;
     charge.message_price = Some(message_price);
+    // A re-admission reserves exactly the quoted admission against the grant
+    // (a paired caller) before anything is dispatched; the owner's key is not
+    // metered. A refusal here leaves nothing requested on our wallet or paid.
+    let debit: &Debit = match readmit {
+        Some(r) => r.reserved.insert(r.parent.readmission(&peer_id.to_hex(), admission_msat)?),
+        None => debit,
+    };
 
     // 4. Record a DispatchUnknown guard from the BOLT11 payment hash BEFORE
     //    dispatching, then pay. This closes the ambiguous-dispatch window (review
@@ -2034,7 +2101,7 @@ async fn first_contact_admission(
 /// bundle them once instead of threading each through the per-member helper.
 struct RoomFanoutCtx<'a> {
     debit: &'a Debit,
-    readmission: Readmission,
+    readmission: &'a Readmission,
     sender: NodeId,
     room_recipient: Recipient,
     plaintext: &'a str,
@@ -2305,11 +2372,12 @@ pub(super) async fn compose_message(
         // the canonical `message_id` and the single WS broadcast stay
         // deterministic regardless of completion order.
         use futures::stream::StreamExt;
+        let readmission = Readmission::for_cap(
+            req.max_total_msat.is_some() || req.max_recipient_msat.is_some(),
+        );
         let ctx = RoomFanoutCtx {
             debit: &debit,
-            readmission: Readmission::for_cap(
-                req.max_total_msat.is_some() || req.max_recipient_msat.is_some(),
-            ),
+            readmission: &readmission,
             sender,
             room_recipient,
             plaintext: req.plaintext.as_str(),
@@ -2391,6 +2459,7 @@ pub(super) async fn compose_message(
             message_id,
             delivered: any_delivered,
             amount_msat: total_amount_msat,
+            readmission_msat: readmission.paid_msat(),
         }))
     } else {
         // ── Peer compose: existing single-recipient path ──
@@ -2547,8 +2616,9 @@ pub(super) async fn compose_message(
 
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
         let message_debit = first_contact_debit.as_ref().unwrap_or(&debit);
+        let readmission = Readmission::for_cap(cap.is_some());
         let paid = create_metered_payment_proof(
-            &state, price_msat, &peer_id, message_debit, Readmission::for_cap(cap.is_some()),
+            &state, price_msat, &peer_id, message_debit, &readmission,
         ).await;
         if first_contact_debit.is_none() {
             debit.resolve_proof(&peer_key, &paid);
@@ -2645,6 +2715,7 @@ pub(super) async fn compose_message(
             message_id: envelope.id.to_hex(),
             delivered,
             amount_msat: admission.settled_msat + amount_msat,
+            readmission_msat: readmission.paid_msat(),
         }))
         }.await;
         let result = result.map_err(|error| admission.error(error));

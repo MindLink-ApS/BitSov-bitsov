@@ -151,10 +151,17 @@ backs that one answer with a short, single-use **first-contact grant**.
    `message_msat`, `total_msat` and `expires_at` (≤ 60 s). It pays and
    reserves nothing, and needs a live budget grant. The node keeps the quote for
    its validity, so the send pays exactly this invoice and the stranger is never
-   asked for a second one. It returns 409 if a session exists or a first contact
-   is already paid or in flight.
+   asked for a second one. For a stranger, it returns 409 if a first contact is
+   already paid or in flight. For a contact that needs admission again after a
+   reconnect (see below), it returns that contact's quote, reusing one the node
+   already holds.
 2. **Confirm.** `POST /api/v1/pair/first-contact-grant {"recipient",
-   "max_total_msat"}` is sent after the owner confirms in the app.
+   "max_total_msat", "contact_budget_msat"?}` is sent after the owner confirms in
+   the app.
+   - `contact_budget_msat` is the contact's budget the owner chose on the door
+     card. If the budget grant has no cap for this contact yet, it becomes one
+     (bounded by the grant's total). This only narrows the grant, and it makes
+     the contact *budgeted* (next section).
    - It needs a live budget grant, and the amount must fit it: per-call maximum,
      what is left of the budget, and the recipient's budget if set. It is at most
      100,000 msat (F1's first-contact ceiling).
@@ -181,6 +188,38 @@ backs that one answer with a short, single-use **first-contact grant**.
 Without a matching grant, a paired first contact is refused with
 `budget_exceeded` / `first_contact` before anything is asked of the stranger. The
 owner's own key is not metered; the #80 caps still bound it.
+
+## Re-admission after a reconnect: paid from the budget for a budgeted contact
+
+Admission is per connection; there is no durable admission object. After a
+reconnect the recipient holds the connection as unpaid and refuses a message
+invoice with `admission_required` (an N2 event on its side). The sender then
+pays admission again on the normal paid path: the recipient's signed quote
+(F1), the admission payment and its signed proof, then the message.
+
+CoS decision (2026-09-27): **a budget may pay that re-admission for a contact
+the owner already budgeted**, without a prompt.
+
+- *Budgeted* means the live budget grant has a cap for this contact: set when
+  the owner granted the budget, or by `contact_budget_msat` on the contact's
+  first-contact confirmation.
+- The node first asks for the recipient's signed quote, then reserves exactly
+  the quoted admission against the grant before paying anything. The
+  reservation must fit the contact's cap, the per-call maximum and what is left.
+  The message is its own reservation, as for every send.
+- The payment is resolved once (settled, released if never dispatched, kept
+  reserved if unknown). The sender records it as an outbound N2 membrane event
+  `readmission`, with the amount and the contact's cap.
+- A contact the grant does not budget is refused with `budget_exceeded` /
+  `first_contact` before the recipient is asked for anything. The owner's
+  one-time confirmation for exactly that contact (steps 1 and 2 above) then
+  covers the re-admission, is consumed by it, and bounds its amount. Never for a
+  stranger without it.
+- A confirmed `max_total_msat` covers the message only. The compose reply's
+  `amount_msat` stays the message principal, and the re-admission is reported
+  apart as `readmission_msat`. For a paired client the grant bounds it; the
+  owner's own key has no such bound, so a capped owner send is refused
+  (`price_cap_exceeded`) and an uncapped one pays.
 
 That the owner, not a program, confirmed is the app's contract, the same as for
 every budgeted send. The node enforces the rest: an explicit call per contact,

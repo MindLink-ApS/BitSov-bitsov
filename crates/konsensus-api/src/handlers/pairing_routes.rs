@@ -488,6 +488,11 @@ pub struct FirstContactGrantBody {
     /// The most the first contact may cost: admission plus the first message,
     /// msat, as the owner confirmed it (the target's quote).
     pub max_total_msat: u64,
+    /// The contact's budget the owner chose with this confirmation, msat. If
+    /// the grant has no cap for this contact yet, it becomes one, so a later
+    /// re-admission after a reconnect is paid from the budget without asking.
+    #[serde(default)]
+    pub contact_budget_msat: Option<u64>,
 }
 
 /// `POST /api/v1/pair/first-contact-grant` — the owner's one-time OK, given in
@@ -501,13 +506,19 @@ async fn first_contact_grant(
     State(state): State<Arc<AppState>>,
     Json(body): Json<FirstContactGrantBody>,
 ) -> Result<Json<crate::spend_budget::FirstContactGrant>, ApiError> {
-    let grant = auth.grant_first_contact(&state, &body.recipient, body.max_total_msat)?;
+    let grant = auth.grant_first_contact(
+        &state,
+        &body.recipient,
+        body.max_total_msat,
+        body.contact_budget_msat,
+    )?;
     state.audit_log.record(
         events::SPEND_FIRST_CONTACT_GRANTED,
         &auth.node_id,
         Some(serde_json::json!({
             "recipient": grant.recipient,
             "max_total_msat": grant.max_total_msat,
+            "contact_budget_msat": body.contact_budget_msat,
             "expires_at": grant.expires_at,
         })),
     );

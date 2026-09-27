@@ -109,6 +109,9 @@ pub enum Code {
     /// way in (a reconnect starts unprivileged). Refused out loud: the peer is
     /// told to pay admission again, and nothing was issued on our wallet.
     AdmissionRequired,
+    /// Outbound: we paid a contact's admission again after a reconnect (the
+    /// connection starts unpaid), from its signed quote. Admitted: money left.
+    Readmission,
 }
 
 /// One admission decision. Serialized as the `/ws` event and the ring entry.
@@ -215,6 +218,8 @@ pub struct Totals {
     pub refused: u64,
     /// Outbound refusals of our own sends.
     pub outbound_refused: u64,
+    /// Outbound re-admissions we paid after a reconnect.
+    pub readmissions: u64,
 }
 
 #[derive(Default)]
@@ -321,6 +326,31 @@ impl Membrane {
         })
     }
 
+    /// We paid `peer`'s admission again after a reconnect: `paid_msat` from
+    /// its signed quote, `budget_msat` the contact's budget cap it was debited
+    /// under (a paired client), or `None` for the owner's own key.
+    pub fn readmission_paid(
+        &self,
+        peer: &NodeId,
+        paid_msat: u64,
+        budget_msat: Option<u64>,
+    ) -> Arc<MembraneEvent> {
+        self.push(|seq| MembraneEvent {
+            event_type: "membrane",
+            seq,
+            at: now_ms(),
+            direction: Direction::Outbound,
+            verdict: Verdict::Admitted,
+            code: Code::Readmission,
+            kind: Some(konsensus_core::kind::KIND_CHAT),
+            counterparty: Some(peer.to_hex()),
+            first_contact: false,
+            required_msat: None,
+            paid_msat: Some(paid_msat),
+            cap_msat: budget_msat,
+        })
+    }
+
     /// One of our own sends was refused before any payment left.
     /// Returns `None` (and records nothing) for errors that are not membrane refusals.
     pub fn outbound_refused(
@@ -362,7 +392,8 @@ impl Membrane {
                 }
             }
             (Direction::Inbound, Verdict::Refused) => ring.totals.refused += 1,
-            (Direction::Outbound, _) => ring.totals.outbound_refused += 1,
+            (Direction::Outbound, Verdict::Refused) => ring.totals.outbound_refused += 1,
+            (Direction::Outbound, Verdict::Admitted) => ring.totals.readmissions += 1,
         }
         if ring.events.len() >= self.capacity {
             ring.events.pop_front();

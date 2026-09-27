@@ -114,6 +114,7 @@ impl MeteredSpend {
         state: &AppState,
         recipient: &str,
         max_total_msat: u64,
+        contact_budget_msat: Option<u64>,
     ) -> Result<FirstContactGrant, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else {
             return Err(ApiError::BadRequest(
@@ -125,7 +126,7 @@ impl MeteredSpend {
             .as_ref()
             .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
         service
-            .grant_first_contact(client_id, *epoch, recipient, max_total_msat)
+            .grant_first_contact(client_id, *epoch, recipient, max_total_msat, contact_budget_msat)
             .map_err(ApiError::BudgetExceeded)
     }
 
@@ -197,6 +198,43 @@ impl Debit {
     /// Whether this debit is held against a budget grant.
     pub(crate) fn is_metered(&self) -> bool {
         self.held.is_some()
+    }
+
+    /// Whether the grant behind this debit may pay admission to `recipient`
+    /// again (see [`PairingService::reserve_readmission`]). Always for the
+    /// owner's own key, which is not metered. Reserves nothing.
+    pub(crate) fn readmission_allowed(&self, recipient: &str) -> Result<(), ApiError> {
+        let Some((service, reservation)) = &self.held else {
+            return Ok(());
+        };
+        service
+            .readmission_allowed(reservation, recipient)
+            .map_err(ApiError::BudgetExceeded)
+    }
+
+    /// The contact's budget cap in the grant behind this debit, msat, if any.
+    pub(crate) fn contact_budget(&self, recipient: &str) -> Option<u64> {
+        let (service, reservation) = self.held.as_ref()?;
+        service
+            .grant_view_for(&reservation.client_id)?
+            .per_recipient_msat
+            .get(recipient)
+            .copied()
+    }
+
+    /// Reserve a re-admission to `recipient` of exactly `amount_msat` (the
+    /// recipient's signed quote) against the same grant, as its own debit.
+    /// Unmetered for the owner's own key.
+    pub(crate) fn readmission(&self, recipient: &str, amount_msat: u64) -> Result<Debit, ApiError> {
+        let Some((service, reservation)) = &self.held else {
+            return Ok(Debit::unmetered());
+        };
+        let readmission = service
+            .reserve_readmission(reservation, recipient, amount_msat)
+            .map_err(ApiError::BudgetExceeded)?;
+        Ok(Debit {
+            held: Some((Arc::clone(service), readmission)),
+        })
     }
 
     /// Guard each poll of an operation that can dispatch value. A separate

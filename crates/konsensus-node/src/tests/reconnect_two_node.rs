@@ -40,8 +40,10 @@ const ADMISSION_MARKER: &[u8] = b"konsensus:admission:v1";
 
 const JWT_SECRET: &str = "reconnect-regression-jwt-secret";
 
-fn identity(mnemonic: &str) -> Arc<NodeIdentity> {
-    Arc::new(NodeIdentity::from_mnemonic(mnemonic, "").unwrap())
+/// A fresh identity per test: the sender's admission ledger and quote cache
+/// are process-wide and keyed by the peer, so tests must not share one.
+fn identity() -> Arc<NodeIdentity> {
+    Arc::new(NodeIdentity::generate().unwrap().1)
 }
 
 fn price_open_transport(identity: &Arc<NodeIdentity>) -> Arc<NoiseTransport> {
@@ -145,6 +147,7 @@ struct Sender {
     router: axum::Router,
     auth: String,
     wallet: Arc<SharedMockProvider>,
+    state: Arc<konsensus_api::AppState>,
     pairing: Option<(Arc<konsensus_api::pairing::PairingService>, String)>,
 }
 
@@ -235,30 +238,50 @@ async fn start_sender(
         router,
         auth,
         wallet,
+        state,
         pairing: pairing.map(|(service, client_id, _)| (service, client_id)),
     }
 }
 
 impl Sender {
-    async fn compose(&self, recipient: &NodeId, text: &str) -> (StatusCode, serde_json::Value) {
+    async fn post(&self, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
         let request = Request::builder()
             .method("POST")
-            .uri("/api/v1/messages/compose")
+            .uri(uri)
             .header("authorization", &self.auth)
             .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({
-                    "recipient": recipient.to_hex(),
-                    "kind": konsensus_core::kind::KIND_CHAT,
-                    "plaintext": text,
-                })
-                .to_string(),
-            ))
+            .body(Body::from(body.to_string()))
             .unwrap();
         let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// A paired sender confirms the message's price as its cap, as the app
+    /// does; the owner's key sends uncapped.
+    async fn compose(&self, recipient: &NodeId, text: &str) -> (StatusCode, serde_json::Value) {
+        let mut body = serde_json::json!({
+            "recipient": recipient.to_hex(),
+            "kind": konsensus_core::kind::KIND_CHAT,
+            "plaintext": text,
+        });
+        if self.pairing.is_some() {
+            body["max_total_msat"] = serde_json::json!(2_000);
+        }
+        self.post("/api/v1/messages/compose", body).await
+    }
+
+    /// The paired app's live budget grant, as the node meters it.
+    fn grant(&self) -> konsensus_api::spend_budget::GrantView {
+        let (service, client_id) = self.pairing.as_ref().expect("a paired sender");
+        service.grant_view_for(client_id).expect("a live grant")
+    }
+
+    /// A's own N2 events with `code`.
+    fn membrane(&self, code: Code) -> Vec<Arc<konsensus_api::membrane::MembraneEvent>> {
+        let (events, _) = self.state.audit_log.membrane().read(None, 100);
+        events.into_iter().filter(|e| e.code == code).collect()
     }
 
     /// Each payment A has made, msat.
@@ -384,12 +407,12 @@ struct TwoNodes {
     _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
 }
 
-const ALICE: &str =
-    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-const BOB: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
-
-async fn two_nodes(grant: Option<konsensus_api::spend_budget::GrantTerms>) -> TwoNodes {
-    let (alice, bob) = (identity(ALICE), identity(BOB));
+/// `grant` gets B's id, to budget it (or not) in the paired app's grant.
+async fn two_nodes(
+    grant: impl FnOnce(&NodeId) -> Option<konsensus_api::spend_budget::GrantTerms>,
+) -> TwoNodes {
+    let (alice, bob) = (identity(), identity());
+    let grant = grant(bob.node_id());
     let (alice_id, bob_id) = (*alice.node_id(), *bob.node_id());
     let (dir_a, dir_b, ledger) = (
         tempfile::tempdir().unwrap(),
@@ -449,12 +472,13 @@ impl TwoNodes {
         self.connect().await;
     }
 
-    async fn send_delivered(&mut self, text: &str) {
+    async fn send_delivered(&mut self, text: &str) -> serde_json::Value {
         let (status, body) = self.sender.compose(&self.bob_id, text).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["delivered"], true, "{body}");
         assert_eq!(self.delivered.recv().await.as_deref(), Some(text));
         assert!(privileged_on(&self.transport_b, &self.alice_id).await, "admission promoted A's connection");
+        body
     }
 
     fn b_codes(&self) -> Vec<Code> {
@@ -471,7 +495,7 @@ impl TwoNodes {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
-    let mut net = two_nodes(None).await;
+    let mut net = two_nodes(|_| None).await;
 
     // 1. Admit: A connects as a stranger; its first paid message pays admission.
     net.connect().await;
@@ -497,5 +521,101 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     assert!(codes.contains(&Code::AdmissionRequired), "explicit refusal event: {codes:?}");
     assert!(!codes.contains(&Code::ProofReused), "stale admission proof re-sent: {codes:?}");
     assert_eq!(codes.iter().filter(|c| **c == Code::Settled).count(), 4, "{codes:?}");
+    net.shutdown();
+}
+
+// ── Budgeted re-admission (CoS decision, 2026-09-27) ────────────────────
+
+/// A day's budget for the paired app; `contact_cap` budgets B in it.
+fn budget(bob: &NodeId, contact_cap: Option<u64>) -> konsensus_api::spend_budget::GrantTerms {
+    let terms = konsensus_api::spend_budget::GrantTerms::new(200_000)
+        .per_call(20_000)
+        .for_secs(3_600);
+    match contact_cap {
+        Some(cap) => terms.recipient(&bob.to_hex(), cap),
+        None => terms,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budgeted_contact_is_readmitted_from_the_budget_without_a_prompt() {
+    let mut net = two_nodes(|bob| Some(budget(bob, Some(50_000)))).await;
+    let bob = net.bob_id;
+
+    // Admit, drop, reconnect: each paid send is one call from the paired app.
+    // No first-contact grant, no owner step: B is a contact the owner budgeted.
+    net.connect().await;
+    net.send_delivered("before the drop").await;
+    net.drop_and_reconnect().await;
+    let reply = net.send_delivered("after the reconnect").await;
+    // The app's confirmed cap covers the message; the admission is reported
+    // apart, bounded by B's budget in the grant.
+    assert_eq!(reply["amount_msat"], 2_000, "{reply}");
+    assert_eq!(reply["readmission_msat"], 2_000, "{reply}");
+
+    // B's signed quote (2,000 msat admission) and the 2,000 msat message, twice.
+    let paid = net.sender.paid_out().await;
+    assert_eq!(paid, vec![2_000; 4], "admission + message, twice, at B's own quote");
+
+    // Every payment was debited to the G1 budget, once, against B's cap.
+    let grant = net.sender.grant();
+    assert_eq!(grant.used_msat, 8_000);
+    assert_eq!(grant.used_by_recipient.get(&bob.to_hex()), Some(&8_000));
+
+    // N2: B refused out loud; A logged each paid re-admission with the cap.
+    assert!(net.b_codes().contains(&Code::AdmissionRequired));
+    let readmissions = net.sender.membrane(Code::Readmission);
+    assert_eq!(readmissions.len(), 2, "{readmissions:?}");
+    for event in &readmissions {
+        assert_eq!(event.paid_msat, Some(2_000));
+        assert_eq!(event.cap_msat, Some(50_000));
+        assert_eq!(event.counterparty.as_deref(), Some(bob.to_hex().as_str()));
+    }
+    net.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_contact_without_a_budget_needs_the_one_time_confirmation_once() {
+    let mut net = two_nodes(|bob| Some(budget(bob, None))).await;
+    let bob = net.bob_id;
+    net.connect().await;
+
+    // The grant does not budget B: the budget never pays its admission alone.
+    let (status, body) = net.sender.compose(&bob, "hello").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "budget_exceeded", "{body}");
+    assert_eq!(body["reason"], "first_contact", "{body}");
+    assert!(net.sender.paid_out().await.is_empty(), "nothing paid");
+    assert!(net.sender.membrane(Code::Readmission).is_empty());
+
+    // The door card: B's own signed quote, then one owner OK that also sets
+    // B's budget in the grant.
+    let (status, quote) = net
+        .sender
+        .post("/api/v1/messages/first-contact/quote", serde_json::json!({ "recipient": bob.to_hex() }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{quote}");
+    assert_eq!(quote["total_msat"], 4_000, "{quote}");
+    let (status, grant) = net
+        .sender
+        .post(
+            "/api/v1/pair/first-contact-grant",
+            serde_json::json!({
+                "recipient": bob.to_hex(),
+                "max_total_msat": quote["total_msat"],
+                "contact_budget_msat": 40_000,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    net.send_delivered("hello").await;
+    assert_eq!(net.sender.grant().per_recipient_msat.get(&bob.to_hex()), Some(&40_000));
+
+    // From now on B is budgeted: the next reconnect needs no prompt.
+    net.drop_and_reconnect().await;
+    net.send_delivered("after the reconnect").await;
+    assert_eq!(net.sender.paid_out().await.len(), 4);
+    assert_eq!(net.sender.grant().used_by_recipient.get(&bob.to_hex()), Some(&8_000));
+    assert_eq!(net.sender.membrane(Code::Readmission).len(), 2);
     net.shutdown();
 }

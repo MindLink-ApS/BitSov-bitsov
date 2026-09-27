@@ -1586,6 +1586,16 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
         provider.get_node_pubkey().await.unwrap()
     );
     source.send_frame(&recipient, &request).await.unwrap();
+    // A repeated attempt gets no second quote or service: only an explicit
+    // refusal, so the requester never waits out a timeout in silence.
+    match tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await {
+        Ok(Some(ControlEvent::InvoiceErrorReceived { peer_id, request_id, reason, .. })) => {
+            assert_eq!(peer_id, recipient);
+            assert_eq!(request_id, id);
+            assert_eq!(reason, konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED);
+        }
+        other => panic!("a repeated attempt must be refused out loud, and only that: {other:?}"),
+    }
     assert!(
         tokio::time::timeout(Duration::from_millis(200), source.recv_control())
             .await
