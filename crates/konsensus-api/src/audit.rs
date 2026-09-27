@@ -107,6 +107,8 @@ pub mod events {
     pub const INVITE_GENERATED: &str = "invite.generated";
     /// Invite token redeemed (peer added from invite).
     pub const INVITE_REDEEMED: &str = "invite.redeemed";
+    /// The owner confirmed a first contact in a paired app (one-time grant).
+    pub const SPEND_FIRST_CONTACT_GRANTED: &str = "spend.first_contact_granted";
     /// Mnemonic (recovery seed) read back over the API. The most
     /// security-sensitive read in the system: this returns the plaintext
     /// seed phrase, so every attempt (success or failure) is recorded.

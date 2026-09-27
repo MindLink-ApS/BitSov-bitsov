@@ -67,9 +67,10 @@ before dispatch releases the reservation. A budget refusal is HTTP 409:
 ```
 
 `reason` is one of `no_grant`, `per_call`, `total`, `recipient`, `unpriced`
-(an amountless invoice, or first-contact admission, whose price is not known
-before paying) or `ledger` (the ledger could not be written). Nothing was
-reserved and nothing was paid.
+(an amountless invoice, whose price is not known before paying),
+`first_contact` (a first contact without the owner's one-time confirmation for
+that contact; see below) or `ledger` (the ledger could not be written). Nothing
+was reserved and nothing was paid.
 
 Outcomes follow the #80 rules. A settled payment is charged the amount the
 provider reported. A refusal before dispatch or a confirmed failure is
@@ -134,3 +135,55 @@ it remains inert and startup purges it before serving requests.
 An expiry that occurs while the debit is persisted refuses dispatch rather than
 returning a reservation that was pruned. Failed expiry deletions remain in
 memory until a successful write, so a later sweep retries after an I/O failure.
+
+## First contact: one confirmation per new contact
+
+A budget never pays a first contact on its own. Reaching a stranger (a
+`price_open` node with no session yet) means paying its admission, and the owner
+decides that once per contact. The app asks in its own window, and the node
+backs that one answer with a short, single-use **first-contact grant**.
+`GET /api/v1/status` advertises `first_contact_grant_v1`.
+
+1. **Quote.** `POST /api/v1/messages/first-contact/quote {"recipient"}` asks the
+   connected stranger for its signed admission quote. This is F1's bounded
+   payment preparation (`docs/v2/F1-CAPPED-FIRST-CONTACT.md`). The node
+   validates the quote as a send would and returns `admission_msat`,
+   `message_msat`, `total_msat` and `expires_at` (≤ 60 s). It pays and
+   reserves nothing, and needs a live budget grant. The node keeps the quote for
+   its validity, so the send pays exactly this invoice and the stranger is never
+   asked for a second one. It returns 409 if a session exists or a first contact
+   is already paid or in flight.
+2. **Confirm.** `POST /api/v1/pair/first-contact-grant {"recipient",
+   "max_total_msat"}` is sent after the owner confirms in the app.
+   - It needs a live budget grant, and the amount must fit it: per-call maximum,
+     what is left of the budget, and the recipient's budget if set. It is at most
+     100,000 msat (F1's first-contact ceiling).
+   - Nothing is reserved yet.
+   - The grant expires after 120 s, or with the budget grant if that is sooner.
+   - It is single use and for exactly this recipient. A new confirmation replaces
+     an unused one.
+   - It is held in memory only: never written down, and dropped on restart,
+     revocation, rotation or replacement of the budget grant.
+3. **Send.** `POST /api/v1/messages/compose` to that stranger consumes the grant.
+   - The grant's amount caps the whole first contact: admission plus first
+     message, together with any `max_total_msat`.
+   - The node reserves that cap **once** against the budget grant before
+     requesting the admission invoice.
+   - The same reservation is carried through the invoice request
+     (`Debit::request_invoice`), the admission payment (`Debit::dispatch`,
+     re-checked on every poll) and the message (`create_metered_payment_proof`).
+   - It is resolved **once** from the aggregate outcome: settled is charged what
+     settled in this call; unknown stays reserved; a call that moved nothing is
+     released.
+   - A paid admission whose session or message then fails stays charged for the
+     admission only.
+
+Without a matching grant, a paired first contact is refused with
+`budget_exceeded` / `first_contact` before anything is asked of the stranger. The
+owner's own key is not metered; the #80 caps still bound it.
+
+That the owner, not a program, confirmed is the app's contract, the same as for
+every budgeted send. The node enforces the rest: an explicit call per contact,
+exact recipient, bounded amount, single use, short life, and inside a budget the
+owner granted at the node.
+

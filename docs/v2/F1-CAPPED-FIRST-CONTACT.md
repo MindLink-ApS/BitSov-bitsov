@@ -116,6 +116,23 @@ Received files remain durable and retain the existing access controls.
 
 ## G1 integration contract
 
+**Implemented** on `feat/g1-first-contact-grant` (the G1 follow-up with #83
+merged). A paired first contact now needs the owner's one-time first-contact
+grant for that recipient (`docs/SPEND_BUDGET_GRANTS.md`, "First contact").
+
+**Carried as below:**
+- One aggregate reservation before the admission invoice.
+- `Debit::request_invoice` for the frame, `Debit::dispatch` for the payment and
+  `create_metered_payment_proof` for the message.
+- One resolution at the outer compose result.
+
+**Remaining limit:** a resumed admission (after an unknown outcome or a
+restart) needs a new confirmation and reserves again. The original reservation
+stays counted, so the tally over-counts until the grant ends. It never
+under-counts.
+
+The contract as written before the integration:
+
 Reviewed against PR #81, `feat/g1-budget-scoped-grant` at
 `fec318395e5b49ab52d42198f62630d865180ba7`, then its dispatch-validity update
 `942b68a698552a5b4e571fa2463f2344fedcaa4f`. F1 is based on main `f2f17695`;

@@ -496,6 +496,16 @@ struct Inner {
     // Never serialized or returned by HTTP/control status. Restart invalidates
     // pending console challenges; the owner must request a new operation.
     owner_confirmations: HashMap<String, (blake3::Hash, i64)>,
+    // One-time first-contact confirmations, by client id. Memory only: never
+    // serialized, dropped on restart (fail closed). See `FirstContactGrant`.
+    first_contact: HashMap<String, PendingFirstContact>,
+}
+
+/// A first-contact grant plus the budget grant it was issued under.
+struct PendingFirstContact {
+    grant: crate::spend_budget::FirstContactGrant,
+    epoch: u64,
+    budget_op_id: String,
 }
 
 struct OwnerTerminal;
@@ -591,6 +601,7 @@ impl PairingService {
                 window_until: None,
                 identity_fingerprint,
                 owner_confirmations: HashMap::new(),
+                first_contact: HashMap::new(),
             }),
             grant_changes: tokio::sync::Notify::new(),
             owner_control_enabled,
@@ -1722,6 +1733,121 @@ impl PairingService {
             op_id,
             charges,
         })
+    }
+
+    /// Issue the owner's one-time first-contact confirmation for `recipient`.
+    ///
+    /// Only for a client holding a live budget grant, and only within it: the
+    /// amount must fit the grant's per-call maximum, what is left of the
+    /// budget and, if set, the recipient's budget. Nothing is reserved here;
+    /// the send debits the budget grant once, before any invoice or payment.
+    /// Replaces any earlier unused first-contact grant of this client.
+    pub fn grant_first_contact(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        recipient: &str,
+        max_total_msat: u64,
+    ) -> Result<crate::spend_budget::FirstContactGrant, BudgetRefusal> {
+        use crate::spend_budget::{
+            canonical_recipient, FirstContactGrant, FIRST_CONTACT_GRANT_TTL_SECS,
+            FIRST_CONTACT_MAX_MSAT,
+        };
+        if !self.owner_control_enabled {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        let recipient = canonical_recipient(recipient)
+            .filter(|key| key.len() == 64)
+            .ok_or_else(|| BudgetRefusal::FirstContact("the recipient is not a node id".into()))?;
+        if max_total_msat == 0 || max_total_msat > FIRST_CONTACT_MAX_MSAT {
+            return Err(BudgetRefusal::FirstContact(format!(
+                "a first contact may cover 1..={FIRST_CONTACT_MAX_MSAT} msat"
+            )));
+        }
+        let mut inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
+        let fingerprint = inner.identity_fingerprint.clone();
+        if !inner
+            .file
+            .clients
+            .iter()
+            .any(|c| c.client_id == client_id && c.epoch == epoch)
+        {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        let Some(grant) = inner.file.grants.iter().find(|g| {
+            g.client_id == client_id
+                && g.epoch == epoch
+                && g.identity_fingerprint == fingerprint
+                && g.is_live(now)
+        }) else {
+            return Err(BudgetRefusal::NoGrant);
+        };
+        let budget = grant.budget.as_ref().ok_or(BudgetRefusal::NoGrant)?;
+        if max_total_msat > budget.per_call_max_msat {
+            return Err(BudgetRefusal::PerCall {
+                max_msat: budget.per_call_max_msat,
+            });
+        }
+        if max_total_msat > budget.remaining_msat() {
+            return Err(BudgetRefusal::Total {
+                remaining_msat: budget.remaining_msat(),
+            });
+        }
+        if let Some(cap) = budget.per_recipient_msat.get(&recipient) {
+            let used = budget.used_by_recipient.get(&recipient).copied().unwrap_or(0);
+            let left = cap.saturating_sub(used);
+            if max_total_msat > left {
+                return Err(BudgetRefusal::Recipient {
+                    recipient,
+                    remaining_msat: left,
+                });
+            }
+        }
+        let issued = FirstContactGrant {
+            recipient,
+            max_total_msat,
+            expires_at: (now + FIRST_CONTACT_GRANT_TTL_SECS).min(grant.expires_at),
+        };
+        let budget_op_id = grant.op_id.clone();
+        inner.first_contact.insert(
+            client_id.to_string(),
+            PendingFirstContact {
+                grant: issued.clone(),
+                epoch,
+                budget_op_id,
+            },
+        );
+        Ok(issued)
+    }
+
+    /// Consume this client's first-contact grant for `recipient`, returning
+    /// its amount. `None` when there is none, it is for someone else, it has
+    /// expired, or the budget grant it was issued under is no longer live
+    /// (revoked, replaced, rotated). Single use: a match is removed.
+    pub fn take_first_contact(&self, client_id: &str, epoch: u64, recipient: &str) -> Option<u64> {
+        let recipient = crate::spend_budget::canonical_recipient(recipient)?;
+        let mut inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
+        let pending = inner.first_contact.get(client_id)?;
+        if pending.grant.expires_at <= now {
+            inner.first_contact.remove(client_id);
+            return None;
+        }
+        if pending.grant.recipient != recipient || pending.epoch != epoch {
+            return None;
+        }
+        let fingerprint = inner.identity_fingerprint.clone();
+        let op_id = pending.budget_op_id.clone();
+        let live = inner.file.grants.iter().any(|g| {
+            g.op_id == op_id
+                && g.client_id == client_id
+                && g.epoch == epoch
+                && g.identity_fingerprint == fingerprint
+                && g.is_live(now)
+        });
+        let taken = inner.first_contact.remove(client_id)?;
+        live.then_some(taken.grant.max_total_msat)
     }
 
     /// Validate a persisted reservation and run one synchronous dispatch step

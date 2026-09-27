@@ -479,6 +479,41 @@ async fn own_grant(
     Ok(Json(serde_json::json!({ "grant": grant })))
 }
 
+/// `POST /api/v1/pair/first-contact-grant` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirstContactGrantBody {
+    /// The new contact's node id (64 hex).
+    pub recipient: String,
+    /// The most the first contact may cost: admission plus the first message,
+    /// msat, as the owner confirmed it (the target's quote).
+    pub max_total_msat: u64,
+}
+
+/// `POST /api/v1/pair/first-contact-grant` — the owner's one-time OK, given in
+/// the app, to pay a first contact to exactly this recipient for at most this
+/// amount. Needs a live budget grant and fits inside it; single use; expires
+/// after two minutes; memory only. The send then debits the budget grant once.
+/// A first contact without one is refused (`budget_exceeded`, reason
+/// `first_contact`). See `docs/SPEND_BUDGET_GRANTS.md`.
+async fn first_contact_grant(
+    auth: crate::metered::MeteredSpend,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<FirstContactGrantBody>,
+) -> Result<Json<crate::spend_budget::FirstContactGrant>, ApiError> {
+    let grant = auth.grant_first_contact(&state, &body.recipient, body.max_total_msat)?;
+    state.audit_log.record(
+        events::SPEND_FIRST_CONTACT_GRANTED,
+        &auth.node_id,
+        Some(serde_json::json!({
+            "recipient": grant.recipient,
+            "max_total_msat": grant.max_total_msat,
+            "expires_at": grant.expires_at,
+        })),
+    );
+    Ok(Json(grant))
+}
+
 /// `POST /api/v1/identity/replacement-request` body.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -575,6 +610,7 @@ pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
         .route("/api/v1/pair/elevation-request", post(elevation_request))
         .route("/api/v1/pair/elevation/:op_id", get(elevation_status))
         .route("/api/v1/pair/grant", get(own_grant))
+        .route("/api/v1/pair/first-contact-grant", post(first_contact_grant))
         .route(
             "/api/v1/identity/replacement-request",
             post(replacement_request),
