@@ -183,3 +183,112 @@ async fn expiry_restart_removes_abandoned_temporary_grant() {
 async fn expiry_restart_preserves_live_grant_when_removing_temporary_file() {
     abandoned_temporary_grant_is_removed(true).await;
 }
+
+#[tokio::test]
+async fn expiry_shutdown_already_signalled_purges_before_task_returns() {
+    let (fx, expiry) = expiring_fixture().await;
+    wait_for_expiry(expiry).await;
+    assert_eq!(disk_grants(&fx).as_array().unwrap().len(), 1);
+    let (_stop, rx) = tokio::sync::watch::channel(true);
+    control::sweep_expired_grants(Arc::clone(&fx.service), rx).await;
+    assert_eq!(disk_grants(&fx), json!([]), "shutdown skipped its purge");
+}
+
+#[tokio::test]
+async fn expiry_shutdown_wakes_sleeping_sweeper_and_preserves_live_grants() {
+    let (fx, expiry) = expiring_fixture().await;
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let sweep = control::sweep_expired_grants(Arc::clone(&fx.service), rx);
+    tokio::pin!(sweep);
+    // Poll the real task into its wait, then freeze monotonic time. Advancing
+    // only wall time makes shutdown the only ready select branch, so the test
+    // cannot pass through a lucky periodic sweep.
+    tokio::time::pause();
+    assert!(futures::poll!(&mut sweep).is_pending());
+    assert_eq!(disk_grants(&fx).as_array().unwrap().len(), 1);
+    while chrono::Utc::now().timestamp_millis() < expiry * 1000 + 100 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    stop.send(true).unwrap();
+    sweep.await;
+    assert_eq!(disk_grants(&fx), json!([]), "shutdown wake skipped purge");
+    tokio::time::resume();
+
+    // Shutdown removes only expired records; a live tally must survive restart.
+    let mut live = fixture().await;
+    let token = live.grant(None, GrantTerms::new(10_000)).await;
+    assert_eq!(live.compose(&token).await.0, StatusCode::OK);
+    let before = disk_grants(&live);
+    let (_stop, rx) = tokio::sync::watch::channel(true);
+    control::sweep_expired_grants(Arc::clone(&live.service), rx).await;
+    assert_eq!(disk_grants(&live), before);
+    live.restart();
+    assert_eq!(live.used(), 1000);
+}
+
+#[tokio::test]
+async fn expiry_api_start_purges_before_binding_listener() {
+    let (fx, expiry) = expiring_fixture().await;
+    wait_for_expiry(expiry).await;
+    assert_eq!(disk_grants(&fx).as_array().unwrap().len(), 1);
+    // Occupy the address: serve must purge before even attempting its bind.
+    // No HTTP server or request can clean the store on this test's behalf.
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_stop, rx) = tokio::sync::watch::channel(false);
+    let err = konsensus_api::serve(occupied.local_addr().unwrap(), fx.state.clone(), rx)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    assert_eq!(disk_grants(&fx), json!([]), "API startup skipped purge");
+    assert_eq!(fx.wallet.money(), 0);
+}
+
+#[tokio::test]
+async fn expiry_api_start_refuses_failed_cleanup_before_binding() {
+    let (fx, expiry) = expiring_fixture().await;
+    let blocker = fx.tmp.path().join("pairing/clients.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    wait_for_expiry(expiry).await;
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_stop, rx) = tokio::sync::watch::channel(false);
+    let err = konsensus_api::serve(occupied.local_addr().unwrap(), fx.state.clone(), rx)
+        .await
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<pairing::PairingError>().is_some(),
+        "API attempted bind before refusing failed cleanup: {err}"
+    );
+    assert_eq!(disk_grants(&fx).as_array().unwrap().len(), 1);
+    std::fs::remove_dir(blocker).unwrap();
+    fx.service.prune_expired_grants().unwrap();
+    assert_eq!(disk_grants(&fx), json!([]));
+}
+
+#[tokio::test]
+async fn expiry_offline_restart_purges_before_any_api_access() {
+    let (mut fx, expiry) = expiring_fixture().await;
+    let stale = fx.token().await;
+    wait_for_expiry(expiry).await;
+    assert_eq!(disk_grants(&fx).as_array().unwrap().len(), 1);
+    fx.restart();
+    // Assert durable removal before even constructing an HTTP request.
+    assert_eq!(disk_grants(&fx), json!([]));
+    assert_eq!(
+        fx.call("GET", "/api/v1/pair/grant", None, Some(&stale))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(fx.compose(&stale).await.0, StatusCode::UNAUTHORIZED);
+    let read = fx.token().await;
+    let (status, body) = fx
+        .call("GET", "/api/v1/pair/grant", None, Some(&read))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"grant": null}));
+    assert_eq!(fx.compose(&read).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(fx.wallet.money(), 0);
+}

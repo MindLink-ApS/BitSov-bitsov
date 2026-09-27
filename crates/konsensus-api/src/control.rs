@@ -643,6 +643,11 @@ pub async fn sweep_expired_grants(
             _ = tokio::time::sleep(delay) => {},
         }
     }
+    // Shutdown is a cleanup opportunity even if signalled before our first
+    // poll or while we slept. Live grants and their tallies survive restart.
+    if let Err(e) = service.prune_expired_grants() {
+        tracing::warn!(error = %e, "expired spend grant cleanup failed at shutdown");
+    }
 }
 
 /// One newline-delimited JSON request, one newline-delimited JSON response.

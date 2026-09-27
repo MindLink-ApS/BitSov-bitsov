@@ -94,6 +94,8 @@ The budget, what has been used and the absolute expiry live in
 `pairing/clients.json` (0600, write-then-rename). A restart keeps the tally and
 cannot extend the window. Store reads and writes purge expired grants under
 one mutex. Opening the store must finish the purge before startup can proceed.
+The API checks again before binding its listener, covering expiry during startup;
+failed cleanup prevents the API from serving any request.
 Startup also deletes abandoned `clients.json.tmp` files from interrupted writes;
 these uncommitted records are never promoted over the authoritative file.
 The running node schedules cleanup for the earliest absolute expiry, waking
@@ -107,11 +109,20 @@ is repeated before success is returned. Reads never expose expired records;
 a fallible disk read reports a cleanup failure instead of returning stale data.
 Failed deletions stay queued and the scheduler retries them once a second.
 
+Graceful shutdown purges expired grants when the scheduler stops and again after
+the API and backend tasks drain. The node waits for the scheduler and reports a
+failed final purge as a shutdown error. Live grants keep their original expiry
+and tallies across shutdown and restart.
+
 Deletion requires a running process and writable storage. While the process is
 stopped, suspended, or unable to write, physical bytes can remain on disk;
 they confer no authority. Restart purges them before opening the service, and
 read/scheduler retries finish cleanup once storage recovers. Deadline scheduling
 is not a guarantee of physical erasure while the process cannot execute.
+The expiry gate is that a grant is never honored at or after its absolute expiry
+and is purged at the next opportunity: sweep, graceful shutdown, or startup before
+API access. A record left while powered off at expiry is acceptable only because
+it remains inert and startup purges it before serving requests.
 
 An expiry that occurs while the debit is persisted refuses dispatch rather than
 returning a reservation that was pruned. Failed expiry deletions remain in
