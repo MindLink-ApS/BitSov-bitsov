@@ -252,4 +252,3 @@ impl LightningProvider for MixedLightning {
         StubLightning.close_channel(channel_id, force).await
     }
 }
-
