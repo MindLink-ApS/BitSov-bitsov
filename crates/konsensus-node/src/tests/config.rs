@@ -2275,3 +2275,15 @@ fn validate_allows_settlement_on_with_non_mock_backend() {
         "non-Mock + settlement-on must be allowed"
     );
 }
+
+#[test]
+fn introduction_endpoint_prefers_advertised_and_skips_wildcards() {
+    let mut net = NetworkConfig { listen_addr: "0.0.0.0:9000".parse().unwrap(), ..Default::default() };
+    assert_eq!(net.introduction_endpoint(), None, "a wildcard bind is not dialable");
+    net.listen_addr = "192.168.1.5:9000".parse().unwrap();
+    assert_eq!(net.introduction_endpoint().as_deref(), Some("192.168.1.5:9000"));
+    net.advertised_addr = Some(" node.example.org:9000 ".into());
+    assert_eq!(net.introduction_endpoint().as_deref(), Some("node.example.org:9000"));
+    let toml_net: NetworkConfig = toml::from_str("advertised_addr = \"n.example:1\"").unwrap();
+    assert_eq!(toml_net.advertised_addr.as_deref(), Some("n.example:1"));
+}

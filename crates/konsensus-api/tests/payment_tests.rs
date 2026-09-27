@@ -275,6 +275,7 @@ async fn pricing_own_chain_aware_reports_mode() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -1283,6 +1284,7 @@ async fn health_lightning_unavailable_shows_null_balance() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -1781,6 +1783,7 @@ async fn chain_status_with_failing_provider() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -1892,6 +1895,7 @@ async fn chain_status_partial_failure() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2214,6 +2218,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         peer_ln_pubkeys: Arc::clone(&base.peer_ln_pubkeys),
         lightning_backend: base.lightning_backend.clone(),
         chain_backend: base.chain_backend.clone(),
+        introduction: Default::default(),
         gossip_validator: base.gossip_validator.clone(),
     });
     let auth = auth_header(&state);

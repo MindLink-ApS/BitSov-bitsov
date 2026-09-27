@@ -922,6 +922,10 @@ async fn cmd_start(
         lightning_backend: config.lightning.backend_name().to_string(),
         chain_backend: config.chain.backend_name().to_string(),
         gossip_validator: Some(Arc::clone(&gossip_validator)),
+        introduction: konsensus_api::handlers::introduction::IntroductionSettings {
+            network: config.lightning.bitcoin_network(),
+            endpoint: config.network.introduction_endpoint(),
+        },
     });
 
     // ── Spawn background tasks ─────────────────────────────────────────

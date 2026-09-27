@@ -147,6 +147,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(handlers::hosting::routes())
         .merge(handlers::invite::routes())
         .merge(handlers::invites::routes())
+        .merge(handlers::introduction::routes())
         .merge(handlers::onboarding::routes())
         .merge(handlers::organism::routes())
         .merge(handlers::gossip::routes())
