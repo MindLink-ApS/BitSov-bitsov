@@ -39,10 +39,12 @@ when no message could be stored. Each row has `recipient`, `status`,
 - `refused`: nothing was dispatched, or the payment was confirmed failed or
   expired. Amount is zero.
 - `unknown`: payment may be in flight or its terminal state cannot be verified.
-  Amount is zero because no settled amount is proven; it is not proof of no spend.
+  Amount reserves the entire attempted principal against the member and total
+  caps. This is not a settled amount and is never released for another attempt.
 
-Top-level `amount_msat` sums known settled amounts. Top-level `message_id` is
-one stored member envelope, or the empty string if none was stored.
+Top-level `amount_msat` sums settled amounts plus the reserved principal of
+unknown members. An unknown row does not establish settlement.
+Top-level `message_id` is one stored member envelope, or the empty string if none was stored.
 `delivered` means at least one envelope reached a connected member; HTTP 200
 and a canonical message ID do not establish every member's success.
 
@@ -52,3 +54,11 @@ settlement from one canonical message. This API does not provide aggregate
 reconciliation for a completely lost room reply. A terminal partial result
 must still disclose refused or paid-but-unstored members; retrying the whole
 room message may duplicate payments to successful members.
+
+Keysend fallback requires `LightningError::PaymentNotDispatched`: a typed
+provider guarantee that dispatch never began (for example, unsupported keysend
+or rejected local key validation). Generic connection/backend/payment errors,
+including response read/parse failures and timeouts, are unknown; they never
+trigger an invoice request or a second payment. Even generic connection errors
+are conservative unless the provider can positively prove pre-dispatch failure.
+A room member with such an error remains unknown with its checked price reserved.

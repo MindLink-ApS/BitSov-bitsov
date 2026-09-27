@@ -2240,7 +2240,7 @@ async fn compose_keysend_fallback_to_invoice() {
             Ok(vec![])
         }
         async fn keysend(&self, _dest: &str, _amt: u64, _memo: Option<&str>) -> Result<PaymentDetails, LightningError> {
-            Err(LightningError::PaymentFailed("keysend not supported".into()))
+            Err(LightningError::PaymentNotDispatched("keysend not supported".into()))
         }
         async fn is_available(&self) -> bool {
             true

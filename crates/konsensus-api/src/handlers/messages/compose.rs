@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use konsensus_core::traits::lightning::{
-    LightningProvider, PaymentDetails, PaymentDirection, PaymentStatus,
+    LightningError, LightningProvider, PaymentDetails, PaymentDirection, PaymentStatus,
 };
 use konsensus_core::types::{MessageId, NodeId, Recipient};
 use konsensus_crypto::ratchet_message_to_bytes;
@@ -64,7 +64,7 @@ pub struct ComposeResponse {
     pub message_id: String,
     /// Whether the message was delivered to a connected peer.
     pub delivered: bool,
-    /// Amount paid in millisatoshis.
+    /// Settled principal plus reserved principal for unknown room members.
     pub amount_msat: u64,
 }
 
@@ -73,6 +73,7 @@ pub struct ComposeResponse {
 pub struct MemberPaymentOutcome {
     pub recipient: String,
     pub status: &'static str,
+    /// Settled principal, or the full reserved principal when status is unknown.
     pub amount_msat: u64,
     pub message_id: Option<String>,
     pub reason: Option<String>,
@@ -200,10 +201,10 @@ async fn await_settlement(
     if initial.payment_hash.is_empty() {
         // Dispatched but not yet trackable (rare race where the backend had not
         // recorded the payment when it returned). Do NOT re-dispatch via another
-        // path — that would risk paying twice. Surface as retryable.
+        // path — that would risk paying twice. Preserve the unknown outcome.
         return Err(ApiError::PaymentUnresolved(format!(
             "{method} dispatched but returned no payment hash to confirm settlement — \
-             not retrying to avoid a double payment; the message can be re-sent once the wallet settles"
+             not retrying to avoid a double payment; reconcile the original payment before any new send"
         )));
     }
 
@@ -249,8 +250,8 @@ async fn await_settlement(
 /// known (exchanged via `Frame::LightningInfo` after handshake), pushes sats
 /// directly to their node. No invoice request needed.
 ///
-/// **Invoice path** (fallback, ~100-200ms round-trip): If keysend is unavailable
-/// (peer has no Lightning pubkey, or keysend fails), falls back to the
+/// **Invoice path** (fallback, ~100-200ms round-trip): If the peer has no
+/// Lightning pubkey, or keysend is positively rejected before dispatch, use the
 /// RequestInvoice/InvoiceResponse/pay_invoice flow.
 ///
 /// Returns (payment_hash, preimage, amount_msat). Never falls back to fake proofs.
@@ -297,13 +298,13 @@ pub async fn create_payment_proof(
                 // Safe to fall through: no HTLC was dispatched.
             }
             Err(e) => {
-                // The keysend WAS dispatched but did not settle. Falling back to
-                // the invoice flow here would risk paying the recipient twice for
-                // one message, so surface the error instead of re-dispatching.
+                // No proof of non-dispatch: the payment may already have
+                // settled. Surface the unresolved/terminal error without a
+                // second payment path.
                 tracing::warn!(
                     peer = %peer_id,
                     error = %e,
-                    "keysend dispatched but did not settle — NOT falling back (double-pay guard)"
+                    "keysend outcome does not permit fallback (double-pay guard)"
                 );
                 return Err(e);
             }
@@ -319,9 +320,8 @@ pub async fn create_payment_proof(
 /// * `Ok(KeysendOutcome::Settled(proof))` — the HTLC settled.
 /// * `Ok(KeysendOutcome::NotDispatched)` — the `keysend` call failed before any
 ///   HTLC went out; the caller may safely fall back to the invoice flow.
-/// * `Err(_)` — the keysend WAS dispatched but did not settle (failed, expired,
-///   timed out, or untrackable). The caller must NOT fall back to another
-///   payment path, or it risks paying the recipient twice.
+/// * `Err(_)` — dispatch or settlement is uncertain, or a dispatched payment
+///   failed/expired. The caller must NOT fall back to another payment path.
 async fn try_keysend(
     state: &AppState,
     ln_pubkey: &str,
@@ -334,15 +334,21 @@ async fn try_keysend(
         .await
     {
         Ok(details) => details,
-        Err(e) => {
-            // The send itself failed — no HTLC was dispatched, so it is safe to
-            // fall back to the invoice flow without risking a double payment.
-            tracing::warn!(peer = %peer_id, error = %e, "keysend not dispatched");
+        Err(LightningError::PaymentNotDispatched(reason)) => {
+            tracing::warn!(peer = %peer_id, %reason, "keysend rejected before dispatch");
             return Ok(KeysendOutcome::NotDispatched);
+        }
+        Err(e) => {
+            // A response read/parse failure or timeout may follow settlement.
+            // Keep this amount reserved; NEVER create a second payment without
+            // positive evidence that the first was not dispatched.
+            return Err(ApiError::PaymentUnresolved(format!(
+                "keysend outcome unknown; not retrying via invoice: {e}"
+            )));
         }
     };
 
-    // Dispatched: from here we must not re-dispatch by another path. Poll the
+    // A payment record exists: never re-dispatch by another path. Poll any
     // in-flight payment to terminal settlement.
     let settled = await_settlement(&state.lightning, details, "keysend").await?;
 
@@ -1475,7 +1481,7 @@ async fn compose_room_member(
                     "skipping room member: payment proof unavailable (offline?)"
                 );
                 return match e {
-                    ApiError::PaymentUnresolved(_) => RoomMemberOutcome::stopped(member, "unknown", 0, "Payment outcome unresolved; do not retry".into()),
+                    ApiError::PaymentUnresolved(_) => RoomMemberOutcome::stopped(member, "unknown", price_msat, "Payment outcome unresolved; do not retry".into()),
                     ApiError::PaymentProofUnavailable { amount_msat, reason } => RoomMemberOutcome::stopped(member, "settled", amount_msat, reason),
                     _ => RoomMemberOutcome::stopped(member, "refused", 0, "Payment was not dispatched or was confirmed failed".into()),
                 };

@@ -120,7 +120,7 @@ async fn capped_first_contact_cannot_pay_an_unquoted_admission() {
 
 #[tokio::test(start_paused = true)]
 async fn room_reports_inflight_member_as_unknown_alongside_settled_member() {
-    mixed_room("unknown", "unknown", 1000).await;
+    mixed_room("unknown", "unknown", 2000).await;
 }
 #[tokio::test]
 async fn room_reports_terminal_failure_as_refused_not_unknown() {

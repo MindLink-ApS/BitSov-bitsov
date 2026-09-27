@@ -1042,7 +1042,7 @@ impl LightningProvider for LdkProvider {
     ) -> Result<PaymentDetails, LightningError> {
         let pubkey: bitcoin::secp256k1::PublicKey = dest_pubkey
             .parse()
-            .map_err(|e| LightningError::Backend(format!("invalid destination pubkey: {e}")))?;
+            .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid destination pubkey: {e}")))?;
 
         let payment_id = self
             .node
