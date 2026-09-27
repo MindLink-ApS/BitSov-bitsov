@@ -12,6 +12,7 @@ use konsensus_core::types::{MessageId, Recipient};
 use crate::audit::events;
 use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use crate::error::ApiError;
+use crate::freshness::DataFreshness;
 use crate::state::AppState;
 
 /// Maximum allowed limit for list queries.
@@ -189,12 +190,16 @@ pub(super) async fn get_message_plaintext(
 /// Without `peer` param: returns incoming messages (recipient = this node).
 /// With `peer` param: returns both sent and received messages for that
 /// conversation, enabling full conversation history including outgoing messages.
+///
+/// `BitSov-Data-As-Of` is the time the message store was read for this
+/// response (the store is local and authoritative, so normally "now").
 pub(super) async fn list_messages(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListMessagesQuery>,
-) -> Result<Json<Vec<MessageResponse>>, ApiError> {
+) -> Result<(DataFreshness, Json<Vec<MessageResponse>>), ApiError> {
     let my_node_hex = state.identity.node_id().to_hex();
+    let store_read = DataFreshness::now();
 
     let messages = if let Some(ref peer_id) = params.peer {
         // Validate peer_id format: either a hex node ID or a UUID room ID.
@@ -247,7 +252,7 @@ pub(super) async fn list_messages(
         responses.push(resp);
     }
 
-    Ok(Json(responses))
+    Ok((store_read, Json(responses)))
 }
 
 /// Maximum number of most-recent messages a single search will decrypt and scan.

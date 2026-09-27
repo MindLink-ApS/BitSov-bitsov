@@ -42,7 +42,7 @@ use async_trait::async_trait;
 use tokio::sync::Semaphore;
 
 use konsensus_core::traits::lightning::{
-    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentStatus,
+    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentStatus, WalletSync,
 };
 
 /// Tunables for [`CircuitBreakerLightning`]. Conservative defaults; an operator
@@ -266,6 +266,10 @@ impl LightningProvider for CircuitBreakerLightning {
     async fn is_available(&self) -> bool {
         self.inner.is_available().await
     }
+
+    async fn wallet_sync(&self) -> WalletSync {
+        self.inner.wallet_sync().await
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +379,9 @@ mod tests {
         }
         async fn is_available(&self) -> bool {
             true
+        }
+        async fn wallet_sync(&self) -> WalletSync {
+            WalletSync::SyncedAt(1_700_000_000)
         }
     }
 
@@ -525,5 +532,13 @@ mod tests {
             start.elapsed() < Duration::from_secs(3),
             "the flood must not pin the node for the full serial duration"
         );
+    }
+
+    // Freshness headers: the wrapper must report the inner wallet's sync
+    // status, not the trait's `Live` default.
+    #[tokio::test]
+    async fn wallet_sync_passes_through_to_inner_provider() {
+        let cb = CircuitBreakerLightning::new(FakeProvider::new(Behavior::Settled), fast_cfg());
+        assert_eq!(cb.wallet_sync().await, WalletSync::SyncedAt(1_700_000_000));
     }
 }

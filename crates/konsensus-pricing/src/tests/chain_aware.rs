@@ -1045,3 +1045,43 @@ fn apply_multiplier_saturates_on_absurd_fee_rate() {
     // A huge finite fee with a large base and NO cap must not panic/overflow.
     let _ = ChainAwarePricingEngine::apply_multiplier(u64::MAX, 1e38, 4.0, 0.0);
 }
+
+#[tokio::test]
+async fn chain_state_fetched_at_tracks_the_last_chain_fetch() {
+    let engine = make_engine(10.0);
+    assert_eq!(engine.cache_ttl(), Duration::from_secs(60));
+    assert!(
+        engine.chain_state_fetched_at().await.is_none(),
+        "nothing fetched yet"
+    );
+
+    let before = std::time::SystemTime::now() - Duration::from_secs(1);
+    let _ = engine.get_price_msat(KIND_CHAT).await.unwrap();
+    let fetched = engine.chain_state_fetched_at().await.expect("fetched");
+    assert!(fetched >= before);
+    assert!(fetched <= std::time::SystemTime::now());
+}
+
+#[tokio::test]
+async fn seeded_chain_state_reports_an_expired_fetch_time() {
+    let engine = make_engine(10.0);
+    engine
+        .seed_ema(FeeRateSnapshot {
+            targets: [(144u32, 7.0f64)].into_iter().collect(),
+            block_height: 886_000,
+            timestamp_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        })
+        .await;
+
+    let fetched = engine.chain_state_fetched_at().await.expect("seeded");
+    let age = std::time::SystemTime::now()
+        .duration_since(fetched)
+        .unwrap();
+    assert!(
+        age >= engine.cache_ttl(),
+        "seeded state is not a fresh chain read: {age:?}"
+    );
+}

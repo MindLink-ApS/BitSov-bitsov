@@ -652,6 +652,21 @@ impl ChainAwarePricingEngine {
         cache.as_ref().map(|c| c.block_height)
     }
 
+    /// Wall-clock time of the chain fetch behind the cached state, if any.
+    ///
+    /// State seeded from a snapshot reports a time already `cache_ttl` in the
+    /// past (it is marked expired, see [`Self::seed_ema`]), never "now".
+    pub async fn chain_state_fetched_at(&self) -> Option<std::time::SystemTime> {
+        let cache = self.cached_state.read().await;
+        let age = cache.as_ref()?.fetched_at.elapsed();
+        std::time::SystemTime::now().checked_sub(age)
+    }
+
+    /// How long cached chain state is used before it must be re-fetched.
+    pub fn cache_ttl(&self) -> Duration {
+        self.config.cache_ttl
+    }
+
     /// Get the current fee rate state from cache for the default target.
     ///
     /// Returns `(raw_sat_per_vbyte, ema_sat_per_vbyte)` if cached, or `None`.

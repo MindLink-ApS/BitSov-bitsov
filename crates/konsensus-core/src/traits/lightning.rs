@@ -165,6 +165,22 @@ pub enum LightningError {
     },
 }
 
+/// How current the wallet figures (`get_balance_msat`, `list_channels`) are.
+///
+/// Feeds the `BitSov-Data-As-Of` / `BitSov-Data-Stale` response headers on
+/// `GET /api/v1/payments/balance` and `/payments/channels`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletSync {
+    /// Every call queries the backend, so the figures are current as of the
+    /// call itself (LNbits, LND: remote query per request).
+    Live,
+    /// The figures come from a local wallet last synced to the chain tip at
+    /// this Unix time in seconds (LDK: background wallet sync).
+    SyncedAt(u64),
+    /// The local wallet has not completed a sync yet; no time is known.
+    NeverSynced,
+}
+
 /// Abstraction over Lightning Network payment backends.
 ///
 /// This is the critical trait for Principle 2 (Lightning Clearance = Message Gate).
@@ -234,6 +250,15 @@ pub trait LightningProvider: Send + Sync {
 
     /// Check whether the Lightning backend is connected and operational.
     async fn is_available(&self) -> bool;
+
+    /// How current the figures from `get_balance_msat` / `list_channels` are.
+    ///
+    /// Default: [`WalletSync::Live`], correct for backends that query a remote
+    /// node on every call. Backends that serve from a locally synced wallet
+    /// (LDK) must override this.
+    async fn wallet_sync(&self) -> WalletSync {
+        WalletSync::Live
+    }
 
     /// Cleanly shut down the Lightning backend.
     ///
@@ -546,5 +571,31 @@ mod tests {
         let json = serde_json::to_string(&invoice).unwrap();
         let deserialized: Invoice = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.amount_msat, 1000);
+    }
+
+    struct QueryPerCall;
+
+    #[async_trait]
+    impl LightningProvider for QueryPerCall {
+        async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
+            Err(LightningError::Backend("unused".into()))
+        }
+        async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+            Err(LightningError::Backend("unused".into()))
+        }
+        async fn get_payment_status(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+            Err(LightningError::Backend("unused".into()))
+        }
+        async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+            Ok(0)
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_sync_defaults_to_live() {
+        assert_eq!(QueryPerCall.wallet_sync().await, WalletSync::Live);
     }
 }
