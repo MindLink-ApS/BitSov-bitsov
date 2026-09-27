@@ -95,6 +95,8 @@ to "age unknown".
 Note for the app side: the pre-implementation spec (bitsov-app F4) proposed
 `BitSov-Data-As-Of` as ASCII digits (ms since epoch). The node sends RFC 3339
 UTC instead; the app's header parser must accept that form.
+The deviation is deliberate; see the reconciled spec,
+[`specs/G-STALENESS-MARKER.md`](specs/G-STALENESS-MARKER.md).
 
 ## Changelog
 
