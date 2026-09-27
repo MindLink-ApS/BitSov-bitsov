@@ -151,6 +151,8 @@ fn default_file_limit() -> u32 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendFileRequest {
+    #[serde(default)]
+    pub max_total_msat: Option<u64>,
     /// Recipient node ID (hex).
     pub recipient: String,
 }
@@ -369,6 +371,15 @@ async fn send_file(
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
     let recipient = Recipient::Node(peer_id);
 
+    // Pricing for file transfer
+    let price_msat = state
+        .pricing
+        .get_price_msat(KIND_FILE_REF)
+        .await
+        .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+
+    super::messages::caps::check(super::messages::caps::payable(price_msat), req.max_total_msat)?;
+
     // Build FilePayload JSON
     let payload = FilePayload {
         filename: file.filename.clone(),
@@ -391,13 +402,6 @@ async fn send_file(
             ))
         })?;
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
-
-    // Pricing for file transfer
-    let price_msat = state
-        .pricing
-        .get_price_msat(KIND_FILE_REF)
-        .await
-        .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
 
     // Create real payment proof — requests invoice from recipient (Principle 2).
     let (payment_hash, preimage, amount_msat) =

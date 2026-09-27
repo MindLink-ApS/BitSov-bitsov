@@ -2240,7 +2240,7 @@ async fn compose_keysend_fallback_to_invoice() {
             Ok(vec![])
         }
         async fn keysend(&self, _dest: &str, _amt: u64, _memo: Option<&str>) -> Result<PaymentDetails, LightningError> {
-            Err(LightningError::PaymentFailed("keysend not supported".into()))
+            Err(LightningError::PaymentNotDispatched("keysend not supported".into()))
         }
         async fn is_available(&self) -> bool {
             true
@@ -2745,7 +2745,7 @@ async fn compose_records_send_timestamp_for_stdp() {
 // ─── Room Compose: All Members Fail ───────────────────────────────
 
 #[tokio::test]
-async fn compose_room_all_members_fail_returns_error() {
+async fn compose_room_all_members_fail_returns_explicit_refusals() {
     // When no room member has an E2EE session, compose should return 400.
     let invoice_requests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
@@ -2861,9 +2861,14 @@ async fn compose_room_all_members_fail_returns_error() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::BAD_REQUEST,
-        "room compose with no E2EE sessions should return 400"
+        StatusCode::OK,
+        "room compose must expose each refusal"
     );
+    let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let outcomes = body["member_outcomes"].as_array().unwrap();
+    assert!(!outcomes.is_empty());
+    assert!(outcomes.iter().all(|row| row["status"] == "refused" && row["amount_msat"] == 0));
 
     // Verify no envelopes were sent.
     let sent = transport.sent_envelopes.lock().unwrap();

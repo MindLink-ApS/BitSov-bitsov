@@ -1153,10 +1153,10 @@ async fn keysend_invalid_hex_pubkey_returns_error() {
         .await
         .unwrap_err();
     match err {
-        LightningError::PaymentFailed(msg) => {
+        LightningError::PaymentNotDispatched(msg) => {
             assert!(msg.contains("invalid dest_pubkey hex"), "got: {msg}");
         }
-        other => panic!("expected PaymentFailed, got: {other:?}"),
+        other => panic!("expected PaymentNotDispatched, got: {other:?}"),
     }
 }
 

@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use konsensus_core::traits::lightning::{
-    LightningProvider, PaymentDetails, PaymentDirection, PaymentStatus,
+    LightningError, LightningProvider, PaymentDetails, PaymentDirection, PaymentStatus,
 };
 use konsensus_core::types::{MessageId, NodeId, Recipient};
 use konsensus_crypto::ratchet_message_to_bytes;
@@ -37,6 +37,10 @@ use crate::state::{AppState, InvoiceResponseData};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComposeRequest {
+    #[serde(default)]
+    pub max_total_msat: Option<u64>,
+    #[serde(default)]
+    pub max_recipient_msat: Option<std::collections::HashMap<String, u64>>,
     /// Recipient node ID (hex) or room ID (UUID when `is_room` is true).
     pub recipient: String,
     /// Whether the recipient is a room (true) or node (false).
@@ -54,12 +58,33 @@ pub struct ComposeRequest {
 /// Response after composing and sending a message.
 #[derive(Serialize)]
 pub struct ComposeResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_outcomes: Option<Vec<MemberPaymentOutcome>>,
     /// The message ID assigned to this envelope.
     pub message_id: String,
     /// Whether the message was delivered to a connected peer.
     pub delivered: bool,
-    /// Amount paid in millisatoshis.
+    /// Settled principal plus reserved principal for unknown room members.
     pub amount_msat: u64,
+}
+
+/// One room recipient's payment result. Unknown is never retry permission.
+#[derive(Serialize)]
+pub struct MemberPaymentOutcome {
+    pub recipient: String,
+    pub status: &'static str,
+    /// Settled principal, or the full reserved principal when status is unknown.
+    pub amount_msat: u64,
+    pub message_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, height: u64) -> Result<u64, ApiError> {
+    let price = match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
+        Some(price) => price,
+        None => state.pricing.get_price_msat(kind).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?,
+    };
+    Ok(super::caps::payable(price))
 }
 
 /// Maximum plaintext message size: 1 MiB.
@@ -176,10 +201,10 @@ async fn await_settlement(
     if initial.payment_hash.is_empty() {
         // Dispatched but not yet trackable (rare race where the backend had not
         // recorded the payment when it returned). Do NOT re-dispatch via another
-        // path — that would risk paying twice. Surface as retryable.
-        return Err(ApiError::Lightning(format!(
+        // path — that would risk paying twice. Preserve the unknown outcome.
+        return Err(ApiError::PaymentUnresolved(format!(
             "{method} dispatched but returned no payment hash to confirm settlement — \
-             not retrying to avoid a double payment; the message can be re-sent once the wallet settles"
+             not retrying to avoid a double payment; reconcile the original payment before any new send"
         )));
     }
 
@@ -192,7 +217,7 @@ async fn await_settlement(
             .get_payment_status(&initial.payment_hash)
             .await
             .map_err(|e| {
-                ApiError::Lightning(format!("{method}: failed to poll payment status: {e}"))
+                ApiError::PaymentUnresolved(format!("{method}: failed to poll payment status: {e}"))
             })?;
 
         match details.status {
@@ -205,7 +230,7 @@ async fn await_settlement(
             }
             PaymentStatus::Pending | PaymentStatus::InFlight => {
                 if waited >= PAYMENT_SETTLE_TIMEOUT {
-                    return Err(ApiError::Lightning(format!(
+                    return Err(ApiError::PaymentUnresolved(format!(
                         "{method} payment still in flight after {}s — not retrying to avoid a double payment",
                         PAYMENT_SETTLE_TIMEOUT.as_secs()
                     )));
@@ -225,8 +250,8 @@ async fn await_settlement(
 /// known (exchanged via `Frame::LightningInfo` after handshake), pushes sats
 /// directly to their node. No invoice request needed.
 ///
-/// **Invoice path** (fallback, ~100-200ms round-trip): If keysend is unavailable
-/// (peer has no Lightning pubkey, or keysend fails), falls back to the
+/// **Invoice path** (fallback, ~100-200ms round-trip): If the peer has no
+/// Lightning pubkey, or keysend is positively rejected before dispatch, use the
 /// RequestInvoice/InvoiceResponse/pay_invoice flow.
 ///
 /// Returns (payment_hash, preimage, amount_msat). Never falls back to fake proofs.
@@ -273,13 +298,13 @@ pub async fn create_payment_proof(
                 // Safe to fall through: no HTLC was dispatched.
             }
             Err(e) => {
-                // The keysend WAS dispatched but did not settle. Falling back to
-                // the invoice flow here would risk paying the recipient twice for
-                // one message, so surface the error instead of re-dispatching.
+                // No proof of non-dispatch: the payment may already have
+                // settled. Surface the unresolved/terminal error without a
+                // second payment path.
                 tracing::warn!(
                     peer = %peer_id,
                     error = %e,
-                    "keysend dispatched but did not settle — NOT falling back (double-pay guard)"
+                    "keysend outcome does not permit fallback (double-pay guard)"
                 );
                 return Err(e);
             }
@@ -295,9 +320,8 @@ pub async fn create_payment_proof(
 /// * `Ok(KeysendOutcome::Settled(proof))` — the HTLC settled.
 /// * `Ok(KeysendOutcome::NotDispatched)` — the `keysend` call failed before any
 ///   HTLC went out; the caller may safely fall back to the invoice flow.
-/// * `Err(_)` — the keysend WAS dispatched but did not settle (failed, expired,
-///   timed out, or untrackable). The caller must NOT fall back to another
-///   payment path, or it risks paying the recipient twice.
+/// * `Err(_)` — dispatch or settlement is uncertain, or a dispatched payment
+///   failed/expired. The caller must NOT fall back to another payment path.
 async fn try_keysend(
     state: &AppState,
     ln_pubkey: &str,
@@ -310,27 +334,33 @@ async fn try_keysend(
         .await
     {
         Ok(details) => details,
-        Err(e) => {
-            // The send itself failed — no HTLC was dispatched, so it is safe to
-            // fall back to the invoice flow without risking a double payment.
-            tracing::warn!(peer = %peer_id, error = %e, "keysend not dispatched");
+        Err(LightningError::PaymentNotDispatched(reason)) => {
+            tracing::warn!(peer = %peer_id, %reason, "keysend rejected before dispatch");
             return Ok(KeysendOutcome::NotDispatched);
+        }
+        Err(e) => {
+            // A response read/parse failure or timeout may follow settlement.
+            // Keep this amount reserved; NEVER create a second payment without
+            // positive evidence that the first was not dispatched.
+            return Err(ApiError::PaymentUnresolved(format!(
+                "keysend outcome unknown; not retrying via invoice: {e}"
+            )));
         }
     };
 
-    // Dispatched: from here we must not re-dispatch by another path. Poll the
+    // A payment record exists: never re-dispatch by another path. Poll any
     // in-flight payment to terminal settlement.
     let settled = await_settlement(&state.lightning, details, "keysend").await?;
 
     let preimage_hex = settled.preimage.ok_or_else(|| {
-        ApiError::Lightning("keysend settled but no preimage returned".into())
+        ApiError::PaymentProofUnavailable { amount_msat, reason: "keysend settled but no preimage returned".into() }
     })?;
 
     let preimage_bytes: [u8; 32] = hex::decode(&preimage_hex)
         .ok()
         .and_then(|v| <[u8; 32]>::try_from(v).ok())
         .ok_or_else(|| {
-            ApiError::Lightning(format!("malformed preimage from keysend: {preimage_hex}"))
+            ApiError::PaymentProofUnavailable { amount_msat, reason: "malformed proof from settled keysend".into() }
         })?;
 
     let hash_bytes: [u8; 32] = Sha256::digest(preimage_bytes).into();
@@ -456,20 +486,20 @@ async fn create_payment_proof_via_invoice(
         .lightning
         .pay_invoice(&response.bolt11)
         .await
-        .map_err(|e| ApiError::Lightning(format!("failed to pay recipient invoice: {e}")))?;
+        .map_err(|e| ApiError::PaymentUnresolved(format!("failed to pay recipient invoice: {e}")))?;
 
     let details = await_settlement(&state.lightning, details, "invoice payment").await?;
 
     // Extract and validate the preimage.
     let preimage_hex = details.preimage.ok_or_else(|| {
-        ApiError::Lightning("payment succeeded but no preimage returned".into())
+        ApiError::PaymentProofUnavailable { amount_msat: invoice_amount_msat, reason: "payment succeeded but no preimage returned".into() }
     })?;
 
     let preimage_bytes: [u8; 32] = hex::decode(&preimage_hex)
         .ok()
         .and_then(|v| <[u8; 32]>::try_from(v).ok())
         .ok_or_else(|| {
-            ApiError::Lightning(format!("malformed preimage from Lightning: {preimage_hex}"))
+            ApiError::PaymentProofUnavailable { amount_msat: invoice_amount_msat, reason: "malformed proof from settled invoice payment".into() }
         })?;
 
     let hash_bytes: [u8; 32] = Sha256::digest(preimage_bytes).into();
@@ -1385,7 +1415,6 @@ struct RoomFanoutCtx<'a> {
     plaintext: &'a str,
     references: &'a [MessageId],
     kind: u16,
-    current_block_height: u64,
 }
 
 /// Result of fanning a room message out to a single member.
@@ -1396,12 +1425,17 @@ struct RoomFanoutCtx<'a> {
 /// *after* the bounded-concurrency fan-out completes, so individual member
 /// futures never touch shared state and can run in parallel safely.
 struct RoomMemberOutcome {
-    /// The composed-and-stored envelope for this member.
-    envelope: konsensus_core::UkmEnvelope,
-    /// Amount paid to this member, in millisatoshis.
-    amount_msat: u64,
-    /// Whether the envelope was delivered directly (vs. queued for later).
+    envelope: Option<konsensus_core::UkmEnvelope>,
+    receipt: MemberPaymentOutcome,
     delivered: bool,
+}
+
+impl RoomMemberOutcome {
+    fn stopped(member: NodeId, status: &'static str, amount: u64, reason: String) -> Self {
+        Self { envelope: None, delivered: false, receipt: MemberPaymentOutcome {
+            recipient: member.to_hex(), status, amount_msat: amount, message_id: None, reason: Some(reason),
+        } }
+    }
 }
 
 /// Compose, pay, encrypt, store, and deliver a room message for **one** member.
@@ -1411,20 +1445,15 @@ struct RoomMemberOutcome {
 /// member is independently gated (Principle 2) — each gets its own E2EE
 /// ciphertext, its own Lightning payment proof, and its own signed envelope.
 ///
-/// Returns `Ok(None)` when the member should be skipped gracefully (self, no
-/// E2EE session, payment proof unavailable / offline, or a storage error) — the
-/// same skip conditions the original serial loop handled with `continue`.
-/// Returns `Err` only for a hard pricing-engine failure, matching the original
-/// behaviour where such an error aborted the whole compose.
+/// Always reports this member's payment outcome. The caller has already
+/// excluded self and checked every price against the confirmed room budget.
+/// A settled payment remains settled even when proof or storage fails.
 async fn compose_room_member(
     state: &AppState,
     ctx: &RoomFanoutCtx<'_>,
     member: NodeId,
-) -> Result<Option<RoomMemberOutcome>, ApiError> {
-    // Don't send to self.
-    if &member == state.identity.node_id() {
-        return Ok(None);
-    }
+    price_msat: u64,
+) -> RoomMemberOutcome {
 
     // Encrypt via Double Ratchet for this specific member.
     let ratchet_msg = match state.session_manager.encrypt(&member, ctx.plaintext.as_bytes()).await {
@@ -1435,36 +1464,13 @@ async fn compose_room_member(
                 error = %e,
                 "skipping room member: E2EE session not established"
             );
-            return Ok(None);
+            return RoomMemberOutcome::stopped(member, "refused", 0, "E2EE session unavailable; nothing paid".into());
         }
     };
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
-    // Get price for this member. The plasticity trust discount (if any) is
-    // applied exactly once inside the cache's single choke point
-    // (`get_fresh_discounted_peer_price`) — never re-applied here. This keeps
-    // the room fan-out on the same money-path invariant as the peer compose
-    // path (HARD-13): one base price, one discount, no compounding drift.
-    let price_msat = match state
-        .peer_prices
-        .get_fresh_discounted_peer_price(
-            &member,
-            ctx.kind,
-            ctx.current_block_height,
-            MAX_PRICE_AGE,
-        )
-        .await
-    {
-        Some(discounted_price) => discounted_price,
-        None => state
-            .pricing
-            .get_price_msat(ctx.kind)
-            .await
-            .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?,
-    };
-
     // Create payment proof — requests invoice from recipient's wallet (Principle 2).
-    // For room messages, skip offline members gracefully (they'll get it when they reconnect).
+    // Preserve refused vs unresolved payment state for every member.
     let (payment_hash, preimage_bytes, amount_msat) =
         match create_payment_proof(state, price_msat, &member).await {
             Ok(proof) => proof,
@@ -1474,7 +1480,11 @@ async fn compose_room_member(
                     error = %e,
                     "skipping room member: payment proof unavailable (offline?)"
                 );
-                return Ok(None);
+                return match e {
+                    ApiError::PaymentUnresolved(_) => RoomMemberOutcome::stopped(member, "unknown", price_msat, "Payment outcome unresolved; do not retry".into()),
+                    ApiError::PaymentProofUnavailable { amount_msat, reason } => RoomMemberOutcome::stopped(member, "settled", amount_msat, reason),
+                    _ => RoomMemberOutcome::stopped(member, "refused", 0, "Payment was not dispatched or was confirmed failed".into()),
+                };
             }
         };
 
@@ -1497,7 +1507,7 @@ async fn compose_room_member(
     // Store.
     if let Err(e) = state.storage.store_message(&envelope).await {
         tracing::warn!(peer = %member, error = %e, "failed to store room message");
-        return Ok(None);
+        return RoomMemberOutcome::stopped(member, "settled", amount_msat, "Payment settled but message storage failed".into());
     }
 
     // Cache plaintext (encrypted at rest) for API retrieval.
@@ -1537,11 +1547,11 @@ async fn compose_room_member(
         }
     };
 
-    Ok(Some(RoomMemberOutcome {
-        envelope,
-        amount_msat,
-        delivered,
-    }))
+    RoomMemberOutcome {
+        receipt: MemberPaymentOutcome { recipient: member.to_hex(), status: "settled", amount_msat,
+            message_id: Some(envelope.id.to_hex()), reason: None },
+        envelope: Some(envelope), delivered,
+    }
 }
 
 /// `POST /api/v1/messages/compose` — compose, encrypt, pay, and send a message.
@@ -1645,6 +1655,12 @@ pub(super) async fn compose_message(
             }
         };
 
+        let mut prices = Vec::new();
+        for member in members.iter().filter(|m| *m != state.identity.node_id()) {
+            prices.push((*member, quoted_price(&state, member, req.kind, current_block_height).await?));
+        }
+        super::caps::check_room(&prices, req.max_total_msat, req.max_recipient_msat.as_ref())?;
+
         // Fan out to members with bounded parallelism. Each member future is
         // fully independent (its own payment proof + envelope — Principle 2 is
         // unchanged) and touches no shared state; we keep the original index so
@@ -1657,30 +1673,21 @@ pub(super) async fn compose_message(
             plaintext: req.plaintext.as_str(),
             references: &references,
             kind: req.kind,
-            current_block_height,
         };
         let mut outcomes: Vec<(usize, RoomMemberOutcome)> = futures::stream::iter(
-            members.iter().copied().enumerate(),
+            prices.into_iter().enumerate(),
         )
-        .map(|(idx, member)| {
+        .map(|(idx, (member, price))| {
             let state = &state;
             let ctx = &ctx;
             async move {
-                let result = compose_room_member(state, ctx, member).await;
+                let result = compose_room_member(state, ctx, member, price).await;
                 (idx, result)
             }
         })
         .buffer_unordered(MAX_ROOM_FANOUT_CONCURRENCY)
-        // A hard pricing-engine error aborts the whole compose, mirroring the
-        // original serial loop's `?` propagation.
-        .map(|(idx, result)| result.map(|opt| opt.map(|outcome| (idx, outcome))))
-        .collect::<Vec<Result<Option<(usize, RoomMemberOutcome)>, ApiError>>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, ApiError>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+        .collect::<Vec<_>>()
+        .await;
 
         // Restore deterministic ordering: the canonical message + WS broadcast
         // is the lowest-indexed member that succeeded, matching the old
@@ -1692,15 +1699,15 @@ pub(super) async fn compose_message(
         let mut first_message_id: Option<String> = None;
 
         for (_idx, outcome) in &outcomes {
-            total_amount_msat = total_amount_msat.saturating_add(outcome.amount_msat);
+            total_amount_msat = total_amount_msat.saturating_add(outcome.receipt.amount_msat);
             any_delivered |= outcome.delivered;
 
-            if first_message_id.is_none() {
-                first_message_id = Some(outcome.envelope.id.to_hex());
+            if let Some(envelope) = outcome.envelope.as_ref().filter(|_| first_message_id.is_none()) {
+                first_message_id = Some(envelope.id.to_hex());
 
                 // Broadcast to WS once (with plaintext — we composed this message).
                 if let Err(e) = state.ws_broadcast.send(Arc::new(crate::state::WsMessage {
-                    envelope: outcome.envelope.clone(),
+                    envelope: envelope.clone(),
                     plaintext: Some(req.plaintext.clone()),
                 })) {
                     tracing::debug!(
@@ -1711,26 +1718,8 @@ pub(super) async fn compose_message(
             }
         }
 
-        let message_id = match first_message_id {
-            Some(id) => id,
-            None => {
-                // No messages could be composed for any room member — all were skipped
-                // due to missing E2EE sessions, payment failures, or storage errors.
-                state.audit_log.record(
-                    "room_compose_failed",
-                    &sender.to_hex(),
-                    Some(serde_json::json!({
-                        "kind": req.kind,
-                        "room_id": req.recipient,
-                        "member_count": members.len(),
-                        "reason": "no members reachable",
-                    })),
-                );
-                return Err(ApiError::BadRequest(
-                    "could not compose message for any room member — E2EE sessions may not be established".into(),
-                ));
-            }
-        };
+        // Even when every member is refused/unknown, return every outcome.
+        let message_id = first_message_id.unwrap_or_default();
 
         state.audit_log.record(
             events::MESSAGE_COMPOSED,
@@ -1745,6 +1734,7 @@ pub(super) async fn compose_message(
         );
 
         Ok(Json(ComposeResponse {
+            member_outcomes: Some(outcomes.into_iter().map(|(_, o)| o.receipt).collect()),
             message_id,
             delivered: any_delivered,
             amount_msat: total_amount_msat,
@@ -1754,6 +1744,14 @@ pub(super) async fn compose_message(
         let peer_id = NodeId::from_hex(&req.recipient)
             .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
         let recipient = Recipient::Node(peer_id);
+
+        let height = state.chain.get_block_height().await.unwrap_or(0);
+        let price_msat = quoted_price(&state, &peer_id, req.kind, height).await?;
+        super::caps::check(price_msat, req.max_total_msat)?;
+        if let Some(per) = &req.max_recipient_msat {
+            let cap = per.get(&peer_id.to_hex()).ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
+            super::caps::check(price_msat, Some(*cap))?;
+        }
 
         // Encrypt via Double Ratchet.
         //
@@ -1803,6 +1801,9 @@ pub(super) async fn compose_message(
                     peer = %peer_id,
                     "no E2EE session with connected peer — attempting paid first-contact admission"
                 );
+                if req.max_total_msat.is_some() || req.max_recipient_msat.is_some() {
+                    return Err(ApiError::PriceCapExceeded("First-contact admission has no confirmed quote. Establish admission separately before a capped send; no invoice was requested or paid.".into()));
+                }
                 first_contact_admission(&state, &peer_id).await?;
 
                 // Poll for the session the target establishes after promotion via
@@ -1837,46 +1838,6 @@ pub(super) async fn compose_message(
             }
         };
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
-
-        // Get price
-        let current_block_height = match state.chain.get_block_height().await {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to get block height for compose, using fallback 0");
-                0
-            }
-        };
-        let price_msat = match state
-            .peer_prices
-            .get_fresh_discounted_peer_price(
-                &peer_id,
-                req.kind,
-                current_block_height,
-                MAX_PRICE_AGE,
-            )
-            .await
-        {
-            Some(discounted) => {
-                // The plasticity trust discount the peer offered us (based on our
-                // synaptic weight in their routing table) was already applied
-                // exactly once inside the cache. `discount` is read here for
-                // observability only — it is NOT re-applied to the price.
-                let discount = state.peer_prices.get_trust_discount(&peer_id).await;
-                tracing::debug!(
-                    peer = %peer_id,
-                    kind = req.kind,
-                    trust_discount = discount,
-                    price_msat = discounted,
-                    "using peer-announced price with plasticity discount"
-                );
-                discounted
-            }
-            None => state
-                .pricing
-                .get_price_msat(req.kind)
-                .await
-                .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?,
-        };
 
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
         let (payment_hash, preimage_bytes, amount_msat) =
@@ -1967,6 +1928,7 @@ pub(super) async fn compose_message(
         );
 
         Ok(Json(ComposeResponse {
+            member_outcomes: None,
             message_id: envelope.id.to_hex(),
             delivered,
             amount_msat,

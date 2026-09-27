@@ -832,7 +832,7 @@ impl LightningProvider for LndProvider {
         // LND's keysend via REST uses the sendpayment endpoint with dest + keysend_preimage
         // The dest must be base64-encoded for the REST API
         let dest_bytes = hex::decode(dest_pubkey).map_err(|e| {
-            LightningError::PaymentFailed(format!("invalid dest_pubkey hex: {e}"))
+            LightningError::PaymentNotDispatched(format!("invalid dest_pubkey hex: {e}"))
         })?;
 
         use base64::Engine;

@@ -120,6 +120,12 @@ pub struct InboundPayment {
 /// Errors from Lightning operations.
 #[derive(Debug, Error)]
 pub enum LightningError {
+    /// Positively proven to have failed BEFORE payment dispatch. Only this
+    /// variant permits a caller to try another payment path. Never use it for
+    /// a response error, timeout, or an unclassified backend/connection error.
+    #[error("payment not dispatched: {0}")]
+    PaymentNotDispatched(String),
+
     /// Invoice creation failed.
     #[error("invoice creation failed: {0}")]
     InvoiceCreation(String),
@@ -303,14 +309,16 @@ pub trait LightningProvider: Send + Sync {
     /// * `amount_msat` — Amount in millisatoshis.
     /// * `memo` — Optional memo attached via custom TLV.
     ///
-    /// Default implementation returns `Err(Backend("keysend not supported"))`.
+    /// Only `PaymentNotDispatched` guarantees that no payment was initiated.
+    /// Every other error is ambiguous: callers must not retry via an invoice.
+    /// The default implementation rejects locally without dispatch.
     async fn keysend(
         &self,
         _dest_pubkey: &str,
         _amount_msat: u64,
         _memo: Option<&str>,
     ) -> Result<PaymentDetails, LightningError> {
-        Err(LightningError::Backend(
+        Err(LightningError::PaymentNotDispatched(
             "keysend not supported by this provider".into(),
         ))
     }
