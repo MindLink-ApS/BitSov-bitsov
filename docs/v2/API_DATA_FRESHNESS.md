@@ -1,6 +1,6 @@
 # Data freshness headers (G-STALENESS-MARKER)
 
-Five read routes tell the caller how old the data in the response is, so a
+Six read routes tell the caller how old the data in the response is, so a
 client can tell "the node answered just now" apart from "the node's figures
 are current". Code: `crates/konsensus-api/src/freshness.rs`. Tests:
 `crates/konsensus-api/tests/data_freshness_tests.rs`.
@@ -38,6 +38,7 @@ not turn stale data into an error; that is the client's decision.
 | `GET /api/v1/health` | Time the chain backend was queried for `block_height` (a live query per request). **Absent** when `block_height` is null (query failed) | never |
 | `GET /api/v1/messages` | Time the local message store was read for this response. The store is the node's own and authoritative, so this is "read just now", present for uniformity | never |
 | `GET /api/v1/pricing` | Chain-aware engine: the oldest real chain fetch among the values being served (each per-target fee rate and the block height); a value reused after a failed fetch keeps its old time. Static engine: time of the read (static prices do not depend on chain data) | chain-aware only: that oldest fetch is at or past the engine's `cache_ttl` (default 60 s), or there is no cached state |
+| `GET /api/v1/peers` | Time the node's peer registry and live connection set were read for this response. Both are the node's own, so this is "read just now"; a client answer that lists peers (for example the app's spend answer) can then state its age | never |
 
 ### Wallet sync time (`/payments/balance`, `/payments/channels`)
 
@@ -82,7 +83,7 @@ whose age could be stated. Clients must treat "no header" as "age unknown".
 
 ## Other routes
 
-Only the five routes above. `/api/v1/status`, `/pricing/peers`, and every
+Only the six routes above. `/api/v1/status`, `/pricing/peers`, and every
 other route do not send the headers; they may adopt them later.
 
 ## CORS
