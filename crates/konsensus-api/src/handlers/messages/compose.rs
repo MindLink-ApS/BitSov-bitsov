@@ -348,7 +348,7 @@ pub(crate) async fn create_metered_payment_proof(
     }
 
     // Invoice-request fallback (only reached when keysend was not dispatched).
-    match create_payment_proof_via_invoice(state, payment_amount_msat, peer_id, debit).await {
+    match create_payment_proof_via_invoice(state, payment_amount_msat, peer_id, debit, None).await {
         Err(e) if is_admission_refusal(&e) => {
             readmit_then_pay(state, payment_amount_msat, peer_id, debit, readmission, kind, charge).await
         }
@@ -436,6 +436,7 @@ async fn readmit_then_pay(
     } else {
         Some(acquire_peer_admission_lock(peer_id).await.ok_or_else(|| ApiError::Internal("admission capacity reached".into()))?)
     };
+    recover_admission_attempt(state, peer_id)?;
     let connected_since = state.transport.connected_since(peer_id).await;
     let had_settled = matches!(lock_admission_ledger().entries.get(peer_id), Some(AdmissionRecord::Settled { .. }));
     let covered = state.transport.admission_paid_on_connection(peer_id).await
@@ -464,14 +465,20 @@ async fn readmit_then_pay(
     if amount_msat == 0 { return Ok(generate_valid_proof(0)); }
     let amount_msat = amount_msat.max(MIN_INVOICE_AMOUNT_MSAT);
 
-    let mut waited = Duration::ZERO;
+    let deadline = tokio::time::Instant::now() + READMIT_PROMOTION_TIMEOUT;
     loop {
-        match create_payment_proof_via_invoice(state, amount_msat, peer_id, debit).await {
-            // Refusals cost nothing on either side and never pay; wait for the
-            // promotion instead of paying admission a second time.
-            Err(e) if is_admission_refusal(&e) && waited < READMIT_PROMOTION_TIMEOUT => {
-                tokio::time::sleep(READMIT_PROMOTION_POLL_INTERVAL).await;
-                waited += READMIT_PROMOTION_POLL_INTERVAL;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(admission_refusal(peer_id));
+        }
+        match create_payment_proof_via_invoice(state, amount_msat, peer_id, debit, Some(deadline)).await {
+            // One wall-clock budget includes every prepayment request/response
+            // and retry sleep. A payment already dispatched is never cancelled.
+            Err(e) if is_admission_refusal(&e) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(e);
+                }
+                tokio::time::sleep_until((now + READMIT_PROMOTION_POLL_INTERVAL).min(deadline)).await;
             }
             other => return other,
         }
@@ -548,6 +555,7 @@ async fn create_payment_proof_via_invoice(
     invoice_amount_msat: u64,
     peer_id: &NodeId,
     debit: &Debit,
+    promotion_deadline: Option<tokio::time::Instant>,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     // Generate a unique request ID for correlating request/response.
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -579,52 +587,47 @@ async fn create_payment_proof_via_invoice(
         .to_bytes()
         .map_err(|e| ApiError::Internal(format!("frame serialization error: {e}")))?;
 
-    let sent = debit.request_invoice(state.transport.send_raw_frame(peer_id, &frame_bytes)).await;
-    if sent.is_err() {
-        state.invoice_requests.lock().await.remove(&request_id);
-    }
-    if let Err(e) = sent? {
-        // Clean up the pending request on failure.
-        state.invoice_requests.lock().await.remove(&request_id);
-        return Err(ApiError::Internal(format!(
-            "failed to send invoice request to peer: {e}"
-        )));
-    }
+    // Only the prepayment exchange is cancellable by the promotion deadline.
+    // Once an invoice is accepted below, dispatch and settlement keep their
+    // existing financial outcome handling even if this deadline then elapses.
+    let response = async {
+        debit.request_invoice(state.transport.send_raw_frame(peer_id, &frame_bytes))
+            .await?
+            .map_err(|e| ApiError::Internal(format!(
+                "failed to send invoice request to peer: {e}"
+            )))?;
 
-    tracing::info!(
-        peer = %peer_id,
-        %request_id,
-        invoice_amount_msat,
-        method = "invoice",
-        "sent invoice request to recipient — awaiting response"
-    );
+        tracing::info!(
+            peer = %peer_id, %request_id, invoice_amount_msat, method = "invoice",
+            "sent invoice request to recipient — awaiting response"
+        );
 
-    // Wait for the response (with timeout).
-    let response = tokio::time::timeout(INVOICE_REQUEST_TIMEOUT, rx).await;
-    let _refusal = binding.finish();
-    let response = response
-        .map_err(|_| {
-            // Clean up stale request on timeout.
-            let request_id = request_id.clone();
-            let invoice_requests = Arc::clone(&state.invoice_requests);
-            tokio::spawn(async move {
-                invoice_requests.lock().await.remove(&request_id);
-            });
-            ApiError::Internal(
-                "Invoice request timed out — recipient did not respond within 30s".into(),
-            )
-        })?
-        .map_err(|_| {
-            ApiError::Lightning(
-                "Recipient could not create invoice — their Lightning wallet may be unavailable".into(),
-            )
-        })?
-        .map_err(|error| {
-            if error.recipient != *peer_id {
-                return ApiError::Lightning("invoice refusal came from another recipient".into());
-            }
-            invoice_refused(peer_id, Some(error.reason))
-        })?;
+        tokio::time::timeout(INVOICE_REQUEST_TIMEOUT, rx)
+            .await
+            .map_err(|_| ApiError::Internal(
+                "Invoice request timed out — recipient did not respond within 30s".into()
+            ))?
+            .map_err(|_| ApiError::Lightning(
+                "Recipient could not create invoice — their Lightning wallet may be unavailable".into()
+            ))?
+            .map_err(|error| {
+                if error.recipient != *peer_id {
+                    return ApiError::Lightning("invoice refusal came from another recipient".into());
+                }
+                invoice_refused(peer_id, Some(error.reason))
+            })
+    };
+    let response = if let Some(deadline) = promotion_deadline {
+        tokio::time::timeout_at(deadline, response)
+            .await
+            .unwrap_or_else(|_| Err(admission_refusal(peer_id)))
+    } else {
+        response.await
+    };
+    let _ = binding.finish();
+    // Includes deadline cancellation while sending, before the response wait.
+    state.invoice_requests.lock().await.remove(&request_id);
+    let response = response?;
 
     tracing::info!(
         peer = %peer_id,
@@ -667,6 +670,10 @@ async fn create_payment_proof_via_invoice(
                 "invoice payee does not match recipient".into(),
             ));
         }
+    }
+
+    if promotion_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        return Err(admission_refusal(peer_id));
     }
 
     // Pay the recipient's invoice, then poll the in-flight payment to terminal
@@ -844,6 +851,9 @@ enum AdmissionRecord {
     /// to pay again if proof construction failed.
     Settled {
         settled_at: Instant,
+        /// Recovered wall-clock evidence has no identity for this connection.
+        /// Its timestamp bounds cache retention, never current admission.
+        recovered: bool,
         /// The signed admission envelope, attached once built. Kept so a retry can
         /// re-deliver the PROOF without re-paying (heals settled-but-envelope-lost).
         envelope: Option<Box<konsensus_core::UkmEnvelope>>,
@@ -933,6 +943,7 @@ impl AdmissionLedger {
             peer,
             AdmissionRecord::Settled {
                 settled_at: now,
+                recovered: false,
                 envelope: None,
             },
         );
@@ -966,19 +977,20 @@ impl AdmissionLedger {
     /// For a re-admission: whether a settled admission covers our current
     /// connection to `peer`, established at `connected_since` (unknown counts
     /// as covered, so an untracked transport never pays twice). A settlement
-    /// older than the connection paid for a previous one: it is forgotten here
-    /// so the paid path runs again.
+    /// older than the connection, or recovered without connection identity,
+    /// paid for a previous one: it is forgotten here so the paid path runs again.
+    /// The transport's live paid flag takes precedence at the caller.
     fn settled_on_connection(
         &mut self,
         peer: &NodeId,
         connected_since: Option<Instant>,
         now: Instant,
     ) -> bool {
-        let Some(AdmissionRecord::Settled { settled_at, .. }) = self.entries.get(peer) else {
+        let Some(AdmissionRecord::Settled { settled_at, recovered, .. }) = self.entries.get(peer) else {
             self.prune(now);
             return false;
         };
-        if connected_since.is_some_and(|since| *settled_at < since) {
+        if connected_since.is_some_and(|since| *recovered || *settled_at < since) {
             self.entries.remove(peer);
             return false;
         }
@@ -1008,6 +1020,7 @@ impl AdmissionLedger {
             Some(AdmissionRecord::Settled {
                 settled_at,
                 envelope,
+                ..
             }) if now.saturating_duration_since(*settled_at) < ADMISSION_SETTLED_TTL => {
                 match envelope {
                     Some(env) => PriorAdmission::SettledWithProof(env.clone()),
@@ -1390,21 +1403,11 @@ async fn reconcile_admission_budget(
     Ok(())
 }
 
-async fn first_contact_admission(
-    state: &AppState,
-    peer_id: &NodeId,
-    kind: u16,
-    cap: Option<u64>,
-    charge: &mut FirstContactCharge,
-    debit: &Debit,
-) -> Result<(), ApiError> {
-    // 0b. Idempotence guard (now race-free under the per-peer lock): if we
-    //     already SETTLED an admission payment to this peer within the TTL, do
-    //     not pay again — re-send the proof envelope (best-effort) and let the
-    //     caller resume polling for the session. This is the fix for the
-    //     post-settlement retry double-pay: session-poll timeout → compose
-    //     error → user retries → without this guard the stranger pays full
-    //     admission on every retry.
+/// Recover payment evidence before deciding whether the current connection is
+/// covered. In particular, a restarted sender must classify its settled journal
+/// against the new connection before deciding to resend a proof. Uncertain
+/// attempts remain recovery guards and never authorize another payment.
+fn recover_admission_attempt(state: &AppState, peer_id: &NodeId) -> Result<(), ApiError> {
     // Reload a durable attempt before considering any new dispatch. An unknown
     // backend result (including PaymentNotFound) never authorizes a new invoice.
     if matches!(
@@ -1427,6 +1430,9 @@ async fn first_contact_admission(
                 if let Some(envelope) = attempt.envelope {
                     let settled_at = Instant::now().checked_sub(settled_age.unwrap_or_default()).unwrap_or_else(Instant::now);
                     ledger.record_settled(*peer_id, settled_at);
+                    if let Some(AdmissionRecord::Settled { recovered, .. }) = ledger.entries.get_mut(peer_id) {
+                        *recovered = true;
+                    }
                     ledger.attach_envelope(peer_id, envelope);
                 } else {
                     ledger.record_dispatch_unknown(
@@ -1442,6 +1448,25 @@ async fn first_contact_admission(
             }
         }
     }
+    Ok(())
+}
+
+async fn first_contact_admission(
+    state: &AppState,
+    peer_id: &NodeId,
+    kind: u16,
+    cap: Option<u64>,
+    charge: &mut FirstContactCharge,
+    debit: &Debit,
+) -> Result<(), ApiError> {
+    // 0b. Idempotence guard (now race-free under the per-peer lock): if we
+    //     already SETTLED an admission payment to this peer within the TTL, do
+    //     not pay again — re-send the proof envelope (best-effort) and let the
+    //     caller resume polling for the session. This is the fix for the
+    //     post-settlement retry double-pay: session-poll timeout → compose
+    //     error → user retries → without this guard the stranger pays full
+    //     admission on every retry.
+    recover_admission_attempt(state, peer_id)?;
     if let Some((quoted_kind, price)) = lock_admission_ledger().quotes.get(peer_id) {
         if *quoted_kind == kind {
             charge.message_price = Some(*price);
