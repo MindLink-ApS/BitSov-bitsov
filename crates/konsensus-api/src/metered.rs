@@ -135,6 +135,8 @@ impl Debit {
         Self { held: None }
     }
 
+    pub(crate) fn is_metered(&self) -> bool { self.held.is_some() }
+
     /// Reconciliation reference only; never restores dispatch authority.
     pub(crate) fn reservation(&self) -> Option<Reservation> {
         self.held.as_ref().map(|(_, reservation)| reservation.clone())

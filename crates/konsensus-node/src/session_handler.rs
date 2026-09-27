@@ -125,6 +125,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         std::collections::HashMap::new();
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
+    let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
@@ -255,6 +256,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         handle_invoice_requested_gated(
                             &peer_id, &request_id, amount_msat, &purpose, privileged,
                             &pricing, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
+                            audit_log.membrane(), &mut last_admission_refusal,
                         ).await;
                     }
 
@@ -936,6 +938,8 @@ async fn handle_invoice_requested_gated(
     recipient: &NodeId,
     source_ip: std::net::IpAddr,
     quotes: &mut crate::admission_quotes::AdmissionQuotes,
+    membrane: &konsensus_api::membrane::Membrane,
+    last_admission_refusal: &mut crate::invoice_refusals::RefusalLimits,
 ) {
     use konsensus_core::admission_quote;
     if purpose == admission_quote::PURPOSE {
@@ -951,6 +955,9 @@ async fn handle_invoice_requested_gated(
             tokio::time::Instant::now(),
             unix,
         ) {
+            if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED).await;
+            }
             return;
         }
         // Exactly the first-contact chat price. Neither kind nor amount is
@@ -989,7 +996,9 @@ async fn handle_invoice_requested_gated(
                 request_id: request_id.into(),
                 reason: "stateless_quote_unsupported".into(),
             };
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), transport.send_frame(peer_id, &refusal)).await;
+            if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                let _ = transport.enqueue_control_frame(peer_id, &refusal).await;
+            }
             return;
         }
         if let Ok(Ok(invoice)) = invoice {
@@ -1025,6 +1034,14 @@ async fn handle_invoice_requested_gated(
         }
         return;
     }
+    if !privileged {
+        let now = tokio::time::Instant::now();
+        if last_admission_refusal.permit(source_ip, now) {
+            last_admission_refusal.event(peer_id, now, membrane);
+            send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
+        }
+        return;
+    }
     // Old arbitrary-kind/legacy admission requests fail closed, even if paid.
     if privileged && !purpose.starts_with(ADMISSION_INVOICE_PURPOSE) {
         handle_invoice_requested(
@@ -1034,11 +1051,14 @@ async fn handle_invoice_requested_gated(
             purpose,
             lightning,
             transport,
+            source_ip,
+            last_admission_refusal,
         )
         .await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_invoice_requested(
     peer_id: &NodeId,
     request_id: &str,
@@ -1046,6 +1066,8 @@ async fn handle_invoice_requested(
     purpose: &str,
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
+    source_ip: std::net::IpAddr,
+    refusals: &mut crate::invoice_refusals::RefusalLimits,
 ) {
     info!(
         peer = %peer_id, %request_id, amount_msat, %purpose,
@@ -1070,17 +1092,41 @@ async fn handle_invoice_requested(
                 peer = %peer_id, %request_id, error = %e,
                 "failed to create invoice for peer request — sending error to peer"
             );
+            if !refusals.permit(source_ip, tokio::time::Instant::now()) { return; }
             let error_frame = Frame::InvoiceError {
                 request_id: request_id.to_string(),
                 reason: format!("invoice creation failed: {e}"),
             };
-            if let Err(send_err) = transport.send_frame(peer_id, &error_frame).await {
+            if let Err(send_err) = transport.enqueue_control_frame(peer_id, &error_frame).await {
                 warn!(peer = %peer_id, %request_id, error = %send_err, "failed to send invoice error frame");
             }
         }
     }
 }
 
+/// Refuse a peer's invoice request out loud: nothing is created on our wallet,
+/// and the peer learns why at once instead of waiting out its request timeout.
+async fn send_invoice_refusal(
+    transport: &Arc<NoiseTransport>,
+    peer_id: &NodeId,
+    request_id: &str,
+    reason: &str,
+) {
+    let refusal = Frame::InvoiceError {
+        request_id: request_id.to_string(),
+        reason: reason.to_string(),
+    };
+    if let Err(e) = transport.enqueue_control_frame(peer_id, &refusal).await {
+        warn!(peer = %peer_id, %request_id, error = %e, "failed to send invoice refusal");
+    }
+}
+
+/// A peer answered one of our invoice requests with `InvoiceError`.
+///
+/// A peer we have not been paid by is still heard when the request was sent to
+/// that same peer (the binding in [`konsensus_api::invoice_refusal`]): it can
+/// only end our own request early, which it could do anyway by never answering.
+/// That is how a sender learns that a recipient now requires admission again.
 async fn handle_invoice_error_received(
     peer_id: &NodeId,
     request_id: &str,
@@ -1090,7 +1136,8 @@ async fn handle_invoice_error_received(
 ) {
     let bound_quote = request_id.starts_with(&format!("v1:{peer_id}:"))
         && reason == "stateless_quote_unsupported";
-    if !privileged && !bound_quote {
+    let bound = konsensus_api::invoice_refusal::record(request_id, peer_id, reason);
+    if !privileged && !bound_quote && !bound {
         warn!(peer = %peer_id, "DROP InvoiceError from unprivileged peer (P2: no pending-invoice bookkeeping drive before payment)");
         return;
     }
@@ -1512,3 +1559,7 @@ async fn handle_gossip_received(
 #[cfg(test)]
 #[path = "tests/session_handler.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/reconnect_two_node.rs"]
+mod reconnect_two_node;
