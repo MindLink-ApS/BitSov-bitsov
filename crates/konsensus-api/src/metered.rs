@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use crate::auth::{AuthUser, Scope};
 use crate::error::ApiError;
 use crate::pairing::PairingService;
-use crate::spend_budget::{BudgetRefusal, Charge, Reservation};
+use crate::spend_budget::{BudgetRefusal, Charge, FirstContactGrant, Reservation};
 use crate::state::AppState;
 
 /// An authenticated caller holding `spend`, with the meter that applies to it.
@@ -91,6 +91,64 @@ impl MeteredSpend {
             ))));
         }
         Ok(())
+    }
+
+    /// Whether this caller may pay right now: the owner always; a paired
+    /// client only while it holds a live budget grant.
+    pub fn has_live_grant(&self, state: &AppState) -> bool {
+        match &self.meter {
+            Meter::Owner => true,
+            Meter::Grant { client_id, .. } => state
+                .pairing
+                .as_ref()
+                .and_then(|service| service.grant_view_for(client_id))
+                .is_some(),
+        }
+    }
+
+    /// Issue the owner's one-time first-contact confirmation for `recipient`
+    /// (see [`FirstContactGrant`]). Only a paired client needs one; the
+    /// owner's own key is not metered and is refused here as a misuse.
+    pub fn grant_first_contact(
+        &self,
+        state: &AppState,
+        recipient: &str,
+        max_total_msat: u64,
+    ) -> Result<FirstContactGrant, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else {
+            return Err(ApiError::BadRequest(
+                "the owner's key is not metered; a first-contact grant is for a paired client".into(),
+            ));
+        };
+        let service = state
+            .pairing
+            .as_ref()
+            .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        service
+            .grant_first_contact(client_id, *epoch, recipient, max_total_msat)
+            .map_err(ApiError::BudgetExceeded)
+    }
+
+    /// For a first contact: the amount the owner confirmed for `recipient`,
+    /// consumed (single use). `Ok(None)` for the owner's own key, which is not
+    /// metered. A paired client without a live matching first-contact grant is
+    /// refused before anything is requested or paid.
+    pub fn take_first_contact(&self, state: &AppState, recipient: &str) -> Result<Option<u64>, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else {
+            return Ok(None);
+        };
+        state
+            .pairing
+            .as_ref()
+            .and_then(|service| service.take_first_contact(client_id, *epoch, recipient))
+            .map(Some)
+            .ok_or_else(|| {
+                ApiError::BudgetExceeded(BudgetRefusal::FirstContact(
+                    "a first contact needs the owner's one-time confirmation for this contact \
+                     (POST /api/v1/pair/first-contact-grant) — nothing was requested or paid"
+                        .into(),
+                ))
+            })
     }
 
     /// Debit a call's charges before anything is dispatched.

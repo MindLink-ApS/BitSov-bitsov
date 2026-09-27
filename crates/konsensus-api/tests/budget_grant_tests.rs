@@ -798,7 +798,9 @@ async fn first_contact_admission_is_not_paid_from_a_budget() {
             Some(&token),
         )
         .await;
-    assert_budget_exceeded(status, &body, "unpriced");
+    // Without the owner's one-time confirmation for this contact, nothing is
+    // requested or paid (budget_grant/first_contact.rs covers the grant).
+    assert_budget_exceeded(status, &body, "first_contact");
     assert_eq!(fx.wallet.money(), 0);
     assert!(fx.state.invoice_requests.lock().await.is_empty());
 }
@@ -1205,3 +1207,6 @@ async fn membrane_observes_direct_payment_budget_denials_without_invoice_data() 
     assert!(!serde_json::to_string(&events).unwrap().contains(&invoice));
     assert_eq!(fx.wallet.money(), 0);
 }
+
+#[path = "budget_grant/first_contact.rs"]
+mod first_contact;
