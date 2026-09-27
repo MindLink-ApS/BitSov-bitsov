@@ -108,6 +108,13 @@ it. If a write crosses a deadline, the expired grant is removed and the write
 is repeated before success is returned. Reads never expose expired records;
 a fallible disk read reports a cleanup failure instead of returning stale data.
 Failed deletions stay queued and the scheduler retries them once a second.
+Revocation removes spend authority immediately but keeps an inert, budgetless
+record in memory until its deletion is durable. A failed write therefore cannot
+make reads, sweeps or shutdown forget the deletion, even before the original
+expiry. The same rule applies to pairing revocation, epoch/key changes, identity
+rebind and grant replacement. A failed revocation still reports an error: if the
+process crashes before a retry succeeds, only the previously durable state can
+be recovered; startup always removes records whose absolute expiry has passed.
 
 Graceful shutdown purges expired grants when the scheduler stops and again after
 the API and backend tasks drain. The node waits for the scheduler and reports a

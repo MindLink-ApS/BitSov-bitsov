@@ -292,3 +292,136 @@ async fn expiry_offline_restart_purges_before_any_api_access() {
     assert_eq!(fx.compose(&read).await.0, StatusCode::FORBIDDEN);
     assert_eq!(fx.wallet.money(), 0);
 }
+
+#[tokio::test]
+async fn failed_revocation_paths_stay_inert_and_retry_durable_deletion() {
+    for operation in ["grant", "all", "epoch", "pairing", "rotation", "identity"] {
+        let fx = fixture().await;
+        let token = fx.grant(None, GrantTerms::new(10_000)).await;
+        let epoch = fx.service.snapshot().clients[0].epoch;
+        let blocker = fx.tmp.path().join("pairing/clients.json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        let result = match operation {
+            "grant" => fx.service.revoke_grants(Some(&fx.client_id)).map(|_| ()),
+            "all" => fx.service.revoke_grants(None).map(|_| ()),
+            "epoch" => fx.service.bump_epoch(&fx.client_id).map(|_| ()),
+            "pairing" => fx.service.revoke(&fx.client_id),
+            "rotation" => {
+                let new_key = SigningKey::from_bytes(&[9u8; 32]);
+                let new_pub = hex::encode(new_key.verifying_key().to_bytes());
+                let msg = format!("bitsov-pair-rotate-v1:{}:{new_pub}", fx.client_id);
+                let sig = hex::encode(fx.key.sign(msg.as_bytes()).to_bytes());
+                fx.service
+                    .rotate_client_key(&fx.client_id, &new_pub, &sig)
+                    .map(|_| ())
+            }
+            "identity" => fx.service.rebind_to_identity("replacement-identity"),
+            _ => unreachable!(),
+        };
+        assert!(result.is_err(), "{operation}: write fault must fire");
+        assert_eq!(disk_grants(&fx).as_array().unwrap().len(), 1);
+        assert!(fx.service.grant_view_for(&fx.client_id).is_none());
+        assert_eq!(fx.compose(&token).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            fx.service.reserve_spend(
+                &fx.client_id,
+                epoch,
+                vec![Charge {
+                    recipient: fx.peer.to_hex(),
+                    amount_msat: 1000
+                }],
+            ),
+            Err(BudgetRefusal::NoGrant),
+            "{operation}: failed deletion must never restore spend authority"
+        );
+        assert!(
+            fx.service.prune_expired_grants().is_err(),
+            "{operation}: cleanup forgot a deletion that is still blocked"
+        );
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(fx.service.prune_expired_grants().unwrap(), 1, "{operation}");
+        assert_eq!(
+            disk_grants(&fx),
+            json!([]),
+            "{operation}: deletion was lost"
+        );
+        assert_eq!(fx.service.prune_expired_grants().unwrap(), 0);
+        assert_eq!(fx.wallet.money(), 0);
+    }
+}
+
+#[tokio::test]
+async fn failed_revoke_is_purged_after_expiry_by_sweep() {
+    let (fx, expiry) = expiring_fixture().await;
+    let blocker = fx.tmp.path().join("pairing/clients.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(fx.service.revoke_grants(Some(&fx.client_id)).is_err());
+    std::fs::remove_dir(&blocker).unwrap();
+    wait_for_expiry(expiry).await;
+    assert_eq!(disk_grants(&fx).as_array().unwrap().len(), 1);
+    assert_eq!(fx.service.prune_expired_grants().unwrap(), 1);
+    assert_eq!(disk_grants(&fx), json!([]));
+}
+
+#[tokio::test]
+async fn failed_revoke_is_retried_at_shutdown_without_waiting_for_expiry() {
+    let fx = fixture().await;
+    fx.grant(None, GrantTerms::new(10_000)).await;
+    let blocker = fx.tmp.path().join("pairing/clients.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(fx.service.revoke_grants(Some(&fx.client_id)).is_err());
+    std::fs::remove_dir(&blocker).unwrap();
+    let (_stop, rx) = tokio::sync::watch::channel(true);
+    control::sweep_expired_grants(Arc::clone(&fx.service), rx).await;
+    assert_eq!(disk_grants(&fx), json!([]), "shutdown forgot failed revoke");
+}
+
+#[tokio::test]
+async fn failed_revoke_expired_disk_record_is_purged_at_startup() {
+    let (mut fx, expiry) = expiring_fixture().await;
+    let blocker = fx.tmp.path().join("pairing/clients.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(fx.service.revoke_grants(Some(&fx.client_id)).is_err());
+    wait_for_expiry(expiry).await;
+    assert!(PairingService::open(fx.tmp.path(), fx.service.bound_fingerprint(), true).is_err());
+    std::fs::remove_dir(&blocker).unwrap();
+    fx.restart();
+    assert_eq!(
+        disk_grants(&fx),
+        json!([]),
+        "startup must purge before API access"
+    );
+    assert_eq!(fx.wallet.money(), 0);
+}
+
+#[tokio::test]
+async fn failed_revoke_remains_retryable_if_replacement_write_also_fails() {
+    let fx = fixture().await;
+    fx.grant(None, GrantTerms::new(10_000)).await;
+    let old_id = disk_grants(&fx)[0]["op_id"].clone();
+    let request = fx
+        .service
+        .create_elevation_request(&fx.client_id, vec![Scope::Spend])
+        .unwrap();
+    let confirmation = fx
+        .console
+        .confirmation(&pairing::grant_confirmation_phrase(&request));
+    let blocker = fx.tmp.path().join("pairing/clients.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(fx.service.revoke_grants(Some(&fx.client_id)).is_err());
+    assert!(fx
+        .service
+        .grant_elevation(&request.op_id, &confirmation, GrantTerms::new(5000))
+        .is_err());
+    assert_eq!(disk_grants(&fx)[0]["op_id"], old_id);
+    std::fs::remove_dir(&blocker).unwrap();
+    // The pending replacement must not erase the old deletion obligation.
+    fx.service.prune_expired_grants().unwrap();
+    let grants = disk_grants(&fx);
+    assert!(grants
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|g| g["op_id"] != old_id));
+    assert_eq!(fx.wallet.money(), 0);
+}

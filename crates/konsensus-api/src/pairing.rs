@@ -249,7 +249,8 @@ pub struct SpendGrant {
     /// Always `"cli"`: the HTTP surface can never write one of these.
     pub granted_by: String,
     /// The meter. A grant without one (written by a pre-G1 node) is never
-    /// honoured and is dropped when the store is opened.
+    /// honoured and is dropped when the store is opened. In memory, removing
+    /// the meter also marks a revoked grant awaiting durable deletion.
     #[serde(default)]
     pub budget: Option<GrantBudget>,
 }
@@ -329,6 +330,23 @@ pub struct PairingFile {
     /// recreate an earlier `(client_id, epoch)` and resurrect a revoked JWT.
     #[serde(default)]
     pub last_epoch: BTreeMap<String, u64>,
+}
+
+impl PairingFile {
+    /// Revoke immediately without forgetting a deletion still owed to disk.
+    /// A budgetless grant is inert even if the clock moves backwards. Persist
+    /// prunes it from a candidate and only removes our record after success;
+    /// failed writes leave it here for reads, sweeps and shutdown to retry.
+    fn revoke_grants(&mut self, client_id: Option<&str>) -> usize {
+        let mut revoked = 0;
+        for grant in &mut self.grants {
+            if client_id.is_none_or(|id| grant.client_id == id) {
+                grant.budget = None;
+                revoked += 1;
+            }
+        }
+        revoked
+    }
 }
 
 /// Current durable schema version.
@@ -1157,7 +1175,7 @@ impl PairingService {
         // A grant is pinned to the epoch it was written against, so a
         // revocation drops the elevation with it rather than leaving a stale
         // `spend` waiting for the next pairing of the same key.
-        inner.file.grants.retain(|g| g.client_id != client_id);
+        inner.file.revoke_grants(Some(client_id));
         self.persist(&mut inner.file)?;
         Ok(epoch)
     }
@@ -1183,7 +1201,7 @@ impl PairingService {
             .or_insert(0);
         *tracked = (*tracked).max(existing.epoch);
         inner.file.clients.retain(|c| c.client_id != client_id);
-        inner.file.grants.retain(|g| g.client_id != client_id);
+        inner.file.revoke_grants(Some(client_id));
         inner
             .file
             .pending_elevations
@@ -1266,7 +1284,7 @@ impl PairingService {
         inner.file.clients.push(rotated.clone());
         // Grants do not survive a key rotation: they were written against a
         // specific client id and epoch by a deliberate owner action.
-        inner.file.grants.retain(|g| g.client_id != client_id);
+        inner.file.revoke_grants(Some(client_id));
         self.persist(&mut inner.file)?;
         Ok(rotated)
     }
@@ -1288,7 +1306,7 @@ impl PairingService {
         // ceremonies are also cleared, but that alone is not the identity
         // authority gate — see the final-lock check in `confirm_pairing`.
         inner.pending.clear();
-        inner.file.grants.clear();
+        inner.file.revoke_grants(None);
         inner.file.pending_elevations.clear();
         inner.file.replacement_approvals.clear();
         inner.owner_confirmations.clear();
@@ -1461,7 +1479,7 @@ impl PairingService {
             budget: Some(GrantBudget::from_terms(&terms)),
         };
         inner.file.pending_elevations.retain(|e| e.op_id != op_id);
-        inner.file.grants.retain(|g| g.client_id != grant.client_id);
+        inner.file.revoke_grants(Some(&grant.client_id));
         inner.file.grants.push(grant.clone());
         self.persist(&mut inner.file)?;
         inner.owner_confirmations.remove(op_id);
@@ -1772,12 +1790,7 @@ impl PairingService {
     /// request, because binding verification recomputes effective scopes.
     pub fn revoke_grants(&self, client_id: Option<&str>) -> Result<usize, PairingError> {
         let mut inner = self.lock();
-        let before = inner.file.grants.len();
-        inner
-            .file
-            .grants
-            .retain(|g| client_id.is_some_and(|id| g.client_id != id));
-        let removed = before - inner.file.grants.len();
+        let removed = inner.file.revoke_grants(client_id);
         self.persist(&mut inner.file)?;
         Ok(removed)
     }
