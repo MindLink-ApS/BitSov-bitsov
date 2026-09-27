@@ -791,6 +791,23 @@ where
 					return Ok(());
 				}
 
+                // Unknown BOLT11 payments are stateless quotes. LDK's inbound
+                // key expiry uses block-time tolerance, so enforce our signed
+                // wall-clock deadline before revealing the preimage/claiming.
+                if self.payment_store.get(&payment_id).is_none() {
+                    if let PaymentPurpose::Bolt11InvoicePayment { payment_secret, .. } = &purpose {
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+                        let metadata = onion_fields.as_ref().and_then(|f| f.payment_metadata.as_deref());
+                        if !now.is_ok_and(|now| crate::payment::bolt11::stateless_quote_valid(
+                            metadata, &payment_hash.0, &payment_secret.0, amount_msat,
+                            &self.channel_manager.get_our_node_id(), now.as_secs(),
+                        )) {
+                            self.channel_manager.fail_htlc_backwards(&payment_hash);
+                            return Ok(());
+                        }
+                    }
+                }
+
 				log_info!(
 					self.logger,
 					"Received payment from payment hash {} of {}msat",
@@ -1925,10 +1942,20 @@ mod bitsov_stateless_tests {
     use bitcoin::hashes::Hash;
     use lightning::events::bump_transaction::Wallet as LdkWallet;
 
+    #[derive(Default)]
+    struct ClaimLog(std::sync::Mutex<Vec<String>>);
+    impl crate::logger::LogWriter for ClaimLog {
+        fn log<'a>(&self, record: crate::logger::LogRecord<'a>) {
+            self.0.lock().unwrap().push(record.args.to_string());
+        }
+    }
+
     #[tokio::test]
     async fn stateless_settlement_persists_and_duplicate_cannot_erase_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let mut builder = crate::Builder::new();
+        let claim_log = Arc::new(ClaimLog::default());
+        builder.set_custom_logger(claim_log.clone());
         builder.set_network(bitcoin::Network::Regtest);
         builder.set_entropy_seed_bytes([43; 64]);
         builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
@@ -1948,6 +1975,22 @@ mod bitsov_stateless_tests {
         );
         let quote = node.bolt11_payment().receive_stateless(2000,
             &lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("quote".into()).unwrap()), 55).unwrap();
+        let deadline = quote.expires_at().unwrap().as_secs();
+        let valid = |metadata: Option<&[u8]>, now| crate::payment::bolt11::stateless_quote_valid(
+            metadata, quote.payment_hash().as_byte_array(), &quote.payment_secret().0, 2000, &node.node_id(), now);
+        let metadata = quote.payment_metadata().unwrap();
+        assert!(quote.features().unwrap().requires_payment_metadata());
+        assert!(valid(Some(metadata), deadline - 1));
+        assert!(!valid(Some(metadata), deadline));
+        assert!(!valid(Some(metadata), deadline + 1));
+        assert!(!valid(None, deadline - 1));
+        for index in [0, 11, 19, 20, metadata.len() - 1] {
+            let mut tampered = metadata.clone(); tampered[index] ^= 1;
+            assert!(!valid(Some(&tampered), deadline - 1));
+        }
+        let mut wrong_hash = quote.payment_hash().to_byte_array(); wrong_hash[0] ^= 1;
+        assert!(!crate::payment::bolt11::stateless_quote_valid(Some(metadata), &wrong_hash,
+            &quote.payment_secret().0, 2000, &node.node_id(), deadline - 1));
         let hash = PaymentHash(quote.payment_hash().to_byte_array());
         let id = PaymentId(hash.0);
         let preimage = node.channel_manager.get_payment_preimage(hash, *quote.payment_secret()).unwrap();
@@ -1955,6 +1998,38 @@ mod bitsov_stateless_tests {
         let purpose = PaymentPurpose::Bolt11InvoicePayment {
             payment_preimage: Some(preimage), payment_secret: *quote.payment_secret(),
         };
+        // Exercise the actual receiving branch, including a positive control.
+        // The log is emitted only after validation and directly before claim_funds.
+        let claimable = |invoice: &lightning_invoice::Bolt11Invoice, metadata: Option<Vec<u8>>| {
+            let hash = PaymentHash(invoice.payment_hash().to_byte_array());
+            LdkEvent::PaymentClaimable {
+                payment_hash: hash,
+                purpose: PaymentPurpose::Bolt11InvoicePayment {
+                    payment_preimage: Some(node.channel_manager.get_payment_preimage(hash, *invoice.payment_secret()).unwrap()),
+                    payment_secret: *invoice.payment_secret(),
+                },
+                amount_msat: 2000, receiver_node_id: Some(node.node_id()),
+                receiving_channel_ids: Vec::new(), claim_deadline: None,
+                onion_fields: Some({
+                    let mut fields = lightning::ln::channelmanager::RecipientOnionFields::secret_only(*invoice.payment_secret());
+                    fields.payment_metadata = metadata;
+                    fields
+                }), counterparty_skimmed_fee_msat: 0, payment_id: Some(PaymentId(hash.0)),
+            }
+        };
+        let expired = node.bolt11_payment().receive_stateless(2000,
+            &lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("expired".into()).unwrap()), 0).unwrap();
+        let mut tampered = metadata.clone(); tampered[11] ^= 1;
+        for (invoice, metadata) in [(&expired, expired.payment_metadata().cloned()), (&quote, None), (&quote, Some(tampered))] {
+            claim_log.0.lock().unwrap().clear();
+            handler.handle_event(claimable(invoice, metadata)).await.unwrap();
+            assert!(!claim_log.0.lock().unwrap().iter().any(|line| line.starts_with("Received payment from payment hash")), "invalid/expired quote reached claim path");
+            assert!(node.list_payments().is_empty());
+        }
+        claim_log.0.lock().unwrap().clear();
+        handler.handle_event(claimable(&quote, Some(metadata.clone()))).await.unwrap();
+        assert!(claim_log.0.lock().unwrap().iter().any(|line| line.starts_with("Received payment from payment hash")), "valid quote must reach claim path");
+        assert!(node.list_payments().is_empty(), "claimable quote must not invent a settlement receipt");
         let claimed = LdkEvent::PaymentClaimed {
             payment_hash: hash, purpose: purpose.clone(), amount_msat: 2000,
             receiver_node_id: Some(node.node_id()), htlcs: Vec::new(),
@@ -1982,5 +2057,7 @@ mod bitsov_stateless_tests {
         drop(node);
         let restarted = builder.build_with_fs_store().unwrap();
         assert_eq!(restarted.payment(&id).unwrap().status, PaymentStatus::Succeeded);
+        assert!(crate::payment::bolt11::stateless_quote_valid(Some(metadata), &hash.0,
+            &quote.payment_secret().0, 2000, &restarted.node_id(), deadline - 1));
     }
 }

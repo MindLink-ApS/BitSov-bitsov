@@ -41,6 +41,7 @@ use konsensus_core::traits::transport::{ConnectedPeerInfo, MessageTransport, Tra
 use konsensus_core::types::NodeId;
 use konsensus_crypto::noise::NoiseSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
@@ -607,7 +608,7 @@ struct PeerConnection {
     /// The Noise session for encrypt/decrypt.
     noise: NoiseSession,
     /// TCP write half — protected by mutex for send serialization.
-    writer: tokio::io::WriteHalf<TcpStream>,
+    writer: tokio::net::tcp::OwnedWriteHalf,
     /// The peer's advertised sovereignty tier.
     tier: SovereigntyTier,
     /// The peer's advertised capabilities.
@@ -737,7 +738,7 @@ impl NoiseTransport {
 
 /// Write a length-prefixed Noise message to a TCP stream.
 async fn write_noise_message(
-    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
     data: &[u8],
 ) -> Result<(), WireError> {
     let len = u32::try_from(data.len()).map_err(|_| {
@@ -746,10 +747,28 @@ async fn write_noise_message(
             max: u32::MAX as usize,
         }
     })?;
-    writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(data).await?;
-    writer.flush().await?;
+    // Dropping a partially written Noise frame must permanently close the
+    // socket: encryption has already consumed a nonce, so reuse is invalid.
+    let mut guard = NoiseWriteGuard { writer, complete: false };
+    guard.writer.write_all(&len.to_be_bytes()).await?;
+    guard.writer.write_all(data).await?;
+    guard.writer.flush().await?;
+    guard.complete = true;
     Ok(())
+}
+
+struct NoiseWriteGuard<'a> {
+    writer: &'a mut tokio::net::tcp::OwnedWriteHalf,
+    complete: bool,
+}
+impl Drop for NoiseWriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            // Synchronous shutdown in Drop works even when the runtime is
+            // cancelling tasks. The reader observes EOF and removes the peer.
+            let _ = socket2::SockRef::from(self.writer.as_ref()).shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 /// Read a length-prefixed frame, refusing — **without allocating** — any frame
@@ -758,7 +777,7 @@ async fn write_noise_message(
 /// return-routability cannot make this node allocate a large buffer; the normal
 /// [`read_noise_message`] cap applies only once the cookie has passed.
 async fn read_bounded_message(
-    reader: &mut tokio::io::ReadHalf<TcpStream>,
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
     max_len: usize,
 ) -> Result<Vec<u8>, WireError> {
     tokio::time::timeout(READ_TIMEOUT, async {
@@ -789,7 +808,7 @@ async fn read_bounded_message(
 /// Applies [`READ_TIMEOUT`] to prevent slowloris attacks where an attacker
 /// sends partial data to hold connections open indefinitely.
 async fn read_noise_message(
-    reader: &mut tokio::io::ReadHalf<TcpStream>,
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
 ) -> Result<Vec<u8>, WireError> {
     // Wrap the entire read (length prefix + payload) in a timeout
     tokio::time::timeout(READ_TIMEOUT, async {
@@ -3895,5 +3914,50 @@ mod tests {
 
         transport_a.shutdown();
         transport_b.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod cancelled_noise_write_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn cancelled_partial_frame_closes_socket_before_next_send() {
+        let mut sender = NoiseSession::initiator(&[11; 32]).unwrap();
+        let mut receiver = NoiseSession::responder(&[22; 32]).unwrap();
+        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        sender.read_handshake(&receiver.write_handshake(&[]).unwrap()).unwrap();
+        receiver.read_handshake(&sender.write_handshake(&[]).unwrap()).unwrap();
+        assert!(sender.try_finish_handshake().unwrap());
+        assert!(receiver.try_finish_handshake().unwrap());
+        let encrypted = sender.encrypt(&vec![0x5a; 4 * 1024 * 1024]).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()), listener.accept()
+        );
+        let (_reader, mut writer) = client.unwrap().into_split();
+        let (mut server, _) = accepted.unwrap();
+        // Same outer cancellation as files.rs timeout_at; the peer deliberately
+        // does not read until the deadline, ensuring TCP backpressure.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(30), write_noise_message(&mut writer, &encrypted)
+        ).await.is_err(), "large frame must be backpressured");
+        let next = sender.encrypt(b"next unrelated message").unwrap();
+        let next_for_send = next.clone();
+        let draining = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        assert!(write_noise_message(&mut writer, &next_for_send).await.is_err(), "abandoned Noise write must close the connection");
+        let _ = writer.shutdown().await;
+        let wire = tokio::time::timeout(Duration::from_secs(2), draining).await.unwrap().unwrap();
+        let advertised = u32::from_be_bytes(wire[..4].try_into().unwrap()) as usize;
+        assert_eq!(advertised, encrypted.len());
+        assert!(wire.len() > 4 + next.len(), "first frame was partially written");
+        assert!(wire.len() < 4 + advertised, "the cancelled frame must remain incomplete");
+        assert!(!wire.ends_with(&next));
+        assert!(receiver.decrypt(&next).is_err(), "even recovering the next frame cannot recover skipped Noise nonce");
     }
 }

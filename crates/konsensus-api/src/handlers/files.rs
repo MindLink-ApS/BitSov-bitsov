@@ -429,13 +429,6 @@ async fn send_file_inner(
     // otherwise release their quota while this future still owns the blob.
     let file = load_file(&state, &auth, &file_id).await?;
 
-    // Reserve this staged blob through every await. Cap refusals leave it
-    // available; an attempted send consumes it even on error/cancellation.
-    let _staged_send = if file_id.starts_with("stage-") {
-        Some(crate::file_staging::FileStaging::claim(&state, &auth, &file_id)?
-            .ok_or_else(|| ApiError::NotFound("staged file expired".into()))?)
-    } else { None };
-
     // Build FilePayload JSON
     let payload = FilePayload {
         filename: file.filename.clone(),
@@ -457,6 +450,14 @@ async fn send_file_inner(
         }],
     )?;
 
+    // Reserve this staged blob through every await. Cap refusals leave it
+    // available; an attempted send consumes it even on error/cancellation.
+    let _staged_send = if file_id.starts_with("stage-") {
+        Some(crate::file_staging::FileStaging::claim(&state, &auth, &file_id)
+            .and_then(|file| file.ok_or_else(|| ApiError::NotFound("staged file expired".into())))
+            .inspect_err(|_| debit.released(&peer_key))?)
+    } else { None };
+
     // E2EE encrypt via Double Ratchet
     let ratchet_msg = state
         .session_manager
@@ -470,12 +471,6 @@ async fn send_file_inner(
         })?;
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
-    // A grant can expire/revoke while pricing or session encryption awaits.
-    if let Some(binding) = &auth.pairing {
-        state.pairing.as_ref().ok_or_else(|| ApiError::Forbidden("pairing unavailable".into()))?
-            .verify_token_binding(&binding.client_id, binding.epoch, &binding.fingerprint, &[crate::auth::Scope::Spend])
-            .map_err(|_| ApiError::Forbidden("spend grant is no longer valid".into()))?;
-    }
     // Create real payment proof — requests invoice from recipient (Principle 2).
     let readmission = super::messages::Readmission::for_cap(req.max_total_msat.is_some());
     let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, &readmission).await;
@@ -500,7 +495,7 @@ async fn send_file_inner(
         .storage
         .store_message(&envelope)
         .await
-        .map_err(|e| ApiError::Storage(e.to_string()))?;
+        .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("file payment settled but storing message failed: {e}") })?;
 
     // Update file record with message_id (best effort)
     // We don't have an update_file method, but the association is recorded
@@ -512,7 +507,7 @@ async fn send_file_inner(
             .transport
             .send(&peer_id, &envelope)
             .await
-            .map_err(|e| ApiError::Transport(e.to_string()))?;
+            .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("file payment settled but delivery failed: {e}") })?;
         true
     } else {
         if let Err(e) = state

@@ -263,6 +263,13 @@ impl Storage for MemStorage {
         Ok(self.peers.lock().unwrap().remove(&id.to_hex()).is_some())
     }
 
+    // This general route fixture accepts replay keys; the real SQLite and gate
+    // suites exercise atomic replay rejection and rollback.
+    async fn store_paid_nonce(&self, _nonce: &Nonce, _hash: &[u8; 32], _sender: &NodeId, _message: &MessageId)
+        -> Result<konsensus_core::gate::PaidReplay, StorageError> {
+        Ok(konsensus_core::gate::PaidReplay::Accepted)
+    }
+
     async fn store_nonce(&self, _nonce: &Nonce, _sender: &NodeId) -> Result<bool, StorageError> {
         Ok(true)
     }

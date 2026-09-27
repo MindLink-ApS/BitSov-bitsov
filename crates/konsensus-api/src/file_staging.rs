@@ -21,23 +21,32 @@ const TTL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, PartialEq, Eq)]
 enum Owner {
-    Paired(PairingBinding),
+    Paired {
+        binding: PairingBinding,
+        grant_op_id: String,
+    },
     Local(String),
 }
 impl Owner {
-    fn from_auth(auth: &AuthUser) -> Self {
-        auth.pairing
-            .clone()
-            .map(Self::Paired)
-            .unwrap_or_else(|| Self::Local(auth.node_id.clone()))
+    fn from_auth(state: &AppState, auth: &AuthUser) -> Option<Self> {
+        match &auth.pairing {
+            Some(binding) => Some(Self::Paired {
+                binding: binding.clone(),
+                grant_op_id: state.pairing.as_ref()?.live_spend_grant_id(binding)?,
+            }),
+            None => Some(Self::Local(auth.node_id.clone())),
+        }
     }
     fn live(&self, state: &AppState) -> bool {
         match self {
             Self::Local(_) => true,
-            Self::Paired(b) => state.pairing.as_ref().is_some_and(|s| {
-                s.verify_token_binding(&b.client_id, b.epoch, &b.fingerprint, &[Scope::Spend])
-                    .is_ok()
-            }),
+            Self::Paired {
+                binding,
+                grant_op_id,
+            } => state
+                .pairing
+                .as_ref()
+                .is_some_and(|s| s.live_spend_grant_id(binding).as_ref() == Some(grant_op_id)),
         }
     }
 }
@@ -65,7 +74,8 @@ impl FileStaging {
         file: FileRecord,
     ) -> Result<(), ApiError> {
         self.sweep(state);
-        let owner = Owner::from_auth(auth);
+        let owner = Owner::from_auth(state, auth)
+            .ok_or_else(|| ApiError::Forbidden("spend grant is no longer valid".into()))?;
         if !owner.live(state) {
             return Err(ApiError::Forbidden("spend grant is no longer valid".into()));
         }
@@ -103,9 +113,10 @@ impl FileStaging {
     }
     pub fn get(&mut self, state: &AppState, auth: &AuthUser, id: &str) -> Option<Arc<FileRecord>> {
         self.sweep(state);
+        let owner = Owner::from_auth(state, auth);
         self.entries
             .get(id)
-            .filter(|e| !e.sending && (auth.has(Scope::Admin) || e.owner == Owner::from_auth(auth)))
+            .filter(|e| !e.sending && (auth.has(Scope::Admin) || Some(&e.owner) == owner.as_ref()))
             .map(|e| Arc::clone(&e.file))
     }
     pub fn list(
@@ -114,9 +125,10 @@ impl FileStaging {
         auth: &AuthUser,
     ) -> Vec<konsensus_storage::FileMetadata> {
         self.sweep(state);
+        let owner = Owner::from_auth(state, auth);
         self.entries
             .values()
-            .filter(|e| !e.sending && (auth.has(Scope::Admin) || e.owner == Owner::from_auth(auth)))
+            .filter(|e| !e.sending && (auth.has(Scope::Admin) || Some(&e.owner) == owner.as_ref()))
             .map(|e| konsensus_storage::FileMetadata::from(e.file.as_ref()))
             .collect()
     }
@@ -146,7 +158,8 @@ impl FileStaging {
             return Ok(None);
         };
         if !entry.owner.live(state)
-            || (!auth.has(Scope::Admin) && entry.owner != Owner::from_auth(auth))
+            || (!auth.has(Scope::Admin)
+                && Some(entry.owner.clone()) != Owner::from_auth(state, auth))
         {
             return Err(ApiError::Forbidden("file belongs to another grant".into()));
         }
@@ -179,13 +192,6 @@ impl Drop for SendGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn auth(id: &str) -> AuthUser {
-        AuthUser {
-            node_id: id.into(),
-            scopes: vec![Scope::Spend],
-            pairing: None,
-        }
-    }
     fn file(id: &str, size: usize) -> FileRecord {
         FileRecord {
             id: id.into(),
@@ -210,7 +216,7 @@ mod tests {
         staging.lock().unwrap().entries.insert(
             "x".into(),
             Entry {
-                owner: Owner::from_auth(&auth("a")),
+                owner: Owner::Local("a".into()),
                 file: Arc::new(file("x", 1)),
                 expires: Instant::now() + TTL,
                 sending: true,

@@ -1010,6 +1010,22 @@ impl Storage for SqliteStorage {
 
     // ── Nonces ─────────────────────────────────────────────────────────
 
+    async fn store_paid_nonce(
+        &self, nonce: &Nonce, payment_hash: &[u8; 32], sender: &NodeId, message_id: &MessageId,
+    ) -> Result<konsensus_core::gate::PaidReplay, StorageError> {
+        use konsensus_core::gate::PaidReplay;
+        let mut tx = self.pool.begin().await?;
+        let nonce_new = sqlx::query("INSERT OR IGNORE INTO nonces (nonce_hex, sender) VALUES (?, ?)")
+            .bind(hex::encode(nonce.as_bytes())).bind(sender.to_hex()).execute(&mut *tx).await?.rows_affected() != 0;
+        if !nonce_new { tx.rollback().await?; return Ok(PaidReplay::NonceReused); }
+        let payment_new = sqlx::query("INSERT OR IGNORE INTO payment_receipts (payment_hash, message_id, sender) VALUES (?, ?, ?)")
+            .bind(hex::encode(payment_hash)).bind(message_id.to_hex()).bind(sender.to_hex())
+            .execute(&mut *tx).await?.rows_affected() != 0;
+        if !payment_new { tx.rollback().await?; return Ok(PaidReplay::PaymentReused); }
+        tx.commit().await?;
+        Ok(PaidReplay::Accepted)
+    }
+
     async fn store_nonce(&self, nonce: &Nonce, sender: &NodeId) -> Result<bool, StorageError> {
         let nonce_hex = hex::encode(nonce.as_bytes());
         let sender_hex = sender.to_hex();
@@ -2721,6 +2737,13 @@ impl Storage for SqliteStorage {
 
 #[async_trait]
 impl konsensus_core::gate::NonceStore for SqliteStorage {
+    async fn check_and_store_paid(
+        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
+        sender: &konsensus_core::NodeId, message_id: &konsensus_core::MessageId,
+    ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.store_paid_nonce(nonce, payment_hash, sender, message_id).await?)
+    }
+
     async fn check_and_store(
         &self,
         nonce: &Nonce,

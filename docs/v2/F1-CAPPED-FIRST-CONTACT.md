@@ -41,8 +41,9 @@ admission or bypass the receiver's single-use settlement gate.
 Paid operational failures return HTTP 502 with
 `code: "payment_settled_send_incomplete"` and the principal newly settled by
 that call in `amount_msat`. Reconciled prior admissions are not charged to the
-retry again. Unknown outcomes remain HTTP 502; clients must retain their full
-confirmed cap until reconciliation, as in #80. The endpoint is not a general
+retry again. If a retry pays nothing new and is refused by its cap or grant, it
+retains the cap/budget refusal code and emits the corresponding N2 event. Unknown
+outcomes remain HTTP 502; clients must retain their full confirmed cap until reconciliation, as in #80. The endpoint is not a general
 message-idempotency API: clients must not blindly retry a lost send response.
 
 ## Stranger payment preparation and the whitepaper floor
@@ -94,7 +95,11 @@ Production first-contact quotes are **LDK-only**. The vendored LDK Node 0.7.0
 extension calls `ChannelManager::create_bolt11_invoice` with `payment_hash=None`,
 which uses `create_inbound_payment`: the hash/secret use the node's expanded inbound
 key, so the preimage is reconstructible on HTLC receipt without a pending record.
-The ordinary `receive` API is not used. The event handler inserts an incoming
+The ordinary `receive` API is not used. Required BOLT11 payment metadata carries a
+node-signed version, absolute expiry and quoted amount, bound to the payment hash
+and secret. `PaymentClaimable` validates it against the local node key and wall
+clock before claiming, including after restart; LDK's block-time grace period
+cannot extend the short quote deadline. Missing or modified metadata fails closed. The event handler inserts an incoming
 successful receipt only on `PaymentClaimed`, before exposing `PaymentReceived`.
 LDK's necessary channel/HTLC safety persistence is unchanged. Unknown stateless
 BOLT11 payments have no fee-skimming allowance, and duplicate attempts cannot
@@ -121,11 +126,13 @@ Staging is volatile memory, never a persistent file/storage record: 4 MiB per
 file, 8 MiB per grant/owner, 16 MiB globally and 64 entries. Filename, MIME,
 encoded-size and decoded-size checks precede insertion. Staging transfers no
 Lightning principal and grants no file-management authority; deletion remains
-Admin-only and another grant cannot read or send the staged file.
+Admin-only and another grant cannot read or send the staged file. Paired entries
+carry the creating grant operation ID as well as client, epoch and identity;
+replacement or regrant never revives the old grant's uploads.
 
 Entries expire after five minutes. Access and a 15-second background sweep
-remove expired/revoked idle entries; startup begins with an empty store, so no
-staged bytes survive restart. A send rechecks the live grant, owns its quota
+remove idle entries whose exact creating grant expired, was revoked or was
+replaced; startup begins with an empty store, so no staged bytes survive restart. A send rechecks the live grant, owns its quota
 through all awaits, and consumes the blob on success, error or cancellation.
 A cap refusal before dispatch leaves it available within its existing expiry.
 In-flight sends end at the earlier of stage expiry and 60 seconds. An ambiguous
@@ -134,66 +141,51 @@ deleting staging never means the
 payment failed, and clients must retain their reservation and not auto-retry.
 Received files remain durable and retain the existing access controls.
 
-## G1 integration contract
+## G1 and N2 integration
 
-**Implemented** on `feat/g1-first-contact-grant` (the G1 follow-up with #83
-merged). A paired first contact now needs the owner's one-time first-contact
-grant for that recipient (`docs/SPEND_BUDGET_GRANTS.md`, "First contact").
+Main through `6dd70976` is merged, including G1 budget grants and N2 membrane
+observations. Compose and file send use `MeteredSpend`; paired staging uses
+`AuthUser` with an explicit spend capability check and retains no permanent blob.
+Price-cap and budget refusals both feed N2's outbound membrane observations.
 
-**Carried as below:**
-- One aggregate reservation before the admission invoice.
-- `Debit::request_invoice` for the frame, `Debit::dispatch` for the payment and
-  `create_metered_payment_proof` for the message.
-- One resolution at the outer compose result.
+Paired first contact reserves one effective aggregate cap before requesting any
+invoice. Requests without an explicit cap fail closed. The same `Debit` guards
+admission invoice requests, admission payment and message payment, revalidating
+the original grant at each dispatch poll. The signed target quote determines
+both prices within the cap. Owner requests still obey the price caps.
 
-**Remaining limit:** a resumed admission (after an unknown outcome or a
-restart) needs a new confirmation and reserves again. The original reservation
-stays counted, so the tally over-counts until the grant ends. It never
-under-counts.
+Each durable reservation has a unique id and outstanding recipient map. Resolving
+one recipient consumes that entry once, atomically with the adjusted tally, so
+retries and restarts cannot release it twice. Outstanding reservations are bounded
+at 1,024 per grant; unknown outcomes are retained rather than evicted.
 
-The contract as written before the integration:
+The admission journal records the original reservation before dispatch. Recovery
+can reconcile confirmed admission settlement/failure against that original grant,
+including when a different caller retries. It never restores spend authority. A
+retry that merely polls an old unknown payment releases its own unused reservation.
+Before starting the message payment the journal durably marks that second leg as
+possibly dispatched. Cancellation in that window keeps the original aggregate
+reserved; admission settlement alone cannot release an uncertain message debit.
 
-Reviewed against PR #81, `feat/g1-budget-scoped-grant` at
-`fec318395e5b49ab52d42198f62630d865180ba7`, then its dispatch-validity update
-`942b68a698552a5b4e571fa2463f2344fedcaa4f`. F1 is based on main `f2f17695`;
-it does not merge, rewrite, or replace G1's grant implementation.
+Per-peer serialization covers the full compose operation. Every known result
+resolves its aggregate reservation once; unknown/currently cancelled payments
+remain reserved. File cap/budget refusals preserve staging, and an abandoned Noise
+write shuts down the connection so later traffic cannot reuse partial framing or
+an unmatched encryption nonce. Post-payment file failures report settled principal.
 
-When rebasing G1, retain `MeteredSpend` on compose and file send. File staging
-must use `AuthUser` plus the explicit capability check: G1 deliberately rejects
-paired clients on the unmetered `ScopedAuth<Spend>` extractor, even though
-staging itself transfers no money.
+Combined regressions cover aggregate budget refusal before quote, target cap
+refusal, both payments under one reservation, revocation during quote retrieval,
+unknown retry/restart, original-grant reconciliation, exactly-once resolution,
+paired staging, and N2 refusal events. The existing G1 cancellation, expiry,
+rotation, fanout and fallback tests run on the combined tree.
 
-For paired first contact, reserve **one call** against the effective aggregate
-cap before requesting an invoice. Keep `refuse_unpriced` for a paired request
-without an explicit aggregate bound. The signed invoice determines the actual
-admission/message split within that reservation. Do not remove G1's refusal
-and leave a message-only debit: that would allow admission to bypass the grant.
-At `942b68a`, G1 debits before encryption and releases on encryption failure.
-The first-contact `NoSession` branch must keep the aggregate debit while it
-continues admission, not release it and continue using a released reservation.
-Until this integration is made, retain G1's fail-closed first-contact refusal.
-
-Carry the same aggregate `Debit` through admission's invoice frame using
-`Debit::request_invoice`, admission payment using `Debit::dispatch`, and the
-message using `create_metered_payment_proof`. That last helper is essential:
-G1's public `create_payment_proof` now wraps an **unmetered** debit. Preserve
-G1's per-poll grant validity checks across revocation/expiry while a provider is
-pending, and across keysend-to-invoice fallback. A reservation alone is not
-permission to dispatch after the grant has been revoked.
-
-Resolve the same-recipient reservation exactly once at the outer compose
-result, using the aggregate receipt or `FirstContactCharge` outcome. Two calls
-to `Debit::settled` for the two legs subtract against the same original
-reservation twice. Ordinary failures after settlement must not release the
-paid admission. Unknown/cancelled outcomes retain the reservation. A resumed
-admission belongs to the original grant/reservation, not the retry's grant;
-associate that reservation with the journal before allowing automatic budget
-reconciliation across retries or restart. Owner calls remain subject to caps.
-
-Required combined regressions: aggregate per-call grant refusal before invoice
-request; admission paid then session/proof/delivery failure; admission unknown
-then retry/restart; admission settled/message failed; same-recipient resolution
-once; cancellation; and bounded paired upload without management privileges.
+**On top of that (#85):** the aggregate cap alone never lets a budget pay a
+stranger. A paired first contact also needs the owner's one-time first-contact
+grant for exactly that recipient, which bounds the cap
+(`docs/SPEND_BUDGET_GRANTS.md`, "First contact"). After a reconnect, a contact
+the grant budgets is admitted again from the budget without a prompt, at its
+signed quote and within its cap. Anyone else needs that one-time confirmation
+("Re-admission after a reconnect").
 
 ## Local proof and limits
 

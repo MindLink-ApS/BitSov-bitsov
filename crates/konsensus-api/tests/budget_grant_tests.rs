@@ -589,7 +589,6 @@ async fn per_call_and_per_recipient_budgets_hold() {
 async fn file_send_is_debited_and_refused_when_spent() {
     let fx = fixture().await;
     let token = fx.grant(None, GrantTerms::new(1_500)).await;
-    // F1: the paired client stages its own file under its live grant.
     let (status, file) = fx
         .call(
             "POST",
@@ -606,17 +605,7 @@ async fn file_send_is_debited_and_refused_when_spent() {
         .await;
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(fx.used(), 1_000);
-    // F1 consumes a staged file on send; stage a second one for the refusal.
-    let (status, again) = fx
-        .call(
-            "POST",
-            "/api/v1/files",
-            Some(json!({"filename": "hi.txt", "mime_type": "text/plain", "data_b64": "aGk="})),
-            Some(&token),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{again}");
-    let path = format!("/api/v1/files/{}/send", again["file_id"].as_str().unwrap());
+    let path = lifecycle::upload_probe_file(&fx).await;
     let (status, err) = fx.call("POST", &path, Some(body), Some(&token)).await;
     assert_budget_exceeded(status, &err, "total");
     assert_eq!(fx.wallet.money(), 1);
@@ -798,8 +787,7 @@ async fn first_contact_admission_is_not_paid_from_a_budget() {
             Some(&token),
         )
         .await;
-    // Without the owner's one-time confirmation for this contact, nothing is
-    // requested or paid (budget_grant/first_contact.rs covers the grant).
+    // #85: without the owner's one-time confirmation, before anything else.
     assert_budget_exceeded(status, &body, "first_contact");
     assert_eq!(fx.wallet.money(), 0);
     assert!(fx.state.invoice_requests.lock().await.is_empty());
@@ -1149,7 +1137,6 @@ async fn membrane_observes_budget_refusals_on_compose_and_file() {
     let fx = fixture().await;
     let token = fx.grant(None, GrantTerms::new(10_000).per_call(999)).await;
     assert_eq!(fx.compose(&token).await.0, StatusCode::CONFLICT);
-    // F1: the paired client stages its own file under its live grant.
     let (_, file) = fx
         .call(
             "POST",
@@ -1208,5 +1195,35 @@ async fn membrane_observes_direct_payment_budget_denials_without_invoice_data() 
     assert_eq!(fx.wallet.money(), 0);
 }
 
+#[tokio::test]
+async fn reservation_resolution_is_idempotent_across_restart() {
+    let mut fx = fixture().await;
+    fx.grant(None, GrantTerms::new(10_000)).await;
+    let epoch = fx.service.snapshot().clients.iter().find(|c| c.client_id == fx.client_id).unwrap().epoch;
+    let charge = Charge { recipient: fx.peer.to_hex(), amount_msat: 4000 };
+    let reservation = fx.service.reserve_spend(&fx.client_id, epoch, vec![charge]).unwrap();
+    fx.service.resolve_spend(&reservation, &fx.peer.to_hex(), 2000);
+    assert_eq!(fx.used(), 2000);
+    fx.restart();
+    fx.service.resolve_spend(&reservation, &fx.peer.to_hex(), 2000);
+    assert_eq!(fx.used(), 2000, "replayed resolution must not subtract twice");
+}
+
 #[path = "budget_grant/first_contact.rs"]
 mod first_contact;
+
+#[path = "budget_grant/first_contact_grant.rs"]
+mod first_contact_grant;
+
+#[tokio::test]
+async fn zero_charge_resolution_consumes_its_durable_reservation() {
+    let fx = fixture().await;
+    fx.grant(None, GrantTerms::new(1000)).await;
+    let epoch = fx.service.snapshot().clients.iter().find(|c| c.client_id == fx.client_id).unwrap().epoch;
+    fx.service.reserve_spend(&fx.client_id, epoch, vec![]).unwrap();
+    assert!(fx.service.snapshot().grants[0].budget.as_ref().unwrap().pending.is_empty());
+    let reservation = fx.service.reserve_spend(&fx.client_id, epoch,
+        vec![Charge { recipient: fx.peer.to_hex(), amount_msat: 0 }]).unwrap();
+    fx.service.resolve_spend(&reservation, &fx.peer.to_hex(), 0);
+    assert!(fx.service.snapshot().grants[0].budget.as_ref().unwrap().pending.is_empty());
+}

@@ -17,6 +17,10 @@ pub(super) struct Attempt {
     pub envelope: Option<UkmEnvelope>,
     #[serde(default)]
     pub settled_at_unix: Option<u64>,
+    #[serde(default)]
+    pub original_reservation: Option<crate::spend_budget::Reservation>,
+    #[serde(default)]
+    pub message_may_have_dispatched: bool,
 }
 fn error(e: impl std::fmt::Display) -> ApiError {
     ApiError::Storage(format!("admission journal: {e}"))
@@ -80,4 +84,16 @@ pub(super) fn clear(state: &AppState, peer: &NodeId) -> Result<(), ApiError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(error(e)),
     }
+}
+
+/// Resolve a positively failed attempt before removing its recovery identity.
+pub(super) fn clear_failed(state: &AppState, peer: &NodeId) -> Result<(), ApiError> {
+    if let Some(attempt) = load(state, peer)? {
+        if !attempt.message_may_have_dispatched {
+            if let (Some(service), Some(original)) = (&state.pairing, &attempt.original_reservation) {
+                service.resolve_spend(original, &peer.to_hex(), 0);
+            }
+        }
+    }
+    clear(state, peer)
 }

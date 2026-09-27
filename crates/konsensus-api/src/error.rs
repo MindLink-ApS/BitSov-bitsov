@@ -118,9 +118,7 @@ impl IntoResponse for ApiError {
             }))).into_response();
         }
         let (status, message) = match &self {
-            ApiError::PriceCapExceeded(_)
-            | ApiError::BudgetExceeded(_)
-            | ApiError::StatelessQuoteUnsupported => unreachable!(),
+            ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),

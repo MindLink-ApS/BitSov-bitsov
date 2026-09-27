@@ -124,6 +124,14 @@ pub enum GateRejection {
 /// without depending on konsensus-storage.
 #[async_trait::async_trait]
 pub trait NonceStore: Send + Sync {
+    /// Atomically consume both replay keys, or write neither on a duplicate.
+    /// Backends without a transaction fail closed.
+    async fn check_and_store_paid(
+        &self, _nonce: &Nonce, _payment_hash: &[u8; 32], _sender: &NodeId, _message_id: &MessageId,
+    ) -> Result<PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
+        Err("atomic paid replay protection not implemented".into())
+    }
+
     /// Store a nonce and return whether it was new.
     ///
     /// Returns `Ok(true)` if the nonce was new (first time seen).
@@ -162,6 +170,17 @@ pub trait NonceStore: Send + Sync {
              with a durable payment-hash store"
             .into())
     }
+}
+
+/// Outcome of the atomic paid-envelope replay transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaidReplay {
+    /// Both keys were committed.
+    Accepted,
+    /// Nonce already consumed; neither key was written.
+    NonceReused,
+    /// Payment already consumed; neither key was written.
+    PaymentReused,
 }
 
 /// Configuration for the payment gate.
@@ -370,35 +389,14 @@ impl PaymentGate {
         // earlier gives unpaid strangers a durable storage primitive.
         // Nonce and payment-hash insert-or-reject checks still run before any
         // accepted envelope is delivered, including concurrent replays.
-        let is_new = nonce_store
-            .check_and_store(&envelope.nonce, &envelope.sender)
-            .await
-            .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
-
-        if !is_new {
-            warn!("rejected: nonce replay detected");
-            return Err(GateRejection::ReplayDetected);
-        }
-
-        debug!("nonce replay check: OK");
-
-        // ── Step 7: Payment proof replay protection ────────────────────
-        // This must run for every accepted paid envelope, even when
-        // settlement verification is disabled for mock/local backends. A
-        // settled payment hash buys one message, not unlimited fresh nonces.
-        let payment_hash_is_new = nonce_store
-            .check_and_store_payment_hash(
-                &envelope.payment_proof.payment_hash,
-                &envelope.sender,
-                &envelope.id,
-            )
-            .await
-            .map_err(|e| GateRejection::NonceCheckFailed(format!("payment hash: {e}")))?;
-
-        if !payment_hash_is_new {
-            let payment_hash = hex::encode(envelope.payment_proof.payment_hash);
-            warn!(%payment_hash, "rejected: payment proof replay detected");
-            return Err(GateRejection::PaymentProofReused { payment_hash });
+        match nonce_store.check_and_store_paid(
+            &envelope.nonce, &envelope.payment_proof.payment_hash, &envelope.sender, &envelope.id,
+        ).await.map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))? {
+            PaidReplay::Accepted => {},
+            PaidReplay::NonceReused => return Err(GateRejection::ReplayDetected),
+            PaidReplay::PaymentReused => return Err(GateRejection::PaymentProofReused {
+                payment_hash: hex::encode(envelope.payment_proof.payment_hash),
+            }),
         }
 
         debug!("gate: ALL CHECKS PASSED — message accepted");
@@ -693,6 +691,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NonceStore for MockNonceStore {
+    async fn check_and_store_paid(
+        &self, nonce: &crate::Nonce, payment_hash: &[u8; 32],
+        _sender: &crate::NodeId, _message_id: &crate::MessageId,
+    ) -> Result<crate::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::gate::PaidReplay;
+        let mut nonces = self.seen.lock().unwrap();
+        let mut payments = self.seen_payment_hashes.lock().unwrap();
+        let key = *nonce.as_bytes();
+        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
+        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
+        nonces.insert(key); payments.insert(*payment_hash);
+        Ok(PaidReplay::Accepted)
+    }
+
         async fn check_and_store(
             &self,
             nonce: &Nonce,
@@ -1108,6 +1120,29 @@ mod tests {
             }
             other => panic!("expected InsufficientPayment, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn review_spent_payment_fresh_nonces_must_not_write_replay_rows() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let gate = PaymentGate::with_config(GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        });
+        let pricing = MockPricing { price_msat: 10 };
+        let lightning = MockLightning::settled(100);
+        let nonces = MockNonceStore::new();
+        let recipient = NodeId::from_bytes([2; 32]);
+        let first = make_signed_envelope(&identity, 100);
+        gate.verify(&first, &nonces, &pricing, None, Some(&lightning), 0.0, Some(&recipient)).await.unwrap();
+        for _ in 0..20 {
+            let replay = make_signed_envelope(&identity, 100);
+            let result = gate.verify(&replay, &nonces, &pricing, None, Some(&lightning), 0.0, Some(&recipient)).await;
+            assert!(matches!(result, Err(GateRejection::PaymentProofReused { .. })));
+        }
+        assert_eq!(nonces.seen_payment_hashes.lock().unwrap().len(), 1);
+        assert_eq!(nonces.seen.lock().unwrap().len(), 1,
+            "single spent payment must not purchase fresh durable nonce rows on rejected envelopes");
     }
 
     #[tokio::test]

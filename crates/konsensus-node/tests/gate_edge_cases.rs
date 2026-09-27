@@ -85,6 +85,20 @@ impl InMemoryNonceStore {
 
 #[async_trait::async_trait]
 impl konsensus_core::gate::NonceStore for InMemoryNonceStore {
+    async fn check_and_store_paid(
+        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
+        _sender: &konsensus_core::NodeId, _message_id: &konsensus_core::MessageId,
+    ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
+        use konsensus_core::gate::PaidReplay;
+        let mut nonces = self.seen.lock().await;
+        let mut payments = self.seen_payment_hashes.lock().await;
+        let key = nonce.as_bytes().to_vec();
+        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
+        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
+        nonces.insert(key); payments.insert(*payment_hash);
+        Ok(PaidReplay::Accepted)
+    }
+
     async fn check_and_store(
         &self,
         nonce: &Nonce,

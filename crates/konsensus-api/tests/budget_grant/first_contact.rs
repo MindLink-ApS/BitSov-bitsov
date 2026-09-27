@@ -1,294 +1,298 @@
-//! G1 × F1: a paired client pays a first contact only with the owner's
-//! one-time confirmation for that contact (a first-contact grant), and the
-//! whole first contact — admission plus the first message — is debited once.
-//!
-//! A real pairing and owner-granted budget (the G1 fixture), F1's shared mock
-//! Lightning (recipient-bound settlement) and a stranger that answers invoice
-//! requests with a signed quote, as in `first_contact_tests.rs`.
-
 use super::*;
-use konsensus_api::state::InvoiceResponseData;
 use konsensus_lightning::shared_mock::SharedMockProvider;
 
-struct Stranger {
-    fx: Fx,
-    peer: NodeId,
-    sender_wallet: Arc<SharedMockProvider>,
-    invoices: Arc<AtomicUsize>,
-    handshake: tokio::task::JoinHandle<()>,
-    _ledger: tempfile::TempDir,
-}
+type FirstContactFixture = (Fx, Arc<SharedMockProvider>, Arc<SharedMockProvider>, Arc<AtomicUsize>);
 
-impl Drop for Stranger {
-    fn drop(&mut self) {
-        self.handshake.abort();
-    }
-}
-
-/// A connected `price_open` stranger pricing admission at 2,000 msat and
-/// signing `message_msat` as the first message's price. Once its wallet has
-/// been paid, it establishes the E2EE session (promotion), as a target does.
-async fn stranger(message_msat: u64) -> Stranger {
-    stranger_with(message_msat, true).await
-}
-
-/// `establish: false` — the stranger takes the admission payment but never
-/// opens a session (the send times out after paying admission).
-async fn stranger_with(message_msat: u64, establish: bool) -> Stranger {
+async fn stranger(establish: bool) -> FirstContactFixture {
     let mut fx = fixture().await;
-    let ledger = tempfile::tempdir().unwrap();
-    let path = ledger.path().join("ledger.db");
-    let a = Arc::new(SharedMockProvider::new(&path, "a", 100_000).unwrap());
-    let b = Arc::new(SharedMockProvider::new(&path, "b", 0).unwrap());
+    let path = fx.tmp.path().join("lightning.db");
+    let sender = Arc::new(SharedMockProvider::new(&path, "sender", 100_000).unwrap());
+    let target = Arc::new(SharedMockProvider::new(&path, "target", 0).unwrap());
     let (_, identity) = konsensus_core::identity::NodeIdentity::generate().unwrap();
-    let peer = *identity.node_id();
-    let invoices = Arc::new(AtomicUsize::new(0));
-    let (count, target) = (Arc::clone(&invoices), Arc::clone(&b));
+    fx.peer = *identity.node_id();
+    let peer = fx.peer;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let recipient = target.clone();
+    let session = fx.state.session_manager.clone();
+    let handshake = Arc::new(std::sync::Mutex::new(establish.then_some(identity)));
     let transport = ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
-        .with_invoice_responder(move |request_id, _hint| {
+        .with_invoice_responder(move |request_id, _| {
             count.fetch_add(1, Ordering::SeqCst);
-            let inv = futures::executor::block_on(target.create_invoice(
-                2000,
-                &format!("konsensus:{request_id}:message={message_msat}"),
-                55,
-            ))
-            .unwrap();
-            Some(InvoiceResponseData {
-                recipient: peer,
-                bolt11: inv.bolt11,
-                payment_hash: inv.payment_hash,
-            })
-        });
-    fx.state = Arc::new(AppState {
-        lightning: a.clone(),
-        transport: Arc::new(transport),
-        ..(*fx.state).clone()
-    });
-    let sessions = fx.state.session_manager.clone();
-    let paid = Arc::clone(&b);
-    let handshake = tokio::spawn(async move {
-        loop {
-            if establish && paid.get_balance_msat().await.unwrap() > 0 {
-                let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
-                sessions
-                    .initiate_session(&peer, &target.prekey_bundle().await)
-                    .await
-                    .unwrap();
-                break;
+            let invoice = futures::executor::block_on(recipient.create_invoice(2000,
+                &format!("konsensus:{request_id}:message=2000"), 55)).unwrap();
+            if let Some(identity) = handshake.lock().unwrap().take() {
+                let recipient = recipient.clone();
+                let session = session.clone();
+                tokio::spawn(async move {
+                    while recipient.get_balance_msat().await.unwrap() == 0 { tokio::task::yield_now().await; }
+                    let target_session = konsensus_crypto::SessionManager::new(Arc::new(identity));
+                    session.initiate_session(&peer, &target_session.prekey_bundle().await).await.unwrap();
+                });
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-    });
-    Stranger {
-        fx,
-        peer,
-        sender_wallet: a,
-        invoices,
-        handshake,
-        _ledger: ledger,
-    }
+            Some(konsensus_api::state::InvoiceResponseData { recipient: peer, bolt11: invoice.bolt11, payment_hash: invoice.payment_hash })
+        });
+    fx.state = Arc::new(AppState { lightning: sender.clone(), transport: Arc::new(transport), ..(*fx.state).clone() });
+    (fx, sender, target, requests)
 }
 
-impl Stranger {
-    async fn spent(&self) -> u64 {
-        100_000 - self.sender_wallet.get_balance_msat().await.unwrap()
-    }
-
-    async fn confirm(&self, token: &str, recipient: &NodeId, max_total_msat: u64) -> (StatusCode, Value) {
-        self.fx
-            .call(
-                "POST",
-                "/api/v1/pair/first-contact-grant",
-                Some(json!({"recipient": recipient.to_hex(), "max_total_msat": max_total_msat})),
-                Some(token),
-            )
-            .await
-    }
-
-    async fn send(&self, token: &str, cap: Option<u64>) -> (StatusCode, Value) {
-        let mut body = json!({"recipient": self.peer.to_hex(), "kind": 0, "plaintext": "hello stranger"});
-        if let Some(cap) = cap {
-            body["max_total_msat"] = json!(cap);
-        }
-        self.fx
-            .call("POST", "/api/v1/messages/compose", Some(body), Some(token))
-            .await
-    }
+/// The owner's one-time OK for this stranger (#85): without it a budget never
+/// pays a first contact, whatever the cap. Its own refusals (a cap the budget
+/// cannot cover) are left for the send to report.
+async fn confirm(fx: &Fx, token: &str, cap: u64) {
+    fx.call("POST", "/api/v1/pair/first-contact-grant",
+        Some(json!({"recipient": fx.peer.to_hex(), "max_total_msat": cap})), Some(token)).await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn confirmed_first_contact_pays_both_legs_and_debits_the_budget_once() {
-    let s = stranger(2000).await;
-    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    let (status, grant) = s.confirm(&token, &s.peer, 4000).await;
-    assert_eq!(status, StatusCode::OK, "{grant}");
-    assert_eq!(grant["recipient"], s.peer.to_hex());
-    assert_eq!(grant["max_total_msat"], 4000);
-
-    let (status, body) = s.send(&token, Some(4000)).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["amount_msat"], 4000, "admission + message under one cap");
-    assert_eq!(s.spent().await, 4000);
-    assert_eq!(s.fx.used(), 4000, "one debit, resolved once to what settled");
-
-    // Single use: the confirmation is gone after the send.
-    assert_eq!(
-        s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()),
-        None
-    );
-    // The next confirmation must fit what is left of the budget (6,000 msat).
-    let other = NodeId::from_hex(&"cd".repeat(32)).unwrap();
-    let (status, body) = s.confirm(&token, &other, 6_001).await;
-    assert_budget_exceeded(status, &body, "total");
-    let (status, _) = s.confirm(&token, &other, 6_000).await;
-    assert_eq!(status, StatusCode::OK);
+async fn send(fx: &Fx, token: &str, cap: u64) -> (StatusCode, Value) {
+    confirm(fx, token, cap).await;
+    fx.call("POST", "/api/v1/messages/compose", Some(json!({"recipient":fx.peer.to_hex(),"kind":0,"plaintext":"first contact","max_total_msat":cap})), Some(token)).await
 }
 
-#[tokio::test(start_paused = true)]
-async fn no_confirmation_means_no_invoice_and_no_payment() {
-    let s = stranger(2000).await;
-    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    let (status, body) = s.send(&token, Some(4000)).await;
-    assert_budget_exceeded(status, &body, "first_contact");
-    assert_eq!(s.invoices.load(Ordering::SeqCst), 0, "nothing asked of the stranger");
-    assert_eq!(s.spent().await, 0);
-    assert_eq!(s.fx.used(), 0);
+#[tokio::test]
+async fn aggregate_budget_refusal_precedes_quote_and_emits_membrane_event() {
+    let (fx, sender, _, requests) = stranger(false).await;
+    let token = fx.grant(None, GrantTerms::new(3999)).await;
+    let (status, body) = send(&fx, &token, 4000).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "budget_exceeded");
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(fx.used(), 0);
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 100_000);
+    let (_, totals) = fx.state.audit_log.membrane().read(None, 500);
+    assert_eq!(totals.outbound_refused, 1);
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_confirmation_is_for_exactly_one_contact() {
-    let s = stranger(2000).await;
-    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    let other = NodeId::from_hex(&"cd".repeat(32)).unwrap();
-    let (status, _) = s.confirm(&token, &other, 4000).await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, body) = s.send(&token, Some(4000)).await;
-    assert_budget_exceeded(status, &body, "first_contact");
-    assert_eq!(s.invoices.load(Ordering::SeqCst), 0);
-    assert_eq!(s.spent().await, 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_confirmed_amount_caps_the_whole_first_contact() {
-    // The stranger asks 2,000 + 2,000; the owner confirmed only 3,999, and
-    // the request itself names no cap: the confirmation is the cap.
-    let s = stranger(2000).await;
-    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    s.confirm(&token, &s.peer, 3999).await;
-    let (status, body) = s.send(&token, None).await;
+#[tokio::test]
+async fn target_cap_refusal_releases_aggregate_budget_and_emits_membrane_event() {
+    let (fx, sender, _, _) = stranger(false).await;
+    let token = fx.grant(None, GrantTerms::new(10_000)).await;
+    let (status, body) = send(&fx, &token, 3999).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "price_cap_exceeded");
-    assert_eq!(s.spent().await, 0, "refused before the admission payment");
-    assert_eq!(s.fx.used(), 0, "the reservation is released");
+    assert_eq!(fx.used(), 0);
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 100_000);
+    let (_, totals) = fx.state.audit_log.membrane().read(None, 500);
+    assert_eq!(totals.outbound_refused, 1);
+}
+
+#[tokio::test]
+async fn both_legs_resolve_one_aggregate_reservation() {
+    let (mut fx, sender, _, _) = stranger(true).await;
+    let token = fx.grant(None, GrantTerms::new(10_000)).await;
+    let (status, body) = send(&fx, &token, 6000).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["amount_msat"], 4000);
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 96_000);
+    fx.restart();
+    assert_eq!(fx.used(), 4000);
+    assert!(fx.service.snapshot().grants[0].budget.as_ref().unwrap().pending.is_empty());
+}
+
+fn journal(fx: &Fx, reservation: &konsensus_api::spend_budget::Reservation, hash: &str) {
+    let dir = fx.tmp.path().join("admission-attempts");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(fx.peer.to_hex()), serde_json::to_vec(&json!({
+        "payment_hash": hash, "amount_msat": 2000, "quote":[0,2000], "envelope":null,
+        "original_reservation": reservation, "message_may_have_dispatched":false
+    })).unwrap()).unwrap();
+}
+
+fn reserve(fx: &Fx, amount: u64) -> konsensus_api::spend_budget::Reservation {
+    let epoch = fx.service.snapshot().clients.iter().find(|c| c.client_id == fx.client_id).unwrap().epoch;
+    fx.service.reserve_spend(&fx.client_id, epoch, vec![Charge { recipient:fx.peer.to_hex(), amount_msat:amount }]).unwrap()
+}
+
+#[tokio::test]
+async fn unknown_prior_attempt_does_not_charge_polling_retries() {
+    let (mut fx, sender, _, requests) = stranger(false).await;
+    let token = fx.grant(None, GrantTerms::new(20_000)).await;
+    let original = reserve(&fx, 6000);
+    journal(&fx, &original, &"fe".repeat(32));
+    for _ in 0..3 {
+        fx.restart();
+        let (status, body) = send(&fx, &token, 4000).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("outcome unknown"), "{body}");
+        assert_eq!(fx.used(), 6000, "only the original unknown attempt remains reserved");
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 100_000);
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_confirmation_must_fit_the_budget_grant() {
-    let s = stranger(2000).await;
-    let token = s
-        .fx
-        .grant(None, GrantTerms::new(3_000).per_call(2_500))
-        .await;
-    let (status, body) = s.confirm(&token, &s.peer, 2_600).await;
-    assert_budget_exceeded(status, &body, "per_call");
-    let token = s.fx.grant(None, GrantTerms::new(1_000_000)).await;
-    let (status, body) = s.confirm(&token, &s.peer, 100_001).await;
-    assert_budget_exceeded(status, &body, "first_contact");
-    let (status, body) = s
-        .fx
-        .call(
-            "POST",
-            "/api/v1/pair/first-contact-grant",
-            Some(json!({"recipient": "not-a-node", "max_total_msat": 4000})),
-            Some(&token),
-        )
-        .await;
-    assert_budget_exceeded(status, &body, "first_contact");
+async fn settled_prior_attempt_reconciles_original_once_across_restart() {
+    let (mut fx, sender, target, requests) = stranger(false).await;
+    let token = fx.grant(None, GrantTerms::new(20_000)).await;
+    let original = reserve(&fx, 6000);
+    let invoice = target.create_invoice(2000, "prior", 55).await.unwrap();
+    sender.pay_invoice(&invoice.bolt11).await.unwrap();
+    journal(&fx, &original, &invoice.payment_hash);
+    for _ in 0..2 {
+        fx.restart();
+        let (status, body) = send(&fx, &token, 4000).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["amount_msat"], 0, "retry did not pay again");
+        assert_eq!(fx.used(), 2000);
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 98_000);
+}
+
+#[tokio::test]
+async fn revoking_grant_while_admission_quote_is_pending_prevents_payment() {
+    let (mut fx, sender, target, _) = stranger(false).await;
+    fx.state = Arc::new(AppState {
+        transport: Arc::new(ConnectedStubTransport::new(vec![fx.peer], fx.state.invoice_requests.clone())),
+        ..(*fx.state).clone()
+    });
+    let token = fx.grant(None, GrantTerms::new(10_000)).await;
+    confirm(&fx, &token, 4000).await;
+    let state = fx.state.clone();
+    let peer = fx.peer;
+    let request = tokio::spawn(async move {
+        call(&state, "POST", "/api/v1/messages/compose",
+            Some(json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"revoke","max_total_msat":4000})), Some(&token)).await
+    });
+    let (id, response) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let mut pending = fx.state.invoice_requests.lock().await;
+            if let Some(id) = pending.keys().next().cloned() {
+                break (id.clone(), pending.remove(&id).unwrap());
+            }
+            drop(pending);
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert_eq!(fx.used(), 4000, "aggregate must already be durably reserved");
+    fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
+    let invoice = target.create_invoice(2000, &format!("konsensus:{id}:message=2000"), 55).await.unwrap();
+    response.send(Ok(konsensus_api::state::InvoiceResponseData { recipient:peer, bolt11:invoice.bolt11, payment_hash:invoice.payment_hash })).unwrap();
+    let (status, body) = request.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "budget_exceeded");
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 100_000);
 }
 
 #[tokio::test(start_paused = true)]
-async fn no_budget_grant_means_no_confirmation_and_no_quote() {
-    let s = stranger(2000).await;
-    let read = s.fx.token().await;
-    let (status, _) = s.confirm(&read, &s.peer, 4000).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "a read+receive client cannot even ask");
-    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    s.fx.service.revoke_grants(Some(&s.fx.client_id)).unwrap();
-    let (status, _) = s.confirm(&token, &s.peer, 4000).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "revoked: the token lost spend");
-    assert_eq!(s.invoices.load(Ordering::SeqCst), 0);
+async fn old_admission_never_charges_replacement_grant() {
+    let (mut fx, sender, target, requests) = stranger(false).await;
+    fx.grant(None, GrantTerms::new(10_000)).await;
+    let original = reserve(&fx, 6000);
+    let invoice = target.create_invoice(2000, "prior grant", 55).await.unwrap();
+    sender.pay_invoice(&invoice.bolt11).await.unwrap();
+    journal(&fx, &original, &invoice.payment_hash);
+    let token = fx.grant(None, GrantTerms::new(20_000)).await;
+    fx.restart();
+    let (status, body) = send(&fx, &token, 4000).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["amount_msat"], 0);
+    assert_eq!(fx.used(), 0, "a new grant cannot inherit the old admission debit");
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 98_000);
 }
 
 #[tokio::test(start_paused = true)]
-async fn revoking_the_budget_voids_an_unused_confirmation() {
-    let s = stranger(2000).await;
-    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    let (status, _) = s.confirm(&token, &s.peer, 4000).await;
-    assert_eq!(status, StatusCode::OK);
-    s.fx.service.revoke_grants(Some(&s.fx.client_id)).unwrap();
+async fn unknown_second_leg_keeps_original_aggregate_reserved_after_restart() {
+    let (mut fx, sender, target, requests) = stranger(false).await;
+    let token = fx.grant(None, GrantTerms::new(20_000)).await;
+    let original = reserve(&fx, 6000);
+    let invoice = target.create_invoice(2000, "before cancellation", 55).await.unwrap();
+    sender.pay_invoice(&invoice.bolt11).await.unwrap();
+    journal(&fx, &original, &invoice.payment_hash);
+    let path = fx.tmp.path().join("admission-attempts").join(fx.peer.to_hex());
+    let mut attempt: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // Models cancellation after the durable message-dispatch marker: knowing
+    // admission settled cannot establish the outcome of the second payment.
+    attempt["message_may_have_dispatched"] = json!(true);
+    std::fs::write(path, serde_json::to_vec(&attempt).unwrap()).unwrap();
+    fx.restart();
+    let (status, body) = send(&fx, &token, 4000).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(fx.used(), 6000);
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 98_000);
+}
+
+
+async fn prior_admission_refusal_emits_membrane_event(refuse_budget: bool) {
+    let (mut fx, sender, target, _) = stranger(false).await;
+    let (_, identity) = konsensus_core::identity::NodeIdentity::generate().unwrap();
+    fx.peer = *identity.node_id();
+    let peer = fx.peer;
+    let transport = Arc::new(ConnectedStubTransport::new(
+        vec![peer],
+        fx.state.invoice_requests.clone(),
+    ));
+    fx.state = Arc::new(AppState {
+        transport: transport.clone(),
+        ..(*fx.state).clone()
+    });
+    let token = fx.grant(None, GrantTerms::new(20_000)).await;
+    let original = reserve(&fx, 6000);
+    let invoice = target
+        .create_invoice(2000, "prior settled admission", 55)
+        .await
+        .unwrap();
+    sender.pay_invoice(&invoice.bolt11).await.unwrap();
+    journal(&fx, &original, &invoice.payment_hash);
+    let session = fx.state.session_manager.clone();
+    let service = fx.service.clone();
+    let client_id = fx.client_id.clone();
+    let establish = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !transport.sent_envelopes.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prior admission proof was redelivered");
+        if refuse_budget {
+            service.revoke_grants(Some(&client_id)).unwrap();
+        }
+        let target_session = konsensus_crypto::SessionManager::new(Arc::new(identity));
+        session
+            .initiate_session(&peer, &target_session.prekey_bundle().await)
+            .await
+            .unwrap();
+    });
+    let (status, body) = send(&fx, &token, if refuse_budget { 4000 } else { 1000 }).await;
+    establish.await.unwrap();
     assert_eq!(
-        s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()),
-        None
+        sender.get_balance_msat().await.unwrap(),
+        98_000,
+        "retry made no new payment"
+    );
+    assert_eq!(
+        fx.used(),
+        if refuse_budget { 0 } else { 2000 },
+        "retry must not charge a new payment"
+    );
+    let (_, totals) = fx.state.audit_log.membrane().read(None, 500);
+    assert_eq!(
+        totals.outbound_refused, 1,
+        "refusal before any payment by this retry must emit N2; status={status}, body={body}"
+    );
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["code"],
+        if refuse_budget {
+            "budget_exceeded"
+        } else {
+            "price_cap_exceeded"
+        }
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn the_door_quote_is_the_invoice_the_send_pays() {
-    let s = stranger(2000).await;
-    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    let (status, quote) = s
-        .fx
-        .call(
-            "POST",
-            "/api/v1/messages/first-contact/quote",
-            Some(json!({"recipient": s.peer.to_hex()})),
-            Some(&token),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{quote}");
-    assert_eq!(quote["admission_msat"], 2000);
-    assert_eq!(quote["message_msat"], 2000);
-    assert_eq!(quote["total_msat"], 4000);
-    assert_eq!(s.spent().await, 0, "a quote pays nothing");
-    assert_eq!(s.fx.used(), 0, "a quote reserves nothing");
-    assert_eq!(s.invoices.load(Ordering::SeqCst), 1);
-
-    s.confirm(&token, &s.peer, 4000).await;
-    let (status, body) = s.send(&token, Some(4000)).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(s.spent().await, 4000);
-    // One admission invoice (the quoted one) plus one message invoice: the
-    // confirmed send never asked the stranger for a second admission quote.
-    assert_eq!(s.invoices.load(Ordering::SeqCst), 2);
+#[tokio::test]
+async fn prior_admission_cap_refusal_emits_membrane_event_without_new_payment() {
+    prior_admission_refusal_emits_membrane_event(false).await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_quote_needs_a_live_budget_grant() {
-    let s = stranger(2000).await;
-    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    s.fx.service.revoke_grants(Some(&s.fx.client_id)).unwrap();
-    let (status, _) = s
-        .fx
-        .call(
-            "POST",
-            "/api/v1/messages/first-contact/quote",
-            Some(json!({"recipient": s.peer.to_hex()})),
-            Some(&token),
-        )
-        .await;
-    assert_ne!(status, StatusCode::OK);
-    assert_eq!(s.invoices.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn admission_paid_then_no_session_keeps_exactly_the_admission_charged() {
-    let s = stranger_with(2000, false).await;
-    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
-    s.confirm(&token, &s.peer, 4000).await;
-    let (status, body) = s.send(&token, Some(4000)).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(body["code"], "payment_settled_send_incomplete", "{body}");
-    assert_eq!(body["amount_msat"], 2000);
-    assert_eq!(s.spent().await, 2000, "only the admission left the wallet");
-    assert_eq!(s.fx.used(), 2000, "resolved once: the paid admission stays charged, the rest is released");
+#[tokio::test]
+async fn prior_admission_budget_refusal_emits_membrane_event_without_new_payment() {
+    prior_admission_refusal_emits_membrane_event(true).await;
 }

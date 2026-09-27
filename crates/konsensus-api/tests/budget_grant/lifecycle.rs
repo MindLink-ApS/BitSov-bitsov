@@ -51,7 +51,7 @@ async fn pending_invoice_authority_probe(how: Invalidation, file: bool) {
     let mut fx = fixture().await;
     let token = fx.grant(None, GrantTerms::new(10_000)).await;
     let route = if file {
-        upload_probe_file(&fx, &token).await
+        upload_probe_file(&fx).await
     } else {
         "/api/v1/messages/compose".into()
     };
@@ -89,9 +89,9 @@ async fn pending_invoice_authority_probe(how: Invalidation, file: bool) {
     invalidate(&fx, how).await;
     response_tx
         .send(Ok(konsensus_api::state::InvoiceResponseData {
-            recipient: fx.peer,
             bolt11: create_test_bolt11(1_000),
             payment_hash: "00".repeat(32),
+            recipient: fx.peer,
         }))
         .unwrap();
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
@@ -396,15 +396,14 @@ async fn queued_room_members_stop_on_revoke() {
     );
 }
 
-/// F1 staging belongs to the uploader: the paired client stages its own file
-/// under its live grant (the owner's staged file is not sendable by a grant).
-async fn upload_probe_file(fx: &Fx, token: &str) -> String {
+pub(super) async fn upload_probe_file(fx: &Fx) -> String {
+    let token = fx.token().await;
     let (status, file) = fx
         .call(
             "POST",
             "/api/v1/files",
             Some(json!({"filename":"grant.txt","mime_type":"text/plain","data_b64":"aGk="})),
-            Some(token),
+            Some(&token),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{file}");
@@ -415,7 +414,7 @@ async fn upload_probe_file(fx: &Fx, token: &str) -> String {
 async fn file_budget_and_cap_refusals_preserve_ratchet() {
     let fx = fixture().await;
     let token = fx.grant(None, GrantTerms::new(10_000).per_call(999)).await;
-    let path = upload_probe_file(&fx, &token).await;
+    let path = upload_probe_file(&fx).await;
     for cap in [999, 1000] {
         let before = fx
             .state
@@ -460,7 +459,7 @@ async fn file_budget_and_cap_refusals_preserve_ratchet() {
 async fn suspended_file_keysend_stops_on_revoke() {
     let fx = fixture().await;
     let token = fx.grant(None, GrantTerms::new(10_000)).await;
-    let path = upload_probe_file(&fx, &token).await;
+    let path = upload_probe_file(&fx).await;
     fx.wallet.pause_dispatch.store(true, Ordering::SeqCst);
     let body = json!({"recipient":fx.peer.to_hex()});
     let state = Arc::clone(&fx.state);
@@ -537,7 +536,7 @@ async fn peer_cap_refusal_preserves_ratchet() {
 async fn file_encryption_failure_releases_reservation() {
     let fx = fixture().await;
     let token = fx.grant(None, GrantTerms::new(1000)).await;
-    let path = upload_probe_file(&fx, &token).await;
+    let path = upload_probe_file(&fx).await;
     let (status, _) = fx
         .call(
             "POST",
@@ -647,9 +646,9 @@ async fn revoke_finishes_started_invoice_frame_but_never_pays() {
     };
     response_tx
         .send(Ok(konsensus_api::state::InvoiceResponseData {
-            recipient: fx.peer,
             bolt11: create_test_bolt11(1000),
             payment_hash: "00".repeat(32),
+            recipient: fx.peer,
         }))
         .unwrap();
     transport.resume.notify_one();

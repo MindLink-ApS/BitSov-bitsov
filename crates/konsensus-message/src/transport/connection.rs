@@ -377,7 +377,7 @@ pub(super) async fn handle_incoming(
     addr: SocketAddr,
     ctx: TransportCtx,
 ) -> Result<(), TransportError> {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, mut writer) = stream.into_split();
 
     // Pre-Noise anti-DoS cookie gate (doorway hardening #2), only when the
     // operator opted in. Runs BEFORE the Noise DH and holds no per-connection

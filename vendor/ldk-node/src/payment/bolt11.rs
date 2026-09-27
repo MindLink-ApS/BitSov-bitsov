@@ -35,7 +35,8 @@ use crate::payment::store::{
 };
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
-use crate::types::{ChannelManager, PaymentStore};
+use crate::types::{ChannelManager, PaymentStore, KeysManager};
+use lightning::sign::{NodeSigner, Recipient};
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt11Invoice = LdkBolt11Invoice;
@@ -54,6 +55,7 @@ type Bolt11InvoiceDescription = crate::ffi::Bolt11InvoiceDescription;
 /// [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 /// [`Node::bolt11_payment`]: crate::Node::bolt11_payment
 pub struct Bolt11Payment {
+	keys_manager: Arc<KeysManager>,
 	runtime: Arc<Runtime>,
 	channel_manager: Arc<ChannelManager>,
 	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
@@ -67,13 +69,14 @@ pub struct Bolt11Payment {
 
 impl Bolt11Payment {
 	pub(crate) fn new(
-		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
+		keys_manager: Arc<KeysManager>, runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
 		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<Arc<Logger>>>,
 		config: Arc<Config>, is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
 	) -> Self {
 		Self {
+			keys_manager,
 			runtime,
 			channel_manager,
 			connection_manager,
@@ -427,9 +430,26 @@ impl Bolt11Payment {
 			payment_hash: None,
 			..Default::default()
 		};
-		self.channel_manager.create_bolt11_invoice(params)
-			.map(maybe_wrap)
-			.map_err(|_| Error::InvoiceCreationFailed)
+		let invoice = self.channel_manager.create_bolt11_invoice(params)
+			.map_err(|_| Error::InvoiceCreationFailed)?;
+        let deadline = invoice.expires_at().ok_or(Error::InvoiceCreationFailed)?.as_secs();
+        let mut metadata = Vec::from(b"BSQ1".as_slice());
+        metadata.extend_from_slice(&deadline.to_be_bytes());
+        metadata.extend_from_slice(&amount_msat.to_be_bytes());
+        let payload = stateless_quote_payload(&metadata, invoice.payment_hash().as_byte_array(), &invoice.payment_secret().0);
+        metadata.extend_from_slice(self.keys_manager.sign_message(&payload).as_bytes());
+        let (mut raw, _, _) = invoice.into_signed_raw().into_parts();
+        for field in &mut raw.data.tagged_fields {
+            if let lightning_invoice::RawTaggedField::KnownSemantics(lightning_invoice::TaggedField::Features(features)) = field {
+                features.set_payment_metadata_required();
+            }
+        }
+        raw.data.tagged_fields.push(lightning_invoice::RawTaggedField::KnownSemantics(
+            lightning_invoice::TaggedField::PaymentMetadata(metadata)));
+        let signature = self.keys_manager.sign_invoice(&raw, Recipient::Node)
+            .map_err(|_| Error::InvoiceCreationFailed)?;
+        let signed = raw.sign(|_| Ok::<_, Error>(signature))?;
+        LdkBolt11Invoice::from_signed(signed).map(maybe_wrap).map_err(|_| Error::InvoiceCreationFailed)
 	}
 
 	/// Returns a payable invoice that can be used to request a payment of the amount
@@ -886,4 +906,30 @@ impl Bolt11Payment {
 
 		Ok(())
 	}
+}
+
+// Versioned, fixed-width signature input. The payer echoes this metadata in the
+// HTLC; it grants no authority for another hash, secret, amount, node or deadline.
+fn stateless_quote_payload(metadata_header: &[u8], hash: &[u8; 32], secret: &[u8; 32]) -> Vec<u8> {
+    let mut bytes = b"BitSov stateless BOLT11 quote expiry v1\0".to_vec();
+    bytes.extend_from_slice(metadata_header);
+    bytes.extend_from_slice(hash);
+    bytes.extend_from_slice(secret);
+    bytes
+}
+
+pub(crate) fn stateless_quote_valid(
+    metadata: Option<&[u8]>, hash: &[u8; 32], secret: &[u8; 32], amount_msat: u64,
+    node_id: &bitcoin::secp256k1::PublicKey, now: u64,
+) -> bool {
+    let Some(metadata) = metadata else { return false; };
+    // LDK message signatures are 104 ASCII zbase32 bytes.
+    if metadata.len() != 124 || &metadata[..4] != b"BSQ1" { return false; }
+    let deadline = u64::from_be_bytes(metadata[4..12].try_into().unwrap());
+    let quoted = u64::from_be_bytes(metadata[12..20].try_into().unwrap());
+    if now >= deadline || amount_msat < quoted { return false; }
+    let Ok(signature) = std::str::from_utf8(&metadata[20..]) else { return false; };
+    lightning::util::message_signing::verify(
+        &stateless_quote_payload(&metadata[..20], hash, secret), signature, node_id,
+    )
 }

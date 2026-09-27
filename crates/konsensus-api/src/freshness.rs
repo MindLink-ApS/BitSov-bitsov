@@ -1,7 +1,7 @@
 //! Data freshness headers (G-STALENESS-MARKER).
 //!
-//! Five pinned read routes — `GET /api/v1/payments/balance`,
-//! `/payments/channels`, `/health`, `/messages` and `/pricing` — attach:
+//! Six pinned read routes — `GET /api/v1/payments/balance`,
+//! `/payments/channels`, `/health`, `/messages`, `/pricing` and `/peers` — attach:
 //!
 //! - `BitSov-Data-As-Of: 2026-09-27T08:20:00Z` — RFC 3339, UTC (`Z`), whole
 //!   seconds, truncated. The oldest "last known current" time among the
