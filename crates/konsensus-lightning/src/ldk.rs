@@ -31,6 +31,9 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, instrument, warn};
 use zeroize::Zeroizing;
 
+use crate::liquidity::{JitBackend, LiquidityClient, LiquidityConfig};
+use konsensus_core::traits::liquidity::{LiquidityInfo, LiquidityQuote, LiquidityReceipt};
+
 use crate::scb_export::write_monitor_store_scb;
 use crate::scb_rotate::{rotate_scb_backup, ScbRotationConfig};
 use konsensus_core::fee_rate::validate_fee_rate_sat_per_vb;
@@ -42,6 +45,8 @@ use konsensus_core::traits::lightning::{
 /// Configuration for the embedded LDK Lightning provider.
 #[derive(Debug, Clone)]
 pub struct LdkConfig {
+    /// Explicit LSPS2 provider registry (off by default).
+    pub liquidity: LiquidityConfig,
     /// Path to store LDK state (channel monitors, network graph, scorer, etc.).
     pub storage_dir: PathBuf,
     /// Directory where encrypted SCB snapshots are rotated.
@@ -244,6 +249,8 @@ fn inbound_payment_from_received_event(
 /// on any successful payment. This ensures `is_available()` reflects actual
 /// payment capability, not just whether the LDK node is running.
 pub struct LdkProvider {
+    liquidity: Option<LiquidityClient>,
+    liquidity_info: LiquidityInfo,
     node: Arc<LdkNode>,
     /// Set to `false` when a payment fails due to a channel/funding issue.
     /// Reset to `true` on successful payment.
@@ -279,6 +286,13 @@ impl std::fmt::Debug for LdkProvider {
 }
 
 impl LdkProvider {
+    fn stored_payment(&self, hash: &str) -> Result<ldk_node::payment::PaymentDetails, LightningError> {
+        let bytes = hex::decode(hash).map_err(|_| LightningError::PaymentNotFound(hash.into()))?;
+        let id: [u8; 32] = bytes.try_into().map_err(|_| LightningError::PaymentNotFound(hash.into()))?;
+        self.node.payment(&ldk_node::lightning::ln::channelmanager::PaymentId(id))
+            .ok_or_else(|| LightningError::PaymentNotFound(hash.into()))
+    }
+
     /// Create and start a new LDK provider from the given config.
     ///
     /// Key derivation: The BIP-39 mnemonic is converted to a 64-byte seed,
@@ -363,15 +377,21 @@ impl LdkProvider {
             builder.set_gossip_source_p2p();
         }
 
-        // LSPS2 liquidity source — automatic inbound channels from LSP
-        if let (Some(ref lsp_id), Some(ref lsp_addr)) = (&config.lsp_node_id, &config.lsp_address) {
-            let pubkey = lsp_id
-                .parse()
-                .map_err(|e| LightningError::Backend(format!("invalid LSP node ID: {e}")))?;
-            let address = lsp_addr
-                .parse()
-                .map_err(|e| LightningError::Backend(format!("invalid LSP address: {e}")))?;
-            builder.set_liquidity_source_lsps2(pubkey, address, config.lsp_token.clone());
+        // The old singleton fields never enabled invoice issuance. Require the
+        // new explicit switch, and reject ambiguous migrations instead of silently
+        // choosing a peer. Existing operators get a clear configuration error.
+        if config.lsp_node_id.is_some() || config.lsp_address.is_some() || config.lsp_token.is_some() {
+            return Err(LightningError::Backend("migrate legacy lsp_* fields to liquidity.providers and explicitly enable liquidity".into()));
+        }
+        if let Some(lsp) = config.liquidity.selected()? {
+            builder.set_liquidity_source_lsps2(
+                lsp.node_id.parse().map_err(|_| LightningError::Backend("invalid LSP key".into()))?,
+                lsp.address.parse().map_err(|_| LightningError::Backend("invalid LSP address".into()))?,
+                lsp.token.clone(),
+            );
+            // LDK logs the full JIT invoice at INFO. Private previews must never
+            // leak a payable invoice via logs before fee authorization.
+            builder.set_filesystem_logger(None, Some(ldk_node::logger::LogLevel::Warn));
         }
 
         // Listening address for Lightning P2P
@@ -431,7 +451,12 @@ impl LdkProvider {
         );
         Self::spawn_scb_timer(Arc::clone(&drainer_shutdown), scb_producer);
 
+        let liquidity = config.liquidity.selected()?.map(|p| LiquidityClient::new(
+            p.node_id.clone(), Arc::new(LdkJitBackend(Arc::clone(&node))),
+        ));
         Ok(Self {
+            liquidity,
+            liquidity_info: config.liquidity.info(),
             node,
             payment_capable: AtomicBool::new(true),
             esplora_url: chosen_esplora_url,
@@ -453,6 +478,8 @@ impl LdkProvider {
         // inbound stream simply stays empty.
         let (inbound_tx, _) = broadcast::channel(INBOUND_BROADCAST_CAPACITY);
         Self {
+            liquidity: None,
+            liquidity_info: LiquidityInfo::default(),
             node,
             payment_capable: AtomicBool::new(true),
             // Test path — broadcast verification will fall through to
@@ -832,6 +859,31 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
+    fn liquidity_info(&self) -> LiquidityInfo { self.liquidity_info.clone() }
+
+    async fn quote_liquidity(&self, owner: &str, gross_msat: u64, max_fee_msat: u64) -> Result<LiquidityQuote, LightningError> {
+        self.liquidity.as_ref().ok_or_else(|| LightningError::Backend("LSPS2 liquidity disabled".into()))?
+            .quote(owner, gross_msat, max_fee_msat).await
+    }
+
+    fn liquidity_quote(&self, owner: &str, id: &str) -> Result<LiquidityQuote, LightningError> {
+        self.liquidity.as_ref().ok_or_else(|| LightningError::Backend("LSPS2 liquidity disabled".into()))?.terms(owner, id)
+    }
+
+    async fn accept_liquidity(&self, owner: &str, id: &str) -> Result<Invoice, LightningError> {
+        self.liquidity.as_ref().ok_or_else(|| LightningError::PaymentNotDispatched("LSPS2 liquidity disabled".into()))?.accept(owner, id)
+    }
+
+    async fn is_funding_payment(&self, hash: &str) -> Result<bool, LightningError> {
+        let details = self.stored_payment(hash)?;
+        Ok(matches!(details.kind, LdkPaymentKind::Bolt11Jit { .. }))
+    }
+
+    async fn liquidity_receipt(&self, hash: &str) -> Result<Option<LiquidityReceipt>, LightningError> {
+        let p = self.stored_payment(hash)?;
+        jit_receipt(&p)
+    }
+
     /// L0e (2026-04-30): graceful shutdown of the embedded LDK node.
     ///
     /// `node.stop()` is synchronous and fsyncs `ChannelMonitor` updates +
@@ -1476,7 +1528,10 @@ fn convert_payment_details(details: &ldk_node::payment::PaymentDetails) -> Payme
         .map(|h| hex::encode(h.0))
         .unwrap_or_default();
 
-    let preimage = preimage_from_kind(&details.kind).map(|p| hex::encode(p.0));
+    let preimage = if details.status == LdkPaymentStatus::Succeeded
+        && !matches!(details.kind, LdkPaymentKind::Bolt11Jit { .. }) {
+        preimage_from_kind(&details.kind).map(|p| hex::encode(p.0))
+    } else { None };
 
     PaymentDetails {
         payment_hash,
@@ -1676,3 +1731,47 @@ pub async fn esplora_tx_visible(esplora_url: &str, txid: &str) -> Result<bool, S
 #[cfg(test)]
 #[path = "tests/ldk.rs"]
 mod tests;
+
+/// Runs the pinned lightning-liquidity LSPS2 client through LDK Node's event
+/// loop/peer manager, sharing exactly one node, seed and channel monitor store.
+struct LdkJitBackend(Arc<LdkNode>);
+
+#[async_trait]
+impl JitBackend for LdkJitBackend {
+    async fn prepare(&self, gross_msat: u64, max_fee_msat: u64, expiry_secs: u32) -> Result<(Invoice, u64), LightningError> {
+        let node = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || {
+            let description = "BitSov wallet funding";
+            let desc = LdkInvoiceDescription::Direct(LdkDescription::new(description.into())
+                .map_err(|_| LightningError::InvoiceCreation("invalid funding description".into()))?);
+            // Internally: lightning_liquidity::lsps2 client get_info -> fee
+            // selection/absolute limit -> buy -> persisted Bolt11Jit record.
+            let inv = node.bolt11_payment().receive_via_jit_channel(gross_msat, &desc, expiry_secs, Some(max_fee_msat))
+                .map_err(|e| LightningError::InvoiceCreation(e.to_string()))?;
+            let hash_bytes: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(inv.payment_hash());
+            let stored = node.payment(&ldk_node::lightning::ln::channelmanager::PaymentId(hash_bytes))
+                .ok_or_else(|| LightningError::Backend("JIT purpose was not persisted".into()))?;
+            let fee = match stored.kind {
+                LdkPaymentKind::Bolt11Jit { lsp_fee_limits, .. } => lsp_fee_limits.max_total_opening_fee_msat
+                    .ok_or_else(|| LightningError::Backend("missing fixed JIT fee".into()))?,
+                _ => return Err(LightningError::Backend("missing JIT payment purpose".into())),
+            };
+            Ok((Invoice { bolt11: inv.to_string(), payment_hash: hex::encode(hash_bytes), amount_msat: gross_msat,
+                description: description.into(), expiry_secs, created_at: inv.duration_since_epoch().as_secs() }, fee))
+        }).await.map_err(|_| LightningError::Backend("JIT worker failed".into()))?
+    }
+}
+
+fn jit_receipt(p: &ldk_node::payment::PaymentDetails) -> Result<Option<LiquidityReceipt>, LightningError> {
+    if let LdkPaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } = p.kind {
+        if p.status == LdkPaymentStatus::Succeeded {
+            // The vendored handler records each eligible JIT attempt's skim,
+            // including zero. Older zero-fee receipts may still contain None.
+            let fee = counterparty_skimmed_fee_msat.unwrap_or(0);
+            let net = p.amount_msat.ok_or_else(|| LightningError::Backend("missing settled JIT amount".into()))?;
+            let gross = net.checked_add(fee).ok_or_else(|| LightningError::Backend("JIT amount overflow".into()))?;
+            return Ok(Some(LiquidityReceipt { net_received_msat: net, lsp_fee_msat: fee, gross_msat: gross }));
+        }
+    }
+    Ok(None)
+}

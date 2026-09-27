@@ -2357,3 +2357,19 @@ async fn close_channel_returns_closing_status() {
     assert_eq!(json["closing_txid"], "stub-closing-txid-force");
     assert_eq!(json["status"], "closing");
 }
+
+#[tokio::test]
+async fn liquidity_is_discoverable_and_off_by_default() {
+    let state = test_state();
+    let auth = auth_header(&state);
+    let app = build_router(state);
+    let response = app.oneshot(Request::builder()
+        .uri("/api/v1/payments/liquidity")
+        .header("authorization", auth)
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["enabled"], false);
+    assert_eq!(json["providers"], serde_json::json!([]));
+}
