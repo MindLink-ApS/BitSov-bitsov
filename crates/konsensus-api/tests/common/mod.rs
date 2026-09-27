@@ -583,11 +583,12 @@ impl LightningProvider for StubLightning {
         })
     }
 
-    async fn pay_invoice(&self, _bolt11: &str) -> Result<PaymentDetails, LightningError> {
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+        let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().ok();
         Ok(PaymentDetails {
-            payment_hash: "bb".repeat(32),
+            payment_hash: invoice.as_ref().map_or("bb".repeat(32), |i| i.payment_hash().to_string()),
             preimage: Some("cc".repeat(32)),
-            amount_msat: 1000,
+            amount_msat: invoice.and_then(|i| i.amount_milli_satoshis()).unwrap_or(1000),
             status: PaymentStatus::Settled,
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
@@ -850,6 +851,7 @@ pub fn test_state() -> Arc<AppState> {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -907,6 +909,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -952,6 +955,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -1007,6 +1011,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -1052,6 +1057,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -1096,27 +1102,13 @@ pub struct ConnectedStubTransport {
     >,
     /// Shared reference to the invoice_requests map so the transport can
     /// fulfill pending requests (simulating the peer responding).
-    pub invoice_requests: Arc<
-        tokio::sync::Mutex<
-            HashMap<
-                String,
-                tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>,
-            >,
-        >,
-    >,
+    pub invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
 }
 
 impl ConnectedStubTransport {
     pub fn new(
         connected_peers: Vec<NodeId>,
-        invoice_requests: Arc<
-            tokio::sync::Mutex<
-                HashMap<
-                    String,
-                    tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>,
-                >,
-            >,
-        >,
+        invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
     ) -> Self {
         Self {
             connected: std::sync::Mutex::new(connected_peers.into_iter().collect()),
@@ -1194,7 +1186,7 @@ impl MessageTransport for ConnectedStubTransport {
                             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                             let mut map = invoice_requests.lock().await;
                             if let Some(tx) = map.remove(&req_id) {
-                                let _ = tx.send(response_data);
+                                let _ = tx.send(Ok(response_data));
                             }
                         });
                     }
@@ -1214,7 +1206,7 @@ pub fn create_test_bolt11(amount_msat: u64) -> String {
     use bitcoin::hashes::{sha256, Hash};
     use lightning_invoice::{Currency, InvoiceBuilder};
 
-    let payment_hash = sha256::Hash::from_slice(&[0u8; 32]).unwrap();
+    let payment_hash = sha256::Hash::hash(&[0xcc; 32]);
     let payment_secret = lightning_invoice::PaymentSecret([42u8; 32]);
 
     let invoice = InvoiceBuilder::new(Currency::BitcoinTestnet)
@@ -1287,6 +1279,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -1507,6 +1500,7 @@ pub fn test_state_with_lightning(lightning: Arc<dyn LightningProvider>) -> Arc<A
         transport: Arc::new(StubTransport),
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,

@@ -906,3 +906,40 @@ async fn membrane_ws_requires_local_pairing_and_rechecks_revocation() {
         let _ = server.await;
     }
 }
+
+// Independent PR83 merge-gate probe; production source is unchanged.
+#[tokio::test]
+async fn paired_staging_never_writes_permanent_storage() {
+    use base64::Engine;
+    use konsensus_storage::{SqliteStorage, Storage};
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, service, console) = state_with_pairing(tmp.path(), true);
+    let db_path = tmp.path().join("staging.sqlite");
+    let storage = Arc::new(SqliteStorage::open(db_path.to_str().unwrap()).await.unwrap());
+    let state = Arc::new(AppState { storage: storage.clone(), ..(*base).clone() });
+    let app = test_router(state.clone());
+    let key = SigningKey::from_bytes(&[93u8; 32]);
+    let (client_id, read_token) = pair_and_token(&app, &service, &key).await;
+    let body = serde_json::json!({"filename":"stage.bin", "data_b64":base64::engine::general_purpose::STANDARD.encode(vec![7u8; 1024*1024])});
+    assert_eq!(post(&app, "/api/v1/files", body.clone(), Some(&read_token)).await.0, StatusCode::FORBIDDEN);
+    let op = service.create_elevation_request(&client_id, vec![Scope::Spend]).unwrap();
+    service.grant_elevation(&op.op_id, &console.confirmation(&pairing::grant_confirmation_phrase(&op)), konsensus_api::spend_budget::GrantTerms::new(1_000_000)).unwrap();
+    let challenge = service.issue_token_challenge(&client_id).unwrap();
+    let issued = service.issue_token(&state.identity.node_id().to_hex(), &state.jwt_secret, &client_id, &challenge, &hex::encode(key.sign(challenge.as_bytes()).to_bytes())).unwrap();
+    let before = state.lightning.get_balance_msat().await.unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..8 {
+        let (status, uploaded) = post(&app, "/api/v1/files", body.clone(), Some(&issued.token)).await;
+        assert_eq!(status, StatusCode::OK);
+        ids.push(uploaded["file_id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(post(&app, "/api/v1/files", body.clone(), Some(&issued.token)).await.0, StatusCode::TOO_MANY_REQUESTS);
+    assert!(storage.list_files(100).await.unwrap().is_empty(), "paired staging must never enter permanent storage");
+    service.revoke(&client_id).unwrap();
+    assert_eq!(post(&app, "/api/v1/files", body, Some(&issued.token)).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(state.lightning.get_balance_msat().await.unwrap(), before);
+    let owner = konsensus_api::auth::AuthUser { node_id:state.identity.node_id().to_hex(), scopes:vec![Scope::Admin], pairing:None };
+    let mut staging = state.file_staging.lock().unwrap();
+    staging.sweep(&state);
+    assert!(ids.iter().all(|id| staging.get(&state, &owner, id).is_none()), "revocation sweep removes abandoned files");
+}

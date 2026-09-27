@@ -223,6 +223,8 @@ pub enum ControlEvent {
     /// The application layer should create an invoice on the local Lightning
     /// wallet and respond with `Frame::InvoiceResponse`.
     InvoiceRequested {
+        /// TCP source, supplied by the transport (never caller-controlled metadata).
+        source_ip: std::net::IpAddr,
         /// The peer who requested.
         peer_id: NodeId,
         /// Correlation ID for matching request to response.
@@ -575,6 +577,7 @@ pub type SharedWhitelist = Arc<RwLock<HashSet<NodeId>>>;
 
 /// State of an active peer connection.
 struct PeerConnection {
+    source_ip: std::net::IpAddr,
     /// Whether this session is whitelist-privileged. In PriceOpen, a non-
     /// whitelisted peer is admitted UNPRIVILEGED (ciphertext established; per-message
     /// payment is the gate). Informational — the PaymentGate is the auth authority.
