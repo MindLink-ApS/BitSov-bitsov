@@ -1242,7 +1242,7 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
 
     handle_invoice_requested_gated(
         &peer_id, "req-priv", 25_000, "konsensus message", true,
-        &pricing, &lightning, &transport,
+        &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
     ).await;
 
     let payments = lightning.list_payments(10).await.unwrap();
@@ -1262,7 +1262,7 @@ async fn unprivileged_non_admission_invoice_request_is_dropped() {
 
     handle_invoice_requested_gated(
         &peer_id, "req-strange", 1_000_000, "konsensus message", false,
-        &pricing, &lightning, &transport,
+        &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
     ).await;
 
     let payments = lightning.list_payments(10).await.unwrap();
@@ -1276,8 +1276,8 @@ async fn unprivileged_admission_invoice_is_issued_and_repriced() {
     // huge amount is IGNORED — a stranger cannot dictate the invoice amount.
     let peer_id = test_peer_id();
     let transport = make_gossip_test_transport();
-    let lightning: Arc<dyn LightningProvider> =
-        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let dir=tempfile::tempdir().unwrap();
+    let lightning: Arc<dyn LightningProvider> = Arc::new(konsensus_lightning::shared_mock::SharedMockProvider::new(&dir.path().join("mock.db"),"b",0).unwrap());
     let pricing = admission_pricing();
 
     let chat_floor = pricing
@@ -1285,15 +1285,19 @@ async fn unprivileged_admission_invoice_is_issued_and_repriced() {
         .await
         .unwrap();
 
+    let mut quotes=crate::admission_quotes::AdmissionQuotes::default();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     handle_invoice_requested_gated(
-        &peer_id, "req-admit", 9_999_999, ADMISSION_INVOICE_PURPOSE, false,
-        &pricing, &lightning, &transport,
+        &peer_id, &konsensus_core::admission_quote::request_id(&test_peer_id(), &peer_id,
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+        9_999_999, konsensus_core::admission_quote::PURPOSE, false,
+        &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut quotes,
     ).await;
 
     let payments = lightning.list_payments(10).await.unwrap();
     assert_eq!(payments.len(), 1, "admission carve-out must create exactly one invoice");
     assert_eq!(
-        payments[0].amount_msat, chat_floor,
+        payments[0].amount_msat, chat_floor.max(1000),
         "admission invoice must be re-priced from the engine, not the caller's amount"
     );
     assert_ne!(
@@ -1424,44 +1428,189 @@ fn routable_peer_addr_filter() {
     }
 }
 
+
 #[tokio::test]
-async fn admission_invoice_cooldown_rate_limits_unpaid_repeat() {
-    // P2 DoS guard: the only unpaid *service* an unprivileged stranger can
-    // drive under PriceOpen is the one reserved admission invoice (a
-    // `create_invoice` wallet RPC). It must be per-peer rate-limited so a
-    // stranger cannot loop it; unpaid control-plane *state* is already
-    // `privileged`-gated elsewhere.
+async fn stranger_cannot_quote_file_or_other_service_kinds() {
+    // No connected/running node, wallet, or paid contact: the handler receives
+    // only an unprivileged request. Its mock provider retains created invoices.
+    let peer_id = test_peer_id();
+    let transport = make_gossip_test_transport();
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> =
+        Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            konsensus_pricing::StaticPricingConfig {
+                chat_msat: 2000,
+                file_ref_msat: 123_456,
+                ..Default::default()
+            },
+        ));
+
+    let mut quotes=crate::admission_quotes::AdmissionQuotes::default();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let id=konsensus_core::admission_quote::request_id(&test_peer_id(), &peer_id,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    // Otherwise-valid, bound, live attempts still cannot request another kind.
+    for purpose in ["konsensus:admission:200", "konsensus:admission:100", "konsensus:admission", "arbitrary invoice"] {
+        handle_invoice_requested_gated(
+            &peer_id, &id, 1, purpose, false,
+            &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut quotes,
+        ).await;
+    }
+    assert!(lightning.list_payments(10).await.unwrap().is_empty(),
+        "unpaid stranger minted a non-chat invoice");
+}
+
+#[tokio::test]
+async fn stranger_quote_over_noise_creates_no_application_state() {
+    use konsensus_core::admission_quote;
+    use konsensus_core::traits::lightning::PaymentStatus;
+    use konsensus_message::{ReachabilityMode, TransportConfig};
     use std::time::Duration;
-
-    let mut map = std::collections::HashMap::new();
-    let peer = NodeId::from_bytes([7u8; 32]);
-    let other = NodeId::from_bytes([8u8; 32]);
-    let t0 = tokio::time::Instant::now();
-
-    // First request from a peer is allowed (and records the timestamp).
-    assert!(!admission_invoice_rate_limited(&mut map, &peer, t0));
-    // A rapid repeat within the cooldown is dropped.
-    assert!(admission_invoice_rate_limited(
-        &mut map,
-        &peer,
-        t0 + Duration::from_secs(1)
-    ));
-    // Still within the window (just before the cooldown elapses) → dropped.
-    assert!(admission_invoice_rate_limited(
-        &mut map,
-        &peer,
-        t0 + ADMISSION_INVOICE_COOLDOWN - Duration::from_millis(1)
-    ));
-    // A different peer is independent — the limit throttles only the offender.
-    assert!(!admission_invoice_rate_limited(
-        &mut map,
-        &other,
-        t0 + Duration::from_secs(1)
-    ));
-    // Once the cooldown elapses, the peer may request again (bootstrap retry).
-    assert!(!admission_invoice_rate_limited(
-        &mut map,
-        &peer,
-        t0 + ADMISSION_INVOICE_COOLDOWN + Duration::from_secs(1)
-    ));
+    let dir = tempfile::tempdir().unwrap();
+    let (_, a) = NodeIdentity::generate().unwrap();
+    let (_, b) = NodeIdentity::generate().unwrap();
+    let a = Arc::new(a);
+    let b = Arc::new(b);
+    let peer = *a.node_id();
+    let recipient = *b.node_id();
+    let transport = |id: Arc<NodeIdentity>| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                whitelist: vec![],
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(a);
+    let target = transport(b.clone());
+    target.start_listener().await.unwrap();
+    let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let initial_onboarding = storage.get_onboarding_state().await.unwrap();
+    let sessions = Arc::new(SessionManager::new(b.clone()));
+    let registry = Arc::new(tokio::sync::RwLock::new(PeerRegistry::new()));
+    let prices = Arc::new(PeerPriceCache::new());
+    let provider = Arc::new(
+        konsensus_lightning::shared_mock::SharedMockProvider::new(
+            &dir.path().join("mock.sqlite"),
+            "b",
+            0,
+        )
+        .unwrap(),
+    );
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws, _ws_rx) = broadcast::channel(8);
+    let (delivery, _delivery_rx) = broadcast::channel(8);
+    let (pending, _pending_rx) = mpsc::channel(8);
+    let (auto, _auto_rx) = mpsc::channel(8);
+    let worker = tokio::spawn(run(SessionHandlerDeps {
+        transport: target.clone(),
+        session_manager: sessions.clone(),
+        storage: storage.clone(),
+        our_node_id: recipient,
+        identity: b,
+        audit_log: Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
+        pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            konsensus_pricing::StaticPricingConfig {
+                chat_msat: 2000,
+                ..Default::default()
+            },
+        )),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_prices: prices.clone(),
+        peer_registry: registry.clone(),
+        routing: Arc::new(konsensus_routing::RoutingTable::new(Default::default())),
+        gossip_validator: Arc::new(konsensus_gossip::GossipValidator::new(Default::default())),
+        send_timestamps: Default::default(),
+        lightning: provider.clone(),
+        lightning_addr: None,
+        invoice_requests: Default::default(),
+        peer_ln_pubkeys: Default::default(),
+        ws_broadcast: ws,
+        ws_delivery_tx: delivery,
+        pending_tx: pending,
+        auto_channel_tx: auto,
+        shutdown_rx,
+    }));
+    source
+        .connect(&recipient, &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = admission_quote::request_id(&recipient, &peer, unix);
+    let request = Frame::RequestInvoice {
+        request_id: id.clone(),
+        amount_msat: 1,
+        purpose: admission_quote::PURPOSE.into(),
+    };
+    source.send_frame(&recipient, &request).await.unwrap();
+    let bolt11 = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match source.recv_control().await.unwrap() {
+                ControlEvent::PeerConnected { privileged, .. } => assert!(!privileged),
+                ControlEvent::InvoiceResponseReceived {
+                    peer_id,
+                    request_id,
+                    bolt11,
+                    ..
+                } => {
+                    assert_eq!(peer_id, recipient);
+                    assert_eq!(request_id, id);
+                    break bolt11;
+                }
+                event => panic!("unexpected pre-settlement disclosure: {event:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
+    assert_eq!(invoice.amount_milli_satoshis(), Some(2000));
+    assert!(invoice.expiry_time().as_secs() <= 60);
+    assert_eq!(
+        invoice.description().to_string(),
+        format!("konsensus:{id}:message=2000")
+    );
+    assert_eq!(
+        invoice.recover_payee_pub_key().to_string(),
+        provider.get_node_pubkey().await.unwrap()
+    );
+    source.send_frame(&recipient, &request).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), source.recv_control())
+            .await
+            .is_err(),
+        "a repeated attempt receives no second quote or service"
+    );
+    let invoices = provider.list_payments(10).await.unwrap();
+    assert_eq!(invoices.len(), 1);
+    assert_eq!(invoices[0].status, PaymentStatus::Pending);
+    assert_eq!(provider.get_balance_msat().await.unwrap(), 0);
+    assert!(registry.read().await.is_empty());
+    assert!(storage.list_peers().await.unwrap().is_empty());
+    assert!(storage.list_sessions().await.unwrap().is_empty());
+    assert!(storage.list_files(10).await.unwrap().is_empty());
+    assert_eq!(
+        storage.get_onboarding_state().await.unwrap(),
+        initial_onboarding
+    );
+    assert!(storage
+        .get_messages_for_recipient(&konsensus_core::Recipient::Node(recipient), 10, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!sessions.has_session(&peer).await);
+    assert!(prices.get_peer_entry(&peer).await.is_none());
+    assert!(target.connected_privileged_peers().await.is_empty());
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
 }

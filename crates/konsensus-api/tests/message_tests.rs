@@ -1890,6 +1890,7 @@ async fn compose_happy_path_keysend() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2013,6 +2014,7 @@ async fn compose_happy_path_invoice_flow() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2119,6 +2121,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2255,6 +2258,7 @@ async fn compose_keysend_fallback_to_invoice() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2282,7 +2286,9 @@ async fn compose_keysend_fallback_to_invoice() {
     });
 
     // Register peer LN pubkey so keysend is attempted first.
-    state.peer_ln_pubkeys.lock().await.insert(peer_id, "02bbbb".repeat(5));
+    let invoice_payee = create_test_bolt11(1000).parse::<lightning_invoice::Bolt11Invoice>()
+        .unwrap().recover_payee_pub_key().to_string();
+    state.peer_ln_pubkeys.lock().await.insert(peer_id, invoice_payee);
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2372,6 +2378,7 @@ async fn compose_queues_when_transport_send_fails() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2465,6 +2472,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2592,6 +2600,7 @@ async fn compose_broadcasts_to_websocket() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2682,6 +2691,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2775,6 +2785,7 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2928,6 +2939,7 @@ async fn compose_room_rejects_oversized_member_count() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,

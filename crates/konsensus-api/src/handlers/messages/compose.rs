@@ -483,6 +483,14 @@ async fn create_payment_proof_via_invoice(
         return Err(ApiError::Lightning("recipient invoice provenance/hash/expiry mismatch".into()));
     }
 
+    if let Some(expected) = state.peer_ln_pubkeys.lock().await.get(peer_id) {
+        if invoice.recover_payee_pub_key().to_string() != *expected {
+            return Err(ApiError::Lightning(
+                "invoice payee does not match recipient".into(),
+            ));
+        }
+    }
+
     // Pay the recipient's invoice, then poll the in-flight payment to terminal
     // settlement (it commonly returns Pending/InFlight before the preimage is
     // known; treating that as failure dropped settling messages).
@@ -1415,7 +1423,13 @@ async fn first_contact_admission(
         .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
     let requested_msat = derive_admission_msat(peer_announced, own_price);
 
-    let request_id = uuid::Uuid::new_v4().to_string();
+    if kind != konsensus_core::kind::KIND_CHAT {
+        return Err(ApiError::BadRequest("first contact must be a chat message".into()));
+    }
+    let request_id = konsensus_core::admission_quote::request_id(
+        peer_id, state.identity.node_id(), std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+    );
     let (tx, rx) = oneshot::channel::<InvoiceResponseData>();
     {
         let mut requests = state.invoice_requests.lock().await;
@@ -1477,7 +1491,23 @@ async fn first_contact_admission(
         )));
     }
 
-    if response.payment_hash != invoice.payment_hash().to_string() || invoice.is_expired() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let attempt_expiry = konsensus_core::admission_quote::expires_at(
+        &request_id, peer_id, state.identity.node_id(), now.as_secs(),
+    );
+    // A short relative TTL alone does not bound a future-dated or delayed
+    // invoice. Its signed absolute expiry must fit the original live attempt.
+    let valid_invoice_time = attempt_expiry.is_some_and(|end| {
+        invoice.duration_since_epoch() <= now
+            && invoice.expires_at().is_some_and(|expiry| {
+                now < expiry && expiry <= Duration::from_secs(end)
+            })
+    });
+    if response.payment_hash != invoice.payment_hash().to_string()
+        || !valid_invoice_time
+        || invoice.expiry_time().as_secs() > u64::from(konsensus_core::admission_quote::EXPIRY_SECS) {
         return Err(ApiError::Lightning(
             "admission invoice hash/expiry mismatch".into(),
         ));

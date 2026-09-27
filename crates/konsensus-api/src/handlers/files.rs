@@ -1,6 +1,6 @@
 //! File endpoints — upload, download, list, send, and delete files.
 //!
-//! Files are stored as encrypted blobs in the storage backend. The node
+//! Uploads use bounded, expiring memory staging; received files are persisted. The node
 //! handles E2EE encryption for file transfer — the frontend sends raw
 //! file bytes (base64-encoded), and the node encrypts them via Double
 //! Ratchet before transmission. Received files are decrypted and stored.
@@ -29,7 +29,7 @@ use crate::handlers::messages::create_payment_proof;
 use crate::state::AppState;
 
 /// Maximum file size: 4 MiB (fits within 16 MiB wire frame with overhead).
-const MAX_FILE_SIZE: usize = 4 * 1024 * 1024;
+const MAX_FILE_SIZE: usize = crate::file_staging::MAX_FILE_BYTES;
 
 /// JSON payload for file data inside a KIND_FILE_REF envelope.
 ///
@@ -250,7 +250,7 @@ async fn upload_file(
     // Compute blake3 hash
     let hash = blake3::hash(&data).to_hex().to_string();
 
-    let file_id = Uuid::new_v4().to_string();
+    let file_id = format!("stage-{}", Uuid::new_v4());
     let size_bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
 
     let file = FileRecord {
@@ -262,14 +262,13 @@ async fn upload_file(
         sender: state.identity.node_id().to_hex(),
         message_id: None,
         data,
-        created_at: String::new(), // default from DB
+        created_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    state
-        .storage
-        .store_file(&file)
-        .await
-        .map_err(|e| ApiError::Storage(e.to_string()))?;
+    // Revalidate the current paired spend grant after body decoding; the
+    // temporary blob never enters the permanent file table.
+    state.file_staging.lock().unwrap_or_else(|e| e.into_inner())
+        .insert(&state, &auth, file)?;
 
     state.audit_log.record(
         events::FILE_UPLOADED,
@@ -288,44 +287,64 @@ async fn upload_file(
     }))
 }
 
+async fn load_file(
+    state: &AppState,
+    auth: &crate::auth::AuthUser,
+    id: &str,
+) -> Result<Arc<FileRecord>, ApiError> {
+    if id.starts_with("stage-") {
+        return state
+            .file_staging
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(state, auth, id)
+            .ok_or_else(|| ApiError::NotFound("staged file unavailable or expired".into()));
+    }
+    state
+        .storage
+        .get_file(id)
+        .await
+        .map_err(|e| ApiError::Storage(e.to_string()))?
+        .map(Arc::new)
+        .ok_or_else(|| ApiError::NotFound(format!("file {id} not found")))
+}
+
 /// `GET /api/v1/files/:id` — download a file (metadata + data).
 async fn download_file(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
 ) -> Result<Json<DownloadResponse>, ApiError> {
-    let file = state
-        .storage
-        .get_file(&file_id)
-        .await
-        .map_err(|e| ApiError::Storage(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound(format!("file {file_id} not found")))?;
+    let file = load_file(&state, &auth, &file_id).await?;
 
     let data_b64 = base64::engine::general_purpose::STANDARD.encode(&file.data);
 
     Ok(Json(DownloadResponse {
-        id: file.id,
-        filename: file.filename,
-        mime_type: file.mime_type,
+        id: file.id.clone(),
+        filename: file.filename.clone(),
+        mime_type: file.mime_type.clone(),
         size_bytes: file.size_bytes,
-        blake3_hash: file.blake3_hash,
-        sender: file.sender,
+        blake3_hash: file.blake3_hash.clone(),
+        sender: file.sender.clone(),
         data_b64,
     }))
 }
 
 /// `GET /api/v1/files` — list file metadata.
 async fn list_files(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListFilesQuery>,
 ) -> Result<Json<Vec<FileResponse>>, ApiError> {
-    let files = state
+    let mut files = state
         .storage
         .list_files(params.limit.min(MAX_FILE_LIST_LIMIT))
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
+    files.extend(state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).list(&state, &auth));
+    files.sort_by(|a,b| b.created_at.cmp(&a.created_at));
+    files.truncate(params.limit.min(MAX_FILE_LIST_LIMIT) as usize);
     Ok(Json(files.into_iter().map(FileResponse::from).collect()))
 }
 
@@ -335,11 +354,10 @@ async fn delete_file(
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let deleted = state
-        .storage
-        .delete_file(&file_id)
-        .await
-        .map_err(|e| ApiError::Storage(e.to_string()))?;
+    let staged = state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).remove(&file_id);
+    let deleted = if staged { true } else {
+        state.storage.delete_file(&file_id).await.map_err(|e| ApiError::Storage(e.to_string()))?
+    };
 
     if deleted {
         state.audit_log.record(
@@ -358,19 +376,19 @@ async fn delete_file(
 /// encrypts it via Double Ratchet, creates a UKM envelope with KIND_FILE_REF,
 /// and delivers it. Same pipeline as compose_message but for files.
 async fn send_file(
-    _auth: ScopedAuth<Spend>,
+    auth: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
     Json(req): Json<SendFileRequest>,
 ) -> Result<Json<SendFileResponse>, ApiError> {
-    // Load the file
-    let file = state
-        .storage
-        .get_file(&file_id)
-        .await
-        .map_err(|e| ApiError::Storage(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound(format!("file {file_id} not found")))?;
+    let deadline = state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).deadline(&file_id);
+    tokio::time::timeout_at(deadline, send_file_inner(auth, state, file_id, req)).await
+        .map_err(|_| ApiError::PaymentUnresolved("file send deadline exceeded; payment may have dispatched; do not retry automatically".into()))?
+}
 
+async fn send_file_inner(
+    auth: ScopedAuth<Spend>, state: Arc<AppState>, file_id: String, req: SendFileRequest,
+) -> Result<Json<SendFileResponse>, ApiError> {
     // Parse recipient
     let peer_id = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
@@ -384,6 +402,17 @@ async fn send_file(
         .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
 
     super::messages::caps::check(super::messages::caps::payable(price_msat), req.max_total_msat)?;
+
+    // Do not retain bytes across pricing awaits: deletion or expiry could
+    // otherwise release their quota while this future still owns the blob.
+    let file = load_file(&state, &auth, &file_id).await?;
+
+    // Reserve this staged blob through every await. Cap refusals leave it
+    // available; an attempted send consumes it even on error/cancellation.
+    let _staged_send = if file_id.starts_with("stage-") {
+        Some(crate::file_staging::FileStaging::claim(&state, &auth, &file_id)?
+            .ok_or_else(|| ApiError::NotFound("staged file expired".into()))?)
+    } else { None };
 
     // Build FilePayload JSON
     let payload = FilePayload {
@@ -408,6 +437,12 @@ async fn send_file(
         })?;
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
+    // A grant can expire/revoke while pricing or session encryption awaits.
+    if let Some(binding) = &auth.pairing {
+        state.pairing.as_ref().ok_or_else(|| ApiError::Forbidden("pairing unavailable".into()))?
+            .verify_token_binding(&binding.client_id, binding.epoch, &binding.fingerprint, &[crate::auth::Scope::Spend])
+            .map_err(|_| ApiError::Forbidden("spend grant is no longer valid".into()))?;
+    }
     // Create real payment proof — requests invoice from recipient (Principle 2).
     let (payment_hash, preimage, amount_msat) =
         create_payment_proof(&state, price_msat, &peer_id).await?;
@@ -487,7 +522,8 @@ async fn send_file(
 /// Registers file management routes for upload, download, list, delete, and send operations.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/v1/files", post(upload_file).get(list_files))
+        .route("/api/v1/files", post(upload_file).get(list_files)
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_FILE_SIZE * 4 / 3 + 2048)))
         .route(
             "/api/v1/files/:id",
             get(download_file).delete(delete_file),

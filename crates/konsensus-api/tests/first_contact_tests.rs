@@ -48,7 +48,7 @@ async fn admission_case(
                 let inv = futures::executor::block_on(b.create_invoice(
                     2000,
                     &format!("konsensus:{request_id}:message={quote}"),
-                    3600,
+                    55,
                 ))
                 .unwrap();
                 Some(InvoiceResponseData {
@@ -142,7 +142,7 @@ async fn durable_unknown_attempt_is_reconciled_without_requesting_or_paying_agai
     let (_, identity) = konsensus_core::identity::NodeIdentity::generate().unwrap();
     let peer = *identity.node_id();
     let invoice = b
-        .create_invoice(2000, "konsensus:lost-request:message=2000", 3600)
+        .create_invoice(2000, "konsensus:lost-request:message=2000", 60)
         .await
         .unwrap();
     // Model a prior process that settled, lost its response, then exited. Only
@@ -285,7 +285,7 @@ async fn lost_admission_response_never_pays_twice_but_explicit_non_dispatch_can_
                     let inv = futures::executor::block_on(b.create_invoice(
                         2000,
                         &format!("konsensus:{rid}:message=2000"),
-                        3600,
+                        60,
                     ))
                     .unwrap();
                     Some(InvoiceResponseData {
@@ -337,4 +337,77 @@ async fn lost_admission_response_never_pays_twice_but_explicit_non_dispatch_can_
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), expected);
         assert_eq!(a.get_balance_msat().await.unwrap(), 98_000);
     }
+}
+
+/// The authenticated target may return a correctly signed invoice whose own
+/// relative expiry is <=60 seconds but whose timestamp extends the attempt.
+async fn admission_invoice_time_case(future_timestamp: bool) {
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let dir = tempfile::tempdir().unwrap();
+    let payer = Arc::new(FaultBackend {
+        inner: SharedMockProvider::new(&dir.path().join("ledger.db"), "payer", 100_000).unwrap(),
+        lose_response: false,
+        first: AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+    });
+    let mut state = common::test_state_with_lightning(payer.clone());
+    let (_, identity) = konsensus_core::identity::NodeIdentity::generate().unwrap();
+    let peer = *identity.node_id();
+    Arc::get_mut(&mut state).unwrap().transport = Arc::new(
+        common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone())
+            .with_invoice_responder(move |request_id, _| {
+                let issued: u64 = request_id.split(':').nth(3).unwrap().parse().unwrap();
+                let timestamp = if future_timestamp {
+                    issued + 120
+                } else {
+                    // Model one second of target/backend latency. The invoice
+                    // is current, but a fresh 60-second TTL exceeds the attempt.
+                    std::thread::sleep(Duration::from_millis(1100));
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                };
+                let invoice = InvoiceBuilder::new(Currency::Regtest)
+                    .description(format!("konsensus:{request_id}:message=2000"))
+                    .payment_hash(sha256::Hash::hash(&[42; 32]))
+                    .payment_secret(PaymentSecret([24; 32]))
+                    .duration_since_epoch(Duration::from_secs(timestamp))
+                    .min_final_cltv_expiry_delta(18)
+                    .amount_milli_satoshis(2000)
+                    .expiry_time(Duration::from_secs(60))
+                    .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(
+                        hash, &SecretKey::from_slice(&[7; 32]).unwrap(),
+                    ))
+                    .unwrap();
+                Some(InvoiceResponseData {
+                    recipient: peer,
+                    payment_hash: invoice.payment_hash().to_string(),
+                    bolt11: invoice.to_string(),
+                })
+            }),
+    );
+    let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
+    let response = common::test_router(state).oneshot(Request::builder()
+        .method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"hello","max_total_msat":4000}).to_string())).unwrap()).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(payer.calls.load(Ordering::SeqCst), 0, "invalid invoice time must be rejected before dispatch: {}", String::from_utf8_lossy(&body));
+    assert_eq!(payer.get_balance_msat().await.unwrap(), 100_000);
+}
+
+#[tokio::test]
+async fn admission_invoice_future_timestamp_is_rejected_before_dispatch() {
+    admission_invoice_time_case(true).await;
+}
+
+#[tokio::test]
+async fn admission_invoice_absolute_expiry_cannot_extend_attempt() {
+    admission_invoice_time_case(false).await;
 }

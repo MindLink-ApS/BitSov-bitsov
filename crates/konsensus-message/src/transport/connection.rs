@@ -454,6 +454,7 @@ pub(super) async fn handle_incoming(
     // Register connection
     let now = Instant::now();
     let conn = Arc::new(Mutex::new(PeerConnection {
+        source_ip: addr.ip(),
         privileged,
         noise,
         writer,

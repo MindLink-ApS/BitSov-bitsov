@@ -102,6 +102,9 @@ pub struct AppState {
     /// `/api/v1/auth/token` must not verify a replayable static string. The
     /// challenge endpoint writes short-lived challenge strings here and token
     /// issuance consumes them exactly once.
+    /// Volatile, quota-limited uploads; never persisted before send.
+    pub file_staging: Arc<std::sync::Mutex<crate::file_staging::FileStaging>>,
+
     pub auth_challenges: Arc<Mutex<HashMap<String, Instant>>>,
 
     /// Client pairing and owner-approved elevation (#76).

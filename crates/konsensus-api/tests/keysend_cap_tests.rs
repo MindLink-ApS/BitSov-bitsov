@@ -37,6 +37,10 @@ use async_trait::async_trait;
 use konsensus_core::traits::lightning::{
     Invoice, LightningError, LightningProvider, PaymentDetails,
 };
+fn invoice_payee() -> String {
+    create_test_bolt11(1000).parse::<lightning_invoice::Bolt11Invoice>()
+        .unwrap().recover_payee_pub_key().to_string()
+}
 #[derive(Default)]
 struct MixedLightning {
     error_kind: u8,
@@ -99,7 +103,7 @@ impl LightningProvider for MixedLightning {
         _memo: Option<&str>,
     ) -> Result<PaymentDetails, LightningError> {
         Self::bump(&self.money_calls);
-        if self.error_kind == 4 || _dest == "pre-dispatch" {
+        if self.error_kind == 4 || _dest == invoice_payee() {
             return Err(LightningError::PaymentNotDispatched(
                 "local validation rejected keysend".into(),
             ));
@@ -194,7 +198,7 @@ async fn review_fixture(
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(peer, "02aaaa".repeat(5));
+        .insert(peer, if error_kind == 4 { invoice_payee() } else { "02aaaa".repeat(5) });
     (state, peer, lightning, requests)
 }
 
@@ -328,7 +332,7 @@ async fn room_reserves_unknown_member_alongside_safe_fallback_within_total_cap()
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(second, "pre-dispatch".into());
+        .insert(second, invoice_payee());
     let (_, room) = post(&state, "/api/v1/rooms", json!({"name":"mixed"})).await;
     let room = room["id"].as_str().unwrap();
     for peer in [first, second] {

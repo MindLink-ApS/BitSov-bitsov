@@ -122,26 +122,14 @@ async fn whitelist_then_verify(
     .await
 }
 
-/// Cooldown between corrective price-table resends to the SAME peer. Long enough
-/// to throttle an unpaid flood, short enough that a legitimately mis-priced
-/// sender can retry promptly.
+/// Cooldown between corrective price-table resends to the same privileged peer.
 const CORRECTIVE_PRICE_TABLE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Cap on the corrective-price-table cooldown map (mirrors the session-handler's
-/// `MAX_COOLDOWN_ENTRIES`) so a spray of distinct sender IDs cannot grow it
-/// without bound.
+/// Maximum retained corrective-price-table cooldown entries.
 const MAX_CORRECTIVE_PRICE_TABLE_ENTRIES: usize = 10_000;
 
-/// Per-peer cooldown on the corrective price-table reply — the unpaid-sender
-/// "free connection back" + asymmetric-work guard. Returns `true` (drop the
-/// resend) if `peer` was already sent one within
-/// [`CORRECTIVE_PRICE_TABLE_COOLDOWN`]; otherwise records `now` and returns
-/// `false` (send allowed). Pure (clock injected) so the throttle is provable
-/// without driving the handler loop; mirrors
-/// `session_handler::admission_invoice_rate_limited`. In PriceOpen mode an
-/// UNPAID stranger lands on `InsufficientPayment`, so without this a 1-msat
-/// underpaid flood could loop a free `build_full_price_table` + wallet lookup +
-/// send (doctrine: no free connection back beyond the irreducible decode floor).
+/// Throttle corrective responses for privileged peers. Unpaid strangers never
+/// enter this path or allocate these per-peer guards.
 fn corrective_price_table_rate_limited(
     last_sent: &mut std::collections::HashMap<konsensus_core::types::NodeId, tokio::time::Instant>,
     peer: &konsensus_core::types::NodeId,
@@ -188,8 +176,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
         mut shutdown_rx,
     } = deps;
 
-    // Per-peer cooldown for the corrective price-table resend (DoS + "no free
-    // connection back" guard, throttled like the admission-invoice path).
+    // Per-peer cooldown for privileged corrective price-table responses.
     let mut last_corrective_price_table: std::collections::HashMap<
         konsensus_core::types::NodeId,
         tokio::time::Instant,
@@ -271,6 +258,16 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 _ => {}
                             }
 
+                            // Rejected PriceOpen strangers get no application record
+                            // or response. In particular, an underpaid self-generated
+                            // proof must not bypass the bounded chat quote to obtain
+                            // arbitrary-kind prices or the complete price table.
+                            if matches!(admission_mode_for_recv, konsensus_message::ReachabilityMode::PriceOpen)
+                                && !transport_for_recv.connected_privileged_peers().await.contains(&sender)
+                            {
+                                continue;
+                            }
+
                             warn!(
                                 sender = %sender,
                                 kind = envelope.kind,
@@ -296,12 +293,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
 
                             // On pricing mismatch, proactively send our current price table
                             // so the sender can update their cache and retry successfully —
-                            // but throttle it per-peer. In PriceOpen mode an UNPAID stranger
-                            // also lands here, so an un-throttled resend is a "free connection
-                            // back" + asymmetric-work primitive (each underpaid packet would
-                            // loop a free build_full_price_table + wallet lookup + send). The
-                            // cooldown lets a legitimately mis-priced sender retry once while a
-                            // flood throttles itself.
+                            // but throttle it per-peer. Only privileged peers reach
+                            // this response path; unpaid PriceOpen strangers were
+                            // dropped above without revealing a price table.
                             if matches!(rejection, konsensus_core::gate::GateRejection::InsufficientPayment { .. }) {
                                 if corrective_price_table_rate_limited(
                                     &mut last_corrective_price_table,
