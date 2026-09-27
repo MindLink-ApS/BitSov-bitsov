@@ -13,6 +13,7 @@ use konsensus_message::PeerEntry;
 
 use crate::audit::events;
 use crate::error::ApiError;
+use crate::freshness::DataFreshness;
 use crate::state::AppState;
 
 /// Maximum length for peer labels (bytes).
@@ -143,10 +144,15 @@ fn peer_response(
 }
 
 /// `GET /api/v1/peers` — list all known peers with connection status.
+///
+/// Carries `BitSov-Data-As-Of` (see `crate::freshness`): the registry and the
+/// live connection set are the node's own, read for this response, so the
+/// stamp is taken before either read. Never stale.
 async fn list_peers(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
-) -> Json<Vec<PeerResponse>> {
+) -> (DataFreshness, Json<Vec<PeerResponse>>) {
+    let read_at = DataFreshness::now();
     let registry = state.peer_registry.read().await;
     let connected = state.transport.connected_peers().await;
     let local_id = state.identity.node_id();
@@ -162,7 +168,7 @@ async fn list_peers(
         peers.push(peer_response(entry, is_connected, local_id, info));
     }
 
-    Json(peers)
+    (read_at, Json(peers))
 }
 
 /// `GET /api/v1/peers/connected` — list currently connected peers.

@@ -1,6 +1,6 @@
-//! G-STALENESS-MARKER: `BitSov-Data-As-Of` / `BitSov-Data-Stale` on the five
+//! G-STALENESS-MARKER: `BitSov-Data-As-Of` / `BitSov-Data-Stale` on the six
 //! pinned read routes (`/payments/balance`, `/payments/channels`, `/health`,
-//! `/messages`, `/pricing`).
+//! `/messages`, `/pricing`, `/peers`).
 //!
 //! Every test drives the production router in-process (`oneshot`, no socket,
 //! no port) with stub/mock providers only.
@@ -411,6 +411,28 @@ async fn health_without_block_height_omits_both_headers() {
         "body unchanged: height omitted"
     );
     assert_eq!(r.json["status"], "ok");
+    assert_eq!(r.as_of, None);
+    assert_eq!(r.stale, None);
+}
+
+// ─── /peers ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn peers_is_as_of_the_registry_read() {
+    let before = Utc::now() - chrono::Duration::seconds(1);
+    let r = get(test_state(), "/api/v1/peers", true).await;
+
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.json.is_array(), "body shape unchanged: bare array");
+    assert!(parse_as_of(r.as_of.as_deref().unwrap()) >= before);
+    assert_eq!(r.stale, None);
+}
+
+#[tokio::test]
+async fn peers_unauthenticated_carries_no_freshness_headers() {
+    let r = get(test_state(), "/api/v1/peers", false).await;
+
+    assert_ne!(r.status, StatusCode::OK);
     assert_eq!(r.as_of, None);
     assert_eq!(r.stale, None);
 }
