@@ -353,8 +353,16 @@ pub enum ControlEvent {
     },
 }
 
-/// Keepalive interval — send a Ping if no frames sent/received for this duration.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Keepalive interval — the dialing side's supervisor sends a Ping once this
+/// long has passed since the last one and the previous Pong wait is over, so
+/// the cadence is the larger of this and [`KEEPALIVE_TIMEOUT`].
+///
+/// That cadence must stay well under [`READ_TIMEOUT`]: the accepting side sends no pings of
+/// its own and closes a connection it has not read from for `READ_TIMEOUT`. At
+/// 30 s (equal to the read timeout) an idle connection was closed just as the
+/// ping went out, and every reconnect starts unprivileged, so a paid sender was
+/// demoted to a stranger after half a minute of silence.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// If no Pong received within this duration after a Ping, consider the connection dead.
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -394,6 +402,14 @@ pub(crate) const MAX_TRACKED_SUBNETS: usize = 65_536;
 /// Timeout for a single TCP read operation (length prefix + payload).
 /// Prevents slowloris attacks where an attacker sends partial data to hold connections.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+// An idle connection must see at least two pings per read timeout.
+const _: () = {
+    let interval = KEEPALIVE_INTERVAL.as_secs();
+    let pong_wait = KEEPALIVE_TIMEOUT.as_secs();
+    let cadence = if interval > pong_wait { interval } else { pong_wait };
+    assert!(cadence * 2 <= READ_TIMEOUT.as_secs());
+};
 
 /// Timeout for the entire Noise_XX + federation handshake.
 /// Prevents attackers from holding inbound connection slots indefinitely.
@@ -596,6 +612,10 @@ struct PeerConnection {
     tier: SovereigntyTier,
     /// The peer's advertised capabilities.
     capabilities: Vec<Capability>,
+    /// When this connection finished its handshake. A reconnect is a new
+    /// connection: it starts unprivileged, and this lets a sender tell an
+    /// admission paid on an older connection from one paid on this one.
+    connected_at: Instant,
     /// Last time we received any frame from this peer (monotonic).
     last_recv: Instant,
     /// Outstanding ping nonce (Some if we sent a Ping and are waiting for Pong).
@@ -942,6 +962,15 @@ impl MessageTransport for NoiseTransport {
             tier: format!("{:?}", conn.tier),
             capabilities: conn.capabilities.iter().map(|c| format!("{:?}", c)).collect(),
         })
+    }
+
+    async fn connected_since(&self, peer: &NodeId) -> Option<Instant> {
+        let conn = {
+            let peers = self.peers.read().await;
+            Arc::clone(peers.get(peer)?)
+        };
+        let connected_at = conn.lock().await.connected_at;
+        Some(connected_at)
     }
 
     async fn add_to_whitelist(&self, peer: &NodeId) {

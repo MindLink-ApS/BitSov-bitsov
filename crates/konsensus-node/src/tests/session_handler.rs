@@ -293,6 +293,34 @@ async fn unprivileged_invoice_error_does_not_drop_sender_channel() {
 }
 
 #[tokio::test]
+async fn unprivileged_refusal_of_a_request_sent_to_that_peer_ends_it() {
+    // The sender learns "admission required" from a recipient that never paid
+    // us — but only for a request it actually sent to that recipient.
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let peer_id = test_peer_id();
+    let binding = konsensus_api::invoice_refusal::bind(&request_id, peer_id);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
+    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    map.lock().await.insert(request_id.clone(), tx);
+
+    handle_invoice_error_received(
+        &peer_id, &request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED, false, &map,
+    ).await;
+
+    let refusal = rx.await.expect("answered").expect_err("refused");
+    assert_eq!(refusal.recipient, peer_id);
+    assert_eq!(refusal.reason, konsensus_api::invoice_refusal::ADMISSION_REQUIRED);
+    assert!(map.lock().await.is_empty());
+    assert_eq!(
+        binding.finish().as_deref(),
+        Some(konsensus_api::invoice_refusal::ADMISSION_REQUIRED),
+        "the binding saw the reason too"
+    );
+}
+
+#[tokio::test]
 async fn invoice_response_concurrent_requests_isolated() {
     let peer_id = test_peer_id();
     let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
@@ -1243,6 +1271,7 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
     handle_invoice_requested_gated(
         &peer_id, "req-priv", 25_000, "konsensus message", true,
         &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8), &mut std::collections::HashMap::new(),
     ).await;
 
     let payments = lightning.list_payments(10).await.unwrap();
@@ -1251,22 +1280,33 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
 }
 
 #[tokio::test]
-async fn unprivileged_non_admission_invoice_request_is_dropped() {
-    // P2: an unprivileged stranger asking for an ordinary message invoice gets
-    // NOTHING — no invoice is minted on our wallet.
+async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
+    // P2: an unprivileged peer asking for an ordinary message invoice gets no
+    // invoice on our wallet. The refusal is explicit: one N2 membrane event per
+    // peer per cooldown, however many requests it sends.
     let peer_id = test_peer_id();
     let transport = make_gossip_test_transport();
     let lightning: Arc<dyn LightningProvider> =
         Arc::new(konsensus_lightning::MockLightningProvider::new());
     let pricing = admission_pricing();
+    let membrane = konsensus_api::membrane::Membrane::with_capacity(8);
+    let mut last_refusal = std::collections::HashMap::new();
 
-    handle_invoice_requested_gated(
-        &peer_id, "req-strange", 1_000_000, "konsensus message", false,
-        &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
-    ).await;
+    for request_id in ["req-strange-1", "req-strange-2"] {
+        handle_invoice_requested_gated(
+            &peer_id, request_id, 1_000_000, "konsensus message", false,
+            &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &membrane, &mut last_refusal,
+        ).await;
+    }
 
     let payments = lightning.list_payments(10).await.unwrap();
     assert!(payments.is_empty(), "no invoice may be created for an unprivileged non-admission request");
+    let (events, totals) = membrane.read(None, 10);
+    assert_eq!(events.len(), 1, "one membrane event per peer per cooldown");
+    assert_eq!(events[0].code, konsensus_api::membrane::Code::AdmissionRequired);
+    assert_eq!(events[0].counterparty.as_deref(), Some(peer_id.to_hex().as_str()));
+    assert_eq!(totals.refused, 1);
 }
 
 // ── Price query handler tests ──────────────────────────────
@@ -1418,6 +1458,7 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
         handle_invoice_requested_gated(
             &peer_id, &id, 1, purpose, false,
             &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut quotes,
+            &konsensus_api::membrane::Membrane::with_capacity(8), &mut std::collections::HashMap::new(),
         ).await;
     }
     assert!(lightning.list_payments(10).await.unwrap().is_empty(),
@@ -1625,7 +1666,8 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
     handle_invoice_requested_gated(&peer, &request_id, 1,
         konsensus_core::admission_quote::PURPOSE, false, &admission_pricing(), &provider,
-        &target, &recipient, "127.0.0.1".parse().unwrap(), &mut quotes).await;
+        &target, &recipient, "127.0.0.1".parse().unwrap(), &mut quotes,
+        &konsensus_api::membrane::Membrane::with_capacity(8), &mut std::collections::HashMap::new()).await;
     let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await.unwrap().unwrap();
     assert!(matches!(event, ControlEvent::InvoiceErrorReceived { peer_id, request_id: id, reason, .. }
         if peer_id == recipient && id == request_id && reason == "stateless_quote_unsupported"));

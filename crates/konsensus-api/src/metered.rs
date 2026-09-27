@@ -194,6 +194,11 @@ impl Debit {
         Self { held: None }
     }
 
+    /// Whether this debit is held against a budget grant.
+    pub(crate) fn is_metered(&self) -> bool {
+        self.held.is_some()
+    }
+
     /// Guard each poll of an operation that can dispatch value. A separate
     /// check followed by `.await` leaves a revocation race: the provider may
     /// suspend before it dispatches. Polling under the ledger mutex orders

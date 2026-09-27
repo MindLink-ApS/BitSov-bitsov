@@ -75,8 +75,9 @@ impl NoiseTransport {
     /// Returns `true` if a connection keyed by `peer` existed and was flipped (or
     /// was already privileged), `false` if no such connection is live. The flip is
     /// in-memory and effective on the NEXT frame the reader stamps for that
-    /// connection. Durable persistence of the promotion is a follow-up; an
-    /// unprivileged reconnect simply re-runs the one-invoice admission pay-loop.
+    /// connection. It is never persisted (no durable admission object): a
+    /// reconnect starts unprivileged, the node refuses its paid invoice requests
+    /// with `admission_required`, and the sender pays admission again.
     pub async fn promote_to_privileged(&self, peer: &NodeId) -> bool {
         let conn = {
             let peers = self.peers.read().await;

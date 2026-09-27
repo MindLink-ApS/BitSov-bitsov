@@ -477,7 +477,8 @@ async fn send_file_inner(
             .map_err(|_| ApiError::Forbidden("spend grant is no longer valid".into()))?;
     }
     // Create real payment proof — requests invoice from recipient (Principle 2).
-    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit).await;
+    let readmission = super::messages::Readmission::for_cap(req.max_total_msat.is_some());
+    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission).await;
     debit.resolve_proof(&peer_key, &paid);
     let (payment_hash, preimage, amount_msat) = paid?;
     let proof =

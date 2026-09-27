@@ -74,6 +74,11 @@ const SESSION_SELF_HEAL_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// PeerExchange requests/responses to trigger expensive registry writes.
 const PEER_EXCHANGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// An unpaid connection's refused invoice requests are logged to the N2
+/// membrane at most once per peer per this interval, so a flood of requests
+/// cannot wash out the owner's view of the ring.
+const ADMISSION_REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Maximum number of peer exchange entries we process from a single response.
 const MAX_PEER_EXCHANGE_ENTRIES: usize = 50;
 
@@ -126,6 +131,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
+    let mut last_admission_refusal: std::collections::HashMap<NodeId, tokio::time::Instant> =
+        std::collections::HashMap::new();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
     let mut cooldown_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -255,6 +262,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         handle_invoice_requested_gated(
                             &peer_id, &request_id, amount_msat, &purpose, privileged,
                             &pricing, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
+                            audit_log.membrane(), &mut last_admission_refusal,
                         ).await;
                     }
 
@@ -384,6 +392,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 last_negotiation.retain(|_, ts| now.duration_since(*ts) < SESSION_NEGOTIATION_COOLDOWN * 6);
                 let before_pex = last_peer_exchange.len();
                 last_peer_exchange.retain(|_, ts| now.duration_since(*ts) < PEER_EXCHANGE_COOLDOWN * 6);
+                last_admission_refusal.retain(|_, ts| now.duration_since(*ts) < ADMISSION_REFUSAL_LOG_INTERVAL);
+                if last_admission_refusal.len() > MAX_COOLDOWN_ENTRIES {
+                    last_admission_refusal.clear();
+                }
                 // Defense-in-depth: if maps still exceed cap after TTL eviction,
                 // force-clear to prevent unbounded growth from a burst of unique peer IDs.
                 if last_negotiation.len() > MAX_COOLDOWN_ENTRIES {
@@ -923,6 +935,16 @@ async fn handle_price_response_received(
 /// engine; the requester cannot choose a price or a different kind. All other
 /// invoice services require an already privileged connection. Legacy admission
 /// requests fail closed even on privileged connections.
+///
+/// Nothing is refused in silence. A quote over the source's rate limit gets
+/// `InvoiceError` with [`ADMISSION_RATE_LIMITED`]. Any other request from an
+/// unpaid connection gets [`ADMISSION_REQUIRED`], so the peer pays admission
+/// (again) instead of timing out, and the refusal is an N2 membrane event (at
+/// most one per peer per [`ADMISSION_REFUSAL_LOG_INTERVAL`]). That is the
+/// normal case after a reconnect: promotion is per connection.
+///
+/// [`ADMISSION_RATE_LIMITED`]: konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED
+/// [`ADMISSION_REQUIRED`]: konsensus_api::invoice_refusal::ADMISSION_REQUIRED
 #[allow(clippy::too_many_arguments)]
 async fn handle_invoice_requested_gated(
     peer_id: &NodeId,
@@ -936,6 +958,8 @@ async fn handle_invoice_requested_gated(
     recipient: &NodeId,
     source_ip: std::net::IpAddr,
     quotes: &mut crate::admission_quotes::AdmissionQuotes,
+    membrane: &konsensus_api::membrane::Membrane,
+    last_admission_refusal: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
 ) {
     use konsensus_core::admission_quote;
     if purpose == admission_quote::PURPOSE {
@@ -951,6 +975,10 @@ async fn handle_invoice_requested_gated(
             tokio::time::Instant::now(),
             unix,
         ) {
+            send_invoice_refusal(
+                transport, peer_id, request_id,
+                konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED,
+            ).await;
             return;
         }
         // Exactly the first-contact chat price. Neither kind nor amount is
@@ -1025,17 +1053,50 @@ async fn handle_invoice_requested_gated(
         }
         return;
     }
-    // Old arbitrary-kind/legacy admission requests fail closed, even if paid.
-    if privileged && !purpose.starts_with(ADMISSION_INVOICE_PURPOSE) {
-        handle_invoice_requested(
-            peer_id,
-            request_id,
-            amount_msat,
-            purpose,
-            lightning,
-            transport,
-        )
-        .await;
+    if privileged {
+        // Old arbitrary-kind/legacy admission requests fail closed, even if paid.
+        if !purpose.starts_with(ADMISSION_INVOICE_PURPOSE) {
+            handle_invoice_requested(
+                peer_id,
+                request_id,
+                amount_msat,
+                purpose,
+                lightning,
+                transport,
+            )
+            .await;
+        }
+        return;
+    }
+    warn!(peer = %peer_id, %request_id, %purpose, "REFUSE invoice request from unprivileged peer: admission required (P2: only the first-contact quote is issuable pre-payment)");
+    let now = tokio::time::Instant::now();
+    let logged_recently = last_admission_refusal
+        .get(peer_id)
+        .is_some_and(|last| now.duration_since(*last) < ADMISSION_REFUSAL_LOG_INTERVAL);
+    if !logged_recently {
+        last_admission_refusal.insert(*peer_id, now);
+        membrane.admission_required(peer_id);
+    }
+    send_invoice_refusal(
+        transport, peer_id, request_id,
+        konsensus_api::invoice_refusal::ADMISSION_REQUIRED,
+    ).await;
+}
+
+/// Refuse a peer's invoice request out loud: nothing is created on our wallet,
+/// and the peer learns why at once instead of waiting out its request timeout.
+async fn send_invoice_refusal(
+    transport: &Arc<NoiseTransport>,
+    peer_id: &NodeId,
+    request_id: &str,
+    reason: &str,
+) {
+    let refusal = Frame::InvoiceError {
+        request_id: request_id.to_string(),
+        reason: reason.to_string(),
+    };
+    if let Err(e) = transport.send_frame(peer_id, &refusal).await {
+        warn!(peer = %peer_id, %request_id, error = %e, "failed to send invoice refusal");
     }
 }
 
@@ -1081,6 +1142,13 @@ async fn handle_invoice_requested(
     }
 }
 
+/// A peer answered one of our invoice requests with `InvoiceError`.
+///
+/// A peer we have not been paid by is still heard when the request was sent to
+/// that same peer: a first-contact quote id embeds its recipient, and other
+/// requests are bound in [`konsensus_api::invoice_refusal`]. It can only end
+/// our own request early, which it could do anyway by never answering. That is
+/// how a sender learns that a recipient now requires admission again.
 async fn handle_invoice_error_received(
     peer_id: &NodeId,
     request_id: &str,
@@ -1089,9 +1157,11 @@ async fn handle_invoice_error_received(
     invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>,
 ) {
     let bound_quote = request_id.starts_with(&format!("v1:{peer_id}:"))
-        && reason == "stateless_quote_unsupported";
-    if !privileged && !bound_quote {
-        warn!(peer = %peer_id, "DROP InvoiceError from unprivileged peer (P2: no pending-invoice bookkeeping drive before payment)");
+        && (reason == "stateless_quote_unsupported"
+            || reason == konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED);
+    let bound = bound_quote || konsensus_api::invoice_refusal::record(request_id, peer_id, reason);
+    if !privileged && !bound {
+        warn!(peer = %peer_id, "DROP InvoiceError from unprivileged peer for a request not sent to it (P2: no pending-invoice bookkeeping drive before payment)");
         return;
     }
     warn!(
@@ -1512,3 +1582,7 @@ async fn handle_gossip_received(
 #[cfg(test)]
 #[path = "tests/session_handler.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/reconnect_two_node.rs"]
+mod reconnect_two_node;
