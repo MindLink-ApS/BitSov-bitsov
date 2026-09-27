@@ -87,6 +87,20 @@ not mean the LSP is online or that capacity is available. Tokens are never retur
    This pilot does not advertise an all-in route-fee cap on the later send; LDK's
    existing outgoing route policy is unchanged.
 
+The vendored LDK receive handler enforces the fixed funding minimum **before
+claiming any HTLC or releasing its preimage**. It reads the original gross and
+negotiated maximum fee from the persisted `Bolt11Jit` record, requires aggregate
+net received to be at least `gross - maximum fee`, and also enforces the skim
+ceiling. An undersized payment is failed back to the payer. Failed attempts keep
+the original amount/fee terms, including across restart. A successful receipt is
+never downgraded by a duplicate attempt.
+
+For multipart payments, LDK first assembles the sender's declared total. Individual
+parts are not compared with the full funding minimum: a missing part remains
+pending until completion or LDK's MPP timeout. The pre-claim guard checks the sum
+of actual received parts, after any LSP deduction. A completed but undersized
+multipart payment fails as a whole; no subset is claimed.
+
 A quote without an invoice cannot be paid. LDK logs full JIT invoices at INFO;
 LSPS2-enabled nodes therefore use a WARN-level LDK filesystem logger. No chat
 text or contact names enter a funding memo. Neither pending nor funding-only
@@ -148,6 +162,12 @@ or contact graph is written on-chain; no global provider graph is introduced.
 
 Validation uses a mock LSP boundary (production preview store and HTTP/ledger),
 LDK payment serialization for purpose/fee retention, and the actual payment gate.
+The vendored LDK regression suite exercises its production receive handler with
+disposable, unstarted objects and real in-memory multipart HTLC assembly:
+`cargo test --manifest-path vendor/ldk-node/Cargo.toml --locked --lib bitsov_jit_tests`.
+It covers below-minimum/exact-minimum funding, excessive skim, malformed fixed
+terms, restart/retry, and multipart aggregates. These vendor tests are run
+separately from the workspace because the vendor crate is excluded as a member.
 The workspace suite does not require the optional downloaded-bitcoind integration
 feature or any real funds. Mock success is not proof of channel-opening mainnet
 compatibility or independent-provider availability.

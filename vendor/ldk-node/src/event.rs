@@ -699,12 +699,32 @@ where
 						_ => 0,
 					};
 
-					if counterparty_skimmed_fee_msat > max_total_opening_fee_msat {
+					// BitSov fixed JIT quotes promise a minimum net. LSPS2's
+					// inbound registration has no amount minimum, so the invoice
+					// alone does not enforce it. PaymentClaimable contains the
+					// aggregate NET after all MPP parts, not an individual shard.
+					// The store still contains the original gross here: successful
+					// receipts (which contain net) were rejected above as duplicates.
+					let below_jit_minimum = match &info.kind {
+						PaymentKind::Bolt11Jit { lsp_fee_limits, .. } => match info.amount_msat {
+							Some(gross) => gross.checked_sub(max_total_opening_fee_msat)
+								.filter(|minimum| *minimum > 0)
+								.is_none_or(|minimum| amount_msat < minimum),
+							// A fixed fee ceiling without its gross is incomplete
+							// policy. Variable invoices retain their fee-only policy.
+							None => lsp_fee_limits.max_total_opening_fee_msat.is_some(),
+						},
+						_ => false,
+					};
+
+					if below_jit_minimum || counterparty_skimmed_fee_msat > max_total_opening_fee_msat {
 						log_info!(
 							self.logger,
-							"Refusing inbound payment with hash {} as the counterparty-withheld fee of {}msat exceeds our limit of {}msat",
+							"Refusing inbound payment with hash {}: net {}msat / skim {}msat violates gross {:?}msat / fee limit {}msat",
 							hex_utils::to_string(&payment_hash.0),
+							amount_msat,
 							counterparty_skimmed_fee_msat,
+							info.amount_msat,
 							max_total_opening_fee_msat,
 						);
 						self.channel_manager.fail_htlc_backwards(&payment_hash);
@@ -2061,3 +2081,7 @@ mod bitsov_stateless_tests {
             &quote.payment_secret().0, 2000, &restarted.node_id(), deadline - 1));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/bitsov_jit.rs"]
+mod bitsov_jit_tests;
