@@ -53,6 +53,7 @@ const FAILED: u8 = 3;
 /// Counts every money-moving call and settles, loses, refuses or fails it.
 #[derive(Default)]
 struct Wallet {
+    liquidity: std::sync::Mutex<Option<Arc<konsensus_lightning::liquidity::LiquidityClient>>>,
     mode: AtomicU8,
     pause_dispatch: AtomicBool,
     waiting: AtomicUsize,
@@ -114,6 +115,16 @@ impl Wallet {
 
 #[async_trait]
 impl LightningProvider for Wallet {
+    async fn quote_liquidity(&self, owner: &str, gross: u64, cap: u64) -> Result<konsensus_core::traits::liquidity::LiquidityQuote, LightningError> {
+        let client = self.liquidity.lock().unwrap().clone().unwrap();
+        client.quote(owner, gross, cap).await
+    }
+    fn liquidity_quote(&self, owner: &str, id: &str) -> Result<konsensus_core::traits::liquidity::LiquidityQuote, LightningError> {
+        self.liquidity.lock().unwrap().as_ref().unwrap().terms(owner, id)
+    }
+    async fn accept_liquidity(&self, owner: &str, id: &str) -> Result<Invoice, LightningError> {
+        self.liquidity.lock().unwrap().as_ref().unwrap().accept(owner, id)
+    }
     async fn create_invoice(
         &self,
         amount_msat: u64,
@@ -1194,3 +1205,21 @@ async fn membrane_observes_direct_payment_budget_denials_without_invoice_data() 
     assert!(!serde_json::to_string(&events).unwrap().contains(&invoice));
     assert_eq!(fx.wallet.money(), 0);
 }
+
+#[tokio::test]
+async fn liquidity_requires_separate_authority_and_uses_durable_g1_budget() {
+    let mut fx = fixture().await;
+    fx.grant(None, GrantTerms::new(10_000)).await;
+    let epoch = fx.service.snapshot().clients.iter().find(|c| c.client_id == fx.client_id).unwrap().epoch;
+    let charge = Charge { recipient: PEER_LN.into(), amount_msat: 2_000 };
+    assert!(fx.service.reserve_liquidity_fee(&fx.client_id, epoch, vec![charge.clone()]).is_err());
+    let mut terms = GrantTerms::new(10_000).recipient(PEER_LN, 3_000);
+    terms.allow_liquidity_fees = true;
+    fx.grant(None, terms).await;
+    fx.service.reserve_liquidity_fee(&fx.client_id, epoch, vec![charge.clone()]).unwrap();
+    fx.restart();
+    assert!(fx.service.reserve_liquidity_fee(&fx.client_id, epoch, vec![charge]).is_err(), "restart must not reset fee reservation or recipient cap");
+}
+
+#[path = "budget_grant/liquidity.rs"]
+mod liquidity_tests;

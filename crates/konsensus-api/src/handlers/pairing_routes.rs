@@ -371,6 +371,9 @@ pub struct ElevationRequestBody {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetProposal {
+    /// Proposal only: the owner must explicitly approve this at the control socket.
+    #[serde(default)]
+    pub allow_liquidity_fees: bool,
     /// Total for the window.
     pub budget_msat: u64,
     /// Most one call may spend. Defaults to the whole budget.
@@ -393,6 +396,7 @@ impl BudgetProposal {
         if let Some(ttl) = self.ttl_secs {
             terms = terms.for_secs(ttl);
         }
+        terms.allow_liquidity_fees = self.allow_liquidity_fees;
         terms.per_recipient_msat = self.per_recipient_msat;
         terms
     }

@@ -10,6 +10,7 @@
 
 pub mod circuit_breaker;
 pub mod ldk;
+pub mod liquidity;
 pub mod lnd;
 pub mod lnbits;
 pub mod mock;

@@ -1667,8 +1667,17 @@ impl PairingService {
         client_id: &str,
         epoch: u64,
         charges: Vec<Charge>,
-        mut clock: impl FnMut() -> i64,
+        clock: impl FnMut() -> i64,
     ) -> Result<Reservation, BudgetRefusal> {
+        self.reserve_spend_for_purpose(client_id, epoch, charges, false, clock)
+    }
+
+    /// Liquidity authority is checked inside the SAME transaction as its debit.
+    pub fn reserve_liquidity_fee(&self, client_id: &str, epoch: u64, charges: Vec<Charge>) -> Result<Reservation, BudgetRefusal> {
+        self.reserve_spend_for_purpose(client_id, epoch, charges, true, || chrono::Utc::now().timestamp())
+    }
+
+    fn reserve_spend_for_purpose(&self, client_id: &str, epoch: u64, charges: Vec<Charge>, liquidity: bool, mut clock: impl FnMut() -> i64) -> Result<Reservation, BudgetRefusal> {
         if !self.owner_control_enabled {
             return Err(BudgetRefusal::NoGrant);
         }
@@ -1692,6 +1701,9 @@ impl PairingService {
         }) else {
             return Err(BudgetRefusal::NoGrant);
         };
+        if liquidity && !inner.file.grants[idx].budget.as_ref().is_some_and(|b| b.allow_liquidity_fees) {
+            return Err(BudgetRefusal::Unpriced("grant does not authorize liquidity fees".into()));
+        }
         let before = inner.file.grants[idx].budget.clone();
         let op_id = inner.file.grants[idx].op_id.clone();
         inner.file.grants[idx]
@@ -1928,6 +1940,7 @@ pub enum ElevationStatus {
 fn grant_view(g: &SpendGrant) -> Option<GrantView> {
     let b = g.budget.as_ref()?;
     Some(GrantView {
+        allow_liquidity_fees: b.allow_liquidity_fees,
         op_id: g.op_id.clone(),
         client_id: g.client_id.clone(),
         granted_at: g.granted_at,

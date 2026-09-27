@@ -534,6 +534,13 @@ impl PaymentGate {
     ) -> Result<(), GateRejection> {
         let payment_hash = hex::encode(envelope.payment_proof.payment_hash);
 
+        if lightning.is_funding_payment(&payment_hash).await
+            .map_err(|e| GateRejection::LightningUnavailable(e.to_string()))? {
+            return Err(GateRejection::PaymentSettlementMismatch(
+                "funding payments cannot admit communication".into(),
+            ));
+        }
+
         let details = lightning
             .get_payment_status(&payment_hash)
             .await
@@ -736,6 +743,7 @@ mod tests {
     // ── Mock LightningProvider ─────────────────────────────────────────
 
     struct MockLightning {
+        funding_only: bool,
         settled: bool,
         amount_msat: u64,
         direction: PaymentDirection,
@@ -746,6 +754,7 @@ mod tests {
     impl MockLightning {
         fn settled(amount_msat: u64) -> Self {
             Self {
+                funding_only: false,
                 settled: true,
                 amount_msat,
                 direction: PaymentDirection::Incoming,
@@ -756,6 +765,7 @@ mod tests {
 
         fn pending() -> Self {
             Self {
+                funding_only: false,
                 settled: false,
                 amount_msat: 0,
                 direction: PaymentDirection::Incoming,
@@ -767,6 +777,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LightningProvider for MockLightning {
+        async fn is_funding_payment(&self, _hash: &str) -> Result<bool, LightningError> { Ok(self.funding_only) }
         async fn create_invoice(
             &self,
             _amount_msat: u64,
@@ -2491,4 +2502,15 @@ mod tests {
             "a floor below the base price must not lower required, got: {result:?}"
         );
     }
+    #[tokio::test]
+    async fn settled_bootstrap_funding_never_admits_a_message() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let envelope = make_signed_envelope(&identity, 100);
+        let gate = PaymentGate::new();
+        let mut lightning = MockLightning::settled(100);
+        lightning.funding_only = true;
+        let result = gate.verify_settlement(&envelope, &lightning, 10, None).await;
+        assert!(matches!(result, Err(GateRejection::PaymentSettlementMismatch(s)) if s.contains("funding")));
+    }
+
 }

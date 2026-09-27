@@ -268,6 +268,9 @@ pub enum LightningConfig {
     /// The node IS its own Lightning node. Keys derived from the same mnemonic.
     #[serde(rename = "ldk")]
     Ldk {
+        /// Bounded LSPS2 bootstrap; disabled unless explicitly enabled.
+        #[serde(default)]
+        liquidity: konsensus_lightning::liquidity::LiquidityConfig,
         /// Bitcoin network: "bitcoin", "testnet", "signet", "regtest".
         #[serde(default = "default_ldk_network")]
         network: String,
@@ -1233,6 +1236,7 @@ impl NodeConfig {
                     lsp_node_id: None,
                     lsp_address: None,
                     lsp_token: None,
+                    liquidity: Default::default(),
                     listening_address: Some("0.0.0.0:9735".to_string()),
                     advertised_address: None,
                 },

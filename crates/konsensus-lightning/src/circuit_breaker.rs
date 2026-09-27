@@ -178,6 +178,26 @@ impl CircuitBreakerLightning {
 
 #[async_trait]
 impl LightningProvider for CircuitBreakerLightning {
+    fn liquidity_info(&self) -> konsensus_core::traits::liquidity::LiquidityInfo {
+        self.inner.liquidity_info()
+    }
+    async fn quote_liquidity(&self, owner: &str, gross: u64, cap: u64) -> Result<konsensus_core::traits::liquidity::LiquidityQuote, LightningError> {
+        self.inner.quote_liquidity(owner, gross, cap).await
+    }
+    fn liquidity_quote(&self, owner: &str, id: &str) -> Result<konsensus_core::traits::liquidity::LiquidityQuote, LightningError> {
+        self.inner.liquidity_quote(owner, id)
+    }
+    async fn accept_liquidity(&self, owner: &str, id: &str) -> Result<Invoice, LightningError> {
+        self.inner.accept_liquidity(owner, id).await
+    }
+    async fn is_funding_payment(&self, hash: &str) -> Result<bool, LightningError> {
+        tokio::time::timeout(self.cfg.call_timeout, self.inner.is_funding_payment(hash)).await
+            .map_err(|_| LightningError::Backend("funding-purpose lookup timeout".into()))?
+    }
+    async fn liquidity_receipt(&self, hash: &str) -> Result<Option<konsensus_core::traits::liquidity::LiquidityReceipt>, LightningError> {
+        self.inner.liquidity_receipt(hash).await
+    }
+
     async fn get_payment_status(
         &self,
         payment_hash: &str,
