@@ -12,6 +12,8 @@
 //! 5. Graceful disconnect or TCP drop
 
 mod connection;
+mod control_reply;
+use control_reply::Connection;
 mod cookie;
 mod handshake;
 mod messaging;
@@ -642,7 +644,7 @@ struct PeerConnection {
 }
 
 /// Shared map of active peer connections.
-type PeerMap = Arc<RwLock<HashMap<NodeId, Arc<Mutex<PeerConnection>>>>>;
+type PeerMap = Arc<RwLock<HashMap<NodeId, Arc<Connection>>>>;
 
 /// Shared map of temporarily banned peers. Value is the ban expiry time (monotonic).
 type BanMap = Arc<RwLock<HashMap<NodeId, Instant>>>;
@@ -988,8 +990,17 @@ impl MessageTransport for NoiseTransport {
             let peers = self.peers.read().await;
             Arc::clone(peers.get(peer)?)
         };
-        let connected_at = conn.lock().await.connected_at;
-        Some(connected_at)
+        Some(conn.connected_at)
+    }
+
+    async fn admission_paid_on_connection(&self, peer: &NodeId) -> bool {
+        self.peers.read().await.get(peer).is_some_and(|conn| conn.admission_paid.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    async fn mark_admission_paid(&self, peer: &NodeId, since: Instant) {
+        if let Some(conn) = self.peers.read().await.get(peer) {
+            if conn.connected_at == since { conn.admission_paid.store(true, std::sync::atomic::Ordering::Release); }
+        }
     }
 
     async fn add_to_whitelist(&self, peer: &NodeId) {
@@ -3961,3 +3972,6 @@ mod cancelled_noise_write_tests {
         assert!(receiver.decrypt(&next).is_err(), "even recovering the next frame cannot recover skipped Noise nonce");
     }
 }
+
+#[cfg(test)]
+mod reply_tests;

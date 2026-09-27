@@ -4,30 +4,33 @@
 //! out after 30 s.
 //!
 //! Real pieces: two Noise transports over loopback (the recipient in
-//! `price_open`), node A's `POST /api/v1/messages/compose` route (with its
-//! admission journal on disk), node B's invoice handler with its stateless
-//! quote gate and payment gate with promote-on-paid, both N2 membranes, each
-//! side's invoice bookkeeping, and F1's shared mock Lightning ledger. The E2EE
-//! sessions are set up directly: in the field X3DH runs after the first
-//! admission, and both sides keep the session across a reconnect.
+//! `price_open`), node A's `POST /api/v1/messages/compose` route, node B's
+//! invoice handler and payment gate with promote-on-paid, both N2 membranes,
+//! and each side's invoice bookkeeping. The stand-ins: one in-memory
+//! Lightning ledger both wallets share, and the E2EE sessions, set up directly
+//! (in the field X3DH runs after the first admission, and both sides keep the
+//! session across a reconnect).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 use konsensus_api::membrane::Code;
-use konsensus_core::traits::lightning::{LightningProvider, PaymentDirection};
+use konsensus_core::traits::lightning::{
+    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection, PaymentStatus,
+};
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::{NodeId, NodeIdentity};
 use konsensus_crypto::SessionManager;
-use konsensus_lightning::shared_mock::SharedMockProvider;
 use konsensus_message::{ControlEvent, NoiseTransport, ReachabilityMode, TransportConfig};
 
 use super::{
@@ -38,12 +41,158 @@ use super::{
 /// The marker node A's compose puts in an admission envelope (not E2EE).
 const ADMISSION_MARKER: &[u8] = b"konsensus:admission:v1";
 
-const JWT_SECRET: &str = "reconnect-regression-jwt-secret";
+// ── A Lightning ledger both test wallets settle through ─────────────────
 
-/// A fresh identity per test: the sender's admission ledger and quote cache
-/// are process-wide and keyed by the peer, so tests must not share one.
-fn identity() -> Arc<NodeIdentity> {
-    Arc::new(NodeIdentity::generate().unwrap().1)
+#[derive(Default)]
+struct Ledger {
+    /// payment hash (hex) → (preimage, amount, settled)
+    invoices: HashMap<String, ([u8; 32], u64, bool)>,
+}
+
+/// One node's wallet on the shared ledger. It issues real BOLT11 invoices
+/// (compose parses them) and reports its own side of each payment.
+struct TestWallet {
+    ledger: Arc<std::sync::Mutex<Ledger>>,
+    created: std::sync::Mutex<HashSet<String>>,
+    paid: std::sync::Mutex<Vec<(String, u64)>>,
+    fail_message: std::sync::atomic::AtomicBool,
+}
+
+impl TestWallet {
+    fn new(ledger: &Arc<std::sync::Mutex<Ledger>>) -> Self {
+        Self {
+            ledger: Arc::clone(ledger),
+            created: std::sync::Mutex::new(HashSet::new()),
+            paid: std::sync::Mutex::new(Vec::new()),
+            fail_message: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn payments_made(&self) -> Vec<(String, u64)> {
+        self.paid.lock().unwrap().clone()
+    }
+}
+
+fn bolt11(amount_msat: u64, preimage: &[u8; 32], description: &str, expiry_secs: u32) -> (String, String) {
+    use bitcoin::hashes::{sha256, Hash};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+    let hash: [u8; 32] = Sha256::digest(preimage).into();
+    let invoice = InvoiceBuilder::new(Currency::Regtest)
+        .description(description.into())
+        .expiry_time(Duration::from_secs(u64::from(expiry_secs)))
+        .payment_hash(sha256::Hash::from_byte_array(hash))
+        .payment_secret(PaymentSecret(rand::random()))
+        .current_timestamp()
+        .min_final_cltv_expiry_delta(18)
+        .amount_milli_satoshis(amount_msat)
+        .build_signed(|msg| {
+            let secp = secp256k1::Secp256k1::new();
+            let key = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+            secp.sign_ecdsa_recoverable(msg, &key)
+        })
+        .unwrap();
+    (invoice.to_string(), hex::encode(hash))
+}
+
+#[async_trait]
+impl LightningProvider for TestWallet {
+    async fn create_invoice(
+        &self,
+        amount_msat: u64,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<Invoice, LightningError> {
+        if !description.starts_with("konsensus:v1:") && self.fail_message.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(LightningError::Backend("test message invoice failure".into()));
+        }
+        let preimage: [u8; 32] = rand::random();
+        let (bolt11, payment_hash) = bolt11(amount_msat, &preimage, description, expiry_secs);
+        self.ledger
+            .lock()
+            .unwrap()
+            .invoices
+            .insert(payment_hash.clone(), (preimage, amount_msat, false));
+        self.created.lock().unwrap().insert(payment_hash.clone());
+        Ok(Invoice {
+            bolt11,
+            payment_hash,
+            amount_msat,
+            description: description.to_string(),
+            expiry_secs,
+            created_at: 0,
+        })
+    }
+
+    async fn create_stateless_invoice(&self, amount_msat: u64, description: &str, expiry_secs: u32) -> Result<Invoice, LightningError> {
+        self.create_invoice(amount_msat, description, expiry_secs).await
+    }
+
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+        let invoice: lightning_invoice::Bolt11Invoice = bolt11
+            .parse()
+            .map_err(|e| LightningError::PaymentFailed(format!("bad invoice: {e:?}")))?;
+        let payment_hash = hex::encode(invoice.payment_hash());
+        let (preimage, amount_msat) = {
+            let mut ledger = self.ledger.lock().unwrap();
+            let entry = ledger
+                .invoices
+                .get_mut(&payment_hash)
+                .ok_or_else(|| LightningError::PaymentFailed("unknown invoice".into()))?;
+            entry.2 = true;
+            (entry.0, entry.1)
+        };
+        self.paid.lock().unwrap().push((payment_hash.clone(), amount_msat));
+        Ok(PaymentDetails {
+            payment_hash,
+            preimage: Some(hex::encode(preimage)),
+            amount_msat,
+            status: PaymentStatus::Settled,
+            direction: PaymentDirection::Outgoing,
+            timestamp: 0,
+            memo: None,
+            fee_msat: None,
+        })
+    }
+
+    async fn get_payment_status(&self, payment_hash: &str) -> Result<PaymentDetails, LightningError> {
+        let (preimage, amount_msat, settled) = *self
+            .ledger
+            .lock()
+            .unwrap()
+            .invoices
+            .get(payment_hash)
+            .ok_or_else(|| LightningError::PaymentFailed("unknown payment".into()))?;
+        let direction = if self.created.lock().unwrap().contains(payment_hash) {
+            PaymentDirection::Incoming
+        } else {
+            PaymentDirection::Outgoing
+        };
+        Ok(PaymentDetails {
+            payment_hash: payment_hash.to_string(),
+            preimage: settled.then(|| hex::encode(preimage)),
+            amount_msat,
+            status: if settled { PaymentStatus::Settled } else { PaymentStatus::Pending },
+            direction,
+            timestamp: 0,
+            memo: None,
+            fee_msat: None,
+        })
+    }
+
+    async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+        Ok(100_000_000)
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+}
+
+// ── Node wiring ─────────────────────────────────────────────────────────
+
+fn identity(mnemonic: &str) -> Arc<NodeIdentity> {
+    Arc::new(NodeIdentity::from_mnemonic(mnemonic, "").unwrap())
 }
 
 fn price_open_transport(identity: &Arc<NodeIdentity>) -> Arc<NoiseTransport> {
@@ -57,10 +206,7 @@ fn price_open_transport(identity: &Arc<NodeIdentity>) -> Arc<NoiseTransport> {
 
 fn pricing() -> Arc<dyn konsensus_core::traits::pricing::PricingEngine> {
     Arc::new(konsensus_pricing::StaticPricingEngine::new(
-        konsensus_pricing::StaticPricingConfig {
-            chat_msat: 2_000,
-            ..Default::default()
-        },
+        konsensus_pricing::StaticPricingConfig::default(),
     ))
 }
 
@@ -68,100 +214,30 @@ async fn storage() -> Arc<dyn konsensus_storage::Storage> {
     Arc::new(konsensus_storage::sqlite::SqliteStorage::in_memory().await.unwrap())
 }
 
-fn audit_log(dir: &std::path::Path) -> Arc<konsensus_api::audit::AuditLog> {
-    Arc::new(konsensus_api::audit::AuditLog::open(dir.join("audit.log")).unwrap())
+fn audit_log() -> Arc<konsensus_api::audit::AuditLog> {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    Arc::new(konsensus_api::audit::AuditLog::open(tmp.path()).unwrap())
 }
 
 type InvoiceRequests =
     Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>>;
 
-/// The owner's terminal, captured: grant confirmations are read from it.
-#[derive(Clone, Default)]
-struct OwnerConsole(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl OwnerConsole {
-    fn confirmation(&self, label: &str) -> String {
-        let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
-        text.lines()
-            .filter(|line| line.starts_with(&format!("{label} CODE ")))
-            .next_back()
-            .unwrap_or_else(|| panic!("owner console has no confirmation for {label}"))
-            .to_owned()
-    }
-}
-
-impl std::io::Write for OwnerConsole {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// A paired app on node A whose owner granted `terms` at the node's terminal.
-/// Returns the pairing service, the client id and a paired token carrying the grant.
-fn paired_client(
-    dir: &std::path::Path,
-    node: &NodeIdentity,
-    terms: konsensus_api::spend_budget::GrantTerms,
-) -> (Arc<konsensus_api::pairing::PairingService>, String, String) {
-    use ed25519_dalek::Signer;
-    use konsensus_api::pairing::{self, PairingService};
-
-    let console = OwnerConsole::default();
-    let fingerprint = pairing::identity_fingerprint(&node.node_id().to_hex());
-    let service = Arc::new(
-        PairingService::open(dir, fingerprint, true)
-            .unwrap()
-            .with_owner_console(Box::new(console.clone()))
-            .without_stdout_code(),
-    );
-    let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-    let pubkey = hex::encode(key.verifying_key().to_bytes());
-    let outcome = service.request_pairing("desktop app", &pubkey).unwrap();
-    let challenge = std::fs::read(service.dir().join(format!("challenge-{}", outcome.pair_id))).unwrap();
-    let proof = key.sign(&PairingService::proof_message(&outcome.pair_id, &pubkey, &challenge));
-    let client = service
-        .confirm_pairing(&outcome.pair_id, &hex::encode(proof.to_bytes()), pairing::default_pairing_scopes())
-        .unwrap();
-
-    let pending = service
-        .create_budget_elevation_request(&client.client_id, vec![konsensus_api::auth::Scope::Spend], None)
-        .unwrap();
-    let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&pending));
-    service.grant_elevation(&pending.op_id, &phrase, terms).unwrap();
-
-    let challenge = service.issue_token_challenge(&client.client_id).unwrap();
-    let signature = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
-    let token = service
-        .issue_token(&node.node_id().to_hex(), JWT_SECRET, &client.client_id, &challenge, &signature)
-        .unwrap()
-        .token;
-    (service, client.client_id, token)
-}
-
 /// Node A: the sender, driven through its real compose route.
 struct Sender {
     router: axum::Router,
     auth: String,
-    wallet: Arc<SharedMockProvider>,
-    state: Arc<konsensus_api::AppState>,
-    pairing: Option<(Arc<konsensus_api::pairing::PairingService>, String)>,
+    wallet: Arc<TestWallet>,
 }
 
 async fn start_sender(
-    dir: &std::path::Path,
     identity: &Arc<NodeIdentity>,
     transport: &Arc<NoiseTransport>,
     sessions: &Arc<SessionManager>,
-    wallet: Arc<SharedMockProvider>,
-    grant: Option<konsensus_api::spend_budget::GrantTerms>,
+    wallet: Arc<TestWallet>,
 ) -> Sender {
-    let pairing = grant.map(|terms| paired_client(&dir.join("pairing"), identity, terms));
     let invoice_requests: InvoiceRequests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let state = Arc::new(konsensus_api::AppState {
+        file_staging: Default::default(),
         identity: Arc::clone(identity),
         storage: storage().await,
         lightning: Arc::clone(&wallet) as Arc<dyn LightningProvider>,
@@ -171,9 +247,9 @@ async fn start_sender(
         peer_registry: Arc::new(tokio::sync::RwLock::new(konsensus_message::PeerRegistry::new())),
         transport: Arc::clone(transport) as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(sessions),
-        jwt_secret: JWT_SECRET.into(),
+        jwt_secret: "reconnect-regression-jwt-secret".into(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        pairing: pairing.as_ref().map(|(service, _, _)| Arc::clone(service)),
+        pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
@@ -183,7 +259,7 @@ async fn start_sender(
         mnemonic_reveal_limiter: Arc::new(
             konsensus_api::rate_limit::RateLimiter::mnemonic_reveal_default(),
         ),
-        audit_log: audit_log(dir),
+        audit_log: audit_log(),
         started_at: std::time::Instant::now(),
         content_dir: None,
         web_page_price_msat: None,
@@ -192,14 +268,12 @@ async fn start_sender(
         plaintext_cipher: None,
         send_timestamps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         invoice_requests: Arc::clone(&invoice_requests),
-        // The admission journal lives here, so a stale settled admission is on disk.
-        data_dir: Some(dir.to_path_buf()),
+        data_dir: None,
         backup_dir: None,
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        lightning_backend: "shared_mock".into(),
+        lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         gossip_validator: None,
-        file_staging: Default::default(),
     });
 
     // A's control plane: the invoice replies it is waiting for.
@@ -220,112 +294,72 @@ async fn start_sender(
         }
     });
 
-    let auth = match &pairing {
-        Some((_, _, token)) => format!("Bearer {token}"),
-        None => {
-            let token = konsensus_api::auth::create_token(
-                &identity.node_id().to_hex(),
-                &state.jwt_secret,
-                konsensus_api::auth::Scope::all(),
-            )
-            .unwrap();
-            format!("Bearer {token}")
-        }
-    };
-    let router = konsensus_api::build_router(Arc::clone(&state))
+    let token = konsensus_api::auth::create_token(
+        &identity.node_id().to_hex(),
+        &state.jwt_secret,
+        konsensus_api::auth::Scope::all(),
+    )
+    .unwrap();
+    let router = konsensus_api::build_router(state)
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50_000))));
-    Sender {
-        router,
-        auth,
-        wallet,
-        state,
-        pairing: pairing.map(|(service, client_id, _)| (service, client_id)),
-    }
+    Sender { router, auth: format!("Bearer {token}"), wallet }
 }
 
 impl Sender {
-    async fn post(&self, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    async fn compose(&self, recipient: &NodeId, text: &str) -> (StatusCode, serde_json::Value) {
         let request = Request::builder()
             .method("POST")
-            .uri(uri)
+            .uri("/api/v1/messages/compose")
             .header("authorization", &self.auth)
             .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
+            .body(Body::from(
+                serde_json::json!({
+                    "recipient": recipient.to_hex(),
+                    "kind": konsensus_core::kind::KIND_CHAT,
+                    "plaintext": text,
+                })
+                .to_string(),
+            ))
             .unwrap();
         let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
     }
-
-    /// A paired sender confirms the message's price as its cap, as the app
-    /// does; the owner's key sends uncapped.
-    async fn compose(&self, recipient: &NodeId, text: &str) -> (StatusCode, serde_json::Value) {
-        let mut body = serde_json::json!({
-            "recipient": recipient.to_hex(),
-            "kind": konsensus_core::kind::KIND_CHAT,
-            "plaintext": text,
-        });
-        if self.pairing.is_some() {
-            body["max_total_msat"] = serde_json::json!(2_000);
-        }
-        self.post("/api/v1/messages/compose", body).await
-    }
-
-    /// The paired app's live budget grant, as the node meters it.
-    fn grant(&self) -> konsensus_api::spend_budget::GrantView {
-        let (service, client_id) = self.pairing.as_ref().expect("a paired sender");
-        service.grant_view_for(client_id).expect("a live grant")
-    }
-
-    /// A's own N2 events with `code`.
-    fn membrane(&self, code: Code) -> Vec<Arc<konsensus_api::membrane::MembraneEvent>> {
-        let (events, _) = self.state.audit_log.membrane().read(None, 100);
-        events.into_iter().filter(|e| e.code == code).collect()
-    }
-
-    /// Each payment A has made, msat.
-    async fn paid_out(&self) -> Vec<u64> {
-        self.wallet
-            .list_payments(100)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|p| p.direction == PaymentDirection::Outgoing)
-            .map(|p| p.amount_msat)
-            .collect()
-    }
 }
 
 /// Node B: the `price_open` recipient. Returns its membrane and the plaintexts
 /// it delivers, in order.
 async fn start_recipient(
-    dir: &std::path::Path,
     identity: &Arc<NodeIdentity>,
     transport: &Arc<NoiseTransport>,
     sessions: &Arc<SessionManager>,
-    wallet: Arc<SharedMockProvider>,
+    wallet: Arc<TestWallet>,
+    refuse_once: Arc<std::sync::atomic::AtomicBool>,
 ) -> (Arc<konsensus_api::audit::AuditLog>, mpsc::UnboundedReceiver<String>) {
-    let audit = audit_log(dir);
+    let audit = audit_log();
     let lightning: Arc<dyn LightningProvider> = wallet;
-    let pricing = pricing();
+    // Deliberately different from A's stale/default message estimate.
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(konsensus_pricing::StaticPricingEngine::new(
+        konsensus_pricing::StaticPricingConfig { chat_msat: 7000, ..Default::default() }
+    ));
 
-    // B's control plane: invoice requests, through the real privilege and quote gates.
+    // B's control plane: invoice requests, through the real privilege gate.
     {
         let transport = Arc::clone(transport);
         let audit = Arc::clone(&audit);
         let lightning = Arc::clone(&lightning);
         let pricing = Arc::clone(&pricing);
-        let us = *identity.node_id();
+        let recipient = *identity.node_id();
         tokio::spawn(async move {
+            let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
             let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
-            let mut last_refusal = HashMap::new();
             while let Some(event) = transport.recv_control().await {
-                if let ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } = event {
+                if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged, source_ip } = event {
+                    let privileged = privileged && !refuse_once.swap(false, std::sync::atomic::Ordering::AcqRel);
                     handle_invoice_requested_gated(
                         &peer_id, &request_id, amount_msat, &purpose, privileged,
-                        &pricing, &lightning, &transport, &us, source_ip, &mut quotes,
-                        audit.membrane(), &mut last_refusal,
+                        &pricing, &lightning, &transport, &recipient, source_ip, &mut quotes, audit.membrane(), &mut last_refusal,
                     )
                     .await;
                 }
@@ -393,32 +427,15 @@ async fn privileged_on(transport: &NoiseTransport, peer: &NodeId) -> bool {
     transport.connected_privileged_peers().await.contains(peer)
 }
 
-/// Two nodes: A (`grant`: a paired app with that budget grant, else the
-/// owner's key) and a `price_open` B, holding an E2EE session, not connected.
-struct TwoNodes {
-    transport_a: Arc<NoiseTransport>,
-    transport_b: Arc<NoiseTransport>,
-    alice_id: NodeId,
-    bob_id: NodeId,
-    addr_b: String,
-    sender: Sender,
-    audit_b: Arc<konsensus_api::audit::AuditLog>,
-    delivered: mpsc::UnboundedReceiver<String>,
-    _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
-}
+// ── The regression ──────────────────────────────────────────────────────
 
-/// `grant` gets B's id, to budget it (or not) in the paired app's grant.
-async fn two_nodes(
-    grant: impl FnOnce(&NodeId) -> Option<konsensus_api::spend_budget::GrantTerms>,
-) -> TwoNodes {
-    let (alice, bob) = (identity(), identity());
-    let grant = grant(bob.node_id());
-    let (alice_id, bob_id) = (*alice.node_id(), *bob.node_id());
-    let (dir_a, dir_b, ledger) = (
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir().unwrap(),
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
+    let alice = identity(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     );
+    let bob = identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
+    let (alice_id, bob_id) = (*alice.node_id(), *bob.node_id());
 
     let transport_a = price_open_transport(&alice);
     let transport_b = price_open_transport(&bob);
@@ -435,187 +452,82 @@ async fn two_nodes(
         .unwrap();
     sessions_b.accept_session(&alice_id, &init).await.unwrap();
 
-    let ledger_path = ledger.path().join("ledger.db");
-    let wallet_a = Arc::new(SharedMockProvider::new(&ledger_path, "a", 1_000_000).unwrap());
-    let wallet_b = Arc::new(SharedMockProvider::new(&ledger_path, "b", 0).unwrap());
-    let sender = start_sender(dir_a.path(), &alice, &transport_a, &sessions_a, wallet_a, grant).await;
-    let (audit_b, delivered) =
-        start_recipient(dir_b.path(), &bob, &transport_b, &sessions_b, wallet_b).await;
-    // B issues no quote in its first second after startup (F1 restart quarantine).
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
-
-    TwoNodes {
-        transport_a,
-        transport_b,
-        alice_id,
-        bob_id,
-        addr_b,
-        sender,
-        audit_b,
-        delivered,
-        _dirs: (dir_a, dir_b, ledger),
-    }
-}
-
-impl TwoNodes {
-    async fn connect(&self) {
-        self.transport_a.connect(&self.bob_id, &self.addr_b).await.unwrap();
-        wait_until("B sees A", || self.transport_b.is_connected(&self.alice_id)).await;
-        assert!(!privileged_on(&self.transport_b, &self.alice_id).await, "a new connection starts unpaid");
-    }
-
-    /// B drops the connection and A dials again: B holds A as unpaid again
-    /// (doctrine: no durable admission object).
-    async fn drop_and_reconnect(&self) {
-        self.transport_b.disconnect(&self.alice_id).await.unwrap();
-        wait_until("A sees the drop", || async { !self.transport_a.is_connected(&self.bob_id).await }).await;
-        self.connect().await;
-    }
-
-    async fn send_delivered(&mut self, text: &str) -> serde_json::Value {
-        let (status, body) = self.sender.compose(&self.bob_id, text).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["delivered"], true, "{body}");
-        assert_eq!(self.delivered.recv().await.as_deref(), Some(text));
-        assert!(privileged_on(&self.transport_b, &self.alice_id).await, "admission promoted A's connection");
-        body
-    }
-
-    fn b_codes(&self) -> Vec<Code> {
-        self.audit_b.membrane().read(None, 100).0.iter().map(|e| e.code).collect()
-    }
-
-    fn shutdown(&self) {
-        self.transport_a.shutdown();
-        self.transport_b.shutdown();
-    }
-}
-
-// ── The regressions ─────────────────────────────────────────────────────
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
-    let mut net = two_nodes(|_| None).await;
+    let ledger = Arc::new(std::sync::Mutex::new(Ledger::default()));
+    let sender = start_sender(&alice, &transport_a, &sessions_a, Arc::new(TestWallet::new(&ledger))).await;
+    let refuse_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recipient_wallet = Arc::new(TestWallet::new(&ledger));
+    let (audit_b, mut delivered) =
+        start_recipient(&bob, &transport_b, &sessions_b, Arc::clone(&recipient_wallet), Arc::clone(&refuse_once)).await;
 
     // 1. Admit: A connects as a stranger; its first paid message pays admission.
-    net.connect().await;
-    net.send_delivered("before the drop").await;
+    transport_a.connect(&bob_id, &addr_b).await.unwrap();
+    wait_until("B sees A", || transport_b.is_connected(&alice_id)).await;
+    assert!(!privileged_on(&transport_b, &alice_id).await, "a new connection starts unpaid");
 
-    // 2. Drop, 3. reconnect, 4. the next paid message is delivered on the
-    //    same E2EE session, with no 30 s silent timeout (B's quote window is
-    //    waited out once, out loud).
-    net.drop_and_reconnect().await;
+    let (status, body) = sender.compose(&bob_id, "before the drop").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["delivered"], true, "{body}");
+    assert_eq!(body["amount_msat"].as_u64().unwrap() + body["readmission_msat"].as_u64().unwrap_or(0), 14_000, "admission plus message must both be reported: {body}");
+    assert_eq!(delivered.recv().await.as_deref(), Some("before the drop"));
+    assert!(privileged_on(&transport_b, &alice_id).await, "admission promoted A's connection");
+
+    // 2. Drop the connection, 3. reconnect: B holds A as unpaid again (doctrine:
+    //    no durable admission object).
+    transport_b.disconnect(&alice_id).await.unwrap();
+    wait_until("A sees the drop", || async { !transport_a.is_connected(&bob_id).await }).await;
+    transport_a.connect(&bob_id, &addr_b).await.unwrap();
+    wait_until("B sees A again", || transport_b.is_connected(&alice_id)).await;
+    assert!(!privileged_on(&transport_b, &alice_id).await, "a reconnect starts unpaid");
+
+    // 4. The next paid message is delivered, promptly, on the same E2EE session.
     let started = std::time::Instant::now();
-    net.send_delivered("after the reconnect").await;
+    let (status, body) = sender.compose(&bob_id, "after the reconnect").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["delivered"], true, "{body}");
+    assert_eq!(body["amount_msat"].as_u64().unwrap() + body["readmission_msat"].as_u64().unwrap_or(0), 14_000, "admission plus message must both be reported: {body}");
     assert!(
-        started.elapsed() < Duration::from_secs(25),
-        "the refusals are answered at once, not by a 30 s timeout ({:?})",
+        started.elapsed() < Duration::from_secs(15),
+        "no silent drop: the refusal is answered at once, not by a 30 s timeout ({:?})",
         started.elapsed()
     );
+    assert_eq!(delivered.recv().await.as_deref(), Some("after the reconnect"));
+    assert!(privileged_on(&transport_b, &alice_id).await, "re-admission promoted the new connection");
+
+    assert!(started.elapsed() >= Duration::from_secs(9), "rapid reconnect must exercise the production quote cooldown");
 
     // Each act re-proven: two admissions and two messages, nothing paid twice.
-    assert_eq!(net.sender.paid_out().await.len(), 4, "admission + message, twice");
+    let payments = sender.wallet.payments_made();
+    assert!(payments.iter().all(|(_, amount)| *amount == 7000), "fresh recipient price must replace stale sender pricing: {payments:?}");
+    assert_eq!(payments.len(), 4, "admission + message, twice: {payments:?}");
+    let unique: HashSet<_> = payments.iter().map(|(hash, _)| hash).collect();
+    assert_eq!(unique.len(), 4, "no invoice paid twice");
 
     // B refused out loud (N2) and never saw a replayed admission proof.
-    let codes = net.b_codes();
+    let (events, totals) = audit_b.membrane().read(None, 50);
+    let codes: Vec<Code> = events.iter().map(|e| e.code).collect();
     assert!(codes.contains(&Code::AdmissionRequired), "explicit refusal event: {codes:?}");
     assert!(!codes.contains(&Code::ProofReused), "stale admission proof re-sent: {codes:?}");
-    assert_eq!(codes.iter().filter(|c| **c == Code::Settled).count(), 4, "{codes:?}");
-    net.shutdown();
-}
+    assert_eq!(totals.admitted, 4, "two admissions and two messages admitted: {codes:?}");
 
-// ── Budgeted re-admission (CoS decision, 2026-09-27) ────────────────────
+    // A stale refusal on the same connection must never buy admission again.
+    refuse_once.store(true, std::sync::atomic::Ordering::Release);
+    let (status, body) = sender.compose(&bob_id, "same connection").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(delivered.recv().await.as_deref(), Some("same connection"));
+    assert_eq!(sender.wallet.payments_made().len(), 5, "only the new message is paid");
+    assert_eq!(body["amount_msat"], 7000, "same-connection retry pays only the message");
 
-/// A day's budget for the paired app; `contact_cap` budgets B in it.
-fn budget(bob: &NodeId, contact_cap: Option<u64>) -> konsensus_api::spend_budget::GrantTerms {
-    let terms = konsensus_api::spend_budget::GrantTerms::new(200_000)
-        .per_call(20_000)
-        .for_secs(3_600);
-    match contact_cap {
-        Some(cap) => terms.recipient(&bob.to_hex(), cap),
-        None => terms,
-    }
-}
+    // A failure after re-admission must report the admission that really settled.
+    transport_b.disconnect(&alice_id).await.unwrap();
+    wait_until("A sees second drop", || async { !transport_a.is_connected(&bob_id).await }).await;
+    transport_a.connect(&bob_id, &addr_b).await.unwrap();
+    wait_until("B sees third connection", || transport_b.is_connected(&alice_id)).await;
+    recipient_wallet.fail_message.store(true, std::sync::atomic::Ordering::Release);
+    let (status, body) = sender.compose(&bob_id, "message invoice fails").await;
+    assert!(!status.is_success(), "{body}");
+    assert!(body.to_string().contains("7000"), "must disclose settled admission despite message failure: {body}");
+    assert_eq!(sender.wallet.payments_made().len(), 6, "only re-admission settled during failed send");
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn budgeted_contact_is_readmitted_from_the_budget_without_a_prompt() {
-    let mut net = two_nodes(|bob| Some(budget(bob, Some(50_000)))).await;
-    let bob = net.bob_id;
-
-    // Admit, drop, reconnect: each paid send is one call from the paired app.
-    // No first-contact grant, no owner step: B is a contact the owner budgeted.
-    net.connect().await;
-    net.send_delivered("before the drop").await;
-    net.drop_and_reconnect().await;
-    let reply = net.send_delivered("after the reconnect").await;
-    // The app's confirmed cap covers the message; the admission is reported
-    // apart, bounded by B's budget in the grant.
-    assert_eq!(reply["amount_msat"], 2_000, "{reply}");
-    assert_eq!(reply["readmission_msat"], 2_000, "{reply}");
-
-    // B's signed quote (2,000 msat admission) and the 2,000 msat message, twice.
-    let paid = net.sender.paid_out().await;
-    assert_eq!(paid, vec![2_000; 4], "admission + message, twice, at B's own quote");
-
-    // Every payment was debited to the G1 budget, once, against B's cap.
-    let grant = net.sender.grant();
-    assert_eq!(grant.used_msat, 8_000);
-    assert_eq!(grant.used_by_recipient.get(&bob.to_hex()), Some(&8_000));
-
-    // N2: B refused out loud; A logged each paid re-admission with the cap.
-    assert!(net.b_codes().contains(&Code::AdmissionRequired));
-    let readmissions = net.sender.membrane(Code::Readmission);
-    assert_eq!(readmissions.len(), 2, "{readmissions:?}");
-    for event in &readmissions {
-        assert_eq!(event.paid_msat, Some(2_000));
-        assert_eq!(event.cap_msat, Some(50_000));
-        assert_eq!(event.counterparty.as_deref(), Some(bob.to_hex().as_str()));
-    }
-    net.shutdown();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_contact_without_a_budget_needs_the_one_time_confirmation_once() {
-    let mut net = two_nodes(|bob| Some(budget(bob, None))).await;
-    let bob = net.bob_id;
-    net.connect().await;
-
-    // The grant does not budget B: the budget never pays its admission alone.
-    let (status, body) = net.sender.compose(&bob, "hello").await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["code"], "budget_exceeded", "{body}");
-    assert_eq!(body["reason"], "first_contact", "{body}");
-    assert!(net.sender.paid_out().await.is_empty(), "nothing paid");
-    assert!(net.sender.membrane(Code::Readmission).is_empty());
-
-    // The door card: B's own signed quote, then one owner OK that also sets
-    // B's budget in the grant.
-    let (status, quote) = net
-        .sender
-        .post("/api/v1/messages/first-contact/quote", serde_json::json!({ "recipient": bob.to_hex() }))
-        .await;
-    assert_eq!(status, StatusCode::OK, "{quote}");
-    assert_eq!(quote["total_msat"], 4_000, "{quote}");
-    let (status, grant) = net
-        .sender
-        .post(
-            "/api/v1/pair/first-contact-grant",
-            serde_json::json!({
-                "recipient": bob.to_hex(),
-                "max_total_msat": quote["total_msat"],
-                "contact_budget_msat": 40_000,
-            }),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{grant}");
-    net.send_delivered("hello").await;
-    assert_eq!(net.sender.grant().per_recipient_msat.get(&bob.to_hex()), Some(&40_000));
-
-    // From now on B is budgeted: the next reconnect needs no prompt.
-    net.drop_and_reconnect().await;
-    net.send_delivered("after the reconnect").await;
-    assert_eq!(net.sender.paid_out().await.len(), 4);
-    assert_eq!(net.sender.grant().used_by_recipient.get(&bob.to_hex()), Some(&8_000));
-    assert_eq!(net.sender.membrane(Code::Readmission).len(), 2);
-    net.shutdown();
+    transport_a.shutdown();
+    transport_b.shutdown();
 }

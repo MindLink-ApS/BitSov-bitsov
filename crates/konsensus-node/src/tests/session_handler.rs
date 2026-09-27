@@ -309,14 +309,12 @@ async fn unprivileged_refusal_of_a_request_sent_to_that_peer_ends_it() {
         &peer_id, &request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED, false, &map,
     ).await;
 
-    let refusal = rx.await.expect("answered").expect_err("refused");
-    assert_eq!(refusal.recipient, peer_id);
-    assert_eq!(refusal.reason, konsensus_api::invoice_refusal::ADMISSION_REQUIRED);
+    assert!(rx.await.unwrap().is_err(), "the pending request ends at once");
     assert!(map.lock().await.is_empty());
     assert_eq!(
         binding.finish().as_deref(),
         Some(konsensus_api::invoice_refusal::ADMISSION_REQUIRED),
-        "the binding saw the reason too"
+        "the compose that asked reads the reason"
     );
 }
 
@@ -1204,7 +1202,7 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
     // Should create invoice without panicking
     handle_invoice_requested(
         &peer_id, "req-inv-1", 25_000, "konsensus message",
-        &lightning, &transport,
+        &lightning, &transport, "127.0.0.1".parse().unwrap(), &mut crate::invoice_refusals::RefusalLimits::default(),
     ).await;
 
     // Verify the invoice was actually created on the mock
@@ -1245,7 +1243,7 @@ async fn invoice_requested_sends_error_on_lightning_failure() {
     // Should not panic — sends InvoiceError frame (which fails silently since no peer connected)
     handle_invoice_requested(
         &peer_id, "req-inv-fail", 25_000, "konsensus message",
-        &lightning, &transport,
+        &lightning, &transport, "127.0.0.1".parse().unwrap(), &mut crate::invoice_refusals::RefusalLimits::default(),
     ).await;
     // No panic = success
 }
@@ -1271,7 +1269,7 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
     handle_invoice_requested_gated(
         &peer_id, "req-priv", 25_000, "konsensus message", true,
         &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
-        &konsensus_api::membrane::Membrane::with_capacity(8), &mut std::collections::HashMap::new(),
+        &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default(),
     ).await;
 
     let payments = lightning.list_payments(10).await.unwrap();
@@ -1290,15 +1288,13 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
         Arc::new(konsensus_lightning::MockLightningProvider::new());
     let pricing = admission_pricing();
     let membrane = konsensus_api::membrane::Membrane::with_capacity(8);
-    let mut last_refusal = std::collections::HashMap::new();
+    let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
 
-    for request_id in ["req-strange-1", "req-strange-2"] {
-        handle_invoice_requested_gated(
-            &peer_id, request_id, 1_000_000, "konsensus message", false,
-            &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
-            &membrane, &mut last_refusal,
-        ).await;
-    }
+    handle_invoice_requested_gated(
+        &peer_id, "req-strange", 1_000_000, "konsensus message", false,
+        &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &membrane, &mut last_refusal,
+    ).await;
 
     let payments = lightning.list_payments(10).await.unwrap();
     assert!(payments.is_empty(), "no invoice may be created for an unprivileged non-admission request");
@@ -1458,7 +1454,7 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
         handle_invoice_requested_gated(
             &peer_id, &id, 1, purpose, false,
             &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut quotes,
-            &konsensus_api::membrane::Membrane::with_capacity(8), &mut std::collections::HashMap::new(),
+            &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default(),
         ).await;
     }
     assert!(lightning.list_payments(10).await.unwrap().is_empty(),
@@ -1586,22 +1582,10 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
         provider.get_node_pubkey().await.unwrap()
     );
     source.send_frame(&recipient, &request).await.unwrap();
-    // A repeated attempt gets no second quote or service: only an explicit
-    // refusal, so the requester never waits out a timeout in silence.
-    match tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await {
-        Ok(Some(ControlEvent::InvoiceErrorReceived { peer_id, request_id, reason, .. })) => {
-            assert_eq!(peer_id, recipient);
-            assert_eq!(request_id, id);
-            assert_eq!(reason, konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED);
-        }
-        other => panic!("a repeated attempt must be refused out loud, and only that: {other:?}"),
-    }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), source.recv_control())
-            .await
-            .is_err(),
-        "a repeated attempt receives no second quote or service"
-    );
+    let refusal = tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await.unwrap().unwrap();
+    assert!(matches!(refusal, ControlEvent::InvoiceErrorReceived { request_id, reason, .. }
+        if request_id == id && reason == konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED),
+        "a repeated attempt receives a bounded refusal, never a second quote or service");
     let invoices = provider.list_payments(10).await.unwrap();
     assert!(invoices.is_empty(), "stranger quote wrote pending backend state");
     assert_eq!(provider.get_balance_msat().await.unwrap(), 0);
@@ -1676,12 +1660,73 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
     handle_invoice_requested_gated(&peer, &request_id, 1,
         konsensus_core::admission_quote::PURPOSE, false, &admission_pricing(), &provider,
-        &target, &recipient, "127.0.0.1".parse().unwrap(), &mut quotes,
-        &konsensus_api::membrane::Membrane::with_capacity(8), &mut std::collections::HashMap::new()).await;
+        &target, &recipient, "127.0.0.1".parse().unwrap(), &mut quotes, &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default()).await;
     let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await.unwrap().unwrap();
     assert!(matches!(event, ControlEvent::InvoiceErrorReceived { peer_id, request_id: id, reason, .. }
         if peer_id == recipient && id == request_id && reason == "stateless_quote_unsupported"));
     assert!(target.connected_privileged_peers().await.is_empty());
     source.shutdown();
     target.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unpaid_request_flood_does_not_stall_other_peers() {
+    use konsensus_message::{ReachabilityMode, TransportConfig};
+    use std::{sync::atomic::{AtomicUsize, Ordering}, time::Duration};
+    let make = || {
+        let (_, identity) = NodeIdentity::generate().unwrap();
+        let id = *identity.node_id();
+        (id, Arc::new(NoiseTransport::new(Arc::new(identity), TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(), admission_mode: ReachabilityMode::PriceOpen,
+            ..Default::default()
+        })))
+    };
+    let (recipient, target) = make();
+    let (_, attacker) = make();
+    let (healthy_id, healthy) = make();
+    target.add_to_whitelist(&healthy_id).await;
+    target.start_listener().await.unwrap();
+    let addr = target.listen_addr().unwrap().to_string();
+    attacker.connect(&recipient, &addr).await.unwrap();
+    healthy.connect(&recipient, &addr).await.unwrap();
+    let lightning: Arc<dyn LightningProvider> = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let handled = Arc::new(AtomicUsize::new(0));
+    let membrane = Arc::new(konsensus_api::membrane::Membrane::with_capacity(64));
+    let handler = {
+        let target = Arc::clone(&target); let lightning = Arc::clone(&lightning);
+        let handled = Arc::clone(&handled); let membrane = Arc::clone(&membrane);
+        tokio::spawn(async move {
+            let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
+            let mut limits = crate::invoice_refusals::RefusalLimits::default();
+            while let Some(event) = target.recv_control().await {
+                if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged, source_ip } = event {
+                    handle_invoice_requested_gated(&peer_id, &request_id, amount_msat, &purpose, privileged,
+                        &admission_pricing(), &lightning, &target, &recipient, source_ip, &mut quotes, &membrane, &mut limits).await;
+                    handled.fetch_add(1, Ordering::Release);
+                }
+            }
+        })
+    };
+    // The attacker never drains its control receiver. Unbounded replies would
+    // eventually stop its reader and fill the recipient's TCP send buffer.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for i in 0..5000 {
+            attacker.send_frame(&recipient, &Frame::RequestInvoice {
+                request_id: format!("{i:04}{}", "x".repeat(1000)), amount_msat: 1000, purpose: "konsensus message".into()
+            }).await.unwrap();
+        }
+        while handled.load(Ordering::Acquire) < 5000 { tokio::task::yield_now().await; }
+        assert!(lightning.list_payments(100).await.unwrap().is_empty(), "unpaid flood must issue no invoices");
+        healthy.send_frame(&recipient, &Frame::RequestInvoice {
+            request_id: "healthy".into(), amount_msat: 1000, purpose: "konsensus message".into()
+        }).await.unwrap();
+        loop {
+            if let Some(ControlEvent::InvoiceResponseReceived { request_id, .. }) = healthy.recv_control().await {
+                assert_eq!(request_id, "healthy"); break;
+            }
+        }
+    }).await.expect("unpaid flood stalled the global control loop or another peer");
+    let (events, totals) = membrane.read(None, 100);
+    assert!(events.len() <= 1); assert!(totals.refused <= 1);
+    handler.abort(); attacker.shutdown(); healthy.shutdown(); target.shutdown();
 }

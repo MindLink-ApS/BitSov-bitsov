@@ -16,6 +16,7 @@ mod profile_handler;
 mod relay;
 mod session_handler;
 mod admission_quotes;
+mod invoice_refusals;
 #[path = "cli/scb_restore.rs"]
 mod scb_restore;
 #[path = "cli/whitelist.rs"]
