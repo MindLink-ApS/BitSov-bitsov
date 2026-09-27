@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -157,7 +156,7 @@ impl NoiseTransport {
 /// Spawn a background task that reads frames from a peer's TCP stream.
 pub(super) fn spawn_reader_task(
     peer_id: NodeId,
-    mut reader: tokio::io::ReadHalf<TcpStream>,
+    mut reader: tokio::net::tcp::OwnedReadHalf,
     conn: Arc<Mutex<PeerConnection>>,
     peers: PeerMap,
     banned_peers: BanMap,

@@ -12,7 +12,7 @@ use crate::error::StorageError;
 use crate::invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,
 };
-use crate::models::{FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
+use crate::models::{EnergyRow, FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
 use crate::reactions::ReactionRecord;
 
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
@@ -58,6 +58,19 @@ pub trait Storage: Send + Sync {
     ///
     /// Used by the retention cleanup task. Returns the number of messages deleted.
     async fn delete_messages_older_than(&self, before_ms: u64) -> Result<u64, StorageError>;
+
+    /// Payment metadata of paid messages with `timestamp_ms >= since_ms`, oldest
+    /// first, at most `limit` rows (N1 energy read). Metadata columns only.
+    ///
+    /// Default: unsupported, so a backend that does not implement it makes the
+    /// energy read fail visibly instead of reporting a false zero.
+    async fn energy_rows_since(
+        &self,
+        _since_ms: u64,
+        _limit: u32,
+    ) -> Result<Vec<EnergyRow>, StorageError> {
+        Err(StorageError::Unsupported("energy_rows_since".to_string()))
+    }
 
     // ── Rooms ──────────────────────────────────────────────────────────
 
@@ -131,8 +144,16 @@ pub trait Storage: Send + Sync {
 
     // ── Nonces (replay protection) ─────────────────────────────────────
 
-    /// Store a nonce for replay protection.
-    /// Returns `false` if the nonce already exists (replay detected).
+    /// Atomically consume nonce and payment replay keys, or write neither.
+    /// Unsupported backends fail closed.
+    async fn store_paid_nonce(
+        &self, nonce: &Nonce, payment_hash: &[u8; 32], sender: &NodeId, message_id: &MessageId,
+    ) -> Result<konsensus_core::gate::PaidReplay, StorageError> {
+        let _ = (nonce, payment_hash, sender, message_id);
+        Err(StorageError::Unsupported("atomic paid replay protection not implemented".into()))
+    }
+
+    /// Store a nonce; returns `false` if it already exists.
     async fn store_nonce(&self, nonce: &Nonce, sender: &NodeId) -> Result<bool, StorageError>;
 
     /// Store an accepted Lightning payment hash for economic replay protection.

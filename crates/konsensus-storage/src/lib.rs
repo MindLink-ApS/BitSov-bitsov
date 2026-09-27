@@ -23,7 +23,7 @@ pub use fiat_snapshots::FiatRateSnapshot;
 pub use invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,
 };
-pub use models::{FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
+pub use models::{EnergyRow, FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
 pub use postgres::PostgresStorage;
 pub use reactions::ReactionRecord;
 pub use recovery::{
@@ -208,6 +208,13 @@ impl<S: Storage + ?Sized> StorageNonceAdapter<S> {
 
 #[async_trait::async_trait]
 impl<S: Storage + ?Sized> konsensus_core::gate::NonceStore for StorageNonceAdapter<S> {
+    async fn check_and_store_paid(
+        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
+        sender: &konsensus_core::NodeId, message_id: &konsensus_core::MessageId,
+    ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.inner.store_paid_nonce(nonce, payment_hash, sender, message_id).await?)
+    }
+
     async fn check_and_store(
         &self,
         nonce: &konsensus_core::Nonce,

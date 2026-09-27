@@ -38,6 +38,7 @@ fn ldk_quote_does_not_write_payment_or_disk_state() {
     assert_eq!(signed.amount_milli_satoshis(), Some(2000));
     assert_eq!(signed.description().to_string(), "bound quote");
     assert_eq!(signed.expiry_time().as_secs(), 55);
+    assert!(signed.payment_metadata().is_some(), "stateless quote must carry authenticated expiry back to the HTLC recipient");
 }
 
 #[tokio::test]

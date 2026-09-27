@@ -8,7 +8,7 @@
 //! Objects for different types of payments.
 
 pub(crate) mod asynchronous;
-mod bolt11;
+pub(crate) mod bolt11;
 mod bolt12;
 mod onchain;
 mod spontaneous;

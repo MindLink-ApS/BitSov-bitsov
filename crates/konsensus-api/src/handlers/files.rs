@@ -8,7 +8,9 @@
 //! File transfer uses `KIND_FILE_REF` (200) UKM envelopes. The plaintext
 //! payload is a JSON `FilePayload` containing metadata + base64 file data.
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read, Spend};
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::metered::MeteredSpend;
+use crate::spend_budget::Charge;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -25,7 +27,7 @@ use konsensus_storage::FileRecord;
 
 use crate::audit::events;
 use crate::error::ApiError;
-use crate::handlers::messages::create_payment_proof;
+use crate::handlers::messages::create_metered_payment_proof;
 use crate::state::AppState;
 
 /// Maximum file size: 4 MiB (fits within 16 MiB wire frame with overhead).
@@ -370,13 +372,33 @@ async fn delete_file(
     Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
 
+async fn send_file_observed(
+    auth: MeteredSpend,
+    State(state): State<Arc<AppState>>,
+    Path(file_id): Path<String>,
+    Json(req): Json<SendFileRequest>,
+) -> Result<Json<SendFileResponse>, ApiError> {
+    let recipient = crate::membrane::parse_recipient(&req.recipient, false);
+    let cap = req.max_total_msat;
+    let result = send_file(auth, State(Arc::clone(&state)), Path(file_id), Json(req)).await;
+    if let Err(e) = &result {
+        state.audit_log.membrane().outbound_refused(
+            e,
+            recipient.as_ref(),
+            Some(KIND_FILE_REF),
+            cap,
+        );
+    }
+    result
+}
+
 /// `POST /api/v1/files/:id/send` — send a file to a peer.
 ///
 /// The node reads the file from local storage, builds a `FilePayload` JSON,
 /// encrypts it via Double Ratchet, creates a UKM envelope with KIND_FILE_REF,
 /// and delivers it. Same pipeline as compose_message but for files.
 async fn send_file(
-    auth: ScopedAuth<Spend>,
+    auth: MeteredSpend,
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
     Json(req): Json<SendFileRequest>,
@@ -387,7 +409,7 @@ async fn send_file(
 }
 
 async fn send_file_inner(
-    auth: ScopedAuth<Spend>, state: Arc<AppState>, file_id: String, req: SendFileRequest,
+    auth: MeteredSpend, state: Arc<AppState>, file_id: String, req: SendFileRequest,
 ) -> Result<Json<SendFileResponse>, ApiError> {
     // Parse recipient
     let peer_id = NodeId::from_hex(&req.recipient)
@@ -407,13 +429,6 @@ async fn send_file_inner(
     // otherwise release their quota while this future still owns the blob.
     let file = load_file(&state, &auth, &file_id).await?;
 
-    // Reserve this staged blob through every await. Cap refusals leave it
-    // available; an attempted send consumes it even on error/cancellation.
-    let _staged_send = if file_id.starts_with("stage-") {
-        Some(crate::file_staging::FileStaging::claim(&state, &auth, &file_id)?
-            .ok_or_else(|| ApiError::NotFound("staged file expired".into()))?)
-    } else { None };
-
     // Build FilePayload JSON
     let payload = FilePayload {
         filename: file.filename.clone(),
@@ -425,27 +440,41 @@ async fn send_file_inner(
     let payload_json = serde_json::to_vec(&payload)
         .map_err(|e| ApiError::Internal(format!("payload serialization: {e}")))?;
 
+    // Reject budget limits before advancing the ratchet or requesting an invoice.
+    let peer_key = peer_id.to_hex();
+    let debit = auth.debit(
+        &state,
+        vec![Charge {
+            recipient: peer_key.clone(),
+            amount_msat: super::messages::caps::payable(price_msat),
+        }],
+    )?;
+
+    // Reserve this staged blob through every await. Cap refusals leave it
+    // available; an attempted send consumes it even on error/cancellation.
+    let _staged_send = if file_id.starts_with("stage-") {
+        Some(crate::file_staging::FileStaging::claim(&state, &auth, &file_id)
+            .and_then(|file| file.ok_or_else(|| ApiError::NotFound("staged file expired".into())))
+            .inspect_err(|_| debit.released(&peer_key))?)
+    } else { None };
+
     // E2EE encrypt via Double Ratchet
     let ratchet_msg = state
         .session_manager
         .encrypt(&peer_id, &payload_json)
         .await
         .map_err(|e| {
+            debit.released(&peer_key);
             ApiError::BadRequest(format!(
                 "E2EE encryption failed (session may not be established): {e}"
             ))
         })?;
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
-    // A grant can expire/revoke while pricing or session encryption awaits.
-    if let Some(binding) = &auth.pairing {
-        state.pairing.as_ref().ok_or_else(|| ApiError::Forbidden("pairing unavailable".into()))?
-            .verify_token_binding(&binding.client_id, binding.epoch, &binding.fingerprint, &[crate::auth::Scope::Spend])
-            .map_err(|_| ApiError::Forbidden("spend grant is no longer valid".into()))?;
-    }
     // Create real payment proof — requests invoice from recipient (Principle 2).
-    let (payment_hash, preimage, amount_msat) =
-        create_payment_proof(&state, price_msat, &peer_id).await?;
+    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit).await;
+    debit.resolve_proof(&peer_key, &paid);
+    let (payment_hash, preimage, amount_msat) = paid?;
     let proof =
         konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
 
@@ -465,7 +494,7 @@ async fn send_file_inner(
         .storage
         .store_message(&envelope)
         .await
-        .map_err(|e| ApiError::Storage(e.to_string()))?;
+        .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("file payment settled but storing message failed: {e}") })?;
 
     // Update file record with message_id (best effort)
     // We don't have an update_file method, but the association is recorded
@@ -477,7 +506,7 @@ async fn send_file_inner(
             .transport
             .send(&peer_id, &envelope)
             .await
-            .map_err(|e| ApiError::Transport(e.to_string()))?;
+            .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("file payment settled but delivery failed: {e}") })?;
         true
     } else {
         if let Err(e) = state
@@ -528,7 +557,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/v1/files/:id",
             get(download_file).delete(delete_file),
         )
-        .route("/api/v1/files/:id/send", post(send_file))
+        .route("/api/v1/files/:id/send", post(send_file_observed))
 }
 
 #[cfg(test)]

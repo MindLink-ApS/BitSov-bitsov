@@ -832,6 +832,7 @@ impl Node {
 	#[cfg(not(feature = "uniffi"))]
 	pub fn bolt11_payment(&self) -> Bolt11Payment {
 		Bolt11Payment::new(
+			Arc::clone(&self.keys_manager),
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),
@@ -850,6 +851,7 @@ impl Node {
 	#[cfg(feature = "uniffi")]
 	pub fn bolt11_payment(&self) -> Arc<Bolt11Payment> {
 		Arc::new(Bolt11Payment::new(
+			Arc::clone(&self.keys_manager),
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.channel_manager),
 			Arc::clone(&self.connection_manager),

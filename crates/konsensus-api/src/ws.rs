@@ -33,6 +33,7 @@ const WS_JWT_PROTOCOL_PREFIX: &str = "bitsov.jwt.";
 
 /// `GET /api/v1/ws` — WebSocket connection.
 async fn ws_handler(
+    _local: crate::local_read::LocalConnection,
     State(state): State<Arc<AppState>>,
     Query(params): Query<WsParams>,
     headers: HeaderMap,
@@ -46,8 +47,10 @@ async fn ws_handler(
     // Validate JWT before upgrading — reject with 401 if invalid
     match auth::validate_token(&token, &state.jwt_secret) {
         Ok(claims) => {
-            if auth::check_pairing_binding(&state, &claims).is_err() {
-                return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+            match auth::check_pairing_binding(&state, &claims) {
+                Ok(Some(_)) => {}
+                Ok(None) => return (StatusCode::FORBIDDEN, "local paired read required").into_response(),
+                Err(_) => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
             }
             // This endpoint authenticates itself rather than going through the
             // `ScopedAuth` extractor, so it was silently exempt from the #72
@@ -106,6 +109,7 @@ const WS_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Claims) {
     let mut rx = state.ws_broadcast.subscribe();
     let mut delivery_rx = state.ws_delivery_broadcast.subscribe();
+    let mut membrane_rx = state.audit_log.membrane().subscribe();
     let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
     // The first tick fires immediately — skip it since we just connected.
     keepalive.tick().await;
@@ -166,6 +170,31 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                 }
             }
 
+            // Forward membrane events (N2): admission decisions at the gate.
+            result = membrane_rx.recv() => {
+                match result {
+                    Ok(event) => {
+                        if !stream_authorized(&state, &claims) { break; }
+                        match serde_json::to_string(event.as_ref()) {
+                            Ok(json) => {
+                                if socket.send(Message::Text(json)).await.is_err() {
+                                    debug!("WebSocket client disconnected");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to serialize membrane event for WS");
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // The ring (`GET /api/v1/membrane`) still holds them.
+                        warn!(missed = n, "WebSocket client lagged, dropped membrane events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                }
+            }
+
             // Handle incoming messages from the client
             msg = socket.recv() => {
                 match msg {
@@ -215,7 +244,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
 fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims) -> bool {
     claims.exp > chrono::Utc::now().timestamp()
         && claims.scp.contains(&auth::Scope::Read)
-        && auth::check_pairing_binding(state, claims).is_ok()
+        && matches!(auth::check_pairing_binding(state, claims), Ok(Some(_)))
 }
 
 /// Registers the WebSocket upgrade route for real-time event streaming.

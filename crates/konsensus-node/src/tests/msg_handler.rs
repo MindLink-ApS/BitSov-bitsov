@@ -60,6 +60,13 @@ impl Storage for TestStorage {
     async fn get_peer(&self, _id: &NodeId) -> Result<Option<Peer>, StorageError> { Ok(None) }
     async fn list_peers(&self) -> Result<Vec<Peer>, StorageError> { Ok(vec![]) }
     async fn delete_peer(&self, _id: &NodeId) -> Result<bool, StorageError> { Ok(false) }
+    // This general route fixture accepts replay keys; the real SQLite and gate
+    // suites exercise atomic replay rejection and rollback.
+    async fn store_paid_nonce(&self, _nonce: &Nonce, _hash: &[u8; 32], _sender: &NodeId, _message: &MessageId)
+        -> Result<konsensus_core::gate::PaidReplay, StorageError> {
+        Ok(konsensus_core::gate::PaidReplay::Accepted)
+    }
+
     async fn store_nonce(&self, _n: &Nonce, _s: &NodeId) -> Result<bool, StorageError> { Ok(true) }
     async fn has_nonce(&self, _n: &Nonce) -> Result<bool, StorageError> { Ok(false) }
     // HARD-5 (#237) made the Storage `store_payment_receipt` default fail-closed.
@@ -794,6 +801,7 @@ async fn whitelist_read_guard_released_before_gate_await() {
     let handle = tokio::spawn(async move {
         whitelist_then_verify(
             &envelope,
+            &konsensus_api::membrane::Membrane::default(),
             registry_for_task.as_ref(),
             &gate,
             nonce_adapter.as_ref(),
@@ -953,4 +961,156 @@ async fn rejected_envelope_disclosures(privileged: bool) {
     assert!(storage.list_sessions().await.unwrap().is_empty());
     assert!(registry.read().await.is_empty());
     assert!(!sessions.has_session(alice.node_id()).await);
+}
+
+// Exercise the actual gate seam used by the receive loop, before post-gate exits.
+#[tokio::test]
+async fn membrane_records_gate_admission_before_relay_and_storage_outcomes() {
+    use konsensus_api::membrane::{Code, Membrane};
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let registry = tokio::sync::RwLock::new(PeerRegistry::new());
+    let store = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let nonce = konsensus_storage::StorageNonceAdapter::new(store.clone());
+    let pricing = BlockingPricing {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Semaphore::new(1)),
+    };
+    let gate = PaymentGate::new();
+    let membrane = Membrane::default();
+    let payload = serde_json::to_vec(&serde_json::json!({"binding_id":vec![0;16],"quota_bytes":100000,"ttl_max_secs":3600,"depositor_whitelist_root":vec![0;32],"created_at":1})).unwrap();
+    let env = make_envelope(&alice, *bob.node_id(), 600, payload);
+    whitelist_then_verify(
+        &env,
+        &membrane,
+        &registry,
+        &gate,
+        &nonce,
+        &pricing,
+        None,
+        0.0,
+        None,
+        konsensus_message::ReachabilityMode::PriceOpen,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        membrane.read(None, 500).0.len(),
+        1,
+        "gate admission must exist BEFORE post-gate dispatch"
+    );
+    let relay = crate::relay::RelayEngine::new(
+        Arc::new(crate::relay::InMemoryRelayStore::new()),
+        crate::relay::RelayPolicy::inert_default(),
+    );
+    let replies = crate::relay::dispatch::handle_relay_control(&relay, &env, bob.node_id()).await;
+    assert!(matches!(
+        replies.as_slice(),
+        [(_, Frame::MessageAck { .. })]
+    ));
+    // The same authenticated envelope is a replay, not a second admission.
+    assert!(whitelist_then_verify(
+        &env,
+        &membrane,
+        &registry,
+        &gate,
+        &nonce,
+        &pricing,
+        None,
+        0.0,
+        None,
+        konsensus_message::ReachabilityMode::PriceOpen
+    )
+    .await
+    .is_err());
+    let (events, totals) = membrane.read(None, 500);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].code, Code::Replay);
+    assert_eq!(totals.admitted, 1);
+    assert_eq!(totals.first_contacts, 1);
+    // A fresh proof passes the same seam even if downstream message storage fails.
+    let store2 = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let nonce2 = konsensus_storage::StorageNonceAdapter::new(store2.clone());
+    let env2 = make_envelope(&alice, *bob.node_id(), 100, vec![1]);
+    whitelist_then_verify(
+        &env2,
+        &membrane,
+        &registry,
+        &gate,
+        &nonce2,
+        &pricing,
+        None,
+        0.0,
+        None,
+        konsensus_message::ReachabilityMode::PriceOpen,
+    )
+    .await
+    .unwrap();
+    store2.pool().close().await;
+    assert!(store2.store_message(&env2).await.is_err());
+    assert_eq!(membrane.read(None, 500).1.admitted, 2);
+}
+
+#[tokio::test]
+async fn membrane_observes_unpaid_insufficient_stale_and_first_contact_decisions() {
+    use konsensus_api::membrane::{Code, Membrane};
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let registry = tokio::sync::RwLock::new(PeerRegistry::new());
+    let store: Arc<dyn Storage> = Arc::new(TestStorage::new());
+    let nonce = konsensus_storage::StorageNonceAdapter::new(store);
+    let membrane = Membrane::default();
+    let pricing = BlockingPricing {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Semaphore::new(1)),
+    };
+    for (case, expected) in [
+        ("unpaid", Code::Unpaid),
+        ("insufficient", Code::InsufficientPayment),
+        ("stale", Code::Stale),
+        ("invite", Code::InviteOnly),
+        ("bad_sig", Code::BadSignature),
+        ("paid", Code::Settled),
+        ("contact", Code::Settled),
+    ] {
+        let gate = PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            min_admission_cost_msat: if case == "insufficient" { 200 } else { 0 },
+            ..Default::default()
+        });
+        if case == "contact" {
+            registry.write().await.add(PeerEntry {
+                node_id: *alice.node_id(),
+                addr: "127.0.0.1:9999".parse().unwrap(),
+                label: None,
+                auto_connect: false,
+            });
+        }
+        let mut env = make_envelope(&alice, *bob.node_id(), 100, vec![1]);
+        if case == "unpaid" {
+            env.payment_proof = make_valid_proof(0);
+        }
+        if case == "stale" {
+            env.timestamp = 1;
+        }
+        env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+        if case == "bad_sig" {
+            env.signature = Signature::from_ed25519(&bob.sign(&env.signable_bytes()));
+        }
+        let mode = if case == "invite" {
+            konsensus_message::ReachabilityMode::Whitelist
+        } else {
+            konsensus_message::ReachabilityMode::PriceOpen
+        };
+        let _ = whitelist_then_verify(
+            &env, &membrane, &registry, &gate, &nonce, &pricing, None, 0.0, None, mode,
+        )
+        .await;
+        let (events, _) = membrane.read(None, 500);
+        assert_eq!(events[0].code, expected, "{case}");
+        assert_eq!(
+            events[0].counterparty.is_some(),
+            matches!(case, "unpaid" | "insufficient" | "paid" | "contact")
+        );
+    }
+    assert_eq!(membrane.read(None, 500).1.first_contacts, 1);
 }

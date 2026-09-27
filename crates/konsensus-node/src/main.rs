@@ -124,8 +124,12 @@ async fn main() -> Result<()> {
         Command::PairStatus { config } => {
             owner_cmd::cmd_pair_status(&config).await?;
         }
-        Command::Grant { op_id, config } => {
-            owner_cmd::cmd_grant(&config, &op_id).await?;
+        Command::Grant { op_id, budget, for_, per_call, recipient, yes, config } => {
+            let flags = owner_cmd::GrantFlags { budget_sats: budget, window: for_, per_call_sats: per_call, recipients: recipient, yes };
+            owner_cmd::cmd_grant(&config, &op_id, flags).await?;
+        }
+        Command::GrantRevoke { client_id, all, config } => {
+            owner_cmd::cmd_grant_revoke(&config, client_id.as_deref(), all).await?;
         }
         Command::ApproveReplacement { op_id, mnemonic, config } => {
             owner_cmd::cmd_approve_replacement(&config, &op_id, mnemonic.as_deref()).await?;
@@ -1093,6 +1097,13 @@ async fn cmd_start(
         );
     }
 
+    // G1: inherited owner grants need expiry cleanup in sidecar mode too.
+    // Reads/startup also purge; failed deletions remain retryable.
+    let grant_cleanup_handle = tokio::spawn(konsensus_api::control::sweep_expired_grants(
+        Arc::clone(&pairing_service),
+        node.shutdown_rx(),
+    ));
+
     // API server — fatal error if it fails (node is unusable without API)
     let api_addr = config.api.listen_addr;
     let shutdown_rx_api = node.shutdown_rx();
@@ -1308,6 +1319,7 @@ async fn cmd_start(
             if let Err(e) = hosting_payment_handle.await { warn!(error = %e, "operator hosting payment task panicked"); }
             if let Err(e) = whitelist_backup_handle.await { warn!(error = %e, "whitelist backup task panicked"); }
             if let Err(e) = api_handle.await { warn!(error = %e, "API server task panicked"); }
+            if let Err(e) = grant_cleanup_handle.await { warn!(error = %e, "grant cleanup task panicked"); }
         },
     )
     .await;
@@ -1315,6 +1327,13 @@ async fn cmd_start(
     if join_result.is_err() {
         warn!("shutdown timed out after {}s, forcing exit", shutdown_timeout.as_secs());
     }
+
+    // A grant can expire while the API/backend tasks drain, after the sweeper
+    // has stopped. Purge once more before returning from graceful shutdown;
+    // surface an I/O failure instead of claiming that cleanup succeeded.
+    pairing_service
+        .prune_expired_grants()
+        .context("failed to purge expired spend grants at shutdown")?;
 
     info!("konsensus node stopped");
     Ok(())

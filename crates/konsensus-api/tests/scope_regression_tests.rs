@@ -141,7 +141,7 @@ async fn ws_handshake_status(query: &str, protocol_header: Option<&str>) -> u16 
     let addr = listener.local_addr().unwrap();
     let app = build_router(test_state());
     let server = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service())
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .unwrap();
     });
@@ -204,15 +204,14 @@ async fn ws_upgrade_rejects_empty_scope_set() {
     assert_eq!(status, 403);
 }
 
-/// Positive control: the loopback token the app actually holds does carry `read`, so the
-/// live WebSocket keeps working. Without this the fix above could be "deny everything",
-/// and it is also what proves the handshake in these tests is genuinely well-formed.
+/// Read alone is insufficient for the local paired observability stream.
+/// Paired positive controls and revocation are tested in pairing_tests.
 #[tokio::test]
-async fn ws_upgrade_accepts_a_read_scoped_token() {
+async fn ws_upgrade_refuses_an_unpaired_read_scoped_token() {
     let status = ws_handshake_status(&format!("?token={}", loopback()), None).await;
     assert_eq!(
-        status, 101,
-        "a read-scoped token must still be able to open the socket, got {status}"
+        status, 403,
+        "an unpaired token must not open the observability stream, got {status}"
     );
 }
 

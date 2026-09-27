@@ -37,7 +37,6 @@ use rand::RngCore;
 use sha2::Sha256;
 
 use konsensus_core::traits::transport::TransportError;
-use tokio::net::TcpStream;
 
 use super::{read_bounded_message, write_noise_message};
 
@@ -275,8 +274,8 @@ pub(super) fn parse_challenge(bytes: &[u8]) -> Option<CookieFrame> {
 ///
 /// Holds **no per-connection state**: the cookie is recomputed from `ip` + epoch.
 pub(super) async fn cookie_gate_responder(
-    reader: &mut tokio::io::ReadHalf<TcpStream>,
-    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
     ip: IpAddr,
     keyring: &CookieKeyring,
 ) -> Result<(), TransportError> {
@@ -333,7 +332,7 @@ pub(super) async fn cookie_gate_responder(
 /// echo it back as a response. v1 carries no PoW, so a non-zero difficulty (which
 /// the v1 responder never sends) is rejected rather than silently ignored.
 pub(super) async fn answer_challenge(
-    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
     challenge: &CookieFrame,
 ) -> Result<(), TransportError> {
     if challenge.difficulty != 0 {
