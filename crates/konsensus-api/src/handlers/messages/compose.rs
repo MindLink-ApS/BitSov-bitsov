@@ -262,7 +262,9 @@ pub async fn create_payment_proof(
     price_msat: u64,
     peer_id: &NodeId,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
-    create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), Readmission::Allowed).await
+    let mut charge = FirstContactCharge::default();
+    create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), Readmission::Allowed, None, &mut charge)
+        .await.map_err(|error| charge.error(error))
 }
 
 /// Whether a paid send may pay admission again when the recipient refuses it
@@ -271,6 +273,7 @@ pub async fn create_payment_proof(
 pub(crate) enum Readmission {
     /// No confirmed cap: pay admission again, then the message.
     Allowed,
+    /// Single-recipient compose already holds the per-peer admission lock.
     LockHeld,
     /// The caller confirmed a price cap that covers the message only, so the
     /// admission is refused like an uncapped first contact (nothing is paid).
@@ -290,6 +293,8 @@ pub(crate) async fn create_metered_payment_proof(
     peer_id: &NodeId,
     debit: &Debit,
     readmission: Readmission,
+    kind: Option<u16>,
+    charge: &mut FirstContactCharge,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     // Zero-price messages get a valid cryptographic proof with zero amount.
     // The payment gate accepts these for kind-0 (control) messages.
@@ -345,7 +350,7 @@ pub(crate) async fn create_metered_payment_proof(
     // Invoice-request fallback (only reached when keysend was not dispatched).
     match create_payment_proof_via_invoice(state, payment_amount_msat, peer_id, debit).await {
         Err(e) if is_admission_refusal(&e) => {
-            readmit_then_pay(state, payment_amount_msat, peer_id, debit, readmission).await
+            readmit_then_pay(state, payment_amount_msat, peer_id, debit, readmission, kind, charge).await
         }
         other => other,
     }
@@ -404,6 +409,8 @@ async fn readmit_then_pay(
     peer_id: &NodeId,
     debit: &Debit,
     readmission: Readmission,
+    kind: Option<u16>,
+    charge: &mut FirstContactCharge,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     if readmission == Readmission::Capped {
         return Err(ApiError::PriceCapExceeded(format!(
@@ -422,7 +429,7 @@ async fn readmit_then_pay(
     }
     tracing::info!(
         peer = %peer_id,
-        "recipient requires admission on this connection — paying admission again"
+        "recipient requires admission — checking payment on the current connection"
     );
     let _guard = if readmission == Readmission::LockHeld {
         None
@@ -431,15 +438,31 @@ async fn readmit_then_pay(
     };
     let connected_since = state.transport.connected_since(peer_id).await;
     let had_settled = matches!(lock_admission_ledger().entries.get(peer_id), Some(AdmissionRecord::Settled { .. }));
-    let covered = lock_admission_ledger().settled_on_connection(peer_id, connected_since, Instant::now());
+    let covered = state.transport.admission_paid_on_connection(peer_id).await
+        || lock_admission_ledger().settled_on_connection(peer_id, connected_since, Instant::now());
     if !covered {
         if had_settled {
+            reconcile_admission_budget(state, peer_id, debit.reservation().as_ref()).await?;
             super::admission_journal::clear(state, peer_id)?;
             lock_admission_ledger().quotes.remove(peer_id);
         }
-        let mut charge = FirstContactCharge::default();
-        first_contact_admission(state, peer_id, konsensus_core::kind::KIND_CHAT, None, &mut charge, debit).await?;
+        let mut attempt = FirstContactCharge::default();
+        let result = first_contact_admission(state, peer_id, konsensus_core::kind::KIND_CHAT, None, &mut attempt, debit).await;
+        charge.include_attempt(attempt);
+        result?;
     }
+    if covered {
+        if let Some((quoted_kind, price)) = lock_admission_ledger().quotes.get(peer_id) {
+            if Some(*quoted_kind) == kind { charge.message_price = Some(*price); }
+        }
+    }
+    // The stateless admission quote prices chat only. Never substitute it for
+    // another service kind's price.
+    let amount_msat = if kind == Some(konsensus_core::kind::KIND_CHAT) {
+        charge.message_price.unwrap_or(amount_msat)
+    } else { amount_msat };
+    if amount_msat == 0 { return Ok(generate_valid_proof(0)); }
+    let amount_msat = amount_msat.max(MIN_INVOICE_AMOUNT_MSAT);
 
     let mut waited = Duration::ZERO;
     loop {
@@ -951,8 +974,8 @@ impl AdmissionLedger {
         connected_since: Option<Instant>,
         now: Instant,
     ) -> bool {
-        self.prune(now);
         let Some(AdmissionRecord::Settled { settled_at, .. }) = self.entries.get(peer) else {
+            self.prune(now);
             return false;
         };
         if connected_since.is_some_and(|since| *settled_at < since) {
@@ -1198,6 +1221,9 @@ async fn deliver_settled_admission(
     settled: PaymentDetails,
 ) -> Result<(), ApiError> {
     lock_admission_ledger().record_settled(*peer_id, Instant::now());
+    if let Some(since) = state.transport.connected_since(peer_id).await {
+        state.transport.mark_admission_paid(peer_id, since).await;
+    }
 
     let preimage_hex = settled.preimage.ok_or_else(|| {
         ApiError::Lightning("admission invoice settled but no preimage returned".into())
@@ -1302,9 +1328,9 @@ async fn deliver_settled_admission(
 /// Financial state survives every operational exit. G1 reserves the checked
 /// aggregate once and resolves this recipient once (never one debit per leg).
 #[derive(Default)]
-struct FirstContactCharge {
+pub(crate) struct FirstContactCharge {
     reserved_msat: u64,
-    settled_msat: u64,
+    pub(crate) settled_msat: u64,
     message_price: Option<u64>,
     message_settled: u64,
     current_dispatch: bool,
@@ -1312,7 +1338,16 @@ struct FirstContactCharge {
     prior_settled_msat: u64,
 }
 impl FirstContactCharge {
-    fn error(&self, error: ApiError) -> ApiError {
+    /// A connection can change again during one compose. Retain every paid or
+    /// uncertain admission instead of overwriting the earlier attempt.
+    fn include_attempt(&mut self, attempt: Self) {
+        self.reserved_msat = self.reserved_msat.saturating_add(attempt.reserved_msat);
+        self.settled_msat = self.settled_msat.saturating_add(attempt.settled_msat);
+        self.prior_settled_msat = self.prior_settled_msat.saturating_add(attempt.prior_settled_msat);
+        self.current_dispatch |= attempt.current_dispatch;
+        if attempt.message_price.is_some() { self.message_price = attempt.message_price; }
+    }
+    pub(crate) fn error(&self, error: ApiError) -> ApiError {
         if self.reserved_msat > self.settled_msat {
             return ApiError::PaymentUnresolved(format!(
                 "admission outcome unknown; {} msat remains reserved: {error}",
@@ -1414,7 +1449,11 @@ async fn first_contact_admission(
     }
     let prior = lock_admission_ledger().prior_admission(peer_id, Instant::now());
     match prior {
-        PriorAdmission::None => {} // fall through to the paid path below
+        PriorAdmission::None => {
+            if state.transport.admission_paid_on_connection(peer_id).await {
+                return Err(ApiError::PaymentUnresolved("admission already settled on this connection; cached proof expired, refusing a second payment".into()));
+            }
+        }
         PriorAdmission::InFlight {
             payment_hash,
             amount_msat,
@@ -1617,58 +1656,67 @@ async fn first_contact_admission(
     if kind != konsensus_core::kind::KIND_CHAT {
         return Err(ApiError::BadRequest("first contact must be a chat message".into()));
     }
-    let request_id = konsensus_core::admission_quote::request_id(
-        peer_id, state.identity.node_id(), std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-    );
-    let (tx, rx) = oneshot::channel::<InvoiceRequestOutcome>();
-    {
-        let mut requests = state.invoice_requests.lock().await;
-        if requests.len() >= MAX_PENDING_INVOICE_REQUESTS {
-            return Err(ApiError::Internal(
-                "Too many pending invoice requests — try again shortly".into(),
-            ));
-        }
-        requests.insert(request_id.clone(), tx);
-    }
-    let binding = invoice_refusal::bind(&request_id, *peer_id);
-    let frame = Frame::RequestInvoice {
-        request_id: request_id.clone(),
-        amount_msat: requested_msat,
-        purpose: format!("{ADMISSION_INVOICE_PURPOSE}:{kind}"),
-    };
-    let frame_bytes = frame
-        .to_bytes()
-        .map_err(|e| ApiError::Internal(format!("frame serialization error: {e}")))?;
-    if let Err(e) = debit.request_invoice(state.transport.send_raw_frame(peer_id, &frame_bytes)).await.and_then(|r| r.map_err(|e| ApiError::Internal(e.to_string()))) {
-        state.invoice_requests.lock().await.remove(&request_id);
-        return Err(ApiError::Internal(format!(
-            "failed to send admission invoice request: {e}"
-        )));
-    }
-
-    // 2. Await the target's repriced BOLT11.
-    let response = tokio::time::timeout(INVOICE_REQUEST_TIMEOUT, rx).await;
-    let _refusal = binding.finish();
-    let response = response
-        .map_err(|_| {
-            let rid = request_id.clone();
-            let reqs = Arc::clone(&state.invoice_requests);
-            tokio::spawn(async move {
-                reqs.lock().await.remove(&rid);
-            });
-            ApiError::Internal(
-                "admission invoice request timed out — target did not respond".into(),
-            )
-        })?
-        .map_err(|_| ApiError::Lightning("target could not create an admission invoice".into()))?
-        .map_err(|error| {
-            if error.recipient == *peer_id && error.reason == "stateless_quote_unsupported" {
-                ApiError::StatelessQuoteUnsupported
-            } else {
-                ApiError::Lightning("target refused admission quote".into())
+    let mut retried = false;
+    let (request_id, response) = loop {
+        let request_id = konsensus_core::admission_quote::request_id(
+            peer_id, state.identity.node_id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        );
+        let (tx, rx) = oneshot::channel::<InvoiceRequestOutcome>();
+        {
+            let mut requests = state.invoice_requests.lock().await;
+            if requests.len() >= MAX_PENDING_INVOICE_REQUESTS {
+                return Err(ApiError::Internal(
+                    "Too many pending invoice requests — try again shortly".into(),
+                ));
             }
-        })?;
+            requests.insert(request_id.clone(), tx);
+        }
+        let binding = invoice_refusal::bind(&request_id, *peer_id);
+        let frame = Frame::RequestInvoice {
+            request_id: request_id.clone(),
+            amount_msat: requested_msat,
+            purpose: format!("{ADMISSION_INVOICE_PURPOSE}:{kind}"),
+        };
+        let frame_bytes = frame
+            .to_bytes()
+            .map_err(|e| ApiError::Internal(format!("frame serialization error: {e}")))?;
+        if let Err(e) = debit.request_invoice(state.transport.send_raw_frame(peer_id, &frame_bytes)).await.and_then(|r| r.map_err(|e| ApiError::Internal(e.to_string()))) {
+            state.invoice_requests.lock().await.remove(&request_id);
+            return Err(ApiError::Internal(format!(
+                "failed to send admission invoice request: {e}"
+            )));
+        }
+
+        // 2. Await the target's repriced BOLT11.
+        let response = tokio::time::timeout(INVOICE_REQUEST_TIMEOUT, rx).await;
+        let _refusal = binding.finish();
+        let response = response
+            .map_err(|_| {
+                let rid = request_id.clone();
+                let reqs = Arc::clone(&state.invoice_requests);
+                tokio::spawn(async move {
+                    reqs.lock().await.remove(&rid);
+                });
+                ApiError::Internal(
+                    "admission invoice request timed out — target did not respond".into(),
+                )
+            })?
+            .map_err(|_| ApiError::Lightning("target could not create an admission invoice".into()))?;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.recipient == *peer_id && error.reason == invoice_refusal::ADMISSION_RATE_LIMITED && !retried => {
+                retried = true;
+                // The recipient's source cooldown is ten seconds. Only retry a
+                // bound, explicit pre-invoice refusal; no payment was dispatched.
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+            Err(error) if error.recipient == *peer_id && error.reason == "stateless_quote_unsupported" => return Err(ApiError::StatelessQuoteUnsupported),
+            Err(_) => return Err(ApiError::Lightning("target refused admission quote".into())),
+        };
+        break (request_id, response);
+    };
 
     // The Noise session authenticates the target that authorized this invoice.
     // Do not trust the UUID alone: a different peer cannot redirect payment.
@@ -1908,8 +1956,9 @@ async fn compose_room_member(
 
     // Create payment proof — requests invoice from recipient's wallet (Principle 2).
     // Preserve refused vs unresolved payment state for every member.
+    let mut admission = FirstContactCharge::default();
     let (payment_hash, preimage_bytes, amount_msat) =
-        match create_metered_payment_proof(state, price_msat, &member, ctx.debit, ctx.readmission).await {
+        match create_metered_payment_proof(state, price_msat, &member, ctx.debit, ctx.readmission, Some(ctx.kind), &mut admission).await.map_err(|error| admission.error(error)) {
             Ok(proof) => proof,
             Err(e) => {
                 tracing::warn!(
@@ -1927,6 +1976,7 @@ async fn compose_room_member(
         };
 
     let proof = konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
+    let amount_msat = amount_msat.saturating_add(admission.settled_msat);
 
     // Build and sign envelope.
     let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
@@ -2341,7 +2391,7 @@ pub(super) async fn compose_message(
             Readmission::Capped
         } else { Readmission::LockHeld };
         let (payment_hash, preimage_bytes, amount_msat) =
-            create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission).await?;
+            create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission, Some(req.kind), &mut admission).await?;
         admission.message_settled = amount_msat;
         let proof =
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
@@ -2520,6 +2570,17 @@ mod settlement_tests {
 mod admission_tests {
     use super::*;
     use konsensus_core::identity::NodeIdentity;
+
+    #[test]
+    fn reconnect_during_compose_retains_prior_spend_and_unresolved_attempt() {
+        let mut charge = FirstContactCharge { reserved_msat: 7000, settled_msat: 7000, ..Default::default() };
+        charge.include_attempt(FirstContactCharge { reserved_msat: 7000, current_dispatch: true, ..Default::default() });
+        assert_eq!(charge.settled_msat, 7000);
+        assert!(matches!(charge.error(ApiError::Lightning("pending second admission".into())), ApiError::PaymentUnresolved(_)));
+        let mut settled = FirstContactCharge { reserved_msat: 7000, settled_msat: 7000, ..Default::default() };
+        settled.include_attempt(FirstContactCharge { reserved_msat: 7000, settled_msat: 7000, ..Default::default() });
+        assert!(matches!(settled.error(ApiError::Internal("message failed".into())), ApiError::PaymentProofUnavailable { amount_msat: 14000, .. }));
+    }
 
     /// The admission amount must come from OUR pricing (peer-announced if fresh,
     /// else our own engine), floored at the invoice minimum — never a caller
@@ -3123,5 +3184,25 @@ mod admission_tests {
         sender_id
             .verify(&envelope.signable_bytes(), &sig)
             .expect("admission envelope signature must verify against the sender key");
+    }
+}
+
+#[cfg(test)]
+mod reviewer_same_connection_ttl {
+    use super::*;
+
+    #[test]
+    fn same_connection_settlement_still_prevents_repayment_after_ttl() {
+        let peer = NodeId::from_bytes([173; 32]);
+        let connected_at = Instant::now();
+        let settled_at = connected_at + Duration::from_secs(1);
+        let mut ledger = AdmissionLedger::default();
+        ledger.record_settled(peer, settled_at);
+        assert!(ledger.settled_on_connection(
+            &peer, Some(connected_at), settled_at + ADMISSION_SETTLED_TTL - Duration::from_secs(1)
+        ));
+        assert!(ledger.settled_on_connection(
+            &peer, Some(connected_at), settled_at + ADMISSION_SETTLED_TTL
+        ), "same connection must not reopen admission payment solely because 15 minutes passed");
     }
 }

@@ -126,6 +126,13 @@ pub trait MessageTransport: Send + Sync {
         None
     }
 
+    /// Whether we settled an admission payment on this live connection. This
+    /// volatile guard lasts until disconnect, independently of proof-cache TTLs.
+    async fn admission_paid_on_connection(&self, _peer: &NodeId) -> bool { false }
+
+    /// Mark settlement only if the connection generation still matches.
+    async fn mark_admission_paid(&self, _peer: &NodeId, _since: std::time::Instant) {}
+
     /// Add a peer to the transport whitelist (Principle 3: Closed Mesh).
     ///
     /// Called when a peer is added via invite redemption or manual peer add.

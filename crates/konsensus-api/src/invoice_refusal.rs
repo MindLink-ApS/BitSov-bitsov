@@ -2,9 +2,9 @@
 //! issue an invoice, and the binding that routes a refusal to the request that
 //! asked.
 //!
-//! A recipient never ignores a payment request in silence. When it refuses one,
-//! it answers with `Frame::InvoiceError` and one of the reasons below, so the
-//! sender learns at once what to do instead of timing out.
+//! A recipient answers refusals with `Frame::InvoiceError` and one of the
+//! reasons below, within bounded source/global reply limits. Excess requests
+//! are dropped; a backpressured connection is closed.
 //!
 //! The sender binds each outgoing invoice request to the peer it was sent to.
 //! A refusal counts only when it comes from that peer. So a refusal from a peer
@@ -23,7 +23,7 @@ use konsensus_core::NodeId;
 pub const ADMISSION_REQUIRED: &str = "konsensus:admission_required";
 
 /// The recipient refused an admission invoice because this peer asked for one
-/// too recently (the unpaid admission path is rate-limited per peer).
+/// too recently (the unpaid admission path has source and global limits).
 pub const ADMISSION_RATE_LIMITED: &str = "konsensus:admission_rate_limited";
 
 /// Bound on requests tracked at once. The compose paths cap their own pending

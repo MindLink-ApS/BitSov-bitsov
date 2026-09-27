@@ -125,7 +125,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         std::collections::HashMap::new();
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
-    let mut last_admission_refusal = std::collections::HashMap::new();
+    let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
@@ -939,7 +939,7 @@ async fn handle_invoice_requested_gated(
     source_ip: std::net::IpAddr,
     quotes: &mut crate::admission_quotes::AdmissionQuotes,
     membrane: &konsensus_api::membrane::Membrane,
-    last_admission_refusal: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
+    last_admission_refusal: &mut crate::invoice_refusals::RefusalLimits,
 ) {
     use konsensus_core::admission_quote;
     if purpose == admission_quote::PURPOSE {
@@ -955,6 +955,9 @@ async fn handle_invoice_requested_gated(
             tokio::time::Instant::now(),
             unix,
         ) {
+            if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED).await;
+            }
             return;
         }
         // Exactly the first-contact chat price. Neither kind nor amount is
@@ -993,7 +996,9 @@ async fn handle_invoice_requested_gated(
                 request_id: request_id.into(),
                 reason: "stateless_quote_unsupported".into(),
             };
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), transport.send_frame(peer_id, &refusal)).await;
+            if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                let _ = transport.enqueue_control_frame(peer_id, &refusal).await;
+            }
             return;
         }
         if let Ok(Ok(invoice)) = invoice {
@@ -1031,12 +1036,10 @@ async fn handle_invoice_requested_gated(
     }
     if !privileged {
         let now = tokio::time::Instant::now();
-        last_admission_refusal.retain(|_, at| now.duration_since(*at) < std::time::Duration::from_secs(10));
-        if last_admission_refusal.len() < 1024 && !last_admission_refusal.contains_key(peer_id) {
-            last_admission_refusal.insert(*peer_id, now);
-            membrane.admission_required(peer_id);
+        if last_admission_refusal.permit(source_ip, now) {
+            last_admission_refusal.event(peer_id, now, membrane);
+            send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
         }
-        send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
         return;
     }
     // Old arbitrary-kind/legacy admission requests fail closed, even if paid.
@@ -1048,11 +1051,14 @@ async fn handle_invoice_requested_gated(
             purpose,
             lightning,
             transport,
+            source_ip,
+            last_admission_refusal,
         )
         .await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_invoice_requested(
     peer_id: &NodeId,
     request_id: &str,
@@ -1060,6 +1066,8 @@ async fn handle_invoice_requested(
     purpose: &str,
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
+    source_ip: std::net::IpAddr,
+    refusals: &mut crate::invoice_refusals::RefusalLimits,
 ) {
     info!(
         peer = %peer_id, %request_id, amount_msat, %purpose,
@@ -1084,11 +1092,12 @@ async fn handle_invoice_requested(
                 peer = %peer_id, %request_id, error = %e,
                 "failed to create invoice for peer request — sending error to peer"
             );
+            if !refusals.permit(source_ip, tokio::time::Instant::now()) { return; }
             let error_frame = Frame::InvoiceError {
                 request_id: request_id.to_string(),
                 reason: format!("invoice creation failed: {e}"),
             };
-            if let Err(send_err) = transport.send_frame(peer_id, &error_frame).await {
+            if let Err(send_err) = transport.enqueue_control_frame(peer_id, &error_frame).await {
                 warn!(peer = %peer_id, %request_id, error = %send_err, "failed to send invoice error frame");
             }
         }
@@ -1107,7 +1116,7 @@ async fn send_invoice_refusal(
         request_id: request_id.to_string(),
         reason: reason.to_string(),
     };
-    if let Err(e) = transport.send_frame(peer_id, &refusal).await {
+    if let Err(e) = transport.enqueue_control_frame(peer_id, &refusal).await {
         warn!(peer = %peer_id, %request_id, error = %e, "failed to send invoice refusal");
     }
 }

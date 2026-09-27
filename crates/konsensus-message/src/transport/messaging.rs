@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use konsensus_core::envelope::UkmEnvelope;
@@ -14,7 +14,7 @@ use crate::wire::Frame;
 
 use super::{
     write_noise_message, read_noise_message,
-    BanMap, ControlEvent, PeerConnection, PeerMap,
+    BanMap, ControlEvent, Connection, PeerMap,
     FRAME_BAN_DURATION, INVALID_FRAME_BUDGET, INVALID_FRAME_WINDOW,
     MEMORY_BUDGET_WINDOW, PEER_MEMORY_BUDGET,
 };
@@ -110,7 +110,7 @@ impl NoiseTransport {
         // Scoped-clone the Arcs first so the `peers` read guard is not held across
         // each `conn.lock().await` (same lock-ordering discipline as `send_frame`
         // and `promote_to_privileged`).
-        let conns: Vec<(NodeId, Arc<Mutex<PeerConnection>>)> = {
+        let conns: Vec<(NodeId, Arc<Connection>)> = {
             let peers = self.peers.read().await;
             peers.iter().map(|(id, c)| (*id, Arc::clone(c))).collect()
         };
@@ -158,7 +158,7 @@ impl NoiseTransport {
 pub(super) fn spawn_reader_task(
     peer_id: NodeId,
     mut reader: tokio::net::tcp::OwnedReadHalf,
-    conn: Arc<Mutex<PeerConnection>>,
+    conn: Arc<Connection>,
     peers: PeerMap,
     banned_peers: BanMap,
     incoming_tx: mpsc::Sender<UkmEnvelope>,
@@ -589,7 +589,7 @@ pub(super) fn spawn_reader_task(
         }
 
         // Clean up: remove peer from connection map
-        peers.write().await.remove(&peer_id);
+        conn.remove(&peer_id, &peers).await;
         debug!(peer = %peer_id, "peer connection cleaned up");
     });
 }

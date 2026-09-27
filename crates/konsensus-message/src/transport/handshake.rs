@@ -443,7 +443,7 @@ pub(super) async fn connect_to_peer(
 ) -> Result<(), TransportError> {
     use std::sync::Arc;
     use std::time::Instant;
-    use tokio::sync::Mutex;
+
 
     use super::{PeerConnection, spawn_reader_task};
     use super::ControlEvent;
@@ -515,7 +515,7 @@ pub(super) async fn connect_to_peer(
     };
 
     let now = Instant::now();
-    let conn = Arc::new(Mutex::new(PeerConnection {
+    let conn = super::Connection::new(PeerConnection {
         source_ip: addr.ip(),
         privileged,
         noise,
@@ -529,12 +529,9 @@ pub(super) async fn connect_to_peer(
         invalid_frame_last_leak: now,
         bytes_received: 0,
         memory_budget_window_start: now,
-    }));
+    }, peer_node_id, Arc::clone(&ctx.peers))?;
 
-    ctx.peers
-        .write()
-        .await
-        .insert(peer_node_id, Arc::clone(&conn));
+    if let Some(old) = ctx.peers.write().await.insert(peer_node_id, Arc::clone(&conn)) { old.close(); }
 
     spawn_reader_task(
         peer_node_id,

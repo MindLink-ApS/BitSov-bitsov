@@ -55,6 +55,7 @@ struct TestWallet {
     ledger: Arc<std::sync::Mutex<Ledger>>,
     created: std::sync::Mutex<HashSet<String>>,
     paid: std::sync::Mutex<Vec<(String, u64)>>,
+    fail_message: std::sync::atomic::AtomicBool,
 }
 
 impl TestWallet {
@@ -63,6 +64,7 @@ impl TestWallet {
             ledger: Arc::clone(ledger),
             created: std::sync::Mutex::new(HashSet::new()),
             paid: std::sync::Mutex::new(Vec::new()),
+            fail_message: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -71,13 +73,14 @@ impl TestWallet {
     }
 }
 
-fn bolt11(amount_msat: u64, preimage: &[u8; 32]) -> (String, String) {
+fn bolt11(amount_msat: u64, preimage: &[u8; 32], description: &str, expiry_secs: u32) -> (String, String) {
     use bitcoin::hashes::{sha256, Hash};
     use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
 
     let hash: [u8; 32] = Sha256::digest(preimage).into();
     let invoice = InvoiceBuilder::new(Currency::Regtest)
-        .description("konsensus test".into())
+        .description(description.into())
+        .expiry_time(Duration::from_secs(u64::from(expiry_secs)))
         .payment_hash(sha256::Hash::from_byte_array(hash))
         .payment_secret(PaymentSecret(rand::random()))
         .current_timestamp()
@@ -100,8 +103,11 @@ impl LightningProvider for TestWallet {
         description: &str,
         expiry_secs: u32,
     ) -> Result<Invoice, LightningError> {
+        if !description.starts_with("konsensus:v1:") && self.fail_message.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(LightningError::Backend("test message invoice failure".into()));
+        }
         let preimage: [u8; 32] = rand::random();
-        let (bolt11, payment_hash) = bolt11(amount_msat, &preimage);
+        let (bolt11, payment_hash) = bolt11(amount_msat, &preimage, description, expiry_secs);
         self.ledger
             .lock()
             .unwrap()
@@ -116,6 +122,10 @@ impl LightningProvider for TestWallet {
             expiry_secs,
             created_at: 0,
         })
+    }
+
+    async fn create_stateless_invoice(&self, amount_msat: u64, description: &str, expiry_secs: u32) -> Result<Invoice, LightningError> {
+        self.create_invoice(amount_msat, description, expiry_secs).await
     }
 
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
@@ -325,10 +335,14 @@ async fn start_recipient(
     transport: &Arc<NoiseTransport>,
     sessions: &Arc<SessionManager>,
     wallet: Arc<TestWallet>,
+    refuse_once: Arc<std::sync::atomic::AtomicBool>,
 ) -> (Arc<konsensus_api::audit::AuditLog>, mpsc::UnboundedReceiver<String>) {
     let audit = audit_log();
     let lightning: Arc<dyn LightningProvider> = wallet;
-    let pricing = pricing();
+    // Deliberately different from A's stale/default message estimate.
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(konsensus_pricing::StaticPricingEngine::new(
+        konsensus_pricing::StaticPricingConfig { chat_msat: 7000, ..Default::default() }
+    ));
 
     // B's control plane: invoice requests, through the real privilege gate.
     {
@@ -338,10 +352,11 @@ async fn start_recipient(
         let pricing = Arc::clone(&pricing);
         let recipient = *identity.node_id();
         tokio::spawn(async move {
-            let mut last_refusal = HashMap::new();
+            let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
             let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
             while let Some(event) = transport.recv_control().await {
                 if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged, source_ip } = event {
+                    let privileged = privileged && !refuse_once.swap(false, std::sync::atomic::Ordering::AcqRel);
                     handle_invoice_requested_gated(
                         &peer_id, &request_id, amount_msat, &purpose, privileged,
                         &pricing, &lightning, &transport, &recipient, source_ip, &mut quotes, audit.membrane(), &mut last_refusal,
@@ -439,8 +454,10 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
 
     let ledger = Arc::new(std::sync::Mutex::new(Ledger::default()));
     let sender = start_sender(&alice, &transport_a, &sessions_a, Arc::new(TestWallet::new(&ledger))).await;
+    let refuse_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recipient_wallet = Arc::new(TestWallet::new(&ledger));
     let (audit_b, mut delivered) =
-        start_recipient(&bob, &transport_b, &sessions_b, Arc::new(TestWallet::new(&ledger))).await;
+        start_recipient(&bob, &transport_b, &sessions_b, Arc::clone(&recipient_wallet), Arc::clone(&refuse_once)).await;
 
     // 1. Admit: A connects as a stranger; its first paid message pays admission.
     transport_a.connect(&bob_id, &addr_b).await.unwrap();
@@ -450,6 +467,7 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     let (status, body) = sender.compose(&bob_id, "before the drop").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["delivered"], true, "{body}");
+    assert_eq!(body["amount_msat"], 14_000, "admission plus message must both be reported: {body}");
     assert_eq!(delivered.recv().await.as_deref(), Some("before the drop"));
     assert!(privileged_on(&transport_b, &alice_id).await, "admission promoted A's connection");
 
@@ -466,6 +484,7 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     let (status, body) = sender.compose(&bob_id, "after the reconnect").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["delivered"], true, "{body}");
+    assert_eq!(body["amount_msat"], 14_000, "admission plus message must both be reported: {body}");
     assert!(
         started.elapsed() < Duration::from_secs(15),
         "no silent drop: the refusal is answered at once, not by a 30 s timeout ({:?})",
@@ -474,8 +493,11 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     assert_eq!(delivered.recv().await.as_deref(), Some("after the reconnect"));
     assert!(privileged_on(&transport_b, &alice_id).await, "re-admission promoted the new connection");
 
+    assert!(started.elapsed() >= Duration::from_secs(9), "rapid reconnect must exercise the production quote cooldown");
+
     // Each act re-proven: two admissions and two messages, nothing paid twice.
     let payments = sender.wallet.payments_made();
+    assert!(payments.iter().all(|(_, amount)| *amount == 7000), "fresh recipient price must replace stale sender pricing: {payments:?}");
     assert_eq!(payments.len(), 4, "admission + message, twice: {payments:?}");
     let unique: HashSet<_> = payments.iter().map(|(hash, _)| hash).collect();
     assert_eq!(unique.len(), 4, "no invoice paid twice");
@@ -486,6 +508,25 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     assert!(codes.contains(&Code::AdmissionRequired), "explicit refusal event: {codes:?}");
     assert!(!codes.contains(&Code::ProofReused), "stale admission proof re-sent: {codes:?}");
     assert_eq!(totals.admitted, 4, "two admissions and two messages admitted: {codes:?}");
+
+    // A stale refusal on the same connection must never buy admission again.
+    refuse_once.store(true, std::sync::atomic::Ordering::Release);
+    let (status, body) = sender.compose(&bob_id, "same connection").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(delivered.recv().await.as_deref(), Some("same connection"));
+    assert_eq!(sender.wallet.payments_made().len(), 5, "only the new message is paid");
+    assert_eq!(body["amount_msat"], 7000, "same-connection retry pays only the message");
+
+    // A failure after re-admission must report the admission that really settled.
+    transport_b.disconnect(&alice_id).await.unwrap();
+    wait_until("A sees second drop", || async { !transport_a.is_connected(&bob_id).await }).await;
+    transport_a.connect(&bob_id, &addr_b).await.unwrap();
+    wait_until("B sees third connection", || transport_b.is_connected(&alice_id)).await;
+    recipient_wallet.fail_message.store(true, std::sync::atomic::Ordering::Release);
+    let (status, body) = sender.compose(&bob_id, "message invoice fails").await;
+    assert!(!status.is_success(), "{body}");
+    assert!(body.to_string().contains("7000"), "must disclose settled admission despite message failure: {body}");
+    assert_eq!(sender.wallet.payments_made().len(), 6, "only re-admission settled during failed send");
 
     transport_a.shutdown();
     transport_b.shutdown();
