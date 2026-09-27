@@ -1118,6 +1118,33 @@ impl PairingService {
         Ok(())
     }
 
+    /// Identify the exact live spend grant for volatile staged-file ownership.
+    /// Binding and grant are checked under the same lock as revoke/replacement;
+    /// a new grant for the same client must not inherit the old grant's bytes.
+    pub(crate) fn live_spend_grant_id(&self, binding: &auth::PairingBinding) -> Option<String> {
+        if !self.owner_control_enabled {
+            return None;
+        }
+        let inner = self.lock();
+        if inner.identity_fingerprint != binding.fingerprint
+            || !inner.file.clients.iter().any(|client| {
+                client.client_id == binding.client_id
+                    && client.epoch == binding.epoch
+                    && client.identity_fingerprint == binding.fingerprint
+            })
+        {
+            return None;
+        }
+        let now = chrono::Utc::now().timestamp();
+        inner.file.grants.iter().find(|grant| {
+            grant.client_id == binding.client_id
+                && grant.epoch == binding.epoch
+                && grant.identity_fingerprint == binding.fingerprint
+                && grant.scopes.contains(&Scope::Spend)
+                && grant.is_live(now)
+        }).map(|grant| grant.op_id.clone())
+    }
+
     /// The scopes a pairing actually carries **in this deployment**, computed
     /// identically at issuance and at per-request verification.
     ///

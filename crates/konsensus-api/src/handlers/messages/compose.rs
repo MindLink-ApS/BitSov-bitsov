@@ -1160,6 +1160,13 @@ impl FirstContactCharge {
                 self.reserved_msat
             ));
         }
+        // A recovered admission belongs to an earlier call. A definitive cap
+        // or grant refusal before this call paid must retain its API/N2 code.
+        if self.settled_msat == 0 && self.message_settled == 0
+            && matches!(&error, ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_))
+        {
+            return error;
+        }
         if self.settled_msat == 0 && self.message_settled == 0 && self.prior_settled_msat == 0 {
             return error;
         }

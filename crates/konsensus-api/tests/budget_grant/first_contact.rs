@@ -203,3 +203,86 @@ async fn unknown_second_leg_keeps_original_aggregate_reserved_after_restart() {
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     assert_eq!(sender.get_balance_msat().await.unwrap(), 98_000);
 }
+
+
+async fn prior_admission_refusal_emits_membrane_event(refuse_budget: bool) {
+    let (mut fx, sender, target, _) = stranger(false).await;
+    let (_, identity) = konsensus_core::identity::NodeIdentity::generate().unwrap();
+    fx.peer = *identity.node_id();
+    let peer = fx.peer;
+    let transport = Arc::new(ConnectedStubTransport::new(
+        vec![peer],
+        fx.state.invoice_requests.clone(),
+    ));
+    fx.state = Arc::new(AppState {
+        transport: transport.clone(),
+        ..(*fx.state).clone()
+    });
+    let token = fx.grant(None, GrantTerms::new(20_000)).await;
+    let original = reserve(&fx, 6000);
+    let invoice = target
+        .create_invoice(2000, "prior settled admission", 55)
+        .await
+        .unwrap();
+    sender.pay_invoice(&invoice.bolt11).await.unwrap();
+    journal(&fx, &original, &invoice.payment_hash);
+    let session = fx.state.session_manager.clone();
+    let service = fx.service.clone();
+    let client_id = fx.client_id.clone();
+    let establish = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !transport.sent_envelopes.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prior admission proof was redelivered");
+        if refuse_budget {
+            service.revoke_grants(Some(&client_id)).unwrap();
+        }
+        let target_session = konsensus_crypto::SessionManager::new(Arc::new(identity));
+        session
+            .initiate_session(&peer, &target_session.prekey_bundle().await)
+            .await
+            .unwrap();
+    });
+    let (status, body) = send(&fx, &token, if refuse_budget { 4000 } else { 1000 }).await;
+    establish.await.unwrap();
+    assert_eq!(
+        sender.get_balance_msat().await.unwrap(),
+        98_000,
+        "retry made no new payment"
+    );
+    assert_eq!(
+        fx.used(),
+        if refuse_budget { 0 } else { 2000 },
+        "retry must not charge a new payment"
+    );
+    let (_, totals) = fx.state.audit_log.membrane().read(None, 500);
+    assert_eq!(
+        totals.outbound_refused, 1,
+        "refusal before any payment by this retry must emit N2; status={status}, body={body}"
+    );
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["code"],
+        if refuse_budget {
+            "budget_exceeded"
+        } else {
+            "price_cap_exceeded"
+        }
+    );
+}
+
+#[tokio::test]
+async fn prior_admission_cap_refusal_emits_membrane_event_without_new_payment() {
+    prior_admission_refusal_emits_membrane_event(false).await;
+}
+
+#[tokio::test]
+async fn prior_admission_budget_refusal_emits_membrane_event_without_new_payment() {
+    prior_admission_refusal_emits_membrane_event(true).await;
+}

@@ -943,3 +943,92 @@ async fn membrane_ws_requires_local_pairing_and_rechecks_revocation() {
         let _ = server.await;
     }
 }
+
+async fn staging_previous_grant_isolation(revoke_before_regrant: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, service, console) = state_with_pairing(tmp.path(), true);
+    let app = test_router(state.clone());
+    let key = SigningKey::from_bytes(&[94u8; 32]);
+    let (client_id, _) = pair_and_token(&app, &service, &key).await;
+    let grant = || {
+        let op = service
+            .create_elevation_request(&client_id, vec![Scope::Spend])
+            .unwrap();
+        service
+            .grant_elevation(
+                &op.op_id,
+                &console.confirmation(&pairing::grant_confirmation_phrase(&op)),
+                konsensus_api::spend_budget::GrantTerms::new(100_000),
+            )
+            .unwrap()
+    };
+    let issue_token = || {
+        let challenge = service.issue_token_challenge(&client_id).unwrap();
+        service
+            .issue_token(
+                &state.identity.node_id().to_hex(),
+                &state.jwt_secret,
+                &client_id,
+                &challenge,
+                &hex::encode(key.sign(challenge.as_bytes()).to_bytes()),
+            )
+            .unwrap()
+            .token
+    };
+    let original = grant();
+    let token = issue_token();
+    let balance = state.lightning.get_balance_msat().await.unwrap();
+    let (status, uploaded) = post(
+        &app,
+        "/api/v1/files",
+        serde_json::json!({"filename":"old-grant.txt", "data_b64":"b2xkIGdyYW50"}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let id = uploaded["file_id"].as_str().unwrap();
+    if revoke_before_regrant {
+        assert_eq!(service.revoke_grants(Some(&client_id)).unwrap(), 1);
+    }
+    let replacement = grant();
+    assert_ne!(original.op_id, replacement.op_id);
+    assert_eq!(
+        original.epoch, replacement.epoch,
+        "grant replacement is not client rotation"
+    );
+    let replacement_token = issue_token();
+    // Sweep explicitly: cleanup should invalidate bytes owned by the old grant,
+    // even when no request happened during the revoke/regrant interval.
+    state.file_staging.lock().unwrap().sweep(&state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/files/{id}"))
+                .header("authorization", format!("Bearer {replacement_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.lightning.get_balance_msat().await.unwrap(), balance);
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "replacement grant must not inherit previous grant's staged bytes: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn staging_replacement_grant_cannot_read_previous_grant_blob() {
+    staging_previous_grant_isolation(false).await;
+}
+
+#[tokio::test]
+async fn staging_revoked_then_regranted_blob_stays_revoked() {
+    staging_previous_grant_isolation(true).await;
+}

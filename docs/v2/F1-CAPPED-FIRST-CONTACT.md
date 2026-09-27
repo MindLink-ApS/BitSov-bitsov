@@ -41,8 +41,9 @@ admission or bypass the receiver's single-use settlement gate.
 Paid operational failures return HTTP 502 with
 `code: "payment_settled_send_incomplete"` and the principal newly settled by
 that call in `amount_msat`. Reconciled prior admissions are not charged to the
-retry again. Unknown outcomes remain HTTP 502; clients must retain their full
-confirmed cap until reconciliation, as in #80. The endpoint is not a general
+retry again. If a retry pays nothing new and is refused by its cap or grant, it
+retains the cap/budget refusal code and emits the corresponding N2 event. Unknown
+outcomes remain HTTP 502; clients must retain their full confirmed cap until reconciliation, as in #80. The endpoint is not a general
 message-idempotency API: clients must not blindly retry a lost send response.
 
 ## Stranger payment preparation and the whitepaper floor
@@ -125,11 +126,13 @@ Staging is volatile memory, never a persistent file/storage record: 4 MiB per
 file, 8 MiB per grant/owner, 16 MiB globally and 64 entries. Filename, MIME,
 encoded-size and decoded-size checks precede insertion. Staging transfers no
 Lightning principal and grants no file-management authority; deletion remains
-Admin-only and another grant cannot read or send the staged file.
+Admin-only and another grant cannot read or send the staged file. Paired entries
+carry the creating grant operation ID as well as client, epoch and identity;
+replacement or regrant never revives the old grant's uploads.
 
 Entries expire after five minutes. Access and a 15-second background sweep
-remove expired/revoked idle entries; startup begins with an empty store, so no
-staged bytes survive restart. A send rechecks the live grant, owns its quota
+remove idle entries whose exact creating grant expired, was revoked or was
+replaced; startup begins with an empty store, so no staged bytes survive restart. A send rechecks the live grant, owns its quota
 through all awaits, and consumes the blob on success, error or cancellation.
 A cap refusal before dispatch leaves it available within its existing expiry.
 In-flight sends end at the earlier of stage expiry and 60 seconds. An ambiguous
