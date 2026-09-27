@@ -120,6 +120,10 @@ pub struct InboundPayment {
 /// Errors from Lightning operations.
 #[derive(Debug, Error)]
 pub enum LightningError {
+    /// This backend cannot issue a quote without retaining unpaid state.
+    #[error("stateless_quote_unsupported")]
+    StatelessQuoteUnsupported,
+
     /// Positively proven to have failed BEFORE payment dispatch. Only this
     /// variant permits a caller to try another payment path. Never use it for
     /// a response error, timeout, or an unclassified backend/connection error.
@@ -233,6 +237,17 @@ pub trait LightningProvider: Send + Sync {
         description: &str,
         expiry_secs: u32,
     ) -> Result<Invoice, LightningError>;
+
+    /// Issue a signed quote without retaining any pending invoice/payment record.
+    /// Unsupported backends MUST NOT fall back to create_invoice.
+    async fn create_stateless_invoice(
+        &self,
+        _amount_msat: u64,
+        _description: &str,
+        _expiry_secs: u32,
+    ) -> Result<Invoice, LightningError> {
+        Err(LightningError::StatelessQuoteUnsupported)
+    }
 
     /// Pay a BOLT11 invoice.
     ///

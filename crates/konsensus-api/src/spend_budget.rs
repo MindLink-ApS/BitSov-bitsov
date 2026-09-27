@@ -180,6 +180,9 @@ pub struct GrantBudget {
     /// The same, per recipient.
     #[serde(default)]
     pub used_by_recipient: BTreeMap<String, u64>,
+    /// Outstanding reservations; terminal resolution consumes each recipient once.
+    #[serde(default)]
+    pub pending: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 impl GrantBudget {
@@ -192,6 +195,7 @@ impl GrantBudget {
             per_recipient_msat: terms.per_recipient_msat.clone(),
             used_msat: 0,
             used_by_recipient: BTreeMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 
@@ -281,7 +285,7 @@ impl GrantBudget {
 }
 
 /// One payment a call intends to make.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Charge {
     /// Canonical recipient key (see [`canonical_recipient`]).
     pub recipient: String,
@@ -292,8 +296,10 @@ pub struct Charge {
 
 /// Charges reserved against one grant. Carries no authority: resolving it
 /// against a grant that has since been revoked or replaced does nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Reservation {
+    /// Unique durable reservation, distinct from the grant id.
+    pub id: String,
     /// Client the grant belongs to.
     pub client_id: String,
     /// The grant's operation id — identifies which grant was debited.

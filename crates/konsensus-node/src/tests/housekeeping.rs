@@ -565,7 +565,7 @@ async fn peer_ln_pubkeys_cleanup_all_connected_retains_all() {
 /// Dropped receiver → sender.is_closed() == true → entry removed.
 #[tokio::test]
 async fn invoice_requests_cleanup_removes_closed_senders() {
-    let mut map: HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>> = HashMap::new();
+    let mut map: HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>> = HashMap::new();
 
     // Create two requests: one with a live receiver, one with a dropped receiver
     let (tx_live, _rx_live) = tokio::sync::oneshot::channel();
@@ -588,7 +588,7 @@ async fn invoice_requests_cleanup_removes_closed_senders() {
 /// All senders are live: nothing is removed.
 #[tokio::test]
 async fn invoice_requests_cleanup_retains_live_senders() {
-    let mut map: HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>> = HashMap::new();
+    let mut map: HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>> = HashMap::new();
 
     let (tx1, _rx1) = tokio::sync::oneshot::channel();
     let (tx2, _rx2) = tokio::sync::oneshot::channel();
@@ -603,7 +603,7 @@ async fn invoice_requests_cleanup_retains_live_senders() {
 /// Empty map: cleanup is a no-op.
 #[tokio::test]
 async fn invoice_requests_cleanup_empty_is_noop() {
-    let mut map: HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>> = HashMap::new();
+    let mut map: HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>> = HashMap::new();
     let before = map.len();
     map.retain(|_, sender| !sender.is_closed());
     assert_eq!(before, 0);

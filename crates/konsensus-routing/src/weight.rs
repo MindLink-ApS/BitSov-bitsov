@@ -275,13 +275,14 @@ impl SynapticWeight {
         let minutes = elapsed.as_secs_f64() / 60.0;
         if minutes > 0.0 {
             self.weight *= DECAY_PER_MINUTE.powf(minutes);
-            // Sanitize: powf with extreme values could produce NaN/Infinity
-            if !self.weight.is_finite() {
-                self.weight = INITIAL_WEIGHT;
-            }
-            self.update_pruning_state();
             self.last_updated = Instant::now();
         }
+        // Recover corrupt weights even within one clock tick. Repair follows
+        // decay so both zero and nonzero elapsed time reset to INITIAL_WEIGHT.
+        if !self.weight.is_finite() {
+            self.weight = INITIAL_WEIGHT;
+        }
+        self.update_pruning_state();
     }
 
     /// Apply homeostatic scaling — reduce weight by a global factor.
@@ -749,6 +750,8 @@ mod tests {
     fn corrupted_weight_field_recovers_on_failure() {
         let mut w = SynapticWeight::new();
         w.weight = f64::INFINITY;
+        // Force zero elapsed time, as can happen within one clock tick.
+        w.last_updated = Instant::now() + Duration::from_secs(1);
         w.record_failure();
         assert!(w.weight().is_finite());
         // apply_decay resets to INITIAL_WEIGHT, then record_failure applies * 0.95

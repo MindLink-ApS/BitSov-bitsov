@@ -14,6 +14,7 @@ pub mod liquidity;
 pub mod lnd;
 pub mod lnbits;
 pub mod mock;
+pub mod shared_mock;
 pub mod scb_export;
 pub mod scb_restore;
 pub mod scb_rotate;

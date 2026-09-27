@@ -499,6 +499,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
 
     // Nonce operations pass through unchanged
+    async fn store_paid_nonce(
+        &self, nonce: &Nonce, payment_hash: &[u8; 32], sender: &NodeId, message_id: &MessageId,
+    ) -> Result<konsensus_core::gate::PaidReplay, StorageError> {
+        self.inner.store_paid_nonce(nonce, payment_hash, sender, message_id).await
+    }
+
     async fn store_nonce(&self, nonce: &Nonce, sender: &NodeId) -> Result<bool, StorageError> {
         self.inner.store_nonce(nonce, sender).await
     }
@@ -904,6 +910,13 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 impl<S: Storage + konsensus_core::gate::NonceStore> konsensus_core::gate::NonceStore
     for EncryptedStorage<S>
 {
+    async fn check_and_store_paid(
+        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
+        sender: &konsensus_core::NodeId, message_id: &konsensus_core::MessageId,
+    ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.check_and_store_paid(nonce, payment_hash, sender, message_id).await
+    }
+
     async fn check_and_store(
         &self,
         nonce: &Nonce,

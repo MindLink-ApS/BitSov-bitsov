@@ -28,3 +28,23 @@ pub fn check_room(prices: &[(konsensus_core::NodeId, u64)], total: Option<u64>, 
     }
     check(sum, total)
 }
+
+/// One authorization covers both first-contact acts. Never reserve/debit them
+/// as separate calls: G1 per-call limits apply to this aggregate.
+pub fn first_contact_total(admission: u64, message: u64, cap: Option<u64>) -> Result<u64, ApiError> {
+    let total = admission.checked_add(message).ok_or_else(|| ApiError::PriceCapExceeded("first-contact total overflow".into()))?;
+    check(total, cap)?;
+    Ok(total)
+}
+
+#[cfg(test)]
+mod first_contact_tests {
+    use super::*;
+    #[test]
+    fn admission_and_message_share_one_cap() {
+        assert_eq!(first_contact_total(2000, 2000, Some(4000)).unwrap(), 4000);
+        assert!(matches!(first_contact_total(2000, 2000, Some(3999)), Err(ApiError::PriceCapExceeded(_))));
+        assert!(first_contact_total(u64::MAX, 1, None).is_err());
+        assert_eq!(first_contact_total(2000, 0, Some(2000)).unwrap(), 2000);
+    }
+}

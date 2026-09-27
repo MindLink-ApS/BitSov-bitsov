@@ -9,6 +9,9 @@ use thiserror::Error;
 /// API errors — converted to appropriate HTTP status codes.
 #[derive(Debug, Error)]
 pub enum ApiError {
+    #[error("recipient backend does not support stateless first-contact quotes")]
+    StatelessQuoteUnsupported,
+
     #[error("price cap exceeded: {0}")]
     PriceCapExceeded(String),
 
@@ -84,9 +87,19 @@ struct ErrorBody {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if matches!(self, ApiError::StatelessQuoteUnsupported) {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                "error": self.to_string(), "code": "stateless_quote_unsupported"
+            }))).into_response();
+        }
         if let ApiError::PriceCapExceeded(message) = &self {
             return (StatusCode::CONFLICT, Json(serde_json::json!({
                 "error": message, "code": "price_cap_exceeded"
+            }))).into_response();
+        }
+        if let ApiError::PaymentProofUnavailable { amount_msat, reason } = &self {
+            return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": reason, "code": "payment_settled_send_incomplete", "amount_msat": amount_msat
             }))).into_response();
         }
         if let ApiError::BudgetExceeded(refusal) = &self {
@@ -105,7 +118,7 @@ impl IntoResponse for ApiError {
             }))).into_response();
         }
         let (status, message) = match &self {
-            ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) => unreachable!(),
+            ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),

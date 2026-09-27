@@ -15,6 +15,7 @@ mod pending_handler;
 mod profile_handler;
 mod relay;
 mod session_handler;
+mod admission_quotes;
 #[path = "cli/scb_restore.rs"]
 mod scb_restore;
 #[path = "cli/whitelist.rs"]
@@ -882,6 +883,7 @@ async fn cmd_start(
         transport: Arc::clone(node.transport()) as Arc<dyn konsensus_core::traits::transport::MessageTransport>,
         session_manager,
         jwt_secret,
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         cors_enabled: config.api.cors_enabled,
         operator_probes_enabled: config
