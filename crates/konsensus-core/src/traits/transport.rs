@@ -114,6 +114,18 @@ pub trait MessageTransport: Send + Sync {
         None
     }
 
+    /// When the current connection to `peer` was established, or `None` if the
+    /// peer is not connected or the transport does not track it.
+    ///
+    /// Every connection is admitted afresh: a reconnect is a new connection, so
+    /// a sender uses this to tell whether a recipient's refusal follows a
+    /// reconnect (pay admission again) or races an admission it already paid
+    /// on this same connection (wait, never pay twice).
+    async fn connected_since(&self, peer: &NodeId) -> Option<std::time::Instant> {
+        let _ = peer;
+        None
+    }
+
     /// Add a peer to the transport whitelist (Principle 3: Closed Mesh).
     ///
     /// Called when a peer is added via invite redemption or manual peer add.

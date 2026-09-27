@@ -31,7 +31,7 @@ mod resync;
 mod send;
 
 pub use compose::{create_payment_proof, ComposeRequest, ComposeResponse};
-pub(crate) use compose::create_metered_payment_proof;
+pub(crate) use compose::{create_metered_payment_proof, Readmission};
 pub use query::{ListMessagesQuery, MessageResponse};
 pub use send::{SendMessageRequest, SendMessageResponse};
 

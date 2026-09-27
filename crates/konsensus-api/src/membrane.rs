@@ -7,7 +7,9 @@
 //!
 //! - Every inbound gate verdict (admitted by settlement, or refused with a reason
 //!   code) and every outbound refusal of our own sends (`price_cap_exceeded`,
-//!   `budget_exceeded`) becomes one [`MembraneEvent`].
+//!   `budget_exceeded`) becomes one [`MembraneEvent`], and so does every
+//!   explicit `admission_required` refusal of a paid invoice request from a
+//!   connection that has not paid its way in.
 //! - Events go to `/ws` as `{"type":"membrane", ...}` and into a bounded
 //!   in-memory ring buffer ([`MEMBRANE_CAPACITY`]) read by
 //!   `GET /api/v1/membrane` (read scope). Nothing here is written to disk; the
@@ -34,7 +36,7 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use konsensus_core::gate::GateRejection;
-use konsensus_core::{Recipient, UkmEnvelope};
+use konsensus_core::{NodeId, Recipient, UkmEnvelope};
 
 use crate::error::ApiError;
 
@@ -103,6 +105,10 @@ pub enum Code {
     PriceCapExceeded,
     /// Outbound: a paired client's budget grant refused the debit (G1).
     BudgetExceeded,
+    /// A peer asked for a paid invoice on a connection that has not paid its
+    /// way in (a reconnect starts unprivileged). Refused out loud: the peer is
+    /// told to pay admission again, and nothing was issued on our wallet.
+    AdmissionRequired,
 }
 
 /// One admission decision. Serialized as the `/ws` event and the ring entry.
@@ -289,6 +295,28 @@ impl Membrane {
             first_contact: false,
             required_msat,
             paid_msat: Some(envelope.payment_proof.amount_msat),
+            cap_msat: None,
+        })
+    }
+
+    /// A connected peer asked for a paid invoice before its connection paid
+    /// admission, and was refused with an explicit `admission_required` reply.
+    ///
+    /// The counterparty is named: the transport authenticated it in the Noise
+    /// handshake, so the id is proven even though no envelope was signed.
+    pub fn admission_required(&self, peer: &NodeId) -> Arc<MembraneEvent> {
+        self.push(|seq| MembraneEvent {
+            event_type: "membrane",
+            seq,
+            at: now_ms(),
+            direction: Direction::Inbound,
+            verdict: Verdict::Refused,
+            code: Code::AdmissionRequired,
+            kind: None,
+            counterparty: Some(peer.to_hex()),
+            first_contact: false,
+            required_msat: None,
+            paid_msat: None,
             cap_msat: None,
         })
     }

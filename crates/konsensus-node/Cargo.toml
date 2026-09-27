@@ -54,3 +54,8 @@ sqlx.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 async-trait.workspace = true
 tempfile = "3"
+axum.workspace = true
+tower = { workspace = true, features = ["util"] }
+bitcoin.workspace = true
+lightning-invoice.workspace = true
+secp256k1 = "0.29"

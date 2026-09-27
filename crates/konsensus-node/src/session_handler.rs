@@ -136,6 +136,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         std::collections::HashMap::new();
     let mut last_admission_invoice: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
+    let mut last_admission_refusal: std::collections::HashMap<NodeId, tokio::time::Instant> =
+        std::collections::HashMap::new();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
     let mut cooldown_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -279,13 +281,18 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             warn!(
                                 peer = %peer_id,
                                 cooldown_secs = ADMISSION_INVOICE_COOLDOWN.as_secs(),
-                                "DROP admission-invoice request from unprivileged peer within cooldown (P2 DoS guard: unpaid create_invoice rate-limit)"
+                                "REFUSE admission-invoice request from unprivileged peer within cooldown (P2 DoS guard: unpaid create_invoice rate-limit)"
                             );
+                            send_invoice_refusal(
+                                &transport, &peer_id, &request_id,
+                                konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED,
+                            ).await;
                             continue;
                         }
                         handle_invoice_requested_gated(
                             &peer_id, &request_id, amount_msat, &purpose, privileged,
                             &pricing, &lightning, &transport,
+                            audit_log.membrane(), &mut last_admission_refusal,
                         ).await;
                     }
 
@@ -417,6 +424,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 last_peer_exchange.retain(|_, ts| now.duration_since(*ts) < PEER_EXCHANGE_COOLDOWN * 6);
                 let before_adm = last_admission_invoice.len();
                 last_admission_invoice.retain(|_, ts| now.duration_since(*ts) < ADMISSION_INVOICE_COOLDOWN * 6);
+                last_admission_refusal.retain(|_, ts| now.duration_since(*ts) < ADMISSION_INVOICE_COOLDOWN);
+                if last_admission_refusal.len() > MAX_COOLDOWN_ENTRIES {
+                    last_admission_refusal.clear();
+                }
                 // Defense-in-depth: if maps still exceed cap after TTL eviction,
                 // force-clear to prevent unbounded growth from a burst of unique peer IDs.
                 if last_negotiation.len() > MAX_COOLDOWN_ENTRIES {
@@ -967,8 +978,14 @@ async fn handle_price_response_received(
 ///   Its amount is re-derived from OUR [`PricingEngine`] at
 ///   [`ADMISSION_INVOICE_KIND`]; the caller's `amount_msat` is IGNORED so a
 ///   stranger cannot mint a zero-value or attacker-chosen invoice on our wallet.
-///   Any other unprivileged invoice request is dropped (P2: no free Lightning
-///   invoice before payment).
+///   Any other unprivileged invoice request is refused out loud (P2: no free
+///   Lightning invoice before payment): the peer gets `InvoiceError` with
+///   [`ADMISSION_REQUIRED`] so it pays admission again instead of timing out,
+///   and the refusal is an N2 membrane event (at most one per peer per
+///   [`ADMISSION_INVOICE_COOLDOWN`], so a flood cannot wash out the ring).
+///   This is the normal case after a reconnect: promotion is per connection.
+///
+/// [`ADMISSION_REQUIRED`]: konsensus_api::invoice_refusal::ADMISSION_REQUIRED
 #[allow(clippy::too_many_arguments)]
 async fn handle_invoice_requested_gated(
     peer_id: &NodeId,
@@ -979,6 +996,8 @@ async fn handle_invoice_requested_gated(
     pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
+    membrane: &konsensus_api::membrane::Membrane,
+    last_admission_refusal: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
 ) {
     if privileged {
         handle_invoice_requested(peer_id, request_id, amount_msat, purpose, lightning, transport).await;
@@ -986,7 +1005,19 @@ async fn handle_invoice_requested_gated(
     }
 
     if purpose != ADMISSION_INVOICE_PURPOSE {
-        warn!(peer = %peer_id, %request_id, %purpose, "DROP invoice request from unprivileged peer (P2: only the reserved admission invoice is issuable pre-payment)");
+        warn!(peer = %peer_id, %request_id, %purpose, "REFUSE invoice request from unprivileged peer: admission required (P2: only the reserved admission invoice is issuable pre-payment)");
+        let now = tokio::time::Instant::now();
+        let logged_recently = last_admission_refusal
+            .get(peer_id)
+            .is_some_and(|last| now.duration_since(*last) < ADMISSION_INVOICE_COOLDOWN);
+        if !logged_recently {
+            last_admission_refusal.insert(*peer_id, now);
+            membrane.admission_required(peer_id);
+        }
+        send_invoice_refusal(
+            transport, peer_id, request_id,
+            konsensus_api::invoice_refusal::ADMISSION_REQUIRED,
+        ).await;
         return;
     }
 
@@ -1074,6 +1105,29 @@ async fn handle_invoice_requested(
     }
 }
 
+/// Refuse a peer's invoice request out loud: nothing is created on our wallet,
+/// and the peer learns why at once instead of waiting out its request timeout.
+async fn send_invoice_refusal(
+    transport: &Arc<NoiseTransport>,
+    peer_id: &NodeId,
+    request_id: &str,
+    reason: &str,
+) {
+    let refusal = Frame::InvoiceError {
+        request_id: request_id.to_string(),
+        reason: reason.to_string(),
+    };
+    if let Err(e) = transport.send_frame(peer_id, &refusal).await {
+        warn!(peer = %peer_id, %request_id, error = %e, "failed to send invoice refusal");
+    }
+}
+
+/// A peer answered one of our invoice requests with `InvoiceError`.
+///
+/// A peer we have not been paid by is still heard when the request was sent to
+/// that same peer (the binding in [`konsensus_api::invoice_refusal`]): it can
+/// only end our own request early, which it could do anyway by never answering.
+/// That is how a sender learns that a recipient now requires admission again.
 async fn handle_invoice_error_received(
     peer_id: &NodeId,
     request_id: &str,
@@ -1081,8 +1135,9 @@ async fn handle_invoice_error_received(
     privileged: bool,
     invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>,
 ) {
-    if !privileged {
-        warn!(peer = %peer_id, "DROP InvoiceError from unprivileged peer (P2: no pending-invoice bookkeeping drive before payment)");
+    let bound = konsensus_api::invoice_refusal::record(request_id, peer_id, reason);
+    if !privileged && !bound {
+        warn!(peer = %peer_id, "DROP InvoiceError from unprivileged peer for a request not sent to it (P2: no pending-invoice bookkeeping drive before payment)");
         return;
     }
     warn!(
@@ -1498,3 +1553,7 @@ async fn handle_gossip_received(
 #[cfg(test)]
 #[path = "tests/session_handler.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/reconnect_two_node.rs"]
+mod reconnect_two_node;

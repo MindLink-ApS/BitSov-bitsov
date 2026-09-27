@@ -60,6 +60,7 @@ pub mod control;
 pub mod error;
 pub mod freshness;
 pub mod handlers;
+pub mod invoice_refusal;
 pub mod metered;
 pub mod metrics;
 pub mod pairing;

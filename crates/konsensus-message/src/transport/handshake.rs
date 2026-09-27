@@ -522,6 +522,7 @@ pub(super) async fn connect_to_peer(
         writer,
         tier,
         capabilities,
+        connected_at: now,
         last_recv: now,
         pending_ping: None,
         invalid_frame_level: 0.0,
