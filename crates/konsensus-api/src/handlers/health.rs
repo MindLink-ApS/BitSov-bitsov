@@ -16,6 +16,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 
 use crate::auth::scoped::{ScopedAuth, Read};
+use crate::freshness::DataFreshness;
 use crate::state::AppState;
 
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
@@ -97,7 +98,10 @@ pub struct PublicHealthResponse {
 ///
 /// Returns only the public subset; never queries the wallet balance or LN
 /// pubkey. For full status (identity, peers, balance) use `GET /api/v1/status`.
-async fn health(State(state): State<Arc<AppState>>) -> Json<PublicHealthResponse> {
+///
+/// `BitSov-Data-As-Of` is the time `block_height` was read from the chain
+/// backend (a live query per request); omitted when `block_height` is null.
+async fn health(State(state): State<Arc<AppState>>) -> (DataFreshness, Json<PublicHealthResponse>) {
     let connected = state.transport.connected_peers().await;
     let ln_available = state.lightning.is_available().await;
     let ln_payment_capable = state.lightning.is_payment_capable().await;
@@ -109,27 +113,31 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<PublicHealthResponse
             0
         }
     };
-    let block_height = match state.chain.get_block_height().await {
-        Ok(h) => Some(h),
+    let chain_read = DataFreshness::now();
+    let (block_height, freshness) = match state.chain.get_block_height().await {
+        Ok(h) => (Some(h), chain_read),
         Err(e) => {
             tracing::warn!(error = %e, "failed to query block height for health check");
-            None
+            (None, DataFreshness::unknown())
         }
     };
 
-    Json(PublicHealthResponse {
-        status: "ok",
-        connected_peers: connected.len(),
-        e2ee_sessions: session_count,
-        pending_deliveries: pending,
-        lightning_available: ln_available,
-        lightning_payment_capable: ln_payment_capable,
-        uptime_secs: state.started_at.elapsed().as_secs(),
-        version: 2,
-        lightning_backend: state.lightning_backend.clone(),
-        chain_backend: state.chain_backend.clone(),
-        block_height,
-    })
+    (
+        freshness,
+        Json(PublicHealthResponse {
+            status: "ok",
+            connected_peers: connected.len(),
+            e2ee_sessions: session_count,
+            pending_deliveries: pending,
+            lightning_available: ln_available,
+            lightning_payment_capable: ln_payment_capable,
+            uptime_secs: state.started_at.elapsed().as_secs(),
+            version: 2,
+            lightning_backend: state.lightning_backend.clone(),
+            chain_backend: state.chain_backend.clone(),
+            block_height,
+        }),
+    )
 }
 
 /// `GET /api/v1/status` — owner-only full node status (behind [`ScopedAuth<Read>`]).

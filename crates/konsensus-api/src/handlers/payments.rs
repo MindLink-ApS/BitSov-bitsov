@@ -2,6 +2,7 @@
 
 use crate::auth::scoped::{ScopedAuth, Read, Receive, Spend};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use konsensus_core::fee_rate::validate_fee_rate_sat_per_vb;
 
 use crate::error::ApiError;
+use crate::freshness::DataFreshness;
 use crate::state::AppState;
 
 /// Request to create a Lightning invoice.
@@ -151,19 +153,28 @@ async fn payment_status(
 }
 
 /// `GET /api/v1/payments/balance` — get Lightning wallet balance.
+///
+/// Carries `BitSov-Data-As-Of` / `BitSov-Data-Stale` from the wallet's sync
+/// status (see [`crate::freshness`]).
 async fn get_balance(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<BalanceResponse>, ApiError> {
+) -> Result<(DataFreshness, Json<BalanceResponse>), ApiError> {
+    // Sync status before the read: the figures are at least this current.
+    let read_at = SystemTime::now();
+    let sync = state.lightning.wallet_sync().await;
     let balance = state
         .lightning
         .get_balance_msat()
         .await
         .map_err(|e| ApiError::Lightning(e.to_string()))?;
 
-    Ok(Json(BalanceResponse {
-        balance_msat: balance,
-    }))
+    Ok((
+        DataFreshness::from_wallet_sync(sync, read_at),
+        Json(BalanceResponse {
+            balance_msat: balance,
+        }),
+    ))
 }
 
 /// Request to pay a BOLT11 invoice.
@@ -324,29 +335,38 @@ pub struct ChannelResponse {
 }
 
 /// `GET /api/v1/payments/channels` — list Lightning channels.
+///
+/// Carries `BitSov-Data-As-Of` / `BitSov-Data-Stale` from the wallet's sync
+/// status (see [`crate::freshness`]).
 async fn list_channels(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<ChannelResponse>>, ApiError> {
+) -> Result<(DataFreshness, Json<Vec<ChannelResponse>>), ApiError> {
+    // Sync status before the read: the figures are at least this current.
+    let read_at = SystemTime::now();
+    let sync = state.lightning.wallet_sync().await;
     let channels = state
         .lightning
         .list_channels()
         .await
         .map_err(|e| ApiError::Lightning(e.to_string()))?;
 
-    Ok(Json(
-        channels
-            .into_iter()
-            .map(|ch| ChannelResponse {
-                channel_id: ch.channel_id,
-                peer_pubkey: ch.peer_pubkey,
-                capacity_msat: ch.capacity_msat,
-                local_balance_msat: ch.local_balance_msat,
-                remote_balance_msat: ch.remote_balance_msat,
-                active: ch.active,
-                short_channel_id: ch.short_channel_id,
-            })
-            .collect(),
+    Ok((
+        DataFreshness::from_wallet_sync(sync, read_at),
+        Json(
+            channels
+                .into_iter()
+                .map(|ch| ChannelResponse {
+                    channel_id: ch.channel_id,
+                    peer_pubkey: ch.peer_pubkey,
+                    capacity_msat: ch.capacity_msat,
+                    local_balance_msat: ch.local_balance_msat,
+                    remote_balance_msat: ch.remote_balance_msat,
+                    active: ch.active,
+                    short_channel_id: ch.short_channel_id,
+                })
+                .collect(),
+        ),
     ))
 }
 

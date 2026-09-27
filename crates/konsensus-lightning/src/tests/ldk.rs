@@ -721,3 +721,31 @@ fn inbound_payment_from_received_event_rejects_oversized_binding() {
         }
     );
 }
+
+#[test]
+fn wallet_sync_is_the_older_of_the_two_wallet_syncs() {
+    assert_eq!(
+        wallet_sync_from_timestamps(Some(1_700_000_100), Some(1_700_000_000)),
+        WalletSync::SyncedAt(1_700_000_000)
+    );
+    assert_eq!(
+        wallet_sync_from_timestamps(Some(1_700_000_000), Some(1_700_000_100)),
+        WalletSync::SyncedAt(1_700_000_000)
+    );
+}
+
+#[test]
+fn wallet_sync_is_never_synced_until_both_wallets_have_synced() {
+    assert_eq!(
+        wallet_sync_from_timestamps(None, None),
+        WalletSync::NeverSynced
+    );
+    assert_eq!(
+        wallet_sync_from_timestamps(Some(1_700_000_000), None),
+        WalletSync::NeverSynced
+    );
+    assert_eq!(
+        wallet_sync_from_timestamps(None, Some(1_700_000_000)),
+        WalletSync::NeverSynced
+    );
+}

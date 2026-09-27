@@ -58,6 +58,7 @@ pub mod auth;
 pub mod bootstrap;
 pub mod control;
 pub mod error;
+pub mod freshness;
 pub mod handlers;
 pub mod metrics;
 pub mod pairing;

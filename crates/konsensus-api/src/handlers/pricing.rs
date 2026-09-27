@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use axum::extract::{Path, State};
 use axum::routing::get;
@@ -19,6 +20,7 @@ use konsensus_pricing::peer_prices::{category_to_string, compute_valid_blocks};
 
 use crate::auth::scoped::{ScopedAuth, Read};
 use crate::error::ApiError;
+use crate::freshness::DataFreshness;
 use crate::state::AppState;
 
 /// Own pricing response — what this node charges per category.
@@ -83,10 +85,17 @@ pub struct PeerPriceResponse {
 }
 
 /// `GET /api/v1/pricing` — get this node's current pricing.
+///
+/// `BitSov-Data-As-Of`: for the chain-aware engine, the time of the chain
+/// fetch the prices were computed against; `BitSov-Data-Stale: 1` when that
+/// cached chain state is past the engine's `cache_ttl` or missing (the chain
+/// refresh failed, so prices fell back to the static table). The static
+/// engine's prices do not depend on chain data: as-of is the read, never stale.
 async fn get_own_pricing(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<OwnPricingResponse>, ApiError> {
+) -> Result<(DataFreshness, Json<OwnPricingResponse>), ApiError> {
+    let read_at = SystemTime::now();
     let block_height = state.chain.get_block_height().await.unwrap_or(0);
 
     // Build price table from our own pricing engine
@@ -188,20 +197,44 @@ async fn get_own_pricing(
             (None, None, None, None, None)
         };
 
-    Ok(Json(OwnPricingResponse {
-        mode,
-        prices,
-        block_height,
-        valid_blocks,
-        trust_level: trust_level_str.to_string(),
-        difficulty_epoch_position,
-        peer_tables_cached: peer_count,
-        raw_fee_rate,
-        ema_fee_rate,
-        max_price_multiplier,
-        fee_rates_by_target,
-        category_fee_targets: cat_fee_targets,
-    }))
+    // Chain-aware: the chain fetch behind the prices. Read after the price
+    // lookups above, which refresh an expired cache.
+    let freshness = match state
+        .pricing
+        .as_any()
+        .downcast_ref::<konsensus_pricing::ChainAwarePricingEngine>()
+    {
+        Some(chain_engine) => match chain_engine.chain_state_fetched_at().await {
+            Some(fetched) => {
+                let age = read_at.duration_since(fetched).unwrap_or_default();
+                if age < chain_engine.cache_ttl() {
+                    DataFreshness::at(fetched)
+                } else {
+                    DataFreshness::at(fetched).stale()
+                }
+            }
+            None => DataFreshness::at(read_at).stale(),
+        },
+        None => DataFreshness::at(read_at),
+    };
+
+    Ok((
+        freshness,
+        Json(OwnPricingResponse {
+            mode,
+            prices,
+            block_height,
+            valid_blocks,
+            trust_level: trust_level_str.to_string(),
+            difficulty_epoch_position,
+            peer_tables_cached: peer_count,
+            raw_fee_rate,
+            ema_fee_rate,
+            max_price_multiplier,
+            fee_rates_by_target,
+            category_fee_targets: cat_fee_targets,
+        }),
+    ))
 }
 
 /// `GET /api/v1/pricing/peers` — list all cached peer price tables.

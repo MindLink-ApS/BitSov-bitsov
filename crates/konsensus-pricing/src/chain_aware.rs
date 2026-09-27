@@ -173,6 +173,9 @@ struct TargetFeeState {
     raw_sat_per_vbyte: f64,
     /// EMA-smoothed fee rate for this target.
     ema_sat_per_vbyte: f64,
+    /// When the chain last really answered for this target. A value carried
+    /// forward after a failed fetch keeps its old time.
+    fetched_at: Instant,
 }
 
 /// Cached chain state with per-target fee rates and expiry.
@@ -181,7 +184,11 @@ struct CachedChainState {
     /// Fee rate state keyed by confirmation target (in blocks).
     targets: HashMap<u32, TargetFeeState>,
     block_height: u64,
-    fetched_at: Instant,
+    /// When the chain last really answered for `block_height`.
+    block_height_fetched_at: Instant,
+    /// When the cache was last refreshed (drives `cache_ttl` expiry). A
+    /// refresh may reuse old values, so this is not the data's age.
+    refreshed_at: Instant,
 }
 
 /// Serializable snapshot of EMA fee rate state for persistence across restarts.
@@ -251,10 +258,7 @@ pub struct ChainAwarePricingEngine {
 
 impl ChainAwarePricingEngine {
     /// Create a new chain-aware pricing engine.
-    pub fn new(
-        config: ChainAwarePricingConfig,
-        chain: Arc<dyn ChainProvider>,
-    ) -> Self {
+    pub fn new(config: ChainAwarePricingConfig, chain: Arc<dyn ChainProvider>) -> Self {
         let base_engine = StaticPricingEngine::new(config.base.clone());
         Self {
             base_engine,
@@ -286,10 +290,7 @@ impl ChainAwarePricingEngine {
 
         // Ignore snapshots older than 1 hour — fee rates change too much.
         if age_secs > 3600 {
-            info!(
-                age_secs,
-                "ignoring stale fee rate snapshot (>1 hour old)"
-            );
+            info!(age_secs, "ignoring stale fee rate snapshot (>1 hour old)");
             return;
         }
 
@@ -298,6 +299,11 @@ impl ChainAwarePricingEngine {
             return;
         }
 
+        // Mark as expired so the next query refreshes, and so the seeded
+        // values never read as a fresh chain fetch.
+        let expired = Instant::now()
+            .checked_sub(self.config.cache_ttl)
+            .unwrap_or_else(Instant::now);
         let mut targets = HashMap::new();
         for (target_blocks, ema) in &snapshot.targets {
             if let Some(ema) = normalized_fee_rate(*ema) {
@@ -306,6 +312,7 @@ impl ChainAwarePricingEngine {
                     TargetFeeState {
                         raw_sat_per_vbyte: ema, // Use EMA as both raw and EMA initially
                         ema_sat_per_vbyte: ema,
+                        fetched_at: expired,
                     },
                 );
             } else {
@@ -326,9 +333,8 @@ impl ChainAwarePricingEngine {
         *cache = Some(CachedChainState {
             targets,
             block_height: snapshot.block_height,
-            fetched_at: Instant::now()
-                .checked_sub(self.config.cache_ttl)
-                .unwrap_or_else(Instant::now), // Mark as expired so next query refreshes
+            block_height_fetched_at: expired,
+            refreshed_at: expired,
         });
 
         info!(
@@ -392,15 +398,17 @@ impl ChainAwarePricingEngine {
         for &target in &unique_targets {
             fee_results.push(self.chain.estimate_fee(target).await);
         }
+        let now = Instant::now();
 
-        let height = match height_result {
-            Ok(h) => h,
+        let (height, block_height_fetched_at) = match height_result {
+            Ok(h) => (h, now),
             Err(e) => {
                 debug!(
                     error = %e,
                     "chain-aware pricing: block height unavailable, using base sensitivity"
                 );
-                0
+                // A fallback, not chain data: already `cache_ttl` old.
+                (0, now.checked_sub(self.config.cache_ttl).unwrap_or(now))
             }
         };
 
@@ -445,6 +453,7 @@ impl ChainAwarePricingEngine {
                         TargetFeeState {
                             raw_sat_per_vbyte: raw_rate,
                             ema_sat_per_vbyte: ema_rate,
+                            fetched_at: now,
                         },
                     );
                     any_succeeded = true;
@@ -488,7 +497,8 @@ impl ChainAwarePricingEngine {
         *cache = Some(CachedChainState {
             targets: new_targets,
             block_height: height,
-            fetched_at: Instant::now(),
+            block_height_fetched_at,
+            refreshed_at: now,
         });
 
         Some(height)
@@ -498,17 +508,14 @@ impl ChainAwarePricingEngine {
     ///
     /// Returns `(ema_fee_rate, block_height)` for the category's configured
     /// confirmation target. Refreshes the cache if expired.
-    async fn get_chain_state_for_category(
-        &self,
-        category: KindCategory,
-    ) -> Option<(f64, u64)> {
+    async fn get_chain_state_for_category(&self, category: KindCategory) -> Option<(f64, u64)> {
         let target = self.config.target_for_category(category);
 
         // Check cache freshness (read lock — cheap).
         {
             let cache = self.cached_state.read().await;
             if let Some(ref cached) = *cache {
-                if cached.fetched_at.elapsed() < self.config.cache_ttl {
+                if cached.refreshed_at.elapsed() < self.config.cache_ttl {
                     // Cache is fresh — look up this target's fee rate.
                     if let Some(state) = cached.targets.get(&target) {
                         return Some((state.ema_sat_per_vbyte, cached.block_height));
@@ -652,6 +659,30 @@ impl ChainAwarePricingEngine {
         cache.as_ref().map(|c| c.block_height)
     }
 
+    /// Wall-clock time of the oldest real chain fetch among the cached values
+    /// (per-target fee rates and block height), if any.
+    ///
+    /// A value carried forward after a failed fetch keeps its original time,
+    /// so a refresh that reuses old data does not make it look fresh. State
+    /// seeded from a snapshot reports a time already `cache_ttl` in the past
+    /// (it is marked expired, see [`Self::seed_ema`]), never "now".
+    pub async fn chain_state_fetched_at(&self) -> Option<std::time::SystemTime> {
+        let cache = self.cached_state.read().await;
+        let cached = cache.as_ref()?;
+        let oldest = cached
+            .targets
+            .values()
+            .map(|t| t.fetched_at)
+            .chain(std::iter::once(cached.block_height_fetched_at))
+            .min()?;
+        std::time::SystemTime::now().checked_sub(oldest.elapsed())
+    }
+
+    /// How long cached chain state is used before it must be re-fetched.
+    pub fn cache_ttl(&self) -> Duration {
+        self.config.cache_ttl
+    }
+
     /// Get the current fee rate state from cache for the default target.
     ///
     /// Returns `(raw_sat_per_vbyte, ema_sat_per_vbyte)` if cached, or `None`.
@@ -717,10 +748,7 @@ impl PricingEngine for ChainAwarePricingEngine {
         }
     }
 
-    async fn get_category_price_msat(
-        &self,
-        category: KindCategory,
-    ) -> Result<u64, PricingError> {
+    async fn get_category_price_msat(&self, category: KindCategory) -> Result<u64, PricingError> {
         let base_price = self.base_engine.get_category_price_msat(category).await?;
 
         match self.get_chain_state_for_category(category).await {

@@ -36,7 +36,7 @@ use crate::scb_rotate::{rotate_scb_backup, ScbRotationConfig};
 use konsensus_core::fee_rate::validate_fee_rate_sat_per_vb;
 use konsensus_core::traits::lightning::{
     ChannelInfo, InboundPayment, Invoice, LightningError, LightningProvider, PaymentDetails,
-    PaymentDirection, PaymentStatus,
+    PaymentDirection, PaymentStatus, WalletSync,
 };
 
 /// Configuration for the embedded LDK Lightning provider.
@@ -1020,6 +1020,16 @@ impl LightningProvider for LdkProvider {
         self.node.status().is_running
     }
 
+    /// Balance and channels are served from LDK's locally synced wallets;
+    /// they are as current as the older of the two last syncs.
+    async fn wallet_sync(&self) -> WalletSync {
+        let status = self.node.status();
+        wallet_sync_from_timestamps(
+            status.latest_lightning_wallet_sync_timestamp,
+            status.latest_onchain_wallet_sync_timestamp,
+        )
+    }
+
     async fn is_payment_capable(&self) -> bool {
         self.payment_capable.load(Ordering::Relaxed)
     }
@@ -1406,6 +1416,17 @@ fn preimage_from_kind(
         LdkPaymentKind::Bolt12Refund { preimage, .. } => *preimage,
         LdkPaymentKind::Spontaneous { preimage, .. } => *preimage,
         _ => None,
+    }
+}
+
+/// Wallet freshness from LDK's two last-successful-sync timestamps (Unix
+/// seconds). `get_balance_msat` sums the Lightning and on-chain balances, so
+/// the figures are only as current as the older sync; until both wallets have
+/// synced once, no time is known.
+fn wallet_sync_from_timestamps(lightning: Option<u64>, onchain: Option<u64>) -> WalletSync {
+    match (lightning, onchain) {
+        (Some(ln), Some(oc)) => WalletSync::SyncedAt(ln.min(oc)),
+        _ => WalletSync::NeverSynced,
     }
 }
 

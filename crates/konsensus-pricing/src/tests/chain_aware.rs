@@ -99,7 +99,10 @@ async fn zero_fee_rate_returns_base_price() {
 async fn non_finite_provider_fee_falls_back_to_static() {
     let engine = make_engine(f64::NAN);
     let price = engine.get_price_msat(KIND_CHAT).await.unwrap();
-    assert_eq!(price, 10, "NaN provider fee should not poison admission price");
+    assert_eq!(
+        price, 10,
+        "NaN provider fee should not poison admission price"
+    );
     assert!(
         engine.fee_rate_state().await.is_none(),
         "invalid provider fee should not populate cache"
@@ -309,7 +312,10 @@ async fn ema_smoothing_reduces_spike_impact() {
 
     // Second fetch: EMA = 0.3 * 100 + 0.7 * 100 = 100 (same rate, no change)
     let price2 = engine.get_price_msat(KIND_CHAT).await.unwrap();
-    assert_eq!(price1, price2, "constant fee rate should produce constant prices");
+    assert_eq!(
+        price1, price2,
+        "constant fee rate should produce constant prices"
+    );
 
     // Verify fee rate state is available
     let state = engine.fee_rate_state().await;
@@ -339,7 +345,10 @@ async fn alpha_one_disables_smoothing() {
     let _ = engine.get_price_msat(KIND_CHAT).await.unwrap();
 
     let state = engine.fee_rate_state().await.unwrap();
-    assert!((state.0 - state.1).abs() < f64::EPSILON, "alpha=1.0: raw and EMA should be identical");
+    assert!(
+        (state.0 - state.1).abs() < f64::EPSILON,
+        "alpha=1.0: raw and EMA should be identical"
+    );
 }
 
 #[tokio::test]
@@ -375,34 +384,22 @@ fn halving_sensitivity_at_different_epochs() {
     assert!((ChainAwarePricingEngine::halving_sensitivity(0) - 1.0).abs() < f64::EPSILON);
 
     // Halving 0: blocks 0–209,999
-    assert!(
-        (ChainAwarePricingEngine::halving_sensitivity(100_000) - 1.0).abs() < f64::EPSILON
-    );
+    assert!((ChainAwarePricingEngine::halving_sensitivity(100_000) - 1.0).abs() < f64::EPSILON);
 
     // Halving 1: blocks 210,000–419,999
-    assert!(
-        (ChainAwarePricingEngine::halving_sensitivity(300_000) - 1.2).abs() < f64::EPSILON
-    );
+    assert!((ChainAwarePricingEngine::halving_sensitivity(300_000) - 1.2).abs() < f64::EPSILON);
 
     // Halving 2: blocks 420,000–629,999
-    assert!(
-        (ChainAwarePricingEngine::halving_sensitivity(500_000) - 1.4).abs() < f64::EPSILON
-    );
+    assert!((ChainAwarePricingEngine::halving_sensitivity(500_000) - 1.4).abs() < f64::EPSILON);
 
     // Halving 3: blocks 630,000–839,999
-    assert!(
-        (ChainAwarePricingEngine::halving_sensitivity(700_000) - 1.6).abs() < f64::EPSILON
-    );
+    assert!((ChainAwarePricingEngine::halving_sensitivity(700_000) - 1.6).abs() < f64::EPSILON);
 
     // Halving 4 (current): blocks 840,000–1,049,999
-    assert!(
-        (ChainAwarePricingEngine::halving_sensitivity(886_000) - 1.8).abs() < f64::EPSILON
-    );
+    assert!((ChainAwarePricingEngine::halving_sensitivity(886_000) - 1.8).abs() < f64::EPSILON);
 
     // Halving 5: blocks 1,050,000+
-    assert!(
-        (ChainAwarePricingEngine::halving_sensitivity(1_100_000) - 2.0).abs() < f64::EPSILON
-    );
+    assert!((ChainAwarePricingEngine::halving_sensitivity(1_100_000) - 2.0).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -487,13 +484,17 @@ impl ChainProvider for UnsyncedChainProvider {
     async fn get_block_header(
         &self,
         _height: u64,
-    ) -> Result<konsensus_core::traits::chain::BlockHeader, konsensus_core::traits::chain::ChainError> {
-        Err(konsensus_core::traits::chain::ChainError::NotAvailable("not synced".into()))
+    ) -> Result<konsensus_core::traits::chain::BlockHeader, konsensus_core::traits::chain::ChainError>
+    {
+        Err(konsensus_core::traits::chain::ChainError::NotAvailable(
+            "not synced".into(),
+        ))
     }
     async fn estimate_fee(
         &self,
         _target_blocks: u32,
-    ) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError> {
+    ) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError>
+    {
         // This should never be reached if is_synced() guard works
         Ok(konsensus_core::traits::chain::FeeEstimate {
             target_blocks: 6,
@@ -528,10 +529,16 @@ async fn desynced_provider_falls_back_to_static() {
     // With a desynced provider, should return base price (10 msat for chat)
     // NOT the sentinel 999.0 fee rate price
     let price = engine.get_price_msat(KIND_CHAT).await.unwrap();
-    assert_eq!(price, 10, "desynced provider should fall back to static base price");
+    assert_eq!(
+        price, 10,
+        "desynced provider should fall back to static base price"
+    );
 
     let file_price = engine.get_price_msat(KIND_FILE_REF).await.unwrap();
-    assert_eq!(file_price, 100, "desynced provider should fall back to static base price");
+    assert_eq!(
+        file_price, 100,
+        "desynced provider should fall back to static base price"
+    );
 }
 
 // ── Multi-target pricing tests ────────────────────────────────────
@@ -548,7 +555,7 @@ async fn category_targets_differentiate_pricing() {
     }));
     let mut category_targets = HashMap::new();
     category_targets.insert("control".to_string(), 144u32); // Economy target
-    // Communication uses default (6 blocks)
+                                                            // Communication uses default (6 blocks)
 
     let config = ChainAwarePricingConfig {
         base: StaticPricingConfig::default(),
@@ -1041,7 +1048,237 @@ fn apply_multiplier_saturates_on_absurd_fee_rate() {
     // cap, so an insane fee simply pins to the cap — never underflows the membrane.
     let base = 1_000_000u64;
     let out = ChainAwarePricingEngine::apply_multiplier(base, 1e30, 4.0, 5.0);
-    assert_eq!(out, base.saturating_mul(5), "absurd finite fee should pin to cap");
+    assert_eq!(
+        out,
+        base.saturating_mul(5),
+        "absurd finite fee should pin to cap"
+    );
     // A huge finite fee with a large base and NO cap must not panic/overflow.
     let _ = ChainAwarePricingEngine::apply_multiplier(u64::MAX, 1e38, 4.0, 0.0);
+}
+
+#[tokio::test]
+async fn chain_state_fetched_at_tracks_the_last_chain_fetch() {
+    let engine = make_engine(10.0);
+    assert_eq!(engine.cache_ttl(), Duration::from_secs(60));
+    assert!(
+        engine.chain_state_fetched_at().await.is_none(),
+        "nothing fetched yet"
+    );
+
+    let before = std::time::SystemTime::now() - Duration::from_secs(1);
+    let _ = engine.get_price_msat(KIND_CHAT).await.unwrap();
+    let fetched = engine.chain_state_fetched_at().await.expect("fetched");
+    assert!(fetched >= before);
+    assert!(fetched <= std::time::SystemTime::now());
+}
+
+#[tokio::test]
+async fn seeded_chain_state_reports_an_expired_fetch_time() {
+    let engine = make_engine(10.0);
+    engine
+        .seed_ema(FeeRateSnapshot {
+            targets: [(144u32, 7.0f64)].into_iter().collect(),
+            block_height: 886_000,
+            timestamp_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        })
+        .await;
+
+    let fetched = engine.chain_state_fetched_at().await.expect("seeded");
+    let age = std::time::SystemTime::now()
+        .duration_since(fetched)
+        .unwrap();
+    assert!(
+        age >= engine.cache_ttl(),
+        "seeded state is not a fresh chain read: {age:?}"
+    );
+}
+
+// ── Freshness of reused values (Codex P2 on #78) ───────────────────
+
+/// Synced provider whose `estimate_fee` fails for the targets in `failing`.
+struct FlakyFeeChain {
+    failing: std::sync::Mutex<Vec<u32>>,
+}
+
+impl FlakyFeeChain {
+    fn new() -> Self {
+        Self {
+            failing: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn fail(&self, targets: &[u32]) {
+        *self.failing.lock().unwrap() = targets.to_vec();
+    }
+}
+
+#[async_trait]
+impl ChainProvider for FlakyFeeChain {
+    fn trust_level(&self) -> konsensus_core::traits::chain::TrustLevel {
+        konsensus_core::traits::chain::TrustLevel::ServerTrust
+    }
+    async fn get_block_height(&self) -> Result<u64, konsensus_core::traits::chain::ChainError> {
+        Ok(886_000)
+    }
+    async fn get_block_header(
+        &self,
+        _height: u64,
+    ) -> Result<konsensus_core::traits::chain::BlockHeader, konsensus_core::traits::chain::ChainError>
+    {
+        Err(konsensus_core::traits::chain::ChainError::NotAvailable(
+            "unused".into(),
+        ))
+    }
+    async fn estimate_fee(
+        &self,
+        target_blocks: u32,
+    ) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError>
+    {
+        if self.failing.lock().unwrap().contains(&target_blocks) {
+            return Err(konsensus_core::traits::chain::ChainError::NotAvailable(
+                "fee estimate unavailable".into(),
+            ));
+        }
+        Ok(konsensus_core::traits::chain::FeeEstimate {
+            target_blocks,
+            sat_per_vbyte: 10.0,
+        })
+    }
+    async fn is_tx_confirmed(
+        &self,
+        _txid: &str,
+        _min_confirmations: u32,
+    ) -> Result<bool, konsensus_core::traits::chain::ChainError> {
+        Ok(false)
+    }
+    async fn is_synced(&self) -> bool {
+        true
+    }
+}
+
+const FLAKY_TTL: Duration = Duration::from_millis(100);
+
+/// Two fee targets (6 for chat, 144 for files) and a short TTL.
+fn make_flaky_engine() -> (Arc<FlakyFeeChain>, ChainAwarePricingEngine) {
+    let chain = Arc::new(FlakyFeeChain::new());
+    let config = ChainAwarePricingConfig {
+        base: StaticPricingConfig::default(),
+        fee_target_blocks: 6,
+        cache_ttl: FLAKY_TTL,
+        max_price_multiplier: 0.0,
+        fee_rate_ema_alpha: 1.0,
+        category_fee_targets: [("files_media".to_string(), 144u32)].into_iter().collect(),
+    };
+    let engine = ChainAwarePricingEngine::new(config, Arc::clone(&chain) as Arc<dyn ChainProvider>);
+    (chain, engine)
+}
+
+/// Fetch once, make `failing` error, let the TTL pass and re-price. Returns
+/// the As-Of of the first real fetch and the As-Of after the partial failure.
+async fn as_of_before_and_after_failure(
+    failing: &[u32],
+) -> (
+    ChainAwarePricingEngine,
+    std::time::SystemTime,
+    std::time::SystemTime,
+) {
+    let (chain, engine) = make_flaky_engine();
+    let chat = engine.get_price_msat(KIND_CHAT).await.unwrap();
+    let file = engine.get_price_msat(KIND_FILE_REF).await.unwrap();
+    let first = engine.chain_state_fetched_at().await.expect("real fetch");
+
+    chain.fail(failing);
+    tokio::time::sleep(FLAKY_TTL + Duration::from_millis(50)).await;
+
+    // Pricing is unchanged: reused values still price exactly as before.
+    assert_eq!(engine.get_price_msat(KIND_CHAT).await.unwrap(), chat);
+    assert_eq!(engine.get_price_msat(KIND_FILE_REF).await.unwrap(), file);
+    let after = engine.chain_state_fetched_at().await.expect("still cached");
+    (engine, first, after)
+}
+
+fn assert_as_of_held_and_stale(
+    engine: &ChainAwarePricingEngine,
+    first: std::time::SystemTime,
+    after: std::time::SystemTime,
+) {
+    // SystemTime is re-derived from Instant on each read; allow a little jitter,
+    // far less than the 150 ms that passed before the failing refresh.
+    let advanced = after.duration_since(first).unwrap_or_default();
+    assert!(
+        advanced < Duration::from_millis(25),
+        "As-Of advanced {advanced:?} past the last real fetch of a reused value"
+    );
+    let age = std::time::SystemTime::now().duration_since(after).unwrap();
+    assert!(
+        age >= engine.cache_ttl(),
+        "reused value older than the TTL must read as stale: {age:?}"
+    );
+}
+
+#[tokio::test]
+async fn fee_failure_for_one_target_does_not_advance_as_of() {
+    let (engine, first, after) = as_of_before_and_after_failure(&[144]).await;
+    assert_as_of_held_and_stale(&engine, first, after);
+}
+
+#[tokio::test]
+async fn fee_failure_for_all_targets_does_not_advance_as_of() {
+    let (engine, first, after) = as_of_before_and_after_failure(&[6, 144]).await;
+    assert_as_of_held_and_stale(&engine, first, after);
+}
+
+#[tokio::test]
+async fn recovered_target_advances_as_of_again() {
+    let (chain, engine) = make_flaky_engine();
+    let _ = engine.get_price_msat(KIND_CHAT).await.unwrap();
+    chain.fail(&[144]);
+    tokio::time::sleep(FLAKY_TTL + Duration::from_millis(50)).await;
+    let _ = engine.get_price_msat(KIND_CHAT).await.unwrap();
+    let held = engine.chain_state_fetched_at().await.unwrap();
+
+    chain.fail(&[]);
+    tokio::time::sleep(FLAKY_TTL + Duration::from_millis(50)).await;
+    let before = std::time::SystemTime::now() - Duration::from_millis(25);
+    let _ = engine.get_price_msat(KIND_CHAT).await.unwrap();
+    let fresh = engine.chain_state_fetched_at().await.unwrap();
+    assert!(
+        fresh > held && fresh >= before,
+        "every value re-fetched: As-Of is now"
+    );
+}
+
+#[tokio::test]
+async fn seeded_values_reused_after_fee_failure_stay_expired() {
+    let (chain, engine) = make_flaky_engine();
+    engine
+        .seed_ema(FeeRateSnapshot {
+            targets: [(6u32, 7.0f64), (144u32, 3.0f64)].into_iter().collect(),
+            block_height: 886_000,
+            timestamp_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        })
+        .await;
+    chain.fail(&[6, 144]);
+
+    let _ = engine.get_price_msat(KIND_CHAT).await.unwrap();
+    assert_eq!(
+        engine.fee_rate_state().await,
+        Some((7.0, 7.0)),
+        "seed reused"
+    );
+    let fetched = engine.chain_state_fetched_at().await.unwrap();
+    let age = std::time::SystemTime::now()
+        .duration_since(fetched)
+        .unwrap();
+    assert!(
+        age >= engine.cache_ttl(),
+        "seed is not a real fetch: {age:?}"
+    );
 }
