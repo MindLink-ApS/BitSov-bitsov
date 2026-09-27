@@ -8,7 +8,7 @@
 //! on the user's own node — it is encrypted before storage or transport
 //! (Principle 4: data sovereignty).
 
-use crate::metered::MeteredSpend;
+use crate::metered::{Debit, MeteredSpend};
 use crate::spend_budget::Charge;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -261,6 +261,16 @@ pub async fn create_payment_proof(
     price_msat: u64,
     peer_id: &NodeId,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
+    create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered()).await
+}
+
+/// Paired paid paths carry the original reservation through every fallback.
+pub(crate) async fn create_metered_payment_proof(
+    state: &AppState,
+    price_msat: u64,
+    peer_id: &NodeId,
+    debit: &Debit,
+) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     // Zero-price messages get a valid cryptographic proof with zero amount.
     // The payment gate accepts these for kind-0 (control) messages.
     if price_msat == 0 {
@@ -289,7 +299,7 @@ pub async fn create_payment_proof(
     // Try keysend first — eliminates the invoice round-trip.
     let peer_ln_pubkey = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
     if let Some(ln_pubkey) = peer_ln_pubkey {
-        match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id).await {
+        match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit).await {
             Ok(KeysendOutcome::Settled(proof)) => return Ok(proof),
             Ok(KeysendOutcome::NotDispatched) => {
                 tracing::warn!(
@@ -313,7 +323,7 @@ pub async fn create_payment_proof(
     }
 
     // Invoice-request fallback (only reached when keysend was not dispatched).
-    create_payment_proof_via_invoice(state, payment_amount_msat, peer_id).await
+    create_payment_proof_via_invoice(state, payment_amount_msat, peer_id, debit).await
 }
 
 /// Attempt a keysend (spontaneous) payment to a peer's Lightning node.
@@ -328,11 +338,12 @@ async fn try_keysend(
     ln_pubkey: &str,
     amount_msat: u64,
     peer_id: &NodeId,
+    debit: &Debit,
 ) -> Result<KeysendOutcome, ApiError> {
-    let details = match state
+    let details = match debit.dispatch(state
         .lightning
-        .keysend(ln_pubkey, amount_msat, Some("konsensus message"))
-        .await
+        .keysend(ln_pubkey, amount_msat, Some("konsensus message")))
+        .await?
     {
         Ok(details) => details,
         Err(LightningError::PaymentNotDispatched(reason)) => {
@@ -384,6 +395,7 @@ async fn create_payment_proof_via_invoice(
     state: &AppState,
     invoice_amount_msat: u64,
     peer_id: &NodeId,
+    debit: &Debit,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     // Generate a unique request ID for correlating request/response.
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -413,7 +425,11 @@ async fn create_payment_proof_via_invoice(
         .to_bytes()
         .map_err(|e| ApiError::Internal(format!("frame serialization error: {e}")))?;
 
-    if let Err(e) = state.transport.send_raw_frame(peer_id, &frame_bytes).await {
+    let sent = debit.request_invoice(state.transport.send_raw_frame(peer_id, &frame_bytes)).await;
+    if sent.is_err() {
+        state.invoice_requests.lock().await.remove(&request_id);
+    }
+    if let Err(e) = sent? {
         // Clean up the pending request on failure.
         state.invoice_requests.lock().await.remove(&request_id);
         return Err(ApiError::Internal(format!(
@@ -483,10 +499,10 @@ async fn create_payment_proof_via_invoice(
     // Pay the recipient's invoice, then poll the in-flight payment to terminal
     // settlement (it commonly returns Pending/InFlight before the preimage is
     // known; treating that as failure dropped settling messages).
-    let details = state
+    let details = debit.dispatch(state
         .lightning
-        .pay_invoice(&response.bolt11)
-        .await
+        .pay_invoice(&response.bolt11))
+        .await?
         .map_err(|e| ApiError::PaymentUnresolved(format!("failed to pay recipient invoice: {e}")))?;
 
     let details = await_settlement(&state.lightning, details, "invoice payment").await?;
@@ -1411,6 +1427,7 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
 /// These values are identical for all members of a single room compose, so we
 /// bundle them once instead of threading each through the per-member helper.
 struct RoomFanoutCtx<'a> {
+    debit: &'a Debit,
     sender: NodeId,
     room_recipient: Recipient,
     plaintext: &'a str,
@@ -1473,7 +1490,7 @@ async fn compose_room_member(
     // Create payment proof — requests invoice from recipient's wallet (Principle 2).
     // Preserve refused vs unresolved payment state for every member.
     let (payment_hash, preimage_bytes, amount_msat) =
-        match create_payment_proof(state, price_msat, &member).await {
+        match create_metered_payment_proof(state, price_msat, &member, ctx.debit).await {
             Ok(proof) => proof,
             Err(e) => {
                 tracing::warn!(
@@ -1681,6 +1698,7 @@ pub(super) async fn compose_message(
         // deterministic regardless of completion order.
         use futures::stream::StreamExt;
         let ctx = RoomFanoutCtx {
+            debit: &debit,
             sender,
             room_recipient,
             plaintext: req.plaintext.as_str(),
@@ -1777,6 +1795,16 @@ pub(super) async fn compose_message(
             super::caps::check(price_msat, Some(*cap))?;
         }
 
+        // Reject budget limits before advancing the ratchet or requesting an invoice.
+        let peer_key = peer_id.to_hex();
+        let debit = auth.debit(
+            &state,
+            vec![Charge {
+                recipient: peer_key.clone(),
+                amount_msat: price_msat,
+            }],
+        )?;
+
         // Encrypt via Double Ratchet.
         //
         // For an already-sessioned/whitelisted/privileged peer this succeeds on
@@ -1796,6 +1824,7 @@ pub(super) async fn compose_message(
         {
             Ok(msg) => msg,
             Err(e) => {
+                debit.released(&peer_key);
                 // Only bootstrap admission for the no-session, connected-stranger
                 // case. If a session already exists (some other encrypt failure)
                 // or the peer is offline, surface the original error unchanged.
@@ -1864,18 +1893,8 @@ pub(super) async fn compose_message(
         };
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
-        // G1: debit the grant before the invoice is requested.
-        let peer_key = peer_id.to_hex();
-        let debit = auth.debit(
-            &state,
-            vec![Charge {
-                recipient: peer_key.clone(),
-                amount_msat: price_msat,
-            }],
-        )?;
-
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
-        let paid = create_payment_proof(&state, price_msat, &peer_id).await;
+        let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit).await;
         debit.resolve_proof(&peer_key, &paid);
         let (payment_hash, preimage_bytes, amount_msat) = paid?;
         let proof =

@@ -1081,12 +1081,7 @@ impl PairingService {
     /// Belt and braces: in sidecar mode every grantable scope is stripped from
     /// the result even if a hand-edited pairing record carries one, because the
     /// only way such a scope can legitimately exist is an owner grant.
-    fn effective_scopes(
-        &self,
-        inner: &Inner,
-        record: &PairedClient,
-        now_unix: i64,
-    ) -> Vec<Scope> {
+    fn effective_scopes(&self, inner: &Inner, record: &PairedClient, now_unix: i64) -> Vec<Scope> {
         let mut scopes = record.scopes.clone();
         if !self.owner_control_enabled {
             scopes.retain(|s| !grantable_scopes().contains(s));
@@ -1609,11 +1604,21 @@ impl PairingService {
         epoch: u64,
         charges: Vec<Charge>,
     ) -> Result<Reservation, BudgetRefusal> {
+        self.reserve_spend_with_clock(client_id, epoch, charges, || chrono::Utc::now().timestamp())
+    }
+
+    fn reserve_spend_with_clock(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        charges: Vec<Charge>,
+        mut clock: impl FnMut() -> i64,
+    ) -> Result<Reservation, BudgetRefusal> {
         if !self.owner_control_enabled {
             return Err(BudgetRefusal::NoGrant);
         }
-        let now = chrono::Utc::now().timestamp();
         let mut inner = self.lock();
+        let now = clock();
         let fingerprint = inner.identity_fingerprint.clone();
         let current_epoch = inner
             .file
@@ -1639,17 +1644,59 @@ impl PairingService {
             .as_mut()
             .ok_or(BudgetRefusal::NoGrant)?
             .reserve(&charges)?;
-        if let Err(e) = self.persist(&mut inner.file) {
+        if let Err(e) = self.persist_at(&mut inner.file, clock()) {
             if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
                 g.budget = before;
             }
             return Err(BudgetRefusal::Ledger(e.to_string()));
+        }
+        // Persistence may have pruned this grant at the expiry boundary.
+        // Never return authority for a reservation that did not survive the
+        // transaction, or whose deadline passed while syncing the ledger.
+        let now = clock();
+        if !inner
+            .file
+            .grants
+            .iter()
+            .any(|g| g.op_id == op_id && g.is_live(now))
+        {
+            return Err(BudgetRefusal::NoGrant);
         }
         Ok(Reservation {
             client_id: client_id.to_string(),
             op_id,
             charges,
         })
+    }
+
+    /// Validate a persisted reservation and run one synchronous dispatch step
+    /// under the same lock used by debit, revoke, rotation and identity rebind.
+    /// The closure must never block or re-enter the pairing service. Async
+    /// callers poll once here and release the lock before returning Pending.
+    pub(crate) fn with_spend_authority<T>(
+        &self,
+        reservation: &Reservation,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, BudgetRefusal> {
+        let inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
+        let valid = self.owner_control_enabled
+            && inner.file.grants.iter().any(|g| {
+                g.op_id == reservation.op_id
+                    && g.client_id == reservation.client_id
+                    && g.identity_fingerprint == inner.identity_fingerprint
+                    && g.scopes.contains(&Scope::Spend)
+                    && g.is_live(now)
+                    && inner.file.clients.iter().any(|c| {
+                        c.client_id == g.client_id
+                            && c.epoch == g.epoch
+                            && c.identity_fingerprint == inner.identity_fingerprint
+                    })
+            });
+        if !valid {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        Ok(action())
     }
 
     /// Resolve one recipient's part of a reservation to what was actually
@@ -1746,15 +1793,22 @@ impl PairingService {
     /// Every write also drops grants that can no longer authorise anything, so
     /// no grant is persisted beyond its expiry.
     fn persist(&self, file: &mut PairingFile) -> Result<(), PairingError> {
-        let now = chrono::Utc::now().timestamp();
-        file.grants.retain(|g| g.is_live(now));
-        file.version = PAIRING_FILE_VERSION;
-        let bytes = serde_json::to_vec_pretty(file)
+        self.persist_at(file, chrono::Utc::now().timestamp())
+    }
+
+    fn persist_at(&self, file: &mut PairingFile, now: i64) -> Result<(), PairingError> {
+        // Do not forget a failed deletion: subsequent sweeps must still see
+        // the expired grant until its removal is durable.
+        let mut candidate = file.clone();
+        candidate.grants.retain(|g| g.is_live(now));
+        candidate.version = PAIRING_FILE_VERSION;
+        let bytes = serde_json::to_vec_pretty(&candidate)
             .map_err(|e| PairingError::Io(format!("serializing pairing store: {e}")))?;
         let tmp = self.file_path.with_extension("json.tmp");
         write_protected(&tmp, &bytes)?;
         std::fs::rename(&tmp, &self.file_path)?;
         fsync_dir(&self.dir)?;
+        *file = candidate;
         Ok(())
     }
 }
@@ -1866,3 +1920,7 @@ pub fn fsync_dir(path: &Path) -> io::Result<()> {
     let _ = dir.sync_all();
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "pairing/budget_tests.rs"]
+mod budget_transaction_tests;

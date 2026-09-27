@@ -309,7 +309,7 @@ fn self_authenticating_endpoints_also_check_scope() {
 /// enough — a paired caller would then spend unmetered.
 #[test]
 fn every_metered_handler_debits_before_it_pays() {
-    const PAYS: &[&str] = &["create_payment_proof(", ".pay_invoice(", ".keysend("];
+    const PAYS: &[&str] = &["create_payment_proof(", "create_metered_payment_proof(", ".pay_invoice(", ".keysend("];
     let mut bad = Vec::new();
     let mut seen = 0;
     for (file, src) in all_sources() {

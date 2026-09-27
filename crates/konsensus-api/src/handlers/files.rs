@@ -27,7 +27,7 @@ use konsensus_storage::FileRecord;
 
 use crate::audit::events;
 use crate::error::ApiError;
-use crate::handlers::messages::create_payment_proof;
+use crate::handlers::messages::create_metered_payment_proof;
 use crate::state::AppState;
 
 /// Maximum file size: 4 MiB (fits within 16 MiB wire frame with overhead).
@@ -393,19 +393,7 @@ async fn send_file(
     let payload_json = serde_json::to_vec(&payload)
         .map_err(|e| ApiError::Internal(format!("payload serialization: {e}")))?;
 
-    // E2EE encrypt via Double Ratchet
-    let ratchet_msg = state
-        .session_manager
-        .encrypt(&peer_id, &payload_json)
-        .await
-        .map_err(|e| {
-            ApiError::BadRequest(format!(
-                "E2EE encryption failed (session may not be established): {e}"
-            ))
-        })?;
-    let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
-
-    // G1: debit the grant before the invoice is requested.
+    // Reject budget limits before advancing the ratchet or requesting an invoice.
     let peer_key = peer_id.to_hex();
     let debit = auth.debit(
         &state,
@@ -415,8 +403,21 @@ async fn send_file(
         }],
     )?;
 
+    // E2EE encrypt via Double Ratchet
+    let ratchet_msg = state
+        .session_manager
+        .encrypt(&peer_id, &payload_json)
+        .await
+        .map_err(|e| {
+            debit.released(&peer_key);
+            ApiError::BadRequest(format!(
+                "E2EE encryption failed (session may not be established): {e}"
+            ))
+        })?;
+    let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
+
     // Create real payment proof — requests invoice from recipient (Principle 2).
-    let paid = create_payment_proof(&state, price_msat, &peer_id).await;
+    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit).await;
     debit.resolve_proof(&peer_key, &paid);
     let (payment_hash, preimage, amount_msat) = paid?;
     let proof =

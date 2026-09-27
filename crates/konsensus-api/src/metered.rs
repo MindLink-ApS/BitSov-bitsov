@@ -13,7 +13,9 @@
 //! A caller holding the node's own key (not a pairing) is the owner and is not
 //! metered; the #80 caps still bound what it asked for.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::task::Poll;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -97,7 +99,7 @@ impl MeteredSpend {
     /// Zero-amount charges are dropped: they move nothing.
     pub fn debit(&self, state: &AppState, charges: Vec<Charge>) -> Result<Debit, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else {
-            return Ok(Debit { held: None });
+            return Ok(Debit::unmetered());
         };
         let service = state
             .pairing
@@ -129,6 +131,67 @@ pub struct Debit {
 }
 
 impl Debit {
+    /// Owner-only paths have no grant to revalidate.
+    pub(crate) fn unmetered() -> Self {
+        Self { held: None }
+    }
+
+    /// Guard each poll of an operation that can dispatch value. A separate
+    /// check followed by `.await` leaves a revocation race: the provider may
+    /// suspend before it dispatches. Polling under the ledger mutex orders
+    /// each dispatch step with debit/revoke/rotation without holding a lock
+    /// across suspension. The provider must not spawn undispatched work that
+    /// outlives its future; handing a request to a backend is dispatch.
+    ///
+    /// Once polled, a provider may have sent funds even if it returned Pending.
+    /// Invalidation then is unknown, never a reason to release or fall back.
+    pub(crate) async fn dispatch<F: Future>(&self, operation: F) -> Result<F::Output, ApiError> {
+        let Some((service, reservation)) = &self.held else {
+            return Ok(operation.await);
+        };
+        let mut operation = std::pin::pin!(operation);
+        let mut polled = false;
+        futures::future::poll_fn(|cx| {
+            match service.with_spend_authority(reservation, || {
+                polled = true;
+                operation.as_mut().poll(cx)
+            }) {
+                Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+                Ok(Poll::Pending) => Poll::Pending,
+                Err(e) if !polled => Poll::Ready(Err(ApiError::BudgetExceeded(e))),
+                Err(_) => Poll::Ready(Err(ApiError::PaymentUnresolved(
+                    "grant invalidated while the provider was pending; payment may have dispatched"
+                        .into(),
+                ))),
+            }
+        })
+        .await
+    }
+
+    /// Authorize the start of a non-paying invoice request. Unlike a wallet
+    /// operation, a started Noise frame must finish: dropping a partial write
+    /// would corrupt framing or consume an unmatched encryption nonce on the
+    /// shared connection. The subsequent invoice payment is separately guarded
+    /// by `dispatch`, even when authority changed during this write.
+    pub(crate) async fn request_invoice<F: Future>(
+        &self,
+        operation: F,
+    ) -> Result<F::Output, ApiError> {
+        let Some((service, reservation)) = &self.held else {
+            return Ok(operation.await);
+        };
+        let mut operation = std::pin::pin!(operation);
+        let first = futures::future::poll_fn(|cx| {
+            Poll::Ready(service.with_spend_authority(reservation, || operation.as_mut().poll(cx)))
+        })
+        .await
+        .map_err(ApiError::BudgetExceeded)?;
+        match first {
+            Poll::Ready(output) => Ok(output),
+            Poll::Pending => Ok(operation.await),
+        }
+    }
+
     /// The payment to `recipient` settled for `amount_msat`.
     pub fn settled(&self, recipient: &str, amount_msat: u64) {
         if let Some((service, reservation)) = &self.held {

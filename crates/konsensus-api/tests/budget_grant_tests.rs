@@ -17,7 +17,7 @@ mod common;
 mod owner_console;
 use owner_console::OwnerConsole;
 
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -54,6 +54,9 @@ const FAILED: u8 = 3;
 #[derive(Default)]
 struct Wallet {
     mode: AtomicU8,
+    pause_dispatch: AtomicBool,
+    waiting: AtomicUsize,
+    resume: tokio::sync::Notify,
     money: AtomicUsize,
     invoices: AtomicUsize,
     /// Principal that actually left (settled or unknown after dispatch).
@@ -71,6 +74,10 @@ impl Wallet {
         self.left_msat.load(Ordering::SeqCst)
     }
     async fn outcome(&self, amount_msat: u64) -> Result<PaymentDetails, LightningError> {
+        if self.pause_dispatch.load(Ordering::SeqCst) {
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+            self.resume.notified().await;
+        }
         self.money.fetch_add(1, Ordering::SeqCst);
         // Yield so concurrent requests genuinely interleave around the debit.
         tokio::task::yield_now().await;
@@ -944,11 +951,13 @@ async fn expired_grant_is_swept_without_any_other_write() {
     let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let now = chrono::Utc::now().timestamp();
     file["grants"][0]["granted_at"] = json!(now - 100);
-    file["grants"][0]["expires_at"] = json!(now + 1);
+    file["grants"][0]["expires_at"] = json!(now + 3);
     std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
     let service = open_owner_service(fx.tmp.path(), &fx.service.bound_fingerprint(), &fx.console);
     assert_eq!(service.reload_from_disk().unwrap().grants.len(), 1);
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    while chrono::Utc::now().timestamp() < now + 3 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert_eq!(service.prune_expired_grants().unwrap(), 1);
     assert!(service.reload_from_disk().unwrap().grants.is_empty());
 }
@@ -1115,3 +1124,6 @@ fn concurrent_reservations_on_the_ledger_are_atomic() {
     assert_eq!(wins.load(Ordering::SeqCst), 10);
     assert_eq!(fx.used(), 10_000);
 }
+
+#[path = "budget_grant/lifecycle.rs"]
+mod lifecycle;

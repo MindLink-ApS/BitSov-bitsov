@@ -235,7 +235,9 @@ async fn pay_invoice(
         None
     };
 
-    let paid = state.lightning.pay_invoice(&req.bolt11).await;
+    let unmetered = Debit::unmetered();
+    let guard = debit.as_ref().map(|(debit, _)| debit).unwrap_or(&unmetered);
+    let paid = guard.dispatch(state.lightning.pay_invoice(&req.bolt11)).await?;
     if let Some((debit, payee)) = &debit {
         resolve_payment(debit, payee, &paid);
     }
@@ -335,10 +337,12 @@ async fn keysend(
         None
     };
 
-    let paid = state
+    let unmetered = Debit::unmetered();
+    let guard = debit.as_ref().unwrap_or(&unmetered);
+    let paid = guard.dispatch(state
         .lightning
-        .keysend(&req.dest_pubkey, req.amount_msat, req.memo.as_deref())
-        .await;
+        .keysend(&req.dest_pubkey, req.amount_msat, req.memo.as_deref()))
+        .await?;
     if let Some(debit) = &debit {
         resolve_payment(debit, &dest, &paid);
     }

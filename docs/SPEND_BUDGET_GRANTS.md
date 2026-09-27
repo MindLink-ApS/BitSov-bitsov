@@ -34,7 +34,10 @@ stays with read+receive. Revoking, bumping or deleting a pairing, rotating its
 key, or rebinding the identity also removes the grant. Every authenticated
 request recomputes the pairing's scopes, so a token that still claims `spend`
 gets a 401 on its next request. `konsensus pair-status` lists live grants with
-what is left.
+what is left. Requests already waiting for an invoice and queued room members
+also recheck their original grant before dispatch. Revocation, rotation,
+replacement or expiry stops those undispatched payments; it cannot recall a
+payment already handed to the Lightning backend.
 
 ## What is debited, and when
 
@@ -47,7 +50,17 @@ what is left.
 | `POST /payments/keysend` | `dest_pubkey` | `amount_msat` |
 
 The debit happens under the pairing store's mutex and is persisted **before**
-any invoice is requested or any payment is dispatched. A refusal is HTTP 409:
+any ratchet is advanced, invoice is requested or payment is dispatched. The
+original reservation is checked under that same mutex before starting an invoice
+request and on every poll of payment futures, including fallback and room-member
+operations. A started invoice-request frame is allowed to finish its write to
+keep the shared encrypted connection intact; its later payment is checked again.
+No mutex is held across an async suspension. If a provider has already been
+polled when its grant becomes invalid, its outcome is conservatively unknown:
+it may have handed the payment to the backend before suspending.
+
+A budget or price-cap refusal precedes encryption. An encryption failure
+before dispatch releases the reservation. A budget refusal is HTTP 409:
 
 ```json
 {"code":"budget_exceeded","reason":"total","remaining_msat":500,"error":"…"}
@@ -83,3 +96,7 @@ cannot extend the window. Expired grants are removed on every store write, at
 open, and by a 60-second sweep. A hand-edited expiry more than 24 h after
 `granted_at` is treated as expired. Granting a new window for a client replaces
 its previous grant and tally.
+
+An expiry that occurs while the debit is persisted refuses dispatch rather than
+returning a reservation that was pruned. Failed expiry deletions remain in
+memory until a successful write, so a later sweep retries after an I/O failure.
