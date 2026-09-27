@@ -60,9 +60,11 @@ pub mod control;
 pub mod error;
 pub mod freshness;
 pub mod handlers;
+pub mod metered;
 pub mod metrics;
 pub mod pairing;
 pub mod rate_limit;
+pub mod spend_budget;
 pub mod state;
 pub mod ws;
 

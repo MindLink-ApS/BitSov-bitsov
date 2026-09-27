@@ -1,6 +1,8 @@
 //! Payment endpoints — Lightning invoices, balances, status.
 
 use crate::auth::scoped::{ScopedAuth, Read, Receive, Spend};
+use crate::metered::{Debit, MeteredSpend};
+use crate::spend_budget::Charge;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -11,6 +13,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use konsensus_core::fee_rate::validate_fee_rate_sat_per_vb;
+use konsensus_core::traits::lightning::LightningError;
 
 use crate::error::ApiError;
 use crate::freshness::DataFreshness;
@@ -201,7 +204,7 @@ const MAX_BOLT11_LEN: usize = 2048;
 
 /// `POST /api/v1/payments/pay` — pay a BOLT11 invoice.
 async fn pay_invoice(
-    _auth: ScopedAuth<Spend>,
+    auth: MeteredSpend,
     State(state): State<Arc<AppState>>,
     Json(req): Json<PayInvoiceRequest>,
 ) -> Result<Json<PayInvoiceResponse>, ApiError> {
@@ -215,11 +218,28 @@ async fn pay_invoice(
         )));
     }
 
-    let details = state
-        .lightning
-        .pay_invoice(&req.bolt11)
-        .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+    // G1: a metered caller's debit needs the amount and payee before paying.
+    let debit = if auth.is_metered() {
+        let (amount_msat, payee) = invoice_terms(&req.bolt11)?;
+        Some((
+            auth.debit(
+                &state,
+                vec![Charge {
+                    recipient: payee.clone(),
+                    amount_msat,
+                }],
+            )?,
+            payee,
+        ))
+    } else {
+        None
+    };
+
+    let paid = state.lightning.pay_invoice(&req.bolt11).await;
+    if let Some((debit, payee)) = &debit {
+        resolve_payment(debit, payee, &paid);
+    }
+    let details = paid.map_err(|e| ApiError::Lightning(e.to_string()))?;
 
     let preimage = details.preimage.unwrap_or_else(|| {
         tracing::warn!(payment_hash = %details.payment_hash, "payment succeeded but no preimage returned");
@@ -274,7 +294,7 @@ const MAX_KEYSEND_AMOUNT_MSAT: u64 = 100_000_000_000;
 /// generates the preimage and pushes it via a TLV record. Requires the
 /// destination node's compressed public key.
 async fn keysend(
-    _auth: ScopedAuth<Spend>,
+    auth: MeteredSpend,
     State(state): State<Arc<AppState>>,
     Json(req): Json<KeysendRequest>,
 ) -> Result<Json<KeysendResponse>, ApiError> {
@@ -298,11 +318,31 @@ async fn keysend(
         )));
     }
 
-    let details = state
+    // G1: debit a metered caller before the keysend is dispatched.
+    let dest = req.dest_pubkey.trim().to_ascii_lowercase();
+    let debit = if auth.is_metered() {
+        let key = crate::spend_budget::canonical_recipient(&dest)
+            .filter(|k| k.len() == 66)
+            .ok_or_else(|| ApiError::BadRequest("dest_pubkey must be a 33-byte hex pubkey".into()))?;
+        Some(auth.debit(
+            &state,
+            vec![Charge {
+                recipient: key,
+                amount_msat: req.amount_msat,
+            }],
+        )?)
+    } else {
+        None
+    };
+
+    let paid = state
         .lightning
         .keysend(&req.dest_pubkey, req.amount_msat, req.memo.as_deref())
-        .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .await;
+    if let Some(debit) = &debit {
+        resolve_payment(debit, &dest, &paid);
+    }
+    let details = paid.map_err(|e| ApiError::Lightning(e.to_string()))?;
 
     let preimage = details.preimage.unwrap_or_default();
 
@@ -312,6 +352,51 @@ async fn keysend(
         preimage,
         status: format!("{:?}", details.status),
     }))
+}
+
+/// Amount and payee of a BOLT11 invoice, for a metered debit.
+///
+/// An invoice without an amount is refused for a metered caller: the amount
+/// would be chosen at payment time, after the budget check.
+fn invoice_terms(bolt11: &str) -> Result<(u64, String), ApiError> {
+    let invoice = bolt11
+        .trim()
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .map_err(|e| ApiError::BadRequest(format!("invalid bolt11 invoice: {e}")))?;
+    let amount_msat = invoice.amount_milli_satoshis().ok_or_else(|| {
+        ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::Unpriced(
+            "this invoice has no amount; a budget grant only pays amounts known before \
+             dispatch — nothing was paid"
+                .into(),
+        ))
+    })?;
+    let payee = invoice
+        .payee_pub_key()
+        .copied()
+        .unwrap_or_else(|| invoice.recover_payee_pub_key());
+    Ok((amount_msat, hex::encode(payee.serialize())))
+}
+
+/// Resolve a pay/keysend debit from the provider's answer.
+///
+/// Settled → the reported amount. Failed, or rejected before dispatch → 0.
+/// Anything else (pending, in flight, or an error that does not prove the
+/// payment never left) stays reserved: the #80 unknown outcome.
+fn resolve_payment(
+    debit: &Debit,
+    recipient: &str,
+    paid: &Result<konsensus_core::traits::lightning::PaymentDetails, LightningError>,
+) {
+    use konsensus_core::traits::lightning::PaymentStatus;
+    match paid {
+        Ok(d) if d.status == PaymentStatus::Settled => debit.settled(recipient, d.amount_msat),
+        Ok(d) if matches!(d.status, PaymentStatus::Failed | PaymentStatus::Expired) => {
+            debit.released(recipient)
+        }
+        Ok(_) => {}
+        Err(LightningError::PaymentNotDispatched(_)) => debit.released(recipient),
+        Err(_) => {}
+    }
 }
 
 /// Channel info response.

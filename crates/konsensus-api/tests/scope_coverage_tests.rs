@@ -118,7 +118,10 @@ fn assert_scoped(handlers: &[&str], scope: &str) {
         {
             None => bad.push(format!("{h}: handler not found (renamed or removed?)")),
             Some((file, sig)) => {
-                if !sig.contains(&format!("ScopedAuth<{scope}>")) {
+                // G1: `MeteredSpend` demands `spend` and also debits a paired
+                // caller's budget grant, so it satisfies a spend requirement.
+                let metered = scope == "Spend" && sig.contains(": MeteredSpend");
+                if !sig.contains(&format!("ScopedAuth<{scope}>")) && !metered {
                     bad.push(format!(
                         "{h} in {file} does not demand ScopedAuth<{scope}>: {}",
                         sig.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -264,7 +267,7 @@ fn every_function_that_can_pay_demands_spend() {
             if !sig.contains("State<Arc<AppState>>") {
                 continue;
             }
-            if !sig.contains("ScopedAuth<Spend>") {
+            if !sig.contains("ScopedAuth<Spend>") && !sig.contains(": MeteredSpend") {
                 bad.push(format!("{file}: {name}"));
             }
         }
@@ -299,4 +302,61 @@ fn self_authenticating_endpoints_also_check_scope() {
         bad.len(),
         bad.join("\n  ")
     );
+}
+
+/// G1: a handler that takes `MeteredSpend` and can move value must debit the
+/// budget grant **before** its first payment call. Taking the extractor is not
+/// enough — a paired caller would then spend unmetered.
+#[test]
+fn every_metered_handler_debits_before_it_pays() {
+    const PAYS: &[&str] = &["create_payment_proof(", ".pay_invoice(", ".keysend("];
+    let mut bad = Vec::new();
+    let mut seen = 0;
+    for (file, src) in all_sources() {
+        let mut from = 0;
+        while let Some(rel) = src[from..].find("async fn ") {
+            let at = from + rel;
+            let body = function_body(&src, at);
+            from = at + body.len().max(1);
+            let sig = body.split_once(") ->").map(|(s, _)| s).unwrap_or(&body);
+            if !sig.contains(": MeteredSpend") {
+                continue;
+            }
+            seen += 1;
+            let Some(first_pay) = PAYS.iter().filter_map(|p| body.find(p)).min() else {
+                continue;
+            };
+            let name = body
+                .trim_start_matches("async fn ")
+                .split('(')
+                .next()
+                .unwrap_or("<unknown>")
+                .trim()
+                .to_string();
+            match body.find(".debit(") {
+                Some(debit) if debit < first_pay => {}
+                _ => bad.push(format!("{file}: {name}")),
+            }
+        }
+    }
+    assert!(seen >= 5, "expected the metered paid handlers, found {seen}");
+    assert!(
+        bad.is_empty(),
+        "{} metered handler(s) can pay without debiting the grant first:\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
+}
+
+/// G1: `ScopedAuth<Spend>` must keep refusing paired callers, whose `spend`
+/// is a budget grant that only metered routes debit.
+#[test]
+fn unmetered_spend_routes_refuse_paired_callers() {
+    let src = std::fs::read_to_string(src_dir().join("auth.rs")).expect("read auth.rs");
+    assert!(
+        src.contains("S::SCOPE == Scope::Spend && user.pairing.is_some()"),
+        "ScopedAuth<Spend> no longer refuses paired callers"
+    );
+    let metered = std::fs::read_to_string(src_dir().join("metered.rs")).expect("read metered.rs");
+    assert!(metered.contains("user.has(Scope::Spend)"), "MeteredSpend must demand spend");
 }

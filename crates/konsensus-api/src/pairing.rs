@@ -58,6 +58,10 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, Scope, TokenError};
+use crate::spend_budget::{
+    BudgetRefusal, Charge, GrantBudget, GrantTerms, GrantView, Reservation,
+    MAX_SPEND_GRANT_TTL_SECS,
+};
 
 /// Length of the pairing challenge written under `data_dir`.
 ///
@@ -101,10 +105,9 @@ pub const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(300);
 /// How long a pending elevation request or replacement approval stays valid.
 pub const ELEVATION_TTL_SECS: i64 = 900;
 
-/// Default lifetime of an owner-written spend grant: 30 days.
-///
-/// A grant is neither transferable to another client nor perpetual.
-pub const SPEND_GRANT_TTL_SECS: i64 = 30 * 24 * 3600;
+// A spend grant's lifetime is the owner's choice, capped at
+// `spend_budget::MAX_SPEND_GRANT_TTL_SECS` (24 h). The 30-day unmetered grant
+// this replaced was a durable admission object; see `crate::spend_budget`.
 
 /// Scopes a pairing carries by default (policy lock A): `read` + `receive`.
 ///
@@ -245,6 +248,21 @@ pub struct SpendGrant {
     pub epoch: u64,
     /// Always `"cli"`: the HTTP surface can never write one of these.
     pub granted_by: String,
+    /// The meter. A grant without one (written by a pre-G1 node) is never
+    /// honoured and is dropped when the store is opened.
+    #[serde(default)]
+    pub budget: Option<GrantBudget>,
+}
+
+impl SpendGrant {
+    /// Whether this grant can authorise anything at `now`: metered, unexpired,
+    /// and no longer-lived than the 24-hour cap (a hand-edited expiry is not
+    /// an extension).
+    pub fn is_live(&self, now: i64) -> bool {
+        self.budget.is_some()
+            && self.expires_at > now
+            && self.expires_at - self.granted_at <= MAX_SPEND_GRANT_TTL_SECS
+    }
 }
 
 /// A pending elevation request created over HTTP. Carries **no authority**.
@@ -262,6 +280,10 @@ pub struct PendingElevation {
     pub created_at: i64,
     /// Unix seconds after which it can no longer be confirmed.
     pub expires_at: i64,
+    /// Budget the client proposed. Carries no authority: the owner sees it
+    /// and may grant it, narrow it, or replace it at the control socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_terms: Option<GrantTerms>,
 }
 
 /// A pending live-identity replacement, bound to five fields and single-use.
@@ -310,7 +332,10 @@ pub struct PairingFile {
 }
 
 /// Current durable schema version.
-pub const PAIRING_FILE_VERSION: u32 = 1;
+///
+/// 2 (G1): grants carry a budget. A pre-G1 node must refuse this file rather
+/// than read a metered grant as an unmetered one.
+pub const PAIRING_FILE_VERSION: u32 = 2;
 
 /// A pending pairing request. Held in memory; the challenge itself lives in the
 /// protected file under `data_dir`, which is the actual control.
@@ -528,7 +553,7 @@ impl PairingService {
             }
         };
 
-        Ok(Self {
+        let service = Self {
             dir,
             file_path,
             inner: Mutex::new(Inner {
@@ -542,7 +567,11 @@ impl PairingService {
             owner_control_enabled,
             print_short_code: true,
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
-        })
+        };
+        // A grant that expired while the node was down, or an unmetered
+        // pre-G1 grant, must not survive the restart on disk either.
+        service.prune_expired_grants()?;
+        Ok(service)
     }
 
     /// Supply a trusted owner-console transport (also used by disposable test
@@ -834,7 +863,7 @@ impl PairingService {
         };
         inner.file.clients.retain(|c| c.client_id != client_id);
         inner.file.clients.push(record.clone());
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
         Ok(record)
     }
 
@@ -982,7 +1011,7 @@ impl PairingService {
         {
             c.last_seen = Some(now_unix);
         }
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
 
         Ok(IssuedToken {
             token,
@@ -1065,7 +1094,7 @@ impl PairingService {
         }
         for grant in &inner.file.grants {
             if grant.client_id == record.client_id
-                && grant.expires_at > now_unix
+                && grant.is_live(now_unix)
                 && grant.epoch == record.epoch
                 && grant.identity_fingerprint == inner.identity_fingerprint
             {
@@ -1100,7 +1129,7 @@ impl PairingService {
         // revocation drops the elevation with it rather than leaving a stale
         // `spend` waiting for the next pairing of the same key.
         inner.file.grants.retain(|g| g.client_id != client_id);
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
         Ok(epoch)
     }
 
@@ -1134,7 +1163,7 @@ impl PairingService {
             .file
             .replacement_approvals
             .retain(|a| a.client_id != client_id);
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
         Ok(())
     }
 
@@ -1209,7 +1238,7 @@ impl PairingService {
         // Grants do not survive a key rotation: they were written against a
         // specific client id and epoch by a deliberate owner action.
         inner.file.grants.retain(|g| g.client_id != client_id);
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
         Ok(rotated)
     }
 
@@ -1234,7 +1263,7 @@ impl PairingService {
         inner.file.pending_elevations.clear();
         inner.file.replacement_approvals.clear();
         inner.owner_confirmations.clear();
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
         Ok(())
     }
 
@@ -1246,6 +1275,22 @@ impl PairingService {
         client_id: &str,
         scopes: Vec<Scope>,
     ) -> Result<PendingElevation, PairingError> {
+        self.create_budget_elevation_request(client_id, scopes, None)
+    }
+
+    /// Create a pending elevation request carrying the budget the client
+    /// proposes. Writes **no** authority: the proposal is shown to the owner,
+    /// who decides the terms at the control socket.
+    pub fn create_budget_elevation_request(
+        &self,
+        client_id: &str,
+        scopes: Vec<Scope>,
+        proposed_terms: Option<GrantTerms>,
+    ) -> Result<PendingElevation, PairingError> {
+        let proposed_terms = proposed_terms
+            .map(GrantTerms::normalized)
+            .transpose()
+            .map_err(PairingError::Malformed)?;
         if scopes.is_empty() {
             return Err(PairingError::NotGrantable("no scopes requested".into()));
         }
@@ -1271,6 +1316,7 @@ impl PairingService {
             scopes,
             created_at: now,
             expires_at: now + ELEVATION_TTL_SECS,
+            proposed_terms,
         };
         self.console_challenge(
             &mut inner,
@@ -1280,7 +1326,7 @@ impl PairingService {
         )?;
         inner.file.pending_elevations.retain(|e| e.expires_at > now);
         inner.file.pending_elevations.push(op.clone());
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
         Ok(op)
     }
 
@@ -1317,7 +1363,7 @@ impl PairingService {
                 .file
                 .grants
                 .iter()
-                .any(|g| g.client_id == op.client_id && g.expires_at > now)
+                .any(|g| g.client_id == op.client_id && g.is_live(now))
             {
                 return ElevationStatus::Granted;
             }
@@ -1329,25 +1375,29 @@ impl PairingService {
             .file
             .grants
             .iter()
-            .any(|g| g.op_id == op_id && g.expires_at > now)
+            .any(|g| g.op_id == op_id && g.is_live(now))
         {
             return ElevationStatus::Granted;
         }
         ElevationStatus::Absent
     }
 
-    /// Write a spend grant. **Owner CLI only.**
+    /// Write a budget-scoped spend grant. **Owner CLI only.**
     ///
     /// Requires the operation-bound random confirmation printed only to the
-    /// owner console. The public operation label is insufficient.
+    /// owner console. The public operation label is insufficient. `terms` are
+    /// the owner's, not the client's proposal: they bound the budget, the
+    /// per-call maximum, per-recipient budgets and the window (≤ 24 h).
     pub fn grant_elevation(
         &self,
         op_id: &str,
         confirmation: &str,
+        terms: GrantTerms,
     ) -> Result<SpendGrant, PairingError> {
         if !self.owner_control_enabled {
             return Err(PairingError::OwnerChannelUnavailable);
         }
+        let terms = terms.normalized().map_err(PairingError::Malformed)?;
         let now = chrono::Utc::now().timestamp();
         let mut inner = self.lock();
         let op = inner
@@ -1359,7 +1409,7 @@ impl PairingService {
             .ok_or(PairingError::UnknownOperation)?;
         if op.expires_at <= now {
             inner.file.pending_elevations.retain(|e| e.op_id != op_id);
-            self.persist(&inner.file)?;
+            self.persist(&mut inner.file)?;
             return Err(PairingError::Expired);
         }
         Self::verify_owner_confirmation(&inner, op_id, confirmation)?;
@@ -1375,15 +1425,16 @@ impl PairingService {
             client_id: op.client_id.clone(),
             scopes: op.scopes.clone(),
             granted_at: now,
-            expires_at: now + SPEND_GRANT_TTL_SECS,
+            expires_at: now + terms.ttl_secs,
             identity_fingerprint: inner.identity_fingerprint.clone(),
             epoch: client.epoch,
             granted_by: "cli".to_string(),
+            budget: Some(GrantBudget::from_terms(&terms)),
         };
         inner.file.pending_elevations.retain(|e| e.op_id != op_id);
         inner.file.grants.retain(|g| g.client_id != grant.client_id);
         inner.file.grants.push(grant.clone());
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
         inner.owner_confirmations.remove(op_id);
         Ok(grant)
     }
@@ -1433,7 +1484,7 @@ impl PairingService {
             .replacement_approvals
             .retain(|a| a.expires_at > now);
         inner.file.replacement_approvals.push(approval.clone());
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
         Ok(approval)
     }
 
@@ -1460,7 +1511,7 @@ impl PairingService {
                 .file
                 .replacement_approvals
                 .retain(|a| a.op_id != op_id);
-            self.persist(&inner.file)?;
+            self.persist(&mut inner.file)?;
             return Err(PairingError::Expired);
         }
         Self::verify_owner_confirmation(&inner, op_id, confirmation)?;
@@ -1473,7 +1524,7 @@ impl PairingService {
             .replacement_approvals
             .retain(|a| a.op_id != op_id);
         inner.file.replacement_approvals.push(approved.clone());
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
         Ok(approved)
     }
 
@@ -1524,7 +1575,7 @@ impl PairingService {
             let a = &inner.file.replacement_approvals[idx];
             if a.expires_at <= now {
                 inner.file.replacement_approvals.remove(idx);
-                self.persist(&inner.file)?;
+                self.persist(&mut inner.file)?;
                 return Err(PairingError::Expired);
             }
             if !a.approved {
@@ -1539,8 +1590,147 @@ impl PairingService {
         }
 
         let consumed = inner.file.replacement_approvals.remove(idx);
-        self.persist(&inner.file)?;
+        self.persist(&mut inner.file)?;
         Ok(consumed)
+    }
+
+    // ── Budget-scoped spend (G1) ───────────────────────────────────
+
+    /// Reserve a call's charges against the client's live grant, atomically.
+    ///
+    /// Runs under the one mutex that guards the durable store and persists
+    /// before returning, so concurrent calls serialise here and a crash after
+    /// this point leaves the reservation counted. On any refusal nothing is
+    /// reserved; on a ledger write failure the in-memory tally is rolled back
+    /// and the call is refused.
+    pub fn reserve_spend(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        charges: Vec<Charge>,
+    ) -> Result<Reservation, BudgetRefusal> {
+        if !self.owner_control_enabled {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        let now = chrono::Utc::now().timestamp();
+        let mut inner = self.lock();
+        let fingerprint = inner.identity_fingerprint.clone();
+        let current_epoch = inner
+            .file
+            .clients
+            .iter()
+            .find(|c| c.client_id == client_id)
+            .map(|c| c.epoch);
+        if current_epoch != Some(epoch) {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        let Some(idx) = inner.file.grants.iter().position(|g| {
+            g.client_id == client_id
+                && g.epoch == epoch
+                && g.identity_fingerprint == fingerprint
+                && g.is_live(now)
+        }) else {
+            return Err(BudgetRefusal::NoGrant);
+        };
+        let before = inner.file.grants[idx].budget.clone();
+        let op_id = inner.file.grants[idx].op_id.clone();
+        inner.file.grants[idx]
+            .budget
+            .as_mut()
+            .ok_or(BudgetRefusal::NoGrant)?
+            .reserve(&charges)?;
+        if let Err(e) = self.persist(&mut inner.file) {
+            if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
+                g.budget = before;
+            }
+            return Err(BudgetRefusal::Ledger(e.to_string()));
+        }
+        Ok(Reservation {
+            client_id: client_id.to_string(),
+            op_id,
+            charges,
+        })
+    }
+
+    /// Resolve one recipient's part of a reservation to what was actually
+    /// paid (`0` for a refusal before dispatch or a confirmed failure).
+    ///
+    /// An unknown outcome is simply never resolved. Resolving against a grant
+    /// that was revoked, replaced or has expired does nothing: there is no
+    /// budget left to return the sats to.
+    pub fn resolve_spend(&self, reservation: &Reservation, recipient: &str, actual_msat: u64) {
+        let reserved = reservation.reserved_for(recipient);
+        if reserved == actual_msat {
+            return;
+        }
+        let mut inner = self.lock();
+        let Some(grant) = inner
+            .file
+            .grants
+            .iter_mut()
+            .find(|g| g.op_id == reservation.op_id && g.client_id == reservation.client_id)
+        else {
+            return;
+        };
+        let Some(budget) = grant.budget.as_mut() else {
+            return;
+        };
+        budget.resolve(recipient, reserved, actual_msat);
+        if let Err(e) = self.persist(&mut inner.file) {
+            // The in-memory tally is right; disk keeps the larger reservation,
+            // which over-counts after a restart. That is the safe direction.
+            tracing::warn!(error = %e, "spend ledger resolution not persisted");
+        }
+    }
+
+    /// Revoke spend grants now: one client's, or every client's. Returns how
+    /// many were removed. Outstanding tokens lose `spend` on their next
+    /// request, because binding verification recomputes effective scopes.
+    pub fn revoke_grants(&self, client_id: Option<&str>) -> Result<usize, PairingError> {
+        let mut inner = self.lock();
+        let before = inner.file.grants.len();
+        inner
+            .file
+            .grants
+            .retain(|g| client_id.is_some_and(|id| g.client_id != id));
+        let removed = before - inner.file.grants.len();
+        self.persist(&mut inner.file)?;
+        Ok(removed)
+    }
+
+    /// Drop grants that can no longer authorise anything and persist, if any
+    /// were found. Called at open and by the node's periodic sweep, so an
+    /// expired grant does not wait for the next unrelated write to leave disk.
+    pub fn prune_expired_grants(&self) -> Result<usize, PairingError> {
+        let now = chrono::Utc::now().timestamp();
+        let mut inner = self.lock();
+        let stale = inner.file.grants.iter().filter(|g| !g.is_live(now)).count();
+        if stale > 0 {
+            self.persist(&mut inner.file)?;
+        }
+        Ok(stale)
+    }
+
+    /// The live grants, as the owner sees them.
+    pub fn grant_views(&self) -> Vec<GrantView> {
+        let now = chrono::Utc::now().timestamp();
+        self.lock()
+            .file
+            .grants
+            .iter()
+            .filter(|g| g.is_live(now))
+            .filter_map(grant_view)
+            .collect()
+    }
+
+    /// A client's live grant, if it holds one in this deployment.
+    pub fn grant_view_for(&self, client_id: &str) -> Option<GrantView> {
+        if !self.owner_control_enabled {
+            return None;
+        }
+        self.grant_views()
+            .into_iter()
+            .find(|g| g.client_id == client_id)
     }
 
     // ── Durable persistence ────────────────────────────────────────
@@ -1552,7 +1742,13 @@ impl PairingService {
     /// Replace the durable file atomically: write a temp file in the same
     /// directory, fsync it, then rename over the target. A reader never sees a
     /// half-written store, and a crash mid-write leaves the previous state.
-    fn persist(&self, file: &PairingFile) -> Result<(), PairingError> {
+    ///
+    /// Every write also drops grants that can no longer authorise anything, so
+    /// no grant is persisted beyond its expiry.
+    fn persist(&self, file: &mut PairingFile) -> Result<(), PairingError> {
+        let now = chrono::Utc::now().timestamp();
+        file.grants.retain(|g| g.is_live(now));
+        file.version = PAIRING_FILE_VERSION;
         let bytes = serde_json::to_vec_pretty(file)
             .map_err(|e| PairingError::Io(format!("serializing pairing store: {e}")))?;
         let tmp = self.file_path.with_extension("json.tmp");
@@ -1575,6 +1771,22 @@ pub enum ElevationStatus {
     Expired,
     /// No such operation.
     Absent,
+}
+
+fn grant_view(g: &SpendGrant) -> Option<GrantView> {
+    let b = g.budget.as_ref()?;
+    Some(GrantView {
+        op_id: g.op_id.clone(),
+        client_id: g.client_id.clone(),
+        granted_at: g.granted_at,
+        expires_at: g.expires_at,
+        budget_msat: b.budget_msat,
+        used_msat: b.used_msat,
+        remaining_msat: b.remaining_msat(),
+        per_call_max_msat: b.per_call_max_msat,
+        per_recipient_msat: b.per_recipient_msat.clone(),
+        used_by_recipient: b.used_by_recipient.clone(),
+    })
 }
 
 fn parse_pubkey(hex_key: &str) -> Result<ed25519_dalek::VerifyingKey, PairingError> {

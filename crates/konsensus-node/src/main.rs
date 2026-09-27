@@ -123,8 +123,12 @@ async fn main() -> Result<()> {
         Command::PairStatus { config } => {
             owner_cmd::cmd_pair_status(&config).await?;
         }
-        Command::Grant { op_id, config } => {
-            owner_cmd::cmd_grant(&config, &op_id).await?;
+        Command::Grant { op_id, budget, for_, per_call, recipient, yes, config } => {
+            let flags = owner_cmd::GrantFlags { budget_sats: budget, window: for_, per_call_sats: per_call, recipients: recipient, yes };
+            owner_cmd::cmd_grant(&config, &op_id, flags).await?;
+        }
+        Command::GrantRevoke { client_id, all, config } => {
+            owner_cmd::cmd_grant_revoke(&config, client_id.as_deref(), all).await?;
         }
         Command::ApproveReplacement { op_id, mnemonic, config } => {
             owner_cmd::cmd_approve_replacement(&config, &op_id, mnemonic.as_deref()).await?;
@@ -1076,6 +1080,12 @@ async fn cmd_start(
                 "owner-run mode: elevation can be granted at this socket"
             );
             tokio::spawn(server.serve(node.shutdown_rx()));
+            // G1: an expired spend grant leaves disk within a minute, not at
+            // the next unrelated write.
+            tokio::spawn(konsensus_api::control::sweep_expired_grants(
+                Arc::clone(&pairing_service),
+                node.shutdown_rx(),
+            ));
         }
         #[cfg(not(unix))]
         {

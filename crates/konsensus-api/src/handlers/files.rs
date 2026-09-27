@@ -8,7 +8,9 @@
 //! File transfer uses `KIND_FILE_REF` (200) UKM envelopes. The plaintext
 //! payload is a JSON `FilePayload` containing metadata + base64 file data.
 
-use crate::auth::scoped::{ScopedAuth, Admin, Read, Spend};
+use crate::auth::scoped::{ScopedAuth, Admin, Read};
+use crate::metered::MeteredSpend;
+use crate::spend_budget::Charge;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -353,7 +355,7 @@ async fn delete_file(
 /// encrypts it via Double Ratchet, creates a UKM envelope with KIND_FILE_REF,
 /// and delivers it. Same pipeline as compose_message but for files.
 async fn send_file(
-    _auth: ScopedAuth<Spend>,
+    auth: MeteredSpend,
     State(state): State<Arc<AppState>>,
     Path(file_id): Path<String>,
     Json(req): Json<SendFileRequest>,
@@ -403,9 +405,20 @@ async fn send_file(
         })?;
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
+    // G1: debit the grant before the invoice is requested.
+    let peer_key = peer_id.to_hex();
+    let debit = auth.debit(
+        &state,
+        vec![Charge {
+            recipient: peer_key.clone(),
+            amount_msat: super::messages::caps::payable(price_msat),
+        }],
+    )?;
+
     // Create real payment proof — requests invoice from recipient (Principle 2).
-    let (payment_hash, preimage, amount_msat) =
-        create_payment_proof(&state, price_msat, &peer_id).await?;
+    let paid = create_payment_proof(&state, price_msat, &peer_id).await;
+    debit.resolve_proof(&peer_key, &paid);
+    let (payment_hash, preimage, amount_msat) = paid?;
     let proof =
         konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
 

@@ -49,6 +49,7 @@ use crate::pairing::{
     grant_confirmation_phrase, replacement_confirmation_phrase, write_protected, PairingError,
     PairingService,
 };
+use crate::spend_budget::{self, GrantTerms, GrantView};
 
 /// Socket file name inside the data directory.
 pub const SOCKET_FILE: &str = "control.sock";
@@ -64,12 +65,21 @@ pub enum ControlRequest {
         /// Pending operation id.
         op_id: String,
     },
-    /// Write a spend grant for a pending elevation request.
+    /// Write a budget-scoped spend grant for a pending elevation request.
     Grant {
         /// Pending operation id.
         op_id: String,
         /// The phrase the owner typed. Must name `op_id`.
         confirmation: String,
+        /// The budget window the owner approves. Always explicit: the node
+        /// never falls back to the client's proposal on its own.
+        terms: GrantTerms,
+    },
+    /// Revoke spend grants now — one client's, or every client's.
+    RevokeGrant {
+        /// Client whose grant to revoke; `None` revokes all.
+        #[serde(default)]
+        client_id: Option<String>,
     },
     /// Approve **and execute** a pending live-identity replacement.
     ///
@@ -113,6 +123,9 @@ pub enum ControlResponse {
         pending_elevations: Vec<PendingSummary>,
         /// Pending replacement approvals awaiting the owner.
         pending_replacements: Vec<ReplacementSummary>,
+        /// Live budget grants and what is left of each.
+        #[serde(default)]
+        grants: Vec<GrantView>,
     },
     /// A rendered pending operation and public label, never its secret nonce.
     Describe {
@@ -120,6 +133,10 @@ pub enum ControlResponse {
         summary: String,
         /// Public label to match against the owner node's console.
         confirmation_label: String,
+        /// The budget the client proposed, if any — a suggestion the owner
+        /// may accept, narrow or replace. Carries no authority.
+        #[serde(default)]
+        proposed_terms: Option<GrantTerms>,
     },
     /// The operation succeeded.
     Ok {
@@ -285,16 +302,19 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                         approved: a.approved,
                     })
                     .collect(),
+                grants: service.grant_views(),
             }
         }
         ControlRequest::Describe { op_id } => describe(service, &op_id),
         ControlRequest::Grant {
             op_id,
             confirmation,
-        } => match service.grant_elevation(&op_id, &confirmation) {
+            terms,
+        } => match service.grant_elevation(&op_id, &confirmation, terms) {
             Ok(g) => ControlResponse::Ok {
                 detail: format!(
-                    "granted {} to client {} until {} (epoch {})",
+                    "granted {} to client {} until {} (epoch {}): {} sats, at most {} sats per \
+                     call. Revoke any time with: konsensus grant-revoke --client-id {}",
                     g.scopes
                         .iter()
                         .map(|s| s.as_str())
@@ -302,11 +322,33 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                         .join("+"),
                     g.client_id,
                     g.expires_at,
-                    g.epoch
+                    g.epoch,
+                    g.budget
+                        .as_ref()
+                        .map(|b| spend_budget::sats(b.budget_msat))
+                        .unwrap_or_default(),
+                    g.budget
+                        .as_ref()
+                        .map(|b| spend_budget::sats(b.per_call_max_msat))
+                        .unwrap_or_default(),
+                    g.client_id,
                 ),
             },
             Err(e) => error(e),
         },
+        ControlRequest::RevokeGrant { client_id } => {
+            match service.revoke_grants(client_id.as_deref()) {
+                Ok(n) => ControlResponse::Ok {
+                    detail: format!(
+                        "revoked {n} spend grant(s){} — spend stops on the client's next request",
+                        client_id
+                            .map(|id| format!(" for {id}"))
+                            .unwrap_or_default()
+                    ),
+                },
+                Err(e) => error(e),
+            }
+        }
         ControlRequest::ApproveReplacement {
             op_id,
             confirmation,
@@ -442,10 +484,19 @@ fn error(e: PairingError) -> ControlResponse {
 fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
     let file = service.snapshot();
     if let Some(op) = file.pending_elevations.iter().find(|e| e.op_id == op_id) {
+        let proposal = match &op.proposed_terms {
+            Some(t) => format!(
+                "\n\nThe client proposes:\n{}",
+                spend_budget::describe_terms(t)
+            ),
+            None => "\n\nThe client proposed no budget; you set it.".to_string(),
+        };
         let summary = format!(
-            "ELEVATION REQUEST\n  operation:   {}\n  client:      {} ({})\n  scopes:      {}\n  \
-             expires at:  {}\n\nGranting this lets that client MOVE VALUE without asking again \
-             until the grant expires.",
+            "SPEND BUDGET REQUEST\n  operation:   {}\n  client:      {} ({})\n  scopes:      {}\n  \
+             request expires at:  {}{proposal}\n\nGranting this lets that client MOVE VALUE \
+             without asking again, up to the budget you set, until the window closes (24 h at \
+             most). The node debits every paid call before it pays and refuses with \
+             budget_exceeded once the budget is spent.",
             op.op_id,
             op.client_name,
             op.client_id,
@@ -459,6 +510,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
         return ControlResponse::Describe {
             confirmation_label: grant_confirmation_phrase(op),
             summary,
+            proposed_terms: op.proposed_terms.clone(),
         };
     }
     if let Some(a) = file.replacement_approvals.iter().find(|a| a.op_id == op_id) {
@@ -481,6 +533,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
         return ControlResponse::Describe {
             confirmation_label: replacement_confirmation_phrase(a),
             summary,
+            proposed_terms: None,
         };
     }
     ControlResponse::Error {
@@ -558,6 +611,30 @@ impl ControlServer {
             }
         }
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Periodically drop expired spend grants from disk until shutdown (G1).
+///
+/// Expired grants are already inert — binding verification ignores them — and
+/// every write prunes them. This sweep bounds how long an expired grant can
+/// sit on disk when nothing else writes.
+pub async fn sweep_expired_grants(
+    service: Arc<PairingService>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let every = std::time::Duration::from_secs(60);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            _ = tokio::time::sleep(every) => {
+                match service.prune_expired_grants() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(removed = n, "expired spend grants removed"),
+                    Err(e) => tracing::warn!(error = %e, "expired spend grant sweep failed"),
+                }
+            }
+        }
     }
 }
 

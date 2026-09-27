@@ -8,7 +8,8 @@
 //! on the user's own node — it is encrypted before storage or transport
 //! (Principle 4: data sovereignty).
 
-use crate::auth::scoped::{ScopedAuth, Spend};
+use crate::metered::MeteredSpend;
+use crate::spend_budget::Charge;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1564,7 +1565,7 @@ async fn compose_room_member(
 /// 5. Sign with Ed25519
 /// 6. Store, deliver via transport, broadcast to WebSocket
 pub(super) async fn compose_message(
-    _auth: ScopedAuth<Spend>,
+    auth: MeteredSpend,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ComposeRequest>,
 ) -> Result<Json<ComposeResponse>, ApiError> {
@@ -1660,6 +1661,18 @@ pub(super) async fn compose_message(
             prices.push((*member, quoted_price(&state, member, req.kind, current_block_height).await?));
         }
         super::caps::check_room(&prices, req.max_total_msat, req.max_recipient_msat.as_ref())?;
+        // G1: the whole fan-out is one call against a budget grant, debited
+        // before any member's invoice is requested.
+        let debit = auth.debit(
+            &state,
+            prices
+                .iter()
+                .map(|(member, price)| Charge {
+                    recipient: member.to_hex(),
+                    amount_msat: *price,
+                })
+                .collect(),
+        )?;
 
         // Fan out to members with bounded parallelism. Each member future is
         // fully independent (its own payment proof + envelope — Principle 2 is
@@ -1693,6 +1706,17 @@ pub(super) async fn compose_message(
         // is the lowest-indexed member that succeeded, matching the old
         // first-success-wins behaviour.
         outcomes.sort_by_key(|(idx, _)| *idx);
+
+        // Resolve each member's reservation from its terminal outcome. An
+        // unknown member keeps its full price reserved, as #80 reports it.
+        for (_idx, outcome) in &outcomes {
+            let r = &outcome.receipt;
+            match r.status {
+                "settled" => debit.settled(&r.recipient, r.amount_msat),
+                "refused" => debit.released(&r.recipient),
+                _ => {}
+            }
+        }
 
         let mut any_delivered = false;
         let mut total_amount_msat: u64 = 0;
@@ -1804,6 +1828,7 @@ pub(super) async fn compose_message(
                 if req.max_total_msat.is_some() || req.max_recipient_msat.is_some() {
                     return Err(ApiError::PriceCapExceeded("First-contact admission has no confirmed quote. Establish admission separately before a capped send; no invoice was requested or paid.".into()));
                 }
+                auth.refuse_unpriced("first-contact admission is priced by the recipient at invoice time")?;
                 first_contact_admission(&state, &peer_id).await?;
 
                 // Poll for the session the target establishes after promotion via
@@ -1839,9 +1864,20 @@ pub(super) async fn compose_message(
         };
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
+        // G1: debit the grant before the invoice is requested.
+        let peer_key = peer_id.to_hex();
+        let debit = auth.debit(
+            &state,
+            vec![Charge {
+                recipient: peer_key.clone(),
+                amount_msat: price_msat,
+            }],
+        )?;
+
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
-        let (payment_hash, preimage_bytes, amount_msat) =
-            create_payment_proof(&state, price_msat, &peer_id).await?;
+        let paid = create_payment_proof(&state, price_msat, &peer_id).await;
+        debit.resolve_proof(&peer_key, &paid);
+        let (payment_hash, preimage_bytes, amount_msat) = paid?;
         let proof =
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
 
