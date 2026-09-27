@@ -61,6 +61,7 @@ pub mod error;
 pub mod freshness;
 pub mod file_staging;
 pub mod handlers;
+pub mod invoice_refusal;
 pub mod metered;
 pub mod metrics;
 pub mod pairing;

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use konsensus_crypto::noise::NoiseSession;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+
 use tracing::{debug, error, info, warn};
 
 use konsensus_core::traits::transport::TransportError;
@@ -453,22 +453,23 @@ pub(super) async fn handle_incoming(
 
     // Register connection
     let now = Instant::now();
-    let conn = Arc::new(Mutex::new(PeerConnection {
+    let conn = super::Connection::new(PeerConnection {
         source_ip: addr.ip(),
         privileged,
         noise,
         writer,
         tier,
         capabilities,
+        connected_at: now,
         last_recv: now,
         pending_ping: None,
         invalid_frame_level: 0.0,
         invalid_frame_last_leak: now,
         bytes_received: 0,
         memory_budget_window_start: now,
-    }));
+    }, peer_node_id, Arc::clone(&ctx.peers))?;
 
-    ctx.peers.write().await.insert(peer_node_id, Arc::clone(&conn));
+    if let Some(old) = ctx.peers.write().await.insert(peer_node_id, Arc::clone(&conn)) { old.close(); }
 
     // Spawn reader task
     spawn_reader_task(

@@ -81,7 +81,7 @@ pub(crate) struct MsgHandlerDeps {
 /// copy-on-write, so this in-flight snapshot is unaffected by a concurrent
 /// revocation.
 #[allow(clippy::too_many_arguments)]
-async fn whitelist_then_verify(
+pub(crate) async fn whitelist_then_verify(
     envelope: &konsensus_core::UkmEnvelope,
     membrane: &konsensus_api::membrane::Membrane,
     peer_registry: &tokio::sync::RwLock<PeerRegistry>,
