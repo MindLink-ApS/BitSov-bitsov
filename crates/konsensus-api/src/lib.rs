@@ -188,25 +188,6 @@ fn parse_cors_allowed_origins(raw: &str) -> Vec<HeaderValue> {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_cors_origins_are_not_wildcard() {
-        let origins = parse_cors_allowed_origins("http://localhost:1420, https://node.example");
-        assert!(
-            origins
-                .iter()
-                .any(|origin| origin == HeaderValue::from_static("http://localhost:1420"))
-        );
-        assert!(
-            !origins
-                .iter()
-                .any(|origin| origin == HeaderValue::from_static("*"))
-        );
-    }
-}
 
 /// Start the API server.
 ///
@@ -261,4 +242,24 @@ pub async fn serve(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_cors_origins_are_not_wildcard() {
+        let origins = parse_cors_allowed_origins("http://localhost:1420, https://node.example");
+        assert!(
+            origins
+                .iter()
+                .any(|origin| origin == HeaderValue::from_static("http://localhost:1420"))
+        );
+        assert!(
+            !origins
+                .iter()
+                .any(|origin| origin == HeaderValue::from_static("*"))
+        );
+    }
 }
