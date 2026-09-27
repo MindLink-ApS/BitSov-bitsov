@@ -890,6 +890,29 @@ impl LightningProvider for LdkProvider {
         })
     }
 
+    async fn create_stateless_invoice(
+        &self,
+        amount_msat: u64,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<Invoice, LightningError> {
+        let desc = LdkInvoiceDescription::Direct(
+            LdkDescription::new(description.to_owned())
+                .map_err(|e| LightningError::InvoiceCreation(e.to_string()))?,
+        );
+        let signed = self.node.bolt11_payment()
+            .receive_stateless(amount_msat, &desc, expiry_secs)
+            .map_err(|e| LightningError::InvoiceCreation(e.to_string()))?;
+        Ok(Invoice {
+            payment_hash: signed.payment_hash().to_string(),
+            bolt11: signed.to_string(),
+            amount_msat,
+            description: description.to_owned(),
+            expiry_secs,
+            created_at: signed.duration_since_epoch().as_secs(),
+        })
+    }
+
     #[instrument(skip(self), fields(bolt11))]
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11

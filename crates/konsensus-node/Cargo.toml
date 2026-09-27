@@ -50,6 +50,8 @@ zeroize.workspace = true
 # stays the wired store until an operator flips a relay to the durable backend.
 sqlx.workspace = true
 
+lightning-invoice.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 async-trait.workspace = true

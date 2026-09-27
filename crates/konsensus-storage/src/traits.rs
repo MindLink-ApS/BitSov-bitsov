@@ -144,8 +144,16 @@ pub trait Storage: Send + Sync {
 
     // ── Nonces (replay protection) ─────────────────────────────────────
 
-    /// Store a nonce for replay protection.
-    /// Returns `false` if the nonce already exists (replay detected).
+    /// Atomically consume nonce and payment replay keys, or write neither.
+    /// Unsupported backends fail closed.
+    async fn store_paid_nonce(
+        &self, nonce: &Nonce, payment_hash: &[u8; 32], sender: &NodeId, message_id: &MessageId,
+    ) -> Result<konsensus_core::gate::PaidReplay, StorageError> {
+        let _ = (nonce, payment_hash, sender, message_id);
+        Err(StorageError::Unsupported("atomic paid replay protection not implemented".into()))
+    }
+
+    /// Store a nonce; returns `false` if it already exists.
     async fn store_nonce(&self, nonce: &Nonce, sender: &NodeId) -> Result<bool, StorageError>;
 
     /// Store an accepted Lightning payment hash for economic replay protection.

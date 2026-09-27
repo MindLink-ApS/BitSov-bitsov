@@ -903,3 +903,31 @@ mod replay_e2e {
         );
     }
 }
+
+#[tokio::test]
+async fn paid_replay_is_atomic_and_durable() {
+    use konsensus_core::gate::PaidReplay;
+    let dir = tempfile::tempdir().unwrap();
+    let url = dir.path().join("replay.db").to_str().unwrap().to_string();
+    let store = SqliteStorage::open(&url).await.unwrap();
+    let sender = make_node_id(7);
+    let message = MessageId::from_bytes([1; 32]);
+    let first = Nonce::from_bytes([1; 24]);
+    let second = Nonce::from_bytes([2; 24]);
+    assert_eq!(store.check_and_store_paid(&first, &[1; 32], &sender, &message).await.unwrap(), PaidReplay::Accepted);
+    assert_eq!(store.check_and_store_paid(&second, &[1; 32], &sender, &message).await.unwrap(), PaidReplay::PaymentReused);
+    assert!(!store.has_nonce(&second).await.unwrap(), "rejected proof persisted a fresh nonce");
+    assert_eq!(store.check_and_store_paid(&first, &[2; 32], &sender, &message).await.unwrap(), PaidReplay::NonceReused);
+    drop(store);
+    let store = Arc::new(SqliteStorage::open(&url).await.unwrap());
+    assert_eq!(store.check_and_store_paid(&second, &[2; 32], &sender, &message).await.unwrap(), PaidReplay::Accepted, "nonce rejection must not consume the new payment");
+    let mut attempts = tokio::task::JoinSet::new();
+    for n in 3u8..23 {
+        let store = store.clone();
+        attempts.spawn(async move { store.check_and_store_paid(&Nonce::from_bytes([n; 24]), &[3; 32], &sender, &message).await.unwrap() });
+    }
+    let mut results = Vec::new();
+    while let Some(result) = attempts.join_next().await { results.push(result.unwrap()); }
+    assert_eq!(results.iter().filter(|r| **r == PaidReplay::Accepted).count(), 1);
+    assert_eq!(results.iter().filter(|r| **r == PaidReplay::PaymentReused).count(), 19);
+}

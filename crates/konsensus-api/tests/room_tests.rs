@@ -878,6 +878,7 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,

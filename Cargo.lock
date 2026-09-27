@@ -2102,6 +2102,7 @@ dependencies = [
  "hex",
  "konsensus-core",
  "ldk-node",
+ "lightning-invoice",
  "mockall",
  "mockito",
  "rand 0.8.6",
@@ -2137,6 +2138,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "snow",
+ "socket2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2168,6 +2170,7 @@ dependencies = [
  "konsensus-pricing",
  "konsensus-routing",
  "konsensus-storage",
+ "lightning-invoice",
  "metrics",
  "rand 0.8.6",
  "reqwest",
@@ -2232,6 +2235,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2250,8 +2254,6 @@ dependencies = [
 [[package]]
 name = "ldk-node"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d830ef2d6b00f089fb6e3ac845370ebf0f35f9d11ce81b3a097c1580d2dce358"
 dependencies = [
  "base64 0.22.1",
  "bdk_chain",

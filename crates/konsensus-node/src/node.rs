@@ -158,6 +158,11 @@ impl KonsensusNode {
                 provider.probe_payment_capability().await;
                 Arc::new(provider)
             }
+            LightningConfig::SharedMock { ledger_path, initial_balance_msat } => {
+                Arc::new(konsensus_lightning::shared_mock::SharedMockProvider::new(
+                    ledger_path, &identity.node_id().to_hex(), *initial_balance_msat,
+                ).map_err(|e| anyhow::anyhow!("shared mock: {e}"))?)
+            }
             LightningConfig::Mock {
                 initial_balance_msat,
             } => {
