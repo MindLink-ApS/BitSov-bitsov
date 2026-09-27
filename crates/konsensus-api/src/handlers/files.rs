@@ -199,10 +199,15 @@ fn validate_filename(name: &str) -> Result<(), ApiError> {
 
 /// `POST /api/v1/files` — upload a file to the local node.
 async fn upload_file(
-    _auth: ScopedAuth<Admin>,
+    auth: crate::auth::AuthUser,
     State(state): State<Arc<AppState>>,
     Json(req): Json<UploadRequest>,
 ) -> Result<Json<UploadResponse>, ApiError> {
+    // Staging costs no Lightning principal. AuthUser revalidates the paired
+    // grant on every request; do not use the paid-route Spend extractor here.
+    if !auth.has(crate::auth::Scope::Admin) && !auth.has(crate::auth::Scope::Spend) {
+        return Err(ApiError::Forbidden("file upload requires spend or admin".into()));
+    }
     // Validate filename and MIME type
     validate_filename(&req.filename)?;
     if req.mime_type.len() > MAX_MIME_TYPE_LEN {

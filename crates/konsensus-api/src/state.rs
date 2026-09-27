@@ -249,6 +249,8 @@ pub struct AppState {
 /// Data returned via the invoice request oneshot channel.
 #[derive(Debug)]
 pub struct InvoiceResponseData {
+    /// Authenticated Noise peer that supplied this invoice.
+    pub recipient: NodeId,
     /// BOLT11 payment request string from the recipient's wallet.
     pub bolt11: String,
     /// Payment hash (hex) from the recipient's invoice.

@@ -269,7 +269,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         // admission path; privileged (paid) peers and non-admission
                         // purposes (dropped by the handler) are unaffected.
                         if !privileged
-                            && purpose == ADMISSION_INVOICE_PURPOSE
+                            && (purpose == ADMISSION_INVOICE_PURPOSE || purpose.starts_with("konsensus:admission:"))
                             && admission_invoice_rate_limited(
                                 &mut last_admission_invoice,
                                 &peer_id,
@@ -980,6 +980,26 @@ async fn handle_invoice_requested_gated(
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
 ) {
+    if let Some(kind) = purpose.strip_prefix("konsensus:admission:").and_then(|s| s.parse::<u16>().ok()) {
+        // Both prices originate here. Bind the message quote and request nonce
+        // into the signed BOLT11 description; no caller-supplied price is used.
+        let (Ok(admission), Ok(message)) = (
+            pricing.get_price_msat(ADMISSION_INVOICE_KIND).await,
+            pricing.get_price_msat(kind).await,
+        ) else { return; };
+        let payable = |n: u64| if n == 0 { 0 } else { n.max(1000) };
+        let description = format!("konsensus:{request_id}:message={}", payable(message));
+        match lightning.create_invoice(payable(admission).max(1000), &description, 3600).await {
+            Ok(invoice) => {
+                let response = Frame::InvoiceResponse { request_id: request_id.into(), bolt11: invoice.bolt11, payment_hash: invoice.payment_hash };
+                if let Err(e) = transport.send_frame(peer_id, &response).await {
+                    warn!(peer = %peer_id, error = %e, "failed to send repriced admission invoice");
+                }
+            }
+            Err(e) => warn!(peer = %peer_id, error = %e, "failed to create repriced admission invoice"),
+        }
+        return;
+    }
     if privileged {
         handle_invoice_requested(peer_id, request_id, amount_msat, purpose, lightning, transport).await;
         return;
@@ -1105,7 +1125,7 @@ async fn handle_invoice_response(
     info!(peer = %peer_id, %request_id, "received invoice response from peer");
     let mut requests = invoice_requests.lock().await;
     if let Some(sender) = requests.remove(request_id) {
-        let data = InvoiceResponseData { bolt11, payment_hash };
+        let data = InvoiceResponseData { recipient: *peer_id, bolt11, payment_hash };
         if sender.send(data).is_err() {
             warn!(%request_id, "invoice response receiver already dropped (timeout?)");
         }

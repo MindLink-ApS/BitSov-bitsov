@@ -84,6 +84,11 @@ impl IntoResponse for ApiError {
                 "error": message, "code": "price_cap_exceeded"
             }))).into_response();
         }
+        if let ApiError::PaymentProofUnavailable { amount_msat, reason } = &self {
+            return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": reason, "code": "payment_settled_send_incomplete", "amount_msat": amount_msat
+            }))).into_response();
+        }
         let (status, message) = match &self {
             ApiError::PriceCapExceeded(_) => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),

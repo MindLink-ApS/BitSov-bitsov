@@ -384,3 +384,21 @@ async fn delete_file_requires_auth() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn spend_upload_is_bounded_and_does_not_grant_file_management() {
+    let state = test_state();
+    let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, vec![auth::Scope::Spend]).unwrap();
+    let app = build_router(state);
+    let request = |method: &str, path: &str, body: serde_json::Value| Request::builder()
+        .method(method).uri(path).header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+    let response = app.clone().oneshot(request("POST", "/api/v1/files", serde_json::json!({"filename":"paired.txt", "mime_type":"text/plain", "data_b64":"aGVsbG8="}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let uploaded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let response = app.clone().oneshot(request("DELETE", &format!("/api/v1/files/{}", uploaded["file_id"].as_str().unwrap()), serde_json::json!({}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = app.oneshot(request("POST", "/api/v1/files", serde_json::json!({"filename":"large.txt", "mime_type":"text/plain", "data_b64":"A".repeat(6*1024*1024)}))).await.unwrap();
+    assert!(response.status().is_client_error());
+}

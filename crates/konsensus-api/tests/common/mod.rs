@@ -529,11 +529,12 @@ impl LightningProvider for StubLightning {
         })
     }
 
-    async fn pay_invoice(&self, _bolt11: &str) -> Result<PaymentDetails, LightningError> {
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+        let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().ok();
         Ok(PaymentDetails {
-            payment_hash: "bb".repeat(32),
+            payment_hash: invoice.as_ref().map_or("bb".repeat(32), |i| i.payment_hash().to_string()),
             preimage: Some("cc".repeat(32)),
-            amount_msat: 1000,
+            amount_msat: invoice.and_then(|i| i.amount_milli_satoshis()).unwrap_or(1000),
             status: PaymentStatus::Settled,
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
@@ -1121,7 +1122,7 @@ pub fn create_test_bolt11(amount_msat: u64) -> String {
     use bitcoin::hashes::{sha256, Hash};
     use lightning_invoice::{Currency, InvoiceBuilder};
 
-    let payment_hash = sha256::Hash::from_slice(&[0u8; 32]).unwrap();
+    let payment_hash = sha256::Hash::hash(&[0xcc; 32]);
     let payment_secret = lightning_invoice::PaymentSecret([42u8; 32]);
 
     let invoice = InvoiceBuilder::new(Currency::BitcoinTestnet)

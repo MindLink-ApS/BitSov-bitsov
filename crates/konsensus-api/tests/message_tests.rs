@@ -1992,8 +1992,9 @@ async fn compose_happy_path_invoice_flow() {
                 // LNbits/LND round up sub-sat amounts, so use max(amount, 1000).
                 let invoice_amount = amount_msat.max(1000);
                 Some(konsensus_api::state::InvoiceResponseData {
+                recipient: peer_id,
                     bolt11: create_test_bolt11(invoice_amount),
-                    payment_hash: "ab".repeat(32),
+                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );
@@ -2095,10 +2096,11 @@ async fn compose_rejects_invoice_amount_mismatch() {
     // Respond with an invoice for 10x the requested amount (overcharging).
     let transport = Arc::new(
         ConnectedStubTransport::new(vec![peer_id], Arc::clone(&invoice_requests))
-            .with_invoice_responder(|_request_id, amount_msat| {
+            .with_invoice_responder(move |_request_id, amount_msat| {
                 Some(konsensus_api::state::InvoiceResponseData {
+                recipient: peer_id,
                     bolt11: create_test_bolt11(amount_msat * 10), // 10x overcharge!
-                    payment_hash: "ab".repeat(32),
+                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );
@@ -2194,11 +2196,12 @@ async fn compose_keysend_fallback_to_invoice() {
     // Transport with invoice responder (for fallback).
     let transport = Arc::new(
         ConnectedStubTransport::new(vec![peer_id], Arc::clone(&invoice_requests))
-            .with_invoice_responder(|_request_id, amount_msat| {
+            .with_invoice_responder(move |_request_id, amount_msat| {
                 let invoice_amount = amount_msat.max(1000);
                 Some(konsensus_api::state::InvoiceResponseData {
+                recipient: peer_id,
                     bolt11: create_test_bolt11(invoice_amount),
-                    payment_hash: "ab".repeat(32),
+                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );
@@ -2218,17 +2221,8 @@ async fn compose_keysend_fallback_to_invoice() {
                 created_at: 1_700_000_000,
             })
         }
-        async fn pay_invoice(&self, _bolt11: &str) -> Result<PaymentDetails, LightningError> {
-            Ok(PaymentDetails {
-                payment_hash: "bb".repeat(32),
-                preimage: Some("cc".repeat(32)),
-                amount_msat: 1000,
-                status: PaymentStatus::Settled,
-                direction: PaymentDirection::Outgoing,
-                timestamp: 1_700_000_000,
-                memo: None,
-                fee_msat: None,
-            })
+        async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+            StubLightning.pay_invoice(bolt11).await
         }
         async fn get_payment_status(&self, _: &str) -> Result<PaymentDetails, LightningError> {
             Err(LightningError::PaymentNotFound("not impl".into()))

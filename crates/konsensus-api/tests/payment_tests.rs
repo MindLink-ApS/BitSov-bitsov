@@ -787,6 +787,7 @@ async fn invoice_request_oneshot_channel_works() {
 
     // Simulate receiving an InvoiceResponse (what main.rs would do).
     let data = konsensus_api::state::InvoiceResponseData {
+                recipient: *state.identity.node_id(),
         bolt11: "lnbc250n1pj...test".into(),
         payment_hash: "ab".repeat(32),
     };
@@ -832,6 +833,7 @@ async fn invoice_request_timeout_cleanup() {
         .expect("should be in map");
 
     let data = konsensus_api::state::InvoiceResponseData {
+                recipient: *state.identity.node_id(),
         bolt11: "lnbc...".into(),
         payment_hash: "ab".repeat(32),
     };

@@ -282,6 +282,7 @@ async fn unprivileged_invoice_error_does_not_drop_sender_channel() {
     assert!(
         sender
             .send(InvoiceResponseData {
+                recipient: peer_id,
                 bolt11: "lnbc100n1...".to_string(),
                 payment_hash: "hash".to_string(),
             })

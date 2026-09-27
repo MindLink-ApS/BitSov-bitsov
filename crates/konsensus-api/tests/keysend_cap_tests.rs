@@ -180,12 +180,13 @@ async fn review_fixture(
         .with_invoice_responder(move |_, amount| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some(konsensus_api::state::InvoiceResponseData {
+                recipient: peer,
                 bolt11: if reply {
                     create_test_bolt11(amount)
                 } else {
                     "invalid invoice".into()
                 },
-                payment_hash: "00".repeat(32),
+                payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
             })
         });
     Arc::get_mut(&mut state).unwrap().transport = Arc::new(transport);
@@ -317,8 +318,9 @@ async fn room_reserves_unknown_member_alongside_safe_fallback_within_total_cap()
             .with_invoice_responder(move |_, amount| {
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Some(konsensus_api::state::InvoiceResponseData {
+                recipient: second,
                     bolt11: create_test_bolt11(amount),
-                    payment_hash: "00".repeat(32),
+                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );

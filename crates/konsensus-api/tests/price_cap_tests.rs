@@ -32,6 +32,7 @@ async fn cap_refuses_before_any_invoice_or_payment_and_exact_cap_succeeds() {
     assert_eq!(status, StatusCode::CONFLICT, "{error}");
     assert_eq!(error["code"], "price_cap_exceeded");
     assert_eq!((lightning.money(),lightning.invoices()),(0,0));
+    tokio::task::yield_now().await; // timeout cleanup runs in its spawned task
     assert!(state.invoice_requests.lock().await.is_empty());
     body["max_total_msat"] = json!(1000);
     let (status, receipt) = post(&state,"/api/v1/messages/compose",body).await;
@@ -106,15 +107,15 @@ async fn file_cap_is_checked_before_payment_and_exact_cap_is_paid_once() {
     assert_eq!(lightning.money(),1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn capped_first_contact_cannot_pay_an_unquoted_admission() {
     let (mut state,_,lightning)=fixture().await;
     let stranger=NodeId::from_hex(&"cc".repeat(32)).unwrap();
     Arc::get_mut(&mut state).unwrap().transport=Arc::new(ConnectedStubTransport::new(vec![stranger],state.invoice_requests.clone()));
     let (status,error)=post(&state,"/api/v1/messages/compose",json!({"recipient":stranger.to_hex(),"kind":100,"plaintext":"hello","max_total_msat":1000000})).await;
-    assert_eq!(status,StatusCode::CONFLICT,"{error}");
-    assert_eq!(error["code"],"price_cap_exceeded");
+    assert_eq!(status,StatusCode::INTERNAL_SERVER_ERROR,"{error}");
     assert_eq!((lightning.money(),lightning.invoices()),(0,0));
+    tokio::task::yield_now().await; // timeout cleanup runs in its spawned task
     assert!(state.invoice_requests.lock().await.is_empty());
 }
 

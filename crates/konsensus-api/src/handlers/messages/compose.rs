@@ -479,6 +479,10 @@ async fn create_payment_proof_via_invoice(
         )));
     }
 
+    if response.recipient != *peer_id || response.payment_hash != invoice.payment_hash().to_string() || invoice.is_expired() {
+        return Err(ApiError::Lightning("recipient invoice provenance/hash/expiry mismatch".into()));
+    }
+
     // Pay the recipient's invoice, then poll the in-flight payment to terminal
     // settlement (it commonly returns Pending/InFlight before the preimage is
     // known; treating that as failure dropped settling messages).
@@ -503,6 +507,11 @@ async fn create_payment_proof_via_invoice(
         })?;
 
     let hash_bytes: [u8; 32] = Sha256::digest(preimage_bytes).into();
+    if hex::encode(hash_bytes) != invoice.payment_hash().to_string()
+        || details.payment_hash != invoice.payment_hash().to_string()
+        || details.amount_msat != invoice_msat || details.direction != PaymentDirection::Outgoing {
+        return Err(ApiError::PaymentProofUnavailable { amount_msat: invoice_msat, reason: "settled invoice payment identity/proof mismatch".into() });
+    }
 
     tracing::info!(
         peer = %peer_id,
@@ -604,8 +613,8 @@ enum PriorAdmission {
     None,
     /// A payment MAY have been dispatched (the pre-`pay_invoice` guard) but is not
     /// confirmed tracked. A retry must PROBE this hash: promote to [`Self::InFlight`]
-    /// if the backend knows it, or clear + reopen once the bounded TTL lets it.
-    /// Never silently re-pays inside the window (review finding #1, 2026-07-07).
+    /// if the backend knows it. Only a matching terminal failure clears it.
+    /// Time passing or PaymentNotFound never authorizes another payment.
     DispatchUnknown {
         payment_hash: String,
         amount_msat: u64,
@@ -634,9 +643,8 @@ enum AdmissionRecord {
     /// by `DispatchUnknown` once we pay. The short TTL backstops a panic leak.
     Reserved { started_at: Instant },
     /// Payment MAY be dispatched; carries the BOLT11 hash so a retry can probe it.
-    /// Bounded TTL so a never-dispatched attempt cannot brick a peer forever.
+    /// No TTL: only positive failure evidence permits another attempt.
     DispatchUnknown {
-        started_at: Instant,
         payment_hash: String,
         amount_msat: u64,
     },
@@ -660,12 +668,12 @@ enum AdmissionRecord {
 ///
 /// This is the money-path idempotence guard for [`first_contact_admission`]:
 /// one reserved/in-flight/settled admission per peer, no matter how many times
-/// the caller retries. In-process only (an entry does not survive a node
-/// restart): the worst case after a restart is one extra admission payment,
-/// bounded by [`ADMISSION_MAX_MSAT`] — the same bound as any first contact.
+/// the caller retries. Production attempts are journaled before dispatch and
+/// reloaded after restart. This in-memory cache also supports ephemeral tests.
 /// Methods take `now` explicitly so TTL behaviour is unit-testable.
 #[derive(Debug, Default)]
 struct AdmissionLedger {
+    quotes: std::collections::HashMap<NodeId, (u16, u64)>,
     entries: std::collections::HashMap<NodeId, AdmissionRecord>,
 }
 
@@ -699,19 +707,18 @@ impl AdmissionLedger {
     }
 
     /// Record that we are ABOUT to dispatch a payment for `peer` (replaces the
-    /// `Reserved` hold). Carries the BOLT11 hash so a retry can probe it; bounded
-    /// TTL so a never-dispatched attempt cannot brick the peer forever.
+    /// `Reserved` hold). Carries the BOLT11 hash so a retry can probe it.
+    /// Unknown outcomes remain reserved until positive failure evidence.
     fn record_dispatch_unknown(
         &mut self,
         peer: NodeId,
         payment_hash: String,
         amount_msat: u64,
-        now: Instant,
+        _now: Instant,
     ) {
         self.entries.insert(
             peer,
             AdmissionRecord::DispatchUnknown {
-                started_at: now,
                 payment_hash,
                 amount_msat,
             },
@@ -781,10 +788,10 @@ impl AdmissionLedger {
                 amount_msat: *amount_msat,
             },
             Some(AdmissionRecord::DispatchUnknown {
-                started_at,
                 payment_hash,
                 amount_msat,
-            }) if now.saturating_duration_since(*started_at) < ADMISSION_SETTLED_TTL => {
+                ..
+            }) => {
                 PriorAdmission::DispatchUnknown {
                     payment_hash: payment_hash.clone(),
                     amount_msat: *amount_msat,
@@ -807,8 +814,8 @@ impl AdmissionLedger {
 
     /// Drop ONLY expired entries. A live CONFIRMED guard is NEVER evicted:
     /// `InFlight` has no TTL at all (forgetting a pending HTLC would re-open
-    /// double-pay); `Settled` and `DispatchUnknown` expire only after their bounded
-    /// TTLs; `Reserved` expires after a short backstop TTL. Capacity is enforced at
+    /// double-pay); `DispatchUnknown` also has no TTL. The settled cache expires
+    /// but durable attempts reload it; bare reservations have a short TTL. Capacity is enforced at
     /// admission time by [`Self::try_reserve`], never by evicting a live guard.
     fn prune(&mut self, now: Instant) {
         self.entries.retain(|_, e| match e {
@@ -816,13 +823,12 @@ impl AdmissionLedger {
             AdmissionRecord::Reserved { started_at } => {
                 now.saturating_duration_since(*started_at) < ADMISSION_RESERVED_TTL
             }
-            AdmissionRecord::DispatchUnknown { started_at, .. } => {
-                now.saturating_duration_since(*started_at) < ADMISSION_SETTLED_TTL
-            }
+            AdmissionRecord::DispatchUnknown { .. } => true,
             AdmissionRecord::Settled { settled_at, .. } => {
                 now.saturating_duration_since(*settled_at) < ADMISSION_SETTLED_TTL
             }
         });
+        self.quotes.retain(|peer, _| self.entries.contains_key(peer));
     }
 }
 
@@ -929,12 +935,19 @@ async fn await_admission_settlement(
     peer_id: &NodeId,
     initial: PaymentDetails,
 ) -> Result<PaymentDetails, ApiError> {
+    let validate = |details: &PaymentDetails| -> Result<(), ApiError> {
+        match lock_admission_ledger().prior_admission(peer_id, Instant::now()) {
+            PriorAdmission::InFlight { payment_hash, amount_msat } | PriorAdmission::DispatchUnknown { payment_hash, amount_msat }
+                if details.payment_hash == payment_hash && details.amount_msat == amount_msat && details.direction == PaymentDirection::Outgoing => Ok(()),
+            _ => Err(ApiError::PaymentUnresolved("admission backend returned a different payment identity".into())),
+        }
+    };
+    validate(&initial)?;
     match initial.status {
         PaymentStatus::Settled => return Ok(initial),
         PaymentStatus::Failed | PaymentStatus::Expired => {
-            if !initial.payment_hash.is_empty() {
-                lock_admission_ledger().clear_tracked(peer_id, &initial.payment_hash);
-            }
+            super::admission_journal::clear(state, peer_id)?;
+            lock_admission_ledger().clear_tracked(peer_id, &initial.payment_hash);
             return Err(ApiError::Lightning(format!(
                 "admission invoice payment failed before settlement: {:?}",
                 initial.status
@@ -966,9 +979,11 @@ async fn await_admission_settlement(
                 ))
             })?;
 
+        validate(&details)?;
         match details.status {
             PaymentStatus::Settled => return Ok(details),
             PaymentStatus::Failed | PaymentStatus::Expired => {
+                super::admission_journal::clear(state, peer_id)?;
                 lock_admission_ledger().clear_tracked(peer_id, &initial.payment_hash);
                 return Err(ApiError::Lightning(format!(
                     "admission invoice payment failed: {:?}",
@@ -1011,6 +1026,9 @@ async fn deliver_settled_admission(
             ))
         })?;
     let hash_bytes: [u8; 32] = Sha256::digest(preimage_bytes).into();
+    if hex::encode(hash_bytes) != settled.payment_hash {
+        return Err(ApiError::Lightning("admission preimage does not match invoice".into()));
+    }
 
     let proof = konsensus_core::PaymentProof::new(hash_bytes, preimage_bytes, settled.amount_msat);
 
@@ -1035,6 +1053,11 @@ async fn deliver_settled_admission(
     // Attach the signed proof to the ledger BEFORE attempting delivery: if the
     // send fails now, a retry re-sends this envelope instead of paying again.
     lock_admission_ledger().attach_envelope(peer_id, envelope.clone());
+    super::admission_journal::save(state, peer_id, &super::admission_journal::Attempt {
+        payment_hash: settled.payment_hash.clone(), amount_msat: settled.amount_msat,
+        quote: lock_admission_ledger().quotes.get(peer_id).copied(), envelope: Some(envelope.clone()),
+        settled_at_unix: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+    })?;
 
     state
         .transport
@@ -1088,7 +1111,43 @@ async fn deliver_settled_admission(
 /// Returns `Ok(())` once the admission envelope is dispatched (or re-dispatched
 /// from the ledger on a retry). The caller then waits for the session to
 /// establish and retries the real (E2EE) send.
-async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(), ApiError> {
+/// Financial state survives every operational exit. G1 reserves the checked
+/// aggregate once and resolves this recipient once (never one debit per leg).
+#[derive(Default)]
+struct FirstContactCharge {
+    reserved_msat: u64,
+    settled_msat: u64,
+    message_price: Option<u64>,
+    message_settled: u64,
+    /// Reconciled prior payment, never attributed to this call's grant/debit.
+    prior_settled_msat: u64,
+}
+impl FirstContactCharge {
+    fn error(&self, error: ApiError) -> ApiError {
+        if self.reserved_msat > self.settled_msat {
+            return ApiError::PaymentUnresolved(format!(
+                "admission outcome unknown; {} msat remains reserved: {error}",
+                self.reserved_msat
+            ));
+        }
+        if self.settled_msat == 0 && self.message_settled == 0 && self.prior_settled_msat == 0 {
+            return error;
+        }
+        match error {
+            ApiError::PaymentUnresolved(reason) => ApiError::PaymentUnresolved(format!("admission settled for {} msat; message outcome unknown: {reason}", self.settled_msat)),
+            ApiError::PaymentProofUnavailable { amount_msat, reason } => ApiError::PaymentProofUnavailable { amount_msat: self.settled_msat.saturating_add(amount_msat), reason },
+            other => ApiError::PaymentProofUnavailable { amount_msat: self.settled_msat + self.message_settled, reason: format!("payment settled but send did not complete (prior admission: {} msat; current call: {} msat): {other}", self.prior_settled_msat, self.settled_msat + self.message_settled) },
+        }
+    }
+}
+
+async fn first_contact_admission(
+    state: &AppState,
+    peer_id: &NodeId,
+    kind: u16,
+    cap: Option<u64>,
+    charge: &mut FirstContactCharge,
+) -> Result<(), ApiError> {
     // 0a. Serialize per peer FIRST: without this, two concurrent composes to
     //     the same no-session peer both read `PriorAdmission::None` below and
     //     both pay (concurrent double-pay). Held for the whole attempt; every
@@ -1112,6 +1171,48 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
     //     post-settlement retry double-pay: session-poll timeout → compose
     //     error → user retries → without this guard the stranger pays full
     //     admission on every retry.
+    // Reload a durable attempt before considering any new dispatch. An unknown
+    // backend result (including PaymentNotFound) never authorizes a new invoice.
+    if matches!(
+        lock_admission_ledger().prior_admission(peer_id, Instant::now()),
+        PriorAdmission::None
+    ) {
+        if let Some(attempt) = super::admission_journal::load(state, peer_id)? {
+            let settled_age = attempt.settled_at_unix.map(|t| Duration::from_secs(
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs().saturating_sub(t)
+            ));
+            let settled_expired = attempt.envelope.is_some()
+                && settled_age.is_some_and(|age| age >= ADMISSION_SETTLED_TTL);
+            if settled_expired {
+                // Preserve the existing settled-admission lifetime. This is
+                // positive settlement evidence; unknown attempts never expire.
+                super::admission_journal::clear(state, peer_id)?;
+            } else {
+                let mut ledger = lock_admission_ledger();
+                if let Some(envelope) = attempt.envelope {
+                    let settled_at = Instant::now().checked_sub(settled_age.unwrap_or_default()).unwrap_or_else(Instant::now);
+                    ledger.record_settled(*peer_id, settled_at);
+                    ledger.attach_envelope(peer_id, envelope);
+                } else {
+                    ledger.record_dispatch_unknown(
+                        *peer_id,
+                        attempt.payment_hash,
+                        attempt.amount_msat,
+                        Instant::now(),
+                    );
+                }
+                if let Some(quote) = attempt.quote {
+                    ledger.quotes.insert(*peer_id, quote);
+                }
+            }
+        }
+    }
+    if let Some((quoted_kind, price)) = lock_admission_ledger().quotes.get(peer_id) {
+        if *quoted_kind == kind {
+            charge.message_price = Some(*price);
+        }
+    }
     let prior = lock_admission_ledger().prior_admission(peer_id, Instant::now());
     match prior {
         PriorAdmission::None => {} // fall through to the paid path below
@@ -1119,6 +1220,7 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
             payment_hash,
             amount_msat,
         } => {
+            charge.reserved_msat = amount_msat;
             tracing::info!(
                 peer = %peer_id,
                 %payment_hash,
@@ -1135,12 +1237,16 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
                 fee_msat: None,
             };
             let settled = await_admission_settlement(state, peer_id, initial).await?;
-            return deliver_settled_admission(state, peer_id, settled).await;
+            charge.prior_settled_msat = settled.amount_msat;
+            charge.reserved_msat = 0;
+            deliver_settled_admission(state, peer_id, settled).await?;
+            return Ok(());
         }
         PriorAdmission::DispatchUnknown {
             payment_hash,
             amount_msat,
         } => {
+            charge.reserved_msat = amount_msat;
             // A prior attempt may have dispatched this payment but never confirmed
             // it (pay_invoice errored). PROBE the backend before deciding — never
             // pay a fresh invoice while the first may still settle, and never brick
@@ -1151,10 +1257,16 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
             );
             match state.lightning.get_payment_status(&payment_hash).await {
                 Ok(details) if details.status == PaymentStatus::Settled => {
-                    lock_admission_ledger()
-                        .promote_to_inflight(*peer_id, payment_hash.clone(), amount_msat);
+                    lock_admission_ledger().promote_to_inflight(
+                        *peer_id,
+                        payment_hash.clone(),
+                        amount_msat,
+                    );
                     let settled = await_admission_settlement(state, peer_id, details).await?;
-                    return deliver_settled_admission(state, peer_id, settled).await;
+                    charge.prior_settled_msat = settled.amount_msat;
+                    charge.reserved_msat = 0;
+                    deliver_settled_admission(state, peer_id, settled).await?;
+                    return Ok(());
                 }
                 Ok(details)
                     if matches!(
@@ -1165,8 +1277,11 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
                     // Backend confirms it — promote to a durable (no-TTL) in-flight
                     // guard so a still-pending HTLC cannot silently expire and be
                     // re-paid, then resume polling.
-                    lock_admission_ledger()
-                        .promote_to_inflight(*peer_id, payment_hash.clone(), amount_msat);
+                    lock_admission_ledger().promote_to_inflight(
+                        *peer_id,
+                        payment_hash.clone(),
+                        amount_msat,
+                    );
                     let initial = PaymentDetails {
                         payment_hash,
                         preimage: None,
@@ -1178,9 +1293,22 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
                         fee_msat: None,
                     };
                     let settled = await_admission_settlement(state, peer_id, initial).await?;
-                    return deliver_settled_admission(state, peer_id, settled).await;
+                    charge.prior_settled_msat = settled.amount_msat;
+                    charge.reserved_msat = 0;
+                    deliver_settled_admission(state, peer_id, settled).await?;
+                    return Ok(());
                 }
                 Ok(details) => {
+                    if details.payment_hash != payment_hash
+                        || details.amount_msat != amount_msat
+                        || details.direction != PaymentDirection::Outgoing
+                    {
+                        return Err(ApiError::PaymentUnresolved(
+                            "admission retry returned mismatched payment".into(),
+                        ));
+                    }
+                    super::admission_journal::clear(state, peer_id)?;
+                    charge.reserved_msat = 0;
                     // Terminal failed/expired — the payment did NOT go through.
                     // Clear the guard so a retry can pay a fresh admission invoice.
                     lock_admission_ledger().clear_tracked(peer_id, &payment_hash);
@@ -1192,19 +1320,16 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
                 }
                 Err(_) => {
                     // Backend does not recognize the hash or is unreachable: we
-                    // cannot confirm dispatch. Stay fail-closed within the bounded
-                    // DispatchUnknown TTL (prune reopens the paid path after it)
-                    // rather than risk a double payment.
-                    return Err(ApiError::Lightning(format!(
-                        "a possibly-dispatched admission payment to {peer_id} could not be \
-                         confirmed with the backend; not paying a second invoice within the \
-                         idempotence window ({}s) — retry shortly",
-                        ADMISSION_SETTLED_TTL.as_secs()
+                    // cannot confirm dispatch. Keep the durable reservation:
+                    // absence of a record does not prove non-dispatch.
+                    return Err(ApiError::PaymentUnresolved(format!(
+                        "admission payment to {peer_id} could not be confirmed; not paying a second invoice"
                     )));
                 }
             }
         }
         PriorAdmission::SettledWithProof(envelope) => {
+            charge.prior_settled_msat = envelope.payment_proof.amount_msat;
             // Re-deliver the already-paid proof. If the target already consumed
             // this payment hash (envelope arrived the first time), its replay
             // table rejects the duplicate — harmless to us, and we are already
@@ -1221,7 +1346,7 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
                     "admission retry: re-sending already-paid admission envelope failed \
                      (will NOT re-pay; a later retry re-sends the same proof)"
                 );
-                return Err(ApiError::Internal(format!(
+                return Err(ApiError::PaymentUnresolved(format!(
                     "an already-paid admission proof for {peer_id} exists but re-delivering it \
                      failed ({e}) — no second payment was made; retry shortly"
                 )));
@@ -1245,12 +1370,10 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
                  is available (malformed preimage from backend) — refusing to pay again \
                  within the idempotence window"
             );
-            return Err(ApiError::Lightning(format!(
+            return Err(ApiError::PaymentUnresolved(format!(
                 "a prior admission payment to {peer_id} settled but no payment proof is \
                  available (the Lightning backend returned a malformed preimage) — refusing \
-                 to pay admission again; investigate the backend or retry after the \
-                 idempotence window ({}s) expires",
-                ADMISSION_SETTLED_TTL.as_secs()
+                 to pay admission again; reconcile the original payment with the backend"
             )));
         }
     }
@@ -1306,7 +1429,7 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
     let frame = Frame::RequestInvoice {
         request_id: request_id.clone(),
         amount_msat: requested_msat,
-        purpose: ADMISSION_INVOICE_PURPOSE.into(),
+        purpose: format!("{ADMISSION_INVOICE_PURPOSE}:{kind}"),
     };
     let frame_bytes = frame
         .to_bytes()
@@ -1331,10 +1454,15 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
                 "admission invoice request timed out — target did not respond".into(),
             )
         })?
-        .map_err(|_| {
-            ApiError::Lightning("target could not create an admission invoice".into())
-        })?;
+        .map_err(|_| ApiError::Lightning("target could not create an admission invoice".into()))?;
 
+    // The Noise session authenticates the target that authorized this invoice.
+    // Do not trust the UUID alone: a different peer cannot redirect payment.
+    if response.recipient != *peer_id {
+        return Err(ApiError::Lightning(
+            "admission invoice came from another recipient".into(),
+        ));
+    }
     // 3. Parse + bound the target's price (recipient-priced; accept up to the cap).
     let invoice = response
         .bolt11
@@ -1349,14 +1477,61 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
         )));
     }
 
+    if response.payment_hash != invoice.payment_hash().to_string() || invoice.is_expired() {
+        return Err(ApiError::Lightning(
+            "admission invoice hash/expiry mismatch".into(),
+        ));
+    }
+    if let Some(expected) = state.peer_ln_pubkeys.lock().await.get(peer_id) {
+        if invoice.recover_payee_pub_key().to_string() != *expected {
+            return Err(ApiError::Lightning(
+                "admission invoice payee does not match recipient".into(),
+            ));
+        }
+    }
+    let prefix = format!("konsensus:{request_id}:message=");
+    let message_price = invoice
+        .description()
+        .to_string()
+        .strip_prefix(&prefix)
+        .and_then(|n| n.parse::<u64>().ok())
+        .ok_or_else(|| {
+            ApiError::Lightning("target did not sign a request-bound message quote".into())
+        })?;
+    let message_price = super::caps::payable(message_price);
+    // G1: reserve the aggregate cap once BEFORE requesting this invoice,
+    // then resolve that same reservation once using the actual combined total.
+    // See docs/v2/F1-CAPPED-FIRST-CONTACT.md; never debit only the message.
+    // The target is authoritative for BOTH prices. A stale local price cannot
+    // spuriously reject a stranger or cause an additional unchecked payment.
+    super::caps::first_contact_total(
+        admission_msat,
+        message_price,
+        cap.or(Some(ADMISSION_MAX_MSAT)),
+    )?;
+    charge.message_price = Some(message_price);
+
     // 4. Record a DispatchUnknown guard from the BOLT11 payment hash BEFORE
     //    dispatching, then pay. This closes the ambiguous-dispatch window (review
     //    finding #4) WITHOUT the permanent-brick hazard (review finding #1,
     //    2026-07-07): DispatchUnknown carries the hash so a retry can PROBE it, and
-    //    it has a bounded TTL so a payment that never dispatched cannot block the
-    //    peer forever. Recording it commits the capacity reservation (the slot is
+    //    unknown dispatch never expires. Recording it commits the capacity reservation (the slot is
     //    now a DispatchUnknown with its own lifecycle, no longer released on drop).
     let bolt11_payment_hash = hex::encode(invoice.payment_hash());
+    super::admission_journal::save(
+        state,
+        peer_id,
+        &super::admission_journal::Attempt {
+            payment_hash: bolt11_payment_hash.clone(),
+            amount_msat: admission_msat,
+            quote: Some((kind, message_price)),
+            envelope: None,
+            settled_at_unix: None,
+        },
+    )?;
+    lock_admission_ledger()
+        .quotes
+        .insert(*peer_id, (kind, message_price));
     lock_admission_ledger().record_dispatch_unknown(
         *peer_id,
         bolt11_payment_hash.clone(),
@@ -1364,21 +1539,21 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
         Instant::now(),
     );
     reservation.committed = true;
+    charge.reserved_msat = admission_msat;
 
-    // Pay the invoice (its route hints reach the target over any topology).
-    let details = state
-        .lightning
-        .pay_invoice(&response.bolt11)
-        .await
-        .map_err(|e| {
-            // pay_invoice errored: leave the DispatchUnknown guard in place
-            // (bounded TTL). A retry PROBES the hash — resumes if the backend
-            // dispatched it, or clears + reopens if it did not.
-            ApiError::Lightning(format!(
-                "failed to pay admission invoice (a retry will probe this payment hash before \
-                 paying again): {e}"
-            ))
-        })?;
+    // Only positively proven non-dispatch releases the durable reservation.
+    let details = match state.lightning.pay_invoice(&response.bolt11).await {
+        Ok(details) => details,
+        Err(LightningError::PaymentNotDispatched(reason)) => {
+            super::admission_journal::clear(state, peer_id)?;
+            lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
+            charge.reserved_msat = 0;
+            return Err(ApiError::Lightning(format!("admission payment not dispatched: {reason}")));
+        }
+        Err(error) => return Err(ApiError::PaymentUnresolved(format!(
+            "admission dispatch outcome unknown for {bolt11_payment_hash}; retry will reconcile the same invoice: {error}"
+        ))),
+    };
 
     // pay_invoice returned Ok — dispatch is CONFIRMED. Promote the guard to a
     // durable (no-TTL) InFlight so a still-pending HTLC cannot silently expire and
@@ -1394,14 +1569,31 @@ async fn first_contact_admission(state: &AppState, peer_id: &NodeId) -> Result<(
     // BOLT11 hash is authoritative.
     let details = if details.payment_hash.is_empty() {
         PaymentDetails {
-            payment_hash: bolt11_payment_hash,
+            payment_hash: bolt11_payment_hash.clone(),
             ..details
         }
     } else {
         details
     };
 
+    if details.payment_hash != bolt11_payment_hash
+        || details.amount_msat != admission_msat
+        || details.direction != PaymentDirection::Outgoing
+    {
+        return Err(ApiError::PaymentUnresolved(
+            "admission backend returned mismatched payment details".into(),
+        ));
+    }
     let settled = await_admission_settlement(state, peer_id, details).await?;
+    if settled.payment_hash != bolt11_payment_hash
+        || settled.amount_msat != admission_msat
+        || settled.direction != PaymentDirection::Outgoing
+    {
+        return Err(ApiError::PaymentUnresolved(
+            "admission settlement identity mismatch".into(),
+        ));
+    }
+    charge.settled_msat = admission_msat;
     deliver_settled_admission(state, peer_id, settled).await
 }
 
@@ -1743,14 +1935,19 @@ pub(super) async fn compose_message(
         // ── Peer compose: existing single-recipient path ──
         let peer_id = NodeId::from_hex(&req.recipient)
             .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+        let mut admission = FirstContactCharge::default();
+        let result = async {
         let recipient = Recipient::Node(peer_id);
 
         let height = state.chain.get_block_height().await.unwrap_or(0);
-        let price_msat = quoted_price(&state, &peer_id, req.kind, height).await?;
-        super::caps::check(price_msat, req.max_total_msat)?;
+        let mut price_msat = quoted_price(&state, &peer_id, req.kind, height).await?;
+        let mut cap = req.max_total_msat;
         if let Some(per) = &req.max_recipient_msat {
-            let cap = per.get(&peer_id.to_hex()).ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
-            super::caps::check(price_msat, Some(*cap))?;
+            let recipient_cap = *per.get(&peer_id.to_hex()).ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
+            cap = Some(cap.map_or(recipient_cap, |total| total.min(recipient_cap)));
+        }
+        if state.session_manager.has_session(&peer_id).await {
+            super::caps::check(price_msat, cap)?;
         }
 
         // Encrypt via Double Ratchet.
@@ -1801,10 +1998,23 @@ pub(super) async fn compose_message(
                     peer = %peer_id,
                     "no E2EE session with connected peer — attempting paid first-contact admission"
                 );
-                if req.max_total_msat.is_some() || req.max_recipient_msat.is_some() {
-                    return Err(ApiError::PriceCapExceeded("First-contact admission has no confirmed quote. Establish admission separately before a capped send; no invoice was requested or paid.".into()));
+                if let Err(error) = first_contact_admission(&state, &peer_id, req.kind, cap, &mut admission).await {
+                    if matches!(lock_admission_ledger().prior_admission(&peer_id, Instant::now()), PriorAdmission::None) {
+                        admission.reserved_msat = 0;
+                    }
+                    return Err(error);
                 }
-                first_contact_admission(&state, &peer_id).await?;
+                if let Some(target_price) = admission.message_price {
+                    price_msat = target_price;
+                } else {
+                    // A resumed admission may belong to another kind. Never
+                    // substitute this node's own price for the target's quote.
+                    price_msat = state.peer_prices.get_fresh_discounted_peer_price(
+                        &peer_id, req.kind, height, MAX_PRICE_AGE,
+                    ).await.map(super::caps::payable).ok_or_else(|| ApiError::Lightning(
+                        "prior admission is paid, but the target quote for this kind is unknown".into()
+                    ))?;
+                }
 
                 // Poll for the session the target establishes after promotion via
                 // the existing prekey/self-heal path.
@@ -1837,11 +2047,13 @@ pub(super) async fn compose_message(
                     })?
             }
         };
+        super::caps::first_contact_total(admission.settled_msat, price_msat, cap)?;
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
         let (payment_hash, preimage_bytes, amount_msat) =
             create_payment_proof(&state, price_msat, &peer_id).await?;
+        admission.message_settled = amount_msat;
         let proof =
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
 
@@ -1931,8 +2143,10 @@ pub(super) async fn compose_message(
             member_outcomes: None,
             message_id: envelope.id.to_hex(),
             delivered,
-            amount_msat,
+            amount_msat: admission.settled_msat + amount_msat,
         }))
+        }.await;
+        result.map_err(|error| admission.error(error))
     }
 }
 
@@ -2248,10 +2462,9 @@ mod admission_tests {
 
     /// A DispatchUnknown guard (pay_invoice may or may not have dispatched):
     /// carries the hash so a retry can PROBE it, suppresses a fresh invoice within
-    /// its bounded TTL, and — crucially — EXPIRES so a never-dispatched attempt
-    /// cannot brick the peer forever (review finding #1, 2026-07-07).
+    /// without expiry. A missing backend record cannot prove non-dispatch.
     #[test]
-    fn admission_ledger_dispatch_unknown_is_pollable_and_bounded() {
+    fn admission_ledger_dispatch_unknown_never_expires_without_evidence() {
         let (_m, peer_identity) = NodeIdentity::generate().expect("generate identity");
         let peer = *peer_identity.node_id();
         let mut ledger = AdmissionLedger::default();
@@ -2268,12 +2481,9 @@ mod admission_tests {
             "DispatchUnknown must carry the hash so a retry can probe it (not re-pay)"
         );
 
-        // Bounded: after the TTL the guard expires so the peer is not bricked.
-        assert_eq!(
-            ledger.prior_admission(&peer, base + ADMISSION_SETTLED_TTL),
-            PriorAdmission::None,
-            "DispatchUnknown must EXPIRE — a never-dispatched attempt cannot brick a peer forever"
-        );
+        ledger.prune(base + ADMISSION_SETTLED_TTL * 100);
+        assert!(matches!(ledger.prior_admission(&peer, base + ADMISSION_SETTLED_TTL * 100), PriorAdmission::DispatchUnknown { .. }),
+            "elapsed time is not proof of non-dispatch");
 
         // A confirmed probe promotes it to a durable (no-TTL) InFlight guard.
         ledger.record_dispatch_unknown(peer, payment_hash.clone(), 11_000, base);
