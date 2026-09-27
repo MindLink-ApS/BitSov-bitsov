@@ -425,3 +425,79 @@ async fn failed_revoke_remains_retryable_if_replacement_write_also_fails() {
         .all(|g| g["op_id"] != old_id));
     assert_eq!(fx.wallet.money(), 0);
 }
+
+async fn expired_staging_is_removed(regrant: bool) {
+    let (fx, expiry) = expiring_fixture().await;
+    let token = fx.token().await;
+    let (status, uploaded) = fx
+        .call(
+            "POST",
+            "/api/v1/files",
+            Some(json!({"filename":"expiring.txt", "data_b64":"aGk="})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{uploaded}");
+    let id = uploaded["file_id"].as_str().unwrap();
+    let path = format!("/api/v1/files/{id}");
+    assert_eq!(
+        fx.call("GET", &path, None, Some(&token)).await.0,
+        StatusCode::OK
+    );
+    wait_for_expiry(expiry).await;
+    let token = if regrant {
+        fx.grant(None, GrantTerms::new(10_000)).await
+    } else {
+        fx.token().await
+    };
+    // No staging access/sweep during expiry: a fresh grant must not revive it.
+    fx.state.file_staging.lock().unwrap().sweep(&fx.state);
+    let (status, body) = fx.call("GET", &path, None, Some(&token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    if regrant {
+        let (status, body) = fx
+            .call(
+                "POST",
+                &format!("{path}/send"),
+                Some(json!({"recipient":fx.peer.to_hex(),"max_total_msat":100_000})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+    assert_eq!(fx.wallet.money(), 0);
+}
+
+#[tokio::test]
+async fn staging_expired_grant_removes_idle_blob() {
+    expired_staging_is_removed(false).await;
+}
+
+#[tokio::test]
+async fn staging_expired_then_regranted_blob_stays_deleted() {
+    expired_staging_is_removed(true).await;
+}
+
+#[tokio::test]
+async fn staging_revoked_grant_removes_idle_blob() {
+    let fx = fixture().await;
+    let token = fx.grant(None, GrantTerms::new(10_000)).await;
+    let (status, uploaded) = fx
+        .call(
+            "POST",
+            "/api/v1/files",
+            Some(json!({"filename":"revoked.txt", "data_b64":"aGk="})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{uploaded}");
+    let id = uploaded["file_id"].as_str().unwrap();
+    fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
+    let mut staging = fx.state.file_staging.lock().unwrap();
+    staging.sweep(&fx.state);
+    assert!(
+        !staging.remove(id),
+        "sweep must delete revoked bytes, not only hide them"
+    );
+    assert_eq!(fx.wallet.money(), 0);
+}

@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -157,7 +156,7 @@ impl NoiseTransport {
 /// Spawn a background task that reads frames from a peer's TCP stream.
 pub(super) fn spawn_reader_task(
     peer_id: NodeId,
-    mut reader: tokio::io::ReadHalf<TcpStream>,
+    mut reader: tokio::net::tcp::OwnedReadHalf,
     conn: Arc<Mutex<PeerConnection>>,
     peers: PeerMap,
     banned_peers: BanMap,
@@ -282,10 +281,10 @@ pub(super) fn spawn_reader_task(
             // promote_to_privileged flips this flag; reading it per frame means a
             // promotion is honoured on the very next frame. In Whitelist mode this
             // is always `true`, so every stamped arm behaves byte-identically.
-            let privileged = {
+            let (privileged, source_ip) = {
                 let mut conn = conn.lock().await;
                 conn.last_recv = Instant::now();
-                conn.privileged
+                (conn.privileged, conn.source_ip)
             };
 
             // Handle frame
@@ -406,6 +405,7 @@ pub(super) fn spawn_reader_task(
                     );
                     if let Err(e) = control_tx
                         .send(ControlEvent::InvoiceRequested {
+                            source_ip,
                             peer_id,
                             request_id,
                             amount_msat,

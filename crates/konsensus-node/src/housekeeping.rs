@@ -396,7 +396,7 @@ pub(crate) async fn run_peer_ln_pubkeys_cleanup(
 /// longer than the configured TTL. Prevents unbounded map growth from leaked
 /// entries when the normal success/timeout cleanup paths are bypassed.
 pub(crate) async fn run_invoice_requests_cleanup(
-    invoice_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>>,
+    invoice_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let cleanup_interval = std::time::Duration::from_secs(60); // every 60 seconds

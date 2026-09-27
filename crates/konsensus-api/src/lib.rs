@@ -59,6 +59,7 @@ pub mod bootstrap;
 pub mod control;
 pub mod error;
 pub mod freshness;
+pub mod file_staging;
 pub mod handlers;
 pub mod metered;
 pub mod metrics;
@@ -233,6 +234,20 @@ pub async fn serve(
     // Start periodic cleanup of expired rate limiter entries
     rate_limit::spawn_cleanup_task(Arc::clone(&state.rate_limiter));
 
+    // Volatile staging is empty after process startup; sweep expired/revoked
+    // grants before serving, then throughout this server's lifetime.
+    state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).sweep(&state);
+    let staging_state = Arc::clone(&state);
+    let mut staging_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => staging_state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).sweep(&staging_state),
+                _ = staging_shutdown.changed() => break,
+            }
+        }
+    });
     let app = build_router(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

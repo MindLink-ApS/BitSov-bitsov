@@ -1118,6 +1118,33 @@ impl PairingService {
         Ok(())
     }
 
+    /// Identify the exact live spend grant for volatile staged-file ownership.
+    /// Binding and grant are checked under the same lock as revoke/replacement;
+    /// a new grant for the same client must not inherit the old grant's bytes.
+    pub(crate) fn live_spend_grant_id(&self, binding: &auth::PairingBinding) -> Option<String> {
+        if !self.owner_control_enabled {
+            return None;
+        }
+        let inner = self.lock();
+        if inner.identity_fingerprint != binding.fingerprint
+            || !inner.file.clients.iter().any(|client| {
+                client.client_id == binding.client_id
+                    && client.epoch == binding.epoch
+                    && client.identity_fingerprint == binding.fingerprint
+            })
+        {
+            return None;
+        }
+        let now = chrono::Utc::now().timestamp();
+        inner.file.grants.iter().find(|grant| {
+            grant.client_id == binding.client_id
+                && grant.epoch == binding.epoch
+                && grant.identity_fingerprint == binding.fingerprint
+                && grant.scopes.contains(&Scope::Spend)
+                && grant.is_live(now)
+        }).map(|grant| grant.op_id.clone())
+    }
+
     /// The scopes a pairing actually carries **in this deployment**, computed
     /// identically at issuance and at per-request verification.
     ///
@@ -1694,11 +1721,20 @@ impl PairingService {
         };
         let before = inner.file.grants[idx].budget.clone();
         let op_id = inner.file.grants[idx].op_id.clone();
-        inner.file.grants[idx]
-            .budget
-            .as_mut()
-            .ok_or(BudgetRefusal::NoGrant)?
-            .reserve(&charges)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let budget = inner.file.grants[idx].budget.as_mut().ok_or(BudgetRefusal::NoGrant)?;
+        if budget.pending.len() >= 1024 {
+            return Err(BudgetRefusal::Ledger("too many unresolved reservations".into()));
+        }
+        budget.reserve(&charges)?;
+        let mut recipients = std::collections::BTreeMap::new();
+        for charge in &charges {
+            *recipients.entry(charge.recipient.clone()).or_insert(0u64) += charge.amount_msat;
+        }
+        // An empty fanout moves no value and grants no dispatch authority.
+        if !recipients.is_empty() {
+            budget.pending.insert(id.clone(), recipients);
+        }
         if let Err(e) = self.persist_with_clock(&mut inner.file, &mut clock) {
             if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
                 g.budget = before;
@@ -1718,6 +1754,7 @@ impl PairingService {
             return Err(BudgetRefusal::NoGrant);
         }
         Ok(Reservation {
+            id,
             client_id: client_id.to_string(),
             op_id,
             charges,
@@ -1738,6 +1775,7 @@ impl PairingService {
         let valid = self.owner_control_enabled
             && inner.file.grants.iter().any(|g| {
                 g.op_id == reservation.op_id
+                    && g.budget.as_ref().is_some_and(|b| b.pending.contains_key(&reservation.id))
                     && g.client_id == reservation.client_id
                     && g.identity_fingerprint == inner.identity_fingerprint
                     && g.scopes.contains(&Scope::Spend)
@@ -1761,27 +1799,21 @@ impl PairingService {
     /// that was revoked, replaced or has expired does nothing: there is no
     /// budget left to return the sats to.
     pub fn resolve_spend(&self, reservation: &Reservation, recipient: &str, actual_msat: u64) {
-        let reserved = reservation.reserved_for(recipient);
-        if reserved == actual_msat {
-            return;
-        }
         let mut inner = self.lock();
-        let Some(grant) = inner
-            .file
-            .grants
-            .iter_mut()
-            .find(|g| g.op_id == reservation.op_id && g.client_id == reservation.client_id)
-        else {
-            return;
-        };
-        let Some(budget) = grant.budget.as_mut() else {
-            return;
-        };
+        let Some(grant) = inner.file.grants.iter_mut().find(|g|
+            g.op_id == reservation.op_id && g.client_id == reservation.client_id
+        ) else { return; };
+        let Some(budget) = grant.budget.as_mut() else { return; };
+        let before = budget.clone();
+        let Some(recipients) = budget.pending.get_mut(&reservation.id) else { return; };
+        let Some(reserved) = recipients.remove(recipient) else { return; };
+        if recipients.is_empty() { budget.pending.remove(&reservation.id); }
         budget.resolve(recipient, reserved, actual_msat);
         if let Err(e) = self.persist(&mut inner.file) {
-            // The in-memory tally is right; disk keeps the larger reservation,
-            // which over-counts after a restart. That is the safe direction.
-            tracing::warn!(error = %e, "spend ledger resolution not persisted");
+            if let Some(grant) = inner.file.grants.iter_mut().find(|g| g.op_id == reservation.op_id) {
+                grant.budget = Some(before);
+            }
+            tracing::warn!(error = %e, "spend ledger resolution not persisted; reservation retained");
         }
     }
 
