@@ -706,6 +706,32 @@ impl Storage for SqliteStorage {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn energy_rows_since(
+        &self,
+        since_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<crate::models::EnergyRow>, StorageError> {
+        let rows = sqlx::query_as::<_, (String, String, String, i64, i64)>(
+            "SELECT sender, recipient_type, recipient_id, timestamp_ms, amount_msat \
+             FROM messages WHERE timestamp_ms >= ? AND amount_msat > 0 \
+             ORDER BY timestamp_ms ASC LIMIT ?",
+        )
+        .bind(since_ms.min(i64::MAX as u64) as i64)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(sender, recipient_type, recipient_id, ts, amount)| crate::models::EnergyRow {
+                sender,
+                recipient_type,
+                recipient_id,
+                timestamp_ms: u64::try_from(ts).unwrap_or(0),
+                amount_msat: u64::try_from(amount).unwrap_or(0),
+            })
+            .collect())
+    }
+
     async fn delete_messages_older_than(&self, before_ms: u64) -> Result<u64, StorageError> {
         // Clean up pending deliveries for messages about to be deleted
         sqlx::query(

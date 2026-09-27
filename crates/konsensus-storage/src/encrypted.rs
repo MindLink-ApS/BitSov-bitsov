@@ -409,6 +409,16 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.delete_messages_older_than(before_ms).await
     }
 
+    // Metadata columns are stored in the clear (only the ciphertext is sealed),
+    // so the energy read passes straight through.
+    async fn energy_rows_since(
+        &self,
+        since_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<crate::models::EnergyRow>, StorageError> {
+        self.inner.energy_rows_since(since_ms, limit).await
+    }
+
     // Room operations — encrypt name and metadata at rest
     async fn create_room(&self, room: &Room) -> Result<(), StorageError> {
         let encrypted = self.encrypt_room(room)?;

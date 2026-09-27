@@ -12,7 +12,7 @@ use crate::error::StorageError;
 use crate::invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,
 };
-use crate::models::{FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
+use crate::models::{EnergyRow, FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
 use crate::reactions::ReactionRecord;
 
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
@@ -58,6 +58,19 @@ pub trait Storage: Send + Sync {
     ///
     /// Used by the retention cleanup task. Returns the number of messages deleted.
     async fn delete_messages_older_than(&self, before_ms: u64) -> Result<u64, StorageError>;
+
+    /// Payment metadata of paid messages with `timestamp_ms >= since_ms`, oldest
+    /// first, at most `limit` rows (N1 energy read). Metadata columns only.
+    ///
+    /// Default: unsupported, so a backend that does not implement it makes the
+    /// energy read fail visibly instead of reporting a false zero.
+    async fn energy_rows_since(
+        &self,
+        _since_ms: u64,
+        _limit: u32,
+    ) -> Result<Vec<EnergyRow>, StorageError> {
+        Err(StorageError::Unsupported("energy_rows_since".to_string()))
+    }
 
     // ── Rooms ──────────────────────────────────────────────────────────
 

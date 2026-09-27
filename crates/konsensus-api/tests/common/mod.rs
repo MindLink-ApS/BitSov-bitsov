@@ -10,10 +10,11 @@ use tower::ServiceExt;
 
 use konsensus_core::gate::PaymentGate;
 use konsensus_core::identity::NodeIdentity;
-use konsensus_core::traits::chain::{BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel};
+use konsensus_core::traits::chain::{
+    BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel,
+};
 use konsensus_core::traits::lightning::{
-    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection,
-    PaymentStatus,
+    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection, PaymentStatus,
 };
 use konsensus_core::traits::pricing::{PricingEngine, PricingError};
 use konsensus_core::traits::transport::{MessageTransport, TransportError};
@@ -27,9 +28,9 @@ use konsensus_storage::Storage;
 
 use konsensus_api::audit::AuditLog;
 use konsensus_api::auth;
+use konsensus_api::build_router;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use konsensus_api::build_router;
 
 // ─── Stub: In-memory Storage ────────────────────────────────────────
 
@@ -41,10 +42,8 @@ pub struct MemStorage {
     room_members: Mutex<HashMap<String, Vec<NodeId>>>,
     peers: Mutex<HashMap<String, Peer>>,
     files: Mutex<HashMap<String, konsensus_storage::FileRecord>>,
-    invites_issued:
-        Mutex<HashMap<uuid::Uuid, konsensus_storage::InviteIssuedRecord>>,
-    accepted_invites:
-        Mutex<HashMap<[u8; 16], konsensus_storage::AcceptedInviteRecord>>,
+    invites_issued: Mutex<HashMap<uuid::Uuid, konsensus_storage::InviteIssuedRecord>>,
+    accepted_invites: Mutex<HashMap<[u8; 16], konsensus_storage::AcceptedInviteRecord>>,
     onboarding_state: Mutex<Option<OnboardingStateRecord>>,
     invite_schema_capabilities: InviteSchemaCapabilities,
     fail_next_whitelist_write: Mutex<bool>,
@@ -81,9 +80,7 @@ impl MemStorage {
 
 #[async_trait]
 impl Storage for MemStorage {
-    async fn invite_schema_capabilities(
-        &self,
-    ) -> Result<InviteSchemaCapabilities, StorageError> {
+    async fn invite_schema_capabilities(&self) -> Result<InviteSchemaCapabilities, StorageError> {
         Ok(self.invite_schema_capabilities)
     }
 
@@ -158,6 +155,35 @@ impl Storage for MemStorage {
         Ok((before_count - msgs.len()) as u64)
     }
 
+    async fn energy_rows_since(
+        &self,
+        since_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<konsensus_storage::EnergyRow>, StorageError> {
+        let msgs = self.messages.lock().unwrap();
+        let mut rows: Vec<_> = msgs
+            .values()
+            .filter(|env| env.timestamp >= since_ms && env.payment_proof.amount_msat > 0)
+            .filter_map(|env| {
+                let (recipient_type, recipient_id) = match &env.recipient {
+                    Recipient::Node(id) => ("node", id.to_hex()),
+                    Recipient::Room(id) => ("room", id.to_string()),
+                    Recipient::Broadcast => return None,
+                };
+                Some(konsensus_storage::EnergyRow {
+                    sender: env.sender.to_hex(),
+                    recipient_type: recipient_type.into(),
+                    recipient_id,
+                    timestamp_ms: env.timestamp,
+                    amount_msat: env.payment_proof.amount_msat,
+                })
+            })
+            .collect();
+        rows.sort_by_key(|r| r.timestamp_ms);
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
     async fn create_room(&self, room: &Room) -> Result<(), StorageError> {
         self.rooms
             .lock()
@@ -174,11 +200,7 @@ impl Storage for MemStorage {
         Ok(self.rooms.lock().unwrap().values().cloned().collect())
     }
 
-    async fn add_room_member(
-        &self,
-        room_id: &RoomId,
-        member: &NodeId,
-    ) -> Result<(), StorageError> {
+    async fn add_room_member(&self, room_id: &RoomId, member: &NodeId) -> Result<(), StorageError> {
         self.room_members
             .lock()
             .unwrap()
@@ -193,7 +215,12 @@ impl Storage for MemStorage {
         room_id: &RoomId,
         member: &NodeId,
     ) -> Result<(), StorageError> {
-        if let Some(members) = self.room_members.lock().unwrap().get_mut(&room_id.to_string()) {
+        if let Some(members) = self
+            .room_members
+            .lock()
+            .unwrap()
+            .get_mut(&room_id.to_string())
+        {
             members.retain(|m| m != member);
         }
         Ok(())
@@ -259,7 +286,11 @@ impl Storage for MemStorage {
         Ok(false)
     }
 
-    async fn store_session(&self, _peer_id: &NodeId, _state_blob: &[u8]) -> Result<(), StorageError> {
+    async fn store_session(
+        &self,
+        _peer_id: &NodeId,
+        _state_blob: &[u8],
+    ) -> Result<(), StorageError> {
         Ok(())
     }
 
@@ -279,7 +310,10 @@ impl Storage for MemStorage {
         Ok(())
     }
 
-    async fn get_pending_for_peer(&self, _: &NodeId) -> Result<Vec<(MessageId, u32)>, StorageError> {
+    async fn get_pending_for_peer(
+        &self,
+        _: &NodeId,
+    ) -> Result<Vec<(MessageId, u32)>, StorageError> {
         Ok(Vec::new())
     }
 
@@ -287,7 +321,11 @@ impl Storage for MemStorage {
         Ok(())
     }
 
-    async fn increment_pending_attempts(&self, _: &MessageId, _: &NodeId) -> Result<(), StorageError> {
+    async fn increment_pending_attempts(
+        &self,
+        _: &MessageId,
+        _: &NodeId,
+    ) -> Result<(), StorageError> {
         Ok(())
     }
 
@@ -312,16 +350,28 @@ impl Storage for MemStorage {
     }
 
     async fn store_file(&self, file: &konsensus_storage::FileRecord) -> Result<(), StorageError> {
-        self.files.lock().unwrap().insert(file.id.clone(), file.clone());
+        self.files
+            .lock()
+            .unwrap()
+            .insert(file.id.clone(), file.clone());
         Ok(())
     }
-    async fn get_file(&self, id: &str) -> Result<Option<konsensus_storage::FileRecord>, StorageError> {
+    async fn get_file(
+        &self,
+        id: &str,
+    ) -> Result<Option<konsensus_storage::FileRecord>, StorageError> {
         Ok(self.files.lock().unwrap().get(id).cloned())
     }
-    async fn get_file_metadata(&self, _: &str) -> Result<Option<konsensus_storage::FileMetadata>, StorageError> {
+    async fn get_file_metadata(
+        &self,
+        _: &str,
+    ) -> Result<Option<konsensus_storage::FileMetadata>, StorageError> {
         Ok(None)
     }
-    async fn list_files(&self, _: u32) -> Result<Vec<konsensus_storage::FileMetadata>, StorageError> {
+    async fn list_files(
+        &self,
+        _: u32,
+    ) -> Result<Vec<konsensus_storage::FileMetadata>, StorageError> {
         Ok(vec![])
     }
     async fn delete_file(&self, id: &str) -> Result<bool, StorageError> {
@@ -342,7 +392,12 @@ impl Storage for MemStorage {
         &self,
         id: &konsensus_core::MessageId,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(self.message_plaintext.lock().unwrap().get(&id.to_hex()).cloned())
+        Ok(self
+            .message_plaintext
+            .lock()
+            .unwrap()
+            .get(&id.to_hex())
+            .cloned())
     }
 
     async fn add_invite_issued(
@@ -458,9 +513,8 @@ impl Storage for MemStorage {
         // wholesale rather than merging individual keys. This matches the real
         // backends, where the blob is opaque (ciphertext under EncryptedStorage)
         // and must never be re-parsed or split.
-        let metadata: serde_json::Value = serde_json::from_str(metadata_json).map_err(|e| {
-            StorageError::Serialization(format!("invalid peer metadata_json: {e}"))
-        })?;
+        let metadata: serde_json::Value = serde_json::from_str(metadata_json)
+            .map_err(|e| StorageError::Serialization(format!("invalid peer metadata_json: {e}")))?;
         let node_id = NodeId::from_bytes(pubkey);
         let mut peers = self.peers.lock().unwrap();
         let mut peer = peers
@@ -781,7 +835,9 @@ pub fn test_identity() -> NodeIdentity {
 pub fn test_state() -> Arc<AppState> {
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     Arc::new(AppState {
         identity: Arc::clone(&identity),
@@ -836,7 +892,9 @@ pub fn test_plaintext_cipher() -> konsensus_crypto::PlaintextCacheCipher {
 pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppState> {
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     Arc::new(AppState {
         identity: Arc::clone(&identity),
@@ -879,7 +937,9 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
 pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     Arc::new(AppState {
         identity: Arc::clone(&identity),
@@ -929,11 +989,12 @@ pub fn auth_header(state: &AppState) -> String {
     format!("Bearer {token}")
 }
 
-
 pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     Arc::new(AppState {
         identity: Arc::clone(&identity),
@@ -976,7 +1037,9 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
 pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     Arc::new(AppState {
         identity: Arc::clone(&identity),
@@ -1028,16 +1091,32 @@ pub struct ConnectedStubTransport {
     /// Invoice request fulfiller: when send_raw_frame receives a
     /// RequestInvoice frame, this closure produces the InvoiceResponseData.
     /// Used to simulate the peer responding to invoice requests.
-    pub invoice_responder: Option<Box<dyn Fn(String, u64) -> Option<konsensus_api::state::InvoiceResponseData> + Send + Sync>>,
+    pub invoice_responder: Option<
+        Box<dyn Fn(String, u64) -> Option<konsensus_api::state::InvoiceResponseData> + Send + Sync>,
+    >,
     /// Shared reference to the invoice_requests map so the transport can
     /// fulfill pending requests (simulating the peer responding).
-    pub invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>>,
+    pub invoice_requests: Arc<
+        tokio::sync::Mutex<
+            HashMap<
+                String,
+                tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>,
+            >,
+        >,
+    >,
 }
 
 impl ConnectedStubTransport {
     pub fn new(
         connected_peers: Vec<NodeId>,
-        invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>>,
+        invoice_requests: Arc<
+            tokio::sync::Mutex<
+                HashMap<
+                    String,
+                    tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>,
+                >,
+            >,
+        >,
     ) -> Self {
         Self {
             connected: std::sync::Mutex::new(connected_peers.into_iter().collect()),
@@ -1049,7 +1128,10 @@ impl ConnectedStubTransport {
 
     pub fn with_invoice_responder(
         mut self,
-        responder: impl Fn(String, u64) -> Option<konsensus_api::state::InvoiceResponseData> + Send + Sync + 'static,
+        responder: impl Fn(String, u64) -> Option<konsensus_api::state::InvoiceResponseData>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         self.invoice_responder = Some(Box::new(responder));
         self
@@ -1062,7 +1144,10 @@ impl MessageTransport for ConnectedStubTransport {
         if !self.connected.lock().unwrap().contains(peer) {
             return Err(TransportError::NotConnected(peer.to_hex()));
         }
-        self.sent_envelopes.lock().unwrap().push((*peer, envelope.clone()));
+        self.sent_envelopes
+            .lock()
+            .unwrap()
+            .push((*peer, envelope.clone()));
         Ok(())
     }
 
@@ -1086,10 +1171,19 @@ impl MessageTransport for ConnectedStubTransport {
         self.connected.lock().unwrap().iter().cloned().collect()
     }
 
-    async fn send_raw_frame(&self, _peer: &NodeId, frame_bytes: &[u8]) -> Result<(), TransportError> {
+    async fn send_raw_frame(
+        &self,
+        _peer: &NodeId,
+        frame_bytes: &[u8],
+    ) -> Result<(), TransportError> {
         // Parse the frame to detect invoice requests and auto-respond.
         if let Ok(frame) = konsensus_message::wire::Frame::from_bytes(frame_bytes) {
-            if let konsensus_message::wire::Frame::RequestInvoice { ref request_id, amount_msat, .. } = frame {
+            if let konsensus_message::wire::Frame::RequestInvoice {
+                ref request_id,
+                amount_msat,
+                ..
+            } = frame
+            {
                 if let Some(ref responder) = self.invoice_responder {
                     if let Some(response_data) = responder(request_id.clone(), amount_msat) {
                         let invoice_requests = Arc::clone(&self.invoice_requests);
@@ -1110,7 +1204,6 @@ impl MessageTransport for ConnectedStubTransport {
         Ok(())
     }
 }
-
 
 // ─── Test BOLT11 Invoice Helper ────────────────────────────────────
 
@@ -1176,11 +1269,12 @@ pub async fn setup_e2ee_session_with_mnemonic(
     peer_id
 }
 
-
 pub fn test_state_with_gossip() -> Arc<AppState> {
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     Arc::new(AppState {
         identity: Arc::clone(&identity),
@@ -1216,9 +1310,9 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
-        gossip_validator: Some(Arc::new(
-            konsensus_gossip::GossipValidator::new(Default::default()),
-        )),
+        gossip_validator: Some(Arc::new(konsensus_gossip::GossipValidator::new(
+            Default::default(),
+        ))),
     })
 }
 
@@ -1276,7 +1370,9 @@ pub async fn store_test_message_with_plaintext(
     let msg_id = envelope.id.to_hex();
     state.storage.store_message(&envelope).await.unwrap();
 
-    let encrypted = test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap();
+    let encrypted = test_plaintext_cipher()
+        .encrypt(plaintext.as_bytes())
+        .unwrap();
     state
         .storage
         .store_message_plaintext(&envelope.id, &encrypted)
@@ -1373,7 +1469,13 @@ impl LightningProvider for CountingLightning {
     ) -> Result<String, LightningError> {
         Self::bump(&self.money_calls);
         StubLightning
-            .open_channel(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb)
+            .open_channel(
+                peer_pubkey,
+                peer_addr,
+                amount_sats,
+                announce,
+                fee_rate_sat_per_vb,
+            )
             .await
     }
     async fn close_channel(
@@ -1390,7 +1492,9 @@ impl LightningProvider for CountingLightning {
 pub fn test_state_with_lightning(lightning: Arc<dyn LightningProvider>) -> Arc<AppState> {
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(test_identity())));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     Arc::new(AppState {
         identity: Arc::clone(&identity),

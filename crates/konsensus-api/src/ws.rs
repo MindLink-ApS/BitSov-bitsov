@@ -106,6 +106,7 @@ const WS_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Claims) {
     let mut rx = state.ws_broadcast.subscribe();
     let mut delivery_rx = state.ws_delivery_broadcast.subscribe();
+    let mut membrane_rx = state.audit_log.membrane().subscribe();
     let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
     // The first tick fires immediately — skip it since we just connected.
     keepalive.tick().await;
@@ -163,6 +164,31 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // Delivery channel closed — continue with message channel only
                     }
+                }
+            }
+
+            // Forward membrane events (N2): admission decisions at the gate.
+            result = membrane_rx.recv() => {
+                match result {
+                    Ok(event) => {
+                        if !stream_authorized(&state, &claims) { break; }
+                        match serde_json::to_string(event.as_ref()) {
+                            Ok(json) => {
+                                if socket.send(Message::Text(json)).await.is_err() {
+                                    debug!("WebSocket client disconnected");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to serialize membrane event for WS");
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // The ring (`GET /api/v1/membrane`) still holds them.
+                        warn!(missed = n, "WebSocket client lagged, dropped membrane events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                 }
             }
 

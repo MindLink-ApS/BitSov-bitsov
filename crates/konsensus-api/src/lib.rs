@@ -65,6 +65,8 @@ pub mod pairing;
 pub mod rate_limit;
 pub mod state;
 pub mod ws;
+// N2 membrane ring (declared last to stay clear of neighbouring module additions).
+pub mod membrane;
 
 pub use audit::AuditLog;
 pub use rate_limit::RateLimiter;
@@ -142,6 +144,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(handlers::invite::routes())
         .merge(handlers::invites::routes())
         .merge(handlers::onboarding::routes())
+        .merge(handlers::organism::routes())
         .merge(handlers::gossip::routes())
         .merge(ws::routes())
         // Prometheus scrape endpoint — unauthenticated, restrict via network ACL.

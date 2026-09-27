@@ -285,6 +285,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     "kind": envelope.kind,
                                 })),
                             );
+                            // N2: the same decision, bounded and in memory, for the
+                            // owner's client. Names the sender only if the gate had
+                            // verified its signature before refusing.
+                            audit_for_recv.membrane().refused(&envelope, &rejection);
                             // Send MessageReject back to sender
                             let reject = Frame::MessageReject {
                                 id: msg_id,
@@ -395,6 +399,15 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                             continue;
                         }
+
+                        // N2: admitted by settlement. A sender that is not a
+                        // contact is a first contact; it is NOT added as one.
+                        let first_contact = !peer_registry_for_recv
+                            .read()
+                            .await
+                            .whitelist_arc()
+                            .contains(&sender);
+                        audit_for_recv.membrane().admitted(&envelope, first_contact);
 
                         // Attempt to decrypt ciphertext via Double Ratchet session
                         let plaintext = decrypt_and_process(

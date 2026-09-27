@@ -179,7 +179,12 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
     };
 
     Json(HealthResponse {
-        api_capabilities: vec![super::messages::caps::CAPABILITY, super::messages::caps::ROOM_CAPABILITY],
+        api_capabilities: vec![
+            super::messages::caps::CAPABILITY,
+            super::messages::caps::ROOM_CAPABILITY,
+            super::organism::ENERGY_CAPABILITY,
+            crate::membrane::CAPABILITY,
+        ],
         status: "ok",
         node_id: state.identity.node_id().to_hex(),
         connected_peers: connected.len(),

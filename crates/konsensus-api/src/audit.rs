@@ -29,6 +29,8 @@ pub struct AuditLog {
     seq: AtomicU64,
     /// Path for diagnostic messages.
     path: PathBuf,
+    /// Bounded in-memory membrane log (N2). Never written to this file.
+    membrane: crate::membrane::Membrane,
 }
 
 /// A single audit log entry.
@@ -152,6 +154,7 @@ impl AuditLog {
             writer: Mutex::new(writer),
             seq: AtomicU64::new(last_seq + 1),
             path,
+            membrane: crate::membrane::Membrane::default(),
         })
     }
 
@@ -193,6 +196,12 @@ impl AuditLog {
                 error!(error = %e, "failed to serialize audit entry");
             }
         }
+    }
+
+    /// The in-memory membrane log (N2): admission decisions at the payment
+    /// gate, bounded, never persisted beyond the entries this log writes.
+    pub fn membrane(&self) -> &crate::membrane::Membrane {
+        &self.membrane
     }
 
     /// Get the log file path.
