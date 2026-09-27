@@ -1890,6 +1890,7 @@ async fn compose_happy_path_keysend() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -1976,7 +1977,7 @@ async fn compose_happy_path_keysend() {
 async fn compose_happy_path_invoice_flow() {
     // Full pipeline with invoice-request/response round-trip.
     // This tests the path when no Lightning pubkey is known for the peer.
-    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>> =
+    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
@@ -1992,8 +1993,9 @@ async fn compose_happy_path_invoice_flow() {
                 // LNbits/LND round up sub-sat amounts, so use max(amount, 1000).
                 let invoice_amount = amount_msat.max(1000);
                 Some(konsensus_api::state::InvoiceResponseData {
+                recipient: peer_id,
                     bolt11: create_test_bolt11(invoice_amount),
-                    payment_hash: "ab".repeat(32),
+                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );
@@ -2012,6 +2014,7 @@ async fn compose_happy_path_invoice_flow() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2084,7 +2087,7 @@ async fn compose_happy_path_invoice_flow() {
 async fn compose_rejects_invoice_amount_mismatch() {
     // Security: If a peer responds with an invoice for a different amount
     // than requested, the compose must reject it to prevent overcharging.
-    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>> =
+    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
@@ -2095,10 +2098,11 @@ async fn compose_rejects_invoice_amount_mismatch() {
     // Respond with an invoice for 10x the requested amount (overcharging).
     let transport = Arc::new(
         ConnectedStubTransport::new(vec![peer_id], Arc::clone(&invoice_requests))
-            .with_invoice_responder(|_request_id, amount_msat| {
+            .with_invoice_responder(move |_request_id, amount_msat| {
                 Some(konsensus_api::state::InvoiceResponseData {
+                recipient: peer_id,
                     bolt11: create_test_bolt11(amount_msat * 10), // 10x overcharge!
-                    payment_hash: "ab".repeat(32),
+                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );
@@ -2117,6 +2121,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2183,7 +2188,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
 async fn compose_keysend_fallback_to_invoice() {
     // When keysend fails (peer doesn't support it), the handler should
     // fall back to the invoice-request flow.
-    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceResponseData>>>> =
+    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
@@ -2194,11 +2199,12 @@ async fn compose_keysend_fallback_to_invoice() {
     // Transport with invoice responder (for fallback).
     let transport = Arc::new(
         ConnectedStubTransport::new(vec![peer_id], Arc::clone(&invoice_requests))
-            .with_invoice_responder(|_request_id, amount_msat| {
+            .with_invoice_responder(move |_request_id, amount_msat| {
                 let invoice_amount = amount_msat.max(1000);
                 Some(konsensus_api::state::InvoiceResponseData {
+                recipient: peer_id,
                     bolt11: create_test_bolt11(invoice_amount),
-                    payment_hash: "ab".repeat(32),
+                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );
@@ -2218,17 +2224,8 @@ async fn compose_keysend_fallback_to_invoice() {
                 created_at: 1_700_000_000,
             })
         }
-        async fn pay_invoice(&self, _bolt11: &str) -> Result<PaymentDetails, LightningError> {
-            Ok(PaymentDetails {
-                payment_hash: "bb".repeat(32),
-                preimage: Some("cc".repeat(32)),
-                amount_msat: 1000,
-                status: PaymentStatus::Settled,
-                direction: PaymentDirection::Outgoing,
-                timestamp: 1_700_000_000,
-                memo: None,
-                fee_msat: None,
-            })
+        async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+            StubLightning.pay_invoice(bolt11).await
         }
         async fn get_payment_status(&self, _: &str) -> Result<PaymentDetails, LightningError> {
             Err(LightningError::PaymentNotFound("not impl".into()))
@@ -2261,6 +2258,7 @@ async fn compose_keysend_fallback_to_invoice() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2288,7 +2286,9 @@ async fn compose_keysend_fallback_to_invoice() {
     });
 
     // Register peer LN pubkey so keysend is attempted first.
-    state.peer_ln_pubkeys.lock().await.insert(peer_id, "02bbbb".repeat(5));
+    let invoice_payee = create_test_bolt11(1000).parse::<lightning_invoice::Bolt11Invoice>()
+        .unwrap().recover_payee_pub_key().to_string();
+    state.peer_ln_pubkeys.lock().await.insert(peer_id, invoice_payee);
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2378,6 +2378,7 @@ async fn compose_queues_when_transport_send_fails() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2471,6 +2472,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2598,6 +2600,7 @@ async fn compose_broadcasts_to_websocket() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2688,6 +2691,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         transport: transport as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2781,6 +2785,7 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,
@@ -2934,6 +2939,7 @@ async fn compose_room_rejects_oversized_member_count() {
         transport: transport.clone() as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
+        file_staging: Default::default(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         pairing: None,
         cors_enabled: false,

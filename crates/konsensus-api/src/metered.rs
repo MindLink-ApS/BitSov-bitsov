@@ -96,7 +96,7 @@ impl MeteredSpend {
     /// Debit a call's charges before anything is dispatched.
     ///
     /// Returns a [`Debit`] the handler resolves once each outcome is known.
-    /// Zero-amount charges are dropped: they move nothing.
+    /// Zero amounts retain their recipient so resolution still consumes the reservation.
     pub fn debit(&self, state: &AppState, charges: Vec<Charge>) -> Result<Debit, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else {
             return Ok(Debit::unmetered());
@@ -105,7 +105,6 @@ impl MeteredSpend {
             .pairing
             .as_ref()
             .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-        let charges: Vec<Charge> = charges.into_iter().filter(|c| c.amount_msat > 0).collect();
         let reservation = service
             .reserve_spend(client_id, *epoch, charges)
             .map_err(ApiError::BudgetExceeded)?;
@@ -136,9 +135,11 @@ impl Debit {
         Self { held: None }
     }
 
-    /// Whether this debit is held against a budget grant.
-    pub(crate) fn is_metered(&self) -> bool {
-        self.held.is_some()
+    pub(crate) fn is_metered(&self) -> bool { self.held.is_some() }
+
+    /// Reconciliation reference only; never restores dispatch authority.
+    pub(crate) fn reservation(&self) -> Option<Reservation> {
+        self.held.as_ref().map(|(_, reservation)| reservation.clone())
     }
 
     /// Guard each poll of an operation that can dispatch value. A separate

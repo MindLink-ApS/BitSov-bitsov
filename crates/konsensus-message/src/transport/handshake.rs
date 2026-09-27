@@ -7,7 +7,6 @@ use std::net::SocketAddr;
 
 use konsensus_core::identity::NodeIdentity;
 use konsensus_crypto::noise::NoiseSession;
-use tokio::net::TcpStream;
 use tracing::{info, warn};
 
 use konsensus_core::traits::transport::TransportError;
@@ -33,13 +32,13 @@ use super::{
 /// handshake with a fresh session. A responder that does not require a cookie
 /// replies with message-2 and the path is byte-identical to pre-cookie.
 pub(super) async fn noise_handshake_initiator(
-    mut reader: tokio::io::ReadHalf<TcpStream>,
-    mut writer: tokio::io::WriteHalf<TcpStream>,
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
     x25519_secret: [u8; 32],
 ) -> Result<
     (
-        tokio::io::ReadHalf<TcpStream>,
-        tokio::io::WriteHalf<TcpStream>,
+        tokio::net::tcp::OwnedReadHalf,
+        tokio::net::tcp::OwnedWriteHalf,
         NoiseSession,
     ),
     TransportError,
@@ -102,13 +101,13 @@ pub(super) async fn noise_handshake_initiator(
 
 /// Perform Noise_XX handshake as responder (owns the NoiseSession).
 pub(super) async fn noise_handshake_responder(
-    mut reader: tokio::io::ReadHalf<TcpStream>,
-    mut writer: tokio::io::WriteHalf<TcpStream>,
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut noise: NoiseSession,
 ) -> Result<
     (
-        tokio::io::ReadHalf<TcpStream>,
-        tokio::io::WriteHalf<TcpStream>,
+        tokio::net::tcp::OwnedReadHalf,
+        tokio::net::tcp::OwnedWriteHalf,
         NoiseSession,
     ),
     TransportError,
@@ -216,7 +215,7 @@ pub(crate) fn verify_identity_binding(
 
 /// Send an encrypted frame over a Noise session (used during handshake only).
 pub(super) async fn send_encrypted_frame(
-    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
     noise: &mut NoiseSession,
     frame: &Frame,
 ) -> Result<(), TransportError> {
@@ -234,7 +233,7 @@ pub(super) async fn send_encrypted_frame(
 
 /// Receive and decrypt a frame over a Noise session (used during handshake only).
 pub(super) async fn recv_encrypted_frame(
-    reader: &mut tokio::io::ReadHalf<TcpStream>,
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
     noise: &mut NoiseSession,
 ) -> Result<Frame, TransportError> {
     let encrypted = read_noise_message(reader)
@@ -253,8 +252,8 @@ pub(super) async fn recv_encrypted_frame(
 /// After the Noise_XX handshake, exchange Hello/HelloAck to bind Ed25519
 /// identities to the X25519 keys used in Noise, and negotiate capabilities.
 pub(super) async fn perform_federation_handshake_initiator(
-    mut reader: tokio::io::ReadHalf<TcpStream>,
-    mut writer: tokio::io::WriteHalf<TcpStream>,
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut noise: NoiseSession,
     identity: &NodeIdentity,
     config: &TransportConfig,
@@ -263,8 +262,8 @@ pub(super) async fn perform_federation_handshake_initiator(
         NodeId,
         SovereigntyTier,
         Vec<Capability>,
-        tokio::io::ReadHalf<TcpStream>,
-        tokio::io::WriteHalf<TcpStream>,
+        tokio::net::tcp::OwnedReadHalf,
+        tokio::net::tcp::OwnedWriteHalf,
         NoiseSession,
     ),
     TransportError,
@@ -330,8 +329,8 @@ pub(super) async fn perform_federation_handshake_initiator(
 
 /// Perform federation handshake as responder.
 pub(super) async fn perform_federation_handshake_responder(
-    mut reader: tokio::io::ReadHalf<TcpStream>,
-    mut writer: tokio::io::WriteHalf<TcpStream>,
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut noise: NoiseSession,
     identity: &NodeIdentity,
     config: &TransportConfig,
@@ -341,8 +340,8 @@ pub(super) async fn perform_federation_handshake_responder(
         NodeId,
         SovereigntyTier,
         Vec<Capability>,
-        tokio::io::ReadHalf<TcpStream>,
-        tokio::io::WriteHalf<TcpStream>,
+        tokio::net::tcp::OwnedReadHalf,
+        tokio::net::tcp::OwnedWriteHalf,
         NoiseSession,
         bool,
     ),
@@ -455,7 +454,7 @@ pub(super) async fn connect_to_peer(
 
     info!(%addr, "TCP connected, starting Noise handshake");
 
-    let (reader, writer) = tokio::io::split(stream);
+    let (reader, writer) = stream.into_split();
 
     // The initiator builds its own Noise session(s) inside the handshake so it can
     // restart cleanly if the responder requires a pre-Noise cookie (#2).
@@ -517,6 +516,7 @@ pub(super) async fn connect_to_peer(
 
     let now = Instant::now();
     let conn = Arc::new(Mutex::new(PeerConnection {
+        source_ip: addr.ip(),
         privileged,
         noise,
         writer,

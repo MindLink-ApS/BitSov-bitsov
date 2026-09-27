@@ -35,7 +35,7 @@ use konsensus_message::{ControlEvent, NoiseTransport, ReachabilityMode, Transpor
 
 use super::{
     handle_invoice_error_received, handle_invoice_requested_gated, handle_invoice_response,
-    InvoiceResponseData,
+    InvoiceRequestOutcome,
 };
 
 /// The marker node A's compose puts in an admission envelope (not E2EE).
@@ -210,7 +210,7 @@ fn audit_log() -> Arc<konsensus_api::audit::AuditLog> {
 }
 
 type InvoiceRequests =
-    Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<InvoiceResponseData>>>>;
+    Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>>;
 
 /// Node A: the sender, driven through its real compose route.
 struct Sender {
@@ -227,6 +227,7 @@ async fn start_sender(
 ) -> Sender {
     let invoice_requests: InvoiceRequests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let state = Arc::new(konsensus_api::AppState {
+        file_staging: Default::default(),
         identity: Arc::clone(identity),
         storage: storage().await,
         lightning: Arc::clone(&wallet) as Arc<dyn LightningProvider>,
@@ -335,13 +336,15 @@ async fn start_recipient(
         let audit = Arc::clone(&audit);
         let lightning = Arc::clone(&lightning);
         let pricing = Arc::clone(&pricing);
+        let recipient = *identity.node_id();
         tokio::spawn(async move {
             let mut last_refusal = HashMap::new();
+            let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
             while let Some(event) = transport.recv_control().await {
-                if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged } = event {
+                if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged, source_ip } = event {
                     handle_invoice_requested_gated(
                         &peer_id, &request_id, amount_msat, &purpose, privileged,
-                        &pricing, &lightning, &transport, audit.membrane(), &mut last_refusal,
+                        &pricing, &lightning, &transport, &recipient, source_ip, &mut quotes, audit.membrane(), &mut last_refusal,
                     )
                     .await;
                 }
