@@ -23,7 +23,7 @@ pub use fiat_snapshots::FiatRateSnapshot;
 pub use invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,
 };
-pub use models::{FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
+pub use models::{EnergyRow, FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
 pub use postgres::PostgresStorage;
 pub use reactions::ReactionRecord;
 pub use recovery::{

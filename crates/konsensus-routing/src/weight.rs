@@ -735,6 +735,8 @@ mod tests {
     #[test]
     fn corrupted_weight_field_recovers_on_decay() {
         let mut w = SynapticWeight::new();
+        // Exercise decay even when consecutive Instant reads share a clock tick.
+        w.last_updated = Instant::now() - Duration::from_secs(1);
         // Simulate corrupted weight (e.g., from deserialization)
         w.weight = f64::NAN;
         w.apply_decay();

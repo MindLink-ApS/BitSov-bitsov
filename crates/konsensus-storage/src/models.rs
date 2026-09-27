@@ -92,6 +92,23 @@ impl From<&FileRecord> for FileMetadata {
     }
 }
 
+/// Payment metadata of one stored message, for the node's energy read (N1).
+///
+/// Only who, when and how much: no ciphertext, no payment hash, no preimage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnergyRow {
+    /// Sender node id (hex).
+    pub sender: String,
+    /// `"node"` or `"room"` (as stored).
+    pub recipient_type: String,
+    /// Recipient node id (hex) or room id.
+    pub recipient_id: String,
+    /// Envelope timestamp, unix milliseconds.
+    pub timestamp_ms: u64,
+    /// Paid amount carried by the envelope's settled payment proof.
+    pub amount_msat: u64,
+}
+
 /// A known peer node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {

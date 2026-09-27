@@ -131,7 +131,7 @@ fn spend_grant_binding_enforced() {
     // POSITIVE CONTROL: the owner's typed confirmation writes the grant, and it
     // reaches the client's token.
     let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
-    let grant = service.grant_elevation(&op.op_id, &phrase).unwrap();
+    let grant = service.grant_elevation(&op.op_id, &phrase, konsensus_api::spend_budget::GrantTerms::new(1_000_000)).unwrap();
     assert_eq!(grant.client_id, a.client_id);
     assert_eq!(grant.granted_by, "cli");
     assert_eq!(grant.scopes, vec![Scope::Spend]);
@@ -194,6 +194,7 @@ fn sidecar_reopen_does_not_inherit_owner_granted_spend() {
             .grant_elevation(
                 &op.op_id,
                 &console.confirmation(&pairing::grant_confirmation_phrase(&op)),
+                konsensus_api::spend_budget::GrantTerms::new(1_000_000),
             )
             .unwrap();
         // POSITIVE CONTROL: in owner mode the grant reaches the token.
@@ -309,7 +310,7 @@ fn sidecar_elevation_unavailable() {
         .unwrap();
     let phrase = pairing::grant_confirmation_phrase(&op);
 
-    let err = sidecar.grant_elevation(&op.op_id, &phrase).unwrap_err();
+    let err = sidecar.grant_elevation(&op.op_id, &phrase, konsensus_api::spend_budget::GrantTerms::new(1_000_000)).unwrap_err();
     assert!(
         matches!(err, PairingError::OwnerChannelUnavailable),
         "sidecar elevation must be unavailable, got: {err}"
@@ -340,6 +341,7 @@ fn sidecar_elevation_unavailable() {
         .grant_elevation(
             &op2.op_id,
             &owner_console.confirmation(&pairing::grant_confirmation_phrase(&op2)),
+            konsensus_api::spend_budget::GrantTerms::new(1_000_000),
         )
         .unwrap();
     assert_eq!(owner.reload_from_disk().unwrap().grants.len(), 1);
@@ -368,6 +370,7 @@ fn owner_cli_confirmation_succeeds() {
         ControlResponse::Describe {
             summary,
             confirmation_label,
+            ..
         } => {
             assert!(summary.contains(&client.client_id));
             assert!(summary.contains("desktop app"));
@@ -387,6 +390,7 @@ fn owner_cli_confirmation_succeeds() {
         ControlRequest::Grant {
             op_id: op.op_id.clone(),
             confirmation: "yes".into(),
+            terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000),
         },
     );
     assert!(
@@ -401,6 +405,7 @@ fn owner_cli_confirmation_succeeds() {
         ControlRequest::Grant {
             op_id: op.op_id.clone(),
             confirmation: phrase,
+            terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000),
         },
     );
     assert!(matches!(ok, ControlResponse::Ok { .. }), "{ok:?}");
@@ -845,7 +850,7 @@ fn expired_approval_no_effect() {
         .unwrap();
     let phrase = pairing::grant_confirmation_phrase(&op);
     let (aged2, console2) = expire_approvals_on_disk(tmp.path());
-    let err = aged2.grant_elevation(&op.op_id, &phrase).unwrap_err();
+    let err = aged2.grant_elevation(&op.op_id, &phrase, konsensus_api::spend_budget::GrantTerms::new(1_000_000)).unwrap_err();
     assert!(matches!(err, PairingError::Expired), "{err}");
     assert!(
         aged2.reload_from_disk().unwrap().grants.is_empty(),
@@ -861,6 +866,7 @@ fn expired_approval_no_effect() {
         .grant_elevation(
             &fresh.op_id,
             &console2.confirmation(&pairing::grant_confirmation_phrase(&fresh)),
+            konsensus_api::spend_budget::GrantTerms::new(1_000_000),
         )
         .unwrap();
     assert_eq!(aged2.reload_from_disk().unwrap().grants.len(), 1);

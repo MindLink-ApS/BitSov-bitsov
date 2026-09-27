@@ -149,14 +149,37 @@ pub enum Command {
         config: PathBuf,
     },
 
-    /// Grant an elevation a client requested, after typing the confirmation (#76).
+    /// Grant a budget-scoped spend window a client requested (#76, G1).
     ///
     /// The owner channel. The requesting app can create the pending request and
-    /// read its status over HTTP; only this command can write the grant.
+    /// read its status over HTTP; only this command can write the grant. One
+    /// command per budget window: `konsensus grant --op <id> --budget 2000
+    /// --for 24h`. A summary is printed before you confirm.
     Grant {
         /// Pending operation id from the app's elevation request.
         #[arg(long = "op")]
         op_id: String,
+
+        /// Total budget in sats. Defaults to the app's proposal, if it made one.
+        #[arg(long)]
+        budget: Option<u64>,
+
+        /// Window, e.g. `24h`, `90m`, `1h30m`. At most 24 h (the default).
+        #[arg(long = "for")]
+        for_: Option<String>,
+
+        /// Most one call may spend, in sats. Defaults to the whole budget.
+        #[arg(long)]
+        per_call: Option<u64>,
+
+        /// Per-recipient budget as `<node-id-or-ln-pubkey>=<sats>`. Repeatable.
+        #[arg(long)]
+        recipient: Vec<String>,
+
+        /// Skip the "grant these terms?" question. The console confirmation
+        /// code is still required.
+        #[arg(long)]
+        yes: bool,
 
         /// Path to the configuration file.
         #[arg(short, long, default_value = "konsensus.toml")]
@@ -179,6 +202,23 @@ pub enum Command {
         /// Prompted for if omitted, so it need not appear in shell history.
         #[arg(long)]
         mnemonic: Option<String>,
+
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+
+    /// Revoke spend grants now, without touching the pairing (G1).
+    ///
+    /// The client keeps read+receive; spend stops on its next request.
+    GrantRevoke {
+        /// Client whose grant to revoke.
+        #[arg(long, conflicts_with = "all", required_unless_present = "all")]
+        client_id: Option<String>,
+
+        /// Revoke every client's grant.
+        #[arg(long)]
+        all: bool,
 
         /// Path to the configuration file.
         #[arg(short, long, default_value = "konsensus.toml")]

@@ -423,6 +423,7 @@ async fn http_elevation_write_paths_absent() {
         control::ControlRequest::Grant {
             op_id: op_id.clone(),
             confirmation: console.confirmation(&pairing::grant_confirmation_phrase(&op)),
+            terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000),
         },
     );
     assert!(
@@ -653,6 +654,7 @@ async fn same_uid_socket_client_cannot_self_grant_from_public_information() {
             &control::ControlRequest::Grant {
                 op_id: op_id.clone(),
                 confirmation: guessed,
+                terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000),
             },
         )
         .await
@@ -668,6 +670,7 @@ async fn same_uid_socket_client_cannot_self_grant_from_public_information() {
         &control::ControlRequest::Grant {
             op_id: op_id.clone(),
             confirmation: phrase.clone(),
+            terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000),
         },
     )
     .await
@@ -682,6 +685,7 @@ async fn same_uid_socket_client_cannot_self_grant_from_public_information() {
         &control::ControlRequest::Grant {
             op_id,
             confirmation: phrase,
+            terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000),
         },
     )
     .await
@@ -758,7 +762,7 @@ async fn websocket_pairing_binding_blocks_upgrade_and_post_revocation_plaintext(
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, app.into_make_service())
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
                 .unwrap();
         });
@@ -818,6 +822,86 @@ async fn websocket_pairing_binding_blocks_upgrade_and_post_revocation_plaintext(
             matches!(read, Ok(0) | Err(_)),
             "revoked stream received a frame: {read:?}"
         );
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn membrane_ws_requires_local_pairing_and_rechecks_revocation() {
+    use tokio::io::AsyncReadExt;
+    for mode in ["remote", "missing", "unpaired", "no_read", "local"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, service, _console) = state_with_pairing(tmp.path(), false);
+        let app = test_router(state.clone());
+        let (client, paired) =
+            pair_and_token(&app, &service, &SigningKey::from_bytes(&[73; 32])).await;
+        let token = if mode == "unpaired" {
+            auth_header(&state).trim_start_matches("Bearer ").to_owned()
+        } else if mode == "no_read" {
+            let binding = &service.list_clients()[0];
+            konsensus_api::auth::create_paired_token(
+                &state.identity.node_id().to_hex(),
+                &state.jwt_secret,
+                vec![Scope::Receive],
+                &client,
+                binding.epoch,
+                &service.bound_fingerprint(),
+            )
+            .unwrap()
+        } else {
+            paired
+        };
+        let app = match mode {
+            "remote" => app.layer(axum::Extension(axum::extract::ConnectInfo(
+                "203.0.113.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+            ))),
+            "missing" => app,
+            _ => app.layer(axum::Extension(axum::extract::ConnectInfo(
+                "127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+            ))),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let (status, mut socket) = ws_connect(addr, &token, true).await;
+        if mode != "local" {
+            assert_eq!(status, 403, "{mode}");
+        } else {
+            assert_eq!(status, 101);
+            let envelope = konsensus_core::UkmEnvelopeBuilder::new(
+                100,
+                *state.identity.node_id(),
+                konsensus_core::types::Recipient::Node(*state.identity.node_id()),
+                vec![],
+                konsensus_core::PaymentProof::new([0; 32], [0; 32], 0),
+            )
+            .build();
+            // An application ping is handled only after all event subscriptions exist.
+            use tokio::io::AsyncWriteExt;
+            socket.write_all(&[0x89, 0x80, 0, 0, 0, 0]).await.unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), 0x8a);
+            assert_eq!(socket.read_u8().await.unwrap(), 0);
+            state.audit_log.membrane().admitted(&envelope, true);
+            let event: serde_json::Value =
+                serde_json::from_str(&read_ws_text(&mut socket).await).unwrap();
+            assert_eq!(event["type"], "membrane");
+            service.revoke(&client).unwrap();
+            state.audit_log.membrane().admitted(&envelope, true);
+            let mut byte = [0; 1];
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(3), socket.read(&mut byte))
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(result, Ok(0) | Err(_)),
+                "revoked membrane frame: {result:?}"
+            );
+        }
         server.abort();
         let _ = server.await;
     }
