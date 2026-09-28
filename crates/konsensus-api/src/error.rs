@@ -9,6 +9,9 @@ use thiserror::Error;
 /// API errors — converted to appropriate HTTP status codes.
 #[derive(Debug, Error)]
 pub enum ApiError {
+    #[error("Lightning is offline or synchronizing; retry when money_ready is true")]
+    NotReady,
+
     #[error("{source}")]
     RoutingFee { source: Box<ApiError>, max_routing_fee_msat: u64 },
     /// The backend positively refused the operation before any dispatch.
@@ -95,6 +98,11 @@ impl ApiError {
         Self::RoutingFee { source: Box::new(self), max_routing_fee_msat }
     }
     fn response_parts(&self) -> (StatusCode, serde_json::Value) {
+        if matches!(self, Self::NotReady) {
+            return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                "error": self.to_string(), "code": "not_ready", "money_ready": false
+            }));
+        }
         if let Self::RoutingFee { source, max_routing_fee_msat } = self {
             let (status, mut body) = source.response_parts();
             body["max_routing_fee_msat"] = (*max_routing_fee_msat).into();
@@ -136,7 +144,7 @@ impl ApiError {
             }));
         }
         let (status, message) = match &self {
-            ApiError::RoutingFee { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
+            ApiError::NotReady | ApiError::RoutingFee { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
@@ -322,5 +330,19 @@ mod tests {
         let msg = "unicod\u{00e9} err\u{00f6}r m\u{00e8}ssage";
         let (_, json) = error_body(ApiError::BadRequest(msg.into())).await;
         assert_eq!(json["error"], msg);
+    }
+}
+
+/// Check before parsing payment details, consuming grants, or issuing invoices.
+pub(crate) async fn require_money_ready(state: &crate::state::AppState) -> Result<(), ApiError> {
+    if state.lightning.money_ready().await { Ok(()) } else { Err(ApiError::NotReady) }
+}
+
+impl From<konsensus_core::traits::lightning::LightningError> for ApiError {
+    fn from(error: konsensus_core::traits::lightning::LightningError) -> Self {
+        match error {
+            konsensus_core::traits::lightning::LightningError::NotReady => Self::NotReady,
+            other => Self::Lightning(other.to_string()),
+        }
     }
 }

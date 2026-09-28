@@ -92,10 +92,24 @@ pub struct MemberPaymentOutcome {
 }
 
 async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, height: u64) -> Result<u64, ApiError> {
-    let price = match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
-        Some(price) => price,
-        None => state.pricing.get_price_msat(kind).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?,
+    let ready = state.lightning.money_ready().await;
+    if !ready && !state.session_manager.has_session(peer).await {
+        return Err(ApiError::NotReady);
+    }
+    let quote = async {
+        match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
+            Some(price) => Ok(price),
+            None => state.pricing.get_price_msat(kind).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}"))),
+        }
     };
+    // Preserve established zero-price conversations when a local quote is
+    // available. Never wait on dynamic chain pricing or assume a free price.
+    let price = if ready { quote.await? } else {
+        tokio::time::timeout(Duration::from_millis(100), quote).await.map_err(|_| ApiError::NotReady)??
+    };
+    if super::caps::payable(price) > 0 || !state.session_manager.has_session(peer).await {
+        crate::error::require_money_ready(state).await?;
+    }
     Ok(super::caps::payable(price))
 }
 
@@ -330,12 +344,8 @@ pub(crate) async fn create_metered_payment_proof(
         return Ok(generate_valid_proof(0));
     }
 
-    // Lightning must be available for non-zero payments.
-    if !state.lightning.is_available().await {
-        return Err(ApiError::Lightning(
-            "Lightning wallet is unavailable — cannot create payment proof".into(),
-        ));
-    }
+    // Recheck after quoting: readiness may have changed before dispatch.
+    crate::error::require_money_ready(state).await?;
 
     // Peer must be connected to receive the invoice request.
     if !state.transport.is_connected(peer_id).await {
@@ -558,6 +568,7 @@ async fn try_keysend(
         .await?
     {
         Ok(details) => details,
+        Err(LightningError::NotReady) => return Err(ApiError::NotReady),
         Err(LightningError::PaymentNotDispatched(reason)) => {
             tracing::warn!(peer = %peer_id, %reason, "keysend rejected before dispatch");
             return Ok(KeysendOutcome::NotDispatched);
@@ -739,6 +750,7 @@ async fn create_payment_proof_via_invoice(
         .pay_invoice_with_fee_limit(&response.bolt11, debit.fee_limit(state, invoice_amount_msat)))
         .await?
         .map_err(|e| match e {
+            LightningError::NotReady => ApiError::NotReady,
             LightningError::PaymentNotDispatched(reason) => ApiError::Lightning(format!("payment not dispatched: {reason}")),
             other => ApiError::PaymentUnresolved(format!("failed to pay recipient invoice: {other}")),
         })?;
@@ -2349,6 +2361,12 @@ async fn first_contact_admission_at(
     };
     let details = match dispatched {
         Ok(details) => details,
+        Err(LightningError::NotReady) => {
+            super::admission_journal::clear_failed(state, peer_id)?;
+            lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
+            charge.reserved_msat = 0;
+            return Err(ApiError::NotReady);
+        }
         Err(LightningError::PaymentNotDispatched(reason)) => {
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
@@ -2654,13 +2672,13 @@ pub(super) async fn compose_message(
             )));
         }
 
-        let current_block_height = match state.chain.get_block_height().await {
+        let current_block_height = if !state.lightning.money_ready().await { 0 } else { match state.chain.get_block_height().await {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to get block height for room compose, using fallback 0");
                 0
             }
-        };
+        }};
 
         let mut prices = Vec::new();
         for member in members.iter().filter(|m| *m != state.identity.node_id()) {
@@ -2793,7 +2811,7 @@ pub(super) async fn compose_message(
         let mut admission = FirstContactCharge::default();
         let recipient = Recipient::Node(peer_id);
 
-        let height = state.chain.get_block_height().await.unwrap_or(0);
+        let height = if state.lightning.money_ready().await { state.chain.get_block_height().await.unwrap_or(0) } else { 0 };
         let mut price_msat = quoted_price(&state, &peer_id, req.kind, height).await?;
         let mut cap = req.max_total_msat;
         if let Some(per) = &req.max_recipient_msat {
