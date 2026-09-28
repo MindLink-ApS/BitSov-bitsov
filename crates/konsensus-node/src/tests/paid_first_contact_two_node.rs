@@ -231,6 +231,8 @@ impl LightningProvider for Faulty {
 struct PauseAfterMark {
     armed: std::sync::atomic::AtomicBool,
     armed_query: std::sync::atomic::AtomicBool,
+    armed_eager: std::sync::atomic::AtomicBool,
+    proof_sent: std::sync::atomic::AtomicBool,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -243,6 +245,18 @@ impl PauseAfterMark {
     /// the proof has been read, nothing has been marked or sent.
     fn arm_after_classification(&self) {
         self.armed_query.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Pause right before the first raw frame written after the admission
+    /// proof went out: the payer's eager PrekeyOffer (PSI-SPEED), after its
+    /// eligibility was decided and before it is written.
+    fn arm_before_eager_offer(&self) {
+        self.proof_sent.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.armed_eager.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    async fn hold_eager(&self) {
+        if self.proof_sent.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.hold(&self.armed_eager).await;
+        }
     }
     async fn hold(&self, armed: &std::sync::atomic::AtomicBool) {
         if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -290,7 +304,17 @@ impl MessageTransport for Hooked {
         self.inner.request_peer_exchange(peer).await
     }
     async fn send_raw_frame(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.pause.hold_eager().await;
         self.inner.send_raw_frame(peer, frame_bytes).await
+    }
+    async fn send_raw_frame_on_paid_connection(
+        &self,
+        peer: &NodeId,
+        since: std::time::Instant,
+        frame_bytes: &[u8],
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.pause.hold_eager().await;
+        self.inner.send_raw_frame_on_paid_connection(peer, since, frame_bytes).await
     }
     async fn peer_info(&self, peer: &NodeId) -> Option<konsensus_core::traits::transport::ConnectedPeerInfo> {
         self.inner.peer_info(peer).await
@@ -313,7 +337,11 @@ impl MessageTransport for Hooked {
         since: Option<std::time::Instant>,
         envelope: &konsensus_core::UkmEnvelope,
     ) -> Result<(), konsensus_core::traits::transport::TransportError> {
-        self.inner.send_on_connection(peer, since, envelope).await
+        let sent = self.inner.send_on_connection(peer, since, envelope).await;
+        if sent.is_ok() && self.pause.armed_eager.load(std::sync::atomic::Ordering::SeqCst) {
+            self.pause.proof_sent.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        sent
     }
     async fn add_to_whitelist(&self, peer: &NodeId) {
         self.inner.add_to_whitelist(peer).await
@@ -1276,6 +1304,171 @@ async fn p2_paid_payee_gets_no_rejection_or_prices_for_an_unpaid_envelope() {
     })
     .await;
     assert_eq!(rejects(&unpaid.id), 0, "the unpaid envelope from the paid-for payee got a MessageReject");
+    net.stop();
+}
+
+// ── PSI-SPEED: first contact without waiting for a self-heal tick ────────
+
+/// First contact used to wait up to one 15 s self-heal tick (about 12 s
+/// observed). Now the payee offers its prekey on promotion, the payer offers
+/// right after its proof, and answers the payee's offer when the payee is the
+/// X3DH initiator.
+const FIRST_CONTACT_BUDGET: Duration = Duration::from_secs(2);
+
+/// The paid first contact completes (compose returns delivered) well inside
+/// [`FIRST_CONTACT_BUDGET`], paying one admission plus the message. A
+/// stranger connected to the payee throughout gets nothing out of it.
+async fn first_contact_is_fast(order: Order) {
+    let mut net = pair(Shape::CardOnly, order, Wallet::Plain, Wallet::Plain).await;
+    let payee = net.payee.id;
+    let (z_identity, z) = stranger();
+    let z_id = *z_identity.node_id();
+    z.connect(&payee, &net.payee.addr()).await.unwrap();
+    wait_until("the payee sees the stranger", Duration::from_secs(5), || async {
+        net.payee.transport.is_connected(&z_id).await
+    })
+    .await;
+
+    let started = std::time::Instant::now();
+    let (status, body) = net.payer.compose(&payee, "fast").await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK, "{order:?}: {body}");
+    assert_eq!(body["delivered"], true, "{body}");
+    println!("PSI-SPEED first contact {order:?}: {elapsed:?}");
+    assert!(elapsed < FIRST_CONTACT_BUDGET, "{order:?}: first contact took {elapsed:?}");
+    net.payee.delivered_once("fast").await;
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT, CHAT_MSAT], "one admission + the message");
+
+    // The stranger, unpaid, got no prekey, handshake or prices.
+    let back = received(&z, Duration::from_secs(2)).await;
+    assert!(
+        !back.iter().any(|e| matches!(
+            e,
+            ControlEvent::PrekeyOffer { .. } | ControlEvent::SessionInit { .. }
+                | ControlEvent::PriceTableReceived { .. } | ControlEvent::PeerExchangeReceived { .. }
+        )),
+        "the payee answered an unpaid stranger: {back:?}"
+    );
+    assert!(!net.payee.sessions.has_session(&z_id).await);
+    z.shutdown();
+    net.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speed_first_contact_is_fast_payer_initiates() {
+    first_contact_is_fast(Order::PayerLower).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speed_first_contact_is_fast_payee_initiates() {
+    first_contact_is_fast(Order::PayerHigher).await;
+}
+
+/// A loopback TCP proxy to `upstream` that adds `delay` of latency to every
+/// byte coming back from it (order kept) and none to the other direction.
+/// Returns its address. Test-only: it sees only Noise ciphertext.
+async fn slow_return_proxy(upstream: String, delay: Duration) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else { continue };
+            let (mut client_rd, mut client_wr) = client.into_split();
+            let (mut server_rd, mut server_wr) = server.into_split();
+            tokio::spawn(async move { let _ = tokio::io::copy(&mut client_rd, &mut server_wr).await; });
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = server_rd.read(&mut buf).await {
+                    if n == 0 || tx.send((tokio::time::Instant::now() + delay, buf[..n].to_vec())).is_err() { break; }
+                }
+            });
+            tokio::spawn(async move {
+                while let Some((due, bytes)) = rx.recv().await {
+                    tokio::time::sleep_until(due).await;
+                    if client_wr.write_all(&bytes).await.is_err() { break; }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Fable review of #102: in the payer-higher order the payer is the X3DH
+/// acceptor. It holds a session (SessionInit received) before its sending
+/// chain exists, which needs the payee's RatchetInit a round trip later.
+/// Compose must wait until it can SEND, not only until a session exists, or
+/// the first compose fails ("session not initialized") after a consumed
+/// admission. The payee's bytes to the payer are delayed by 250 ms (a proxy)
+/// so that window is always wider than the 50 ms poll: deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speed_payer_higher_first_compose_delivers_while_ratchet_init_is_in_flight() {
+    let mut net = pair(Shape::CardOnly, Order::PayerHigher, Wallet::Plain, Wallet::Plain).await;
+    let payee = net.payee.id;
+    // Reconnect through the proxy before anything was paid.
+    net.payee.transport.disconnect(&net.payer.id).await.unwrap();
+    wait_until("the payer sees the drop", Duration::from_secs(5), || async {
+        !net.payer.transport.is_connected(&payee).await
+    })
+    .await;
+    let proxy = slow_return_proxy(net.payee.addr(), Duration::from_millis(250)).await;
+    net.payer.transport.connect(&payee, &proxy).await.unwrap();
+    wait_until("both sides see the proxied connection", Duration::from_secs(5), || async {
+        net.payer.transport.is_connected(&payee).await && net.payee.transport.is_connected(&net.payer.id).await
+    })
+    .await;
+
+    let (status, body) = net.payer.compose(&payee, "first").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["delivered"], true, "{body}");
+    net.payee.delivered_once("first").await;
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT, CHAT_MSAT], "one admission + the message");
+    net.stop();
+}
+
+/// Codex review of 7af1bc8 (#102 P1): the connection is replaced after the
+/// payer's eager PrekeyOffer was found eligible (its proof went out on the
+/// paid connection) and before it is written. The offer is bound to the paid
+/// generation: it never reaches the unpaid replacement (whose P2 gate at the
+/// payee would drop it), and the payee sends nothing there either. The paid
+/// connection is gone, so this first contact fails with the settled amount
+/// disclosed; the retry pays the replacement's own admission once and delivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speed_eager_offer_never_reaches_an_unpaid_replacement() {
+    let mut net = pair(Shape::CardOnly, Order::PayerLower, Wallet::Plain, Wallet::Plain).await;
+    let payee = net.payee.id;
+    let original = net.payer.transport.connected_since(&payee).await.unwrap();
+    net.payer.pause.arm_before_eager_offer();
+    let mark = log_mark();
+    let ((status, body), (payee_before, payer_before)) = tokio::join!(net.payer.compose(&payee, "first"), async {
+        net.payer.pause.reached().await;
+        // Each side's session refusals from here on: an eager offer on the
+        // unpaid replacement is refused (and counted) by the other side's gate.
+        let before = (net.payee.refused(), net.payer.refused());
+        net.flap().await;
+        let replacement = net.payer.transport.connected_since(&payee).await.unwrap();
+        assert_ne!(original, replacement, "a new generation");
+        assert!(!net.payer.paid_on_connection(&payee).await, "the replacement is unpaid");
+        net.payer.pause.release();
+        before
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let session = PrePaymentReason::SessionBeforePayment;
+    assert_eq!(refused_delta(&payee_before, &net.payee.refused(), session), 0, "the payer's eager offer reached the unpaid replacement");
+    assert_eq!(refused_delta(&payer_before, &net.payer.refused(), session), 0, "the payee offered on the unpaid replacement");
+    assert!(
+        logged_since(mark, &["sent PrekeyOffer right after the admission proof", &format!("peer={payee}")]).is_empty(),
+        "an eager offer was written after the paid connection was replaced"
+    );
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["amount_msat"], CHAT_MSAT, "the settled admission is disclosed: {body}");
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT]);
+
+    let (status, body) = net.payer.compose(&payee, "retry").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    net.payee.delivered_once("retry").await;
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT; 3], "one admission per admitted connection, plus the message");
     net.stop();
 }
 

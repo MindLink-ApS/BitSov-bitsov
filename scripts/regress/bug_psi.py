@@ -19,8 +19,14 @@ Scenarios (default: all):
 
 Passes (exit 0) when, in every scenario, each compose returns 200 delivered,
 B pays at most one admission plus each message, the second message pays the
-message only, and after B's admission settled B's log shows no dropped
-PrekeyOffer from A. Fails (exit 1) otherwise.
+message only, each first contact (the compose that pays admission) returns
+within FIRST_CONTACT_MAX_S, and after B's admission settled B's log shows no
+dropped PrekeyOffer from A. Fails (exit 1) otherwise.
+
+Timing (PSI-SPEED): first contact used to wait for one 15 s E2EE self-heal
+tick (about 12 s observed). The payee now offers its prekey on promotion and
+the payer offers right after its proof (and answers the payee's offer), so the
+session forms within round trips of the payment.
 
 Mock only: shared_mock Lightning and a mock chain, fresh loopback ports, and
 on macOS `sandbox-exec` with network limited to loopback. It stops only the
@@ -32,6 +38,8 @@ import argparse, base64, hashlib, hmac, json, os, shutil, socket, subprocess, sy
 import urllib.error, urllib.request
 
 CHAT_MSAT = 2_000
+# A paid first contact must not wait for a self-heal tick (PSI-SPEED).
+FIRST_CONTACT_MAX_S = 2.0
 SANDBOX = ('(version 1)\n(allow default)\n(deny network*)\n'
            '(allow network-inbound (local ip "localhost:*"))\n'
            '(allow network-outbound (remote ip "localhost:*"))\n'
@@ -190,7 +198,8 @@ content_dir = "{root}/pages"
         started = time.time()
         st, body = self.api(frm, "POST", "/messages/compose", {
             "recipient": self.ids[to], "is_room": False, "kind": 0, "plaintext": text, "max_total_msat": 20_000})
-        log(f"{frm.upper()}->{to.upper()} compose HTTP {st} in {time.time() - started:.1f}s:", json.dumps(body)[:300])
+        self.elapsed = time.time() - started
+        log(f"{frm.upper()}->{to.upper()} compose HTTP {st} in {self.elapsed:.2f}s:", json.dumps(body)[:300])
         return st, body
 
     def log_lines(self, n):
@@ -222,6 +231,8 @@ def scenario(name, binary, workdir, sandbox):
         if name == "control":
             st, body = net.compose("a", "b", "hi from A")
             check(st == 200 and body.get("delivered") is True, f"control: A->B first contact failed: {st} {body}")
+            check(net.elapsed < FIRST_CONTACT_MAX_S,
+                  f"control: A->B first contact took {net.elapsed:.2f}s (max {FIRST_CONTACT_MAX_S}s)")
         if name == "reply":
             st, _ = net.api("b", "POST", "/peers", {
                 "node_id": net.ids["a"], "addr": f"127.0.0.1:{net.ports['a']['p2p']}", "label": "A"})
@@ -230,8 +241,12 @@ def scenario(name, binary, workdir, sandbox):
         b_before = net.balance("b")
         st, body = net.compose("b", "a", "hola 1")
         check(st == 200 and body.get("delivered") is True, f"{name}: B->A #1 not delivered: {st} {body}")
+        first_s = net.elapsed
         paid_1 = b_before - net.balance("b")
         check(paid_1 <= 2 * CHAT_MSAT, f"{name}: B->A #1 paid {paid_1} msat (more than one admission + message)")
+        if paid_1 > CHAT_MSAT:  # it paid admission: a first contact
+            check(first_s < FIRST_CONTACT_MAX_S,
+                  f"{name}: B->A first contact took {first_s:.2f}s (max {FIRST_CONTACT_MAX_S}s)")
 
         b_before = net.balance("b")
         st, body = net.compose("b", "a", "hola 2")
@@ -245,7 +260,7 @@ def scenario(name, binary, workdir, sandbox):
         if settled is not None:
             drops = [l for l in lines[settled:] if "DROP PrekeyOffer" in l and net.ids["a"] in l]
             check(not drops, f"{name}: B dropped A's PrekeyOffer after paying A: {drops[:2]}")
-        log(f"{name}: B paid {paid_1} + {paid_2} msat; admission settled by B: {settled is not None}")
+        log(f"{name}: B paid {paid_1} + {paid_2} msat (#1 in {first_s:.2f}s); admission settled by B: {settled is not None}")
     finally:
         net.stop_all()
     return failures
