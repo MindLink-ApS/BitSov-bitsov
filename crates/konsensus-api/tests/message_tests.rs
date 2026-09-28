@@ -1914,6 +1914,7 @@ async fn compose_happy_path_keysend() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2039,6 +2040,7 @@ async fn compose_happy_path_invoice_flow() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2145,6 +2147,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2282,6 +2285,7 @@ async fn compose_keysend_fallback_to_invoice() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2402,6 +2406,7 @@ async fn compose_queues_when_transport_send_fails() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2496,6 +2501,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2624,6 +2630,7 @@ async fn compose_broadcasts_to_websocket() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2715,6 +2722,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2809,6 +2817,7 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2963,6 +2972,7 @@ async fn compose_room_rejects_oversized_member_count() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 

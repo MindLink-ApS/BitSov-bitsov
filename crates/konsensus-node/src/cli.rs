@@ -156,6 +156,9 @@ pub enum Command {
     /// command per budget window: `konsensus grant --op <id> --budget 2000
     /// --for 24h`. A summary is printed before you confirm.
     Grant {
+        /// Also authorize capped LSP deductions from this same budget.
+        #[arg(long)]
+        allow_liquidity_fees: bool,
         /// Pending operation id from the app's elevation request.
         #[arg(long = "op")]
         op_id: String,

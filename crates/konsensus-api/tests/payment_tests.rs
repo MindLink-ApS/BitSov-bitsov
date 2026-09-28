@@ -275,6 +275,7 @@ async fn pricing_own_chain_aware_reports_mode() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -1283,6 +1284,7 @@ async fn health_lightning_unavailable_shows_null_balance() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -1781,6 +1783,7 @@ async fn chain_status_with_failing_provider() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -1892,6 +1895,7 @@ async fn chain_status_partial_failure() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 
@@ -2214,6 +2218,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         peer_ln_pubkeys: Arc::clone(&base.peer_ln_pubkeys),
         lightning_backend: base.lightning_backend.clone(),
         chain_backend: base.chain_backend.clone(),
+        introduction: Default::default(),
         gossip_validator: base.gossip_validator.clone(),
     });
     let auth = auth_header(&state);
@@ -2351,4 +2356,20 @@ async fn close_channel_returns_closing_status() {
     assert_eq!(json["force"], true);
     assert_eq!(json["closing_txid"], "stub-closing-txid-force");
     assert_eq!(json["status"], "closing");
+}
+
+#[tokio::test]
+async fn liquidity_is_discoverable_and_off_by_default() {
+    let state = test_state();
+    let auth = auth_header(&state);
+    let app = build_router(state);
+    let response = app.oneshot(Request::builder()
+        .uri("/api/v1/payments/liquidity")
+        .header("authorization", auth)
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["enabled"], false);
+    assert_eq!(json["providers"], serde_json::json!([]));
 }

@@ -882,6 +882,7 @@ pub fn test_state() -> Arc<AppState> {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     })
 }
@@ -940,6 +941,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     })
 }
@@ -986,6 +988,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     })
 }
@@ -1042,6 +1045,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     })
 }
@@ -1088,6 +1092,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     })
 }
@@ -1310,6 +1315,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: Some(Arc::new(konsensus_gossip::GossipValidator::new(
             Default::default(),
         ))),
@@ -1531,6 +1537,7 @@ pub fn test_state_with_lightning(lightning: Arc<dyn LightningProvider>) -> Arc<A
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     })
 }

@@ -215,6 +215,24 @@ pub struct NetworkConfig {
     /// Sovereignty tier to advertise to peers.
     #[serde(default = "default_tier")]
     pub tier: SovereigntyTier,
+
+    /// Dialable `host:port` for `listen_addr`, signed into this node's
+    /// introduction (K1 door card). Needed when `listen_addr` is a wildcard
+    /// bind such as `0.0.0.0:9000`. Never the API address.
+    #[serde(default)]
+    pub advertised_addr: Option<String>,
+}
+
+impl NetworkConfig {
+    /// The peer endpoint an introduction may name: `advertised_addr`, else
+    /// `listen_addr` unless it is a wildcard bind.
+    pub fn introduction_endpoint(&self) -> Option<String> {
+        self.advertised_addr
+            .as_ref()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .or_else(|| (!self.listen_addr.ip().is_unspecified()).then(|| self.listen_addr.to_string()))
+    }
 }
 
 impl Default for NetworkConfig {
@@ -222,6 +240,7 @@ impl Default for NetworkConfig {
         Self {
             listen_addr: default_listen_addr(),
             tier: SovereigntyTier::T1,
+            advertised_addr: None,
         }
     }
 }
@@ -275,6 +294,9 @@ pub enum LightningConfig {
     /// The node IS its own Lightning node. Keys derived from the same mnemonic.
     #[serde(rename = "ldk")]
     Ldk {
+        /// Bounded LSPS2 bootstrap; disabled unless explicitly enabled.
+        #[serde(default)]
+        liquidity: konsensus_lightning::liquidity::LiquidityConfig,
         /// Bitcoin network: "bitcoin", "testnet", "signet", "regtest".
         #[serde(default = "default_ldk_network")]
         network: String,
@@ -334,6 +356,22 @@ impl LightningConfig {
             Self::Mock { .. } => "mock",
             Self::SharedMock { .. } => "shared_mock",
             Self::Ldk { .. } => "ldk",
+        }
+    }
+
+    /// Bitcoin network this backend pays on, when it states one. Mock
+    /// backends are regtest; LND and LNbits do not say.
+    pub fn bitcoin_network(&self) -> Option<String> {
+        match self {
+            Self::Ldk { network, .. } => match network.to_ascii_lowercase().as_str() {
+                "bitcoin" | "mainnet" => Some("bitcoin".into()),
+                "testnet" | "testnet3" => Some("testnet".into()),
+                "signet" => Some("signet".into()),
+                "regtest" => Some("regtest".into()),
+                _ => None,
+            },
+            Self::Mock { .. } | Self::SharedMock { .. } => Some("regtest".into()),
+            Self::Lnbits { .. } | Self::Lnd { .. } => None,
         }
     }
 
@@ -1241,6 +1279,7 @@ impl NodeConfig {
                     lsp_node_id: None,
                     lsp_address: None,
                     lsp_token: None,
+                    liquidity: Default::default(),
                     listening_address: Some("0.0.0.0:9735".to_string()),
                     advertised_address: None,
                 },
@@ -1265,6 +1304,7 @@ impl NodeConfig {
             network: NetworkConfig {
                 listen_addr: default_listen_addr(),
                 tier: network_tier,
+                advertised_addr: None,
             },
             lightning,
             chain,

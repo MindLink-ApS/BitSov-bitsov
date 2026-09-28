@@ -501,6 +501,13 @@ struct Inner {
     first_contact: HashMap<String, PendingFirstContact>,
 }
 
+/// Authority constraints checked inside the same transaction as the debit.
+#[derive(Default)]
+struct ReservationAuthority<'a> {
+    expected_op_id: Option<&'a str>,
+    liquidity: bool,
+}
+
 /// Consumed, single-use authorization. Its grant identity survives the handoff
 /// to reservation; neither replacement nor a different client can reuse it.
 #[derive(Debug, PartialEq, Eq)]
@@ -1720,7 +1727,15 @@ impl PairingService {
         clock: impl FnMut() -> i64,
     ) -> Result<Reservation, BudgetRefusal> {
         let mut inner = self.lock();
-        self.reserve_spend_locked(&mut inner, client_id, epoch, charges, None, clock)
+        self.reserve_spend_locked(&mut inner, client_id, epoch, charges, ReservationAuthority::default(), clock)
+    }
+
+    /// Liquidity authority is checked inside the SAME transaction as its debit.
+    pub fn reserve_liquidity_fee(&self, client_id: &str, epoch: u64, charges: Vec<Charge>) -> Result<Reservation, BudgetRefusal> {
+        let mut inner = self.lock();
+        self.reserve_spend_locked(&mut inner, client_id, epoch, charges,
+            ReservationAuthority { liquidity: true, ..Default::default() },
+            || chrono::Utc::now().timestamp())
     }
 
     fn reserve_spend_locked(
@@ -1729,7 +1744,7 @@ impl PairingService {
         client_id: &str,
         epoch: u64,
         charges: Vec<Charge>,
-        expected_op_id: Option<&str>,
+        authority: ReservationAuthority<'_>,
         mut clock: impl FnMut() -> i64,
     ) -> Result<Reservation, BudgetRefusal> {
         if !self.owner_control_enabled { return Err(BudgetRefusal::NoGrant); }
@@ -1745,7 +1760,7 @@ impl PairingService {
             return Err(BudgetRefusal::NoGrant);
         }
         let Some(idx) = inner.file.grants.iter().position(|g| {
-            if expected_op_id.is_some_and(|op_id| g.op_id != op_id) { return false; }
+            if authority.expected_op_id.is_some_and(|op_id| g.op_id != op_id) { return false; }
             g.client_id == client_id
                 && g.epoch == epoch
                 && g.identity_fingerprint == fingerprint
@@ -1753,6 +1768,9 @@ impl PairingService {
         }) else {
             return Err(BudgetRefusal::NoGrant);
         };
+        if authority.liquidity && !inner.file.grants[idx].budget.as_ref().is_some_and(|b| b.allow_liquidity_fees) {
+            return Err(BudgetRefusal::Unpriced("grant does not authorize liquidity fees".into()));
+        }
         let before = inner.file.grants[idx].budget.clone();
         let op_id = inner.file.grants[idx].op_id.clone();
         let id = uuid::Uuid::new_v4().to_string();
@@ -2001,7 +2019,8 @@ impl PairingService {
         }
         // Eligibility and reservation share the replacement/revocation mutex.
         self.reserve_spend_locked(&mut inner, &parent.client_id, epoch,
-            vec![Charge { recipient, amount_msat }], Some(&parent.op_id),
+            vec![Charge { recipient, amount_msat }],
+            ReservationAuthority { expected_op_id: Some(&parent.op_id), ..Default::default() },
             || chrono::Utc::now().timestamp())
     }
 
@@ -2017,7 +2036,8 @@ impl PairingService {
         if approval.expires_at <= chrono::Utc::now().timestamp() { return Err(BudgetRefusal::NoGrant); }
         self.reserve_spend_locked(&mut inner, &approval.client_id, approval.epoch,
             vec![Charge { recipient: approval.recipient, amount_msat }],
-            Some(&approval.budget_op_id), || chrono::Utc::now().timestamp())
+            ReservationAuthority { expected_op_id: Some(&approval.budget_op_id), ..Default::default() },
+            || chrono::Utc::now().timestamp())
     }
 
     /// Consume this client's first-contact grant for `recipient`, returning
@@ -2259,6 +2279,7 @@ pub enum ElevationStatus {
 fn grant_view(g: &SpendGrant) -> Option<GrantView> {
     let b = g.budget.as_ref()?;
     Some(GrantView {
+        allow_liquidity_fees: b.allow_liquidity_fees,
         op_id: g.op_id.clone(),
         client_id: g.client_id.clone(),
         granted_at: g.granted_at,

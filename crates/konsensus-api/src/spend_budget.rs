@@ -92,6 +92,10 @@ pub const MAX_RECIPIENT_BUDGETS: usize = 256;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GrantTerms {
+    /// Explicit authority for LSP deductions, charged to this SAME budget.
+    /// Ordinary message grants never imply liquidity-purchase authority.
+    #[serde(default)]
+    pub allow_liquidity_fees: bool,
     /// Total the client may spend inside the window, in millisatoshis.
     pub budget_msat: u64,
     /// Most one API call may reserve, in millisatoshis. A room message is one
@@ -111,6 +115,7 @@ impl GrantTerms {
     /// equal to the whole budget, no per-recipient budgets.
     pub fn new(budget_msat: u64) -> Self {
         Self {
+            allow_liquidity_fees: false,
             budget_msat,
             per_call_max_msat: budget_msat,
             per_recipient_msat: BTreeMap::new(),
@@ -193,6 +198,8 @@ pub fn canonical_recipient(key: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GrantBudget {
+    #[serde(default)]
+    pub allow_liquidity_fees: bool,
     /// Total budget, msat.
     pub budget_msat: u64,
     /// Per-call maximum, msat.
@@ -214,6 +221,7 @@ impl GrantBudget {
     /// A fresh meter for approved terms.
     pub fn from_terms(terms: &GrantTerms) -> Self {
         Self {
+            allow_liquidity_fees: terms.allow_liquidity_fees,
             budget_msat: terms.budget_msat,
             per_call_max_msat: terms.per_call_max_msat,
             per_recipient_msat: terms.per_recipient_msat.clone(),
@@ -399,6 +407,8 @@ impl BudgetRefusal {
 /// A grant as reported to the client that holds it and to the owner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GrantView {
+    #[serde(default)]
+    pub allow_liquidity_fees: bool,
     /// The grant's operation id.
     pub op_id: String,
     /// Client it belongs to.
@@ -429,6 +439,7 @@ pub fn describe_terms(terms: &GrantTerms) -> String {
         sats(terms.per_call_max_msat),
         human_duration(terms.ttl_secs)
     );
+    out.push_str(if terms.allow_liquidity_fees { "\n  LSP fees:      allowed, within this same budget" } else { "\n  LSP fees:      not authorized" });
     if terms.per_recipient_msat.is_empty() {
         out.push_str("\n  recipients:    any, within the total");
     } else {

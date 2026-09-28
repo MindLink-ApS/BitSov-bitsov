@@ -13,3 +13,25 @@ Production event regression (unstarted, fixed-seed regtest object with synthetic
     cargo test --manifest-path vendor/ldk-node/Cargo.toml --locked --lib bitsov_stateless_tests
 
 The vendor unit-test lock is separate; workspace dependencies remain pinned by the root Cargo.lock. The vendor manifest adds tempfile for these disposable storage tests. No upstream integration tests or real node daemons run.
+
+## Fixed LSPS2 funding minimum
+
+Before claiming a stored fixed-amount `Bolt11Jit` payment, `PaymentClaimable`
+validates the aggregate net against the persisted gross minus the negotiated
+maximum opening fee. An amount below that minimum, an excessive skim, or invalid
+fixed-amount terms fails the whole payment backwards before the preimage is
+released. Rejection preserves the original gross/fee terms for retries and
+restart. Variable-amount JIT invoices retain their existing fee-only policy;
+BitSov's pilot does not issue them.
+
+The check runs after LDK has assembled MPP parts and before either automatic
+claim or manual-claim notification. It never rejects an individual shard merely
+because it is below the whole-payment minimum. Existing `Succeeded` duplicate
+protection remains before this check because settled records contain net, not
+the original gross.
+
+    cargo test --manifest-path vendor/ldk-node/Cargo.toml --locked --lib bitsov_jit_tests
+
+The regression invokes the production handler and uses LDK's existing in-memory
+test channel managers to deliver multipart HTLCs. No node is started, no socket
+is bound, and no real wallet or funds are used.
