@@ -48,6 +48,10 @@ struct Recovery {
     admission_is_readmission: bool,
     #[serde(default)]
     admission_reservation: Option<Reservation>,
+    #[serde(default)]
+    resend_after_ms: i64,
+    #[serde(default)]
+    resend_delay_ms: u64,
 }
 
 fn storage(e: impl std::fmt::Display) -> ApiError {
@@ -646,6 +650,10 @@ pub(super) async fn get_operation(
 
 async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
     let mut data = recovery(op)?;
+    // Settlement evidence is monotonic even while proof retrieval is incomplete.
+    if let Some(details) = data.settlement.as_ref().filter(|d| settlement_matches(op, &data, d)) {
+        op.settled_msat = i64::try_from(details.amount_msat).map_err(storage)?;
+    }
     if data.admission_pending && !data.dispatched {
         let details = match &op.admission_payment_hash {
             Some(hash) => state.lightning.get_payment_status(hash).await.ok(),
@@ -710,10 +718,12 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
         return Ok(());
     }
     if data.envelope_ready {
-        let env = data
-            .draft
-            .as_ref()
-            .ok_or_else(|| storage("missing paid draft"))?;
+        let Some(env) = data.draft.as_ref() else {
+            op.state = "payment_unknown".into();
+            op.last_error = Some("settled payment missing encrypted draft".into());
+            save(state, op).await?;
+            return Ok(());
+        };
         materialize(state, op, env).await?;
         if let Some(details) = &data.settlement {
             resolve_budget(
@@ -728,10 +738,8 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
     }
     let details = match &data.settlement {
         Some(p)
-            if matches!(
-                p.status,
-                PaymentStatus::Settled | PaymentStatus::Failed | PaymentStatus::Expired
-            ) =>
+            if matches!(p.status, PaymentStatus::Failed | PaymentStatus::Expired)
+                || (p.status == PaymentStatus::Settled && settlement_preimage(p).is_some()) =>
         {
             Some(p.clone())
         }
@@ -755,6 +763,11 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
         return Ok(());
     }
     match details.status {
+        PaymentStatus::Failed | PaymentStatus::Expired if op.settled_msat > 0 => {
+            op.state = "payment_unknown".into();
+            op.last_error = Some("backend failure contradicts recorded settlement".into());
+            save(state, op).await?;
+        }
         PaymentStatus::Failed | PaymentStatus::Expired => {
             op.state = "released".into();
             save(state, op).await?;
@@ -773,20 +786,14 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
                 details.amount_msat,
                 details.fee_msat,
             );
-            let proof = details
-                .preimage
-                .as_ref()
-                .and_then(|p| hex::decode(p).ok())
-                .and_then(|v| <[u8; 32]>::try_from(v).ok())
-                .filter(|p| hex::encode(Sha256::digest(p)) == details.payment_hash);
-            let Some(preimage) = proof else {
-                op.state = "failed_paid".into();
+            let Some(preimage) = settlement_preimage(&details) else {
+                op.state = "payment_unknown".into();
                 op.last_error = Some("settled payment has no valid proof".into());
                 save(state, op).await?;
                 return Ok(());
             };
             let Some(mut env) = data.draft.clone() else {
-                op.state = "failed_paid".into();
+                op.state = "payment_unknown".into();
                 op.last_error = Some("settled payment missing encrypted draft".into());
                 save(state, op).await?;
                 return Ok(());
@@ -797,6 +804,12 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
                 &state.identity.sign(&env.signable_bytes()),
             );
             op.settled_msat = i64::try_from(details.amount_msat).map_err(storage)?;
+            // Carry the recovered evidence through the paid transaction so a
+            // second crash can still resolve the original pairing reservation.
+            data.settlement = Some(details.clone());
+            data.draft = Some(env.clone());
+            data.envelope_ready = true;
+            encode(op, &data)?;
             materialize(state, op, &env).await?;
             resolve_budget(
                 state,
@@ -809,6 +822,15 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
     }
     Ok(())
 }
+fn settlement_preimage(details: &PaymentDetails) -> Option<[u8; 32]> {
+    details
+        .preimage
+        .as_ref()
+        .and_then(|p| hex::decode(p).ok())
+        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+        .filter(|p| hex::encode(Sha256::digest(p)) == details.payment_hash)
+}
+
 fn resolve_budget(
     state: &AppState,
     data: &Recovery,
@@ -856,8 +878,11 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             if matches!(op.state.as_str(), "paying" | "payment_unknown") {
                 reconcile(state, &mut op).await?;
             }
+            if matches!(op.state.as_str(), "paid" | "sent" | "acked" | "rejected_retryable" | "failed_paid") {
+                recover_budget(state, &op)?;
+            }
             if op.state == "paid" {
-                resend(state, &op).await?;
+                recover_paid(state, &mut op).await?;
             }
             Ok(())
         }
@@ -866,5 +891,53 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             tracing::warn!(operation_id = %candidate.operation_id, %error, "operation recovery deferred");
         }
     }
+    Ok(())
+}
+
+
+fn settlement_matches(op: &OutboxOperation, data: &Recovery, details: &PaymentDetails) -> bool {
+    details.status == PaymentStatus::Settled
+        && details.direction == PaymentDirection::Outgoing
+        && Some(&details.payment_hash) == op.payment_hash.as_ref()
+        && details.amount_msat == data.expected_msat
+}
+
+fn recover_budget(state: &AppState, op: &OutboxOperation) -> Result<(), ApiError> {
+    let data = recovery(op)?;
+    // Original reservation/grant IDs make this idempotent even after an ACK or
+    // reject won the race with recovery. Delivery never gates accounting.
+    if let Some(details) = data.settlement.as_ref().filter(|d| settlement_matches(op, &data, d)) {
+        resolve_budget(state, &data, &op.recipient, details.amount_msat, details.fee_msat);
+    } else if data.envelope_ready && !data.dispatched && data.expected_msat == 0
+        && data.draft.as_ref().is_some_and(|env| env.payment_proof.amount_msat == 0)
+    {
+        // Free messages have no Lightning settlement record, but their admission
+        // can still hold a reservation. Unknown admission fees remain reserved.
+        resolve_budget(state, &data, &op.recipient, 0, Some(0));
+    }
+    Ok(())
+}
+
+async fn recover_paid(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    let mut data = recovery(op)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    if now < data.resend_after_ms {
+        return Ok(());
+    }
+    let peer = NodeId::from_hex(&op.recipient).map_err(storage)?;
+    if !state.transport.is_connected(&peer).await {
+        data.resend_delay_ms = data.resend_delay_ms.saturating_mul(2).clamp(15_000, 300_000);
+        data.resend_after_ms = now.saturating_add(data.resend_delay_ms as i64);
+        encode(op, &data)?;
+        save(state, op).await?;
+        return Ok(());
+    }
+    if data.resend_delay_ms != 0 || data.resend_after_ms != 0 {
+        data.resend_delay_ms = 0;
+        data.resend_after_ms = 0;
+        encode(op, &data)?;
+        save(state, op).await?;
+    }
+    resend(state, op).await?;
     Ok(())
 }

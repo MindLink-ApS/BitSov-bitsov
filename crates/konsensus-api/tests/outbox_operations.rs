@@ -175,9 +175,10 @@ impl LightningProvider for Wallet {
                 details.status = PaymentStatus::Failed;
                 details.preimage = None;
             }
-            5 => {
-                details.preimage = Some("00".repeat(32));
-            }
+            5 => { details.preimage = Some("00".repeat(32)); }
+            7 => { details.preimage = None; }
+            8 => { details.preimage = Some("not hex".into()); }
+            9 => { details.preimage = Some("cd".repeat(31)); }
             _ => {}
         }
         Ok(details)
@@ -449,7 +450,7 @@ async fn recovery_never_resends_legacy_connection_admission() {
 
 #[tokio::test]
 async fn confirmed_failed_payment_releases_and_invalid_settled_proof_reports_paid_amount() {
-    for failure in [2, 5] {
+    for failure in [2, 5, 7, 8, 9] {
         let mut f = Fixture::new().await;
         f.wallet.mode.store(1, Ordering::SeqCst);
         let old_sessions = f.state.session_manager.clone();
@@ -488,12 +489,111 @@ async fn confirmed_failed_payment_releases_and_invalid_settled_proof_reports_pai
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 2);
         } else {
-            assert_eq!(f.op().await.state, "failed_paid");
+            assert_eq!(f.op().await.state, "payment_unknown");
             assert_eq!(f.op().await.settled_msat, 1000);
             assert_eq!(f.post().await.0, StatusCode::CONFLICT);
             assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+            // A contradictory later backend status must not erase settlement
+            // evidence and turn the missing-proof condition into retry permission.
+            f.wallet.mode.store(2, Ordering::SeqCst);
+            konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+            assert_eq!(f.op().await.state, "payment_unknown");
+            f.wallet.mode.store(0, Ordering::SeqCst);
+            konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+            assert_eq!(f.op().await.state, "sent");
+            assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
         }
     }
+}
+
+#[tokio::test]
+async fn recovery_repolls_cached_settlement_without_proof() {
+    let mut f = Fixture::new().await;
+    // The mock's deferred path stores payments by their pollable raw hash.
+    f.wallet.inner.defer_next_keysend_settlement(0).await;
+    sqlx::raw_sql("CREATE TRIGGER crash BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'before paid commit'); END").execute(f.db.pool()).await.unwrap();
+    let _ = f.post().await;
+    sqlx::raw_sql("DROP TRIGGER crash").execute(f.db.pool()).await.unwrap();
+    let mut op = f.op().await;
+    let mut data: serde_json::Value = serde_json::from_slice(&op.recovery).unwrap();
+    data["envelope_ready"] = false.into();
+    data["settlement"]["preimage"] = serde_json::Value::Null;
+    op.recovery = serde_json::to_vec(&data).unwrap();
+    op.state = "payment_unknown".into();
+    op.settled_msat = 0; // record() can persist settlement before the amount receipt
+    assert!(f.db.update_outbox_operation(&op).await.unwrap());
+    f.restart().await;
+    f.wallet.mode.store(2, Ordering::SeqCst);
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(f.op().await.state, "payment_unknown");
+    assert_eq!(f.op().await.settled_msat, 1000);
+    f.wallet.mode.store(0, Ordering::SeqCst);
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(f.op().await.state, "sent");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn recovery_missing_draft_stays_unknown_until_draft_restored() {
+    for ready in [false, true] {
+        let mut f = Fixture::new().await;
+        sqlx::raw_sql("CREATE TRIGGER crash BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'before paid commit'); END").execute(f.db.pool()).await.unwrap();
+        let _ = f.post().await;
+        sqlx::raw_sql("DROP TRIGGER crash").execute(f.db.pool()).await.unwrap();
+        let mut op = f.op().await;
+        let mut data: serde_json::Value = serde_json::from_slice(&op.recovery).unwrap();
+        let draft = data["draft"].take();
+        data["envelope_ready"] = ready.into();
+        op.recovery = serde_json::to_vec(&data).unwrap();
+        op.state = "paying".into();
+        assert!(f.db.update_outbox_operation(&op).await.unwrap());
+        f.restart().await;
+        konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+        assert_eq!(f.op().await.state, "payment_unknown");
+        assert_eq!(f.op().await.settled_msat, 1000);
+        assert_eq!(f.post().await.0, StatusCode::CONFLICT);
+        let mut op = f.op().await;
+        data["draft"] = draft;
+        op.recovery = serde_json::to_vec(&data).unwrap();
+        assert!(f.db.update_outbox_operation(&op).await.unwrap());
+        konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+        assert_eq!(f.op().await.state, "sent");
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn recovery_offline_backoff_is_exponential_capped_and_survives_restart() {
+    let mut f = Fixture::new().await;
+    Arc::get_mut(&mut f.state).unwrap().transport = Arc::new(ReceiptTransport {
+        db: f.db.clone(), peer: f.peer, fail_write: true,
+    });
+    assert_eq!(f.post().await.0, StatusCode::OK);
+    assert_eq!(f.op().await.state, "paid");
+    let attempts = f.op().await.attempts;
+    for delay in [15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000] {
+        f.restart().await;
+        Arc::get_mut(&mut f.state).unwrap().transport = Arc::new(common::StubTransport);
+        let before = chrono::Utc::now().timestamp_millis();
+        konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+        let op = f.op().await;
+        assert_eq!(op.state, "paid");
+        assert_eq!(op.attempts, attempts, "offline recovery must not mark a send intent");
+        let data: serde_json::Value = serde_json::from_slice(&op.recovery).unwrap();
+        let due = data["resend_after_ms"].as_i64().unwrap();
+        assert!(due >= before + delay && due <= chrono::Utc::now().timestamp_millis() + delay);
+        konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+        assert_eq!(f.op().await.version, op.version, "no per-tick retry bookkeeping");
+        // Move just the persisted deadline into the past; no wall-clock sleeps.
+        sqlx::query("UPDATE outbox_operations SET recovery = CAST(json_set(CAST(recovery AS TEXT), '$.resend_after_ms', 0) AS BLOB)")
+            .execute(f.db.pool()).await.unwrap();
+    }
+    f.restart().await; // connected again
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(f.op().await.state, "sent");
+    let data: serde_json::Value = serde_json::from_slice(&f.op().await.recovery).unwrap();
+    assert_eq!(data["resend_delay_ms"], 0);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
 }
 
 struct ReceiptTransport {
