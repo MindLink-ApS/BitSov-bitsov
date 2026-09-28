@@ -422,6 +422,21 @@ impl Bolt11Payment {
 	pub fn receive_stateless(
 		&self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
 	) -> Result<Bolt11Invoice, Error> {
+        self.receive_stateless_inner(amount_msat, description, expiry_secs, false)
+    }
+
+    /// Stateless receptor quote for a new act, excluding private route hints.
+    /// Legacy chat uses receive_stateless and preserves its original invoice.
+    pub fn receive_stateless_without_route_hints(
+        &self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+    ) -> Result<Bolt11Invoice, Error> {
+        self.receive_stateless_inner(amount_msat, description, expiry_secs, true)
+    }
+
+    fn receive_stateless_inner(
+        &self, amount_msat: u64, description: &Bolt11InvoiceDescription, expiry_secs: u32,
+        omit_route_hints: bool,
+    ) -> Result<Bolt11Invoice, Error> {
 		let description = maybe_try_convert_enum(description)?;
 		let params = Bolt11InvoiceParameters {
 			amount_msats: Some(amount_msat),
@@ -432,6 +447,12 @@ impl Bolt11Payment {
 		};
 		let invoice = self.channel_manager.create_bolt11_invoice(params)
 			.map_err(|_| Error::InvoiceCreationFailed)?;
+        self.sign_stateless_quote(invoice, amount_msat, omit_route_hints)
+    }
+
+    // Apply the receptor disclosure policy and authenticate settlement metadata
+    // in the same node signature. Called only for stateless invoice preparation.
+    fn sign_stateless_quote(&self, invoice: LdkBolt11Invoice, amount_msat: u64, omit_route_hints: bool) -> Result<Bolt11Invoice, Error> {
         let deadline = invoice.expires_at().ok_or(Error::InvoiceCreationFailed)?.as_secs();
         let mut metadata = Vec::from(b"BSQ1".as_slice());
         metadata.extend_from_slice(&deadline.to_be_bytes());
@@ -439,6 +460,13 @@ impl Bolt11Payment {
         let payload = stateless_quote_payload(&metadata, invoice.payment_hash().as_byte_array(), &invoice.payment_secret().0);
         metadata.extend_from_slice(self.keys_manager.sign_message(&payload).as_bytes());
         let (mut raw, _, _) = invoice.into_signed_raw().into_parts();
+        // New acts omit private topology before signing. Chat preserves main's
+        // fields and signature until the separate ADR-042 decision.
+        if omit_route_hints {
+            raw.data.tagged_fields.retain(|field| !matches!(field,
+                lightning_invoice::RawTaggedField::KnownSemantics(
+                    lightning_invoice::TaggedField::PrivateRoute(_))));
+        }
         for field in &mut raw.data.tagged_fields {
             if let lightning_invoice::RawTaggedField::KnownSemantics(lightning_invoice::TaggedField::Features(features)) = field {
                 features.set_payment_metadata_required();
@@ -932,4 +960,117 @@ pub(crate) fn stateless_quote_valid(
     lightning::util::message_signing::verify(
         &stateless_quote_payload(&metadata[..20], hash, secret), signature, node_id,
     )
+}
+
+#[cfg(all(test, not(feature = "uniffi")))]
+mod receptor_tests {
+    use super::*;
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret, RouteHint, RouteHintHop, RoutingFees};
+
+    #[test]
+    fn stateless_signature_omits_private_routes_and_preserves_quote() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = crate::Builder::new();
+        builder.set_network(bitcoin::Network::Regtest);
+        builder.set_entropy_seed_bytes([42; 64]);
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+        let node = builder.build().unwrap();
+        let key = SecretKey::from_slice(&[7; 32]).unwrap();
+        let secp = Secp256k1::new();
+        let hinted = InvoiceBuilder::new(Currency::Regtest)
+            .description("bound receptor quote".into())
+            .payment_hash(Sha256::hash(&[1; 32]))
+            .payment_secret(PaymentSecret([2; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(18)
+            .amount_milli_satoshis(2000)
+            .expiry_time(std::time::Duration::from_secs(55))
+            .private_route(RouteHint(vec![RouteHintHop {
+                src_node_id: PublicKey::from_secret_key(&secp, &key),
+                short_channel_id: 42,
+                fees: RoutingFees { base_msat: 1, proportional_millionths: 10 },
+                cltv_expiry_delta: 18,
+                htlc_minimum_msat: None,
+                htlc_maximum_msat: None,
+            }]))
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &key)).unwrap();
+        assert_eq!(hinted.route_hints().len(), 1);
+        let hash = *hinted.payment_hash();
+        let deadline = hinted.expires_at();
+        let signed = node.bolt11_payment().sign_stateless_quote(hinted, 2000, true).unwrap();
+        assert!(signed.route_hints().is_empty());
+        assert_eq!(signed.recover_payee_pub_key(), node.node_id());
+        assert_eq!(signed.payment_hash(), &hash);
+        assert_eq!(signed.amount_milli_satoshis(), Some(2000));
+        assert_eq!(signed.description().to_string(), "bound receptor quote");
+        assert_eq!(signed.expires_at(), deadline);
+        assert!(signed.payment_metadata().is_some());
+        assert!(node.list_payments().is_empty());
+    }
+    // Frozen signing algorithm from main 696d57a4e7c427a086538118933e6a562132050d.
+    fn main_sign_stateless_quote(payment: &Bolt11Payment, invoice: LdkBolt11Invoice, amount_msat: u64) -> Result<Bolt11Invoice, Error> {
+        let deadline = invoice.expires_at().ok_or(Error::InvoiceCreationFailed)?.as_secs();
+        let mut metadata = Vec::from(b"BSQ1".as_slice());
+        metadata.extend_from_slice(&deadline.to_be_bytes());
+        metadata.extend_from_slice(&amount_msat.to_be_bytes());
+        let payload = stateless_quote_payload(&metadata, invoice.payment_hash().as_byte_array(), &invoice.payment_secret().0);
+        metadata.extend_from_slice(payment.keys_manager.sign_message(&payload).as_bytes());
+        let (mut raw, _, _) = invoice.into_signed_raw().into_parts();
+        for field in &mut raw.data.tagged_fields {
+            if let lightning_invoice::RawTaggedField::KnownSemantics(lightning_invoice::TaggedField::Features(features)) = field {
+                features.set_payment_metadata_required();
+            }
+        }
+        raw.data.tagged_fields.push(lightning_invoice::RawTaggedField::KnownSemantics(
+            lightning_invoice::TaggedField::PaymentMetadata(metadata)));
+        let signature = payment.keys_manager.sign_invoice(&raw, Recipient::Node)
+            .map_err(|_| Error::InvoiceCreationFailed)?;
+        let signed = raw.sign(|_| Ok::<_, Error>(signature))?;
+        LdkBolt11Invoice::from_signed(signed).map(maybe_wrap).map_err(|_| Error::InvoiceCreationFailed)
+    }
+
+    #[test]
+    fn stateless_chat_signature_preserves_private_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = crate::Builder::new();
+        builder.set_network(bitcoin::Network::Regtest);
+        builder.set_entropy_seed_bytes([42; 64]);
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+        let node = builder.build().unwrap();
+        let key = SecretKey::from_slice(&[7; 32]).unwrap();
+        let secp = Secp256k1::new();
+        let hinted = InvoiceBuilder::new(Currency::Regtest)
+            .description("bound receptor quote".into())
+            .payment_hash(Sha256::hash(&[1; 32]))
+            .payment_secret(PaymentSecret([2; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(18)
+            .amount_milli_satoshis(2000)
+            .expiry_time(std::time::Duration::from_secs(55))
+            .private_route(RouteHint(vec![RouteHintHop {
+                src_node_id: PublicKey::from_secret_key(&secp, &key),
+                short_channel_id: 42,
+                fees: RoutingFees { base_msat: 1, proportional_millionths: 10 },
+                cltv_expiry_delta: 18,
+                htlc_minimum_msat: None,
+                htlc_maximum_msat: None,
+            }]))
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &key)).unwrap();
+        assert_eq!(hinted.route_hints().len(), 1);
+        let hash = *hinted.payment_hash();
+        let deadline = hinted.expires_at();
+        let hints = hinted.route_hints();
+        let expected = main_sign_stateless_quote(&node.bolt11_payment(), hinted.clone(), 2000).unwrap();
+        let signed = node.bolt11_payment().sign_stateless_quote(hinted, 2000, false).unwrap();
+        assert_eq!(signed.to_string(), expected.to_string(), "chat signing must remain byte-identical to main");
+        assert_eq!(signed.route_hints(), hints);
+        assert_eq!(signed.recover_payee_pub_key(), node.node_id());
+        assert_eq!(signed.payment_hash(), &hash);
+        assert_eq!(signed.amount_milli_satoshis(), Some(2000));
+        assert_eq!(signed.description().to_string(), "bound receptor quote");
+        assert_eq!(signed.expires_at(), deadline);
+        assert!(signed.payment_metadata().is_some());
+        assert!(node.list_payments().is_empty());
+    }
 }

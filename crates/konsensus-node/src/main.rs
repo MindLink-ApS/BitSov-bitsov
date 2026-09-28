@@ -1037,6 +1037,7 @@ async fn cmd_start(
 
     // Session/control event handler — E2EE negotiation, pricing, invoices, peer exchange, gossip
     let session_handle = tokio::spawn(session_handler::run(session_handler::SessionHandlerDeps {
+        receptor: config.receptor.clone(),
         transport: Arc::clone(node.transport()),
         session_manager: Arc::clone(&api_state.session_manager),
         storage: Arc::clone(node.storage()),

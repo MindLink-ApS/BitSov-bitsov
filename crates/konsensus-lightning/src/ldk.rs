@@ -291,6 +291,31 @@ impl std::fmt::Debug for LdkProvider {
 static INVOICE_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl LdkProvider {
+    fn stateless_invoice(
+        &self, amount_msat: u64, description: &str, expiry_secs: u32,
+        omit_route_hints: bool,
+    ) -> Result<Invoice, LightningError> {
+        let desc = LdkInvoiceDescription::Direct(
+            LdkDescription::new(description.to_owned())
+                .map_err(|e| LightningError::InvoiceCreation(e.to_string()))?,
+        );
+        let payment = self.node.bolt11_payment();
+        let signed = if omit_route_hints {
+            payment.receive_stateless_without_route_hints(amount_msat, &desc, expiry_secs)
+        } else {
+            payment.receive_stateless(amount_msat, &desc, expiry_secs)
+        }
+            .map_err(|e| LightningError::InvoiceCreation(e.to_string()))?;
+        Ok(Invoice {
+            payment_hash: signed.payment_hash().to_string(),
+            bolt11: signed.to_string(),
+            amount_msat,
+            description: description.to_owned(),
+            expiry_secs,
+            created_at: signed.duration_since_epoch().as_secs(),
+        })
+    }
+
     async fn pay_invoice_routed(
         &self, bolt11: &str,
         route_parameters: Option<ldk_node::lightning::routing::router::RouteParametersConfig>,
@@ -1006,26 +1031,15 @@ impl LightningProvider for LdkProvider {
     }
 
     async fn create_stateless_invoice(
-        &self,
-        amount_msat: u64,
-        description: &str,
-        expiry_secs: u32,
+        &self, amount_msat: u64, description: &str, expiry_secs: u32,
     ) -> Result<Invoice, LightningError> {
-        let desc = LdkInvoiceDescription::Direct(
-            LdkDescription::new(description.to_owned())
-                .map_err(|e| LightningError::InvoiceCreation(e.to_string()))?,
-        );
-        let signed = self.node.bolt11_payment()
-            .receive_stateless(amount_msat, &desc, expiry_secs)
-            .map_err(|e| LightningError::InvoiceCreation(e.to_string()))?;
-        Ok(Invoice {
-            payment_hash: signed.payment_hash().to_string(),
-            bolt11: signed.to_string(),
-            amount_msat,
-            description: description.to_owned(),
-            expiry_secs,
-            created_at: signed.duration_since_epoch().as_secs(),
-        })
+        self.stateless_invoice(amount_msat, description, expiry_secs, false)
+    }
+
+    async fn create_stateless_invoice_without_route_hints(
+        &self, amount_msat: u64, description: &str, expiry_secs: u32,
+    ) -> Result<Invoice, LightningError> {
+        self.stateless_invoice(amount_msat, description, expiry_secs, true)
     }
 
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {

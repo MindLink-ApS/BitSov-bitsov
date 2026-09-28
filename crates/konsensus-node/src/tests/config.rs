@@ -2320,3 +2320,44 @@ fn sponsor_is_off_by_default_and_clamped_to_the_spec() {
     }
     assert!(toml::from_str::<SponsorConfig>("enabled = true\nfree_lane = true").is_err(), "unknown keys refused");
 }
+
+#[test]
+fn receptor_defaults_and_opt_in_are_explicit() {
+    let defaults: ReceptorConfig = toml::from_str("").unwrap();
+    assert_eq!(defaults.acts.len(), 1);
+    assert_eq!(defaults.acts[0].kind, konsensus_core::kind::KIND_CHAT);
+    assert!(defaults.acts[0].enabled);
+    let configured: ReceptorConfig = toml::from_str(
+        r#"
+        route_hints = "none"
+        [[acts]]
+        kind = 200
+    "#,
+    )
+    .unwrap();
+    assert!(!configured.acts[0].enabled);
+    assert!(toml::from_str::<ReceptorConfig>("route_hints = 'single_lsp'").is_err());
+    for invalid in [
+        "[[acts]]\nkind = 0\n[[acts]]\nkind = 0",
+        "[[acts]]\nkind = 200\nwindow_secs = 0",
+        "[[acts]]\nkind = 200\nper_source = 0",
+        "[[acts]]\nkind = 200\nglobal = 0",
+    ] {
+        assert!(toml::from_str::<ReceptorConfig>(invalid)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+}
+
+#[test]
+fn receptor_rejects_enabled_unpriceable_kind_700_at_config_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = NodeConfig::default_for_tier(NodeTier::Light, dir.path().join("mnemonic"), dir.path());
+    config.receptor = toml::from_str("[[acts]]\nkind=700\nenabled=true").unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    assert!(NodeConfig::load(&path).unwrap_err().to_string().contains("700"));
+    config.receptor.acts[0].enabled = false;
+    config.receptor.validate().unwrap();
+}

@@ -1506,6 +1506,7 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
     let (pending, _pending_rx) = mpsc::channel(8);
     let (auto, _auto_rx) = mpsc::channel(8);
     let worker = tokio::spawn(run(SessionHandlerDeps {
+        receptor: Default::default(),
         transport: target.clone(),
         session_manager: sessions.clone(),
         storage: storage.clone(),
@@ -1610,6 +1611,211 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
     source.shutdown();
     target.shutdown();
 }
+
+#[tokio::test]
+async fn enabled_second_act_quote_over_noise_creates_no_application_state() {
+    second_act_quote_over_noise(
+        r#"
+        [[acts]]
+        kind = 200
+        enabled = true
+    "#,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn disabled_second_act_quote_over_noise_is_refused_without_state() {
+    second_act_quote_over_noise(
+        r#"
+        [[acts]]
+        kind = 200
+    "#,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn default_second_act_quote_over_noise_is_refused_without_state() {
+    second_act_quote_over_noise("", false).await;
+}
+
+async fn second_act_quote_over_noise(config: &str, enabled: bool) {
+    use konsensus_core::admission_quote;
+    use konsensus_message::{ReachabilityMode, TransportConfig};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, a) = NodeIdentity::generate().unwrap();
+    let (_, b) = NodeIdentity::generate().unwrap();
+    let a = Arc::new(a);
+    let b = Arc::new(b);
+    let peer = *a.node_id();
+    let recipient = *b.node_id();
+    let transport = |id: Arc<NodeIdentity>| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                whitelist: vec![],
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(a);
+    let target = transport(b.clone());
+    target.start_listener().await.unwrap();
+    let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let initial_onboarding = storage.get_onboarding_state().await.unwrap();
+    let sessions = Arc::new(SessionManager::new(b.clone()));
+    let registry = Arc::new(tokio::sync::RwLock::new(PeerRegistry::new()));
+    let prices = Arc::new(PeerPriceCache::new());
+    let provider = Arc::new(
+        konsensus_lightning::shared_mock::SharedMockProvider::new(
+            &dir.path().join("mock.sqlite"),
+            "b",
+            0,
+        )
+        .unwrap(),
+    );
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws, _ws_rx) = broadcast::channel(8);
+    let (delivery, _delivery_rx) = broadcast::channel(8);
+    let (pending, _pending_rx) = mpsc::channel(8);
+    let (auto, _auto_rx) = mpsc::channel(8);
+    let worker = tokio::spawn(run(SessionHandlerDeps {
+        receptor: toml::from_str(config).unwrap(),
+        transport: target.clone(),
+        session_manager: sessions.clone(),
+        storage: storage.clone(),
+        our_node_id: recipient,
+        identity: b,
+        audit_log: Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
+        pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            konsensus_pricing::StaticPricingConfig {
+                chat_msat: 2000,
+                file_ref_msat: 123_456,
+                ..Default::default()
+            },
+        )),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_prices: prices.clone(),
+        peer_registry: registry.clone(),
+        routing: Arc::new(konsensus_routing::RoutingTable::new(Default::default())),
+        gossip_validator: Arc::new(konsensus_gossip::GossipValidator::new(Default::default())),
+        send_timestamps: Default::default(),
+        lightning: provider.clone(),
+        lightning_addr: None,
+        invoice_requests: Default::default(),
+        peer_ln_pubkeys: Default::default(),
+        ws_broadcast: ws,
+        ws_delivery_tx: delivery,
+        pending_tx: pending,
+        auto_channel_tx: auto,
+        shutdown_rx,
+    }));
+    source
+        .connect(&recipient, &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = admission_quote::request_id(&recipient, &peer, unix);
+    let request = Frame::RequestInvoice {
+        request_id: id.clone(),
+        amount_msat: 1,
+        purpose: "konsensus:admission:200".into(),
+    };
+    source.send_frame(&recipient, &request).await.unwrap();
+    let bolt11 = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match source.recv_control().await.unwrap() {
+                ControlEvent::PeerConnected { privileged, .. } => assert!(!privileged),
+                ControlEvent::InvoiceResponseReceived {
+                    peer_id,
+                    request_id,
+                    bolt11,
+                    ..
+                } => {
+                    assert!(enabled, "disabled act minted an invoice");
+                    assert_eq!(peer_id, recipient);
+                    assert_eq!(request_id, id);
+                    break Some(bolt11);
+                }
+                ControlEvent::InvoiceErrorReceived {
+                    peer_id,
+                    request_id,
+                    reason,
+                    ..
+                } if !enabled => {
+                    assert_eq!(peer_id, recipient);
+                    assert_eq!(request_id, id);
+                    assert_eq!(reason, konsensus_api::invoice_refusal::ADMISSION_REQUIRED);
+                    break None;
+                }
+                event => panic!("unexpected pre-settlement disclosure: {event:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    if let Some(bolt11) = bolt11 {
+        let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
+        assert!(invoice.route_hints().is_empty());
+        assert_eq!(invoice.amount_milli_satoshis(), Some(123_456));
+        assert!(invoice.expiry_time().as_secs() <= 60);
+        assert_eq!(
+            invoice.description().to_string(),
+            format!("konsensus:{id}:act=200:price=123456")
+        );
+        assert_eq!(
+            invoice.recover_payee_pub_key().to_string(),
+            provider.get_node_pubkey().await.unwrap()
+        );
+        source.send_frame(&recipient, &request).await.unwrap();
+        let refusal = tokio::time::timeout(Duration::from_secs(2), source.recv_control())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(refusal, ControlEvent::InvoiceErrorReceived { request_id, reason, .. }
+        if request_id == id && reason == konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED),
+            "a repeated attempt receives a bounded refusal, never a second quote or service"
+        );
+    }
+    let invoices = provider.list_payments(10).await.unwrap();
+    assert!(
+        invoices.is_empty(),
+        "stranger quote wrote pending backend state"
+    );
+    assert_eq!(provider.get_balance_msat().await.unwrap(), 0);
+    assert!(registry.read().await.is_empty());
+    assert!(storage.list_peers().await.unwrap().is_empty());
+    assert!(storage.list_sessions().await.unwrap().is_empty());
+    assert!(storage.list_files(10).await.unwrap().is_empty());
+    assert_eq!(
+        storage.get_onboarding_state().await.unwrap(),
+        initial_onboarding
+    );
+    assert!(storage
+        .get_messages_for_recipient(&konsensus_core::Recipient::Node(recipient), 10, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!sessions.has_session(&peer).await);
+    assert!(prices.get_peer_entry(&peer).await.is_none());
+    assert!(target.connected_privileged_peers().await.is_empty());
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
+}
+
 
 #[tokio::test]
 async fn bound_unsupported_quote_error_preserves_provenance() {
@@ -1729,4 +1935,368 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
     let (events, totals) = membrane.read(None, 100);
     assert!(events.len() <= 1); assert!(totals.refused <= 1);
     handler.abort(); attacker.shutdown(); healthy.shutdown(); target.shutdown();
+}
+
+#[cfg(test)]
+mod receptor_regressions {
+    use super::*;
+    use konsensus_core::traits::lightning::{Invoice, LightningError, PaymentDetails};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    mod legacy_quotes {
+        include!("fixtures/main_admission_quotes.rs");
+    }
+    include!("fixtures/main_invoice_handler.rs");
+    struct FixedQuote {
+        invoice: Invoice,
+        calls: std::sync::Mutex<Vec<(u64, String, u32)>>,
+    }
+    #[async_trait::async_trait]
+    impl LightningProvider for FixedQuote {
+        async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
+            panic!("stateful mint")
+        }
+        async fn create_stateless_invoice(
+            &self,
+            a: u64,
+            d: &str,
+            e: u32,
+        ) -> Result<Invoice, LightningError> {
+            self.calls.lock().unwrap().push((a, d.into(), e));
+            Ok(self.invoice.clone())
+        }
+        async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+            panic!("payment")
+        }
+        async fn get_payment_status(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+            panic!("storage")
+        }
+        async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+            Ok(0)
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+    async fn capture(t: &NoiseTransport) -> Option<Vec<u8>> {
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let f = match t.recv_control().await.unwrap() {
+                    ControlEvent::PeerConnected { .. } => continue,
+                    ControlEvent::InvoiceResponseReceived {
+                        request_id,
+                        bolt11,
+                        payment_hash,
+                        ..
+                    } => Frame::InvoiceResponse {
+                        request_id,
+                        bolt11,
+                        payment_hash,
+                    },
+                    ControlEvent::InvoiceErrorReceived {
+                        request_id, reason, ..
+                    } => Frame::InvoiceError { request_id, reason },
+                    other => panic!("unexpected {other:?}"),
+                };
+                return konsensus_message::wire::encode_frame(&f).unwrap();
+            }
+        })
+        .await
+        .ok()
+    }
+    #[tokio::test]
+    async fn hinted_chat_wire_matches_main_and_unpriceable_act_gets_bounded_refusal() {
+        use bitcoin::hashes::Hash;
+        use konsensus_message::{ReachabilityMode, TransportConfig};
+        use lightning_invoice::{
+            Currency, InvoiceBuilder, PaymentSecret, RouteHint, RouteHintHop, RoutingFees,
+        };
+        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let (_, a) = NodeIdentity::generate().unwrap();
+        let (_, b) = NodeIdentity::generate().unwrap();
+        let peer = *a.node_id();
+        let recipient = *b.node_id();
+        let mk = |id| {
+            Arc::new(NoiseTransport::new(
+                Arc::new(id),
+                TransportConfig {
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    admission_mode: ReachabilityMode::PriceOpen,
+                    whitelist: vec![],
+                    ..Default::default()
+                },
+            ))
+        };
+        let source = mk(a);
+        let target = mk(b);
+        target.start_listener().await.unwrap();
+        source
+            .connect(&recipient, &target.listen_addr().unwrap().to_string())
+            .await
+            .unwrap();
+        let mut legacy = legacy_quotes::AdmissionQuotes::default();
+        let mut current = crate::admission_quotes::AdmissionQuotes::default();
+        let mut legacy_hint = legacy_quotes::AdmissionQuotes::default();
+        let mut current_hint = crate::admission_quotes::AdmissionQuotes::default();
+        let mut unknown = crate::admission_quotes::AdmissionQuotes::new(
+            toml::from_str("[[acts]]\nkind=700\nenabled=true").unwrap(),
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let id = konsensus_core::admission_quote::request_id(&recipient, &peer, unix);
+        let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+            konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
+                chat_msat: 2000,
+                file_ref_msat: 100000,
+                ..Default::default()
+            }),
+        );
+        let desc = format!("konsensus:{id}:message=2000");
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(&[7; 32]).unwrap();
+        let fixture = |hint: bool, desc: String, amount: u64| {
+            let mut b = InvoiceBuilder::new(Currency::Regtest)
+                .description(desc.clone())
+                .payment_hash(bitcoin::hashes::sha256::Hash::hash(&[1; 32]))
+                .payment_secret(PaymentSecret([2; 32]))
+                .duration_since_epoch(Duration::from_secs(unix))
+                .min_final_cltv_expiry_delta(18)
+                .amount_milli_satoshis(amount)
+                .expiry_time(Duration::from_secs(50));
+            if hint {
+                b = b.private_route(RouteHint(vec![RouteHintHop {
+                    src_node_id: PublicKey::from_secret_key(&secp, &key),
+                    short_channel_id: 42,
+                    fees: RoutingFees {
+                        base_msat: 1,
+                        proportional_millionths: 10,
+                    },
+                    cltv_expiry_delta: 18,
+                    htlc_minimum_msat: None,
+                    htlc_maximum_msat: None,
+                }]));
+            }
+            let signed = b
+                .build_signed(|h| secp.sign_ecdsa_recoverable(h, &key))
+                .unwrap();
+            Invoice {
+                bolt11: signed.to_string(),
+                payment_hash: signed.payment_hash().to_string(),
+                amount_msat: amount,
+                description: desc.clone(),
+                expiry_secs: 50,
+                created_at: unix,
+            }
+        };
+        let mock = Arc::new(FixedQuote {
+            invoice: fixture(false, desc.clone(), 2000),
+            calls: Default::default(),
+        });
+        let backend: Arc<dyn LightningProvider> = mock.clone();
+        let ip = "127.0.0.1".parse().unwrap();
+        let membrane = konsensus_api::membrane::Membrane::with_capacity(8);
+        let mut old_ref = crate::invoice_refusals::RefusalLimits::default();
+        let mut new_ref = crate::invoice_refusals::RefusalLimits::default();
+        for _replay in [false, true] {
+            baseline_invoice_requested_gated(
+                &peer,
+                &id,
+                1,
+                konsensus_core::admission_quote::PURPOSE,
+                false,
+                &pricing,
+                &backend,
+                &target,
+                &recipient,
+                ip,
+                &mut legacy,
+                &membrane,
+                &mut old_ref,
+            )
+            .await;
+            let old = capture(&source).await.expect("baseline response");
+            handle_invoice_requested_gated(
+                &peer,
+                &id,
+                1,
+                konsensus_core::admission_quote::PURPOSE,
+                false,
+                &pricing,
+                &backend,
+                &target,
+                &recipient,
+                ip,
+                &mut current,
+                &membrane,
+                &mut new_ref,
+            )
+            .await;
+            let new = capture(&source).await.expect("head response");
+            assert_eq!(old, new);
+        }
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, calls[1].0);
+        assert_eq!(calls[0].1, calls[1].1);
+        drop(calls);
+        let backend: Arc<dyn LightningProvider> = Arc::new(FixedQuote {
+            invoice: fixture(true, desc.clone(), 2000),
+            calls: Default::default(),
+        });
+        baseline_invoice_requested_gated(
+            &peer,
+            &id,
+            1,
+            konsensus_core::admission_quote::PURPOSE,
+            false,
+            &pricing,
+            &backend,
+            &target,
+            &recipient,
+            ip,
+            &mut legacy_hint,
+            &membrane,
+            &mut Default::default(),
+        )
+        .await;
+        let hinted = capture(&source)
+            .await
+            .expect("main sends hinted chat invoice");
+        handle_invoice_requested_gated(
+            &peer,
+            &id,
+            1,
+            konsensus_core::admission_quote::PURPOSE,
+            false,
+            &pricing,
+            &backend,
+            &target,
+            &recipient,
+            ip,
+            &mut current_hint,
+            &membrane,
+            &mut Default::default(),
+        )
+        .await;
+        assert_eq!(
+            capture(&source).await.expect("hinted chat response"),
+            hinted
+        );
+        // Same valid hinted fixture for a new act must be suppressed by policy,
+        // while an otherwise identical hint-free fixture is delivered.
+        for hint in [true, false] {
+            let mut acts = crate::admission_quotes::AdmissionQuotes::new(
+                toml::from_str("[[acts]]\nkind=200\nenabled=true").unwrap(),
+            );
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let issued = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let fresh = konsensus_core::admission_quote::request_id(&recipient, &peer, issued);
+            let invoice = fixture(
+                hint,
+                format!("konsensus:{fresh}:act=200:price=100000"),
+                100000,
+            );
+            // Match the explicitly configured file price above.
+            let expected = konsensus_message::wire::encode_frame(&Frame::InvoiceResponse {
+                request_id: fresh.clone(),
+                bolt11: invoice.bolt11.clone(),
+                payment_hash: invoice.payment_hash.clone(),
+            })
+            .unwrap();
+            let backend: Arc<dyn LightningProvider> = Arc::new(FixedQuote {
+                invoice,
+                calls: Default::default(),
+            });
+            handle_invoice_requested_gated(
+                &peer,
+                &fresh,
+                1,
+                "konsensus:admission:200",
+                false,
+                &pricing,
+                &backend,
+                &target,
+                &recipient,
+                ip,
+                &mut acts,
+                &membrane,
+                &mut Default::default(),
+            )
+            .await;
+            let response = capture(&source).await;
+            if hint {
+                assert!(response.is_none());
+            } else {
+                assert_eq!(response.unwrap(), expected);
+            }
+        }
+        let mut unpriceable_refusals = crate::invoice_refusals::RefusalLimits::default();
+        handle_invoice_requested_gated(
+            &peer,
+            &id,
+            1,
+            "konsensus:admission:700",
+            false,
+            &pricing,
+            &backend,
+            &target,
+            &recipient,
+            ip,
+            &mut unknown,
+            &membrane,
+            &mut unpriceable_refusals,
+        )
+        .await;
+        let expected = konsensus_message::wire::encode_frame(&Frame::InvoiceError {
+            request_id: id.clone(),
+            reason: konsensus_api::invoice_refusal::ADMISSION_REQUIRED.into(),
+        })
+        .unwrap();
+        assert_eq!(
+            capture(&source).await.expect("unpriceable fixed refusal"),
+            expected
+        );
+        // The pricing refusal shares the same four/source/second envelope as
+        // replay/rate refusals, even when each subsequent request has a fresh ID.
+        for attempt in 1..=4 {
+            let fresh = konsensus_core::admission_quote::request_id(&recipient, &peer, unix);
+            handle_invoice_requested_gated(
+                &peer,
+                &fresh,
+                1,
+                "konsensus:admission:700",
+                false,
+                &pricing,
+                &backend,
+                &target,
+                &recipient,
+                ip,
+                &mut unknown,
+                &membrane,
+                &mut unpriceable_refusals,
+            )
+            .await;
+            let response = capture(&source).await;
+            if attempt < 4 {
+                let expected = konsensus_message::wire::encode_frame(&Frame::InvoiceError {
+                    request_id: fresh,
+                    reason: konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED.into(),
+                })
+                .unwrap();
+                assert_eq!(response.unwrap(), expected);
+            } else {
+                assert!(
+                    response.is_none(),
+                    "unpriceable refusal bypassed RefusalLimits"
+                );
+            }
+        }
+        source.shutdown();
+        target.shutdown();
+    }
 }

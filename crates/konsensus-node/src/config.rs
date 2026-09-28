@@ -146,6 +146,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub admission_mode: konsensus_message::ReachabilityMode,
 
+    /// Stateless one-act quotes. Only chat is enabled unless explicitly configured.
+    #[serde(default)]
+    pub receptor: ReceptorConfig,
+
     /// Pre-Noise anti-DoS cookie (doorway hardening #2) — `disabled` (default) or
     /// `required`. When `required`, this node demands a stateless return-
     /// routability cookie before it spends a Noise DH on an inbound connection
@@ -191,6 +195,100 @@ pub struct NodeConfig {
     /// never decrypts relay payloads or holds user keys.
     #[serde(default)]
     pub relay: RelayConfig,
+}
+
+/// Route-hint policy for newly enabled acts. Chat retains main/F1 behavior.
+/// Other policies require the ADR-042 decision.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceptorRouteHints {
+    #[default]
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceptorActConfig {
+    pub kind: u16,
+    /// A new act entry never enables itself implicitly.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "receptor_window_secs")]
+    pub window_secs: u64,
+    #[serde(default = "receptor_per_source")]
+    pub per_source: usize,
+    #[serde(default = "receptor_global")]
+    pub global: usize,
+}
+
+fn receptor_window_secs() -> u64 {
+    10
+}
+fn receptor_per_source() -> usize {
+    1
+}
+fn receptor_global() -> usize {
+    16
+}
+
+impl Default for ReceptorActConfig {
+    fn default() -> Self {
+        Self {
+            kind: 0,
+            enabled: false,
+            window_secs: 10,
+            per_source: 1,
+            global: 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReceptorConfig {
+    pub route_hints: ReceptorRouteHints,
+    /// An explicit list replaces the defaults, including chat.
+    pub acts: Vec<ReceptorActConfig>,
+}
+
+impl Default for ReceptorConfig {
+    fn default() -> Self {
+        Self {
+            route_hints: ReceptorRouteHints::None,
+            acts: vec![ReceptorActConfig {
+                kind: konsensus_core::kind::KIND_CHAT,
+                enabled: true,
+                ..Default::default()
+            }],
+        }
+    }
+}
+
+impl ReceptorConfig {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        let mut kinds = std::collections::HashSet::new();
+        for act in &self.acts {
+            // Both static and chain-aware pricing use this category mapping;
+            // chain-aware pricing delegates its base price to the static engine.
+            anyhow::ensure!(
+                !act.enabled || konsensus_core::kind::KindCategory::from_kind(act.kind)
+                    != konsensus_core::kind::KindCategory::Unknown,
+                "enabled receptor act {} is not priceable",
+                act.kind
+            );
+            anyhow::ensure!(
+                kinds.insert(act.kind),
+                "duplicate receptor act {}",
+                act.kind
+            );
+            anyhow::ensure!(
+                act.window_secs > 0 && act.per_source > 0 && act.global > 0,
+                "receptor caps must be positive for act {}",
+                act.kind
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Identity configuration — where the mnemonic is stored.
@@ -948,6 +1046,7 @@ impl NodeConfig {
     /// the final config — `from_config` does not validate, so a post-load mutation
     /// would otherwise escape the fail-closed guards.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.receptor.validate()?;
         self.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?;
         // Check mnemonic file exists and is readable
         if !self.identity.mnemonic_file.exists() {
@@ -1342,6 +1441,7 @@ impl NodeConfig {
             // M1a: closed mesh by default (fail-closed). Operators opt into
             // price-admission via konsensus.toml or `--admission-mode price-open`.
             admission_mode: konsensus_message::ReachabilityMode::Whitelist,
+            receptor: ReceptorConfig::default(),
             cookie_mode: konsensus_message::CookieMode::Disabled,
             // R1-a: onboarding channel-open subsidy OFF by default — generated
             // configs never auto-spend operator sats on invite membership.

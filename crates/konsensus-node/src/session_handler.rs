@@ -37,6 +37,7 @@ use crate::onboarding::funding_poll;
 
 /// All dependencies needed by the session/control event handler task.
 pub(crate) struct SessionHandlerDeps {
+    pub receptor: crate::config::ReceptorConfig,
     pub transport: Arc<NoiseTransport>,
     pub session_manager: Arc<SessionManager>,
     pub storage: Arc<dyn konsensus_storage::Storage>,
@@ -93,6 +94,7 @@ const ADMISSION_INVOICE_KIND: u16 = konsensus_core::kind::KIND_CHAT;
 /// Runs the session/control event handler loop.
 pub(crate) async fn run(deps: SessionHandlerDeps) {
     let SessionHandlerDeps {
+        receptor,
         transport,
         session_manager,
         storage,
@@ -126,7 +128,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
-    let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
+    let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::new(receptor);
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
     let mut cooldown_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -921,8 +923,8 @@ async fn handle_price_response_received(
 }
 
 /// Privilege-gated invoice dispatch. Strangers get only the bounded,
-/// recipient-bound first-contact chat quote. Its amount comes from our pricing
-/// engine; the requester cannot choose a price or a different kind. All other
+/// recipient-bound quote for an explicitly enabled act. Its amount comes from
+/// our pricing engine; the requester cannot choose a price. All other
 /// invoice services require an already privileged connection. Legacy admission
 /// requests fail closed even on privileged connections.
 #[allow(clippy::too_many_arguments)]
@@ -942,12 +944,20 @@ async fn handle_invoice_requested_gated(
     last_admission_refusal: &mut crate::invoice_refusals::RefusalLimits,
 ) {
     use konsensus_core::admission_quote;
-    if purpose == admission_quote::PURPOSE {
+    if let Some(kind) = admission_quote::kind_from_purpose(purpose) {
+        if quotes.act(kind).is_none() {
+            if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                send_invoice_refusal(transport, peer_id, request_id,
+                    konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
+            }
+            return;
+        }
         let unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if !quotes.permit(
+        if !quotes.permit_act(
+            kind,
             source_ip,
             recipient,
             peer_id,
@@ -960,19 +970,30 @@ async fn handle_invoice_requested_gated(
             }
             return;
         }
-        // Exactly the first-contact chat price. Neither kind nor amount is
-        // requester-selected. No peer/storage/session dependency is present.
-        let Ok(Ok(price)) = tokio::time::timeout(
+        // Only the enabled act price. No peer/storage/session dependency.
+        let price = match tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            pricing.get_price_msat(ADMISSION_INVOICE_KIND),
-        )
-        .await
-        else {
-            return;
+            pricing.get_price_msat(kind),
+        ).await {
+            Ok(Ok(price)) => price,
+            Ok(Err(konsensus_core::traits::pricing::PricingError::NotPriceable(_))) => {
+                if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                    send_invoice_refusal(transport, peer_id, request_id,
+                        konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
+                }
+                return;
+            }
+            _ => return,
         };
-        // Same rule as the signed introduction's display prices.
-        let (admission, message) = konsensus_core::introduction::first_contact_prices(price);
-        let description = format!("konsensus:{request_id}:message={message}");
+        // Preserve F1's chat amount and signed description byte for byte.
+        // Other acts bind their kind and only their own payable price.
+        let (admission, description) = if kind == ADMISSION_INVOICE_KIND {
+            let (admission, message) = konsensus_core::introduction::first_contact_prices(price);
+            (admission, format!("konsensus:{request_id}:message={message}"))
+        } else {
+            let amount = price.max(1000);
+            (amount, format!("konsensus:{request_id}:act={kind}:price={amount}"))
+        };
         let unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -987,9 +1008,16 @@ async fn handle_invoice_requested_gated(
         if expiry == 0 {
             return;
         }
+        let omit_route_hints = quotes.omit_route_hints(kind);
         let invoice = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            lightning.create_stateless_invoice(admission, &description, expiry),
+            async {
+                if omit_route_hints {
+                    lightning.create_stateless_invoice_without_route_hints(admission, &description, expiry).await
+                } else {
+                    lightning.create_stateless_invoice(admission, &description, expiry).await
+                }
+            },
         )
         .await;
         if matches!(&invoice, Ok(Err(konsensus_core::traits::lightning::LightningError::StatelessQuoteUnsupported))) {
@@ -1014,6 +1042,7 @@ async fn handle_invoice_requested_gated(
                 || signed
                     .expires_at()
                     .is_none_or(|end| end.as_secs() > attempt_end)
+                || (omit_route_hints && !signed.route_hints().is_empty())
                 || signed.amount_milli_satoshis() != Some(admission)
                 || signed.description().to_string() != description
                 || signed.payment_hash().to_string() != invoice.payment_hash
