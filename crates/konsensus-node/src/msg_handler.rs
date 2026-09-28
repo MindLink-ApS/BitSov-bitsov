@@ -159,7 +159,7 @@ fn corrective_price_table_rate_limited(
 }
 
 /// PSI-SPEED: offer our X3DH prekey to `peer` right after a settled payment
-/// promoted its connection, so the session forms now rather than on the next
+/// promoted its connection (generation `promoted`), so the session forms now rather than on the next
 /// self-heal tick. Skipped when a sending chain already exists (an offer would
 /// make a lower-NodeId peer replace a working session) or when the limiter
 /// refuses; the periodic self-heal remains the fallback either way.
@@ -167,6 +167,7 @@ async fn offer_prekey_after_promotion(
     transport: &NoiseTransport,
     sessions: &SessionManager,
     peer: &konsensus_core::types::NodeId,
+    promoted: std::time::Instant,
     limiter: &mut konsensus_message::EagerOfferLimiter,
 ) {
     if sessions.can_send(peer).await {
@@ -183,7 +184,16 @@ async fn offer_prekey_after_promotion(
             return;
         }
     };
-    match transport.send_frame(peer, &Frame::PrekeyOffer { bundle }).await {
+    let frame = match (Frame::PrekeyOffer { bundle }).to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(peer = %peer, error = %e, "failed to encode eager PrekeyOffer");
+            return;
+        }
+    };
+    // Only on the exact connection this payment promoted, and only while it is
+    // still privileged: a replacement that reconnected meanwhile is unpaid.
+    match transport.send_raw_frame_on(peer, promoted, konsensus_message::Standing::Privileged, &frame).await {
         Ok(()) => info!(peer = %peer, "sent PrekeyOffer to the payer just promoted (PSI-SPEED)"),
         Err(e) => warn!(peer = %peer, error = %e, "failed to send eager PrekeyOffer after promotion"),
     }
@@ -223,6 +233,8 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
     > = std::collections::HashMap::new();
 
     // PSI-SPEED: bounds the prekey offers sent right after promote-on-paid.
+    // Separate from the other two eager limiters on purpose; see `eager_offers`
+    // in the compose handler.
     let mut eager_offers = konsensus_message::EagerOfferLimiter::new();
 
     // Doorway hardening #3: wrap the settlement-verification provider in a
@@ -391,11 +403,12 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             admission_mode_for_recv,
                             konsensus_message::ReachabilityMode::PriceOpen
                         ) {
-                            if transport_for_recv.promote_to_privileged(&sender).await {
+                            if let Some(promoted) = transport_for_recv.promote_to_privileged_at(&sender).await {
                                 offer_prekey_after_promotion(
                                     &transport_for_ack,
                                     &session_mgr_for_recv,
                                     &sender,
+                                    promoted,
                                     &mut eager_offers,
                                 )
                                 .await;

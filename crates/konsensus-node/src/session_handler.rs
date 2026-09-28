@@ -127,7 +127,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
-    // PSI-SPEED: bounds our prekey replies to a paid payee's offer.
+    // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
+    // from the other two eager limiters on purpose; see `eager_offers` in the
+    // compose handler.
     let mut eager_offers = konsensus_message::EagerOfferLimiter::new();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
@@ -784,6 +786,10 @@ async fn reply_prekey_offer_to_paid_payee(
     transport: &Arc<NoiseTransport>,
     limiter: &mut konsensus_message::EagerOfferLimiter,
 ) {
+    // The generation is captured once; the reply goes on that connection only,
+    // and only if it is still the one we paid on (checked under its lock by
+    // `send_raw_frame_on`), never on an unpaid replacement.
+    let Some(since) = transport.connected_since(peer_id).await else { return };
     if our_node_id.as_bytes() < peer_id.as_bytes()
         || !transport.admission_paid_on_connection(peer_id).await
         || !e2ee_needs_self_heal(session_manager, peer_id).await
@@ -794,7 +800,17 @@ async fn reply_prekey_offer_to_paid_payee(
         debug!(peer = %peer_id, "prekey reply to paid payee rate-limited; self-heal will offer");
         return;
     }
-    match send_prekey_offer(session_manager, transport, peer_id).await {
+    let sent = match serde_json::to_value(session_manager.prekey_bundle().await)
+        .map_err(|e| format!("serialize prekey bundle: {e}"))
+        .and_then(|bundle| Frame::PrekeyOffer { bundle }.to_bytes().map_err(|e| e.to_string()))
+    {
+        Ok(frame) => transport
+            .send_raw_frame_on(peer_id, since, konsensus_message::Standing::AdmissionPaid, &frame)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match sent {
         Ok(()) => info!(peer = %peer_id, "answered the paid payee's PrekeyOffer with ours (PSI-SPEED)"),
         Err(e) => warn!(peer = %peer_id, error = %e, "failed to answer the paid payee's PrekeyOffer"),
     }
