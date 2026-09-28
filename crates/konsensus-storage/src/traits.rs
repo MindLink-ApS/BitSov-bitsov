@@ -22,6 +22,33 @@ pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused 
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// Record transport write success without regressing an immediate ACK/reject.
+    async fn record_outbox_sent(&self, _id: &MessageId, _peer: &NodeId) -> Result<(), StorageError> { Ok(()) }
+
+    /// Atomically publish the paid envelope, pending queue entry and operation.
+    /// Uses the same version CAS as update_outbox_operation; false writes nothing.
+    async fn commit_outbox_envelope(&self, _op: &crate::OutboxOperation, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("outbox operations".into()))
+    }
+
+    /// Insert once. A duplicate never overwrites the request binding.
+    async fn insert_outbox_operation(&self, _op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("outbox operations".into()))
+    }
+    /// Compare-and-swap using op.version; a successful write increments it.
+    async fn update_outbox_operation(&self, _op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("outbox operations".into()))
+    }
+    async fn get_outbox_operation(&self, _id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        Err(StorageError::Unsupported("outbox operations".into()))
+    }
+    /// Complete recovery authority: never silently truncate unpaid/paid work.
+    /// Include delivered/terminal receipts: their pairing reservation may still
+    /// need crash recovery even though delivery itself is complete.
+    async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        Err(StorageError::Unsupported("outbox operations".into()))
+    }
+
     // ── Messages ───────────────────────────────────────────────────────
 
     /// Store a UKM envelope.

@@ -137,9 +137,14 @@ impl MeteredSpend {
             })
     }
 
-    pub(crate) fn debit_first_contact(&self, state: &AppState, approval: FirstContactAuthorization, cap: Option<u64>) -> Result<Debit, ApiError> {
+    pub(crate) fn debit_operation(&self, state: &AppState, charges: Vec<Charge>, approval: Option<FirstContactAuthorization>, cap: Option<u64>, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()); };
         let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-        let reservation = service.reserve_first_contact(approval, cap).map_err(ApiError::BudgetExceeded)?;
+        let link = operation.reservation_link(false);
+        let reservation = match approval {
+            Some(approval) => service.reserve_first_contact_operation(approval, cap, Some(link)),
+            None => service.reserve_operation_spend(client_id, *epoch, charges, link),
+        }.map_err(ApiError::BudgetExceeded)?;
         Ok(Debit::reserved(Arc::clone(service), reservation))
     }
 
@@ -201,6 +206,7 @@ impl MeteredSpend {
 /// mid-payment. Resolve explicitly to release or settle.
 #[must_use = "resolve each charge once its outcome is known; dropping keeps it reserved"]
 pub struct Debit {
+    operation: Option<crate::handlers::messages::operations::Operation>,
     held: Option<(Arc<PairingService>, Reservation)>,
     max_routing_fee_msat: Option<u64>,
     // None means a settled payment's fee is still unknown. Never release that liability.
@@ -211,6 +217,18 @@ pub struct Debit {
 }
 
 impl Debit {
+    pub(crate) fn with_operation(mut self, operation: crate::handlers::messages::operations::Operation) -> Self {
+        self.operation = Some(operation); self
+    }
+    pub(crate) fn operation(&self) -> Option<&crate::handlers::messages::operations::Operation> { self.operation.as_ref() }
+    pub(crate) async fn dispatch_message<F>(&self, _state: &AppState, hash: Option<String>, amount: u64, future: F) -> Result<F::Output, ApiError>
+    where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
+        match &self.operation {
+            Some(op) => op.dispatch(self, hash, amount, future).await,
+            None => self.dispatch(future).await,
+        }
+    }
+
     pub(crate) fn with_fee_limit(mut self, limit: Option<u64>) -> Self {
         self.max_routing_fee_msat = limit;
         self
@@ -226,12 +244,12 @@ impl Debit {
 
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { max_routing_fee_msat: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self { operation: None, max_routing_fee_msat: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { max_routing_fee_msat: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        Self { operation: None, max_routing_fee_msat: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.
@@ -266,7 +284,8 @@ impl Debit {
         };
         let mut call_total = self.call_reserved_msat.lock().unwrap_or_else(|e| e.into_inner());
         let readmission = service
-            .reserve_readmission(reservation, recipient, amount_msat, *call_total)
+            .reserve_readmission_operation(reservation, recipient, amount_msat, *call_total,
+                self.operation.as_ref().map(|op| op.reservation_link(true)))
             .map_err(ApiError::BudgetExceeded)?;
         *call_total += amount_msat; // checked against the grant limit under its ledger lock
         Ok(Debit::reserved(Arc::clone(service), readmission).with_fee_limit(self.max_routing_fee_msat))
