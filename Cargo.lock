@@ -2159,6 +2159,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "corepc-node",
  "ed25519-dalek",
  "hex",
  "konsensus-api",

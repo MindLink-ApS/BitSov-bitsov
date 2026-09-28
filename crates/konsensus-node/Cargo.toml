@@ -8,7 +8,11 @@ license.workspace = true
 name = "konsensus"
 path = "src/main.rs"
 
+[features]
+regtest-e2e = ["dep:corepc-node"]
+
 [dependencies]
+corepc-node = { version = "0.10.1", optional = true }
 konsensus-core = { path = "../konsensus-core" }
 konsensus-chain = { path = "../konsensus-chain" }
 konsensus-fiat = { path = "../konsensus-fiat" }
