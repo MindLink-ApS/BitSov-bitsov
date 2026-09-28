@@ -2002,6 +2002,10 @@ fn recover_admission_attempt(state: &AppState, peer_id: &NodeId) -> Result<(), A
     Ok(())
 }
 
+/// How many times a proof re-send reclassifies after the connection it was
+/// classified against was replaced, before giving up without paying.
+const RECLASSIFY_ATTEMPTS: u8 = 2;
+
 async fn first_contact_admission(
     state: &AppState,
     peer_id: &NodeId,
@@ -2010,6 +2014,21 @@ async fn first_contact_admission(
     charge: &mut FirstContactCharge,
     debit: &Debit,
     readmit: Option<&mut Readmit<'_>>,
+) -> Result<(), ApiError> {
+    first_contact_admission_at(state, peer_id, kind, cap, charge, debit, readmit, RECLASSIFY_ATTEMPTS).await
+}
+
+/// [`first_contact_admission`] with `reclassify` re-classifications left.
+#[allow(clippy::too_many_arguments)]
+async fn first_contact_admission_at(
+    state: &AppState,
+    peer_id: &NodeId,
+    kind: u16,
+    cap: Option<u64>,
+    charge: &mut FirstContactCharge,
+    debit: &Debit,
+    readmit: Option<&mut Readmit<'_>>,
+    reclassify: u8,
 ) -> Result<(), ApiError> {
     // The stateless quote signs a chat price, including when cached or recovered.
     if kind != konsensus_core::kind::KIND_CHAT {
@@ -2163,6 +2182,23 @@ async fn first_contact_admission(
             }
         }
         PriorAdmission::SettledWithProof(envelope) => {
+            // The proof's coverage was classified against `connected_since`.
+            // If that connection was replaced since, the classification is
+            // stale: the proof may have been consumed on the old connection,
+            // and marking the replacement paid for it would block the
+            // admission the replacement needs. Classify again on the live one.
+            if state.transport.connected_since(peer_id).await != connected_since {
+                if reclassify == 0 {
+                    return Err(ApiError::PaymentUnresolved(format!(
+                        "the connection to {peer_id} kept changing while re-sending an already-paid \
+                         admission proof; nothing was re-sent and no second payment was made — retry shortly"
+                    )));
+                }
+                tracing::info!(peer = %peer_id, "admission retry: connection replaced after classification; reclassifying");
+                return Box::pin(first_contact_admission_at(
+                    state, peer_id, kind, cap, charge, debit, readmit, reclassify - 1,
+                )).await;
+            }
             report_readmission_settlement(state, peer_id, envelope.payment_proof.amount_msat)?;
             charge.prior_settled_msat = envelope.payment_proof.amount_msat;
             // Re-deliver the already-paid proof. If the target already consumed
@@ -2171,9 +2207,11 @@ async fn first_contact_admission(
             // promoted there. If the first delivery was lost after settlement,
             // this re-send is exactly the heal that makes the payment count.
             //
-            // As on first delivery, the live generation is captured once, marked
-            // paid, and the proof goes out on it or not at all.
-            let since = state.transport.connected_since(peer_id).await;
+            // The generation it was classified against is the one marked paid
+            // and the only one the proof goes out on. If it was replaced after
+            // the check above, the mark is ignored and the send is refused as
+            // NotConnected: a replacement is never marked paid for this proof.
+            let since = connected_since;
             if let Some(since) = since {
                 state.transport.mark_admission_paid(peer_id, since).await;
             }
