@@ -20,6 +20,7 @@ mod messaging;
 mod supervisor;
 
 pub use cookie::CookieMode;
+pub use messaging::Standing;
 
 // Re-export internal helpers that sibling submodules access via `super::`.
 // handshake::connect_to_peer does `use super::{PeerConnection, spawn_reader_task}` —
@@ -1037,6 +1038,15 @@ impl MessageTransport for NoiseTransport {
                 )))?
         };
         write_envelope(&conn, envelope).await
+    }
+
+    async fn send_raw_frame_on_paid_connection(
+        &self,
+        peer: &NodeId,
+        since: Instant,
+        frame_bytes: &[u8],
+    ) -> Result<(), TransportError> {
+        self.send_raw_frame_on(peer, since, messaging::Standing::AdmissionPaid, frame_bytes).await
     }
 
     /// Adding a peer is the owner's explicit admission of that NodeId, so it
@@ -2798,6 +2808,82 @@ mod tests {
         let captured = Arc::clone(transport_a.peers.read().await.get(&node_b_id).unwrap());
         captured.close();
         let closed = write_envelope(&captured, &make_test_envelope(&id_a, &node_b_id)).await;
+        assert!(matches!(closed, Err(TransportError::NotConnected(_))), "{closed:?}");
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    /// #102 review: an eager PrekeyOffer is written only on the exact
+    /// generation that holds the standing it was sent for. A replacement
+    /// (new generation), a connection without the standing, or a closed one
+    /// gets nothing, and the caller sees NotConnected.
+    #[tokio::test]
+    async fn eager_frames_go_only_to_the_exact_paid_or_promoted_generation() {
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let (node_a_id, node_b_id) = (*id_a.node_id(), *id_b.node_id());
+        let open = || TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            admission_mode: ReachabilityMode::PriceOpen,
+            ..Default::default()
+        };
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), open());
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap().to_string();
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), open());
+        transport_a.connect(&node_b_id, &addr_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let offer = Frame::PrekeyOffer { bundle: serde_json::json!({}) }.to_bytes().unwrap();
+        // Whether `t` receives a PrekeyOffer within a short window.
+        async fn offered(t: &NoiseTransport) -> bool {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+            while let Ok(Some(event)) = tokio::time::timeout_at(deadline, t.recv_control()).await {
+                if matches!(event, ControlEvent::PrekeyOffer { .. }) { return true; }
+            }
+            false
+        }
+
+        // Payer side: A paid B's admission on generation g1.
+        let g1 = transport_a.connected_since(&node_b_id).await.unwrap();
+        let unpaid = transport_a.send_raw_frame_on(&node_b_id, g1, Standing::AdmissionPaid, &offer).await;
+        assert!(matches!(unpaid, Err(TransportError::NotConnected(_))), "not paid yet: {unpaid:?}");
+        assert!(!offered(&transport_b).await, "an unpaid connection got the offer");
+        transport_a.mark_admission_paid(&node_b_id, g1).await;
+
+        // Payee side: B promotes A's connection after A's payment.
+        let promoted = transport_b.promote_to_privileged_at(&node_a_id).await.expect("live connection");
+
+        // Both connections are replaced by a reconnect: the checks passed for
+        // g1 / `promoted`; the replacement is unpaid and unprivileged.
+        transport_a.disconnect(&node_b_id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        transport_a.connect(&node_b_id, &addr_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let g2 = transport_a.connected_since(&node_b_id).await.unwrap();
+        assert_ne!(g1, g2);
+        let stale = transport_a.send_raw_frame_on(&node_b_id, g1, Standing::AdmissionPaid, &offer).await;
+        assert!(matches!(stale, Err(TransportError::NotConnected(_))), "{stale:?}");
+        assert!(!offered(&transport_b).await, "the payer's offer reached the unpaid replacement");
+        let stale = transport_b.send_raw_frame_on(&node_a_id, promoted, Standing::Privileged, &offer).await;
+        assert!(matches!(stale, Err(TransportError::NotConnected(_))), "{stale:?}");
+        assert!(!offered(&transport_a).await, "the payee's offer reached the unpromoted replacement");
+        // The live replacement without the standing gets nothing either.
+        let live_b = transport_b.connected_since(&node_a_id).await.unwrap();
+        let unpromoted = transport_b.send_raw_frame_on(&node_a_id, live_b, Standing::Privileged, &offer).await;
+        assert!(matches!(unpromoted, Err(TransportError::NotConnected(_))), "{unpromoted:?}");
+        let unpaid = transport_a.send_raw_frame_on(&node_b_id, g2, Standing::AdmissionPaid, &offer).await;
+        assert!(matches!(unpaid, Err(TransportError::NotConnected(_))), "{unpaid:?}");
+        assert!(!offered(&transport_b).await && !offered(&transport_a).await);
+
+        // Once g2 is paid for, the offer goes on it.
+        transport_a.mark_admission_paid(&node_b_id, g2).await;
+        transport_a.send_raw_frame_on(&node_b_id, g2, Standing::AdmissionPaid, &offer).await.unwrap();
+        assert!(offered(&transport_b).await, "sent on the paid generation");
+
+        // A captured connection that is closed before the write gets nothing.
+        transport_a.peers.read().await.get(&node_b_id).unwrap().close();
+        let closed = transport_a.send_raw_frame_on(&node_b_id, g2, Standing::AdmissionPaid, &offer).await;
         assert!(matches!(closed, Err(TransportError::NotConnected(_))), "{closed:?}");
 
         transport_a.shutdown();

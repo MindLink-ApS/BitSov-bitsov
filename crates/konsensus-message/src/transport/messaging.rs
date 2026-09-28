@@ -20,6 +20,15 @@ use super::{
 };
 use super::NoiseTransport;
 
+/// What a connection must hold for [`NoiseTransport::send_raw_frame_on`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// We settled an admission on this connection (`admission_paid`).
+    AdmissionPaid,
+    /// The peer is privileged on this connection (whitelisted or promoted by its payment).
+    Privileged,
+}
+
 // ─── impl NoiseTransport — send_frame ────────────────────────────────────────
 
 impl NoiseTransport {
@@ -134,6 +143,52 @@ impl NoiseTransport {
         Ok(())
     }
 
+    /// Send `frame_bytes` on connection generation `since` of `peer` only, and
+    /// only while that connection holds `standing`. The connection is looked
+    /// up once and everything is checked under its lock right before the
+    /// write: a replacement (a new generation), a closed connection or one
+    /// without the standing gets nothing. `NotConnected` means nothing was
+    /// written.
+    ///
+    /// For eager session setup after a paid admission (PSI-SPEED): the prekey
+    /// goes only to the exact connection that was paid for or promoted, never
+    /// through a fresh NodeId lookup that could land on an unpaid replacement.
+    pub async fn send_raw_frame_on(
+        &self,
+        peer: &NodeId,
+        since: Instant,
+        standing: Standing,
+        frame_bytes: &[u8],
+    ) -> Result<(), TransportError> {
+        let conn = {
+            let peers = self.peers.read().await;
+            peers
+                .get(peer)
+                .filter(|conn| conn.connected_at == since)
+                .map(Arc::clone)
+                .ok_or_else(|| TransportError::NotConnected(format!(
+                    "{}: connection generation replaced or gone", peer.to_hex()
+                )))?
+        };
+        let mut state = conn.lock().await;
+        let holds = match standing {
+            Standing::AdmissionPaid => conn.admission_paid.load(std::sync::atomic::Ordering::Acquire),
+            Standing::Privileged => state.privileged,
+        };
+        if conn.is_closed() || !holds {
+            return Err(TransportError::NotConnected(format!(
+                "{}: connection closed or not {standing:?}", peer.to_hex()
+            )));
+        }
+        let encrypted = state
+            .noise
+            .encrypt(frame_bytes)
+            .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+        write_noise_message(&mut state.writer, &encrypted)
+            .await
+            .map_err(|e| TransportError::Other(e.to_string()))
+    }
+
     /// M1b promote-on-paid: flip a connection's `privileged` flag to `true`.
     ///
     /// Called by the message-plane handler AFTER the PaymentGate accepts a PAID,
@@ -150,19 +205,23 @@ impl NoiseTransport {
     /// reconnect starts unprivileged, the node refuses its paid invoice requests
     /// with `admission_required`, and the sender pays admission again.
     pub async fn promote_to_privileged(&self, peer: &NodeId) -> bool {
+        self.promote_to_privileged_at(peer).await.is_some()
+    }
+
+    /// [`promote_to_privileged`](Self::promote_to_privileged), returning the
+    /// generation (`connected_at`) of the exact connection promoted, so a
+    /// follow-up send can be bound to it ([`send_raw_frame_on`](Self::send_raw_frame_on)).
+    pub async fn promote_to_privileged_at(&self, peer: &NodeId) -> Option<Instant> {
         let conn = {
             let peers = self.peers.read().await;
-            match peers.get(peer) {
-                Some(c) => Arc::clone(c),
-                None => return false,
-            }
+            Arc::clone(peers.get(peer)?)
         };
-        let mut conn = conn.lock().await;
-        if !conn.privileged {
-            conn.privileged = true;
+        let mut state = conn.lock().await;
+        if !state.privileged {
+            state.privileged = true;
             info!(peer = %peer, "promoted connection to privileged after settled payment (M1b)");
         }
-        true
+        Some(conn.connected_at)
     }
 
     /// Connected peers that are currently **privileged** — whitelisted in

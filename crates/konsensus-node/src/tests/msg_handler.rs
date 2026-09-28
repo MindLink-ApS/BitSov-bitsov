@@ -1227,7 +1227,16 @@ async fn paid_acceptance_retry_case(legacy: bool, retained: bool, price_rise: bo
     assert!(!target.connected_privileged_peers().await.contains(alice.node_id()));
     sqlx::query("DROP TRIGGER fail_message").execute(db.pool()).await.unwrap();
     source.send(bob.node_id(), &env).await.unwrap();
-    let ack = tokio::time::timeout(Duration::from_secs(5), source.recv_control()).await.unwrap().unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match source.recv_control().await.unwrap() {
+                event @ ControlEvent::MessageAcked { .. } => break event,
+                event @ ControlEvent::MessageRejected { .. } => panic!("expected ACK: {event:?}"),
+                // PSI-SPEED can publish its eager PrekeyOffer before the ACK.
+                _ => {}
+            }
+        }
+    }).await.unwrap();
     assert!(matches!(ack, ControlEvent::MessageAcked { duplicate: false, .. }));
     let message = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv()).await.unwrap().unwrap();
     assert_eq!(message.plaintext.as_deref(), Some("paid exactly once"));
@@ -1256,7 +1265,16 @@ async fn paid_acceptance_retry_case(legacy: bool, retained: bool, price_rise: bo
     source.connect(bob.node_id(), &target.listen_addr().unwrap().to_string()).await.unwrap();
     while !matches!(source.recv_control().await.unwrap(), ControlEvent::PeerConnected { .. }) {}
     source.send(bob.node_id(), &env).await.unwrap();
-    let ack = tokio::time::timeout(Duration::from_secs(5), source.recv_control()).await.unwrap().unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match source.recv_control().await.unwrap() {
+                event @ ControlEvent::MessageAcked { .. } => break event,
+                event @ ControlEvent::MessageRejected { .. } => panic!("expected ACK: {event:?}"),
+                // PSI-SPEED can publish its eager PrekeyOffer before the ACK.
+                _ => {}
+            }
+        }
+    }).await.unwrap();
     assert!(matches!(ack, ControlEvent::MessageAcked { duplicate: true, .. }));
     assert!(!target.connected_privileged_peers().await.contains(alice.node_id()));
     assert!(ws_rx.try_recv().is_err());

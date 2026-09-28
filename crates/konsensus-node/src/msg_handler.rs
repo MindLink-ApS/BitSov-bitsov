@@ -155,6 +155,47 @@ fn corrective_price_table_rate_limited(
     false
 }
 
+/// PSI-SPEED: offer our X3DH prekey to `peer` right after a settled payment
+/// promoted its connection (generation `promoted`), so the session forms now rather than on the next
+/// self-heal tick. Skipped when a sending chain already exists (an offer would
+/// make a lower-NodeId peer replace a working session) or when the limiter
+/// refuses; the periodic self-heal remains the fallback either way.
+async fn offer_prekey_after_promotion(
+    transport: &NoiseTransport,
+    sessions: &SessionManager,
+    peer: &konsensus_core::types::NodeId,
+    promoted: std::time::Instant,
+    limiter: &mut konsensus_message::EagerOfferLimiter,
+) {
+    if sessions.can_send(peer).await {
+        return;
+    }
+    if !limiter.allow(peer, std::time::Instant::now()) {
+        debug!(peer = %peer, "eager PrekeyOffer rate-limited; self-heal will offer");
+        return;
+    }
+    let bundle = match serde_json::to_value(sessions.prekey_bundle().await) {
+        Ok(bundle) => bundle,
+        Err(e) => {
+            warn!(peer = %peer, error = %e, "failed to serialize prekey bundle for eager offer");
+            return;
+        }
+    };
+    let frame = match (Frame::PrekeyOffer { bundle }).to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(peer = %peer, error = %e, "failed to encode eager PrekeyOffer");
+            return;
+        }
+    };
+    // Only on the exact connection this payment promoted, and only while it is
+    // still privileged: a replacement that reconnected meanwhile is unpaid.
+    match transport.send_raw_frame_on(peer, promoted, konsensus_message::Standing::Privileged, &frame).await {
+        Ok(()) => info!(peer = %peer, "sent PrekeyOffer to the payer just promoted (PSI-SPEED)"),
+        Err(e) => warn!(peer = %peer, error = %e, "failed to send eager PrekeyOffer after promotion"),
+    }
+}
+
 /// Runs the incoming message handler loop.
 ///
 /// Receives envelopes from the transport, validates them through the payment gate,
@@ -187,6 +228,11 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
         konsensus_core::types::NodeId,
         tokio::time::Instant,
     > = std::collections::HashMap::new();
+
+    // PSI-SPEED: bounds the prekey offers sent right after promote-on-paid.
+    // Separate from the other two eager limiters on purpose; see `eager_offers`
+    // in the compose handler.
+    let mut eager_offers = konsensus_message::EagerOfferLimiter::new();
 
     // Doorway hardening #3: wrap the settlement-verification provider in a
     // circuit-breaker (timeout + breaker + bounded concurrency + short negative
@@ -393,12 +439,28 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // as `sender` is flipped (binding: envelope.sender ==
                         // connection.peer_id). In Whitelist mode the peer is already
                         // privileged, so this is a no-op (byte-identical).
+                        //
+                        // PSI-SPEED: offer our prekey on that connection now,
+                        // instead of on the next self-heal tick (up to 15 s).
+                        // Only the connection just promoted by this payment is
+                        // offered to, never an unpaid peer, and the offer is
+                        // rate-limited (`EagerOfferLimiter`).
                         if matches!(
                             admission_mode_for_recv,
                             konsensus_message::ReachabilityMode::PriceOpen
-                        ) && !transport_for_recv.promote_to_privileged(&sender).await
-                        {
-                            debug!(sender = %sender, "paid sender has no live connection to promote (relayed/offline proof)");
+                        ) {
+                            if let Some(promoted) = transport_for_recv.promote_to_privileged_at(&sender).await {
+                                offer_prekey_after_promotion(
+                                    &transport_for_ack,
+                                    &session_mgr_for_recv,
+                                    &sender,
+                                    promoted,
+                                    &mut eager_offers,
+                                )
+                                .await;
+                            } else {
+                                debug!(sender = %sender, "paid sender has no live connection to promote (relayed/offline proof)");
+                            }
                         }
 
                         // R3 SEAM-B (Route B) — relay-control intercept. Fires only
