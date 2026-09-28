@@ -8,7 +8,7 @@
 //! amount, hash) and freezes it as the kit's one candidate; `POST
 //! /sponsor/approve`, with the six-digit code both people compared, reserves
 //! gift + fee ceiling against the rolling purse, persists that, and only then
-//! pays. A metered (paired) caller is also debited against its G1 grant.
+//! pays. Only independent owner credentials can approve; a G1 grant cannot.
 //!
 //! **Newcomer node:** `POST /sponsor/request` checks the card and offer,
 //! creates one fixed invoice to its own wallet, and registers its hash as
@@ -109,6 +109,8 @@ pub enum KitState {
     Unknown,
     /// The sponsor cancelled before dispatch.
     Cancelled,
+    /// Observed past its dispatch deadline; never reopens after clock rollback.
+    Expired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,19 +189,37 @@ impl Kit {
 #[serde(deny_unknown_fields)]
 pub struct Ledger {
     pub version: u32,
+    /// Highest observed wall time, durably advanced even on refused operations.
+    #[serde(default)]
+    pub last_observed_time: u64,
     pub kits: Vec<Kit>,
 }
 
 impl Ledger {
+    fn observe(&mut self, wall_now: u64) -> u64 {
+        self.last_observed_time = self.last_observed_time.max(wall_now);
+        let now = self.last_observed_time;
+        for kit in &mut self.kits {
+            let deadline = kit.candidate.as_ref().map_or(kit.expires_at, |c| kit.expires_at.min(c.expires_at));
+            if matches!(kit.state, KitState::Offered | KitState::Candidate) && deadline <= now {
+                kit.state = KitState::Expired;
+            }
+        }
+        now
+    }
+
     pub fn purse_used(&self, now: u64) -> u64 {
+        let now = now.max(self.last_observed_time);
         self.kits.iter().fold(0u64, |used, k| used.saturating_add(k.charge(now)))
     }
 
     pub fn kits_today(&self, now: u64) -> u32 {
+        let now = now.max(self.last_observed_time);
         self.kits.iter().filter(|k| k.in_day(now)).count() as u32
     }
 
     pub fn active(&self, now: u64) -> u32 {
+        let now = now.max(self.last_observed_time);
         self.kits.iter().filter(|k| k.open(now)).count() as u32
     }
 
@@ -300,7 +320,7 @@ fn load(dir: &Path) -> Result<Ledger, ApiError> {
             }
             Ok(ledger)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Ledger { version: LEDGER_VERSION, kits: Vec::new() }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Ledger { version: LEDGER_VERSION, ..Ledger::default() }),
         Err(e) => Err(ApiError::Internal(format!("sponsor ledger unreadable: {e}"))),
     }
 }
@@ -319,12 +339,25 @@ fn save(dir: &Path, ledger: &Ledger) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Run `edit` on the ledger under the lock, saving only if it succeeds.
-async fn with_ledger<T>(state: &AppState, edit: impl FnOnce(&mut Ledger) -> Result<T, ApiError>) -> Result<T, ApiError> {
+/// Advance time durably before a caller can observe expiry, even if its
+/// subsequent operation is refused. Caller must hold LEDGER_LOCK.
+fn load_observed(dir: &Path, wall_now: u64) -> Result<Ledger, ApiError> {
+    let mut ledger = load(dir)?;
+    let before = ledger.clone();
+    ledger.observe(wall_now);
+    if ledger != before {
+        save(dir, &ledger)?;
+    }
+    Ok(ledger)
+}
+
+/// Run `edit` under the lock with durable, nondecreasing effective time.
+async fn with_ledger<T>(state: &AppState, edit: impl FnOnce(&mut Ledger, u64) -> Result<T, ApiError>) -> Result<T, ApiError> {
     let _guard = LEDGER_LOCK.lock().await;
     let dir = ledger_dir(state)?;
-    let mut ledger = load(&dir)?;
-    let out = edit(&mut ledger)?;
+    let mut ledger = load_observed(&dir, now_unix()?)?;
+    let now = ledger.last_observed_time;
+    let out = edit(&mut ledger, now)?;
     save(&dir, &ledger)?;
     Ok(out)
 }
@@ -340,6 +373,17 @@ fn network(state: &AppState) -> Result<String, ApiError> {
     state.introduction.network.clone().ok_or_else(|| {
         ApiError::Conflict("sponsor_unavailable: this node's Lightning backend does not state a Bitcoin network".into())
     })
+}
+
+fn invoice_currency(network: &str) -> Result<lightning_invoice::Currency, ApiError> {
+    use lightning_invoice::Currency;
+    match network {
+        "bitcoin" => Ok(Currency::Bitcoin),
+        "testnet" => Ok(Currency::BitcoinTestnet),
+        "signet" => Ok(Currency::Signet),
+        "regtest" => Ok(Currency::Regtest),
+        _ => Err(invalid("unsupported sponsor network")),
+    }
 }
 
 fn invalid(e: impl std::fmt::Display) -> ApiError {
@@ -364,17 +408,22 @@ pub struct OfferResponse {
 /// purse. Spend authority: it is the start of a payment the owner allowed.
 async fn create_offer(_auth: MeteredSpend, State(state): State<Arc<AppState>>) -> Result<Json<OfferResponse>, ApiError> {
     let policy = state.sponsor.clone();
-    let now = now_unix()?;
     // Check first, so a refused offer signs nothing.
-    with_ledger(&state, |l| l.check_new_kit(&policy, now)).await?;
+    let now = with_ledger(&state, |l, now| {
+        l.check_new_kit(&policy, now)?;
+        Ok(now)
+    }).await?;
     let card = super::introduction::issue_card(&state).await?;
     let intro_id: [u8; 16] = hex::decode(&card.intro_id).ok().and_then(|b| b.try_into().ok())
         .ok_or_else(|| ApiError::Internal("card id".into()))?;
     let expires_at = card.expires_at.min(now + core::OFFER_LIFETIME_SECS);
     let offer = SponsorOffer::sign(state.identity.ed25519_signing_key(), &card.network, intro_id, policy.gift_msat, expires_at)
         .map_err(|e| ApiError::Internal(format!("offer: {e}")))?;
-    with_ledger(&state, |l| {
+    with_ledger(&state, |l, now| {
         l.check_new_kit(&policy, now)?;
+        if expires_at <= now {
+            return Err(ApiError::Conflict("sponsor_kit_expired: introduction has expired".into()));
+        }
         l.kits.push(Kit {
             intro_id: card.intro_id.clone(),
             gift_msat: policy.gift_msat,
@@ -409,6 +458,7 @@ pub struct CandidateRequest {
 pub struct CandidateResponse {
     pub intro_id: String,
     pub newcomer: String,
+    pub payment_hash: String,
     pub gift_msat: u64,
     pub fee_max_msat: u64,
     /// The six digits the newcomer's screen shows. Compare them in person.
@@ -425,15 +475,20 @@ async fn add_candidate(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CandidateRequest>,
 ) -> Result<Json<CandidateResponse>, ApiError> {
-    let now = now_unix()?;
+    // Persist observation even when signature/invoice expiry refuses the request.
+    let now = with_ledger(&state, |_, now| Ok(now)).await?;
     let req = FundingRequest::parse(&body.request).map_err(invalid)?;
-    req.verify(now, &network(&state)?).map_err(invalid)?;
+    let net = network(&state)?;
+    req.verify(now, &net).map_err(invalid)?;
     if req.sponsor != *state.identity.node_id().as_bytes() {
         return Err(invalid("this request is for another sponsor"));
     }
     // The invoice must be exactly what the newcomer signed: its amount, its
     // hash, and payable to the Lightning key the request binds.
     let invoice = req.bolt11.parse::<lightning_invoice::Bolt11Invoice>().map_err(|e| invalid(format!("invoice: {e}")))?;
+    if invoice.currency() != invoice_currency(&net)? {
+        return Err(invalid("invoice network differs from this sponsor"));
+    }
     let payee = invoice.payee_pub_key().copied().unwrap_or_else(|| invoice.recover_payee_pub_key());
     if payee.serialize() != req.newcomer_ln {
         return Err(invalid("the invoice is not payable to the key the request names"));
@@ -444,7 +499,7 @@ async fn add_candidate(
     if invoice.payment_hash().as_ref() as &[u8] != req.payment_hash.as_slice() {
         return Err(invalid("the invoice hash differs from the request"));
     }
-    if invoice.is_expired() {
+    if invoice.expires_at().map_or(0, |d| d.as_secs()) <= now {
         return Err(invalid("the invoice has expired"));
     }
     let intro_id = hex::encode(req.intro_id);
@@ -455,9 +510,13 @@ async fn add_candidate(
         payment_hash: hex::encode(req.payment_hash),
         bolt11: req.bolt11.clone(),
         code: code.clone(),
-        expires_at: req.expires_at,
+        expires_at: req.expires_at.min(invoice.expires_at().map_or(0, |d| d.as_secs())),
     };
-    let (gift_msat, fee_msat, expires_at) = with_ledger(&state, |l| {
+    let (gift_msat, fee_msat, expires_at) = with_ledger(&state, |l, now| {
+        req.verify(now, &net).map_err(invalid)?;
+        if candidate.expires_at <= now {
+            return Err(invalid("the invoice has expired"));
+        }
         let kit = l.kit_mut(&intro_id)?;
         if kit.expires_at <= now {
             return Err(ApiError::Conflict("sponsor_kit_expired: make a new offer".into()));
@@ -479,13 +538,18 @@ async fn add_candidate(
         Ok((kit.gift_msat, kit.fee_msat, kit.expires_at.min(candidate.expires_at)))
     })
     .await?;
-    Ok(Json(CandidateResponse { intro_id, newcomer: candidate.newcomer, gift_msat, fee_max_msat: fee_msat, code, expires_at }))
+    Ok(Json(CandidateResponse { intro_id, newcomer: candidate.newcomer, payment_hash: candidate.payment_hash, gift_msat, fee_max_msat: fee_msat, code, expires_at }))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApproveRequest {
     pub intro_id: String,
+    /// Exact immutable funding intent the independent owner reviewed.
+    pub newcomer: String,
+    pub payment_hash: String,
+    pub gift_msat: u64,
+    pub fee_max_msat: u64,
     /// The code the owner compared with the newcomer's screen.
     pub code: String,
 }
@@ -499,23 +563,47 @@ pub struct ApproveResponse {
     pub payment_hash: String,
 }
 
+/// Enforce the owner boundary before parsing an approval body, so paired
+/// callers always receive the owner-approval refusal, including old clients.
+struct SponsorOwner(MeteredSpend);
+
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<Arc<AppState>> for SponsorOwner {
+    type Rejection = axum::response::Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        use axum::response::IntoResponse;
+        let auth = MeteredSpend::from_request_parts(parts, state).await?;
+        // Same authority boundary as first_contact_grant: a delegated budget
+        // cannot mint the independent owner's consent.
+        if auth.is_metered() {
+            return Err(ApiError::Conflict("sponsor_owner_approval_required".into()).into_response());
+        }
+        Ok(Self(auth))
+    }
+}
+
 /// `POST /api/v1/sponsor/approve` — the owner's approval of exactly this
 /// candidate. Re-checks the daily count and purse, reserves gift + fee
-/// ceiling and persists that before dispatch; a paired caller is debited
-/// against its G1 grant too. Settled → funded; failed → the kit closes;
+/// ceiling and consumes the intent in the same durable write before dispatch.
+/// Paired credentials cannot provide this independent owner approval.
+/// Settled → funded; failed → the kit closes;
 /// anything else → unknown, reservation kept.
 async fn approve(
-    auth: MeteredSpend,
+    SponsorOwner(auth): SponsorOwner,
     State(state): State<Arc<AppState>>,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<ApproveResponse>, ApiError> {
     let (candidate, fee_msat, deadline, debit, _active_dispatch) = {
-        // One transaction serializes the exact purse check, kit claim, and
-        // linked G1 debit. The kit reference is durable BEFORE the G1 debit.
+        // One transaction validates the owner intent and consumes the kit
+        // with its purse reservation. No await separates approval and claim.
         let _guard = LEDGER_LOCK.lock().await;
         let dir = ledger_dir(&state)?;
-        let mut ledger = load(&dir)?;
-        let now = now_unix()?;
+        let mut ledger = load_observed(&dir, now_unix()?)?;
+        let now = ledger.last_observed_time;
         let policy = &state.sponsor;
         if !policy.enabled {
             return Err(ApiError::Conflict("sponsor_disabled: the owner has turned sponsoring off".into()));
@@ -527,11 +615,22 @@ async fn approve(
         if kit.gift_msat > policy.gift_msat || kit.fee_msat > policy.fee_msat {
             return Err(ApiError::Conflict("sponsor_policy_changed: this candidate exceeds the current owner policy; make a new offer".into()));
         }
+        if ledger.active(now) > core::MAX_ACTIVE_KITS {
+            return Err(ApiError::Conflict("sponsor_kit_open: another kit is active".into()));
+        }
         ledger.check_room(policy, kit.gift_msat.saturating_add(kit.fee_msat), now)?;
         let candidate = kit.candidate.clone().ok_or_else(|| ApiError::Internal("candidate".into()))?;
+        if body.newcomer != candidate.newcomer || body.payment_hash != candidate.payment_hash
+            || body.gift_msat != kit.gift_msat || body.fee_max_msat != kit.fee_msat {
+            return Err(invalid("approval differs from the frozen funding intent"));
+        }
         let deadline = kit.expires_at.min(candidate.expires_at);
         let invoice = candidate.bolt11.parse::<lightning_invoice::Bolt11Invoice>().map_err(invalid)?;
-        if deadline <= now || invoice.is_expired() {
+        if invoice.currency() != invoice_currency(&network(&state)?)? {
+            return Err(invalid("invoice network differs from this sponsor"));
+        }
+        let deadline = deadline.min(invoice.expires_at().map_or(0, |d| d.as_secs()));
+        if deadline <= now {
             return Err(ApiError::Conflict("sponsor_kit_expired: the request or invoice dispatch window has passed".into()));
         }
         if body.code.trim() != candidate.code {
@@ -566,7 +665,7 @@ async fn approve(
     // process restart. Lookup errors other than absence fail before dispatch.
     let preflight = match state.lightning.get_payment_status(&candidate.payment_hash).await {
         Err(LightningError::PaymentNotFound(_)) => {
-            with_ledger(&state, |ledger| {
+            with_ledger(&state, |ledger, _now| {
                 ledger.kit_mut(&body.intro_id)?.fresh_payment_hash = true;
                 Ok(())
             }).await?;
@@ -577,7 +676,9 @@ async fn approve(
     };
     let result = debit.dispatch(async {
         preflight?;
-        if now_unix().map_err(|e| LightningError::PaymentNotDispatched(e.to_string()))? >= deadline {
+        let now = with_ledger(&state, |_, now| Ok(now)).await
+            .map_err(|e| LightningError::PaymentNotDispatched(e.to_string()))?;
+        if now >= deadline {
             return Err(LightningError::PaymentNotDispatched("sponsor request expired before dispatch".into()));
         }
         state.lightning.pay_invoice_with_fee_limit(&candidate.bolt11, fee_msat).await
@@ -587,9 +688,9 @@ async fn approve(
         Err(ApiError::BudgetExceeded(e)) => Err(LightningError::PaymentNotDispatched(e.to_string())),
         Err(e) => Err(LightningError::Backend(e.to_string())),
     };
-    let outcome = with_ledger(&state, |ledger| {
+    let outcome = with_ledger(&state, |ledger, now| {
         let kit = ledger.kit_mut(&body.intro_id)?;
-        record_outcome(kit, &paid, now_unix()?, true);
+        record_outcome(kit, &paid, now, true);
         Ok(kit.clone())
     }).await?;
     resolve_grant(&state, &outcome);
@@ -608,7 +709,7 @@ async fn approve(
 /// Only the outgoing record for the exact approved operation may release a
 /// reservation. Terminal outcomes are monotonic across concurrent callers.
 fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>, now: u64, from_dispatch: bool) {
-    if matches!(kit.state, KitState::Failed | KitState::Cancelled)
+    if matches!(kit.state, KitState::Failed | KitState::Cancelled | KitState::Expired)
         || (kit.state == KitState::Funded && kit.reserved_msat == 0) {
         return;
     }
@@ -668,7 +769,7 @@ async fn cancel(
     State(state): State<Arc<AppState>>,
     UrlPath(intro_id): UrlPath<String>,
 ) -> Result<Json<Kit>, ApiError> {
-    with_ledger(&state, |l| {
+    with_ledger(&state, |l, _now| {
         let kit = l.kit_mut(&intro_id)?;
         if !matches!(kit.state, KitState::Offered | KitState::Candidate) {
             return Err(ApiError::Conflict("sponsor_kit_dispatched: only an undispatched kit can be cancelled".into()));
@@ -688,7 +789,7 @@ async fn reconcile(
     State(state): State<Arc<AppState>>,
     UrlPath(intro_id): UrlPath<String>,
 ) -> Result<Json<Kit>, ApiError> {
-    let (snapshot, active) = with_ledger(&state, |ledger| {
+    let (snapshot, active) = with_ledger(&state, |ledger, _now| {
         let kit = ledger.kit_mut(&intro_id)?;
         if !matches!(kit.state, KitState::Unknown | KitState::Paying | KitState::Funded | KitState::Failed) {
             return Err(ApiError::Conflict("sponsor_kit_not_dispatched: nothing to reconcile".into()));
@@ -709,9 +810,9 @@ async fn reconcile(
         .map_err(|e| LightningError::Backend(e.to_string()));
     // Re-read under lock: another reconciliation or the original approval
     // may have completed while the backend was awaited.
-    let outcome = with_ledger(&state, |ledger| {
+    let outcome = with_ledger(&state, |ledger, now| {
         let kit = ledger.kit_mut(&intro_id)?;
-        record_outcome(kit, &details, now_unix()?, false);
+        record_outcome(kit, &details, now, false);
         Ok(kit.clone())
     }).await?;
     resolve_grant(&state, &outcome);
@@ -737,7 +838,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
     let now = now_unix()?;
     let _guard = LEDGER_LOCK.lock().await;
     let ledger = match ledger_dir(&state) {
-        Ok(dir) => load(&dir)?,
+        Ok(dir) => load_observed(&dir, now)?,
         Err(_) => Ledger::default(),
     };
     let mut kits: Vec<Kit> = ledger.kits.iter().rev().take(20).cloned().collect();
@@ -908,10 +1009,10 @@ mod tests {
 
     #[test]
     fn unknown_outcomes_keep_their_reservation_in_the_purse() {
-        let l = Ledger { version: 1, kits: vec![kit(KitState::Unknown, Some(NOW - 10), 21_000, 0)] };
+        let l = Ledger { version: 1, last_observed_time: 0, kits: vec![kit(KitState::Unknown, Some(NOW - 10), 21_000, 0)] };
         assert_eq!(l.purse_used(NOW), 21_000);
         assert_eq!(l.active(NOW), 1, "an unknown kit blocks a new one until reconciled");
-        let failed = Ledger { version: 1, kits: vec![kit(KitState::Failed, Some(NOW - 10), 0, 0)] };
+        let failed = Ledger { version: 1, last_observed_time: 0, kits: vec![kit(KitState::Failed, Some(NOW - 10), 0, 0)] };
         assert_eq!(failed.purse_used(NOW), 0);
         assert_eq!(failed.kits_today(NOW), 1, "a failed approval still used a daily kit");
     }
@@ -919,11 +1020,11 @@ mod tests {
     #[test]
     fn a_clock_moved_back_cannot_refresh_the_purse() {
         // Approved "in the future" relative to a clock that went back: still counts.
-        let l = Ledger { version: 1, kits: vec![kit(KitState::Funded, Some(NOW + 3_600), 0, 20_000)] };
+        let l = Ledger { version: 1, last_observed_time: 0, kits: vec![kit(KitState::Funded, Some(NOW + 3_600), 0, 20_000)] };
         assert_eq!(l.purse_used(NOW), 20_000);
         assert_eq!(l.kits_today(NOW), 1);
         // A day after approval it leaves the window.
-        let old = Ledger { version: 1, kits: vec![kit(KitState::Funded, Some(NOW - DAY_SECS), 0, 20_000)] };
+        let old = Ledger { version: 1, last_observed_time: 0, kits: vec![kit(KitState::Funded, Some(NOW - DAY_SECS), 0, 20_000)] };
         assert_eq!(old.purse_used(NOW), 0);
     }
 
@@ -931,10 +1032,51 @@ mod tests {
     fn an_expired_offer_no_longer_blocks_a_new_kit() {
         let mut k = kit(KitState::Offered, None, 0, 0);
         k.expires_at = NOW - 1;
-        let l = Ledger { version: 1, kits: vec![k] };
+        let l = Ledger { version: 1, last_observed_time: 0, kits: vec![k] };
         assert_eq!(l.active(NOW), 0);
         let policy = SponsorPolicy::new(true, 20_000, 1_000, 100_000, 2).unwrap();
         assert!(l.check_new_kit(&policy, NOW).is_ok());
+    }
+
+    #[test]
+    fn observed_expiry_and_time_floor_survive_reload_and_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = kit(KitState::Offered, None, 0, 0);
+        a.intro_id = "A".into();
+        a.created_at = 1000;
+        a.expires_at = 1600;
+        save(dir.path(), &Ledger { version: 1, kits: vec![a], ..Ledger::default() }).unwrap();
+        let mut ledger = load_observed(dir.path(), 1601).unwrap();
+        assert_eq!(ledger.active(1601), 0);
+        let mut b = kit(KitState::Offered, None, 0, 0);
+        b.intro_id = "B".into();
+        b.created_at = 1601;
+        b.expires_at = 2201;
+        ledger.kits.push(b);
+        save(dir.path(), &ledger).unwrap();
+        drop(ledger);
+        let restarted = load_observed(dir.path(), 1599).unwrap();
+        assert_eq!(restarted.active(1599), 1, "A must not revive alongside B");
+        assert_eq!(restarted.kits[0].state, KitState::Expired);
+        assert_eq!(restarted.last_observed_time, 1601);
+        assert_eq!(load(dir.path()).unwrap().last_observed_time, 1601);
+        let expired = load_observed(dir.path(), 2201).unwrap();
+        assert_eq!(expired.active(2201), 0, "expiry is inclusive");
+        assert_eq!(load_observed(dir.path(), 1000).unwrap().active(1000), 0);
+    }
+
+    #[test]
+    fn candidate_deadline_retires_kit_without_releasing_unresolved_payments() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut candidate, _) = pending_with_record();
+        candidate.state = KitState::Candidate;
+        candidate.reserved_msat = 0;
+        let (unknown, _) = pending_with_record();
+        save(dir.path(), &Ledger { version: 1, kits: vec![candidate, unknown], ..Ledger::default() }).unwrap();
+        let ledger = load_observed(dir.path(), NOW + 50).unwrap();
+        assert_eq!(ledger.kits[0].state, KitState::Expired);
+        assert_eq!(ledger.kits[1].state, KitState::Unknown);
+        assert_eq!(ledger.purse_used(NOW + DAY_SECS * 2), 21_000);
     }
 
     fn pending_with_record() -> (Kit, PaymentDetails) {

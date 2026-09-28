@@ -18,11 +18,11 @@ One person funds another. The inviter's node pays a small, capped gift of its ow
 | 2 | sponsor | `POST /api/v1/sponsor/offer` | spend (metered) | Signs a fresh introduction card plus a `SponsorOffer` for that card's `intro_id` only. Link: `bitsov://introduce#<card>.<offer>`. Opens the one active kit. Moves nothing. |
 | 3 | newcomer | `POST /api/v1/sponsor/request {link}` | receive | Verifies the card and offer (same key, same `intro_id`, network, expiry, strict Ed25519). Creates one invoice of exactly the offered gift, registers its hash as funding-only (fails closed), and signs a `FundingRequest`. Returns `bitsov://sponsor-request#…` and a six-digit code. |
 | 4 | in person | — | — | The newcomer shows the request as a QR; both people compare the six digits. |
-| 5 | sponsor | `POST /api/v1/sponsor/candidate {request}` | spend (metered) | Verifies the signature, that the request is for this sponsor, and that the invoice pays the bound Lightning key the exact amount with the exact hash. Freezes the request as the kit's only candidate; a different one is refused, not swapped in. |
-| 6 | sponsor | `POST /api/v1/sponsor/approve {intro_id, code}` | spend (metered) | Wrong code: nothing paid. Re-checks the purse and daily count, reserves gift + fee ceiling, and **persists that before dispatch**. A paired app is also debited against its G1 grant. |
+| 5 | sponsor | `POST /api/v1/sponsor/candidate {request}` | spend (metered) | Verifies the signature, that the request is for this sponsor, and that the invoice currency matches the configured Bitcoin network and pays the bound Lightning key the exact amount with the exact hash. Freezes the request as the kit's only candidate; a different one is refused, not swapped in. |
+| 6 | sponsor | `POST /api/v1/sponsor/approve {intro_id, newcomer, payment_hash, gift_msat, fee_max_msat, code}` | independent owner spend | Requires the exact funding intent returned by `/candidate` and the compared code. Re-checks active-kit exclusivity, purse and daily count, then **atomically consumes the single-use intent with the gift + fee reservation before dispatch**. Paired/G1 approvals return `409 sponsor_owner_approval_required`. |
 | 7 | newcomer | `GET /api/v1/sponsor/request/:hash` | read | `waiting` or `received`. |
 
-- **Outcomes of step 6:** settled → `funded`. Failed or not dispatched → `failed`: the kit closes and both holds are released. Anything else → `unknown`: both holds stay until `POST /api/v1/sponsor/kits/:id/reconcile` finds a definitive outgoing record.
+- **Outcomes of step 6:** settled → `funded`. Failed or not dispatched → `failed`: the kit closes and its purse reservation is released. Anything else → `unknown`: the reservation stays until `POST /api/v1/sponsor/kits/:id/reconcile` finds a definitive outgoing record.
 - **Cancelling:** `POST /api/v1/sponsor/kits/:id/cancel` withdraws an offer or candidate before dispatch.
 - **Status:** `GET /api/v1/sponsor` (read) shows the policy, the rolling purse and the recent kits, without invoices.
 
@@ -38,12 +38,12 @@ The funding request travels in person rather than over the peer transport. That 
 | Open kits (offered, candidate, paying or unknown) | 1 | ledger `active` |
 | Offer and dispatch window | 10 min | `SponsorOffer`, kit `expires_at` |
 
-- **Clock rollback:** it cannot refresh the purse. A reservation dated after the node's current clock still counts.
+- **Clock rollback:** the ledger persists a nondecreasing `last_observed_time`. All sponsor dispatch deadlines use `max(wall_time, last_observed_time)`, including after restart and before payment. Observed expiry terminally retires offered/candidate kits as `expired`; even refused operations persist time advancement. Unresolved payment reservations remain held.
 - **Failed approvals:** a failed approval still used one of the day's kits.
 - **Consumed introductions:** a consumed `intro_id` never pays twice.
 - **Fresh invoices only:** before dispatch, the sponsor requires an authoritative absence of a prior payment record and persists that fact. The capped LDK send also checks the hash under the invoice-dispatch lock, so it cannot retry an older failed attempt. Existing invoices and unavailable lookups close the kit without paying.
 - **Ambiguous legacy failures:** old ledgers lack fresh-invoice proof. A failed lookup for one of those operations cannot release its reservation: it might describe an earlier attempt for the same hash. A verified settlement can still reconcile it. New operations retain their freshness proof across restarts, allowing definitive failure to release both holds.
-- **Unknown fees:** a settlement without an authoritative fee retains the full approved maximum. Once known, its principal and fee count for 24 hours from reconciliation, even if approval was more than a day ago. G1 continues to meter principal only, as specified by the budget grant contract.
+- **Unknown fees:** a settlement without an authoritative fee retains the full approved maximum. Once known, its principal and fee count for 24 hours from reconciliation, even if approval was more than a day ago. Legacy G1-backed operations still reconcile their principal reservations; new gifts require independent owner approval and use the sponsor purse.
 - **The ledger:** `<data_dir>/sponsor/kits.json` (0600, atomic replace, versioned).
 
 ## Records

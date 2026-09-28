@@ -1,6 +1,5 @@
-//! K1 slice 2 × G1: a paired app approving a sponsor gift is debited against
-//! its owner-granted budget as well as the node's sponsor purse; outcomes
-//! settle, release or stay reserved on both.
+//! K1 × G1: delegation cannot approve gifts. Owner-approved gifts use the
+//! sponsor purse; legacy grant-backed operations still reconcile after restart.
 use super::*;
 use konsensus_api::handlers::introduction::IntroductionSettings;
 use konsensus_api::handlers::sponsor::SponsorPolicy;
@@ -40,8 +39,36 @@ async fn kit(budget: u64) -> (Fx, String, Value) {
     (fx, token, cand)
 }
 
+fn approval(cand: &Value) -> Value {
+    json!({"intro_id":cand["intro_id"], "code":cand["code"],
+        "newcomer":cand["newcomer"], "payment_hash":cand["payment_hash"],
+        "gift_msat":cand["gift_msat"], "fee_max_msat":cand["fee_max_msat"]})
+}
+
+async fn owner_approve(fx: &Fx, cand: &Value) -> (StatusCode, Value) {
+    let owner = auth_header(&fx.state);
+    approve(fx, owner.trim_start_matches("Bearer "), cand).await
+}
+
+// Old versions could dispatch against G1. Seed their durable state so the
+// reconciliation contract remains tested without enabling new paired approval.
+async fn legacy_unknown(fx: &Fx) {
+    let path = fx.state.data_dir.as_ref().unwrap().join("sponsor/kits.json");
+    let mut ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let epoch = fx.service.snapshot().clients.iter().find(|c| c.client_id == fx.client_id).unwrap().epoch;
+    let recipient = ledger["kits"][0]["candidate"]["newcomer_ln"].as_str().unwrap().to_owned();
+    let reservation = fx.service.reserve_spend(&fx.client_id, epoch, vec![Charge { recipient, amount_msat: GIFT }]).unwrap();
+    ledger["kits"][0]["state"] = json!("unknown");
+    ledger["kits"][0]["reserved_msat"] = json!(GIFT + FEE);
+    ledger["kits"][0]["fresh_payment_hash"] = json!(true);
+    ledger["kits"][0]["grant_reservation"] = serde_json::to_value(reservation).unwrap();
+    std::fs::write(path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    fx.wallet.set(UNKNOWN);
+    assert!(fx.wallet.pay_invoice_with_fee_limit(ledger["kits"][0]["candidate"]["bolt11"].as_str().unwrap(), FEE).await.is_err());
+}
+
 async fn approve(fx: &Fx, token: &str, cand: &Value) -> (StatusCode, Value) {
-    fx.call("POST", "/api/v1/sponsor/approve", Some(json!({"intro_id": cand["intro_id"], "code": cand["code"]})), Some(token)).await
+    fx.call("POST", "/api/v1/sponsor/approve", Some(approval(cand)), Some(token)).await
 }
 
 async fn kit_state(fx: &Fx, token: &str) -> (Value, Value) {
@@ -53,28 +80,28 @@ async fn kit_state(fx: &Fx, token: &str) -> (Value, Value) {
 async fn a_grant_that_cannot_cover_the_gift_pays_nothing() {
     let (fx, token, cand) = kit(GIFT - 1).await;
     let (s, body) = approve(&fx, &token, &cand).await;
-    // A grant's per-call maximum defaults to its total: refused as per_call.
-    assert_budget_exceeded(s, &body, "per_call");
+    assert_eq!(s, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("sponsor_owner_approval_required"));
     assert_eq!(fx.wallet.money(), 0, "nothing dispatched");
     assert_eq!(kit_state(&fx, &token).await, (json!("candidate"), json!(0)), "the kit waits, nothing reserved");
 }
 
 #[tokio::test]
-async fn a_settled_gift_is_debited_once_from_the_grant() {
+async fn regression_g1_alone_cannot_approve_a_sponsor_gift() {
     let (fx, token, cand) = kit(50_000).await;
     let (s, body) = approve(&fx, &token, &cand).await;
-    assert_eq!(s, StatusCode::OK, "{body}");
-    assert_eq!(body["state"], "funded");
-    assert_eq!(fx.used(), GIFT);
-    assert_eq!(fx.wallet.money(), 1);
-    assert_eq!(kit_state(&fx, &token).await, (json!("funded"), json!(GIFT)));
+    assert_eq!(s, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("sponsor_owner_approval_required"), "{body}");
+    assert_eq!(fx.used(), 0);
+    assert_eq!(fx.wallet.money(), 0);
+    assert_eq!(kit_state(&fx, &token).await, (json!("candidate"), json!(0)));
 }
 
 #[tokio::test]
 async fn an_unknown_outcome_stays_reserved_and_blocks_a_new_kit() {
     let (fx, token, cand) = kit(50_000).await;
     fx.wallet.set(UNKNOWN);
-    let (s, body) = approve(&fx, &token, &cand).await;
+    let (s, body) = owner_approve(&fx, &cand).await;
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_eq!(body["state"], "unknown");
     assert_eq!(kit_state(&fx, &token).await, (json!("unknown"), json!(GIFT + FEE)), "gift + fee ceiling stay held");
@@ -84,24 +111,22 @@ async fn an_unknown_outcome_stays_reserved_and_blocks_a_new_kit() {
 }
 
 #[tokio::test]
-async fn a_failed_payment_closes_the_kit_and_releases_both_holds() {
+async fn an_owner_payment_failure_closes_the_kit_without_debiting_a_grant() {
     let (fx, token, cand) = kit(50_000).await;
     fx.wallet.set(FAILED);
-    let (s, body) = approve(&fx, &token, &cand).await;
+    let (s, body) = owner_approve(&fx, &cand).await;
     assert_ne!(s, StatusCode::OK, "{body}");
     assert_eq!(kit_state(&fx, &token).await, (json!("failed"), json!(0)));
-    assert_eq!(fx.used(), 0, "the grant debit is released");
+    assert_eq!(fx.used(), 0, "owner approval never debits the paired grant");
     // Single use: a failed kit is not retried; the sponsor makes a new offer.
-    let (s, _) = approve(&fx, &token, &cand).await;
+    let (s, _) = owner_approve(&fx, &cand).await;
     assert_eq!(s, StatusCode::CONFLICT);
 }
 
 #[tokio::test]
 async fn regression_definitive_reconcile_releases_grant_hold_after_restart() {
-    let (mut fx, token, cand) = kit(50_000).await;
-    fx.wallet.set(UNKNOWN);
-    let (s, body) = approve(&fx, &token, &cand).await;
-    assert_eq!(s, StatusCode::OK, "{body}");
+    let (mut fx, _token, cand) = kit(50_000).await;
+    legacy_unknown(&fx).await;
     assert_eq!(fx.used(), GIFT);
     fx.restart();
     fx.wallet.set(FAILED);
@@ -118,11 +143,11 @@ async fn regression_definitive_reconcile_releases_grant_hold_after_restart() {
 }
 
 #[tokio::test]
-async fn sponsor_journal_failure_never_orphans_a_grant_debit_or_dispatches() {
-    let (fx, token, cand) = kit(50_000).await;
+async fn sponsor_journal_failure_never_dispatches() {
+    let (fx, _token, cand) = kit(50_000).await;
     let dir = fx.state.data_dir.as_ref().unwrap().join("sponsor");
     std::fs::create_dir(dir.join("kits.json.tmp")).unwrap();
-    let (s, _) = approve(&fx, &token, &cand).await;
+    let (s, _) = owner_approve(&fx, &cand).await;
     assert_ne!(s, StatusCode::OK);
     assert_eq!(fx.wallet.money(), 0);
     assert_eq!(fx.used(), 0);
@@ -130,11 +155,12 @@ async fn sponsor_journal_failure_never_orphans_a_grant_debit_or_dispatches() {
 }
 
 #[tokio::test]
-async fn cancelled_dispatch_retains_its_durable_grant_reference_for_restart() {
-    let (mut fx, token, cand) = kit(50_000).await;
+async fn cancelled_owner_dispatch_retains_its_purse_reservation_for_restart() {
+    let (mut fx, _token, cand) = kit(50_000).await;
     fx.wallet.pause_dispatch.store(true, Ordering::SeqCst);
     let state = fx.state.clone();
-    let request = json!({"intro_id":cand["intro_id"], "code":cand["code"]});
+    let request = approval(&cand);
+    let token = auth_header(&fx.state).trim_start_matches("Bearer ").to_owned();
     let pending = tokio::spawn(async move {
         call(&state, "POST", "/api/v1/sponsor/approve", Some(request), Some(&token)).await
     });
@@ -144,13 +170,14 @@ async fn cancelled_dispatch_retains_its_durable_grant_reference_for_restart() {
         }
     }).await.unwrap();
     let ledger: Value = serde_json::from_slice(&std::fs::read(fx.state.data_dir.as_ref().unwrap().join("sponsor/kits.json")).unwrap()).unwrap();
-    let id = ledger["kits"][0]["grant_reservation"]["id"].as_str().unwrap();
-    assert!(fx.service.snapshot().grants[0].budget.as_ref().unwrap().pending.contains_key(id));
-    assert_eq!(fx.wallet.money(), 0, "reference exists before first dispatch");
+    assert!(ledger["kits"][0]["grant_reservation"].is_null());
+    assert_eq!(ledger["kits"][0]["reserved_msat"], GIFT + FEE);
+    assert_eq!(fx.wallet.money(), 0, "reservation exists before first dispatch");
     pending.abort();
     assert!(pending.await.unwrap_err().is_cancelled());
     fx.restart();
-    assert_eq!(fx.used(), GIFT);
+    assert_eq!(fx.used(), 0);
+    assert_eq!(kit_state(&fx, &fx.token().await).await.1, GIFT + FEE);
     fx.wallet.set(FAILED);
     let token = fx.token().await;
     let (s, body) = fx.call("POST", &format!("/api/v1/sponsor/kits/{}/reconcile", cand["intro_id"].as_str().unwrap()), None, Some(&token)).await;
@@ -160,9 +187,9 @@ async fn cancelled_dispatch_retains_its_durable_grant_reference_for_restart() {
 
 #[tokio::test]
 async fn reconciliation_needs_read_authority_but_never_a_new_spend_grant() {
-    let (fx, token, cand) = kit(50_000).await;
+    let (fx, _token, cand) = kit(50_000).await;
     fx.wallet.set(UNKNOWN);
-    assert_eq!(approve(&fx, &token, &cand).await.0, StatusCode::OK);
+    assert_eq!(owner_approve(&fx, &cand).await.0, StatusCode::OK);
     fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
     fx.wallet.set(FAILED);
     let read_token = fx.token().await;
@@ -170,4 +197,15 @@ async fn reconciliation_needs_read_authority_but_never_a_new_spend_grant() {
     assert_eq!(s, StatusCode::OK, "{body}");
     assert_eq!(body["state"], "failed");
     assert_eq!(fx.wallet.money(), 1, "reconciliation never sends another payment");
+}
+
+#[tokio::test]
+async fn paired_approval_is_refused_before_parsing_the_funding_intent() {
+    let (fx, token, cand) = kit(50_000).await;
+    let (s, body) = fx.call("POST", "/api/v1/sponsor/approve",
+        Some(json!({"intro_id":cand["intro_id"], "code":cand["code"]})), Some(&token)).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("sponsor_owner_approval_required"), "{body}");
+    assert_eq!(fx.wallet.money(), 0);
+    assert_eq!(fx.used(), 0);
 }

@@ -78,6 +78,14 @@ async fn call(state: &Arc<AppState>, method: &str, path: &str, body: Option<Valu
     (status, serde_json::from_slice(&bytes).unwrap_or(json!({ "raw": String::from_utf8_lossy(&bytes) })))
 }
 
+fn approval(candidate: &Value) -> Value {
+    json!({
+        "intro_id": candidate["intro_id"], "code": candidate["code"],
+        "newcomer": candidate["newcomer"], "payment_hash": candidate["payment_hash"],
+        "gift_msat": candidate["gift_msat"], "fee_max_msat": candidate["fee_max_msat"],
+    })
+}
+
 /// Offer → request → candidate: what the two people see before approval.
 async fn up_to_candidate(p: &Pair) -> (Value, Value) {
     let (s, offer) = call(&p.sponsor, "POST", "/api/v1/sponsor/offer", None).await;
@@ -109,11 +117,11 @@ async fn the_gift_arrives_after_one_approval_with_the_matching_code() {
     // A wrong code pays nothing.
     let before = p.newcomer_ln.get_balance_msat().await.unwrap();
     let wrong = if cand["code"] == "000000" { "111111" } else { "000000" };
-    let (s, body) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(json!({ "intro_id": cand["intro_id"], "code": wrong }))).await;
+    let (s, body) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some({ let mut body = approval(&cand); body["code"] = json!(wrong); body })).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(p.newcomer_ln.get_balance_msat().await.unwrap(), before);
 
-    let (s, paid) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(json!({ "intro_id": cand["intro_id"], "code": cand["code"] }))).await;
+    let (s, paid) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(approval(&cand))).await;
     assert_eq!(s, StatusCode::OK, "{paid}");
     assert_eq!(paid["state"], "funded");
     assert_eq!(paid["paid_msat"], GIFT);
@@ -124,7 +132,7 @@ async fn the_gift_arrives_after_one_approval_with_the_matching_code() {
     assert_eq!((s, st["state"].clone(), st["amount_msat"].clone()), (StatusCode::OK, json!("received"), json!(GIFT)));
 
     // Single use: the same kit never pays twice.
-    let (s, again) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(json!({ "intro_id": cand["intro_id"], "code": cand["code"] }))).await;
+    let (s, again) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(approval(&cand))).await;
     assert_eq!(s, StatusCode::CONFLICT, "{again}");
     let (_, status) = call(&p.sponsor, "GET", "/api/v1/sponsor", None).await;
     assert_eq!(status["purse_used_msat"], GIFT);
@@ -136,7 +144,7 @@ async fn the_gift_arrives_after_one_approval_with_the_matching_code() {
 async fn the_gift_hash_is_funding_only_and_never_admits_a_message() {
     let p = pair(policy(1_000_000, 2)).await;
     let (ask, cand) = up_to_candidate(&p).await;
-    call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(json!({ "intro_id": cand["intro_id"], "code": cand["code"] }))).await;
+    call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(approval(&cand))).await;
     // The sponsor learned the preimage by paying. The newcomer's gate must
     // still refuse that payment as a message proof: it is a used receipt.
     let hash: [u8; 32] = hex::decode(ask["payment_hash"].as_str().unwrap()).unwrap().try_into().unwrap();
@@ -171,7 +179,7 @@ async fn one_kit_at_a_time_and_the_daily_count_and_purse_hold() {
     assert_eq!(s, StatusCode::OK);
     for _ in 0..2 {
         let (_, cand) = up_to_candidate(&p).await;
-        let (s, paid) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(json!({ "intro_id": cand["intro_id"], "code": cand["code"] }))).await;
+        let (s, paid) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(approval(&cand))).await;
         assert_eq!((s, paid["state"].clone()), (StatusCode::OK, json!("funded")), "{paid}");
     }
     let (s, body) = call(&p.sponsor, "POST", "/api/v1/sponsor/offer", None).await;
@@ -184,7 +192,7 @@ async fn the_purse_refuses_a_kit_it_cannot_cover() {
     // Room for one kit only, although three a day would be allowed... two max.
     let p = pair(policy(GIFT + FEE, 2)).await;
     let (_, cand) = up_to_candidate(&p).await;
-    call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(json!({ "intro_id": cand["intro_id"], "code": cand["code"] }))).await;
+    call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(approval(&cand))).await;
     let (s, body) = call(&p.sponsor, "POST", "/api/v1/sponsor/offer", None).await;
     assert_eq!(s, StatusCode::CONFLICT);
     assert!(body.to_string().contains("sponsor_purse_exhausted"), "{body}");
@@ -256,7 +264,7 @@ async fn regression_lowered_policy_applies_to_pending_candidate() {
         sponsor: SponsorPolicy::new(true, 1_000, 1_000, 2_000, 2).unwrap(),
         ..(*p.sponsor).clone()
     });
-    let (s, paid) = call(&restarted, "POST", "/api/v1/sponsor/approve", Some(json!({"intro_id": cand["intro_id"], "code": cand["code"]}))).await;
+    let (s, paid) = call(&restarted, "POST", "/api/v1/sponsor/approve", Some(approval(&cand))).await;
     let (_, st) = call(&restarted, "GET", "/api/v1/sponsor", None).await;
     assert!(s != StatusCode::OK && st["purse_used_msat"].as_u64().unwrap() <= 2_000,
         "old unapproved candidate spent beyond new purse: response={paid}, status={st}");
@@ -306,7 +314,7 @@ async fn regression_route_fee_is_bounded_before_dispatch() {
     let (_, cand) = up_to_candidate(&p).await;
     let before = p.newcomer_ln.get_balance_msat().await.unwrap();
     let state = Arc::new(AppState { lightning: Arc::new(FeeProvider(p.sponsor_ln.clone())), ..(*p.sponsor).clone() });
-    let (s, paid) = call(&state, "POST", "/api/v1/sponsor/approve", Some(json!({"intro_id":cand["intro_id"], "code":cand["code"]}))).await;
+    let (s, paid) = call(&state, "POST", "/api/v1/sponsor/approve", Some(approval(&cand))).await;
     let (_, st) = call(&state,"GET","/api/v1/sponsor",None).await;
     assert!(s != StatusCode::OK && st["purse_used_msat"].as_u64().unwrap() <= GIFT + FEE,
        "payment backend received no cap; oversized fee accepted: paid={paid}, status={st}");
@@ -325,7 +333,7 @@ async fn regression_signed_request_expiry_is_enforced_at_approval() {
     let (s, cand) = call(&p.sponsor,"POST","/api/v1/sponsor/candidate",Some(json!({"request":short.to_link()}))).await;
     assert_eq!(s,StatusCode::OK,"{cand}");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    let (s, paid) = call(&p.sponsor,"POST","/api/v1/sponsor/approve",Some(json!({"intro_id":cand["intro_id"],"code":cand["code"]}))).await;
+    let (s, paid) = call(&p.sponsor,"POST","/api/v1/sponsor/approve",Some(approval(&cand))).await;
     assert_ne!(s,StatusCode::OK,"expired signed request still pays: {paid}");
 }
 
@@ -337,6 +345,7 @@ struct ReportedFeeProvider {
     pause: std::sync::atomic::AtomicBool,
     waiting: std::sync::atomic::AtomicBool,
     resume: tokio::sync::Notify,
+    pause_lookup: bool,
 }
 #[async_trait::async_trait]
 impl LightningProvider for ReportedFeeProvider {
@@ -354,6 +363,10 @@ impl LightningProvider for ReportedFeeProvider {
         Ok(paid)
     }
     async fn get_payment_status(&self,h:&str)->Result<konsensus_core::traits::lightning::PaymentDetails,konsensus_core::traits::lightning::LightningError>{
+        if self.pause_lookup {
+            self.waiting.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.resume.notified().await;
+        }
         if self.pause.load(std::sync::atomic::Ordering::SeqCst)
             && self.waiting.load(std::sync::atomic::Ordering::SeqCst) {
             // A definitive prior attempt for this invoice is not the outcome
@@ -380,9 +393,9 @@ async fn missing_fee_keeps_maximum_reserved_across_restart_and_window_rollover()
     use std::sync::atomic::Ordering;
     let p = pair(policy(GIFT + FEE, 2)).await;
     let (_, candidate) = up_to_candidate(&p).await;
-    let wallet = Arc::new(ReportedFeeProvider { inner: p.sponsor_ln.clone(), fee: u64::MAX.into(), cap: u64::MAX.into(), pause: false.into(), waiting: false.into(), resume: tokio::sync::Notify::new() });
+    let wallet = Arc::new(ReportedFeeProvider { inner: p.sponsor_ln.clone(), fee: u64::MAX.into(), cap: u64::MAX.into(), pause: false.into(), waiting: false.into(), resume: tokio::sync::Notify::new(), pause_lookup: false });
     let state = Arc::new(AppState { lightning: wallet.clone(), ..(*p.sponsor).clone() });
-    let (s, paid) = call(&state, "POST", "/api/v1/sponsor/approve", Some(json!({"intro_id":candidate["intro_id"],"code":candidate["code"]}))).await;
+    let (s, paid) = call(&state, "POST", "/api/v1/sponsor/approve", Some(approval(&candidate))).await;
     assert_eq!(s, StatusCode::OK, "{paid}");
     assert_eq!(wallet.cap.load(Ordering::SeqCst), FEE, "exact approved fee cap reaches backend");
     assert_eq!(p.newcomer_ln.get_balance_msat().await.unwrap(), GIFT);
@@ -407,7 +420,7 @@ async fn concurrent_approvals_dispatch_exactly_one_capped_gift() {
     let p = pair(policy(GIFT + FEE, 2)).await;
     let (_, candidate) = up_to_candidate(&p).await;
     let requests = (0..16).map(|_| call(&p.sponsor,"POST","/api/v1/sponsor/approve",
-        Some(json!({"intro_id":candidate["intro_id"],"code":candidate["code"]}))));
+        Some(approval(&candidate))));
     let results = futures::future::join_all(requests).await;
     assert_eq!(results.iter().filter(|(s,_)| *s == StatusCode::OK).count(), 1);
     assert_eq!(p.newcomer_ln.get_balance_msat().await.unwrap(), GIFT);
@@ -421,11 +434,11 @@ async fn reconciliation_cannot_release_a_live_dispatch_from_an_older_failed_reco
     let (_, candidate) = up_to_candidate(&p).await;
     let wallet = Arc::new(ReportedFeeProvider {
         inner: p.sponsor_ln.clone(), fee: 0.into(), cap: u64::MAX.into(),
-        pause: true.into(), waiting: false.into(), resume: tokio::sync::Notify::new(),
+        pause: true.into(), waiting: false.into(), resume: tokio::sync::Notify::new(), pause_lookup: false,
     });
     let state = Arc::new(AppState { lightning: wallet.clone(), ..(*p.sponsor).clone() });
     let sending = state.clone();
-    let body = json!({"intro_id":candidate["intro_id"],"code":candidate["code"]});
+    let body = approval(&candidate);
     let task = tokio::spawn(async move { call(&sending,"POST","/api/v1/sponsor/approve",Some(body)).await });
     tokio::time::timeout(std::time::Duration::from_secs(5),async {
         while !wallet.waiting.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
@@ -447,7 +460,7 @@ async fn reconciliation_cannot_release_a_live_dispatch_from_an_older_failed_reco
 async fn legacy_funded_kits_without_a_settlement_time_are_reconciled_before_reuse() {
     let p = pair(policy(GIFT + FEE, 2)).await;
     let (_, candidate) = up_to_candidate(&p).await;
-    let (s, paid) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(json!({"intro_id":candidate["intro_id"],"code":candidate["code"]}))).await;
+    let (s, paid) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(approval(&candidate))).await;
     assert_eq!(s, StatusCode::OK, "{paid}");
     let path = p.sponsor.data_dir.as_ref().unwrap().join("sponsor/kits.json");
     let mut ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -478,7 +491,7 @@ async fn legacy_ambiguous_failure_cannot_release_the_purse_after_restart() {
     std::fs::write(path, serde_json::to_vec(&ledger).unwrap()).unwrap();
     let wallet = Arc::new(ReportedFeeProvider {
         inner: p.sponsor_ln.clone(), fee: 0.into(), cap: u64::MAX.into(),
-        pause: true.into(), waiting: true.into(), resume: tokio::sync::Notify::new(),
+        pause: true.into(), waiting: true.into(), resume: tokio::sync::Notify::new(), pause_lookup: false,
     });
     let restarted = Arc::new(AppState { lightning: wallet.clone(), ..(*p.sponsor).clone() });
     let reconcile = format!("/api/v1/sponsor/kits/{}/reconcile", candidate["intro_id"].as_str().unwrap());
@@ -504,7 +517,204 @@ async fn approval_refuses_an_invoice_with_an_existing_outgoing_attempt() {
     let request = FundingRequest::parse(ask["request"].as_str().unwrap()).unwrap();
     p.sponsor_ln.pay_invoice(&request.bolt11).await.unwrap();
     let (status, _) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve",
-        Some(json!({"intro_id":candidate["intro_id"],"code":candidate["code"]}))).await;
+        Some(approval(&candidate))).await;
     assert_ne!(status, StatusCode::OK, "a prior attempt must not be claimed as this gift");
     assert_eq!(call(&p.sponsor, "GET", "/api/v1/sponsor", None).await.1["purse_used_msat"], 0);
+}
+
+#[tokio::test]
+async fn regression_wrong_invoice_network_must_be_rejected() {
+    let p = pair(policy(1_000_000, 2)).await;
+    let (_, offer) = call(&p.sponsor, "POST", "/api/v1/sponsor/offer", None).await;
+    let offer_rec = konsensus_core::sponsor::SponsorOffer::decode(offer["link"].as_str().unwrap().rsplit_once('.').unwrap().1).unwrap();
+    let bolt11 = create_test_bolt11(GIFT);
+    let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
+    assert_eq!(invoice.currency(), lightning_invoice::Currency::BitcoinTestnet);
+    assert_eq!(offer_rec.network, "regtest");
+    let payee = invoice.payee_pub_key().copied().unwrap_or_else(|| invoice.recover_payee_pub_key());
+    let hash = hex::decode(invoice.payment_hash().to_string()).unwrap().try_into().unwrap();
+    let request = FundingRequest::sign(p.newcomer.identity.ed25519_signing_key(), &offer_rec, payee.serialize(), GIFT, hash, offer_rec.expires_at, bolt11).unwrap();
+    let (s, body) = call(&p.sponsor, "POST", "/api/v1/sponsor/candidate", Some(json!({"request": request.to_link()}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "foreign-network invoice was frozen: {body}");
+    let (_, status) = call(&p.sponsor, "GET", "/api/v1/sponsor", None).await;
+    assert_eq!(status["kits"][0]["state"], "offered");
+    assert!(status["kits"][0]["candidate"].is_null());
+}
+
+
+#[tokio::test]
+async fn regression_observed_expiry_is_terminal_and_persisted() {
+    let p = pair(policy(1_000_000, 2)).await;
+    let (_, cand) = up_to_candidate(&p).await;
+    let path = p.sponsor.data_dir.as_ref().unwrap().join("sponsor/kits.json");
+    let mut ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    ledger["kits"][0]["expires_at"] = json!(1);
+    std::fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let (s, status) = call(&p.sponsor, "GET", "/api/v1/sponsor", None).await;
+    assert_eq!(s, StatusCode::OK, "{status}");
+    assert_eq!(status["kits"][0]["state"], "expired");
+    let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(persisted["kits"][0]["state"], "expired");
+    assert!(persisted["last_observed_time"].as_u64().unwrap() > 1);
+    let restarted = Arc::new((*p.sponsor).clone());
+    assert_eq!(call(&restarted, "POST", "/api/v1/sponsor/offer", None).await.0, StatusCode::OK);
+    assert_eq!(call(&restarted, "POST", "/api/v1/sponsor/approve",
+        Some(approval(&cand))).await.0, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn regression_approval_refuses_multiple_active_kits() {
+    let p = pair(policy(1_000_000, 2)).await;
+    let (_, cand) = up_to_candidate(&p).await;
+    let path = p.sponsor.data_dir.as_ref().unwrap().join("sponsor/kits.json");
+    let mut ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut second = ledger["kits"][0].clone();
+    second["intro_id"] = json!("ee".repeat(16));
+    second["state"] = json!("offered");
+    second["candidate"] = Value::Null;
+    ledger["kits"].as_array_mut().unwrap().push(second);
+    std::fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let (s, body) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve",
+        Some(approval(&cand))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("sponsor_kit_open"), "{body}");
+    assert_eq!(p.newcomer_ln.get_balance_msat().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn owner_approval_binds_every_funding_intent_field() {
+    let p = pair(policy(1_000_000, 2)).await;
+    let (_, cand) = up_to_candidate(&p).await;
+    for (field, changed) in [
+        ("intro_id", json!("ff".repeat(16))),
+        ("newcomer", json!("ff".repeat(32))),
+        ("payment_hash", json!("ff".repeat(32))),
+        ("gift_msat", json!(GIFT + 1)),
+        ("fee_max_msat", json!(FEE + 1)),
+    ] {
+        let mut body = approval(&cand);
+        body[field] = changed;
+        let (s, error) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(body)).await;
+        assert!(s == StatusCode::BAD_REQUEST || s == StatusCode::NOT_FOUND, "{field}: {error}");
+        let (_, status) = call(&p.sponsor, "GET", "/api/v1/sponsor", None).await;
+        assert_eq!(status["purse_used_msat"], 0);
+        assert_eq!(status["kits"][0]["state"], "candidate");
+        assert_eq!(p.newcomer_ln.get_balance_msat().await.unwrap(), 0);
+    }
+    assert_eq!(call(&p.sponsor, "POST", "/api/v1/sponsor/approve", Some(approval(&cand))).await.0, StatusCode::OK);
+    let restarted = Arc::new((*p.sponsor).clone());
+    assert_eq!(call(&restarted, "POST", "/api/v1/sponsor/approve", Some(approval(&cand))).await.0, StatusCode::CONFLICT);
+    assert_eq!(p.newcomer_ln.get_balance_msat().await.unwrap(), GIFT);
+}
+
+#[tokio::test]
+async fn persisted_future_time_refuses_approval_after_restart_without_paying() {
+    let p = pair(policy(1_000_000, 2)).await;
+    let (_, cand) = up_to_candidate(&p).await;
+    let path = p.sponsor.data_dir.as_ref().unwrap().join("sponsor/kits.json");
+    let mut ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // Represents a previously observed time, followed by restart with a lower wall clock.
+    let floor = cand["expires_at"].as_u64().unwrap() + 1;
+    ledger["last_observed_time"] = json!(floor);
+    std::fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let restarted = Arc::new((*p.sponsor).clone());
+    let (s, body) = call(&restarted, "POST", "/api/v1/sponsor/approve", Some(approval(&cand))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{body}");
+    let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(persisted["last_observed_time"], floor);
+    assert_eq!(persisted["kits"][0]["state"], "expired", "even a refusal persists expiration");
+    assert_eq!(p.newcomer_ln.get_balance_msat().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn configured_network_requires_its_exact_invoice_currency() {
+    use bitcoin::hashes::{sha256, Hash};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    let networks = [("bitcoin", Currency::Bitcoin), ("testnet", Currency::BitcoinTestnet),
+        ("signet", Currency::Signet), ("regtest", Currency::Regtest)];
+    for (network, expected) in &networks {
+        for (_, currency) in &networks {
+            let p = pair(policy(1_000_000, 2)).await;
+            let state = Arc::new(AppState {
+                introduction: IntroductionSettings { network: Some((*network).into()), endpoint: Some("127.0.0.1:9001".into()) },
+                ..(*p.sponsor).clone()
+            });
+            let (s, offer) = call(&state, "POST", "/api/v1/sponsor/offer", None).await;
+            assert_eq!(s, StatusCode::OK, "{offer}");
+            let offer = konsensus_core::sponsor::SponsorOffer::decode(offer["link"].as_str().unwrap().rsplit_once('.').unwrap().1).unwrap();
+            let invoice = InvoiceBuilder::new(currency.clone()).description("network binding".into())
+                .payment_hash(sha256::Hash::hash(&[42; 32])).payment_secret(PaymentSecret([42; 32]))
+                .current_timestamp().min_final_cltv_expiry_delta(18).amount_milli_satoshis(GIFT)
+                .build_signed(|hash| secp256k1::Secp256k1::new().sign_ecdsa_recoverable(hash,
+                    &secp256k1::SecretKey::from_slice(&[1; 32]).unwrap())).unwrap();
+            let request = FundingRequest::sign(p.newcomer.identity.ed25519_signing_key(), &offer,
+                invoice.recover_payee_pub_key().serialize(), GIFT,
+                hex::decode(invoice.payment_hash().to_string()).unwrap().try_into().unwrap(),
+                offer.expires_at, invoice.to_string()).unwrap();
+            let (s, body) = call(&state, "POST", "/api/v1/sponsor/candidate", Some(json!({"request":request.to_link()}))).await;
+            let (_, status) = call(&state, "GET", "/api/v1/sponsor", None).await;
+            if currency == expected {
+                assert_eq!(s, StatusCode::OK, "{network} {currency:?}: {body}");
+                assert_eq!(status["kits"][0]["state"], "candidate");
+            } else {
+                assert_eq!(s, StatusCode::BAD_REQUEST, "{network} {currency:?}: {body}");
+                assert!(status["kits"][0]["candidate"].is_null());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn expired_candidate_resubmission_persists_terminal_expiry_even_on_refusal() {
+    let p = pair(policy(1_000_000, 2)).await;
+    let (_, offer) = call(&p.sponsor, "POST", "/api/v1/sponsor/offer", None).await;
+    let (_, ask) = call(&p.newcomer, "POST", "/api/v1/sponsor/request", Some(json!({"link":offer["link"]}))).await;
+    let original = FundingRequest::parse(ask["request"].as_str().unwrap()).unwrap();
+    let offer = konsensus_core::sponsor::SponsorOffer::decode(offer["link"].as_str().unwrap().rsplit_once('.').unwrap().1).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let short = FundingRequest::sign(p.newcomer.identity.ed25519_signing_key(), &offer,
+        original.newcomer_ln, GIFT, original.payment_hash, now + 2, original.bolt11).unwrap();
+    let body = json!({"request":short.to_link()});
+    let (s, candidate) = call(&p.sponsor, "POST", "/api/v1/sponsor/candidate", Some(body.clone())).await;
+    assert_eq!(s, StatusCode::OK, "{candidate}");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let (s, error) = call(&p.sponsor, "POST", "/api/v1/sponsor/candidate", Some(body)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{error}");
+    let path = p.sponsor.data_dir.as_ref().unwrap().join("sponsor/kits.json");
+    let ledger: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(ledger["kits"][0]["state"], "expired", "an early refusal must record observed expiry");
+    assert!(ledger["last_observed_time"].as_u64().unwrap() >= now + 2);
+}
+
+#[tokio::test]
+async fn time_floor_advanced_during_preflight_prevents_dispatch() {
+    use std::sync::atomic::Ordering;
+    let p = pair(policy(GIFT + FEE, 2)).await;
+    let (_, candidate) = up_to_candidate(&p).await;
+    let wallet = Arc::new(ReportedFeeProvider {
+        inner: p.sponsor_ln.clone(), fee: 0.into(), cap: u64::MAX.into(),
+        pause: false.into(), waiting: false.into(), resume: tokio::sync::Notify::new(), pause_lookup: true,
+    });
+    let state = Arc::new(AppState { lightning: wallet.clone(), ..(*p.sponsor).clone() });
+    let sending = state.clone();
+    let body = approval(&candidate);
+    let pending = tokio::spawn(async move { call(&sending, "POST", "/api/v1/sponsor/approve", Some(body)).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !wallet.waiting.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    let path = state.data_dir.as_ref().unwrap().join("sponsor/kits.json");
+    let mut ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(ledger["kits"][0]["state"], "paying");
+    // Model another observation while lookup is pending; the actual wall
+    // clock remains earlier than the deadline when lookup resumes.
+    ledger["last_observed_time"] = json!(candidate["expires_at"].as_u64().unwrap() + 1);
+    std::fs::write(path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    wallet.resume.notify_one();
+    let (s, body) = pending.await.unwrap();
+    assert_ne!(s, StatusCode::OK, "{body}");
+    assert_eq!(wallet.cap.load(Ordering::SeqCst), u64::MAX, "backend pay was never invoked");
+    assert_eq!(p.newcomer_ln.get_balance_msat().await.unwrap(), 0);
+    let (_, status) = call(&state, "GET", "/api/v1/sponsor", None).await;
+    assert_eq!(status["kits"][0]["state"], "failed");
+    assert_eq!(status["purse_used_msat"], 0);
 }
