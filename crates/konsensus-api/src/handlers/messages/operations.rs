@@ -495,7 +495,12 @@ pub(super) async fn compose(
         recover_budget(&state, &mut op).await?;
         // Pre-fix rows may have terminalized incomplete settlement as failed_paid.
         // Reopen those only; genuine terminal rejects stay failed_paid.
-        if op.state == "failed_paid" && incomplete_settled_recovery(&op) {
+        // Compaction strips recovery evidence (dispatched/envelope_ready) but is
+        // payload retention, not re-payment authorization — never reopen compacted.
+        if op.state == "failed_paid"
+            && !op.recovery_compacted
+            && incomplete_settled_recovery(&op)
+        {
             op.state = "payment_unknown".into();
             save(&state, &mut op).await?;
         }
@@ -798,6 +803,14 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
         return Ok(());
     }
     if !data.dispatched && !data.envelope_ready {
+        // Defense in depth: a prior settlement (or recorded payment_hash) means
+        // this is not a fresh attempt — never authorize another payment by
+        // resetting to prepared (e.g. after recovery compaction stripped flags).
+        if op.settled_msat > 0 || op.payment_hash.is_some() {
+            op.state = "payment_unknown".into();
+            save(state, op).await?;
+            return Ok(());
+        }
         queue_message_resolution(&mut data, 0, Some(0));
         data.reservation = None;
         data.execution_id = None;
@@ -991,12 +1004,9 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             if let Some(linked) = links.get(&id) {
                 attach_recovered_reservations(state, &mut op, linked).await?;
             }
-            // Mistagged incomplete settlement must not stay terminal failed_paid:
-            // that blocks later proof recovery while still forbidding repayment.
-            if op.state == "failed_paid" && incomplete_settled_recovery(&op) {
-                op.state = "payment_unknown".into();
-                save(state, &mut op).await?;
-            }
+            // No sweep-side failed_paid→payment_unknown reopen: list_recoverable
+            // never selects failed_paid unless accounting_pending. Compose owns
+            // mistagged reopen (with recovery_compacted guard).
             if matches!(op.state.as_str(), "paying" | "payment_unknown") {
                 reconcile(state, &mut op).await?;
             }

@@ -745,6 +745,57 @@ async fn mistagged_failed_paid_incomplete_settlement_reopens_to_payment_unknown(
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
 }
 
+/// Compaction retains payment_hash/settled_msat but clears dispatched flags.
+/// A client retry of a compacted mistagged failed_paid must 409 without a
+/// second keysend — compaction is retention, not re-payment authorization.
+#[tokio::test]
+async fn compacted_mistagged_failed_paid_retry_never_repays() {
+    let mut f = Fixture::new().await;
+    sqlx::raw_sql("CREATE TRIGGER crash BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'before paid commit'); END")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let _ = f.post().await;
+    sqlx::raw_sql("DROP TRIGGER crash")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let mut op = f.op().await;
+    let mut data: serde_json::Value = serde_json::from_slice(&op.recovery).unwrap();
+    data["settlement"]["preimage"] = serde_json::Value::Null;
+    data["envelope_ready"] = false.into();
+    op.recovery = serde_json::to_vec(&data).unwrap();
+    op.state = "failed_paid".into();
+    op.last_error = Some("settled payment has no valid proof".into());
+    assert!(f.db.update_outbox_operation(&op).await.unwrap());
+    assert!(op.settled_msat > 0 || op.payment_hash.is_some());
+
+    // Age past retention so the real compact_terminal_operations sweep runs.
+    sqlx::query("UPDATE outbox_operations SET updated_at = 0")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    let compacted = f.op().await;
+    assert!(compacted.recovery_compacted, "must use real compaction sweep");
+    assert_eq!(compacted.state, "failed_paid");
+    let pay_before = f.wallet.calls.load(Ordering::SeqCst);
+
+    f.restart().await;
+    f.wallet.mode.store(7, Ordering::SeqCst);
+    let (status, body) = f.post().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "failed_paid", "{body}");
+    assert_eq!(f.op().await.state, "failed_paid");
+    assert_eq!(
+        f.wallet.calls.load(Ordering::SeqCst),
+        pay_before,
+        "compacted mistagged failed_paid must never dispatch another keysend"
+    );
+}
+
 #[tokio::test]
 async fn recovery_offline_backoff_is_exponential_capped_and_survives_restart() {
     let mut f = Fixture::new().await;
