@@ -44,6 +44,11 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("mark_pending_sent".into()))
     }
 
+    /// Match a non-destructive rejection to an already dispatched outbox entry.
+    async fn is_pending_dispatched(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("is_pending_dispatched".into()))
+    }
+
     /// Atomically consume a dispatched outbox entry bound to our identity and peer.
     async fn acknowledge_pending(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("acknowledge_pending".into()))
@@ -306,15 +311,11 @@ pub trait Storage: Send + Sync {
 
     /// Remove all pending deliveries for a specific peer.
     ///
-    /// Called when an E2EE session is re-negotiated — pending messages encrypted
-    /// with the old session keys become undeliverable and must be cleared.
+    /// Explicit administrative removal only. Session resets must retain paid rows.
     async fn clear_pending_for_peer(&self, recipient: &NodeId) -> Result<u64, StorageError>;
 
-    /// Remove pending deliveries that have exceeded the maximum retry attempts.
-    ///
-    /// Returns the number of entries removed. This prevents unbounded table
-    /// growth when a peer is permanently unreachable or messages are encrypted
-    /// with stale keys that will never decrypt.
+    /// Mark deliveries past the retry threshold stalled, retaining paid envelopes.
+    /// Returns newly stalled rows; the periodic scan continues retrying them.
     async fn cleanup_stale_pending(&self, max_attempts: u32) -> Result<u64, StorageError>;
 
     // ── Files ──────────────────────────────────────────────────────────

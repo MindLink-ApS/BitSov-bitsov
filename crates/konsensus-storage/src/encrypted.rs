@@ -365,6 +365,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.mark_pending_sent(id, peer).await
     }
 
+    async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        self.inner.is_pending_dispatched(id, peer, sender).await
+    }
+
     async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
         self.inner.acknowledge_pending(id, peer, sender).await
     }

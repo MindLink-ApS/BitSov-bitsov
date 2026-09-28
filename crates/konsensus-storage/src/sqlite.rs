@@ -638,6 +638,10 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = ? AND p.recipient_id = ? AND p.dispatched = 1 AND m.sender = ?)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).fetch_one(&self.pool).await?)
+    }
+
     async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
         Ok(sqlx::query("DELETE FROM pending_deliveries WHERE message_id = ? AND recipient_id = ? AND dispatched = 1 AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = ?)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
             .execute(&self.pool).await?.rows_affected() == 1)

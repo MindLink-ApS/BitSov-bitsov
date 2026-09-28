@@ -559,7 +559,7 @@ async fn handle_prekey_offer(
     bundle: serde_json::Value,
     our_node_id: NodeId,
     session_manager: &SessionManager,
-    storage: &Arc<dyn konsensus_storage::Storage>,
+    _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
@@ -589,9 +589,7 @@ async fn handle_prekey_offer(
     if session_manager.has_session(peer_id).await {
         warn!(peer = %peer_id, "peer sent PrekeyOffer but session exists — replacing stale session");
         session_manager.remove_session(peer_id).await;
-        if let Err(e) = storage.clear_pending_for_peer(peer_id).await {
-            warn!(peer = %peer_id, error = %e, "failed to clear stale pending deliveries");
-        }
+        // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
     }
 
     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
@@ -631,7 +629,7 @@ async fn handle_session_init(
     peer_id: &NodeId,
     init_data: serde_json::Value,
     session_manager: &SessionManager,
-    storage: &Arc<dyn konsensus_storage::Storage>,
+    _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
@@ -652,9 +650,7 @@ async fn handle_session_init(
     if session_manager.has_session(peer_id).await {
         warn!(peer = %peer_id, "peer sent SessionInit but session exists — replacing stale session");
         session_manager.remove_session(peer_id).await;
-        if let Err(e) = storage.clear_pending_for_peer(peer_id).await {
-            warn!(peer = %peer_id, error = %e, "failed to clear stale pending deliveries");
-        }
+        // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
     }
 
     let init: konsensus_crypto::SerializableSessionInit =
@@ -722,7 +718,7 @@ async fn handle_ratchet_init(
     peer_id: &NodeId,
     payload: &[u8],
     session_manager: &SessionManager,
-    storage: &Arc<dyn konsensus_storage::Storage>,
+    _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
 ) {
     match konsensus_crypto::ratchet_message_from_bytes(payload) {
@@ -737,9 +733,7 @@ async fn handle_ratchet_init(
                         "failed to decrypt ratchet init — removing broken session and re-negotiating"
                     );
                     session_manager.remove_session(peer_id).await;
-                    if let Err(clear_err) = storage.clear_pending_for_peer(peer_id).await {
-                        warn!(peer = %peer_id, error = %clear_err, "failed to clear pending after ratchet init failure");
-                    }
+                    // Preserve paid envelopes across ratchet recovery; acceptance ACKs do not require decryption.
                     // Send fresh PrekeyOffer to trigger re-negotiation
                     if let Err(send_err) = send_prekey_offer(session_manager, transport, peer_id).await {
                         warn!(peer = %peer_id, error = %send_err, "failed to send PrekeyOffer after ratchet init failure");
@@ -824,10 +818,7 @@ async fn handle_delivery_confirmation(
         }
         handle_message_acked(peer, id, timestamps, storage, routing, ws, privileged && !legacy).await;
     } else {
-        let matches_outbox = matches!(storage.get_pending_for_peer(peer).await,
-            Ok(rows) if rows.iter().any(|(pending, _)| pending == id))
-            && matches!(storage.get_message(id).await, Ok(Some(env)) if env.sender == *own_id);
-        if !matches_outbox { return; }
+        if !matches!(storage.is_pending_dispatched(id, peer, own_id).await, Ok(true)) { return; }
         // A transient rejection keeps the paid envelope available for retry.
         handle_message_rejected(peer, id, rejection.unwrap_or_default(), routing, ws, privileged).await;
     }

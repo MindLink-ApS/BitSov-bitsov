@@ -393,6 +393,7 @@ async fn start_recipient(
                     0.0,
                     Some(identity.node_id()),
                     ReachabilityMode::PriceOpen,
+                    true,
                 )
                 .await;
                 if verdict.is_err() {

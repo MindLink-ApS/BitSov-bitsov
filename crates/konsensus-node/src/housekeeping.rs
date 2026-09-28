@@ -136,9 +136,8 @@ async fn write_whitelist_sidecar(
     }
 }
 
-/// Spawns the pending deliveries cleanup task — removes entries that have exceeded
-/// max retry attempts or are too old, preventing unbounded table growth when
-/// peers stay offline for extended periods.
+/// Marks paid deliveries stalled after repeated failures, retaining their rows
+/// and envelopes for periodic retry until the recipient acknowledges them.
 pub(crate) async fn run_pending_cleanup(
     storage: Arc<dyn konsensus_storage::Storage>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -149,8 +148,8 @@ pub(crate) async fn run_pending_cleanup(
         tokio::select! {
             _ = tokio::time::sleep(cleanup_interval) => {
                 match storage.cleanup_stale_pending(MAX_DELIVERY_ATTEMPTS).await {
-                    Ok(removed) if removed > 0 => {
-                        info!(removed, "cleaned up stale pending deliveries");
+                    Ok(stalled) if stalled > 0 => {
+                        info!(stalled, "marked paid deliveries stalled; retaining for retry");
                     }
                     Ok(_) => {} // nothing to clean
                     Err(e) => {

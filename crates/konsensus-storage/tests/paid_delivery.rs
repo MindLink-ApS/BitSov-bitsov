@@ -117,3 +117,35 @@ async fn ack_requires_dispatched_outbox_peer_and_own_identity_and_is_consumed_on
     assert!(db.acknowledge_pending(&env.id, &peer, &env.sender).await.unwrap());
     assert!(!db.acknowledge_pending(&env.id, &peer, &env.sender).await.unwrap());
 }
+
+// Subprocess exit intentionally skips transaction/connection destructors.
+#[tokio::test]
+async fn crash_before_commit_worker() {
+    let Ok(path) = std::env::var("BITSOV_TEST_CRASH_ACCEPT_DB") else { return; };
+    let db = SqliteStorage::open(&path).await.unwrap();
+    let env = envelope();
+    let mut tx = db.pool().begin().await.unwrap();
+    sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES (?, ?, ?)")
+        .bind(hex::encode(env.payment_proof.payment_hash)).bind(env.id.to_hex()).bind(env.sender.to_hex())
+        .execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES (?, ?)")
+        .bind(hex::encode(env.nonce.as_bytes())).bind(env.sender.to_hex()).execute(&mut *tx).await.unwrap();
+    std::process::exit(91);
+}
+
+#[tokio::test]
+async fn recipient_process_exit_before_commit_does_not_burn_keys() {
+    let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("recipient.db");
+    let db = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    db.pool().close().await;
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "crash_before_commit_worker", "--nocapture"])
+        .env("BITSOV_TEST_CRASH_ACCEPT_DB", &path).output().unwrap();
+    assert_eq!(result.status.code(), Some(91), "{}", String::from_utf8_lossy(&result.stderr));
+    let db = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    let env = envelope();
+    assert!(!db.has_nonce(&env.nonce).await.unwrap());
+    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payment_receipts").fetch_one(db.pool()).await.unwrap(), 1);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages").fetch_one(db.pool()).await.unwrap(), 1);
+}

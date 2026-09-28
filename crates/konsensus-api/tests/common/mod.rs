@@ -313,6 +313,16 @@ impl Storage for MemStorage {
         Ok(Vec::new())
     }
 
+    async fn mark_pending_sent(&self, _: &MessageId, _: &NodeId) -> Result<(), StorageError> { Ok(()) }
+    async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
+        let mut messages = self.messages.lock().unwrap();
+        if let Some(stored) = messages.get_mut(&envelope.id.to_hex()) {
+            stored.timestamp = envelope.timestamp;
+            stored.signature = envelope.signature;
+        }
+        Ok(())
+    }
+
     async fn queue_pending_delivery(&self, _: &MessageId, _: &NodeId) -> Result<(), StorageError> {
         Ok(())
     }

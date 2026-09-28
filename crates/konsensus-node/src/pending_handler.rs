@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use konsensus_api::audit::AuditLog;
 use konsensus_core::traits::transport::MessageTransport;
@@ -46,13 +46,13 @@ pub(crate) async fn run(deps: PendingHandlerDeps) {
     loop {
         tokio::select! {
             Some(peer_id) = pending_rx.recv() => {
-                flush_peer(&peer_id, storage.as_ref(), transport.as_ref(), &audit, &send_timestamps, &identity).await;
+                flush_peer(&peer_id, storage.as_ref(), transport.as_ref(), &audit, &send_timestamps, &identity, false).await;
             }
             _ = periodic_scan.tick() => {
                 // Check all connected peers for pending deliveries
                 let connected = transport.connected_peers().await;
                 for peer_id in &connected {
-                    flush_peer(peer_id, storage.as_ref(), transport.as_ref(), &audit, &send_timestamps, &identity).await;
+                    flush_peer(peer_id, storage.as_ref(), transport.as_ref(), &audit, &send_timestamps, &identity, true).await;
                 }
             }
             _ = shutdown_rx.changed() => {
@@ -64,6 +64,7 @@ pub(crate) async fn run(deps: PendingHandlerDeps) {
 }
 
 /// Flush all pending deliveries for a single peer.
+#[allow(clippy::too_many_arguments)]
 async fn flush_peer(
     peer_id: &NodeId,
     storage: &dyn konsensus_storage::Storage,
@@ -71,6 +72,7 @@ async fn flush_peer(
     audit: &AuditLog,
     send_timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>,
     identity: &konsensus_core::identity::NodeIdentity,
+    include_stalled: bool,
 ) {
     let pending = match storage.get_pending_for_peer(peer_id).await {
         Ok(p) => p,
@@ -90,7 +92,9 @@ async fn flush_peer(
         "flushing pending deliveries"
     );
 
-    for (message_id, _recipient_id) in &pending {
+    for (message_id, attempts) in &pending {
+        // Stalled deliveries only retry on the 60-second scan, avoiding reconnect storms.
+        if *attempts >= 10 && !include_stalled { continue; }
         // Load the full envelope from storage
         let mut envelope = match storage.get_message(message_id).await {
             Ok(Some(env)) => env,

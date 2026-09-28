@@ -1871,3 +1871,44 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
         "connecting is not a refused frame"
     );
 }
+
+#[tokio::test]
+async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weights() {
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    let own = make_peer_id(61); let peer = make_peer_id(62); let impostor = make_peer_id(63);
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    let routing = konsensus_routing::RoutingTable::new(Default::default());
+    let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+    let (ws, mut updates) = broadcast::channel(16);
+    let dir = tempfile::tempdir().unwrap();
+    let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+    let env = UkmEnvelopeBuilder::new(100, own, Recipient::Node(peer), vec![1],
+        PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000)).build();
+    db.store_message(&env).await.unwrap();
+    db.queue_pending_delivery(&env.id, &peer).await.unwrap();
+    for rejection in [None, Some("storage error"), Some("replay detected: nonce already used")] {
+        handle_delivery_confirmation(&peer, &env.id, rejection, false, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    }
+    assert!(updates.try_recv().is_err(), "unsent ids are not delivery receipts");
+    db.mark_pending_sent(&env.id, &peer).await.unwrap();
+    handle_delivery_confirmation(&impostor, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    handle_delivery_confirmation(&peer, &konsensus_core::MessageId::from_bytes([9; 32]), None, false, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    assert!(updates.try_recv().is_err());
+    handle_delivery_confirmation(&peer, &env.id, Some("storage error"), false, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    assert_eq!(updates.try_recv().unwrap().status, "rejected");
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 1);
+    handle_delivery_confirmation(&peer, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    assert_eq!(updates.try_recv().unwrap().status, "delivered");
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
+    handle_delivery_confirmation(&peer, &env.id, None, true, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    assert!(updates.try_recv().is_err(), "duplicate ACK cannot update weights or emit twice");
+    assert!(routing.get_peer_weight(&peer).await.is_none());
+    // Explicit compatibility mapping consumes only an own, dispatched row.
+    db.prepare_delivery(&env.id, &peer).await.unwrap();
+    handle_delivery_confirmation(&peer, &env.id, Some("replay detected: nonce already used"), true, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    assert_eq!(updates.try_recv().unwrap().status, "delivered");
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
+    assert!(routing.get_peer_weight(&peer).await.is_none());
+    assert!(std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap().contains("acked_legacy"));
+}

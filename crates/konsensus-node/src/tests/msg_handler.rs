@@ -1109,3 +1109,102 @@ async fn membrane_observes_unpaid_insufficient_stale_and_first_contact_decisions
     }
     assert_eq!(membrane.read(None, 500).1.first_contacts, 1);
 }
+
+/// Exercise the production Noise receive loop, full settlement gate and SQLite
+/// commit. A failed commit and a lost ACK must never consume a second payment.
+#[tokio::test]
+async fn paid_acceptance_storage_retry_and_lost_ack_are_idempotent() {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| Arc::new(NoiseTransport::new(id, TransportConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        admission_mode: ReachabilityMode::PriceOpen, ..Default::default()
+    }));
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let hash = wallet.inject_inbound_keysend(100, None).await;
+    let payment = wallet.get_payment_status(&hash).await.unwrap();
+    let proof = PaymentProof::new(hex::decode(&hash).unwrap().try_into().unwrap(),
+        hex::decode(payment.preimage.unwrap()).unwrap().try_into().unwrap(), 100);
+    let sessions_a = SessionManager::new(alice.clone());
+    let sessions_b = Arc::new(SessionManager::new(bob.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &sessions_a.encrypt(bob.node_id(), b"paid exactly once").await.unwrap());
+    let mut env = UkmEnvelopeBuilder::new(konsensus_core::kind::KIND_CHAT, *alice.node_id(), Recipient::Node(*bob.node_id()), ciphertext, proof).build();
+    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, mut ws_rx) = broadcast::channel(8);
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(), transport_ack: target.clone(), storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true, ..Default::default()
+        })),
+        pricing: Arc::new(BlockingPricing { entered: Arc::new(tokio::sync::Notify::new()), release: Arc::new(tokio::sync::Semaphore::new(1)) }),
+        lightning: wallet, chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b, nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None, routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(), plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx, audit_log: audit.clone(), admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None, shutdown_rx,
+    }));
+    source.connect(bob.node_id(), &target.listen_addr().unwrap().to_string()).await.unwrap();
+    assert!(matches!(source.recv_control().await.unwrap(), ControlEvent::PeerConnected { privileged: false, .. }));
+    sqlx::query("CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(db.pool()).await.unwrap();
+    source.send(bob.node_id(), &env).await.unwrap();
+    let rejected = tokio::time::timeout(Duration::from_secs(5), source.recv_control()).await.unwrap().unwrap();
+    assert!(matches!(rejected, ControlEvent::MessageRejected { reason, .. } if reason == "storage error"));
+    assert!(!db.has_nonce(&env.nonce).await.unwrap());
+    assert_eq!(audit.membrane().read(None, 100).1.admitted, 0);
+    assert!(!target.connected_privileged_peers().await.contains(alice.node_id()));
+    sqlx::query("DROP TRIGGER fail_message").execute(db.pool()).await.unwrap();
+    source.send(bob.node_id(), &env).await.unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(5), source.recv_control()).await.unwrap().unwrap();
+    assert!(matches!(ack, ControlEvent::MessageAcked { duplicate: false, .. }));
+    let message = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(message.plaintext.as_deref(), Some("paid exactly once"));
+    assert_eq!(audit.membrane().read(None, 100).1.admitted, 1);
+    assert!(target.connected_privileged_peers().await.contains(alice.node_id()));
+    // Treat the first ACK as dropped. Reconnect so a second promotion would be observable.
+    source.disconnect(bob.node_id()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while target.is_connected(alice.node_id()).await { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    source.connect(bob.node_id(), &target.listen_addr().unwrap().to_string()).await.unwrap();
+    while !matches!(source.recv_control().await.unwrap(), ControlEvent::PeerConnected { .. }) {}
+    source.send(bob.node_id(), &env).await.unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(5), source.recv_control()).await.unwrap().unwrap();
+    assert!(matches!(ack, ControlEvent::MessageAcked { duplicate: true, .. }));
+    assert!(!target.connected_privileged_peers().await.contains(alice.node_id()));
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(audit.membrane().read(None, 100).1.admitted, 1);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages").fetch_one(db.pool()).await.unwrap(), 1);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payment_receipts").fetch_one(db.pool()).await.unwrap(), 1);
+    // Even a previously accepted id must still pass full signature validation.
+    let mut tampered = env.clone(); tampered.signature = Signature::from_bytes([0; 64]);
+    source.send(bob.node_id(), &tampered).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while audit.membrane().read(None, 100).0.first().unwrap().code != konsensus_api::membrane::Code::BadSignature { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    assert!(!target.connected_privileged_peers().await.contains(alice.node_id()));
+    assert!(ws_rx.try_recv().is_err());
+    // A different valid id cannot reuse that payment or be promoted.
+    let mut reused = UkmEnvelopeBuilder::new(env.kind, env.sender, env.recipient.clone(), vec![8], env.payment_proof.clone()).build();
+    reused.signature = Signature::from_ed25519(&alice.sign(&reused.signable_bytes()));
+    source.send(bob.node_id(), &reused).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while audit.membrane().read(None, 100).0.first().unwrap().code != konsensus_api::membrane::Code::ProofReused { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    assert!(!target.connected_privileged_peers().await.contains(alice.node_id()));
+    shutdown.send(true).unwrap(); worker.await.unwrap(); source.shutdown(); target.shutdown();
+}

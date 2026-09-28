@@ -2356,20 +2356,13 @@ async fn compose_room_member(
         return RoomMemberOutcome::stopped(member, "settled", amount_msat, format!("Cannot persist delivery: {e}"));
     }
     // Deliver or queue — try sending directly to avoid TOCTOU race.
-    let delivered = match state.transport.send(&member, &envelope).await {
-        Ok(()) => {
-            // Record send timestamp for STDP latency measurement.
-            let mut ts = state.send_timestamps.lock().await;
-            if ts.len() < MAX_SEND_TIMESTAMPS {
-                ts.insert(envelope.id, std::time::Instant::now());
-            }
-            drop(ts);
-            true
+    {
+        let mut ts = state.send_timestamps.lock().await;
+        if ts.len() < MAX_SEND_TIMESTAMPS {
+            ts.insert(envelope.id, std::time::Instant::now());
         }
-        Err(_) => {
-            false
-        }
-    };
+    }
+    let delivered = state.transport.send(&member, &envelope).await.is_ok();
 
     RoomMemberOutcome {
         receipt: MemberPaymentOutcome { recipient: member.to_hex(), status: "settled", amount_msat,
@@ -2785,19 +2778,13 @@ pub(super) async fn compose_message(
         // Deliver via transport; keep queued until ACK.
         // Try sending directly — avoids TOCTOU race where peer disconnects
         // between an is_connected check and the actual send.
-        let delivered = match state.transport.send(&peer_id, &envelope).await {
-            Ok(()) => {
-                // Record send timestamp for STDP latency measurement.
-                let mut ts = state.send_timestamps.lock().await;
-                if ts.len() < MAX_SEND_TIMESTAMPS {
-                    ts.insert(envelope.id, std::time::Instant::now());
-                }
-                true
+        {
+            let mut ts = state.send_timestamps.lock().await;
+            if ts.len() < MAX_SEND_TIMESTAMPS {
+                ts.insert(envelope.id, std::time::Instant::now());
             }
-            Err(_) => {
-                false
-            }
-        };
+        }
+        let delivered = state.transport.send(&peer_id, &envelope).await.is_ok();
 
         // Broadcast to WebSocket clients (with plaintext — we composed this message)
         if let Err(e) = state.ws_broadcast.send(Arc::new(crate::state::WsMessage {
