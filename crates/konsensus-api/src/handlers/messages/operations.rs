@@ -49,10 +49,6 @@ struct Recovery {
     #[serde(default)]
     admission_reservation: Option<Reservation>,
     #[serde(default)]
-    resend_after_ms: i64,
-    #[serde(default)]
-    resend_delay_ms: u64,
-    #[serde(default)]
     budget_resolutions: Vec<BudgetResolution>,
 }
 
@@ -969,7 +965,7 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
         .map(|op| op.operation_id)
         .collect();
     ids.extend(links.keys().cloned());
-    for id in ids {
+    for id in ids.clone() {
         let Ok(_guard) = operation_lock(state, &id)?.try_lock_owned() else {
             continue;
         };
@@ -990,7 +986,7 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             }
             recover_budget(state, &mut op).await?;
             if op.state == "paid" {
-                recover_paid(state, &mut op).await?;
+                recover_paid(state, &op).await?;
             }
             Ok(())
         }
@@ -999,6 +995,7 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             tracing::warn!(operation_id = %id, %error, "operation recovery deferred");
         }
     }
+    prune_paces(state, &ids);
     compact_terminal_operations(state, &links).await
 }
 
@@ -1137,26 +1134,99 @@ async fn recover_budget(state: &AppState, op: &mut OutboxOperation) -> Result<()
     drain_resolutions(state, op).await
 }
 
-async fn recover_paid(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
-    let mut data = recovery(op)?;
-    let now = chrono::Utc::now().timestamp_millis();
-    if now < data.resend_after_ms {
-        return Ok(());
-    }
+/// First retry delay after a failed resend; doubles per consecutive failure.
+const RESEND_BASE: Duration = Duration::from_secs(15);
+/// Upper bound on the resend delay while a peer stays unreachable.
+const RESEND_CAP: Duration = Duration::from_secs(600);
+
+/// What the sweep last saw of the peer's connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Link {
+    Offline,
+    /// Connection generation, when the transport tracks one.
+    Online(Option<std::time::Instant>),
+}
+
+/// Volatile resend pacing for one paid operation. It never touches the row:
+/// payment state, the paid envelope and its pending delivery are unchanged,
+/// and a restart simply retries once before backing off again.
+struct Pace {
+    failures: u32,
+    due: tokio::time::Instant,
+    link: Link,
+}
+
+// Scoped to the storage instance rather than the node: pacing belongs to the
+// rows one server sweeps, and a reopened database starts afresh like a restart.
+fn pace_prefix(state: &AppState) -> String {
+    format!("{:p}:", Arc::as_ptr(&state.storage))
+}
+fn pace_key(state: &AppState, id: &str) -> String {
+    format!("{}{id}", pace_prefix(state))
+}
+fn paces() -> std::sync::MutexGuard<'static, HashMap<String, Pace>> {
+    static PACES: OnceLock<Mutex<HashMap<String, Pace>>> = OnceLock::new();
+    PACES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+/// Drop pacing for operations that are no longer recoverable.
+fn prune_paces(state: &AppState, live: &std::collections::BTreeSet<String>) {
+    let prefix = pace_prefix(state);
+    paces().retain(|key, _| {
+        key.strip_prefix(&prefix)
+            .is_none_or(|id| live.contains(id))
+    });
+}
+
+/// Exponential delay capped at [`RESEND_CAP`], with deterministic
+/// per-operation jitter in `[base/2, base]` so one peer's backlog does not
+/// retry in lockstep.
+fn resend_delay(operation_id: &str, failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    let base = RESEND_BASE.saturating_mul(1 << doublings).min(RESEND_CAP);
+    let hash = blake3::hash(format!("{operation_id}:{failures}").as_bytes());
+    let jitter = u32::from(u16::from_le_bytes([hash.as_bytes()[0], hash.as_bytes()[1]]));
+    base / 2 + base / 2 * jitter / u32::from(u16::MAX)
+}
+
+async fn recover_paid(state: &AppState, op: &OutboxOperation) -> Result<(), ApiError> {
     let peer = NodeId::from_hex(&op.recipient).map_err(storage)?;
-    if !state.transport.is_connected(&peer).await {
-        data.resend_delay_ms = data.resend_delay_ms.saturating_mul(2).clamp(15_000, 300_000);
-        data.resend_after_ms = now.saturating_add(data.resend_delay_ms as i64);
-        encode(op, &data)?;
-        save(state, op).await?;
-        return Ok(());
+    let link = if state.transport.is_connected(&peer).await {
+        Link::Online(state.transport.connected_since(&peer).await)
+    } else {
+        Link::Offline
+    };
+    let key = pace_key(state, &op.operation_id);
+    let now = tokio::time::Instant::now();
+    {
+        let mut paces = paces();
+        if let Some(pace) = paces.get_mut(&key) {
+            let reconnected = link != Link::Offline && link != pace.link;
+            pace.link = link;
+            if reconnected {
+                // A fresh connection deserves a prompt delivery attempt.
+                paces.remove(&key);
+            } else if link == Link::Offline || now < pace.due {
+                return Ok(());
+            }
+        } else if link == Link::Offline {
+            // Nothing is sent while offline; remember it so the next
+            // connection counts as a reconnect.
+            paces.insert(key, Pace { failures: 0, due: now, link });
+            return Ok(());
+        }
     }
-    if data.resend_delay_ms != 0 || data.resend_after_ms != 0 {
-        data.resend_delay_ms = 0;
-        data.resend_after_ms = 0;
-        encode(op, &data)?;
-        save(state, op).await?;
+    let result = resend(state, op).await;
+    let mut paces = paces();
+    if matches!(result, Ok(true)) {
+        paces.remove(&key);
+    } else {
+        let pace = paces.entry(key).or_insert(Pace { failures: 0, due: now, link });
+        pace.failures = pace.failures.saturating_add(1);
+        pace.due = now + resend_delay(&op.operation_id, pace.failures);
+        pace.link = link;
     }
-    resend(state, op).await?;
-    Ok(())
+    result.map(|_| ())
 }
