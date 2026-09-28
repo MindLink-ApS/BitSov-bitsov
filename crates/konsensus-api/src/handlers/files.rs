@@ -154,6 +154,8 @@ fn default_file_limit() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct SendFileRequest {
     #[serde(default)]
+    pub max_routing_fee_msat: Option<u64>,
+    #[serde(default)]
     pub max_total_msat: Option<u64>,
     /// Recipient node ID (hex).
     pub recipient: String,
@@ -162,6 +164,7 @@ pub struct SendFileRequest {
 /// Response after sending a file.
 #[derive(Serialize)]
 pub struct SendFileResponse {
+    pub max_routing_fee_msat: u64,
     /// The message ID of the UKM envelope.
     pub message_id: String,
     /// Whether the file was delivered to a connected peer.
@@ -423,7 +426,7 @@ async fn send_file_inner(
         .await
         .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
 
-    super::messages::caps::check(super::messages::caps::payable(price_msat), req.max_total_msat)?;
+    let all_in = super::messages::caps::check_payment(&state, super::messages::caps::payable(price_msat), req.max_routing_fee_msat, req.max_total_msat)?;
 
     // Do not retain bytes across pricing awaits: deletion or expiry could
     // otherwise release their quota while this future still owns the blob.
@@ -446,9 +449,9 @@ async fn send_file_inner(
         &state,
         vec![Charge {
             recipient: peer_key.clone(),
-            amount_msat: super::messages::caps::payable(price_msat),
+            amount_msat: all_in,
         }],
-    )?;
+    ).map_err(|e| e.with_routing_fee(all_in - super::messages::caps::payable(price_msat)))?.with_fee_limit(req.max_routing_fee_msat);
 
     // Reserve this staged blob through every await. Cap refusals leave it
     // available; an attempted send consumes it even on error/cancellation.
@@ -482,7 +485,7 @@ async fn send_file_inner(
     } else {
         debit.resolve_proof(&peer_key, &paid);
     }
-    let (payment_hash, preimage, amount_msat) = paid?;
+    let (payment_hash, preimage, amount_msat) = paid.map_err(|e| e.with_routing_fee(debit.fee_limit(&state, super::messages::caps::payable(price_msat)).saturating_add(readmission.fee_ceiling_msat())))?;
     let proof =
         konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
     let amount_msat = amount_msat.saturating_add(admission.settled_msat);
@@ -551,6 +554,7 @@ async fn send_file_inner(
     );
 
     Ok(Json(SendFileResponse {
+        max_routing_fee_msat: (all_in - super::messages::caps::payable(price_msat)).saturating_add(readmission.fee_ceiling_msat()),
         message_id: envelope.id.to_hex(),
         delivered,
         amount_msat,

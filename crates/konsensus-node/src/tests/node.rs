@@ -18,6 +18,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
     )
     .unwrap();
     NodeConfig {
+        routing_fees: Default::default(),
         tier: NodeTier::Light,
         identity: IdentityConfig {
             mnemonic_file: mnemonic_path,
@@ -50,6 +51,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
 /// Helper: create a config struct for snapshot tests (no temp dir needed).
 fn snapshot_config(storage: StorageConfig) -> NodeConfig {
     NodeConfig {
+        routing_fees: Default::default(),
         tier: NodeTier::Light,
         identity: IdentityConfig {
             mnemonic_file: PathBuf::from("/tmp/m.txt"),

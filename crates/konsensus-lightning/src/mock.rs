@@ -63,6 +63,7 @@ type SentBinding = (String, Vec<u8>);
 /// Invoices start as `Pending` until explicitly paid. Payment proofs are
 /// cryptographically valid (the payment gate's preimage verification passes).
 pub struct MockLightningProvider {
+    routing_fee_msat: u64,
     /// Current simulated balance in millisatoshis.
     balance_msat: Arc<Mutex<u64>>,
     /// Stored invoices/payments by payment hash.
@@ -85,6 +86,18 @@ pub struct MockLightningProvider {
 }
 
 impl MockLightningProvider {
+    /// Model a route with a fixed fee, enforced against the approved ceiling before debit.
+    pub fn with_routing_fee_msat(mut self, fee: u64) -> Self {
+        self.routing_fee_msat = fee;
+        self
+    }
+    fn capped_debit(&self, amount: u64, cap: u64) -> Result<u64, LightningError> {
+        if self.routing_fee_msat > cap {
+            return Err(LightningError::PaymentNotDispatched(format!("routing fee exceeds max_routing_fee_msat={cap}")));
+        }
+        amount.checked_add(self.routing_fee_msat).ok_or_else(|| LightningError::PaymentNotDispatched("payment debit overflow".into()))
+    }
+
     /// Create a new mock provider with default config (1 BTC balance).
     pub fn new() -> Self {
         Self::with_config(MockLightningConfig::default())
@@ -94,6 +107,7 @@ impl MockLightningProvider {
     pub fn with_config(config: MockLightningConfig) -> Self {
         let (inbound_tx, _) = broadcast::channel(256);
         Self {
+            routing_fee_msat: 0,
             balance_msat: Arc::new(Mutex::new(config.initial_balance_msat)),
             payments: Arc::new(Mutex::new(HashMap::new())),
             inbound_tx,
@@ -158,7 +172,7 @@ impl MockLightningProvider {
             direction: PaymentDirection::Incoming,
             timestamp: now,
             memo: None,
-            fee_msat: None,
+            fee_msat: Some(0),
         };
         // Poll-consistency: the gate's verify_settlement poll
         // (`get_payment_status`) must find this exact settled record.
@@ -262,7 +276,7 @@ impl LightningProvider for MockLightningProvider {
             direction: PaymentDirection::Incoming,
             timestamp: now,
             memo: Some(description.to_string()),
-            fee_msat: None,
+            fee_msat: Some(0),
         };
 
         self.payments
@@ -288,14 +302,12 @@ impl LightningProvider for MockLightningProvider {
     }
 
     #[instrument(skip(self, bolt11))]
-    // This test backend has no route and charges zero routing fees.
-    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, _max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
-        let mut paid = self.pay_invoice(bolt11).await?;
-        paid.fee_msat = Some(0);
-        Ok(paid)
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+        let (_, amount) = Self::decode_bolt11(bolt11).unwrap_or_default();
+        self.pay_invoice_with_fee_limit(bolt11, self.routing_fee_policy().ceiling(amount.max(1000), None)).await
     }
 
-    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -319,14 +331,15 @@ impl LightningProvider for MockLightningProvider {
         let hash: [u8; 32] = Sha256::digest(&preimage_bytes).into();
         let payment_hash = hex::encode(hash);
 
-        // Debit balance
+        // Enforce before any wallet or recipient mutation.
+        let debit_msat = self.capped_debit(amount_msat, max_fee_msat)?;
         let mut balance = self.balance_msat.lock().await;
-        if *balance < amount_msat {
+        if *balance < debit_msat {
             return Err(LightningError::PaymentFailed(
                 "insufficient mock balance".into(),
             ));
         }
-        *balance -= amount_msat;
+        *balance -= debit_msat;
         drop(balance);
 
         // If this invoice exists locally (self-pay scenario), settle it
@@ -340,7 +353,7 @@ impl LightningProvider for MockLightningProvider {
             direction: PaymentDirection::Outgoing,
             timestamp: now,
             memo: None,
-            fee_msat: Some(0),
+            fee_msat: Some(self.routing_fee_msat),
         };
 
         self.payments
@@ -432,6 +445,12 @@ impl LightningProvider for MockLightningProvider {
         amount_msat: u64,
         memo: Option<&str>,
     ) -> Result<PaymentDetails, LightningError> {
+        self.keysend_with_fee_limit(dest_pubkey, amount_msat, memo, self.routing_fee_policy().ceiling(amount_msat, None)).await
+    }
+
+    async fn keysend_with_fee_limit(
+        &self, dest_pubkey: &str, amount_msat: u64, memo: Option<&str>, max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -449,14 +468,15 @@ impl LightningProvider for MockLightningProvider {
         let preimage_hex = hex::encode(preimage);
         let payment_hash = hex::encode(hash);
 
-        // Debit balance
+        // Enforce before any wallet or recipient mutation.
+        let debit_msat = self.capped_debit(amount_msat, max_fee_msat)?;
         let mut balance = self.balance_msat.lock().await;
-        if *balance < amount_msat {
+        if *balance < debit_msat {
             return Err(LightningError::PaymentFailed(
                 "insufficient mock balance".into(),
             ));
         }
-        *balance -= amount_msat;
+        *balance -= debit_msat;
         drop(balance);
 
         let details = PaymentDetails {
@@ -467,7 +487,7 @@ impl LightningProvider for MockLightningProvider {
             direction: PaymentDirection::Outgoing,
             timestamp: now,
             memo: memo.map(String::from),
-            fee_msat: None,
+            fee_msat: Some(self.routing_fee_msat),
         };
 
         // Test knob: optionally return in-flight and only settle on later polls,
@@ -567,7 +587,7 @@ impl LightningProvider for MockLightningProvider {
             direction: PaymentDirection::Incoming,
             timestamp: now,
             memo: Some(description.to_string()),
-            fee_msat: None,
+            fee_msat: Some(0),
         };
 
         self.payments

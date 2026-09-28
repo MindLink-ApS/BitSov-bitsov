@@ -202,20 +202,36 @@ impl MeteredSpend {
 #[must_use = "resolve each charge once its outcome is known; dropping keeps it reserved"]
 pub struct Debit {
     held: Option<(Arc<PairingService>, Reservation)>,
+    max_routing_fee_msat: Option<u64>,
+    // None means a settled payment's fee is still unknown. Never release that liability.
+    fees: std::sync::Mutex<std::collections::BTreeMap<String, Option<u64>>>,
     // Shared by every member of a room fan-out. Reservations consume this
     // call's allowance even when a sibling finishes before another starts.
     call_reserved_msat: std::sync::Mutex<u64>,
 }
 
 impl Debit {
+    pub(crate) fn with_fee_limit(mut self, limit: Option<u64>) -> Self {
+        self.max_routing_fee_msat = limit;
+        self
+    }
+    pub(crate) fn fee_limit(&self, state: &AppState, principal: u64) -> u64 {
+        state.lightning.routing_fee_policy().ceiling(principal, self.max_routing_fee_msat)
+    }
+    pub(crate) fn record_payment(&self, recipient: &str, details: &konsensus_core::traits::lightning::PaymentDetails) {
+        let mut fees = self.fees.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = fees.entry(recipient.to_owned()).or_insert(Some(0));
+        *previous = previous.and_then(|total| details.fee_msat.and_then(|fee| total.checked_add(fee)));
+    }
+
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self { max_routing_fee_msat: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        Self { max_routing_fee_msat: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.
@@ -246,14 +262,14 @@ impl Debit {
     /// Unmetered for the owner's own key.
     pub(crate) fn readmission(&self, recipient: &str, amount_msat: u64) -> Result<Debit, ApiError> {
         let Some((service, reservation)) = &self.held else {
-            return Ok(Debit::unmetered());
+            return Ok(Debit::unmetered().with_fee_limit(self.max_routing_fee_msat));
         };
         let mut call_total = self.call_reserved_msat.lock().unwrap_or_else(|e| e.into_inner());
         let readmission = service
             .reserve_readmission(reservation, recipient, amount_msat, *call_total)
             .map_err(ApiError::BudgetExceeded)?;
         *call_total += amount_msat; // checked against the grant limit under its ledger lock
-        Ok(Debit::reserved(Arc::clone(service), readmission))
+        Ok(Debit::reserved(Arc::clone(service), readmission).with_fee_limit(self.max_routing_fee_msat))
     }
 
     /// Reconciliation reference only; never restores dispatch authority.
@@ -320,7 +336,11 @@ impl Debit {
     /// The payment to `recipient` settled for `amount_msat`.
     pub fn settled(&self, recipient: &str, amount_msat: u64) {
         if let Some((service, reservation)) = &self.held {
-            service.resolve_spend(reservation, recipient, amount_msat);
+            let fees = self.fees.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(total) = fees.get(recipient).copied().unwrap_or(Some(0))
+                .and_then(|fee| amount_msat.checked_add(fee)) {
+                service.resolve_spend(reservation, recipient, total);
+            }
         }
     }
 

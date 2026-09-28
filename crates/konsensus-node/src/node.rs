@@ -223,6 +223,7 @@ impl KonsensusNode {
                 Arc::new(
                     LdkProvider::new(ldk_config)
                         .await
+                        .map(|provider| provider.with_routing_fee_policy(config.routing_fees))
                         .map_err(|e| anyhow::anyhow!("ldk provider: {e}"))?,
                 )
             }

@@ -574,6 +574,14 @@ pub struct StubLightning;
 
 #[async_trait]
 impl LightningProvider for StubLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn create_invoice(
         &self,
         amount_msat: u64,
@@ -600,7 +608,7 @@ impl LightningProvider for StubLightning {
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
             memo: None,
-            fee_msat: None,
+            fee_msat: Some(0),
         })
     }
 
@@ -616,7 +624,7 @@ impl LightningProvider for StubLightning {
             direction: PaymentDirection::Incoming,
             timestamp: 1_700_000_000,
             memo: None,
-            fee_msat: None,
+            fee_msat: Some(0),
         })
     }
 
@@ -665,7 +673,7 @@ impl LightningProvider for StubLightning {
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
             memo: None,
-            fee_msat: Some(1),
+            fee_msat: Some(0),
         })
     }
 
@@ -1421,6 +1429,14 @@ impl CountingLightning {
 
 #[async_trait]
 impl LightningProvider for CountingLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn create_invoice(
         &self,
         amount_msat: u64,

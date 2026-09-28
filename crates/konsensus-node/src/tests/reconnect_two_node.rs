@@ -97,6 +97,14 @@ fn bolt11(amount_msat: u64, preimage: &[u8; 32], description: &str, expiry_secs:
 
 #[async_trait]
 impl LightningProvider for TestWallet {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn create_invoice(
         &self,
         amount_msat: u64,

@@ -91,6 +91,10 @@ impl NodeTier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    /// Ordinary Lightning routing fees; sponsor gifts use their separately approved cap.
+    #[serde(default)]
+    pub routing_fees: konsensus_core::traits::lightning::RoutingFeePolicy,
+
     /// User-facing onboarding tier (cloud, light, full).
     /// Determines default backends and UI presentation.
     #[serde(default)]
@@ -1305,6 +1309,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            routing_fees: Default::default(),
             tier,
             identity: IdentityConfig {
                 mnemonic_file,

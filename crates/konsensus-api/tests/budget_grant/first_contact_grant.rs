@@ -234,7 +234,7 @@ async fn the_door_quote_is_the_invoice_the_send_pays() {
     assert_eq!(status, StatusCode::OK, "{quote}");
     assert_eq!(quote["admission_msat"], 2000);
     assert_eq!(quote["message_msat"], 2000);
-    assert_eq!(quote["total_msat"], 4000);
+    assert_eq!(quote["total_msat"], 6000);
     assert_eq!(s.spent().await, 0, "a quote pays nothing");
     assert_eq!(s.fx.used(), 0, "a quote reserves nothing");
     assert_eq!(s.invoices.load(Ordering::SeqCst), 1);

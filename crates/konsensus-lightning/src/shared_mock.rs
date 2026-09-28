@@ -265,6 +265,13 @@ impl LightningProvider for SharedMockProvider {
     async fn is_available(&self) -> bool {
         true
     }
+    async fn keysend_with_fee_limit(
+        &self, dest: &str, amount: u64, memo: Option<&str>, _max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
+        // This backend has zero routing fees, including a caller's zero cap.
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn keysend(
         &self,
         _dest: &str,

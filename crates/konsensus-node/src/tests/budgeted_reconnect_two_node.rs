@@ -281,17 +281,15 @@ impl Sender {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
-    /// A paired sender confirms the message's price as its cap, as the app
-    /// does; the owner's key sends uncapped.
+    /// These reconnect scenarios authorize admission from G1 without a separate
+    /// total cap. A capped request now refuses any unquoted extra admission.
     async fn compose(&self, recipient: &NodeId, text: &str) -> (StatusCode, serde_json::Value) {
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "recipient": recipient.to_hex(),
             "kind": konsensus_core::kind::KIND_CHAT,
             "plaintext": text,
+            "max_routing_fee_msat": 0,
         });
-        if self.pairing.is_some() {
-            body["max_total_msat"] = serde_json::json!(2_000);
-        }
         self.post("/api/v1/messages/compose", body).await
     }
 
@@ -648,7 +646,7 @@ async fn a_contact_without_a_budget_needs_the_one_time_confirmation_once() {
         .post("/api/v1/messages/first-contact/quote", serde_json::json!({ "recipient": bob.to_hex() }))
         .await;
     assert_eq!(status, StatusCode::OK, "{quote}");
-    assert_eq!(quote["total_msat"], 4_000, "{quote}");
+    assert_eq!(quote["total_msat"], 6_000, "{quote}");
     let (status, grant) = net
         .sender
         .owner_confirm(
@@ -710,7 +708,7 @@ async fn fresh_quote_cannot_exceed_the_reserved_message_budget() {
 
 
 #[derive(Clone, Copy)]
-enum AdmissionFailure { Failed, Unknown, SettledResponseLost }
+enum AdmissionFailure { Failed, Unknown, SettledResponseLost, RequireZeroFee }
 
 struct UnsettledAdmission {
     wallet: Arc<SharedMockProvider>,
@@ -720,6 +718,18 @@ struct UnsettledAdmission {
 
 #[async_trait::async_trait]
 impl LightningProvider for UnsettledAdmission {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        if matches!(self.failure, AdmissionFailure::RequireZeroFee) {
+            assert_eq!(_cap, 0, "the caller's tighter ceiling must reach admission and message invoices");
+            return self.wallet.pay_invoice_with_fee_limit(invoice, _cap).await;
+        }
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn create_invoice(&self, amount: u64, description: &str, expiry: u32)
         -> Result<konsensus_core::traits::lightning::Invoice, konsensus_core::traits::lightning::LightningError>
     {
@@ -811,5 +821,32 @@ async fn regression_recovered_admission_emits_one_n2_event() {
     let (status, body) = net.sender.compose(&net.bob_id, "already admitted").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(net.sender.membrane(Code::Readmission).len(), 1, "proof reuse must not duplicate settlement");
+    net.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_readmission_preserves_zero_routing_fee_ceiling() {
+    let mut net = two_nodes_with_outcome(|_| None, 2_000, Some(AdmissionFailure::RequireZeroFee)).await;
+    net.connect().await;
+    net.send_delivered("zero routing fees").await;
+    net.drop_and_reconnect().await;
+    net.send_delivered("still zero routing fees").await;
+    assert_eq!(net.sender.paid_out().await.len(), 4);
+    net.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capped_paired_send_cannot_add_unquoted_reconnection_debit() {
+    let net = two_nodes(|bob| Some(budget(bob, Some(50_000)))).await;
+    let bob = net.bob_id;
+    net.connect().await;
+    let (status, body) = net.sender.post("/api/v1/messages/compose", serde_json::json!({
+        "recipient":bob.to_hex(), "kind":konsensus_core::kind::KIND_CHAT,
+        "plaintext":"all in", "max_total_msat":3000,
+    })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "price_cap_exceeded");
+    assert!(net.sender.paid_out().await.is_empty());
+    assert_eq!(net.sender.grant().used_msat, 0);
     net.shutdown();
 }
