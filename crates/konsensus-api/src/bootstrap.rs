@@ -267,9 +267,9 @@ pub fn classify(probe: &DataDirProbe) -> StartupMode {
             return StartupMode::Refuse(Refusal {
                 reason: "identity_and_state_without_marker",
                 detail: "identity material and wallet/channel state exist but the \
-                         initialization marker is absent — most likely a crash after the \
-                         transition renamed identity into place but before the marker was \
-                         written"
+                         NODE_INITIALIZED marker is absent — common when upgrading a production \
+                         node from before #76/#77 (the marker did not exist yet), or after a crash \
+                         between renaming identity into place and writing the marker"
                     .into(),
                 repair: repair_mark_initialized(),
             });
@@ -325,10 +325,11 @@ pub fn classify(probe: &DataDirProbe) -> StartupMode {
 }
 
 fn repair_mark_initialized() -> String {
-    "run `konsensus repair mark-initialized --config <path-to-konsensus.toml> --confirm` to \
-     finish the interrupted transition (it writes the marker and nothing else), or move the \
-     data directory aside to start over. The node will not write the marker for you, because \
-     doing so silently would make a crashed transition indistinguishable from a completed one."
+    "run `konsensus repair mark-initialized --config <path-to-konsensus.toml> --confirm` \
+     (writes NODE_INITIALIZED and nothing else). Required for legacy nodes upgraded without \
+     the marker and for interrupted first-run transitions. The node will not write the marker \
+     for you, because doing so silently would make a crashed transition indistinguishable from \
+     a completed one. Alternatively, move the data directory aside to start over."
         .to_string()
 }
 
