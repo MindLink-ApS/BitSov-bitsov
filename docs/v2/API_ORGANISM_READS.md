@@ -92,7 +92,9 @@ The Body can sum the counts for the displayed hours, separately from message-gat
 `totals.refused`; adding a UI consumer is an app-side change.
 
 - `session_before_payment`: PrekeyOffer, SessionInit, SessionAck, RatchetInit.
-- `delivery_before_payment`: MessageAck, MessageReject.
+- `delivery_before_payment`: MessageAck/MessageReject on an **unprivileged**
+  connection. Confirmations from a bought/`admission_paid` peer (#100) are not
+  counted here.
 - `price_before_payment`: PriceTable, PriceQuery, PriceResponse.
 - `peer_exchange_before_payment`: PeerExchange request or response.
 - `lightning_info_before_payment`: LightningInfo.

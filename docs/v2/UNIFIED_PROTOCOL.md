@@ -539,7 +539,7 @@ konsensus/
 │   │       ├── ldk.rs
 │   │       ├── lnd.rs
 │   │       ├── cln.rs
-│   │       └── lnbits.rs
+│   │       └── lnbits.rs   # LNbits legacy — rejected at startup (#99/#104)
 │   │
 │   ├── konsensus-pricing/           # Kind-aware PricingEngine (chain-aware message pricing · ADR-027)
 │   │   └── src/

@@ -251,6 +251,7 @@ fn inbound_payment_from_received_event(
 /// on any successful payment. This ensures `is_available()` reflects actual
 /// payment capability, not just whether the LDK node is running.
 pub struct LdkProvider {
+    sync_baseline: (Option<u64>, Option<u64>),
     routing_fee_policy: konsensus_core::traits::lightning::RoutingFeePolicy,
     liquidity: Option<LiquidityClient>,
     liquidity_info: LiquidityInfo,
@@ -471,7 +472,7 @@ impl LdkProvider {
         let chosen_esplora_url =
             select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref())
                 .await;
-        let (node, chosen_esplora_url) =
+        let (node, chosen_esplora_url, baseline) =
             start_esplora_with_retry(builder, &config, chosen_esplora_url, started).await?;
 
         info!(
@@ -516,6 +517,7 @@ impl LdkProvider {
             p.node_id.clone(), Arc::new(LdkJitBackend(Arc::clone(&node))),
         ));
         Ok(Self {
+            sync_baseline: (baseline.latest_lightning_wallet_sync_timestamp, baseline.latest_onchain_wallet_sync_timestamp),
             routing_fee_policy: Default::default(),
             liquidity,
             liquidity_info: config.liquidity.info(),
@@ -540,6 +542,7 @@ impl LdkProvider {
         // inbound stream simply stays empty.
         let (inbound_tx, _) = broadcast::channel(INBOUND_BROADCAST_CAPACITY);
         Self {
+            sync_baseline: (None, None),
             routing_fee_policy: Default::default(),
             liquidity: None,
             liquidity_info: LiquidityInfo::default(),
@@ -923,6 +926,21 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
+    async fn money_ready(&self) -> bool {
+        let status = self.node.status();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        // Require both wallets to synchronize in this startup, and revoke readiness
+        // if updates stop. Allow two normal sync periods before declaring stale.
+        let fresh = |timestamp: Option<u64>, max_age: u64| timestamp.is_some_and(|t|
+            now.saturating_sub(t) <= max_age);
+        status.is_running
+            && status.latest_lightning_wallet_sync_timestamp != self.sync_baseline.0
+            && status.latest_onchain_wallet_sync_timestamp != self.sync_baseline.1
+            && fresh(status.latest_fee_rate_cache_update_timestamp, 1200)
+            && fresh(status.latest_lightning_wallet_sync_timestamp, 60)
+            && fresh(status.latest_onchain_wallet_sync_timestamp, 160)
+    }
+
     fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy { self.routing_fee_policy }
     fn liquidity_info(&self) -> LiquidityInfo { self.liquidity_info.clone() }
 
@@ -1477,7 +1495,7 @@ async fn start_esplora_with_retry(
     config: &LdkConfig,
     mut endpoint: String,
     started: Instant,
-) -> Result<(LdkNode, String), LightningError> {
+) -> Result<(LdkNode, String, ldk_node::NodeStatus), LightningError> {
     const BUDGET: Duration = Duration::from_secs(60);
     const FEE_WINDOW: Duration = Duration::from_secs(5);
     const DELAYS: [u64; 4] = [2, 4, 8, 8];
@@ -1496,12 +1514,13 @@ async fn start_esplora_with_retry(
             break;
         }
         attempts += 1;
+        let baseline = node.as_ref().expect("node was built").status();
         let result = node.as_ref().expect("node was built").start();
         // Deliver pending cancellation even if the synchronous call succeeded.
         // Dropping a successfully started Node invokes stop before returning.
         tokio::task::yield_now().await;
         match result {
-            Ok(()) => return Ok((node.expect("node was built"), endpoint)),
+            Ok(()) => return Ok((node.expect("node was built"), endpoint, baseline)),
             Err(
                 error @ (ldk_node::NodeError::FeerateEstimationUpdateFailed
                 | ldk_node::NodeError::FeerateEstimationUpdateTimeout),

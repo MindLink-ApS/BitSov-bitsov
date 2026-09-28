@@ -175,6 +175,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     // Periodic E2EE self-heal. Transport supervision can reconnect peers after
     // restart/flap without a fresh application message; this loop makes the
     // session membrane repair itself without operator intervention.
+    let mut lightning_was_ready = lightning.money_ready().await;
     let mut session_self_heal_interval = tokio::time::interval(SESSION_SELF_HEAL_INTERVAL);
     session_self_heal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -186,6 +187,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     break;
                 };
 
+                // Unprivileged frames refused here never reach the per-arm
+                // `!privileged` guards below; those stay as defense in depth.
                 if refuse_unpaid_control(&event, audit_log.membrane()) {
                     continue;
                 }
@@ -214,7 +217,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PrekeyOffer { peer_id, bundle, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP PrekeyOffer from unprivileged peer (P2: no free X3DH before payment)");
                             continue;
                         }
                         reply_prekey_offer_to_paid_payee(
@@ -228,7 +230,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::SessionInit { peer_id, init_data, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP SessionInit from unprivileged peer (P2: no free durable session before payment)");
                             continue;
                         }
                         handle_session_init(
@@ -239,7 +240,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::SessionAck { peer_id, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP SessionAck from unprivileged peer (P2: no free session-state before payment)");
                             continue;
                         }
                         handle_session_ack(
@@ -249,7 +249,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::RatchetInit { peer_id, payload, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP RatchetInit from unprivileged peer (P2: no free ratchet-state before payment)");
                             continue;
                         }
                         handle_ratchet_init(
@@ -259,7 +258,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::MessageAcked { peer_id, message_id, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP MessageAck from unprivileged peer (P2: no free trust-weight pump before payment)");
                             continue;
                         }
                         handle_message_acked(
@@ -270,7 +268,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP MessageReject from unprivileged peer (P2: no free trust-weight pump before payment)");
                             continue;
                         }
                         handle_message_rejected(
@@ -287,7 +284,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PriceQueryReceived { peer_id, kind, privileged } => {
                         if !privileged {
-                            debug!(peer = %peer_id, kind, "DROP PriceQuery from unprivileged peer (info-disclosure floor: strangers learn our price surface only via the admission path)");
                             continue;
                         }
                         handle_price_query(&peer_id, kind, &pricing, &chain, &transport).await;
@@ -323,7 +319,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PeerExchangeRequested { peer_id, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP PeerExchange request from unprivileged peer (P3: no mesh-topology / social-graph leak before payment)");
                             continue;
                         }
                         handle_peer_exchange_request(
@@ -334,7 +329,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PeerExchangeReceived { peer_id, peers, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP PeerExchange response from unprivileged peer (P2/P3: no unauthenticated registry write before payment)");
                             continue;
                         }
                         handle_peer_exchange_received(
@@ -345,7 +339,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::LightningInfoReceived { peer_id, ln_pubkey, ln_addr, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP LightningInfo from unprivileged peer (P2: no durable onboarding write or auto-channel open — spends sats — before payment)");
                             continue;
                         }
                         let valid = handle_lightning_info_received(
@@ -382,7 +375,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::GossipReceived { from_peer, envelope, privileged } => {
                         if !privileged {
-                            warn!(peer = %from_peer, "DROP Gossip from unprivileged peer (P2: no free relay/amplification before payment)");
                             continue;
                         }
                         handle_gossip_received(
@@ -456,6 +448,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 }
             }
             _ = session_self_heal_interval.tick() => {
+                refresh_recovered_lightning(
+                    &mut lightning_was_ready, &transport, &lightning, &lightning_addr,
+                    &storage, &ws_delivery_tx, our_node_id,
+                ).await;
                 heal_connected_e2ee_sessions(&session_manager, &transport).await;
             }
             _ = shutdown_rx.changed() => {
@@ -464,6 +460,67 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
             }
         }
     }
+}
+
+/// Recovery reuses the existing session maintenance task, and only shares
+/// identity with already privileged connections. No reconnect or re-admission.
+async fn refresh_recovered_lightning(
+    was_ready: &mut bool,
+    transport: &Arc<NoiseTransport>,
+    lightning: &Arc<dyn LightningProvider>,
+    lightning_addr: &Option<String>,
+    storage: &Arc<dyn konsensus_storage::Storage>,
+    ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    our_node_id: NodeId,
+) {
+    let ready = lightning.money_ready().await;
+    if ready && !*was_ready {
+        for peer in transport.connected_privileged_peers().await {
+            send_lightning_info(&peer, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
+        }
+    }
+    *was_ready = ready;
+}
+
+async fn send_lightning_info(
+    peer_id: &NodeId,
+    transport: &Arc<NoiseTransport>,
+    lightning: &Arc<dyn LightningProvider>,
+    lightning_addr: &Option<String>,
+    storage: &Arc<dyn konsensus_storage::Storage>,
+    ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    our_node_id: NodeId,
+) {
+    // Send our Lightning pubkey if available (enables keysend payments from peer).
+    if let Some(ln_pubkey) = lightning.get_node_pubkey().await {
+        let ln_frame = Frame::LightningInfo {
+            ln_pubkey,
+            ln_addr: lightning_addr.clone(),
+        };
+        if let Err(e) = transport.send_frame(peer_id, &ln_frame).await {
+            warn!(peer = %peer_id, error = %e, "failed to send Lightning info");
+        } else {
+            if let Err(e) = funding_poll::emit_progress_step(
+                storage.as_ref(),
+                ws_delivery_tx,
+                peer_id,
+                "lightning_info_sent",
+                "Lightning details shared",
+            )
+            .await
+            {
+                warn!(error = %e, "failed to persist onboarding lightning_info_sent step");
+            }
+            funding_poll::ensure_poll_task(
+                our_node_id.to_hex(),
+                Arc::clone(storage),
+                Arc::clone(lightning),
+                ws_delivery_tx.clone(),
+            )
+            .await;
+        }
+    }
+
 }
 
 // ── Individual event handlers ─────────────────────────────────────────────
@@ -533,35 +590,7 @@ async fn handle_peer_connected(
         warn!(peer = %peer_id, error = %e, "failed to send price table");
     }
 
-    // Send our Lightning pubkey if available (enables keysend payments from peer).
-    if let Some(ln_pubkey) = lightning.get_node_pubkey().await {
-        let ln_frame = Frame::LightningInfo {
-            ln_pubkey,
-            ln_addr: lightning_addr.clone(),
-        };
-        if let Err(e) = transport.send_frame(peer_id, &ln_frame).await {
-            warn!(peer = %peer_id, error = %e, "failed to send Lightning info");
-        } else {
-            if let Err(e) = funding_poll::emit_progress_step(
-                storage.as_ref(),
-                ws_delivery_tx,
-                peer_id,
-                "lightning_info_sent",
-                "Lightning details shared",
-            )
-            .await
-            {
-                warn!(error = %e, "failed to persist onboarding lightning_info_sent step");
-            }
-            funding_poll::ensure_poll_task(
-                our_node_id.to_hex(),
-                Arc::clone(storage),
-                Arc::clone(lightning),
-                ws_delivery_tx.clone(),
-            )
-            .await;
-        }
-    }
+    send_lightning_info(peer_id, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
 
     // Request peer's known peers for mesh discovery.
     if let Err(e) = transport.send_frame(peer_id, &Frame::PeerExchangeRequest).await {

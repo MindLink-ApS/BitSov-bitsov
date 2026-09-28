@@ -92,6 +92,17 @@ impl Storage for MemStorage {
         Ok(self.calendar.lock().unwrap().get(id).cloned())
     }
 
+    async fn list_calendar_events_in_range(
+        &self, from_ms: u64, to_ms: u64, limit: u32,
+    ) -> Result<Vec<konsensus_storage::calendar::CalendarEventRecord>, StorageError> {
+        let mut events: Vec<_> = self.calendar.lock().unwrap().values()
+            .filter(|event| event.start_ms < to_ms && event.end_ms > from_ms)
+            .cloned().collect();
+        events.sort_by_key(|event| event.start_ms);
+        events.truncate(limit as usize);
+        Ok(events)
+    }
+
     async fn invite_schema_capabilities(&self) -> Result<InviteSchemaCapabilities, StorageError> {
         Ok(self.invite_schema_capabilities)
     }

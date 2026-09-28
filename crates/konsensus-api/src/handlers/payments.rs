@@ -96,6 +96,7 @@ async fn create_invoice(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateInvoiceRequest>,
 ) -> Result<Json<InvoiceResponse>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     if req.description.len() > MAX_INVOICE_DESCRIPTION_LEN {
         return Err(ApiError::BadRequest(format!(
             "description too long: {} bytes (max {MAX_INVOICE_DESCRIPTION_LEN})",
@@ -129,7 +130,7 @@ async fn create_invoice(
         .lightning
         .create_invoice(req.amount_msat, &req.description, req.expiry_secs)
         .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     Ok(Json(InvoiceResponse {
         bolt11: invoice.bolt11,
@@ -147,10 +148,10 @@ async fn payment_status(
         .lightning
         .get_payment_status(&hash)
         .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     let liquidity = state.lightning.liquidity_receipt(&hash).await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
     Ok(Json(PaymentStatusResponse {
         liquidity,
         payment_hash: details.payment_hash,
@@ -175,7 +176,7 @@ async fn get_balance(
         .lightning
         .get_balance_msat()
         .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     Ok((
         DataFreshness::from_wallet_sync(sync, read_at),
@@ -216,6 +217,7 @@ async fn pay_invoice(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PayInvoiceRequest>,
 ) -> Result<Json<PayInvoiceResponse>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     if req.bolt11.is_empty() {
         return Err(ApiError::BadRequest("bolt11 invoice string is required".into()));
     }
@@ -255,7 +257,7 @@ async fn pay_invoice(
     if let Some((debit, payee)) = &debit {
         resolve_payment(debit, payee, &paid);
     }
-    let details = paid.map_err(|e| ApiError::Lightning(e.to_string()).with_routing_fee(max_routing_fee_msat))?;
+    let details = paid.map_err(|e| ApiError::from(e).with_routing_fee(max_routing_fee_msat))?;
 
     if matches!(details.status, konsensus_core::traits::lightning::PaymentStatus::Failed | konsensus_core::traits::lightning::PaymentStatus::Expired) {
         return Err(ApiError::Lightning("invoice payment failed before settlement".into()).with_routing_fee(max_routing_fee_msat));
@@ -321,6 +323,7 @@ async fn keysend(
     State(state): State<Arc<AppState>>,
     Json(req): Json<KeysendRequest>,
 ) -> Result<Json<KeysendResponse>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     if req.dest_pubkey.is_empty() {
         return Err(ApiError::BadRequest("dest_pubkey is required".into()));
     }
@@ -368,7 +371,7 @@ async fn keysend(
     if let Some(debit) = &debit {
         resolve_payment(debit, &dest, &paid);
     }
-    let details = paid.map_err(|e| ApiError::Lightning(e.to_string()).with_routing_fee(max_routing_fee_msat))?;
+    let details = paid.map_err(|e| ApiError::from(e).with_routing_fee(max_routing_fee_msat))?;
 
     let preimage = details.preimage.unwrap_or_default();
 
@@ -421,7 +424,7 @@ pub(crate) fn resolve_payment(
             debit.released(recipient)
         }
         Ok(_) => {}
-        Err(LightningError::PaymentNotDispatched(_)) => debit.released(recipient),
+        Err(LightningError::PaymentNotDispatched(_) | LightningError::NotReady) => debit.released(recipient),
         Err(_) => {}
     }
 }
@@ -461,7 +464,7 @@ async fn list_channels(
         .lightning
         .list_channels()
         .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     Ok((
         DataFreshness::from_wallet_sync(sync, read_at),
@@ -544,7 +547,7 @@ async fn list_payments(
         .lightning
         .list_payments(limit)
         .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     Ok(Json(
         payments
@@ -632,6 +635,7 @@ async fn open_channel(
     _user: ScopedAuth<Spend>,
     Json(req): Json<OpenChannelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     // L0a: shared validator rejects NaN/Inf and enforces 1.0–10_000.0 sat/vB.
     // The naive `<= 0.0` check accepts NaN (NaN compares false everywhere) and
     // ignores fractional floors that would silently produce a 0-rate tx.
@@ -650,6 +654,7 @@ async fn open_channel(
         )
         .await
         .map_err(|e| match e {
+            LightningError::NotReady => ApiError::NotReady,
             LightningError::PaymentNotDispatched(reason) => ApiError::NotDispatched(reason),
             other => ApiError::BadRequest(format!("open_channel failed: {other}")),
         })?;
@@ -667,6 +672,7 @@ async fn close_channel(
     _user: ScopedAuth<Spend>,
     Json(req): Json<CloseChannelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     if req.channel_id.trim().is_empty() {
         return Err(ApiError::BadRequest("channel_id is required".into()));
     }
@@ -675,7 +681,7 @@ async fn close_channel(
         .lightning
         .close_channel(&req.channel_id, req.force)
         .await
-        .map_err(|e| ApiError::BadRequest(format!("close_channel failed: {e}")))?;
+        .map_err(ApiError::from)?;
 
     Ok(Json(serde_json::json!({
         "channel_id": req.channel_id,
@@ -703,6 +709,7 @@ async fn send_onchain(
     _user: ScopedAuth<Spend>,
     Json(req): Json<SendOnchainRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    crate::error::require_money_ready(&state).await?;
     // L0a: see open_channel above for the same validation rationale.
     if let Some(rate) = req.fee_rate_sat_per_vb {
         validate_fee_rate_sat_per_vb(rate)
@@ -740,6 +747,7 @@ async fn send_onchain(
                 })),
             ))
         }
+        Err(LightningError::NotReady) => Err(ApiError::NotReady),
         Err(e) => Err(ApiError::BadRequest(format!("send_onchain failed: {e}"))),
     }
 }
@@ -752,6 +760,7 @@ async fn get_funding_address(
     State(state): State<Arc<AppState>>,
     _user: ScopedAuth<Receive>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     match state.lightning.get_funding_address().await {
         Some(address) => Ok(Json(serde_json::json!({
             "address": address,
