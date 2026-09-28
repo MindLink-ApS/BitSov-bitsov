@@ -508,9 +508,11 @@ async fn fourteen_minute_admission_resend_renews_same_paid_envelope() {
     // No X3DH peer is running, so compose eventually times out after resending.
     assert!(response.status().is_server_error());
     assert_eq!(sender_wallet.money(), 0);
-    let sent = transport.sent_envelopes.lock().unwrap();
-    assert_eq!(sent.len(), 1);
-    let renewed = sent[0].1.clone(); drop(sent);
+    let renewed = {
+        let sent = transport.sent_envelopes.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        sent[0].1.clone()
+    };
     assert!(renewed.timestamp > old.timestamp);
     let mut expected = old.clone(); expected.timestamp = renewed.timestamp; expected.signature = renewed.signature;
     assert_eq!(renewed, expected);

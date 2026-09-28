@@ -215,6 +215,12 @@ impl LightningProvider for RecoveringLightning {
     fn routing_fee_policy(&self) -> RoutingFeePolicy {
         self.policy
     }
+    fn outgoing_payment_updates(&self) -> Option<BoxStream<'static, String>> {
+        // Subscribe synchronously to the current ready backend, including after
+        // offline startup recovery, so hints during dispatch are not lost. Keep
+        // the backend's stream lifetime: when it closes, callers use their timer.
+        self.backend().ok()?.outgoing_payment_updates()
+    }
     fn liquidity_info(&self) -> LiquidityInfo {
         self.state
             .read()

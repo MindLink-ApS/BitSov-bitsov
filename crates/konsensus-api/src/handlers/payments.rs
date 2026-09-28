@@ -641,7 +641,7 @@ async fn open_channel(
     // ignores fractional floors that would silently produce a 0-rate tx.
     if let Some(rate) = req.fee_rate_sat_per_vb {
         validate_fee_rate_sat_per_vb(rate)
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            .map_err(|e| ApiError::NotDispatched(e.to_string()))?;
     }
     let channel_id = state
         .lightning
@@ -653,11 +653,7 @@ async fn open_channel(
             req.fee_rate_sat_per_vb,
         )
         .await
-        .map_err(|e| match e {
-            LightningError::NotReady => ApiError::NotReady,
-            LightningError::PaymentNotDispatched(reason) => ApiError::NotDispatched(reason),
-            other => ApiError::BadRequest(format!("open_channel failed: {other}")),
-        })?;
+        .map_err(ApiError::from)?;
 
     Ok(Json(serde_json::json!({
         "channel_id": channel_id,
@@ -713,7 +709,7 @@ async fn send_onchain(
     // L0a: see open_channel above for the same validation rationale.
     if let Some(rate) = req.fee_rate_sat_per_vb {
         validate_fee_rate_sat_per_vb(rate)
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            .map_err(|e| ApiError::NotDispatched(e.to_string()))?;
     }
     // L0f: distinguish between "broadcast confirmed visible" (HTTP 200) and
     // "broadcast initiated, but the chain provider couldn't confirm
@@ -747,8 +743,7 @@ async fn send_onchain(
                 })),
             ))
         }
-        Err(LightningError::NotReady) => Err(ApiError::NotReady),
-        Err(e) => Err(ApiError::BadRequest(format!("send_onchain failed: {e}"))),
+        Err(e) => Err(ApiError::from(e)),
     }
 }
 

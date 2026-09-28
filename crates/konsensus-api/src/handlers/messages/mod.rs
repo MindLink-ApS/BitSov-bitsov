@@ -26,6 +26,8 @@ use crate::state::AppState;
 pub(crate) mod caps;
 mod admission_journal;
 mod compose;
+pub(crate) mod operations;
+pub use operations::reconcile_operations;
 mod query;
 mod receive;
 mod resync;
@@ -87,6 +89,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/v1/messages", post(send_observed).get(query::list_messages))
         .route("/api/v1/messages/search", get(query::search_messages))
         .route("/api/v1/messages/compose", post(compose_observed))
+        .route("/api/v1/messages/operations/:id", get(operations::get_operation))
         .route("/api/v1/messages/resync", post(resync::resync_messages))
         .route("/api/v1/messages/first-contact/quote", post(compose::first_contact_quote))
         .route(

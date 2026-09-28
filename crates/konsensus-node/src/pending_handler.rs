@@ -149,6 +149,9 @@ async fn flush_peer(
         send_timestamps.lock().await.insert(*message_id, std::time::Instant::now());
         match transport.send(peer_id, &envelope).await {
             Ok(()) => {
+                if let Err(error) = storage.record_outbox_sent(message_id, peer_id).await {
+                    warn!(%error, "cannot record operation transport write; paid queue retained");
+                }
                 info!(
                     peer = %peer_id,
                     msg_id = %message_id,

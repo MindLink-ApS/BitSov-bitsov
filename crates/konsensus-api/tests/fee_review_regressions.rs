@@ -27,8 +27,10 @@ async fn owner_can_pay_invoice_created_by_actual_stock_mock() {
     let signed: lightning_invoice::Bolt11Invoice = invoice["bolt11"].as_str().unwrap().parse().unwrap();
     assert_eq!(signed.currency(), lightning_invoice::Currency::Regtest);
     assert_eq!(signed.amount_milli_satoshis(), Some(1000));
-    let (status, _) = post(&state, "/api/v1/payments/pay", json!({"bolt11": invoice["bolt11"], "max_routing_fee_msat":399})).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let (status, refused) = post(&state, "/api/v1/payments/pay", json!({"bolt11": invoice["bolt11"], "max_routing_fee_msat":399})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["code"], "not_dispatched");
+    assert_eq!(refused["max_routing_fee_msat"], 399);
     assert_eq!(wallet.get_balance_msat().await.unwrap(), before);
     let (status, paid) = post(&state, "/api/v1/payments/pay", json!({"bolt11": invoice["bolt11"], "max_routing_fee_msat":400})).await;
     assert_eq!(status, StatusCode::OK, "stock mock invoice rejected: {paid}");
