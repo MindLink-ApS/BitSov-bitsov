@@ -295,3 +295,56 @@ async fn prior_admission_cap_refusal_emits_membrane_event_without_new_payment() 
 async fn prior_admission_budget_refusal_emits_membrane_event_without_new_payment() {
     prior_admission_refusal_emits_membrane_event(true).await;
 }
+// A failed operation journal must not create an unpaid admission guard.
+#[tokio::test]
+async fn failed_admission_operation_journal_does_not_poison_unpaid_retry() {
+    use konsensus_storage::Storage;
+    use konsensus_storage::SqliteStorage;
+    for mode in ["failed_write", "committed_write", "other_operation"] {
+    let (mut fx, sender, _target, requests) = stranger(true).await;
+    let db = Arc::new(SqliteStorage::open(fx.tmp.path().join("review113.db").to_str().unwrap()).await.unwrap());
+    fx.state = Arc::new(AppState { storage: db.clone(), ..(*fx.state).clone() });
+    let token = fx.grant(None, GrantTerms::new(20_000)).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut request = json!({"operation_id":id,"recipient":fx.peer.to_hex(),"kind":0,"plaintext":"operation write failure","max_total_msat":6000,"wait_ack_ms":0});
+    sqlx::raw_sql("CREATE TRIGGER review113_crash BEFORE UPDATE ON outbox_operations WHEN NEW.admission_payment_hash IS NOT NULL BEGIN SELECT RAISE(ABORT, 'review113 admission journal failure'); END").execute(db.pool()).await.unwrap();
+    confirm(&fx, &token, 6000).await;
+    let first = fx.call("POST", "/api/v1/messages/compose", Some(request.clone()), Some(&token)).await;
+    assert_eq!(first.0, StatusCode::INTERNAL_SERVER_ERROR, "{first:?}");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 100_000, "no Lightning dispatch occurred");
+    assert_eq!(fx.used(), 0, "known unpaid reservation released");
+    let op = db.get_outbox_operation(&id).await.unwrap().unwrap();
+    assert_eq!(op.state, "prepared");
+    assert!(op.admission_payment_hash.is_none());
+    sqlx::raw_sql("DROP TRIGGER review113_crash").execute(db.pool()).await.unwrap();
+    // False dispatch marker survives both failed and committed SQL writes.
+    // In other_operation mode the prior fields are not yet visible: cleanup
+    // must still fence the old version against a late cancelled SQL update.
+    let stale = op.clone();
+    if mode == "committed_write" {
+        let journal: Value = serde_json::from_slice(&std::fs::read(fx.tmp.path().join("admission-attempts").join(fx.peer.to_hex())).unwrap()).unwrap();
+        assert_eq!(journal["dispatch_started"], false);
+        let mut op = op;
+        let mut data: Value = serde_json::from_slice(&op.recovery).unwrap();
+        data["admission_pending"] = true.into();
+        data["admission_expected_msat"] = journal["amount_msat"].clone();
+        data["admission_reservation"] = journal["original_reservation"].clone();
+        op.admission_payment_hash = Some(journal["payment_hash"].as_str().unwrap().into());
+        op.recovery = serde_json::to_vec(&data).unwrap();
+        op.state = "payment_unknown".into();
+        assert!(db.update_outbox_operation(&op).await.unwrap());
+        fx.restart();
+    }
+    if mode == "other_operation" { request["operation_id"] = uuid::Uuid::new_v4().to_string().into(); }
+    confirm(&fx, &token, 6000).await;
+    let retry = fx.call("POST", "/api/v1/messages/compose", Some(request), Some(&token)).await;
+    assert_eq!(retry.0, StatusCode::OK, "known undispatched admission must recover after its failed write: {retry:?}");
+    assert_eq!(sender.get_balance_msat().await.unwrap(), 96_000);
+    assert_eq!(fx.used(), 4000);
+    if mode == "other_operation" {
+        assert!(!db.update_outbox_operation(&stale).await.unwrap(), "late cancelled SQL writer must be fenced");
+        assert_eq!(db.get_outbox_operation(&id).await.unwrap().unwrap().state, "prepared");
+    }
+    }
+}

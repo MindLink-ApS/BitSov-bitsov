@@ -9,6 +9,10 @@ use thiserror::Error;
 /// API errors — converted to appropriate HTTP status codes.
 #[derive(Debug, Error)]
 pub enum ApiError {
+    #[error("{source}")]
+    Operation { source: Box<ApiError>, operation_id: String, state: String, payment_hash: Option<String>, retry_allowed: bool },
+    #[error("{0}")]
+    OperationConflict(&'static str),
     #[error("Lightning is offline or synchronizing; retry when money_ready is true")]
     NotReady,
 
@@ -98,6 +102,16 @@ impl ApiError {
         Self::RoutingFee { source: Box::new(self), max_routing_fee_msat }
     }
     fn response_parts(&self) -> (StatusCode, serde_json::Value) {
+        if let Self::Operation { source, operation_id, state, payment_hash, retry_allowed } = self {
+            let (status, mut body) = source.response_parts();
+            body["operation_id"] = operation_id.clone().into(); body["state"] = state.clone().into();
+            body["payment_hash"] = serde_json::json!(payment_hash);
+            body["accepted"] = false.into(); body["retry_allowed"] = (*retry_allowed).into();
+            return (status, body);
+        }
+        if let Self::OperationConflict(code) = self {
+            return (StatusCode::CONFLICT, serde_json::json!({"error": code, "code": code}));
+        }
         if matches!(self, Self::NotReady) {
             return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
                 "error": self.to_string(), "code": "not_ready", "money_ready": false
@@ -144,7 +158,7 @@ impl ApiError {
             }));
         }
         let (status, message) = match &self {
-            ApiError::NotReady | ApiError::RoutingFee { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
+            ApiError::Operation { .. } | ApiError::OperationConflict(_) | ApiError::NotReady | ApiError::RoutingFee { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
