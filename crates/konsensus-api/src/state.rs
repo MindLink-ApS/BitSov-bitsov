@@ -55,9 +55,9 @@ pub struct WsDeliveryStatus {
     pub event_type: &'static str,
     /// The message ID this status update applies to (hex-encoded).
     pub message_id: String,
-    /// Delivery status: `"delivered"` or `"rejected"`.
+    /// Delivery status: `"delivered"`, transient `"rejected"`, or terminal `"failed_paid"`.
     pub status: String,
-    /// Reason for rejection (only present when `status == "rejected"`).
+    /// Reason for a transient rejection or terminal paid failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

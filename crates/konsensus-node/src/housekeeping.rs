@@ -136,9 +136,8 @@ async fn write_whitelist_sidecar(
     }
 }
 
-/// Spawns the pending deliveries cleanup task — removes entries that have exceeded
-/// max retry attempts or are too old, preventing unbounded table growth when
-/// peers stay offline for extended periods.
+/// Marks paid deliveries stalled after repeated failures, retaining their rows
+/// and envelopes for periodic retry until the recipient acknowledges them.
 pub(crate) async fn run_pending_cleanup(
     storage: Arc<dyn konsensus_storage::Storage>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -149,8 +148,8 @@ pub(crate) async fn run_pending_cleanup(
         tokio::select! {
             _ = tokio::time::sleep(cleanup_interval) => {
                 match storage.cleanup_stale_pending(MAX_DELIVERY_ATTEMPTS).await {
-                    Ok(removed) if removed > 0 => {
-                        info!(removed, "cleaned up stale pending deliveries");
+                    Ok(stalled) if stalled > 0 => {
+                        info!(stalled, "marked paid deliveries stalled; retaining for retry");
                     }
                     Ok(_) => {} // nothing to clean
                     Err(e) => {
@@ -282,6 +281,7 @@ pub(crate) async fn run_gossip_eviction(
 /// rejections. Re-announces every 10 minutes. Only sends if prices have
 /// actually changed since last announcement.
 pub(crate) async fn run_price_refresh(
+    storage: Arc<dyn konsensus_storage::Storage>,
     transport: Arc<NoiseTransport>,
     pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     chain: Arc<dyn ChainProvider>,
@@ -345,7 +345,7 @@ pub(crate) async fn run_price_refresh(
                         valid_blocks: meta.valid_blocks,
                         trust_discount: peer_discount,
                     };
-                    if let Err(e) = transport.send_frame(peer_id, &frame).await {
+                    if let Err(e) = crate::delivery_prices::send_price_frame(&transport, storage.as_ref(), peer_id, &frame, pricing.as_ref()).await {
                         warn!(peer = %peer_id, error = %e, "failed to send updated price table");
                     }
                 }

@@ -286,18 +286,23 @@ pub async fn create_payment_proof(
     price_msat: u64,
     peer_id: &NodeId,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
-    create_payment_proof_with_fee_report(state, price_msat, peer_id).await.map(|(proof, _)| proof)
+    create_payment_proof_with_fee_report(state, price_msat, peer_id).await.map(|(proof, _, _)| proof)
 }
 
+/// Return message proof, combined routing-fee ceiling, and all principal settled
+/// by this call (including re-admission). Admission never inflates the proof.
 pub(crate) async fn create_payment_proof_with_fee_report(
     state: &AppState, price_msat: u64, peer_id: &NodeId,
-) -> Result<(([u8; 32], [u8; 32], u64), u64), ApiError> {
+) -> Result<(([u8; 32], [u8; 32], u64), u64, u64), ApiError> {
     let mut charge = FirstContactCharge::default();
     let readmission = Readmission::for_cap(false);
     let fee = state.lightning.routing_fee_policy().ceiling(super::caps::payable(price_msat), None);
     let result = create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), &readmission, None, &mut charge).await;
     let ceiling = fee.saturating_add(readmission.fee_ceiling_msat());
-    result.map(|proof| (proof, ceiling)).map_err(|error| charge.error(error).with_routing_fee(ceiling))
+    result.map(|proof| {
+        let settled_msat = proof.2.saturating_add(charge.settled_msat);
+        (proof, ceiling, settled_msat)
+    }).map_err(|error| charge.error(error).with_routing_fee(ceiling))
 }
 
 /// How a paid send may pay admission again when the recipient refuses it with
@@ -2229,7 +2234,7 @@ async fn first_contact_admission_at(
                 }
             }
         }
-        PriorAdmission::SettledWithProof(envelope) => {
+        PriorAdmission::SettledWithProof(mut envelope) => {
             // The proof's coverage was classified against `connected_since`.
             // If that connection was replaced since, the classification is
             // stale: the proof may have been consumed on the old connection,
@@ -2249,6 +2254,15 @@ async fn first_contact_admission_at(
             }
             report_readmission_settlement(state, peer_id, envelope.payment_proof.amount_msat)?;
             charge.prior_settled_msat = envelope.payment_proof.amount_msat;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
+            envelope.refresh_for_resend(&state.identity, now)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if let Some(mut attempt) = super::admission_journal::load(state, peer_id)? {
+                attempt.envelope = Some(*envelope.clone());
+                super::admission_journal::save(state, peer_id, &attempt)?;
+            }
+            lock_admission_ledger().attach_envelope(peer_id, *envelope.clone());
             // Re-deliver the already-paid proof. If the target already consumed
             // this payment hash (envelope arrived the first time), its replay
             // table rejects the duplicate — harmless to us, and we are already
@@ -2614,24 +2628,17 @@ async fn compose_room_member(
         }
     }
 
+    if let Err(e) = state.storage.prepare_delivery(&envelope.id, &member).await {
+        return RoomMemberOutcome::stopped(member, "settled", amount_msat, format!("Cannot persist delivery: {e}"));
+    }
     // Deliver or queue — try sending directly to avoid TOCTOU race.
-    let delivered = match state.transport.send(&member, &envelope).await {
-        Ok(()) => {
-            // Record send timestamp for STDP latency measurement.
-            let mut ts = state.send_timestamps.lock().await;
-            if ts.len() < MAX_SEND_TIMESTAMPS {
-                ts.insert(envelope.id, std::time::Instant::now());
-            }
-            drop(ts);
-            true
+    {
+        let mut ts = state.send_timestamps.lock().await;
+        if ts.len() < MAX_SEND_TIMESTAMPS {
+            ts.insert(envelope.id, std::time::Instant::now());
         }
-        Err(_) => {
-            if let Err(qe) = state.storage.queue_pending_delivery(&envelope.id, &member).await {
-                tracing::warn!(peer = %member, error = %qe, "failed to queue pending room delivery");
-            }
-            false
-        }
-    };
+    }
+    let delivered = state.transport.send(&member, &envelope).await.is_ok();
 
     RoomMemberOutcome {
         receipt: MemberPaymentOutcome { recipient: member.to_hex(), status: "settled", amount_msat,
@@ -3055,27 +3062,18 @@ pub(super) async fn compose_message(
             }
         }
 
-        // Deliver via transport; queue for later if peer offline or send fails.
+        state.storage.prepare_delivery(&envelope.id, &peer_id).await
+            .map_err(|e| ApiError::Storage(e.to_string()))?;
+        // Deliver via transport; keep queued until ACK.
         // Try sending directly — avoids TOCTOU race where peer disconnects
         // between an is_connected check and the actual send.
-        let delivered = match state.transport.send(&peer_id, &envelope).await {
-            Ok(()) => {
-                // Record send timestamp for STDP latency measurement.
-                let mut ts = state.send_timestamps.lock().await;
-                if ts.len() < MAX_SEND_TIMESTAMPS {
-                    ts.insert(envelope.id, std::time::Instant::now());
-                }
-                true
+        {
+            let mut ts = state.send_timestamps.lock().await;
+            if ts.len() < MAX_SEND_TIMESTAMPS {
+                ts.insert(envelope.id, std::time::Instant::now());
             }
-            Err(_) => {
-                if let Err(e) =
-                    state.storage.queue_pending_delivery(&envelope.id, &peer_id).await
-                {
-                    tracing::warn!(error = %e, "failed to queue pending delivery");
-                }
-                false
-            }
-        };
+        }
+        let delivered = state.transport.send(&peer_id, &envelope).await.is_ok();
 
         // Broadcast to WebSocket clients (with plaintext — we composed this message)
         if let Err(e) = state.ws_broadcast.send(Arc::new(crate::state::WsMessage {

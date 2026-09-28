@@ -66,7 +66,7 @@ impl PostgresStorage {
             // Check if this is an existing database (messages table already exists)
             let table_exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-                 WHERE table_name = 'messages')",
+                 WHERE table_schema = current_schema() AND table_name = 'messages')",
             )
             .fetch_one(&self.pool)
             .await
@@ -108,12 +108,18 @@ impl PostgresStorage {
             if applied.contains(&version) {
                 continue;
             }
-            sqlx::query(sql).execute(&self.pool).await?;
-            sqlx::query("INSERT INTO _konsensus_migrations (version, name) VALUES ($1, $2)")
-                .bind(version)
-                .bind(name)
-                .execute(&self.pool)
-                .await?;
+            let mut tx = self.pool.begin().await?;
+            // Serialize concurrent startups and recheck after acquiring the lock.
+            sqlx::query("LOCK TABLE _konsensus_migrations IN EXCLUSIVE MODE").execute(&mut *tx).await?;
+            let recorded: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _konsensus_migrations WHERE version = $1)")
+                .bind(version).fetch_one(&mut *tx).await?;
+            if !recorded {
+                // Migrations contain multiple statements; use the simple protocol.
+                sqlx::raw_sql(sql).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO _konsensus_migrations (version, name) VALUES ($1, $2)")
+                    .bind(version).bind(name).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
         }
 
         Ok(())
@@ -425,6 +431,10 @@ impl PostgresStorage {
                     ON payment_receipts(sender, received_at DESC);
                 "#,
             ),
+            (20, "pending_delivery_state", "ALTER TABLE pending_deliveries ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'pending'; ALTER TABLE pending_deliveries ADD COLUMN IF NOT EXISTS dispatched INTEGER NOT NULL DEFAULT 0;"),
+            (21, "paid_delivery_rejections", include_str!("../migrations/postgres/021_paid_delivery_rejections.sql")),
+            (22, "receipt bindings", include_str!("../migrations/022_receipt_bindings.sql")),
+            (23, "delivery price quotes", include_str!("../migrations/023_delivery_price_quotes.sql")),
         ]
     }
 
@@ -616,7 +626,7 @@ const SESSIONS_SELECT: &str = "SELECT peer_id FROM sessions ORDER BY updated_at 
 /// here means a node with queued mail to more than the cap of distinct peers never
 /// flushes the overflow recipients on reconnect, a Principle-2 fail-open. Guarded by
 /// code symmetry with SQLite plus the `dbh2_guard` test below.
-const PENDING_PEERS_SELECT: &str = "SELECT DISTINCT recipient_id FROM pending_deliveries";
+const PENDING_PEERS_SELECT: &str = "SELECT DISTINCT recipient_id FROM pending_deliveries WHERE state != 'failed_paid'";
 
 /// Room-membership query for the Postgres backend. Returns ALL members of a room —
 /// deliberately **no `LIMIT`** (DBH2), mirroring SQLite. The room message fan-out
@@ -640,7 +650,7 @@ const ROOM_MEMBERS_SELECT: &str =
 /// peer.
 const PENDING_FOR_PEER_SELECT: &str =
     "SELECT message_id, attempts FROM pending_deliveries \
-     WHERE recipient_id = $1 ORDER BY queued_at ASC";
+     WHERE recipient_id = $1 AND state != 'failed_paid' AND retry_after_ms <= CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) ORDER BY queued_at ASC";
 
 /// `list_invites_issued` — AUTHORITY. Duplicate-pending-invite gate and
 /// acceptance lookup; must be complete.
@@ -754,6 +764,210 @@ impl Storage for PostgresStorage {
         .await?;
 
         Ok(())
+    }
+
+    async fn record_delivery_prices(&self, sender: &NodeId, prices: &[(String, u64)], excluded_kinds: &[u16], issued_at: u64, expires_at: u64) -> Result<(), StorageError> {
+        if expires_at <= issued_at || expires_at - issued_at > konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS {
+            return Err(StorageError::Conversion("invalid delivery price window".into()));
+        }
+        let issued = i64::try_from(issued_at).map_err(|_| StorageError::Conversion("quote time overflow".into()))?;
+        let expires = i64::try_from(expires_at).map_err(|_| StorageError::Conversion("quote expiry overflow".into()))?;
+        let exclusions = format!(",{},", excluded_kinds.iter().map(u16::to_string).collect::<Vec<_>>().join(","));
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM delivery_price_quotes WHERE expires_at < $1").bind(issued.saturating_sub(konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS as i64)).execute(&mut *tx).await?;
+        for (scope, amount) in prices {
+            let amount = i64::try_from(*amount).map_err(|_| StorageError::Conversion("quote amount overflow".into()))?;
+            sqlx::query("INSERT INTO delivery_price_quotes (sender, scope, amount_msat, issued_at, expires_at, excluded_kinds) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING")
+                .bind(sender.to_hex()).bind(scope).bind(amount).bind(issued).bind(expires).bind(&exclusions).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delivery_price_floor(&self, envelope: &UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, StorageError> {
+        // Paid-at comes from our Lightning backend, never the signed wrapper.
+        if paid_at > now || now.saturating_sub(paid_at) > konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS { return Ok(None); }
+        let paid = i64::try_from(paid_at).map_err(|_| StorageError::Conversion("payment time overflow".into()))?;
+        let category = format!("category:{}", konsensus_core::kind::KindCategory::from_kind(envelope.kind).price_table_key());
+        let amount: Option<i64> = sqlx::query_scalar("SELECT MIN(amount_msat) FROM delivery_price_quotes WHERE sender = $1 AND (scope = $2 OR (scope = $3 AND excluded_kinds NOT LIKE $4)) AND issued_at <= $5 AND expires_at >= $6")
+            .bind(envelope.sender.to_hex()).bind(format!("kind:{}", envelope.kind)).bind(category).bind(format!("%,{},%", envelope.kind)).bind(paid).bind(paid)
+            .fetch_one(&self.pool).await?;
+        amount.map(|n| u64::try_from(n).map_err(|_| StorageError::Conversion("negative quoted price".into()))).transpose()
+    }
+
+    async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = 1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
+            .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+            .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .fetch_one(&self.pool).await?;
+        if durable == 1 { return Ok(true); }
+        let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = $1 AND r.message_id = $2 AND r.sender = $3 AND m.sender = r.sender AND m.kind = $4 AND m.recipient_type = $5 AND m.recipient_id = $6 AND m.payment_hash = r.payment_hash AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10")
+            .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+            .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .fetch_one(&self.pool).await?;
+        if matched != 1 { return Ok(false); }
+        // A legacy full-message match is already accepted. Preserve its binding
+        // before ACK so subsequent content retention cannot erase that evidence.
+        // The guarded UPDATE never inserts a message or consumes a fresh proof.
+        let upgraded = sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8 AND message_id = $9 AND sender = $10 AND EXISTS (SELECT 1 FROM messages m WHERE m.id = payment_receipts.message_id AND m.sender = payment_receipts.sender AND m.kind = $11 AND m.recipient_type = $12 AND m.recipient_id = $13 AND m.payment_hash = payment_receipts.payment_hash AND m.preimage = $14 AND m.amount_msat = $15 AND m.nonce = $16 AND m.references_json = $17)")
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .bind(&ph).bind(&id).bind(&sender)
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .execute(&self.pool).await?.rows_affected();
+        if upgraded != 1 {
+            // A retention race is retryable, never a current-price rejection.
+            return Err(StorageError::Conversion("legacy acceptance binding changed during lookup".into()));
+        }
+        Ok(true)
+    }
+
+    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        use crate::PaidAcceptance::*;
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ts = i64::try_from(envelope.timestamp)
+            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ciphertext = &envelope.ciphertext;
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let sig = hex::encode(envelope.signature.as_bytes());
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let mut tx = self.pool.begin().await?;
+        let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+            .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
+        let healing = receipt.rows_affected() == 0;
+        if healing {
+            // Serialize legacy healers on the receipt binding (SQLite already
+            // holds the writer lock from the INSERT above).
+            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = $1 FOR UPDATE")
+                .bind(&ph).fetch_one(&mut *tx).await?;
+            if binding.0 != id || binding.1 != sender {
+                tx.rollback().await?;
+                return Ok(PaymentReused);
+            }
+            // Receipt metadata is independent of retained message content and
+            // excludes only the timestamp/signature wrapper refreshed on retry.
+            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = 1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if durable == 1 {
+                tx.rollback().await?;
+                return Ok(AlreadyAccepted);
+            }
+            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = $1 AND r.message_id = $2 AND r.sender = $3 AND m.sender = r.sender AND m.kind = $4 AND m.recipient_type = $5 AND m.recipient_id = $6 AND m.payment_hash = r.payment_hash AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if matched == 1 {
+                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
+                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+                tx.commit().await?;
+                return Ok(AlreadyAccepted);
+            }
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = $1")
+                .bind(&id).fetch_one(&mut *tx).await?;
+            if exists != 0 || binding.2 != 0 {
+                tx.rollback().await?;
+                return Ok(PaymentReused);
+            }
+            // Full gate validation precedes this transaction. The receipt
+            // binds this paid identity; repair only its missing message row.
+        }
+        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = $1")
+                .bind(&nonce).fetch_one(&mut *tx).await?;
+            if !healing || owner != sender {
+                tx.rollback().await?;
+                return Ok(NonceReused);
+            }
+        }
+        sqlx::query(
+            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(&sender)
+        .bind(rtype)
+        .bind(&rid)
+        .bind(ts)
+        .bind(ciphertext)
+        .bind(&ph)
+        .bind(&pi)
+        .bind(amt)
+        .bind(&sig)
+        .bind(&nonce)
+        .bind(&refs_json)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Accepted)
+    }
+
+    async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
+        let ts = i64::try_from(envelope.timestamp).map_err(|_| StorageError::Conversion("timestamp overflow".into()))?;
+        let result = sqlx::query("UPDATE messages SET timestamp_ms = $1, signature = $2 WHERE id = $3 AND sender = $4 AND payment_hash = $5")
+            .bind(ts).bind(hex::encode(envelope.signature.as_bytes())).bind(envelope.id.to_hex())
+            .bind(envelope.sender.to_hex()).bind(hex::encode(envelope.payment_proof.payment_hash))
+            .execute(&self.pool).await?;
+        if result.rows_affected() != 1 { return Err(StorageError::Conversion("missing paid envelope".into())); }
+        Ok(())
+    }
+
+    async fn mark_pending_sent(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
+        let changed = sqlx::query("UPDATE pending_deliveries SET dispatched = 1, retry_after_ms = 0 WHERE message_id = $1 AND recipient_id = $2 AND state != 'failed_paid' AND retry_after_ms <= CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)")
+            .bind(id.to_hex()).bind(peer.to_hex()).execute(&self.pool).await?.rows_affected();
+        if changed != 1 { return Err(StorageError::Conversion("delivery is not eligible for dispatch".into())); }
+        Ok(())
+    }
+
+    async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = $1 AND p.recipient_id = $2 AND p.dispatched = 1 AND p.state != 'failed_paid' AND m.sender = $3)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).fetch_one(&self.pool).await?)
+    }
+
+    async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {
+        Ok(sqlx::query("UPDATE pending_deliveries SET state = $1, rejection_reason = $2, retry_after_ms = CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) + LEAST(3600000, 60000 * (1 << LEAST(attempts, 6))), attempts = attempts + 1 WHERE message_id = $3 AND recipient_id = $4 AND dispatched = 1 AND state != 'failed_paid' AND retry_after_ms = 0 AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = $5)")
+            .bind(if terminal { "failed_paid" } else { "pending" }).bind(reason)
+            .bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+            .execute(&self.pool).await?.rows_affected() == 1)
+    }
+
+    async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        Ok(sqlx::query("DELETE FROM pending_deliveries WHERE message_id = $1 AND recipient_id = $2 AND dispatched = 1 AND state != 'failed_paid' AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = $3)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+            .execute(&self.pool).await?.rows_affected() == 1)
+    }
+
+    async fn acknowledge_pending_payment(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        Ok(sqlx::query("DELETE FROM pending_deliveries WHERE message_id = $1 AND recipient_id = $2 AND dispatched = 1 AND state != 'failed_paid' AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = $3 AND payment_hash = $4)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).bind(hex::encode(hash))
+            .execute(&self.pool).await?.rows_affected() == 1)
     }
 
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
@@ -917,18 +1131,8 @@ impl Storage for PostgresStorage {
     }
 
     async fn delete_messages_older_than(&self, before_ms: u64) -> Result<u64, StorageError> {
-        // Clean up pending deliveries for messages about to be deleted
-        sqlx::query(
-            "DELETE FROM pending_deliveries WHERE message_id IN \
-             (SELECT id FROM messages WHERE timestamp_ms < $1)",
-        )
-        .bind(before_ms.min(i64::MAX as u64) as i64)
-        .execute(&self.pool)
-        .await?;
-        let result = sqlx::query("DELETE FROM messages WHERE timestamp_ms < $1")
-            .bind(before_ms.min(i64::MAX as u64) as i64)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query("DELETE FROM messages WHERE timestamp_ms < $1 AND NOT EXISTS (SELECT 1 FROM pending_deliveries WHERE message_id = messages.id)")
+            .bind(before_ms.min(i64::MAX as u64) as i64).execute(&self.pool).await?;
         Ok(result.rows_affected())
     }
 
@@ -1401,7 +1605,7 @@ impl Storage for PostgresStorage {
 
         sqlx::query(
             "UPDATE pending_deliveries SET attempts = attempts + 1 \
-             WHERE message_id = $1 AND recipient_id = $2",
+             WHERE message_id = $1 AND recipient_id = $2 AND state != 'failed_paid'",
         )
         .bind(&mid)
         .bind(&rid)
@@ -1451,7 +1655,7 @@ impl Storage for PostgresStorage {
 
     async fn cleanup_stale_pending(&self, max_attempts: u32) -> Result<u64, StorageError> {
         let result = sqlx::query(
-            "DELETE FROM pending_deliveries WHERE attempts >= $1",
+            "UPDATE pending_deliveries SET state = 'stalled' WHERE attempts >= $1 AND state = 'pending'",
         )
         .bind(max_attempts as i64)
         .execute(&self.pool)
@@ -2973,5 +3177,79 @@ mod accepted_invites_guard {
             "postgres ACTIVE_ACCEPTED_INVITES_SELECT must not contain LIMIT (AUTHORITY fail-open guard): {}",
             super::ACTIVE_ACCEPTED_INVITES_SELECT
         );
+    }
+}
+
+#[cfg(test)]
+mod migration_recovery_tests {
+    use super::*;
+
+    // This test creates and removes its own databases on a disposable server.
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn interrupted_upgrade_is_atomic_and_old_partial_020_resumes() {
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+        let admin = PgPool::connect(&url).await.unwrap();
+        for partial in [0, 1, 2] {
+            let name = format!("migration_{}", uuid::Uuid::new_v4().simple());
+            sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+            let base = url.rsplit_once('/').unwrap().0;
+            let db = PostgresStorage { pool: PgPool::connect(&format!("{base}/{name}")).await.unwrap() };
+            sqlx::raw_sql("CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)").execute(&db.pool).await.unwrap();
+            for (v, name, sql) in PostgresStorage::pg_migrations().into_iter().filter(|(v, _, _)| *v < 20) {
+                sqlx::raw_sql(sql).execute(&db.pool).await.unwrap();
+                sqlx::query("INSERT INTO _konsensus_migrations VALUES ($1, $2)").bind(v).bind(name).execute(&db.pool).await.unwrap();
+            }
+            if partial == 0 {
+                // Kill the migration connection precisely between DDL and bookkeeping.
+                sqlx::raw_sql("CREATE FUNCTION interrupt_upgrade() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.version = 20 THEN PERFORM pg_terminate_backend(pg_backend_pid()); END IF; RETURN NEW; END $$; CREATE TRIGGER interrupt_upgrade BEFORE INSERT ON _konsensus_migrations FOR EACH ROW EXECUTE FUNCTION interrupt_upgrade();").execute(&db.pool).await.unwrap();
+                assert!(db.run_migrations().await.is_err());
+                let columns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'pending_deliveries' AND column_name IN ('state', 'dispatched')").fetch_one(&db.pool).await.unwrap();
+                // Clean up before asserting, so a red run leaves no orphan database.
+                sqlx::raw_sql("DROP TRIGGER interrupt_upgrade ON _konsensus_migrations; DROP FUNCTION interrupt_upgrade()").execute(&db.pool).await.unwrap();
+                if columns != 0 {
+                    db.pool.close().await;
+                    sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+                    panic!("interrupted migration committed {columns} columns without its version record");
+                }
+            } else {
+                sqlx::raw_sql("ALTER TABLE pending_deliveries ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'").execute(&db.pool).await.unwrap();
+                if partial == 2 {
+                    sqlx::raw_sql("ALTER TABLE pending_deliveries ADD COLUMN dispatched INTEGER NOT NULL DEFAULT 0").execute(&db.pool).await.unwrap();
+                }
+            }
+            let result = db.run_migrations().await;
+            if result.is_ok() {
+                db.run_migrations().await.unwrap();
+                let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _konsensus_migrations WHERE version >= 20").fetch_one(&db.pool).await.unwrap();
+                assert_eq!(versions, 4);
+                // Exercise retained receipt acceptance on PostgreSQL too.
+                let sender = NodeId::from_bytes([1; 32]);
+                let peer = NodeId::from_bytes([2; 32]);
+                let env = konsensus_core::UkmEnvelopeBuilder::new(0, sender, Recipient::Node(peer), vec![7], PaymentProof::new([3; 32], [4; 32], 1000)).build();
+                assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), crate::PaidAcceptance::Accepted);
+                db.prepare_delivery(&env.id, &peer).await.unwrap();
+                assert!(!db.acknowledge_pending_payment(&env.id, &peer, &sender, &[8; 32]).await.unwrap());
+                assert!(db.acknowledge_pending_payment(&env.id, &peer, &sender, &env.payment_proof.payment_hash).await.unwrap());
+                // Exercise the read-only fast path and legacy metadata upgrade.
+                sqlx::query("UPDATE payment_receipts SET accepted = 0, kind = NULL WHERE payment_hash = $1")
+                    .bind(hex::encode(env.payment_proof.payment_hash)).execute(&db.pool).await.unwrap();
+                assert!(db.is_paid_envelope_accepted(&env).await.unwrap());
+                db.record_delivery_prices(&sender, &[("kind:0".into(), 1000)], &[1], 1000, 4600).await.unwrap();
+                assert_eq!(db.delivery_price_floor(&env, 2000, 5600).await.unwrap(), Some(1000));
+                assert_eq!(db.delivery_price_floor(&env, 2000, 5601).await.unwrap(), None);
+                db.delete_messages_older_than(env.timestamp + 1).await.unwrap();
+                assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), crate::PaidAcceptance::AlreadyAccepted);
+                assert!(db.get_message(&env.id).await.unwrap().is_none());
+                assert!(db.is_paid_envelope_accepted(&env).await.unwrap());
+                let mut changed = env.clone(); changed.kind += 1;
+                assert!(!db.is_paid_envelope_accepted(&changed).await.unwrap());
+                assert_eq!(db.accept_paid_envelope(&changed).await.unwrap(), crate::PaidAcceptance::PaymentReused);
+            }
+            db.pool.close().await;
+            sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+            result.unwrap();
+        }
+        admin.close().await;
     }
 }
