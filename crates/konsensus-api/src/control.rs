@@ -1,4 +1,4 @@
-//! The owner control socket: the only channel that can write a grant (#76, P1-2).
+//! The owner control socket: local grants and approval commands (#76, P1-2).
 //!
 //! # The honest problem, stated before the mechanism
 //!
@@ -30,15 +30,19 @@
 //! `<data_dir>/control.sock` at mode `0600` is **not reachable over loopback
 //! TCP**, which is exactly what excludes the in-scope attacker class: a browser
 //! page, another OS user, a container with host networking, an SSH
-//! port-forward. There is no authenticated HTTP endpoint that does what this
-//! socket does, because the requesting app could call it.
+//! port-forward. Spend elevation and identity replacement have no HTTP approval
+//! endpoint. First-contact and gift approvals also have owner-key HTTP paths;
+//! paired credentials cannot use them, and this socket never exports a key.
 //!
 //! # Consent is the typed phrase, not the connection
 //!
 //! The node never treats "a message arrived on the socket" as consent. Each
 //! elevation/replacement request must carry an operation-bound random nonce
 //! printed only to the owner node's terminal. HTTP, socket status, and files
-//! expose no nonce. Same-uid socket access alone is insufficient.
+//! expose no nonce. Same-uid socket access alone is insufficient for those
+//! operations. First-contact and gift commands instead take the complete
+//! owner-reviewed tuple as consent; they require an owner-managed node and OS
+//! account outside the paired app's control, as the owner-key HTTP paths do.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,7 +60,7 @@ pub const SOCKET_FILE: &str = "control.sock";
 
 /// A request from the owner CLI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "op", rename_all = "kebab-case")]
+#[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlRequest {
     /// List pairings, pending elevations and pending approvals.
     Status,
@@ -74,6 +78,34 @@ pub enum ControlRequest {
         /// The budget window the owner approves. Always explicit: the node
         /// never falls back to the client's proposal on its own.
         terms: GrantTerms,
+    },
+    /// Approve one recipient and cap under this exact live budget grant.
+    ApproveFirstContact {
+        /// Paired client receiving the authorization.
+        client_id: String,
+        /// Live budget grant reviewed by the owner.
+        grant_op_id: String,
+        /// Recipient node id.
+        recipient: String,
+        /// Admission plus first-message ceiling, in msat.
+        max_total_msat: u64,
+        /// Optional exact per-contact budget, in msat.
+        contact_budget_msat: Option<u64>,
+    },
+    /// Approve the exact frozen sponsor funding intent.
+    ApproveGift {
+        /// Introduction kit id.
+        intro_id: String,
+        /// Newcomer's node key.
+        newcomer: String,
+        /// Invoice payment hash.
+        payment_hash: String,
+        /// Exact gift, in msat.
+        gift_msat: u64,
+        /// Exact fee ceiling, in msat.
+        fee_max_msat: u64,
+        /// Six-digit code compared with the newcomer.
+        code: String,
     },
     /// Revoke spend grants now — one client's, or every client's.
     RevokeGrant {
@@ -255,8 +287,8 @@ impl ReplacementGuard {
 /// Pure request/response so the typed-confirmation rules can be tested without
 /// a socket, and so the socket server has no policy of its own.
 ///
-/// Every mutating arm below is reachable ONLY from here. There is no HTTP path
-/// into any of them: `grant_elevation`, `approve_replacement` and
+/// Spend elevation and identity replacement are reachable only through owner
+/// control: `grant_elevation`, `approve_replacement` and
 /// `consume_replacement_approval` each refuse unless owner-run mode put a
 /// `0600` socket on disk, and the identity write lives in this function rather
 /// than in any handler.
@@ -335,6 +367,20 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                 ),
             },
             Err(e) => error(e),
+        },
+        ControlRequest::ApproveFirstContact {
+            client_id, grant_op_id, recipient, max_total_msat, contact_budget_msat,
+        } => match service.grant_first_contact(
+            &client_id, &grant_op_id, &recipient, max_total_msat, contact_budget_msat,
+        ) {
+            Ok(grant) => ControlResponse::Ok {
+                detail: format!("approved first contact for client {client_id}, grant {grant_op_id}, recipient {}, maximum {} msat; expires at {} (single use)",
+                    grant.recipient, grant.max_total_msat, grant.expires_at),
+            },
+            Err(e) => ControlResponse::Error { message: e.to_string() },
+        },
+        ControlRequest::ApproveGift { .. } => ControlResponse::Error {
+            message: "gift approval requires the running node's sponsor service".into(),
         },
         ControlRequest::RevokeGrant { client_id } => {
             match service.revoke_grants(client_id.as_deref()) {
@@ -551,6 +597,7 @@ pub struct ControlServer {
     path: PathBuf,
     listener: tokio::net::UnixListener,
     ctx: Arc<ControlContext>,
+    approval_state: Option<Arc<crate::state::AppState>>,
 }
 
 #[cfg(unix)]
@@ -579,7 +626,15 @@ impl ControlServer {
             path,
             listener,
             ctx,
+            approval_state: None,
         })
+    }
+
+    /// Attach the running node's services for owner-local sponsor approval.
+    /// This does not expose an HTTP route or issue a transferable credential.
+    pub fn with_approval_state(mut self, state: Arc<crate::state::AppState>) -> Self {
+        self.approval_state = Some(state);
+        self
     }
 
     /// The socket path.
@@ -596,8 +651,9 @@ impl ControlServer {
                     match accepted {
                         Ok((stream, _addr)) => {
                             let ctx = Arc::clone(&self.ctx);
+                            let approval_state = self.approval_state.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = serve_connection(stream, ctx).await {
+                                if let Err(e) = serve_connection(stream, ctx, approval_state).await {
                                     tracing::warn!(error = %e, "control socket connection failed");
                                 }
                             });
@@ -655,6 +711,7 @@ pub async fn sweep_expired_grants(
 async fn serve_connection(
     stream: tokio::net::UnixStream,
     ctx: Arc<ControlContext>,
+    approval_state: Option<Arc<crate::state::AppState>>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -665,7 +722,7 @@ async fn serve_connection(
             continue;
         }
         let response = match serde_json::from_str::<ControlRequest>(&line) {
-            Ok(req) => handle(&ctx, req),
+            Ok(req) => handle_local(&ctx, approval_state.as_ref(), req).await,
             Err(e) => ControlResponse::Error {
                 message: format!("malformed control request: {e}"),
             },
@@ -704,4 +761,35 @@ pub async fn send(socket: &Path, req: &ControlRequest) -> std::io::Result<Contro
         )
     })?;
     serde_json::from_str(&line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Socket-only dispatch. HTTP authentication never calls this function.
+#[cfg(unix)]
+async fn handle_local(
+    ctx: &ControlContext,
+    state: Option<&Arc<crate::state::AppState>>,
+    req: ControlRequest,
+) -> ControlResponse {
+    let ControlRequest::ApproveGift {
+        intro_id, newcomer, payment_hash, gift_msat, fee_max_msat, code,
+    } = req else {
+        return handle(ctx, req);
+    };
+    let Some(state) = state.filter(|state| {
+        ctx.service.owner_control_enabled()
+            && state.pairing.as_ref().is_some_and(|service| Arc::ptr_eq(service, &ctx.service))
+    }) else {
+        return ControlResponse::Error { message: "owner sponsor service unavailable".into() };
+    };
+    let body = crate::handlers::sponsor::ApproveRequest {
+        intro_id, newcomer, payment_hash, gift_msat, fee_max_msat, code,
+    };
+    let auth = crate::metered::MeteredSpend::owner_control(state);
+    match crate::handlers::sponsor::approve_owner(auth, Arc::clone(state), body).await {
+        Ok(axum::Json(paid)) => ControlResponse::Ok {
+            detail: format!("gift {}: {:?}; paid {} msat, fee {} msat, payment hash {}",
+                paid.intro_id, paid.state, paid.paid_msat, paid.fee_paid_msat, paid.payment_hash),
+        },
+        Err(e) => ControlResponse::Error { message: e.to_string() },
+    }
 }

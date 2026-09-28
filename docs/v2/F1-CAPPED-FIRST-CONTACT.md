@@ -212,3 +212,5 @@ plus the target paired `client_id` and exact budget `grant_op_id`. Paired spend
 tokens can fetch quotes and send within approved terms, but cannot mint owner
 approval. Cached quotes remain chat-only and expire at the signed BOLT11 expiry,
 which may be earlier than the admission request deadline.
+
+Owner terminal commands for the app handoff: [Owner approvals](OWNER-APPROVALS.md).

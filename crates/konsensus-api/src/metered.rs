@@ -77,6 +77,15 @@ impl FromRequestParts<Arc<AppState>> for MeteredSpend {
 }
 
 impl MeteredSpend {
+    /// Only the owner control socket may construct authority without HTTP proof.
+    #[cfg(unix)]
+    pub(crate) fn owner_control(state: &AppState) -> Self {
+        Self {
+            user: AuthUser { node_id: state.identity.node_id().to_hex(), scopes: vec![Scope::Spend], pairing: None },
+            meter: Meter::Owner,
+        }
+    }
+
     /// Whether this caller spends from a budget grant.
     pub fn is_metered(&self) -> bool {
         matches!(self.meter, Meter::Grant { .. })

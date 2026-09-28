@@ -1057,3 +1057,32 @@ mod liquidity_authority_tests {
         assert!(resolve_terms(&flags, Some(&proposal)).unwrap().allow_liquidity_fees);
     }
 }
+
+/// Print the complete reviewed tuple, flush it, then act over the owner socket.
+/// The explicit flags are the owner's consent; no paired credential is accepted.
+pub async fn cmd_approve(command: crate::cli::ApprovalCommand) -> Result<()> {
+    use crate::cli::ApprovalCommand;
+    let (config, request, summary) = match command {
+        ApprovalCommand::FirstContact { client, op, to, max_msat, contact_budget_msat, config } => {
+            let summary = format!(
+                "Approve first contact: client {client}, grant {op}, recipient {to}, maximum {max_msat} msat, contact budget {}.",
+                contact_budget_msat.map(|n| format!("{n} msat")).unwrap_or_else(|| "unchanged".into())
+            );
+            (config, ControlRequest::ApproveFirstContact {
+                client_id: client, grant_op_id: op, recipient: to,
+                max_total_msat: max_msat, contact_budget_msat,
+            }, summary)
+        }
+        ApprovalCommand::Gift { intro, newcomer, hash, gift_msat, fee_max_msat, code, config } => {
+            let summary = format!(
+                "Approve gift: introduction {intro}, newcomer {newcomer}, payment hash {hash}, gift {gift_msat} msat, maximum fee {fee_max_msat} msat, code {code}."
+            );
+            (config, ControlRequest::ApproveGift {
+                intro_id: intro, newcomer, payment_hash: hash, gift_msat, fee_max_msat, code,
+            }, summary)
+        }
+    };
+    println!("{summary}");
+    std::io::stdout().flush()?;
+    report(send(&config, request).await?)
+}
