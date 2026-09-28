@@ -19,6 +19,8 @@ pub(super) struct ReadmissionSettlement {
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Attempt {
+    #[serde(default)]
+    pub max_routing_fee_msat: Option<u64>,
     pub payment_hash: String,
     pub amount_msat: u64,
     pub quote: Option<(u16, u64)>,

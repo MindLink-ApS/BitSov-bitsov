@@ -251,6 +251,7 @@ fn inbound_payment_from_received_event(
 /// on any successful payment. This ensures `is_available()` reflects actual
 /// payment capability, not just whether the LDK node is running.
 pub struct LdkProvider {
+    routing_fee_policy: konsensus_core::traits::lightning::RoutingFeePolicy,
     liquidity: Option<LiquidityClient>,
     liquidity_info: LiquidityInfo,
     node: Arc<LdkNode>,
@@ -293,9 +294,15 @@ impl std::fmt::Debug for LdkProvider {
 static INVOICE_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl LdkProvider {
+    /// Configure the ordinary payment fee ceiling before sharing this provider.
+    pub fn with_routing_fee_policy(mut self, policy: konsensus_core::traits::lightning::RoutingFeePolicy) -> Self {
+        self.routing_fee_policy = policy;
+        self
+    }
+
     async fn pay_invoice_routed(
         &self, bolt11: &str,
-        route_parameters: Option<ldk_node::lightning::routing::router::RouteParametersConfig>,
+        max_fee_msat: u64, fresh_hash: bool,
     ) -> Result<PaymentDetails, LightningError> {
         let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11
             .parse()
@@ -308,20 +315,13 @@ impl LdkProvider {
             .map_err(|_| LightningError::PaymentNotDispatched("invoice dispatch lock poisoned".into()))?;
         let payment_id_bytes: [u8; 32] = AsRef::<[u8]>::as_ref(invoice.payment_hash()).try_into()
             .map_err(|_| LightningError::PaymentNotDispatched("invalid payment hash".into()))?;
-        if route_parameters.is_some()
+        if fresh_hash
             && self.node.payment(&ldk_node::lightning::ln::channelmanager::PaymentId(payment_id_bytes)).is_some() {
             return Err(LightningError::PaymentNotDispatched("capped payments require a fresh invoice hash".into()));
         }
-        let payment_id = self
-            .node
-            .bolt11_payment()
-            .send(&invoice, route_parameters)
-            .map_err(|e| {
-                // Mark as payment-incapable on channel/funding errors
-                self.payment_capable.store(false, Ordering::Relaxed);
-                warn!(error = %e, "LDK payment failed — marking as payment-incapable");
-                LightningError::PaymentFailed(format!("{e}"))
-            })?;
+        let payment_id = dispatch_invoice_with_fee_limit(&invoice, max_fee_msat,
+            |invoice, route| self.node.bolt11_payment().send(invoice, route))
+            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         // Successful send — ensure the capability flag is set
         self.payment_capable.store(true, Ordering::Relaxed);
@@ -516,6 +516,7 @@ impl LdkProvider {
             p.node_id.clone(), Arc::new(LdkJitBackend(Arc::clone(&node))),
         ));
         Ok(Self {
+            routing_fee_policy: Default::default(),
             liquidity,
             liquidity_info: config.liquidity.info(),
             node,
@@ -539,6 +540,7 @@ impl LdkProvider {
         // inbound stream simply stays empty.
         let (inbound_tx, _) = broadcast::channel(INBOUND_BROADCAST_CAPACITY);
         Self {
+            routing_fee_policy: Default::default(),
             liquidity: None,
             liquidity_info: LiquidityInfo::default(),
             node,
@@ -921,6 +923,7 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
+    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy { self.routing_fee_policy }
     fn liquidity_info(&self) -> LiquidityInfo { self.liquidity_info.clone() }
 
     async fn quote_liquidity(&self, owner: &str, gross_msat: u64, max_fee_msat: u64) -> Result<LiquidityQuote, LightningError> {
@@ -1028,15 +1031,14 @@ impl LightningProvider for LdkProvider {
     }
 
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
-        self.pay_invoice_routed(bolt11, None).await
+        let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11.parse()
+            .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
+        let amount = invoice.amount_milli_satoshis().ok_or_else(|| LightningError::PaymentNotDispatched("amountless invoice".into()))?;
+        self.pay_invoice_routed(bolt11, self.routing_fee_policy.ceiling(amount, None), false).await
     }
 
     async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
-        let route = ldk_node::lightning::routing::router::RouteParametersConfig {
-            max_total_routing_fee_msat: Some(max_fee_msat),
-            ..Default::default()
-        };
-        self.pay_invoice_routed(bolt11, Some(route)).await
+        self.pay_invoice_routed(bolt11, max_fee_msat, true).await
     }
 
     #[instrument(skip(self), fields(payment_hash))]
@@ -1140,21 +1142,21 @@ impl LightningProvider for LdkProvider {
         &self,
         dest_pubkey: &str,
         amount_msat: u64,
-        _memo: Option<&str>,
+        memo: Option<&str>,
+    ) -> Result<PaymentDetails, LightningError> {
+        self.keysend_with_fee_limit(dest_pubkey, amount_msat, memo, self.routing_fee_policy.ceiling(amount_msat, None)).await
+    }
+
+    async fn keysend_with_fee_limit(
+        &self, dest_pubkey: &str, amount_msat: u64, _memo: Option<&str>, max_fee_msat: u64,
     ) -> Result<PaymentDetails, LightningError> {
         let pubkey: bitcoin::secp256k1::PublicKey = dest_pubkey
             .parse()
             .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid destination pubkey: {e}")))?;
 
-        let payment_id = self
-            .node
-            .spontaneous_payment()
-            .send(amount_msat, pubkey, None)
-            .map_err(|e| {
-                self.payment_capable.store(false, Ordering::Relaxed);
-                warn!(error = %e, "LDK keysend failed — marking as payment-incapable");
-                LightningError::PaymentFailed(format!("keysend failed: {e}"))
-            })?;
+        let payment_id = dispatch_keysend_with_fee_limit(amount_msat, pubkey, max_fee_msat,
+            |amount, dest, route| self.node.spontaneous_payment().send(amount, dest, route))
+            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         // Successful send — ensure the capability flag is set
         self.payment_capable.store(true, Ordering::Relaxed);
@@ -1206,15 +1208,9 @@ impl LightningProvider for LdkProvider {
             .parse()
             .map_err(|e| LightningError::Backend(format!("invalid destination pubkey: {e}")))?;
 
-        let payment_id = self
-            .node
-            .spontaneous_payment()
-            .send_with_custom_tlvs(amount_msat, pubkey, None, custom_tlvs)
-            .map_err(|e| {
-                self.payment_capable.store(false, Ordering::Relaxed);
-                warn!(error = %e, "LDK keysend_with_binding failed — marking as payment-incapable");
-                LightningError::PaymentFailed(format!("keysend_with_binding failed: {e}"))
-            })?;
+        let payment_id = dispatch_keysend_with_fee_limit(amount_msat, pubkey, self.routing_fee_policy.ceiling(amount_msat, None),
+            |amount, dest, route| self.node.spontaneous_payment().send_with_custom_tlvs(amount, dest, route, custom_tlvs))
+            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1908,6 +1904,45 @@ fn jit_receipt(p: &ldk_node::payment::PaymentDetails) -> Result<Option<Liquidity
         }
     }
     Ok(None)
+}
+
+/// Always provide an explicit LDK override: its default includes a 50,000 msat floor.
+fn routing_fee_parameters(max_fee_msat: u64) -> ldk_node::lightning::routing::router::RouteParametersConfig {
+    ldk_node::lightning::routing::router::RouteParametersConfig {
+        max_total_routing_fee_msat: Some(max_fee_msat), ..Default::default()
+    }
+}
+
+// Small dispatch seams let tests capture the exact arguments delivered to LDK.
+fn dispatch_invoice_with_fee_limit<T>(
+    invoice: &ldk_node::lightning_invoice::Bolt11Invoice, max_fee_msat: u64,
+    send: impl FnOnce(&ldk_node::lightning_invoice::Bolt11Invoice, Option<ldk_node::lightning::routing::router::RouteParametersConfig>) -> T,
+) -> T {
+    send(invoice, Some(routing_fee_parameters(max_fee_msat)))
+}
+fn dispatch_keysend_with_fee_limit<T>(
+    amount: u64, dest: bitcoin::secp256k1::PublicKey, max_fee_msat: u64,
+    send: impl FnOnce(u64, bitcoin::secp256k1::PublicKey, Option<ldk_node::lightning::routing::router::RouteParametersConfig>) -> T,
+) -> T {
+    send(amount, dest, Some(routing_fee_parameters(max_fee_msat)))
+}
+
+/// Pinned ldk-node bolt11/spontaneous send paths return PaymentSendingFailed
+/// only for RetryableSendFailure BEFORE any HTLC dispatch (including RouteNotFound).
+/// PersistenceFailed can occur after dispatch; DuplicatePayment can refer to an
+/// earlier live attempt. Neither proves that the liability is absent.
+fn classify_dispatch_error(error: ldk_node::NodeError, payment_capable: &AtomicBool) -> LightningError {
+    use ldk_node::NodeError::*;
+    match error {
+        PaymentSendingFailed | InvalidInvoice | InvalidAmount | InvalidCustomTlvs | NotRunning => {
+            LightningError::PaymentNotDispatched(error.to_string())
+        }
+        DuplicatePayment => LightningError::PaymentFailed(error.to_string()),
+        _ => {
+            payment_capable.store(false, Ordering::Relaxed);
+            LightningError::PaymentFailed(error.to_string())
+        }
+    }
 }
 
 // Keep the LDK API boundary injectable so tests observe calls without connecting

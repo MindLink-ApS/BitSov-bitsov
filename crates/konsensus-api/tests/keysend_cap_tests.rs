@@ -11,7 +11,10 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-async fn post(state: &Arc<AppState>, path: &str, body: Value) -> (StatusCode, Value) {
+async fn post(state: &Arc<AppState>, path: &str, mut body: Value) -> (StatusCode, Value) {
+    if path == "/api/v1/messages/compose" || (path.starts_with("/api/v1/files/") && path.ends_with("/send")) {
+        body["max_routing_fee_msat"] = json!(0);
+    }
     let response = test_router(state.clone())
         .oneshot(
             Request::builder()
@@ -65,6 +68,14 @@ impl MixedLightning {
 
 #[async_trait]
 impl LightningProvider for MixedLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn create_invoice(
         &self,
         amount_msat: u64,

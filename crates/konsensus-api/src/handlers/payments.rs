@@ -189,6 +189,8 @@ async fn get_balance(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PayInvoiceRequest {
+    #[serde(default)]
+    pub max_routing_fee_msat: Option<u64>,
     /// BOLT11 payment request string.
     pub bolt11: String,
 }
@@ -196,6 +198,7 @@ pub struct PayInvoiceRequest {
 /// Response after paying an invoice.
 #[derive(Serialize)]
 pub struct PayInvoiceResponse {
+    pub max_routing_fee_msat: u64,
     /// Payment hash (hex).
     pub payment_hash: String,
     /// Amount paid in millisatoshis.
@@ -223,6 +226,12 @@ async fn pay_invoice(
         )));
     }
 
+    let (principal, _) = invoice_terms(&req.bolt11).map_err(|error| {
+        if !auth.is_metered() && matches!(error, ApiError::BudgetExceeded(_)) {
+            ApiError::BadRequest("amountless invoices are not supported; request an invoice with an amount".into())
+        } else { error }
+    })?;
+    let max_routing_fee_msat = state.lightning.routing_fee_policy().ceiling(principal, req.max_routing_fee_msat);
     // G1: a metered caller's debit needs the amount and payee before paying.
     let debit = if auth.is_metered() {
         let (amount_msat, payee) = invoice_terms(&req.bolt11)?;
@@ -231,9 +240,9 @@ async fn pay_invoice(
                 &state,
                 vec![Charge {
                     recipient: payee.clone(),
-                    amount_msat,
+                    amount_msat: amount_msat.checked_add(max_routing_fee_msat).ok_or_else(|| ApiError::BadRequest("payment debit overflow".into()))?,
                 }],
-            )?,
+            ).map_err(|e| e.with_routing_fee(max_routing_fee_msat))?,
             payee,
         ))
     } else {
@@ -242,18 +251,22 @@ async fn pay_invoice(
 
     let unmetered = Debit::unmetered();
     let guard = debit.as_ref().map(|(debit, _)| debit).unwrap_or(&unmetered);
-    let paid = guard.dispatch(state.lightning.pay_invoice(&req.bolt11)).await?;
+    let paid = guard.dispatch(state.lightning.pay_invoice_with_fee_limit(&req.bolt11, max_routing_fee_msat)).await.map_err(|e| e.with_routing_fee(max_routing_fee_msat))?;
     if let Some((debit, payee)) = &debit {
         resolve_payment(debit, payee, &paid);
     }
-    let details = paid.map_err(|e| ApiError::Lightning(e.to_string()))?;
+    let details = paid.map_err(|e| ApiError::Lightning(e.to_string()).with_routing_fee(max_routing_fee_msat))?;
 
+    if matches!(details.status, konsensus_core::traits::lightning::PaymentStatus::Failed | konsensus_core::traits::lightning::PaymentStatus::Expired) {
+        return Err(ApiError::Lightning("invoice payment failed before settlement".into()).with_routing_fee(max_routing_fee_msat));
+    }
     let preimage = details.preimage.unwrap_or_else(|| {
         tracing::warn!(payment_hash = %details.payment_hash, "payment succeeded but no preimage returned");
         String::new()
     });
 
     Ok(Json(PayInvoiceResponse {
+        max_routing_fee_msat,
         payment_hash: details.payment_hash,
         amount_msat: details.amount_msat,
         preimage,
@@ -264,6 +277,8 @@ async fn pay_invoice(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeysendRequest {
+    #[serde(default)]
+    pub max_routing_fee_msat: Option<u64>,
     /// Destination Lightning node public key (hex, 66 chars).
     pub dest_pubkey: String,
     /// Amount in millisatoshis.
@@ -276,6 +291,7 @@ pub struct KeysendRequest {
 /// Response after a keysend payment.
 #[derive(Serialize)]
 pub struct KeysendResponse {
+    pub max_routing_fee_msat: u64,
     /// Payment hash (hex).
     pub payment_hash: String,
     /// Amount paid in millisatoshis.
@@ -325,6 +341,7 @@ async fn keysend(
         )));
     }
 
+    let max_routing_fee_msat = state.lightning.routing_fee_policy().ceiling(req.amount_msat, req.max_routing_fee_msat);
     // G1: debit a metered caller before the keysend is dispatched.
     let dest = req.dest_pubkey.trim().to_ascii_lowercase();
     let debit = if auth.is_metered() {
@@ -335,9 +352,9 @@ async fn keysend(
             &state,
             vec![Charge {
                 recipient: key,
-                amount_msat: req.amount_msat,
+                amount_msat: req.amount_msat.checked_add(max_routing_fee_msat).ok_or_else(|| ApiError::BadRequest("payment debit overflow".into()))?,
             }],
-        )?)
+        ).map_err(|e| e.with_routing_fee(max_routing_fee_msat))?)
     } else {
         None
     };
@@ -346,16 +363,17 @@ async fn keysend(
     let guard = debit.as_ref().unwrap_or(&unmetered);
     let paid = guard.dispatch(state
         .lightning
-        .keysend(&req.dest_pubkey, req.amount_msat, req.memo.as_deref()))
-        .await?;
+        .keysend_with_fee_limit(&req.dest_pubkey, req.amount_msat, req.memo.as_deref(), max_routing_fee_msat))
+        .await.map_err(|e| e.with_routing_fee(max_routing_fee_msat))?;
     if let Some(debit) = &debit {
         resolve_payment(debit, &dest, &paid);
     }
-    let details = paid.map_err(|e| ApiError::Lightning(e.to_string()))?;
+    let details = paid.map_err(|e| ApiError::Lightning(e.to_string()).with_routing_fee(max_routing_fee_msat))?;
 
     let preimage = details.preimage.unwrap_or_default();
 
     Ok(Json(KeysendResponse {
+        max_routing_fee_msat,
         payment_hash: details.payment_hash,
         amount_msat: details.amount_msat,
         preimage,
@@ -398,7 +416,7 @@ pub(crate) fn resolve_payment(
 ) {
     use konsensus_core::traits::lightning::PaymentStatus;
     match paid {
-        Ok(d) if d.status == PaymentStatus::Settled => debit.settled(recipient, d.amount_msat),
+        Ok(d) if d.status == PaymentStatus::Settled => { debit.record_payment(recipient, d); debit.settled(recipient, d.amount_msat); },
         Ok(d) if matches!(d.status, PaymentStatus::Failed | PaymentStatus::Expired) => {
             debit.released(recipient)
         }

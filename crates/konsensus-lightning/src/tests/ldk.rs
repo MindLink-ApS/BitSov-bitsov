@@ -783,6 +783,47 @@ fn jit_purpose_fee_and_net_survive_ldk_serialization_without_admission_proof() {
     }
 }
 
+#[test]
+fn invoice_and_keysend_ldk_call_arguments_include_exact_fee_ceiling() {
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    let key = SecretKey::from_slice(&[42; 32]).unwrap();
+    let secp = Secp256k1::new();
+    let dest = key.public_key(&secp);
+    let invoice = InvoiceBuilder::new(Currency::Regtest)
+        .description("fee cap".into())
+        .payment_hash(sha256::Hash::hash(&[7; 32]))
+        .payment_secret(PaymentSecret([8; 32]))
+        .current_timestamp().min_final_cltv_expiry_delta(18)
+        .amount_milli_satoshis(1000)
+        .build_signed(|h| secp.sign_ecdsa_recoverable(h, &key)).unwrap();
+    for ceiling in [0, 7, 1000, 100_000] {
+        dispatch_invoice_with_fee_limit(&invoice, ceiling, |arg, route| {
+            assert_eq!(arg, &invoice);
+            assert_eq!(route.unwrap().max_total_routing_fee_msat, Some(ceiling));
+        });
+        dispatch_keysend_with_fee_limit(1000, dest, ceiling, |amount, recipient, route| {
+            assert_eq!(amount, 1000);
+            assert_eq!(recipient, dest);
+            assert_eq!(route.unwrap().max_total_routing_fee_msat, Some(ceiling));
+        });
+    }
+}
+
+#[test]
+fn dispatch_error_classification_retains_ambiguous_liabilities() {
+    use ldk_node::NodeError;
+    for error in [NodeError::PaymentSendingFailed, NodeError::InvalidInvoice,
+        NodeError::InvalidAmount, NodeError::InvalidCustomTlvs, NodeError::NotRunning] {
+        let capable = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(super::classify_dispatch_error(error, &capable), LightningError::PaymentNotDispatched(_)));
+        assert!(capable.load(std::sync::atomic::Ordering::Relaxed));
+    }
+    for error in [NodeError::PersistenceFailed, NodeError::DuplicatePayment] {
+        assert!(matches!(super::classify_dispatch_error(error, &std::sync::atomic::AtomicBool::new(true)), LightningError::PaymentFailed(_)));
+    }
+}
 
 const CHANNEL_PEER: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 

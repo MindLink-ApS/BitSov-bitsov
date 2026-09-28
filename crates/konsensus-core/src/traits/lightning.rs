@@ -7,6 +7,33 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+
+/// Routing-fee authorization, independent of the recipient's principal price.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutingFeePolicy {
+    /// Minimum ordinary fee allowance, msat.
+    pub minimum_msat: u64,
+    /// Proportional allowance in parts per million (10,000 = 1%).
+    pub proportional_millionths: u64,
+    /// Absolute ordinary fee ceiling, msat.
+    pub maximum_msat: u64,
+}
+impl Default for RoutingFeePolicy {
+    fn default() -> Self {
+        Self { minimum_msat: 5_000, proportional_millionths: 10_000, maximum_msat: 10_000 }
+    }
+}
+impl RoutingFeePolicy {
+    /// A caller may tighten, never widen, ordinary routing authority.
+    pub fn ceiling(&self, principal: u64, caller: Option<u64>) -> u64 {
+        if principal == 0 { return 0; }
+        let proportional = (u128::from(principal) * u128::from(self.proportional_millionths) / 1_000_000)
+            .min(u128::from(u64::MAX)) as u64;
+        proportional.max(self.minimum_msat).min(self.maximum_msat).min(caller.unwrap_or(u64::MAX))
+    }
+}
+
 /// Status of a Lightning payment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PaymentStatus {
@@ -262,6 +289,16 @@ pub trait LightningProvider: Send + Sync {
         _expiry_secs: u32,
     ) -> Result<Invoice, LightningError> {
         Err(LightningError::StatelessQuoteUnsupported)
+    }
+
+    /// The policy used by ordinary outgoing payments and pre-dispatch budgets.
+    fn routing_fee_policy(&self) -> RoutingFeePolicy { RoutingFeePolicy::default() }
+
+    /// Send with a routing ceiling enforced before dispatch; unsupported backends refuse.
+    async fn keysend_with_fee_limit(
+        &self, _dest: &str, _amount: u64, _memo: Option<&str>, _max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
+        Err(LightningError::PaymentNotDispatched("backend cannot enforce keysend routing fee limit".into()))
     }
 
     /// Pay a BOLT11 invoice.
@@ -676,5 +713,22 @@ mod tests {
     #[tokio::test]
     async fn wallet_sync_defaults_to_live() {
         assert_eq!(QueryPerCall.wallet_sync().await, WalletSync::Live);
+    }
+}
+
+#[cfg(test)]
+mod routing_fee_policy_tests {
+    use super::*;
+    #[test]
+    fn default_policy_bounds_small_large_and_overflowing_inputs() {
+        let p = RoutingFeePolicy::default();
+        for (amount, expected) in [(0,0), (1,5000), (1000,5000), (100_000,5000), (500_000,5000), (1_000_000,10000), (u64::MAX,10000)] {
+            assert_eq!(p.ceiling(amount, None), expected);
+            assert_eq!(p.ceiling(amount, Some(0)), 0);
+            assert_eq!(p.ceiling(amount, Some(u64::MAX)), expected);
+        }
+        let p = RoutingFeePolicy { minimum_msat: 300, proportional_millionths: u64::MAX, maximum_msat: 700 };
+        assert_eq!(p.ceiling(u64::MAX, None), 700);
+        assert_eq!(p.ceiling(u64::MAX, Some(500)), 500);
     }
 }

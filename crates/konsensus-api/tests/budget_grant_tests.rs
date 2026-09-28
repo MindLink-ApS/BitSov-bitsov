@@ -53,6 +53,8 @@ const FAILED: u8 = 3;
 /// Counts every money-moving call and settles, loses, refuses or fails it.
 #[derive(Default)]
 struct Wallet {
+    fee: AtomicU64,
+    unknown_fee: AtomicBool,
     outgoing: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
     liquidity: std::sync::Mutex<Option<Arc<konsensus_lightning::liquidity::LiquidityClient>>>,
     mode: AtomicU8,
@@ -109,13 +111,20 @@ impl Wallet {
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
             memo: None,
-            fee_msat: None,
+            fee_msat: (!self.unknown_fee.load(Ordering::SeqCst)).then(|| self.fee.load(Ordering::SeqCst)),
         })
     }
 }
 
 #[async_trait]
 impl LightningProvider for Wallet {
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        if self.fee.load(Ordering::SeqCst) > _cap {
+            return Err(LightningError::PaymentNotDispatched("route exceeds fee ceiling".into()));
+        }
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn quote_liquidity(&self, owner: &str, gross: u64, cap: u64) -> Result<konsensus_core::traits::liquidity::LiquidityQuote, LightningError> {
         let client = self.liquidity.lock().unwrap().clone().unwrap();
         client.quote(owner, gross, cap).await
@@ -138,10 +147,12 @@ impl LightningProvider for Wallet {
             .await
     }
     async fn pay_invoice_with_fee_limit(&self, bolt11: &str, _max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
+        if self.fee.load(Ordering::SeqCst) > _max_fee_msat {
+            return Err(LightningError::PaymentNotDispatched("route exceeds fee ceiling".into()));
+        }
         let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
         let mut paid = self.pay_invoice(bolt11).await?;
         paid.payment_hash = invoice.payment_hash().to_string();
-        paid.fee_msat = Some(0);
         Ok(paid)
     }
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
@@ -426,6 +437,12 @@ async fn call(
     body: Option<Value>,
     token: Option<&str>,
 ) -> (StatusCode, Value) {
+    let mut body = body;
+    if uri == "/api/v1/messages/compose" || uri == "/api/v1/payments/pay" || uri == "/api/v1/payments/keysend" || (uri.starts_with("/api/v1/files/") && uri.ends_with("/send")) {
+        if let Some(Value::Object(fields)) = &mut body {
+            fields.entry("max_routing_fee_msat").or_insert(json!(0));
+        }
+    }
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
@@ -1290,4 +1307,65 @@ async fn zero_charge_resolution_consumes_its_durable_reservation() {
         vec![Charge { recipient: fx.peer.to_hex(), amount_msat: 0 }]).unwrap();
     fx.service.resolve_spend(&reservation, &fx.peer.to_hex(), 0);
     assert!(fx.service.snapshot().grants[0].budget.as_ref().unwrap().pending.is_empty());
+}
+
+#[tokio::test]
+async fn all_in_reservation_settles_actual_fee_and_holds_unknown_fee() {
+    let fx = fixture().await;
+    fx.wallet.fee.store(400, Ordering::SeqCst);
+    let token = fx.grant(None, GrantTerms::new(2000)).await;
+    let request = json!({"dest_pubkey":PEER_LN,"amount_msat":1000,"max_routing_fee_msat":1000});
+    let (status, receipt) = fx.call("POST", "/api/v1/payments/keysend", Some(request.clone()), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["max_routing_fee_msat"], 1000);
+    assert_eq!(fx.used(), 1400);
+    let (status, _) = fx.call("POST", "/api/v1/payments/keysend", Some(request.clone()), Some(&token)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(fx.wallet.money(), 1);
+
+    fx.wallet.unknown_fee.store(true, Ordering::SeqCst);
+    let token = fx.grant(None, GrantTerms::new(2000)).await;
+    let (status, receipt) = fx.call("POST", "/api/v1/payments/keysend", Some(request), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(fx.used(), 2000, "unknown fee retains full durable liability");
+}
+
+#[tokio::test]
+async fn all_in_invoice_reserves_fee_before_dispatch_and_settles_actual_fee() {
+    let fx = fixture().await;
+    fx.wallet.fee.store(400, Ordering::SeqCst);
+    let invoice = create_test_bolt11(1000);
+    let request = json!({"bolt11":invoice,"max_routing_fee_msat":1000});
+    let token = fx.grant(None, GrantTerms::new(1999)).await;
+    assert_eq!(fx.call("POST", "/api/v1/payments/pay", Some(request.clone()), Some(&token)).await.0, StatusCode::CONFLICT);
+    assert_eq!(fx.wallet.money(), 0);
+    let token = fx.grant(None, GrantTerms::new(2000)).await;
+    let (status, receipt) = fx.call("POST", "/api/v1/payments/pay", Some(request), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["max_routing_fee_msat"], 1000);
+    assert_eq!(fx.used(), 1400);
+}
+
+#[tokio::test]
+async fn invoice_fee_refusal_releases_message_reservation() {
+    let mut fx = fixture().await;
+    let peer = fx.peer;
+    let requests = fx.state.invoice_requests.clone();
+    Arc::get_mut(&mut fx.state).unwrap().transport = Arc::new(
+        ConnectedStubTransport::new(vec![peer], requests).with_invoice_responder(move |_, amount| {
+            let bolt11 = create_test_bolt11(amount);
+            let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse().unwrap();
+            Some(konsensus_api::state::InvoiceResponseData {
+                payment_hash: invoice.payment_hash().to_string(), recipient: peer, bolt11,
+            })
+        })
+    );
+    fx.wallet.fee.store(1, Ordering::SeqCst);
+    fx.state.peer_ln_pubkeys.lock().await.clear();
+    let token = fx.grant(None, GrantTerms::new(2000)).await;
+    let (status, receipt) = fx.compose(&token).await; // explicitly requests a zero-fee route
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{receipt}");
+    assert_eq!(receipt["max_routing_fee_msat"], 0);
+    assert_eq!(fx.wallet.money(), 0);
+    assert_eq!(fx.used(), 0, "positive non-dispatch releases all authority");
 }

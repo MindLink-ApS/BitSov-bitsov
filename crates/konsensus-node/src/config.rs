@@ -91,6 +91,10 @@ impl NodeTier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    /// Ordinary Lightning routing fees; sponsor gifts use their separately approved cap.
+    #[serde(default)]
+    pub routing_fees: konsensus_core::traits::lightning::RoutingFeePolicy,
+
     /// User-facing onboarding tier (cloud, light, full).
     /// Determines default backends and UI presentation.
     #[serde(default)]
@@ -955,7 +959,15 @@ impl NodeConfig {
     /// (e.g. the `--admission-mode` CLI override in `cmd_start`) can RE-validate
     /// the final config — `from_config` does not validate, so a post-load mutation
     /// would otherwise escape the fail-closed guards.
+    pub(crate) fn validate_routing_fee_backend(&self) -> anyhow::Result<()> {
+        if matches!(self.lightning, LightningConfig::Lnbits { .. }) {
+            anyhow::bail!("not_supported: LNbits cannot enforce per-payment routing fee ceilings; configure LDK or LND");
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.validate_routing_fee_backend()?;
         self.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?;
         // Check mnemonic file exists and is readable
         if !self.identity.mnemonic_file.exists() {
@@ -1313,6 +1325,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            routing_fees: Default::default(),
             tier,
             identity: IdentityConfig {
                 mnemonic_file,

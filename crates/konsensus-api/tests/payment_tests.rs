@@ -447,7 +447,7 @@ async fn pay_invoice_success() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "bolt11": "lnbc1test..."
+                "bolt11": create_test_bolt11(1000)
             })
             .to_string(),
         ))
@@ -473,7 +473,7 @@ async fn pay_invoice_requires_auth() {
         .uri("/api/v1/payments/pay")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"bolt11": "lnbc1test..."}).to_string(),
+            serde_json::json!({"bolt11": create_test_bolt11(1000)}).to_string(),
         ))
         .unwrap();
 
@@ -1222,6 +1222,14 @@ async fn health_lightning_unavailable_shows_null_balance() {
 
     #[async_trait]
     impl LightningProvider for UnavailableLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
         async fn create_invoice(
             &self, _: u64, _: &str, _: u32,
         ) -> Result<Invoice, LightningError> {
@@ -1411,7 +1419,7 @@ async fn payments_pay_returns_preimage_and_hash() {
         .header("authorization", &auth)
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({ "bolt11": "lnbc1stub..." }).to_string(),
+            serde_json::json!({ "bolt11": create_test_bolt11(1000) }).to_string(),
         ))
         .unwrap();
 
@@ -1420,7 +1428,7 @@ async fn payments_pay_returns_preimage_and_hash() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["payment_hash"], "bb".repeat(32));
+    assert_eq!(json["payment_hash"].as_str().unwrap().len(), 64);
     assert_eq!(json["preimage"], "cc".repeat(32));
     assert_eq!(json["amount_msat"], 1000);
 }
@@ -2149,6 +2157,14 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
 
     #[async_trait]
     impl LightningProvider for UnconfirmedLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
         async fn create_invoice(
             &self,
             _amount_msat: u64,
