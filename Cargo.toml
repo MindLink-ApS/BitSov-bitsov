@@ -122,7 +122,7 @@ subtle = "2"
 # Misc
 bytes = "1"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 unicode-normalization = "0.1"
 
 [patch.crates-io]

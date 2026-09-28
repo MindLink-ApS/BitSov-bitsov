@@ -796,38 +796,218 @@ async fn compacted_mistagged_failed_paid_retry_never_repays() {
     );
 }
 
-#[tokio::test]
-async fn recovery_offline_backoff_is_exponential_capped_and_survives_restart() {
-    let mut f = Fixture::new().await;
-    Arc::get_mut(&mut f.state).unwrap().transport = Arc::new(ReceiptTransport {
-        db: f.db.clone(), peer: f.peer, fail_write: true,
-    });
-    assert_eq!(f.post().await.0, StatusCode::OK);
-    assert_eq!(f.op().await.state, "paid");
-    let attempts = f.op().await.attempts;
-    for delay in [15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000] {
-        f.restart().await;
-        Arc::get_mut(&mut f.state).unwrap().transport = Arc::new(common::StubTransport);
-        let before = chrono::Utc::now().timestamp_millis();
-        konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
-        let op = f.op().await;
-        assert_eq!(op.state, "paid");
-        assert_eq!(op.attempts, attempts, "offline recovery must not mark a send intent");
-        let data: serde_json::Value = serde_json::from_slice(&op.recovery).unwrap();
-        let due = data["resend_after_ms"].as_i64().unwrap();
-        assert!(due >= before + delay && due <= chrono::Utc::now().timestamp_millis() + delay);
-        konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
-        assert_eq!(f.op().await.version, op.version, "no per-tick retry bookkeeping");
-        // Move just the persisted deadline into the past; no wall-clock sleeps.
-        sqlx::query("UPDATE outbox_operations SET recovery = CAST(json_set(CAST(recovery AS TEXT), '$.resend_after_ms', 0) AS BLOB)")
-            .execute(f.db.pool()).await.unwrap();
+/// Peer reachability scripted by the test. Every write is counted; a
+/// successful one is acknowledged like a real recipient would.
+struct PacedTransport {
+    db: Arc<SqliteStorage>,
+    peer: NodeId,
+    online: AtomicBool,
+    fail_write: AtomicBool,
+    generation: std::sync::Mutex<std::time::Instant>,
+    writes: AtomicUsize,
+}
+impl PacedTransport {
+    fn install(f: &mut Fixture, online: bool, fail_write: bool) -> Arc<Self> {
+        let transport = Arc::new(Self {
+            db: f.db.clone(),
+            peer: f.peer,
+            online: AtomicBool::new(online),
+            fail_write: AtomicBool::new(fail_write),
+            generation: std::sync::Mutex::new(std::time::Instant::now()),
+            writes: AtomicUsize::new(0),
+        });
+        Arc::get_mut(&mut f.state).unwrap().transport = transport.clone();
+        transport
+
     }
-    f.restart().await; // connected again
+    fn reconnect(&self) {
+        *self.generation.lock().unwrap() = std::time::Instant::now();
+        self.online.store(true, Ordering::SeqCst);
+    }
+}
+#[async_trait::async_trait]
+impl konsensus_core::traits::transport::MessageTransport for PacedTransport {
+    async fn send(
+        &self,
+        peer: &NodeId,
+        env: &konsensus_core::UkmEnvelope,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        if !self.online.load(Ordering::SeqCst) || self.fail_write.load(Ordering::SeqCst) {
+            return Err(konsensus_core::traits::transport::TransportError::NotConnected(
+                "peer unreachable".into(),
+            ));
+        }
+        assert!(self.db.acknowledge_pending(&env.id, peer, &env.sender).await.unwrap());
+        Ok(())
+    }
+    async fn recv(
+        &self,
+    ) -> Result<konsensus_core::UkmEnvelope, konsensus_core::traits::transport::TransportError>
+    {
+        futures::future::pending().await
+    }
+    async fn connect(
+        &self,
+        _: &NodeId,
+        _: &str,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+    async fn disconnect(
+        &self,
+        _: &NodeId,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        Ok(())
+    }
+    async fn is_connected(&self, peer: &NodeId) -> bool {
+        peer == &self.peer && self.online.load(Ordering::SeqCst)
+    }
+    async fn connected_peers(&self) -> Vec<NodeId> {
+        if self.online.load(Ordering::SeqCst) { vec![self.peer] } else { Vec::new() }
+    }
+    async fn connected_since(&self, peer: &NodeId) -> Option<std::time::Instant> {
+        self.is_connected(peer)
+            .await
+            .then(|| *self.generation.lock().unwrap())
+    }
+}
+
+const SWEEP: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Pins the paused clock: a running blocking task inhibits Tokio's
+/// auto-advance, so SQLite round-trips cannot fire sqlx pool timeouts and
+/// only explicit `advance` calls move time.
+struct PinnedClock(std::sync::mpsc::Sender<()>);
+fn pin_clock() -> PinnedClock {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || rx.recv());
+    PinnedClock(tx)
+}
+
+/// One production sweep tick, then the 15 s interval in paused Tokio time.
+async fn sweep(f: &Fixture) {
     konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
-    assert_eq!(f.op().await.state, "sent");
-    let data: serde_json::Value = serde_json::from_slice(&f.op().await.recovery).unwrap();
-    assert_eq!(data["resend_delay_ms"], 0);
-    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+    tokio::time::advance(SWEEP).await;
+}
+
+/// The paid row, its envelope and its pending delivery are exactly as compose left them.
+async fn assert_paid_untouched(f: &Fixture, paid: &konsensus_storage::OutboxOperation) {
+    let op = f.op().await;
+    assert_eq!(op.state, "paid");
+    assert_eq!(op.payment_hash, paid.payment_hash);
+    assert_eq!(op.settled_msat, paid.settled_msat);
+    assert_eq!(op.recovery, paid.recovery, "pacing never rewrites the recovery journal");
+    let id = konsensus_core::MessageId::from_hex(op.message_id.as_deref().unwrap()).unwrap();
+    assert!(f.db.get_message(&id).await.unwrap().is_some(), "paid envelope retained");
+    assert!(
+        f.db.get_pending_for_peer(&f.peer).await.unwrap().iter().any(|(p, _)| p == &id),
+        "pending delivery retained"
+    );
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "never re-pays");
+}
+
+#[tokio::test(start_paused = true)]
+async fn failing_resends_back_off_exponentially_to_a_ten_minute_cap() {
+    let _clock = pin_clock();
+    let mut f = Fixture::new().await;
+    let transport = PacedTransport::install(&mut f, true, true);
+    assert_eq!(f.post().await.0, StatusCode::OK);
+    let paid = f.op().await;
+    assert_eq!(paid.state, "paid");
+    let start = tokio::time::Instant::now();
+    let mut attempts = Vec::new();
+    // Two hours of 15 s sweeps: 480 resends without backoff.
+    for _ in 0..480 {
+        let before = transport.writes.load(Ordering::SeqCst);
+        let at = tokio::time::Instant::now() - start;
+        sweep(&f).await;
+        if transport.writes.load(Ordering::SeqCst) > before {
+            attempts.push(at);
+        }
+    }
+    let gaps: Vec<_> = attempts.windows(2).map(|w| w[1] - w[0]).collect();
+    for (i, gap) in gaps.iter().enumerate() {
+        let base = (SWEEP * (1 << i.min(10))).min(std::time::Duration::from_secs(600));
+        // Jitter spans [base/2, base]; sweeps round the retry up to the next tick.
+        assert!(*gap >= base / 2 && *gap <= base + SWEEP, "gap {i}: {gap:?} vs base {base:?}");
+    }
+    assert!(gaps.iter().any(|g| *g > std::time::Duration::from_secs(300)), "{gaps:?}");
+    assert!(gaps.iter().all(|g| *g <= std::time::Duration::from_secs(615)), "{gaps:?}");
+    assert!(attempts.len() < 30, "{} resends in two hours", attempts.len());
+    assert_paid_untouched(&f, &paid).await;
+    // Jitter decorrelates operations: another backlog entry must not retry in lockstep.
+    assert!(gaps.windows(2).any(|w| w[0] != w[1]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn offline_peer_gets_no_resends_and_reconnect_delivers_on_the_next_sweep() {
+    let _clock = pin_clock();
+    let mut f = Fixture::new().await;
+    let transport = PacedTransport::install(&mut f, true, true);
+    assert_eq!(f.post().await.0, StatusCode::OK);
+    let paid = f.op().await;
+    // Back off to the cap while the peer is up but unreachable…
+    for _ in 0..120 {
+        sweep(&f).await;
+    }
+    let writes = transport.writes.load(Ordering::SeqCst);
+    while transport.writes.load(Ordering::SeqCst) == writes {
+        sweep(&f).await;
+    }
+    // …then, right after a capped attempt (next one ≥ 5 min out), it drops
+    // off entirely: no writes and no row changes.
+    transport.online.store(false, Ordering::SeqCst);
+    transport.fail_write.store(false, Ordering::SeqCst);
+    let writes = transport.writes.load(Ordering::SeqCst);
+    let version = f.op().await.version;
+    for _ in 0..10 {
+        sweep(&f).await;
+    }
+    assert_eq!(transport.writes.load(Ordering::SeqCst), writes, "nothing is sent while offline");
+    assert_eq!(f.op().await.version, version, "offline sweeps never write the row");
+    assert_paid_untouched(&f, &paid).await;
+    // Reconnect: the very next sweep delivers, ignoring the pending backoff.
+    transport.reconnect();
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(transport.writes.load(Ordering::SeqCst), writes + 1);
+    assert_eq!(f.op().await.state, "acked");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "never re-pays");
+}
+
+#[tokio::test(start_paused = true)]
+async fn new_connection_generation_resets_backoff_immediately() {
+    let _clock = pin_clock();
+    let mut f = Fixture::new().await;
+    let transport = PacedTransport::install(&mut f, true, true);
+    assert_eq!(f.post().await.0, StatusCode::OK);
+    let paid = f.op().await;
+    for _ in 0..120 {
+        sweep(&f).await;
+    }
+    // Same connection, backed off: a sweep right after an attempt is a no-op.
+    let writes = transport.writes.load(Ordering::SeqCst);
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert!(transport.writes.load(Ordering::SeqCst) <= writes + 1);
+    let writes = transport.writes.load(Ordering::SeqCst);
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(transport.writes.load(Ordering::SeqCst), writes, "backed off on the same connection");
+    // A reconnect between sweeps is seen through the connection generation.
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    transport.reconnect();
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(transport.writes.load(Ordering::SeqCst), writes + 1, "retried on reconnect");
+    assert_paid_untouched(&f, &paid).await;
+    // Still failing on the new connection: the schedule restarts from the base.
+    tokio::time::advance(SWEEP).await;
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(transport.writes.load(Ordering::SeqCst), writes + 2);
+    transport.fail_write.store(false, Ordering::SeqCst);
+    tokio::time::advance(SWEEP * 2).await;
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(f.op().await.state, "acked");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "never re-pays");
 }
 
 struct ReceiptTransport {
