@@ -783,7 +783,9 @@ async fn create_payment_proof_via_invoice(
 const ADMISSION_SESSION_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Interval between session-establishment polls after a first-contact admission.
-const ADMISSION_SESSION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// `can_send` is an in-memory check; the session now forms within round
+/// trips of the proof (PSI-SPEED), so a coarse poll would dominate first contact.
+const ADMISSION_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Fixed non-empty sentinel payload for a first-contact admission envelope.
 ///
@@ -1375,6 +1377,62 @@ fn set_proof_delivered(state: &AppState, peer: &NodeId, delivered: bool) -> Resu
     Ok(())
 }
 
+/// PSI-SPEED: bounds the prekey offers the payer sends right after its proof.
+///
+/// One of three separate limiters, one per eager path (this one, the payee's
+/// offer after promotion in `msg_handler`, and the payer's reply in
+/// `session_handler`). They are deliberately not shared: each path runs in its
+/// own task (this one in API handlers, the others in their own loops), and in
+/// one first contact the payer's offer here and its reply there go to the same
+/// peer within milliseconds, so a shared per-peer cooldown would drop the
+/// reply that the lower-NodeId payee needs. Each is bounded on its own (one
+/// offer per peer per 10 s, 16 per second), so the node-wide total is at most
+/// three times that.
+fn eager_offers() -> std::sync::MutexGuard<'static, konsensus_message::EagerOfferLimiter> {
+    static LIMITER: std::sync::OnceLock<std::sync::Mutex<konsensus_message::EagerOfferLimiter>> =
+        std::sync::OnceLock::new();
+    LIMITER
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// PSI-SPEED: right after the admission proof went out, offer our X3DH prekey
+/// on the same connection, so the session does not wait for the next
+/// self-heal tick. Offering it to the node we just paid is part of the act we
+/// bought (BUG-PSI); nothing is offered unless that very connection generation
+/// is still the live one and marked paid, and the offer is rate-limited. The
+/// payee usually reads this before its own promotion and drops it; the session
+/// then forms from the payee's offer on promotion (and our reply to it).
+/// Best-effort: the periodic self-heal remains the fallback.
+async fn offer_prekey_after_proof(state: &AppState, peer_id: &NodeId, since: Option<Instant>) {
+    let Some(since) = since else { return };
+    if state.session_manager.can_send(peer_id).await {
+        return;
+    }
+    if !eager_offers().allow(peer_id, Instant::now()) {
+        tracing::debug!(peer = %peer_id, "eager PrekeyOffer after proof rate-limited; self-heal will offer");
+        return;
+    }
+    let frame = match serde_json::to_value(state.session_manager.prekey_bundle().await)
+        .map_err(|e| e.to_string())
+        .and_then(|bundle| Frame::PrekeyOffer { bundle }.to_bytes().map_err(|e| e.to_string()))
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(peer = %peer_id, error = %e, "failed to build eager PrekeyOffer");
+            return;
+        }
+    };
+    // Written only on generation `since`, and only while it is still marked
+    // paid: checked under that connection's lock, never via a fresh NodeId
+    // lookup that could land on an unpaid replacement.
+    match state.transport.send_raw_frame_on_paid_connection(peer_id, since, &frame).await {
+        Ok(()) => tracing::info!(peer = %peer_id, "sent PrekeyOffer right after the admission proof (PSI-SPEED)"),
+        Err(e) => tracing::warn!(peer = %peer_id, error = %e, "failed to send eager PrekeyOffer after the admission proof"),
+    }
+}
+
 /// Send the admission proof on connection generation `since` (captured by the
 /// caller, who marked that generation paid) and on no other.
 ///
@@ -1394,7 +1452,10 @@ async fn send_admission_proof(
     let before = lock_admission_ledger().delivered(peer_id);
     set_proof_delivered(state, peer_id, true)?;
     match state.transport.send_on_connection(peer_id, since, envelope).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            offer_prekey_after_proof(state, peer_id, since).await;
+            Ok(())
+        }
         Err(e) => {
             if matches!(e, konsensus_core::traits::transport::TransportError::NotConnected(_)) {
                 tracing::warn!(
@@ -2886,9 +2947,13 @@ pub(super) async fn compose_message(
                 }
 
                 // Poll for the session the target establishes after promotion via
-                // the existing prekey/self-heal path.
+                // the existing prekey/self-heal path, until we can SEND on it. An
+                // X3DH acceptor holds a session before it has a sending chain: that
+                // needs the initiator's RatchetInit. Waiting on `has_session` alone
+                // raced it (payer-higher order: we are the acceptor) and failed the
+                // encrypt below after a consumed admission.
                 let mut waited = Duration::ZERO;
-                while !state.session_manager.has_session(&peer_id).await {
+                while !state.session_manager.can_send(&peer_id).await {
                     if waited >= ADMISSION_SESSION_TIMEOUT {
                         return Err(ApiError::Internal(format!(
                             "first-contact admission payment for {peer_id} settled and a signed \

@@ -163,6 +163,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
+    // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
+    // from the other two eager limiters on purpose; see `eager_offers` in the
+    // compose handler.
+    let mut eager_offers = konsensus_message::EagerOfferLimiter::new();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
     let mut cooldown_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -214,6 +218,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         if !privileged {
                             continue;
                         }
+                        reply_prekey_offer_to_paid_payee(
+                            &peer_id, our_node_id, &session_manager, &transport, &mut eager_offers,
+                        ).await;
                         handle_prekey_offer(
                             &peer_id, bundle, our_node_id, &session_manager, &storage,
                             &transport, &audit_log, &mut last_negotiation,
@@ -793,6 +800,52 @@ async fn heal_connected_e2ee_sessions(
                 );
             }
         }
+    }
+}
+
+/// PSI-SPEED: the payee offers its prekey the moment our paid admission
+/// promotes us, but when the payee has the LOWER NodeId it is the X3DH
+/// initiator and needs OUR bundle, and the offer we sent right after our proof
+/// usually reached it before its promotion and was dropped. So when the node
+/// whose admission WE settled on this live connection offers, and we are not
+/// the initiator and have no sending chain, answer with our offer at once
+/// instead of on the next self-heal tick. Only a connection we paid on
+/// (`admission_paid`) qualifies, never a stranger, and replies are
+/// rate-limited; self-heal remains the fallback.
+async fn reply_prekey_offer_to_paid_payee(
+    peer_id: &NodeId,
+    our_node_id: NodeId,
+    session_manager: &SessionManager,
+    transport: &Arc<NoiseTransport>,
+    limiter: &mut konsensus_message::EagerOfferLimiter,
+) {
+    // The generation is captured once; the reply goes on that connection only,
+    // and only if it is still the one we paid on (checked under its lock by
+    // `send_raw_frame_on`), never on an unpaid replacement.
+    let Some(since) = transport.connected_since(peer_id).await else { return };
+    if our_node_id.as_bytes() < peer_id.as_bytes()
+        || !transport.admission_paid_on_connection(peer_id).await
+        || !e2ee_needs_self_heal(session_manager, peer_id).await
+    {
+        return;
+    }
+    if !limiter.allow(peer_id, std::time::Instant::now()) {
+        debug!(peer = %peer_id, "prekey reply to paid payee rate-limited; self-heal will offer");
+        return;
+    }
+    let sent = match serde_json::to_value(session_manager.prekey_bundle().await)
+        .map_err(|e| format!("serialize prekey bundle: {e}"))
+        .and_then(|bundle| Frame::PrekeyOffer { bundle }.to_bytes().map_err(|e| e.to_string()))
+    {
+        Ok(frame) => transport
+            .send_raw_frame_on(peer_id, since, konsensus_message::Standing::AdmissionPaid, &frame)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match sent {
+        Ok(()) => info!(peer = %peer_id, "answered the paid payee's PrekeyOffer with ours (PSI-SPEED)"),
+        Err(e) => warn!(peer = %peer_id, error = %e, "failed to answer the paid payee's PrekeyOffer"),
     }
 }
 
