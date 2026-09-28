@@ -507,7 +507,7 @@ async fn readmit_then_pay(
     } else {
         Some(acquire_peer_admission_lock(peer_id).await.ok_or_else(|| ApiError::Internal("admission capacity reached".into()))?)
     };
-    recover_admission_attempt(state, peer_id)?;
+    recover_admission_attempt(state, peer_id).await?;
     let connected_since = state.transport.connected_since(peer_id).await;
     let paid_on_live = state.transport.admission_paid_on_connection(peer_id).await;
     let coverage = lock_admission_ledger().settled_coverage(peer_id, connected_since, paid_on_live, Instant::now());
@@ -1580,6 +1580,9 @@ async fn deliver_settled_admission(
     lock_admission_ledger().attach_envelope(peer_id, envelope.clone());
     let previous = super::admission_journal::load(state, peer_id)?;
     super::admission_journal::save(state, peer_id, &super::admission_journal::Attempt {
+        dispatch_started: true,
+        previous_attempt: None,
+        operation: previous.as_ref().and_then(|a| a.operation.clone()),
         max_routing_fee_msat: previous.as_ref().and_then(|a| a.max_routing_fee_msat),
         readmission: previous.as_ref().and_then(|a| a.readmission.clone())
             .or_else(|| lock_admission_ledger().readmissions.get(peer_id).cloned()),
@@ -2040,7 +2043,23 @@ async fn reconcile_admission_budget(
 /// covered. In particular, a restarted sender must classify its settled journal
 /// against the new connection before deciding to resend a proof. Uncertain
 /// attempts remain recovery guards and never authorize another payment.
-fn recover_admission_attempt(state: &AppState, peer_id: &NodeId) -> Result<(), ApiError> {
+pub(super) async fn clear_undispatched_admission(state: &AppState, peer_id: &NodeId, hash: &str) -> Result<bool, ApiError> {
+    if let Some(attempt) = super::admission_journal::load(state, peer_id)? {
+        if !attempt.dispatch_started && attempt.payment_hash == hash {
+            if let Some(link) = &attempt.operation {
+                super::operations::record_undispatched_admission(state, peer_id, link, attempt.original_reservation.as_ref()).await?;
+            }
+        }
+    }
+    let cleared = super::admission_journal::undo_undispatched(state, peer_id, hash)?;
+    if cleared { lock_admission_ledger().clear_tracked(peer_id, hash); }
+    Ok(cleared)
+}
+
+async fn recover_admission_attempt(state: &AppState, peer_id: &NodeId) -> Result<(), ApiError> {
+    if let Some(attempt) = super::admission_journal::load(state, peer_id)? {
+        clear_undispatched_admission(state, peer_id, &attempt.payment_hash).await?;
+    }
     // Reload a durable attempt before considering any new dispatch. An unknown
     // backend result (including PaymentNotFound) never authorizes a new invoice.
     if matches!(
@@ -2124,7 +2143,7 @@ async fn first_contact_admission_at(
     //     post-settlement retry double-pay: session-poll timeout → compose
     //     error → user retries → without this guard the stranger pays full
     //     admission on every retry.
-    recover_admission_attempt(state, peer_id)?;
+    recover_admission_attempt(state, peer_id).await?;
     // 0a. A proof that went out on an OLDER connection (a flap, a reconnect, a
     //     restart that reloaded the journal) was consumed there and cannot admit
     //     us on this one: the recipient admits per connection, and its replay
@@ -2419,10 +2438,10 @@ async fn first_contact_admission_at(
     //    unknown dispatch never expires. Recording it commits the capacity reservation (the slot is
     //    now a DispatchUnknown with its own lifecycle, no longer released on drop).
     let bolt11_payment_hash = hex::encode(invoice.payment_hash());
-    super::admission_journal::save(
-        state,
-        peer_id,
-        &super::admission_journal::Attempt {
+    let mut attempt = super::admission_journal::Attempt {
+            dispatch_started: false,
+            previous_attempt: super::admission_journal::load(state, peer_id)?.map(Box::new),
+            operation: charge.operation.as_ref().map(|op| op.reservation_link(readmission_event.is_some())),
             max_routing_fee_msat: Some(debit.fee_limit(state, admission_msat)),
             payment_hash: bolt11_payment_hash.clone(),
             amount_msat: admission_msat,
@@ -2433,8 +2452,8 @@ async fn first_contact_admission_at(
             message_may_have_dispatched: false,
             readmission: readmission_event.clone(),
             proof_delivered: false,
-        },
-    )?;
+        };
+    super::admission_journal::save(state, peer_id, &attempt)?;
     lock_admission_ledger()
         .quotes
         .insert(*peer_id, (kind, message_price));
@@ -2445,8 +2464,18 @@ async fn first_contact_admission_at(
         Instant::now(),
     );
     if let Some(operation) = &charge.operation {
-        operation.admission_started(bolt11_payment_hash.clone(), admission_msat, readmission_event.is_some(), debit).await?;
+        if let Err(error) = operation.admission_started(bolt11_payment_hash.clone(), admission_msat, readmission_event.is_some(), debit).await {
+            // Keep the durable false dispatch marker until recovery can also
+            // checkpoint the operation; an I/O error may have committed SQL.
+            lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
+            return Err(error);
+        }
     }
+    // No await separates this durable dispatch marker from the guarded wallet
+    // call below. Cancellation while admission_started awaited leaves false.
+    attempt.dispatch_started = true;
+    attempt.previous_attempt = None;
+    super::admission_journal::save(state, peer_id, &attempt)?;
     if let Some(event) = readmission_event {
         lock_admission_ledger().readmissions.insert(*peer_id, event);
     } else {
@@ -2460,6 +2489,7 @@ async fn first_contact_admission_at(
     let dispatched = match debit.dispatch(state.lightning.pay_invoice_with_fee_limit(&response.bolt11, debit.fee_limit(state, admission_msat))).await {
         Ok(result) => result,
         Err(error @ ApiError::BudgetExceeded(_)) => {
+            super::admission_journal::mark_undispatched(state, peer_id, &bolt11_payment_hash)?;
             if let Some(operation) = &charge.operation { operation.admission_not_dispatched().await?; }
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
@@ -2471,6 +2501,7 @@ async fn first_contact_admission_at(
     let details = match dispatched {
         Ok(details) => details,
         Err(LightningError::NotReady) => {
+            super::admission_journal::mark_undispatched(state, peer_id, &bolt11_payment_hash)?;
             if let Some(operation) = &charge.operation { operation.admission_not_dispatched().await?; }
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
@@ -2478,6 +2509,7 @@ async fn first_contact_admission_at(
             return Err(ApiError::NotReady);
         }
         Err(LightningError::PaymentNotDispatched(reason)) => {
+            super::admission_journal::mark_undispatched(state, peer_id, &bolt11_payment_hash)?;
             if let Some(operation) = &charge.operation { operation.admission_not_dispatched().await?; }
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
@@ -2954,15 +2986,12 @@ pub(super) async fn compose_peer(
 
         // Reject budget limits before advancing the ratchet or requesting an invoice.
         let peer_key = peer_id.to_hex();
-        let debit = if let Some(approval) = confirmation {
-            auth.debit_first_contact(&state, approval, cap).map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?
-        } else { auth.debit(
-            &state,
-            vec![Charge {
-                recipient: peer_key.clone(),
-                amount_msat: if first_contact { cap.unwrap_or(ADMISSION_MAX_MSAT) } else { super::caps::all_in(&state, price_msat, req.max_routing_fee_msat)? },
-            }],
-        ).map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))? }.with_fee_limit(req.max_routing_fee_msat);
+        let debit = auth.debit_operation(&state, vec![Charge {
+            recipient: peer_key.clone(),
+            amount_msat: if first_contact { cap.unwrap_or(ADMISSION_MAX_MSAT) } else { super::caps::all_in(&state, price_msat, req.max_routing_fee_msat)? },
+        }], confirmation, cap, &operation)
+            .map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))?
+            .with_fee_limit(req.max_routing_fee_msat);
         let debit = debit.with_operation(operation.clone());
         if let Err(error) = operation.attach_debit(&debit).await {
             // No payment/invoice future has been polled under this debit.
@@ -3073,7 +3102,7 @@ pub(super) async fn compose_peer(
         ).references(references).build();
         operation.draft(draft, price_msat,
             debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat),
-            admission.settled_msat.saturating_sub(admission.readmission_msat), admission.readmission_msat).await?;
+            admission.settled_msat.saturating_sub(admission.readmission_msat)).await?;
 
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
         if let Some(mut attempt) = super::admission_journal::load(&state, &peer_id)? {

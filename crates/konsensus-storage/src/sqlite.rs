@@ -568,7 +568,7 @@ impl Storage for SqliteStorage {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery FROM outbox_operations WHERE operation_id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery FROM outbox_operations WHERE state IN ('paying', 'payment_unknown', 'paid', 'sent', 'acked', 'rejected_retryable', 'failed_paid') ORDER BY created_at").fetch_all(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery FROM outbox_operations WHERE state IN ('prepared', 'released', 'paying', 'payment_unknown', 'paid', 'sent', 'acked', 'rejected_retryable', 'failed_paid') ORDER BY created_at").fetch_all(&self.pool).await?)
     }
 
     // ── Messages ───────────────────────────────────────────────────────

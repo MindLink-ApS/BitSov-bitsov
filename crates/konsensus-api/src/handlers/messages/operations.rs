@@ -52,6 +52,15 @@ struct Recovery {
     resend_after_ms: i64,
     #[serde(default)]
     resend_delay_ms: u64,
+    #[serde(default)]
+    budget_resolutions: Vec<BudgetResolution>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct BudgetResolution {
+    reservation: Reservation,
+    // None keeps the full liability when any fee is unknown.
+    actual_msat: Option<u64>,
 }
 
 fn storage(e: impl std::fmt::Display) -> ApiError {
@@ -137,6 +146,11 @@ pub(crate) struct Operation {
     execution_id: String,
 }
 impl Operation {
+    pub(crate) fn reservation_link(&self, readmission: bool) -> crate::spend_budget::OperationReservationLink {
+        crate::spend_budget::OperationReservationLink {
+            operation_id: self.id.clone(), execution_id: self.execution_id.clone(), readmission,
+        }
+    }
     async fn load(&self) -> Result<OutboxOperation, ApiError> {
         let op = self
             .state
@@ -188,6 +202,13 @@ impl Operation {
     pub(crate) async fn admission_not_dispatched(&self) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
+        if data.admission_is_readmission {
+            if let Some(reservation) = data.admission_reservation.clone() {
+                queue_resolution(&mut data, reservation, Some(0));
+            }
+        } else {
+            queue_message_resolution(&mut data, 0, Some(0));
+        }
         data.admission_pending = false;
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await
@@ -219,6 +240,11 @@ impl Operation {
                     .and_then(|a| details.fee_msat.and_then(|b| a.checked_add(b)));
             }
         }
+        if data.admission_is_readmission {
+            if let Some(reservation) = data.admission_reservation.clone() {
+                queue_resolution(&mut data, reservation, details.fee_msat.and_then(|fee| details.amount_msat.checked_add(fee)));
+            }
+        }
         data.admission_pending = false;
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await
@@ -229,7 +255,6 @@ impl Operation {
         expected_msat: u64,
         fee_ceiling: u64,
         admission_msat: u64,
-        readmission_msat: u64,
     ) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
@@ -242,7 +267,6 @@ impl Operation {
             data.budget_admission_msat = admission_msat;
             data.admission_fee_msat = None; // absent historical evidence is never a zero fee
         }
-        op.readmission_msat = i64::try_from(readmission_msat).map_err(storage)?;
         if let Some(attempt) = super::admission_journal::load(
             &self.state,
             &NodeId::from_hex(&op.recipient).map_err(storage)?,
@@ -464,6 +488,7 @@ pub(super) async fn compose(
                 &op,
             ));
         }
+        recover_budget(&state, &mut op).await?;
         if matches!(op.state.as_str(), "paying" | "payment_unknown") {
             reconcile(&state, &mut op).await?;
         }
@@ -494,6 +519,11 @@ pub(super) async fn compose(
     let execution_id = uuid::Uuid::new_v4().to_string();
     data.execution_id = Some(execution_id.clone());
     data.reservation = None;
+    data.admission_reservation = None;
+    data.budget_admission_msat = 0;
+    data.admission_fee_msat = Some(0);
+    data.envelope_ready = false;
+    data.draft = None;
     op.payment_hash = None;
     encode(&mut op, &data)?;
     save(&state, &mut op).await?;
@@ -648,13 +678,62 @@ pub(super) async fn get_operation(
     )?))
 }
 
+/// Checkpoint the original operation before another compose clears its peer
+/// journal. A failed/ambiguous SQL write leaves the false dispatch marker intact.
+pub(super) async fn record_undispatched_admission(
+    state: &AppState, peer: &NodeId, link: &crate::spend_budget::OperationReservationLink,
+    reservation: Option<&Reservation>,
+) -> Result<(), ApiError> {
+    let Some(mut op) = state.storage.get_outbox_operation(&link.operation_id).await.map_err(storage)? else { return Ok(()); };
+    let mut data = recovery(&op)?;
+    if op.recipient != peer.to_hex() || data.execution_id.as_deref() != Some(&link.execution_id) {
+        return Ok(());
+    }
+    if data.dispatched {
+        return Err(ApiError::PaymentUnresolved("cannot undo admission after message dispatch".into()));
+    }
+    // Fence even an admission_started UPDATE still queued in the SQL worker.
+    // Its fields may not be visible yet, but its old version must never commit
+    // after we remove the only durable proof of nondispatch.
+    if link.readmission {
+        if let Some(reservation) = reservation {
+            queue_resolution(&mut data, reservation.clone(), Some(0));
+        }
+    }
+    queue_message_resolution(&mut data, 0, Some(0));
+    data.admission_pending = false;
+    data.execution_id = None;
+    op.state = "prepared".into();
+    encode(&mut op, &data)?;
+    save(state, &mut op).await?;
+    drain_resolutions(state, &mut op).await
+}
+
 async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    recover_budget(state, op).await?;
     let mut data = recovery(op)?;
     // Settlement evidence is monotonic even while proof retrieval is incomplete.
     if let Some(details) = data.settlement.as_ref().filter(|d| settlement_matches(op, &data, d)) {
         op.settled_msat = i64::try_from(details.amount_msat).map_err(storage)?;
     }
     if data.admission_pending && !data.dispatched {
+        let peer = NodeId::from_hex(&op.recipient).map_err(storage)?;
+        if let Some(hash) = op.admission_payment_hash.clone() {
+            if super::admission_journal::load(state, &peer)?.is_some_and(|a| a.payment_hash == hash && !a.dispatch_started) {
+                data.admission_pending = false;
+                if let Some(reservation) = data.admission_reservation.take() {
+                    queue_resolution(&mut data, reservation, Some(0));
+                }
+                queue_message_resolution(&mut data, 0, Some(0));
+                data.execution_id = None;
+                op.state = "prepared".into();
+                encode(op, &data)?;
+                save(state, op).await?;
+                drain_resolutions(state, op).await?;
+                super::compose::clear_undispatched_admission(state, &peer, &hash).await?;
+                return Ok(());
+            }
+        }
         let details = match &op.admission_payment_hash {
             Some(hash) => state.lightning.get_payment_status(hash).await.ok(),
             None => None,
@@ -683,8 +762,15 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
                     op.readmission_msat = op.readmission_msat.saturating_add(principal as i64);
                 } else {
                     data.admission_msat = data.admission_msat.saturating_add(principal);
-                    data.admission_fee_msat = None;
+                    data.budget_admission_msat = data.budget_admission_msat.saturating_add(principal);
+                    data.admission_fee_msat = data.admission_fee_msat.and_then(|prior| fee.and_then(|f| prior.checked_add(f)));
                 }
+                if data.admission_is_readmission {
+                    if let Some(reservation) = admission_reservation {
+                        queue_resolution(&mut data, reservation, fee.and_then(|f| principal.checked_add(f)));
+                    }
+                }
+                queue_message_resolution(&mut data, 0, Some(0));
                 data.admission_pending = false;
                 // Invalidate the old worker before resolving its admission-only
                 // liability. A new POST must pass today's caps and grant checks.
@@ -693,13 +779,7 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
                 op.state = "prepared".into();
                 encode(op, &data)?;
                 save(state, op).await?;
-                if let (Some(service), Some(reservation), Some(fee)) =
-                    (&state.pairing, &admission_reservation, fee)
-                {
-                    if let Some(total) = principal.checked_add(fee) {
-                        service.resolve_spend(reservation, &op.recipient, total);
-                    }
-                }
+                drain_resolutions(state, op).await?;
                 return Ok(());
             }
         }
@@ -708,13 +788,13 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
         return Ok(());
     }
     if !data.dispatched && !data.envelope_ready {
-        let original = data.clone();
+        queue_message_resolution(&mut data, 0, Some(0));
         data.reservation = None;
         data.execution_id = None;
         op.state = "prepared".into();
         encode(op, &data)?;
         save(state, op).await?;
-        resolve_budget(state, &original, &op.recipient, 0, Some(0));
+        drain_resolutions(state, op).await?;
         return Ok(());
     }
     if data.envelope_ready {
@@ -725,15 +805,7 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
             return Ok(());
         };
         materialize(state, op, env).await?;
-        if let Some(details) = &data.settlement {
-            resolve_budget(
-                state,
-                &data,
-                &op.recipient,
-                details.amount_msat,
-                details.fee_msat,
-            );
-        }
+        recover_budget(state, op).await?;
         return Ok(());
     }
     let details = match &data.settlement {
@@ -769,9 +841,12 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
             save(state, op).await?;
         }
         PaymentStatus::Failed | PaymentStatus::Expired => {
+            data.settlement = Some(details.clone());
+            queue_message_resolution(&mut data, 0, Some(0));
             op.state = "released".into();
+            encode(op, &data)?;
             save(state, op).await?;
-            resolve_budget(state, &data, &op.recipient, 0, Some(0));
+            drain_resolutions(state, op).await?;
         }
         PaymentStatus::Pending | PaymentStatus::InFlight => {
             op.state = "payment_unknown".into();
@@ -779,23 +854,22 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
         }
         PaymentStatus::Settled => {
             op.settled_msat = i64::try_from(details.amount_msat).map_err(storage)?;
-            resolve_budget(
-                state,
-                &data,
-                &op.recipient,
-                details.amount_msat,
-                details.fee_msat,
-            );
+            data.settlement = Some(details.clone());
+            queue_message_resolution(&mut data, details.amount_msat, details.fee_msat);
             let Some(preimage) = settlement_preimage(&details) else {
                 op.state = "payment_unknown".into();
                 op.last_error = Some("settled payment has no valid proof".into());
+                encode(op, &data)?;
                 save(state, op).await?;
+                drain_resolutions(state, op).await?;
                 return Ok(());
             };
             let Some(mut env) = data.draft.clone() else {
                 op.state = "payment_unknown".into();
                 op.last_error = Some("settled payment missing encrypted draft".into());
+                encode(op, &data)?;
                 save(state, op).await?;
+                drain_resolutions(state, op).await?;
                 return Ok(());
             };
             let hash: [u8; 32] = Sha256::digest(preimage).into();
@@ -811,13 +885,7 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
             data.envelope_ready = true;
             encode(op, &data)?;
             materialize(state, op, &env).await?;
-            resolve_budget(
-                state,
-                &data,
-                &op.recipient,
-                details.amount_msat,
-                details.fee_msat,
-            );
+            drain_resolutions(state, op).await?;
         }
     }
     Ok(())
@@ -831,27 +899,44 @@ fn settlement_preimage(details: &PaymentDetails) -> Option<[u8; 32]> {
         .filter(|p| hex::encode(Sha256::digest(p)) == details.payment_hash)
 }
 
-fn resolve_budget(
-    state: &AppState,
-    data: &Recovery,
-    recipient: &str,
-    principal: u64,
-    fee: Option<u64>,
-) {
-    if let (Some(service), Some(reservation), Some(fee), Some(admission_fee)) = (
-        &state.pairing,
-        &data.reservation,
-        fee,
-        data.admission_fee_msat,
-    ) {
-        if let Some(total) = principal
-            .checked_add(fee)
+fn queue_resolution(data: &mut Recovery, reservation: Reservation, actual_msat: Option<u64>) {
+    if let Some(existing) = data.budget_resolutions.iter_mut().find(|r| r.reservation.id == reservation.id && r.reservation.op_id == reservation.op_id) {
+        if existing.actual_msat.is_none() { existing.actual_msat = actual_msat; }
+    } else {
+        data.budget_resolutions.push(BudgetResolution { reservation, actual_msat });
+    }
+}
+
+fn queue_message_resolution(data: &mut Recovery, principal: u64, fee: Option<u64>) {
+    if let Some(reservation) = data.reservation.clone() {
+        let total = fee.and_then(|fee| principal.checked_add(fee))
             .and_then(|v| v.checked_add(data.budget_admission_msat))
-            .and_then(|v| v.checked_add(admission_fee))
-        {
-            service.resolve_spend(reservation, recipient, total);
+            .and_then(|v| data.admission_fee_msat.and_then(|fee| v.checked_add(fee)));
+        queue_resolution(data, reservation, total);
+    }
+}
+
+async fn drain_resolutions(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    let Some(service) = &state.pairing else { return Ok(()); };
+    let mut data = recovery(op)?;
+    let before = data.budget_resolutions.len();
+    for resolution in &data.budget_resolutions {
+        if let Some(actual) = resolution.actual_msat {
+            service.try_resolve_spend(&resolution.reservation, &op.recipient, actual).map_err(storage)?;
+            if data.reservation.as_ref().is_some_and(|r| r.id == resolution.reservation.id && r.op_id == resolution.reservation.op_id) {
+                data.reservation = None;
+            }
+            if data.admission_reservation.as_ref().is_some_and(|r| r.id == resolution.reservation.id && r.op_id == resolution.reservation.op_id) {
+                data.admission_reservation = None;
+            }
         }
     }
+    data.budget_resolutions.retain(|r| r.actual_msat.is_none());
+    if before != data.budget_resolutions.len() {
+        encode(op, &data)?;
+        save(state, op).await?;
+    }
+    Ok(())
 }
 
 /// Run at startup and periodically. It only queries payment status and repairs
@@ -878,9 +963,7 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             if matches!(op.state.as_str(), "paying" | "payment_unknown") {
                 reconcile(state, &mut op).await?;
             }
-            if matches!(op.state.as_str(), "paid" | "sent" | "acked" | "rejected_retryable" | "failed_paid") {
-                recover_budget(state, &op)?;
-            }
+            recover_budget(state, &mut op).await?;
             if op.state == "paid" {
                 recover_paid(state, &mut op).await?;
             }
@@ -902,20 +985,35 @@ fn settlement_matches(op: &OutboxOperation, data: &Recovery, details: &PaymentDe
         && details.amount_msat == data.expected_msat
 }
 
-fn recover_budget(state: &AppState, op: &OutboxOperation) -> Result<(), ApiError> {
-    let data = recovery(op)?;
-    // Original reservation/grant IDs make this idempotent even after an ACK or
-    // reject won the race with recovery. Delivery never gates accounting.
-    if let Some(details) = data.settlement.as_ref().filter(|d| settlement_matches(op, &data, d)) {
-        resolve_budget(state, &data, &op.recipient, details.amount_msat, details.fee_msat);
-    } else if data.envelope_ready && !data.dispatched && data.expected_msat == 0
-        && data.draft.as_ref().is_some_and(|env| env.payment_proof.amount_msat == 0)
-    {
-        // Free messages have no Lightning settlement record, but their admission
-        // can still hold a reservation. Unknown admission fees remain reserved.
-        resolve_budget(state, &data, &op.recipient, 0, Some(0));
+async fn recover_budget(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    let mut data = recovery(op)?;
+    let before = op.recovery.clone();
+    if let Some(service) = &state.pairing {
+        for (link, reservation) in service.operation_reservations(&op.operation_id) {
+            if data.budget_resolutions.iter().any(|r| r.reservation.id == reservation.id && r.reservation.op_id == reservation.op_id) { continue; }
+            if data.execution_id.as_deref() != Some(&link.execution_id) && data.execution_id.is_some() { continue; }
+            if link.readmission {
+                if data.admission_reservation.as_ref().is_none_or(|r| r.id != reservation.id) {
+                    // Admission cannot dispatch until this exact child is attached.
+                    queue_resolution(&mut data, reservation, Some(0));
+                }
+            } else if data.reservation.is_none() {
+                data.reservation = Some(reservation);
+            }
+        }
     }
-    Ok(())
+    if let Some(details) = data.settlement.clone().filter(|d| settlement_matches(op, &data, d)) {
+        queue_message_resolution(&mut data, details.amount_msat, details.fee_msat);
+    } else if op.state == "released"
+        || (!data.dispatched && !data.admission_pending && !data.envelope_ready)
+        || (data.envelope_ready && !data.dispatched && data.expected_msat == 0
+            && data.draft.as_ref().is_some_and(|env| env.payment_proof.amount_msat == 0))
+    {
+        queue_message_resolution(&mut data, 0, Some(0));
+    }
+    encode(op, &data)?;
+    if op.recovery != before { save(state, op).await?; }
+    drain_resolutions(state, op).await
 }
 
 async fn recover_paid(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {

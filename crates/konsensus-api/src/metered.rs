@@ -137,9 +137,14 @@ impl MeteredSpend {
             })
     }
 
-    pub(crate) fn debit_first_contact(&self, state: &AppState, approval: FirstContactAuthorization, cap: Option<u64>) -> Result<Debit, ApiError> {
+    pub(crate) fn debit_operation(&self, state: &AppState, charges: Vec<Charge>, approval: Option<FirstContactAuthorization>, cap: Option<u64>, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()); };
         let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-        let reservation = service.reserve_first_contact(approval, cap).map_err(ApiError::BudgetExceeded)?;
+        let link = operation.reservation_link(false);
+        let reservation = match approval {
+            Some(approval) => service.reserve_first_contact_operation(approval, cap, Some(link)),
+            None => service.reserve_operation_spend(client_id, *epoch, charges, link),
+        }.map_err(ApiError::BudgetExceeded)?;
         Ok(Debit::reserved(Arc::clone(service), reservation))
     }
 
@@ -279,7 +284,8 @@ impl Debit {
         };
         let mut call_total = self.call_reserved_msat.lock().unwrap_or_else(|e| e.into_inner());
         let readmission = service
-            .reserve_readmission(reservation, recipient, amount_msat, *call_total)
+            .reserve_readmission_operation(reservation, recipient, amount_msat, *call_total,
+                self.operation.as_ref().map(|op| op.reservation_link(true)))
             .map_err(ApiError::BudgetExceeded)?;
         *call_total += amount_msat; // checked against the grant limit under its ledger lock
         Ok(Debit::reserved(Arc::clone(service), readmission).with_fee_limit(self.max_routing_fee_msat))

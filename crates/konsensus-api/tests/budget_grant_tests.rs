@@ -1511,3 +1511,157 @@ async fn recovery_free_message_resolves_recorded_admission_but_keeps_unknown_fee
         assert_eq!(fx.wallet.money(), 0, "recovery must never pay the free message or admission");
     }
 }
+
+// Cancellation before the asynchronous operation/debit attachment.
+// Exhaust the SQLx pool only after the operation claim exists. This suspends
+// attach_debit's first SELECT before any attachment query can be enqueued,
+// avoiding SQLite worker cancellation races and wall-clock sleeps.
+struct ReadyPauseBeforeDebit {
+    inner: Arc<Wallet>,
+    pause_once: AtomicBool,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+#[async_trait]
+impl LightningProvider for ReadyPauseBeforeDebit {
+    async fn money_ready(&self) -> bool {
+        if self.pause_once.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+        true
+    }
+    async fn create_invoice(&self, a: u64, d: &str, e: u32) -> Result<Invoice, LightningError> {
+        self.inner.create_invoice(a, d, e).await
+    }
+    async fn pay_invoice(&self, b: &str) -> Result<PaymentDetails, LightningError> {
+        self.inner.pay_invoice(b).await
+    }
+    async fn pay_invoice_with_fee_limit(&self, b: &str, fee: u64) -> Result<PaymentDetails, LightningError> {
+        self.inner.pay_invoice_with_fee_limit(b, fee).await
+    }
+    async fn keysend_with_fee_limit(&self, d: &str, a: u64, m: Option<&str>, fee: u64) -> Result<PaymentDetails, LightningError> {
+        self.inner.keysend_with_fee_limit(d, a, m, fee).await
+    }
+    async fn get_payment_status(&self, h: &str) -> Result<PaymentDetails, LightningError> {
+        self.inner.get_payment_status(h).await
+    }
+    async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+        self.inner.get_balance_msat().await
+    }
+    async fn is_available(&self) -> bool { true }
+}
+
+#[tokio::test]
+async fn cancel_before_reservation_attachment_does_not_leak_grant() {
+    use konsensus_storage::{SqliteStorage, Storage};
+    use std::time::Duration;
+    for first_contact in [false, true] {
+    let mut fx = fixture().await;
+    let db = Arc::new(SqliteStorage::open(fx.tmp.path().join("review113-link.db").to_str().unwrap()).await.unwrap());
+    fx.state = Arc::new(AppState { storage: db.clone(), ..(*fx.state).clone() });
+    let token = fx.grant(None, GrantTerms::new(2500)).await;
+    if first_contact {
+        fx.state = Arc::new(AppState {
+            session_manager: Arc::new(konsensus_crypto::SessionManager::new(fx.state.identity.clone())),
+            ..(*fx.state).clone()
+        });
+        assert_eq!(fx.owner_confirm(&fx.peer.to_hex(), 2500).await.0, StatusCode::OK);
+    }
+    let wallet = Arc::new(ReadyPauseBeforeDebit {
+        inner: fx.wallet.clone(), pause_once: AtomicBool::new(true),
+        entered: tokio::sync::Notify::new(), resume: tokio::sync::Notify::new(),
+    });
+    fx.state = Arc::new(AppState { lightning: wallet.clone(), ..(*fx.state).clone() });
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let mut body = json!({"operation_id": operation_id, "recipient":fx.peer.to_hex(), "kind":100, "plaintext":"hi", "wait_ack_ms":0});
+    if first_contact { body["max_total_msat"] = 2500.into(); body["kind"] = 0.into(); }
+    let state = fx.state.clone();
+    let request_token = token.clone();
+    let request_body = body.clone();
+    let request = tokio::spawn(async move {
+        call(&state, "POST", "/api/v1/messages/compose", Some(request_body), Some(&request_token)).await
+    });
+    tokio::time::timeout(Duration::from_secs(10), wallet.entered.notified()).await.expect("readiness checkpoint");
+    let claimed = db.get_outbox_operation(&operation_id).await.unwrap().unwrap();
+    assert_eq!(claimed.state, "paying");
+    assert_eq!(fx.used(), 0);
+
+    // SqliteStorage::open sets max_connections(10). Hold all connections;
+    // the next DB await in attach_debit cannot execute until we release them.
+    let mut held = Vec::new();
+    for _ in 0..10 {
+        held.push(tokio::time::timeout(Duration::from_secs(10), db.pool().acquire()).await.expect("pool checkpoint").unwrap());
+    }
+    wallet.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fx.used() == 0 { tokio::task::yield_now().await; }
+    }).await.expect("grant debit checkpoint");
+    assert_eq!(fx.used(), if first_contact { 2500 } else { 1000 });
+    assert_eq!(fx.wallet.money(), 0);
+    assert!(!request.is_finished(), "request must be suspended before reservation attachment");
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    drop(held);
+
+    let cancelled = db.get_outbox_operation(&operation_id).await.unwrap().unwrap();
+    let recovery: Value = serde_json::from_slice(&cancelled.recovery).unwrap();
+    assert!(recovery["reservation"].is_null());
+    assert_eq!(cancelled.state, "paying");
+    fx.restart(); // Reopen the persisted paired budget as well as run startup recovery.
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    assert_eq!(db.get_outbox_operation(&operation_id).await.unwrap().unwrap().state, "prepared");
+    assert_eq!(fx.wallet.money(), 0);
+    assert_eq!(fx.used(), 0, "no-dispatch cancellation must release the durable grant reservation before a same-operation retry");
+    }
+}
+
+#[tokio::test]
+async fn accounting_intents_survive_prepared_released_and_ledger_write_failure() {
+    use konsensus_storage::{OutboxOperation, SqliteStorage, Storage};
+    for terminal in ["prepared", "released", "acked"] {
+        let mut fx = fixture().await;
+        fx.grant(None, GrantTerms::new(5000)).await;
+        let epoch = fx.service.snapshot().clients.iter().find(|c| c.client_id == fx.client_id).unwrap().epoch;
+        let reserve = |amount_msat| fx.service.reserve_spend(&fx.client_id, epoch, vec![Charge {
+            recipient: fx.peer.to_hex(), amount_msat,
+        }]).unwrap();
+        let parent = reserve(1500);
+        let child = reserve(1000);
+        let path = fx.tmp.path().join("accounting.db");
+        let db = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+        let mut op = OutboxOperation::prepared(uuid::Uuid::new_v4().to_string(), fx.peer.to_hex(), 1, "accounting crash".into());
+        op.state = terminal.into();
+        // Crash snapshot after the terminal transition: both execution fields
+        // are already gone; independent resolution intents must survive it.
+        op.recovery = serde_json::to_vec(&json!({
+            "caller":null, "draft":null, "dispatched":false, "expected_msat":0,
+            "settlement":null, "reservation":null, "fee_ceiling_msat":0,
+            "admission_msat":0, "admission_fee_msat":0,
+            "budget_resolutions":[
+                {"reservation":parent,"actual_msat":0},
+                {"reservation":child,"actual_msat":800}
+            ]
+        })).unwrap();
+        assert!(db.insert_outbox_operation(&op).await.unwrap());
+        fx.state = Arc::new(AppState { storage:db.clone(), ..(*fx.state).clone() });
+        let blocker = fx.tmp.path().join("pairing/clients.json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+        assert_eq!(fx.used(), 2500, "failed persistence retains both liabilities");
+        let saved = db.get_outbox_operation(&op.operation_id).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&saved.recovery).unwrap()["budget_resolutions"].as_array().unwrap().len(), 2);
+        std::fs::remove_dir(blocker).unwrap();
+        fx.restart();
+        fx.state = Arc::new(AppState { storage:Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap()), ..(*fx.state).clone() });
+        for _ in 0..3 {
+            konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+            assert_eq!(fx.used(), 800, "release parent and charge child's actual principal plus fee once");
+            assert!(fx.service.reload_from_disk().unwrap().grants[0].budget.as_ref().unwrap().pending.is_empty());
+            let saved = db.get_outbox_operation(&op.operation_id).await.unwrap().unwrap();
+            assert_eq!(saved.state, terminal, "accounting never changes delivery");
+            assert!(serde_json::from_slice::<Value>(&saved.recovery).unwrap()["budget_resolutions"].as_array().unwrap().is_empty());
+        }
+        assert_eq!(fx.wallet.money(), 0);
+    }
+}
