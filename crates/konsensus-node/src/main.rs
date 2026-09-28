@@ -1671,3 +1671,7 @@ mod whitelist_replay_tests {
 #[cfg(test)]
 #[path = "tests/main_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "regtest-e2e"))]
+#[path = "tests/regtest_e2e.rs"]
+mod regtest_e2e;
