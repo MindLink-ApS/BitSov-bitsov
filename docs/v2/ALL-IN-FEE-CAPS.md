@@ -86,9 +86,9 @@ are rejected. Mock settlement and fee-limit enforcement remain active.
 On-chain channel opens are outside Lightning routing-fee caps. For
 `POST /payments/open-channel` (and the LDK opener):
 
-- An explicit per-channel funding `fee_rate` is **refused before dispatch**
-  (`PaymentNotDispatched`: LDK cannot enforce that ceiling). Omit the override
-  and use the node's fee estimator.
+- An explicit per-channel funding `fee_rate_sat_per_vb` (sat/vB) is **refused
+  before dispatch** (`PaymentNotDispatched`: LDK cannot enforce that ceiling).
+  Omit the override and use the node's fee estimator.
 - `announce: true` is refused before dispatch when the node cannot honour
   announcement prerequisites (no alias / listening addresses) —
   `announce_unavailable`. Private opens (`announce: false`) remain the
