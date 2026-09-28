@@ -367,7 +367,7 @@ async fn keysend(
 ///
 /// An invoice without an amount is refused for a metered caller: the amount
 /// would be chosen at payment time, after the budget check.
-fn invoice_terms(bolt11: &str) -> Result<(u64, String), ApiError> {
+pub(crate) fn invoice_terms(bolt11: &str) -> Result<(u64, String), ApiError> {
     let invoice = bolt11
         .trim()
         .parse::<lightning_invoice::Bolt11Invoice>()
@@ -391,7 +391,7 @@ fn invoice_terms(bolt11: &str) -> Result<(u64, String), ApiError> {
 /// Settled → the reported amount. Failed, or rejected before dispatch → 0.
 /// Anything else (pending, in flight, or an error that does not prove the
 /// payment never left) stays reserved: the #80 unknown outcome.
-fn resolve_payment(
+pub(crate) fn resolve_payment(
     debit: &Debit,
     recipient: &str,
     paid: &Result<konsensus_core::traits::lightning::PaymentDetails, LightningError>,

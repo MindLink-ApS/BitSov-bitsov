@@ -2300,3 +2300,23 @@ fn introduction_network_normalizes_ldk_names() {
         assert_eq!(config.bitcoin_network().as_deref(), canonical, "{configured}");
     }
 }
+
+#[test]
+fn sponsor_is_off_by_default_and_clamped_to_the_spec() {
+    let cfg: SponsorConfig = toml::from_str("").unwrap();
+    assert!(!cfg.enabled);
+    assert!(!cfg.policy().unwrap().enabled);
+    let on: SponsorConfig = toml::from_str("enabled = true\ngift_sats = 20000\nfee_sats = 100\npurse_sats = 100000\nkits_per_day = 2").unwrap();
+    let p = on.policy().unwrap();
+    assert_eq!((p.gift_msat, p.fee_msat, p.purse_msat, p.kits_per_day), (20_000_000, 100_000, 100_000_000, 2));
+    for bad in [
+        "enabled = true\ngift_sats = 50000\nfee_sats = 100",
+        "enabled = true\npurse_sats = 200000",
+        "enabled = true\nkits_per_day = 5",
+        "enabled = true\nfee_sats = 1000",
+    ] {
+        let cfg: SponsorConfig = toml::from_str(bad).unwrap();
+        assert!(cfg.policy().is_err(), "{bad}");
+    }
+    assert!(toml::from_str::<SponsorConfig>("enabled = true\nfree_lane = true").is_err(), "unknown keys refused");
+}

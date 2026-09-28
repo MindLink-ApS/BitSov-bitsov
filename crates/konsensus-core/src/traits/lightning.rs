@@ -254,6 +254,18 @@ pub trait LightningProvider: Send + Sync {
     /// Returns payment details once the payment is initiated (may still be in-flight).
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError>;
 
+    /// Pay with an exact routing-fee ceiling enforced BEFORE dispatch.
+    /// This single-use operation must not retry an existing failed payment
+    /// hash: callers reconcile by hash across crashes. Serialize any freshness
+    /// check with dispatch so an old failure cannot stand for a new attempt.
+    /// Unsupported backends fail closed; never use unbounded pay_invoice as
+    /// a fallback or discover an overspend only after it has occurred.
+    async fn pay_invoice_with_fee_limit(
+        &self, _bolt11: &str, _max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
+        Err(LightningError::PaymentNotDispatched("backend cannot enforce routing fee limit".into()))
+    }
+
     /// Check the status of a payment by its payment hash.
     async fn get_payment_status(
         &self,

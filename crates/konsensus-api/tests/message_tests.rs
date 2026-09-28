@@ -1915,6 +1915,7 @@ async fn compose_happy_path_keysend() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -2041,6 +2042,7 @@ async fn compose_happy_path_invoice_flow() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -2148,6 +2150,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -2286,6 +2289,7 @@ async fn compose_keysend_fallback_to_invoice() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -2407,6 +2411,7 @@ async fn compose_queues_when_transport_send_fails() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -2502,6 +2507,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -2631,6 +2637,7 @@ async fn compose_broadcasts_to_websocket() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -2723,6 +2730,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -2818,6 +2826,7 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -2973,6 +2982,7 @@ async fn compose_room_rejects_oversized_member_count() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 

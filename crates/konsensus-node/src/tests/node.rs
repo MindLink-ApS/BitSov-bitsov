@@ -42,6 +42,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
         admission_mode: konsensus_message::ReachabilityMode::Whitelist,
         cookie_mode: konsensus_message::CookieMode::Disabled,
         onboarding_subsidy: crate::config::SubsidyConfig::default(),
+        sponsor: crate::config::SponsorConfig::default(),
         relay: RelayConfig::default(),
     }
 }
@@ -69,6 +70,7 @@ fn snapshot_config(storage: StorageConfig) -> NodeConfig {
         admission_mode: konsensus_message::ReachabilityMode::Whitelist,
         cookie_mode: konsensus_message::CookieMode::Disabled,
         onboarding_subsidy: crate::config::SubsidyConfig::default(),
+        sponsor: crate::config::SponsorConfig::default(),
         relay: RelayConfig::default(),
     }
 }

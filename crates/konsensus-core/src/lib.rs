@@ -14,6 +14,7 @@ pub mod fee_rate;
 pub mod gate;
 pub mod identity;
 pub mod introduction;
+pub mod sponsor;
 pub mod invite;
 pub mod kind;
 pub mod payloads;

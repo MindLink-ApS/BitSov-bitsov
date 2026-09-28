@@ -278,6 +278,9 @@ impl LightningProvider for CircuitBreakerLightning {
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         self.inner.pay_invoice(bolt11).await
     }
+    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
+        self.inner.pay_invoice_with_fee_limit(bolt11, max_fee_msat).await
+    }
 
     async fn get_balance_msat(&self) -> Result<u64, LightningError> {
         self.inner.get_balance_msat().await
@@ -391,6 +394,12 @@ mod tests {
         ) -> Result<Invoice, LightningError> {
             Err(LightningError::Backend("n/a".into()))
         }
+        async fn pay_invoice_with_fee_limit(&self, bolt11: &str, cap: u64) -> Result<PaymentDetails, LightningError> {
+            assert_eq!(bolt11, "capped-test-invoice");
+            let mut paid = settled_details();
+            paid.fee_msat = Some(cap);
+            Ok(paid)
+        }
         async fn pay_invoice(&self, _b: &str) -> Result<PaymentDetails, LightningError> {
             Err(LightningError::Backend("n/a".into()))
         }
@@ -403,6 +412,14 @@ mod tests {
         async fn wallet_sync(&self) -> WalletSync {
             WalletSync::SyncedAt(1_700_000_000)
         }
+    }
+
+    #[tokio::test]
+    async fn capped_payments_forward_the_exact_limit() {
+        let inner = FakeProvider::new(Behavior::Settled);
+        let wrapper = CircuitBreakerLightning::new(inner, fast_cfg());
+        let paid = wrapper.pay_invoice_with_fee_limit("capped-test-invoice", 123).await.unwrap();
+        assert_eq!(paid.fee_msat, Some(123));
     }
 
     fn fast_cfg() -> CircuitBreakerConfig {

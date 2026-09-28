@@ -276,6 +276,7 @@ async fn pricing_own_chain_aware_reports_mode() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -1285,6 +1286,7 @@ async fn health_lightning_unavailable_shows_null_balance() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -1784,6 +1786,7 @@ async fn chain_status_with_failing_provider() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -1896,6 +1899,7 @@ async fn chain_status_partial_failure() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: None,
     });
 
@@ -2219,6 +2223,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         lightning_backend: base.lightning_backend.clone(),
         chain_backend: base.chain_backend.clone(),
         introduction: Default::default(),
+        sponsor: Default::default(),
         gossip_validator: base.gossip_validator.clone(),
     });
     let auth = auth_header(&state);

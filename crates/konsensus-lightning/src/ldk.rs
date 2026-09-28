@@ -285,7 +285,70 @@ impl std::fmt::Debug for LdkProvider {
     }
 }
 
+// The fresh-hash check and send share a lock with ordinary invoice payments.
+// A capped sponsor payment must never retry an older failed attempt: LDK may
+// initiate HTLCs before persisting its replacement Pending record.
+static INVOICE_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl LdkProvider {
+    async fn pay_invoice_routed(
+        &self, bolt11: &str,
+        route_parameters: Option<ldk_node::lightning::routing::router::RouteParametersConfig>,
+    ) -> Result<PaymentDetails, LightningError> {
+        let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11
+            .parse()
+            .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
+
+        let payment_hash_hex = hex::encode(AsRef::<[u8]>::as_ref(invoice.payment_hash()));
+        let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0);
+
+        let _dispatch = INVOICE_DISPATCH_LOCK.lock()
+            .map_err(|_| LightningError::PaymentNotDispatched("invoice dispatch lock poisoned".into()))?;
+        let payment_id_bytes: [u8; 32] = AsRef::<[u8]>::as_ref(invoice.payment_hash()).try_into()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid payment hash".into()))?;
+        if route_parameters.is_some()
+            && self.node.payment(&ldk_node::lightning::ln::channelmanager::PaymentId(payment_id_bytes)).is_some() {
+            return Err(LightningError::PaymentNotDispatched("capped payments require a fresh invoice hash".into()));
+        }
+        let payment_id = self
+            .node
+            .bolt11_payment()
+            .send(&invoice, route_parameters)
+            .map_err(|e| {
+                // Mark as payment-incapable on channel/funding errors
+                self.payment_capable.store(false, Ordering::Relaxed);
+                warn!(error = %e, "LDK payment failed — marking as payment-incapable");
+                LightningError::PaymentFailed(format!("{e}"))
+            })?;
+
+        // Successful send — ensure the capability flag is set
+        self.payment_capable.store(true, Ordering::Relaxed);
+
+        // Poll for completion (LDK processes payments asynchronously)
+        // We return InFlight immediately; callers should use get_payment_status to poll.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Check if the payment completed quickly
+        if let Some(details) = self.node.payment(&payment_id) {
+            return Ok(convert_payment_details(&details));
+        }
+
+        Ok(PaymentDetails {
+            payment_hash: payment_hash_hex,
+            preimage: None,
+            amount_msat,
+            status: PaymentStatus::InFlight,
+            direction: PaymentDirection::Outgoing,
+            timestamp: now,
+            memo: None,
+            fee_msat: None,
+        })
+    }
+
+
     fn stored_payment(&self, hash: &str) -> Result<ldk_node::payment::PaymentDetails, LightningError> {
         let bytes = hex::decode(hash).map_err(|_| LightningError::PaymentNotFound(hash.into()))?;
         let id: [u8; 32] = bytes.try_into().map_err(|_| LightningError::PaymentNotFound(hash.into()))?;
@@ -965,51 +1028,16 @@ impl LightningProvider for LdkProvider {
         })
     }
 
-    #[instrument(skip(self), fields(bolt11))]
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
-        let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11
-            .parse()
-            .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
+        self.pay_invoice_routed(bolt11, None).await
+    }
 
-        let payment_hash_hex = hex::encode(AsRef::<[u8]>::as_ref(invoice.payment_hash()));
-        let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0);
-
-        let payment_id = self
-            .node
-            .bolt11_payment()
-            .send(&invoice, None)
-            .map_err(|e| {
-                // Mark as payment-incapable on channel/funding errors
-                self.payment_capable.store(false, Ordering::Relaxed);
-                warn!(error = %e, "LDK payment failed — marking as payment-incapable");
-                LightningError::PaymentFailed(format!("{e}"))
-            })?;
-
-        // Successful send — ensure the capability flag is set
-        self.payment_capable.store(true, Ordering::Relaxed);
-
-        // Poll for completion (LDK processes payments asynchronously)
-        // We return InFlight immediately; callers should use get_payment_status to poll.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Check if the payment completed quickly
-        if let Some(details) = self.node.payment(&payment_id) {
-            return Ok(convert_payment_details(&details));
-        }
-
-        Ok(PaymentDetails {
-            payment_hash: payment_hash_hex,
-            preimage: None,
-            amount_msat,
-            status: PaymentStatus::InFlight,
-            direction: PaymentDirection::Outgoing,
-            timestamp: now,
-            memo: None,
-            fee_msat: None,
-        })
+    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
+        let route = ldk_node::lightning::routing::router::RouteParametersConfig {
+            max_total_routing_fee_msat: Some(max_fee_msat),
+            ..Default::default()
+        };
+        self.pay_invoice_routed(bolt11, Some(route)).await
     }
 
     #[instrument(skip(self), fields(payment_hash))]

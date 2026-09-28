@@ -288,6 +288,13 @@ impl LightningProvider for MockLightningProvider {
     }
 
     #[instrument(skip(self, bolt11))]
+    // This test backend has no route and charges zero routing fees.
+    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, _max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
+        let mut paid = self.pay_invoice(bolt11).await?;
+        paid.fee_msat = Some(0);
+        Ok(paid)
+    }
+
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -333,7 +340,7 @@ impl LightningProvider for MockLightningProvider {
             direction: PaymentDirection::Outgoing,
             timestamp: now,
             memo: None,
-            fee_msat: None,
+            fee_msat: Some(0),
         };
 
         self.payments
@@ -373,10 +380,9 @@ impl LightningProvider for MockLightningProvider {
                 pending.remove(payment_hash);
             }
         }
-        self.payments
-            .lock()
-            .await
-            .get(payment_hash)
+        let payments = self.payments.lock().await;
+        payments.get(payment_hash)
+            .or_else(|| payments.get(&format!("out-{payment_hash}")))
             .cloned()
             .ok_or_else(|| LightningError::PaymentNotFound(payment_hash.to_string()))
     }
