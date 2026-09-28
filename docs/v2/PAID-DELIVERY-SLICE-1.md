@@ -35,3 +35,5 @@ Wire compatibility adds only the optional, default-false `duplicate` field to th
 Run `CARGO_TARGET_DIR=/tmp/bitsov-target-a13 cargo test --workspace --locked` and `cargo clippy --workspace --locked -- -D warnings`. The real-wallet matrix additionally uses `cargo test -p konsensus-lightning --locked --features ldk-integration-test --test ldk_payment_e2e ldk_two_node_channel_payment_and_gate_verification` and requires the existing Bitcoin Core/electrs test binaries. PostgreSQL parity is compiled by the workspace; runtime storage fault tests use SQLite.
 
 Existing synthetic profile and content-response sends are outside the durable API outbox. Operation IDs, idempotent repeated POSTs, crash recovery between Lightning dispatch and envelope creation, new operation-status APIs and app changes belong to subsequent slices. They are not provided by this delivery retry mechanism.
+
+Validation on this branch: locked workspace suite passed (3,313 tests, zero failures, two existing ignored); clippy with `-D warnings` passed. The feature-gated two-node LDK regtest test also passed against local Bitcoin Core and electrs.
