@@ -9,6 +9,8 @@
 #![forbid(unsafe_code)]
 
 pub mod circuit_breaker;
+pub mod recovering;
+pub use recovering::RecoveringLightning;
 pub mod ldk;
 pub mod liquidity;
 pub mod lnd;
