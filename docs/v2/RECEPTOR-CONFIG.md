@@ -28,20 +28,25 @@ global = 16
 
 An explicit `acts` list replaces the default list; include chat to retain it.
 An omitted `enabled` is false. Omitted caps use F1's defaults above. Duplicate
-kinds and zero caps/windows are rejected. An empty list disables all receptors.
+kinds, zero caps/windows, and enabled unpriceable kinds (including 700–899)
+are rejected at config load. An empty list disables all receptors.
 Disabled/absent acts receive the existing fixed `konsensus:admission_required`
 refusal; replay and exhausted caps receive `konsensus:admission_rate_limited`.
 Refusals themselves retain the existing source and global rate limits.
 Unsupported backends return `stateless_quote_unsupported` without an invoice RPC.
-Other pricing/backend/validation failures remain fail-closed, as in F1.
+A runtime unpriceable act receives bounded `konsensus:admission_required`;
+other pricing/backend/validation failures remain fail-closed, as in F1.
 
 Send `purpose = "konsensus:admission:<kind>"`, using canonical decimal digits.
 The existing `admission_quote::request_id` binds sender, recipient, issue second
 and a fresh random nonce. One ID can mint at most one invoice across *all*
 acts. A retry needs a fresh ID; rotating identity does not reset the source-IP
-cap. IPv4-mapped IPv6 shares its IPv4 bucket. Caps are independent per act;
-volatile source guards and request-ID digests also have shared hard bounds of
-1,024 each. Exhaustion refuses work rather than evicting live guards. Restart
+cap. IPv4-mapped IPv6 shares its IPv4 bucket. In addition to the per-act caps,
+all acts share F1's fixed envelope: one mint per source IP per 10 seconds and
+16 mints node-wide per 10 seconds. Enabling acts cannot multiply that budget.
+Every budget and guard is checked before any permit or request ID is consumed.
+Volatile shared source guards, per-act source guards and request-ID digests
+each have a hard bound of 1,024 entries. Exhaustion refuses work rather than evicting live guards. Restart
 retains F1's startup quarantine, so pre-start attempts cannot reopen.
 
 Chat preserves F1's amount and `konsensus:<id>:message=<price>` description,
@@ -58,10 +63,11 @@ Production quotes still use the LDK `create_inbound_payment` path, retaining
 no pending payment or application record. Only bounded volatile counters and
 request-ID digests exist before settlement. LND/LNbits remain unsupported.
 
-`route_hints = "none"` is the only currently accepted policy and the default.
-The LDK adapter removes private route hints before signing stateless invoices;
-the receptor also rejects any backend invoice containing hints. Ordinary paid
-invoice creation is unaffected. A single-LSP-hint option awaits Rasmus's
-ADR-042 decision and cannot be enabled through this implementation. This may
-make a recipient reachable only through private channels unpayable until the
-payer knows a route separately.
+`route_hints = "none"` is the only currently accepted policy and the default
+for newly enabled act types. The LDK adapter removes their private route hints
+before signing; the receptor rejects a hinted backend invoice for those acts.
+KIND_CHAT retains main/F1 behavior byte for byte, including private route hints,
+under the Atlas CoS decision. Ordinary paid invoice creation is unaffected.
+A different hint policy awaits Rasmus's open ADR-042 decision. Newly enabled
+acts may be unpayable through private channels unless the payer knows a route
+separately.

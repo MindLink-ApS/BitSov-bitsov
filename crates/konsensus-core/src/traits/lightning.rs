@@ -249,6 +249,18 @@ pub trait LightningProvider: Send + Sync {
         Err(LightningError::StatelessQuoteUnsupported)
     }
 
+    /// Stateless quote for a new receptor act, with no private route hints.
+    /// The receptor validates the returned invoice before disclosure. Backends
+    /// that include hints must override this to remove them before signing.
+    async fn create_stateless_invoice_without_route_hints(
+        &self,
+        amount_msat: u64,
+        description: &str,
+        expiry_secs: u32,
+    ) -> Result<Invoice, LightningError> {
+        self.create_stateless_invoice(amount_msat, description, expiry_secs).await
+    }
+
     /// Pay a BOLT11 invoice.
     ///
     /// Returns payment details once the payment is initiated (may still be in-flight).

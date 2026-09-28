@@ -2349,3 +2349,15 @@ fn receptor_defaults_and_opt_in_are_explicit() {
             .is_err());
     }
 }
+
+#[test]
+fn receptor_rejects_enabled_unpriceable_kind_700_at_config_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = NodeConfig::default_for_tier(NodeTier::Light, dir.path().join("mnemonic"), dir.path());
+    config.receptor = toml::from_str("[[acts]]\nkind=700\nenabled=true").unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    assert!(NodeConfig::load(&path).unwrap_err().to_string().contains("700"));
+    config.receptor.acts[0].enabled = false;
+    config.receptor.validate().unwrap();
+}

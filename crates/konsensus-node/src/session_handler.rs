@@ -971,13 +971,19 @@ async fn handle_invoice_requested_gated(
             return;
         }
         // Only the enabled act price. No peer/storage/session dependency.
-        let Ok(Ok(price)) = tokio::time::timeout(
+        let price = match tokio::time::timeout(
             std::time::Duration::from_secs(5),
             pricing.get_price_msat(kind),
-        )
-        .await
-        else {
-            return;
+        ).await {
+            Ok(Ok(price)) => price,
+            Ok(Err(konsensus_core::traits::pricing::PricingError::NotPriceable(_))) => {
+                if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                    send_invoice_refusal(transport, peer_id, request_id,
+                        konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
+                }
+                return;
+            }
+            _ => return,
         };
         // Preserve F1's chat amount and signed description byte for byte.
         // Other acts bind their kind and only their own payable price.
@@ -1002,9 +1008,16 @@ async fn handle_invoice_requested_gated(
         if expiry == 0 {
             return;
         }
+        let omit_route_hints = quotes.omit_route_hints(kind);
         let invoice = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            lightning.create_stateless_invoice(admission, &description, expiry),
+            async {
+                if omit_route_hints {
+                    lightning.create_stateless_invoice_without_route_hints(admission, &description, expiry).await
+                } else {
+                    lightning.create_stateless_invoice(admission, &description, expiry).await
+                }
+            },
         )
         .await;
         if matches!(&invoice, Ok(Err(konsensus_core::traits::lightning::LightningError::StatelessQuoteUnsupported))) {
@@ -1029,7 +1042,7 @@ async fn handle_invoice_requested_gated(
                 || signed
                     .expires_at()
                     .is_none_or(|end| end.as_secs() > attempt_end)
-                || !signed.route_hints().is_empty()
+                || (omit_route_hints && !signed.route_hints().is_empty())
                 || signed.amount_milli_satoshis() != Some(admission)
                 || signed.description().to_string() != description
                 || signed.payment_hash().to_string() != invoice.payment_hash

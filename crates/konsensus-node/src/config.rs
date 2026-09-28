@@ -197,7 +197,8 @@ pub struct NodeConfig {
     pub relay: RelayConfig,
 }
 
-/// Receptor route-hint policy. Other policies require the ADR-042 decision.
+/// Route-hint policy for newly enabled acts. Chat retains main/F1 behavior.
+/// Other policies require the ADR-042 decision.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceptorRouteHints {
@@ -267,6 +268,14 @@ impl ReceptorConfig {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         let mut kinds = std::collections::HashSet::new();
         for act in &self.acts {
+            // Both static and chain-aware pricing use this category mapping;
+            // chain-aware pricing delegates its base price to the static engine.
+            anyhow::ensure!(
+                !act.enabled || konsensus_core::kind::KindCategory::from_kind(act.kind)
+                    != konsensus_core::kind::KindCategory::Unknown,
+                "enabled receptor act {} is not priceable",
+                act.kind
+            );
             anyhow::ensure!(
                 kinds.insert(act.kind),
                 "duplicate receptor act {}",
