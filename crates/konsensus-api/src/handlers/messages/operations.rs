@@ -489,6 +489,17 @@ pub(super) async fn compose(
             ));
         }
         recover_budget(&state, &mut op).await?;
+        // Pre-fix rows may have terminalized incomplete settlement as failed_paid.
+        // Reopen those only; genuine terminal rejects stay failed_paid.
+        // Compaction strips recovery evidence (dispatched/envelope_ready) but is
+        // payload retention, not re-payment authorization — never reopen compacted.
+        if op.state == "failed_paid"
+            && !op.recovery_compacted
+            && incomplete_settled_recovery(&op)
+        {
+            op.state = "payment_unknown".into();
+            save(&state, &mut op).await?;
+        }
         if matches!(op.state.as_str(), "paying" | "payment_unknown") {
             reconcile(&state, &mut op).await?;
         }
@@ -788,6 +799,14 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
         return Ok(());
     }
     if !data.dispatched && !data.envelope_ready {
+        // Defense in depth: a prior settlement (or recorded payment_hash) means
+        // this is not a fresh attempt — never authorize another payment by
+        // resetting to prepared (e.g. after recovery compaction stripped flags).
+        if op.settled_msat > 0 || op.payment_hash.is_some() {
+            op.state = "payment_unknown".into();
+            save(state, op).await?;
+            return Ok(());
+        }
         queue_message_resolution(&mut data, 0, Some(0));
         data.reservation = None;
         data.execution_id = None;
@@ -981,12 +1000,15 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             if let Some(linked) = links.get(&id) {
                 attach_recovered_reservations(state, &mut op, linked).await?;
             }
+            // No sweep-side failed_paid→payment_unknown reopen: list_recoverable
+            // never selects failed_paid unless accounting_pending. Compose owns
+            // mistagged reopen (with recovery_compacted guard).
             if matches!(op.state.as_str(), "paying" | "payment_unknown") {
                 reconcile(state, &mut op).await?;
             }
             recover_budget(state, &mut op).await?;
             if op.state == "paid" {
-                recover_paid(state, &op).await?;
+                recover_paid(state, &mut op).await?;
             }
             Ok(())
         }
@@ -1191,7 +1213,30 @@ fn resend_delay(operation_id: &str, failures: u32) -> Duration {
     base / 2 + base / 2 * jitter / u32::from(u16::MAX)
 }
 
-async fn recover_paid(state: &AppState, op: &OutboxOperation) -> Result<(), ApiError> {
+async fn recover_paid(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    // Paid without a durable envelope cannot be resent and must never re-pay.
+    // Fail closed before pacing so a missing envelope cannot linger as paid.
+    let message_id = match op.message_id.as_deref() {
+        Some(hex) => MessageId::from_hex(hex).map_err(storage)?,
+        None => {
+            op.state = "payment_unknown".into();
+            op.last_error = Some("paid operation missing message id".into());
+            save(state, op).await?;
+            return Ok(());
+        }
+    };
+    if state
+        .storage
+        .get_message(&message_id)
+        .await
+        .map_err(storage)?
+        .is_none()
+    {
+        op.state = "payment_unknown".into();
+        op.last_error = Some("paid envelope missing".into());
+        save(state, op).await?;
+        return Ok(());
+    }
     let peer = NodeId::from_hex(&op.recipient).map_err(storage)?;
     let link = if state.transport.is_connected(&peer).await {
         Link::Online(state.transport.connected_since(&peer).await)
@@ -1229,4 +1274,16 @@ async fn recover_paid(state: &AppState, op: &OutboxOperation) -> Result<(), ApiE
         pace.link = link;
     }
     result.map(|_| ())
+
+}
+
+/// Early #113 builds terminalized settled-without-proof / missing-draft as
+/// `failed_paid`. Those must reopen to `payment_unknown` so later backend proof
+/// can still complete delivery — without authorizing another payment.
+fn incomplete_settled_recovery(op: &OutboxOperation) -> bool {
+    matches!(
+        op.last_error.as_deref(),
+        Some("settled payment has no valid proof")
+            | Some("settled payment missing encrypted draft")
+    )
 }
