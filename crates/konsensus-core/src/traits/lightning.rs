@@ -120,6 +120,21 @@ pub struct InboundPayment {
 /// Errors from Lightning operations.
 #[derive(Debug, Error)]
 pub enum LightningError {
+    /// The bounded startup fee barrier could not obtain usable chain data.
+    #[error("BOOT_CHAIN_SOURCE_UNAVAILABLE: BitSov could not obtain usable fees from a Bitcoin chain service. Your local identity is saved. Check your connection and try again. (network={network}, service={service}, attempts={attempts}, elapsed_ms={elapsed_ms}, cause={cause})")]
+    ChainSourceUnavailable {
+        network: String,
+        /// Host only; never an authenticated URL or response body.
+        service: String,
+        attempts: usize,
+        elapsed_ms: u64,
+        cause: String,
+    },
+
+    /// A local startup setting is invalid; retrying the network cannot fix it.
+    #[error("BOOT_INVALID_CONFIG: Invalid Lightning configuration: {0}. Check konsensus.toml and try again.")]
+    InvalidStartupConfig(String),
+
     /// This backend cannot issue a quote without retaining unpaid state.
     #[error("stateless_quote_unsupported")]
     StatelessQuoteUnsupported,
