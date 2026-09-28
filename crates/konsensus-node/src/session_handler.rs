@@ -28,6 +28,7 @@ use konsensus_message::{ControlEvent, Frame, NoiseTransport};
 use konsensus_pricing::PeerPriceCache;
 
 use konsensus_api::audit::AuditLog;
+use konsensus_api::membrane::{Membrane, PrePaymentReason};
 use konsensus_api::state::WsDeliveryStatus;
 use konsensus_api::InvoiceResponseData;
 use konsensus_api::state::{InvoiceRequestOutcome, InvoiceResponseError};
@@ -90,6 +91,41 @@ const ADMISSION_INVOICE_PURPOSE: &str = "konsensus:admission";
 /// chat floor — the minimum energy required to be admitted and promoted.
 const ADMISSION_INVOICE_KIND: u16 = konsensus_core::kind::KIND_CHAT;
 
+/// Refuse state-changing control frames before dispatch. This consumes no
+/// identity or payload into telemetry: only a fixed reason counter is updated.
+fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
+    use ControlEvent::*;
+    let (privileged, reason) = match event {
+        PrekeyOffer { privileged, .. }
+        | SessionInit { privileged, .. }
+        | SessionAck { privileged, .. }
+        | RatchetInit { privileged, .. } => (privileged, PrePaymentReason::SessionBeforePayment),
+        MessageAcked { privileged, .. } | MessageRejected { privileged, .. } => {
+            (privileged, PrePaymentReason::DeliveryBeforePayment)
+        }
+        PriceTableReceived { privileged, .. }
+        | PriceQueryReceived { privileged, .. }
+        | PriceResponseReceived { privileged, .. } => {
+            (privileged, PrePaymentReason::PriceBeforePayment)
+        }
+        PeerExchangeRequested { privileged, .. } | PeerExchangeReceived { privileged, .. } => {
+            (privileged, PrePaymentReason::PeerExchangeBeforePayment)
+        }
+        LightningInfoReceived { privileged, .. } => {
+            (privileged, PrePaymentReason::LightningInfoBeforePayment)
+        }
+        GossipReceived { privileged, .. } => (privileged, PrePaymentReason::GossipBeforePayment),
+        // Connecting is not a refused frame. Invoice requests and responses
+        // have binding/bootstrap exceptions and are counted at their decision.
+        _ => return false,
+    };
+    if *privileged {
+        return false;
+    }
+    membrane.pre_payment_refused(reason);
+    true
+}
+
 /// Runs the session/control event handler loop.
 pub(crate) async fn run(deps: SessionHandlerDeps) {
     let SessionHandlerDeps {
@@ -145,6 +181,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     info!("control channel closed, session handler exiting");
                     break;
                 };
+
+                if refuse_unpaid_control(&event, audit_log.membrane()) {
+                    continue;
+                }
 
                 match event {
                     // M1b: PeerConnected for an UNPRIVILEGED (PriceOpen stranger)
@@ -267,9 +307,11 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     }
 
                     ControlEvent::InvoiceErrorReceived { peer_id, request_id, reason, privileged } => {
-                        handle_invoice_error_received(
+                        if handle_invoice_error_received(
                             &peer_id, &request_id, &reason, privileged, &invoice_requests,
-                        ).await;
+                        ).await {
+                            audit_log.membrane().pre_payment_refused(PrePaymentReason::InvoiceErrorBeforePayment);
+                        }
                     }
 
                     ControlEvent::PeerExchangeRequested { peer_id, privileged } => {
@@ -1042,9 +1084,9 @@ async fn handle_invoice_requested_gated(
         return;
     }
     if !privileged {
+        membrane.pre_payment_refused(PrePaymentReason::AdmissionRequired);
         let now = tokio::time::Instant::now();
         if last_admission_refusal.permit(source_ip, now) {
-            last_admission_refusal.event(peer_id, now, membrane);
             send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
         }
         return;
@@ -1134,19 +1176,19 @@ async fn send_invoice_refusal(
 /// that same peer (the binding in [`konsensus_api::invoice_refusal`]): it can
 /// only end our own request early, which it could do anyway by never answering.
 /// That is how a sender learns that a recipient now requires admission again.
+/// Returns true only for a pre-payment drop, for anonymous aggregate counting.
 async fn handle_invoice_error_received(
     peer_id: &NodeId,
     request_id: &str,
     reason: &str,
     privileged: bool,
     invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>,
-) {
+) -> bool {
     let bound_quote = request_id.starts_with(&format!("v1:{peer_id}:"))
         && reason == "stateless_quote_unsupported";
     let bound = konsensus_api::invoice_refusal::record(request_id, peer_id, reason);
     if !privileged && !bound_quote && !bound {
-        warn!(peer = %peer_id, "DROP InvoiceError from unprivileged peer (P2: no pending-invoice bookkeeping drive before payment)");
-        return;
+        return true;
     }
     warn!(
         peer = %peer_id, %request_id, %reason,
@@ -1156,11 +1198,12 @@ async fn handle_invoice_error_received(
     // First-contact IDs embed the intended recipient. A different connected
     // peer cannot cancel that request, even if it knows the correlation ID.
     if request_id.starts_with("v1:") && !request_id.starts_with(&format!("v1:{peer_id}:")) {
-        return;
+        return false;
     }
     if let Some(sender) = requests.remove(request_id) {
         let _ = sender.send(Err(InvoiceResponseError { recipient: *peer_id, reason: reason.into() }));
     }
+    false
 }
 
 async fn handle_invoice_response(

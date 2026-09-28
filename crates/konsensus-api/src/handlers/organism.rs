@@ -264,6 +264,8 @@ pub struct MembraneResponse {
     pub totals: Totals,
     /// Newest first.
     pub events: Vec<Arc<MembraneEvent>>,
+    /// Anonymous pre-payment counts; no event storage or identity keys.
+    pub pre_payment_refusals: crate::membrane::PrePaymentRefusals,
 }
 
 /// `GET /api/v1/membrane?since=&limit=` — recent admission decisions from the
@@ -277,6 +279,7 @@ async fn membrane(
     let limit = q.limit.unwrap_or(100).min(MEMBRANE_CAPACITY);
     let (events, totals) = log.read(q.since, limit);
     Json(MembraneResponse {
+        pre_payment_refusals: log.pre_payment_refusals(),
         capacity: log.capacity(),
         totals,
         events,

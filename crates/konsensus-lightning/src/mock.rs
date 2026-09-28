@@ -63,6 +63,8 @@ type SentBinding = (String, Vec<u8>);
 /// Invoices start as `Pending` until explicitly paid. Payment proofs are
 /// cryptographically valid (the payment gate's preimage verification passes).
 pub struct MockLightningProvider {
+    invoice_attempts: Mutex<std::collections::HashSet<String>>,
+    routing_fee_msat: u64,
     /// Current simulated balance in millisatoshis.
     balance_msat: Arc<Mutex<u64>>,
     /// Stored invoices/payments by payment hash.
@@ -85,6 +87,18 @@ pub struct MockLightningProvider {
 }
 
 impl MockLightningProvider {
+    /// Model a route with a fixed fee, enforced against the approved ceiling before debit.
+    pub fn with_routing_fee_msat(mut self, fee: u64) -> Self {
+        self.routing_fee_msat = fee;
+        self
+    }
+    fn capped_debit(&self, amount: u64, cap: u64) -> Result<u64, LightningError> {
+        if self.routing_fee_msat > cap {
+            return Err(LightningError::PaymentNotDispatched(format!("routing fee exceeds max_routing_fee_msat={cap}")));
+        }
+        amount.checked_add(self.routing_fee_msat).ok_or_else(|| LightningError::PaymentNotDispatched("payment debit overflow".into()))
+    }
+
     /// Create a new mock provider with default config (1 BTC balance).
     pub fn new() -> Self {
         Self::with_config(MockLightningConfig::default())
@@ -94,6 +108,8 @@ impl MockLightningProvider {
     pub fn with_config(config: MockLightningConfig) -> Self {
         let (inbound_tx, _) = broadcast::channel(256);
         Self {
+            invoice_attempts: Default::default(),
+            routing_fee_msat: 0,
             balance_msat: Arc::new(Mutex::new(config.initial_balance_msat)),
             payments: Arc::new(Mutex::new(HashMap::new())),
             inbound_tx,
@@ -158,7 +174,7 @@ impl MockLightningProvider {
             direction: PaymentDirection::Incoming,
             timestamp: now,
             memo: None,
-            fee_msat: None,
+            fee_msat: Some(0),
         };
         // Poll-consistency: the gate's verify_settlement poll
         // (`get_payment_status`) must find this exact settled record.
@@ -175,39 +191,34 @@ impl MockLightningProvider {
         payment_hash
     }
 
-    /// Encode a mock BOLT11 string that carries the preimage for cross-instance pay.
-    ///
-    /// Format: `lnbcrt{amount_sats}m1mock{hash_prefix}p{preimage_hex}`
-    ///
-    /// This allows `pay_invoice` on a **different** mock instance to extract the
-    /// original preimage — matching real Lightning behavior where the preimage
-    /// is revealed by the invoice creator upon settlement.
-    fn encode_bolt11(amount_msat: u64, hash: &[u8; 32], preimage: &[u8; 32]) -> String {
-        format!(
-            "lnbcrt{}m1mock{}p{}",
-            amount_msat / 1000,
-            &hex::encode(hash)[..16],
-            hex::encode(preimage),
-        )
+    /// Signed regtest BOLT11. Mock-only metadata reveals the preimage to other
+    /// mock instances; real settlement remains simulated and never uses funds.
+    fn encode_bolt11(amount_msat: u64, hash: &[u8; 32], preimage: &[u8; 32], description: &str, expiry_secs: u32) -> Result<String, LightningError> {
+        use bitcoin::hashes::Hash;
+        let key = bitcoin::secp256k1::SecretKey::from_slice(&[42; 32]).expect("fixed mock signing key");
+        let mut metadata = b"bitsov-mock-v1:".to_vec();
+        metadata.extend_from_slice(preimage);
+        lightning_invoice::InvoiceBuilder::new(lightning_invoice::Currency::Regtest)
+            .amount_milli_satoshis(amount_msat)
+            .description(description.to_owned())
+            .payment_hash(bitcoin::hashes::sha256::Hash::from_byte_array(*hash))
+            .payment_secret(lightning_invoice::PaymentSecret([42; 32]))
+            .payment_metadata(metadata)
+            .current_timestamp()
+            .expiry_time(std::time::Duration::from_secs(u64::from(expiry_secs)))
+            .min_final_cltv_expiry_delta(18)
+            .build_signed(|message| bitcoin::secp256k1::Secp256k1::new().sign_ecdsa_recoverable(message, &key))
+            .map(|invoice| invoice.to_string())
+            .map_err(|e| LightningError::InvoiceCreation(e.to_string()))
     }
 
-    /// Extract the preimage and amount from a mock BOLT11 string.
-    ///
-    /// Returns `(preimage_hex, amount_msat)` or `None` if the format is unrecognized.
     fn decode_bolt11(bolt11: &str) -> Option<(String, u64)> {
-        let stripped = bolt11.strip_prefix("lnbcrt")?;
-        let (amount_str, rest) = stripped.split_once('m')?;
-        let amount_sats: u64 = amount_str.parse().ok()?;
-
-        // New format with embedded preimage: ...p{preimage_hex}
-        if let Some((_prefix, preimage_hex)) = rest.split_once('p') {
-            if preimage_hex.len() == 64 {
-                return Some((preimage_hex.to_string(), amount_sats * 1000));
-            }
-        }
-
-        // Legacy format without preimage (backward compat)
-        None
+        let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse().ok()?;
+        if invoice.currency() != lightning_invoice::Currency::Regtest { return None; }
+        let metadata = invoice.payment_metadata()?;
+        let preimage = metadata.strip_prefix(b"bitsov-mock-v1:")?;
+        if preimage.len() != 32 || hex::encode(Sha256::digest(preimage)) != invoice.payment_hash().to_string() { return None; }
+        Some((hex::encode(preimage), invoice.amount_milli_satoshis()?))
     }
 
     /// Settle an invoice (called internally when `pay_invoice` targets a local invoice).
@@ -262,7 +273,7 @@ impl LightningProvider for MockLightningProvider {
             direction: PaymentDirection::Incoming,
             timestamp: now,
             memo: Some(description.to_string()),
-            fee_msat: None,
+            fee_msat: Some(0),
         };
 
         self.payments
@@ -273,7 +284,7 @@ impl LightningProvider for MockLightningProvider {
         // Balance is NOT credited yet — only credited when settled.
 
         // Encode preimage in BOLT11 so pay_invoice can extract it
-        let bolt11 = Self::encode_bolt11(amount_msat, &hash, &preimage);
+        let bolt11 = Self::encode_bolt11(amount_msat, &hash, &preimage, description, expiry_secs)?;
 
         debug!(payment_hash = %payment_hash, amount_msat, "mock invoice created (pending)");
 
@@ -288,14 +299,12 @@ impl LightningProvider for MockLightningProvider {
     }
 
     #[instrument(skip(self, bolt11))]
-    // This test backend has no route and charges zero routing fees.
-    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, _max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
-        let mut paid = self.pay_invoice(bolt11).await?;
-        paid.fee_msat = Some(0);
-        Ok(paid)
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+        let (_, amount) = Self::decode_bolt11(bolt11).unwrap_or_default();
+        self.pay_invoice_with_fee_limit(bolt11, self.routing_fee_policy().ceiling(amount.max(1000), None)).await
     }
 
-    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -304,13 +313,8 @@ impl LightningProvider for MockLightningProvider {
         // Extract preimage and amount from the mock BOLT11 string.
         // In real Lightning, the preimage is revealed by the recipient upon
         // HTLC settlement — here we simulate this by embedding it in BOLT11.
-        let (preimage_hex, amount_msat) = Self::decode_bolt11(bolt11).unwrap_or_else(|| {
-            // Fallback for unrecognized formats: generate a new proof
-            // (legacy behavior, used for malformed or non-mock invoices)
-            let (preimage, hash) = Self::generate_proof();
-            let _ = hash; // Not used in fallback
-            (hex::encode(preimage), 1000)
-        });
+        let (preimage_hex, amount_msat) = Self::decode_bolt11(bolt11)
+            .ok_or_else(|| LightningError::PaymentNotDispatched("expected a signed regtest invoice issued by the stock mock".into()))?;
 
         // Compute the payment hash from the preimage
         let preimage_bytes = hex::decode(&preimage_hex).map_err(|e| {
@@ -319,14 +323,19 @@ impl LightningProvider for MockLightningProvider {
         let hash: [u8; 32] = Sha256::digest(&preimage_bytes).into();
         let payment_hash = hex::encode(hash);
 
-        // Debit balance
+        // Enforce before any wallet or recipient mutation.
+        let debit_msat = self.capped_debit(amount_msat, max_fee_msat)?;
+        let mut attempts = self.invoice_attempts.lock().await;
+        if !attempts.insert(payment_hash.clone()) {
+            return Err(LightningError::PaymentNotDispatched("capped payments require a fresh invoice hash".into()));
+        }
         let mut balance = self.balance_msat.lock().await;
-        if *balance < amount_msat {
+        if *balance < debit_msat {
             return Err(LightningError::PaymentFailed(
                 "insufficient mock balance".into(),
             ));
         }
-        *balance -= amount_msat;
+        *balance -= debit_msat;
         drop(balance);
 
         // If this invoice exists locally (self-pay scenario), settle it
@@ -340,7 +349,7 @@ impl LightningProvider for MockLightningProvider {
             direction: PaymentDirection::Outgoing,
             timestamp: now,
             memo: None,
-            fee_msat: Some(0),
+            fee_msat: Some(self.routing_fee_msat),
         };
 
         self.payments
@@ -432,6 +441,12 @@ impl LightningProvider for MockLightningProvider {
         amount_msat: u64,
         memo: Option<&str>,
     ) -> Result<PaymentDetails, LightningError> {
+        self.keysend_with_fee_limit(dest_pubkey, amount_msat, memo, self.routing_fee_policy().ceiling(amount_msat, None)).await
+    }
+
+    async fn keysend_with_fee_limit(
+        &self, dest_pubkey: &str, amount_msat: u64, memo: Option<&str>, max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -449,14 +464,15 @@ impl LightningProvider for MockLightningProvider {
         let preimage_hex = hex::encode(preimage);
         let payment_hash = hex::encode(hash);
 
-        // Debit balance
+        // Enforce before any wallet or recipient mutation.
+        let debit_msat = self.capped_debit(amount_msat, max_fee_msat)?;
         let mut balance = self.balance_msat.lock().await;
-        if *balance < amount_msat {
+        if *balance < debit_msat {
             return Err(LightningError::PaymentFailed(
                 "insufficient mock balance".into(),
             ));
         }
-        *balance -= amount_msat;
+        *balance -= debit_msat;
         drop(balance);
 
         let details = PaymentDetails {
@@ -467,7 +483,7 @@ impl LightningProvider for MockLightningProvider {
             direction: PaymentDirection::Outgoing,
             timestamp: now,
             memo: memo.map(String::from),
-            fee_msat: None,
+            fee_msat: Some(self.routing_fee_msat),
         };
 
         // Test knob: optionally return in-flight and only settle on later polls,
@@ -567,7 +583,7 @@ impl LightningProvider for MockLightningProvider {
             direction: PaymentDirection::Incoming,
             timestamp: now,
             memo: Some(description.to_string()),
-            fee_msat: None,
+            fee_msat: Some(0),
         };
 
         self.payments

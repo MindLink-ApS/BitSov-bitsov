@@ -82,3 +82,14 @@ async fn unsupported_keysend_proves_no_payment_was_dispatched() {
     let err = DefaultProvider.keysend("unused", 1000, None).await.unwrap_err();
     assert!(matches!(err, LightningError::PaymentNotDispatched(_)));
 }
+
+#[tokio::test]
+async fn channel_fee_unsupported_provider_proves_no_dispatch() {
+    for fee in [None, Some(5.0)] {
+        let err = DefaultProvider
+            .open_channel("unused", "unused", 50_000, true, fee)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LightningError::PaymentNotDispatched(_)));
+    }
+}

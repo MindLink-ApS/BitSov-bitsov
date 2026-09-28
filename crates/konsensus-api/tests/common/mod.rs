@@ -35,6 +35,7 @@ use konsensus_api::state::AppState;
 // ─── Stub: In-memory Storage ────────────────────────────────────────
 
 pub struct MemStorage {
+    calendar: Mutex<HashMap<String, konsensus_storage::calendar::CalendarEventRecord>>,
     messages: Mutex<HashMap<String, UkmEnvelope>>,
     /// AES-GCM-encrypted plaintext blobs keyed by message id hex (mirrors prod).
     message_plaintext: Mutex<HashMap<String, Vec<u8>>>,
@@ -52,6 +53,7 @@ pub struct MemStorage {
 impl MemStorage {
     pub fn new() -> Self {
         Self {
+            calendar: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             message_plaintext: Mutex::new(HashMap::new()),
             rooms: Mutex::new(HashMap::new()),
@@ -80,6 +82,14 @@ impl MemStorage {
 
 #[async_trait]
 impl Storage for MemStorage {
+    async fn store_calendar_event(&self, event: &konsensus_storage::calendar::CalendarEventRecord) -> Result<(), StorageError> {
+        self.calendar.lock().unwrap().insert(event.id.clone(), event.clone());
+        Ok(())
+    }
+    async fn get_calendar_event(&self, id: &str) -> Result<Option<konsensus_storage::calendar::CalendarEventRecord>, StorageError> {
+        Ok(self.calendar.lock().unwrap().get(id).cloned())
+    }
+
     async fn invite_schema_capabilities(&self) -> Result<InviteSchemaCapabilities, StorageError> {
         Ok(self.invite_schema_capabilities)
     }
@@ -574,6 +584,14 @@ pub struct StubLightning;
 
 #[async_trait]
 impl LightningProvider for StubLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn create_invoice(
         &self,
         amount_msat: u64,
@@ -600,7 +618,7 @@ impl LightningProvider for StubLightning {
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
             memo: None,
-            fee_msat: None,
+            fee_msat: Some(0),
         })
     }
 
@@ -616,7 +634,7 @@ impl LightningProvider for StubLightning {
             direction: PaymentDirection::Incoming,
             timestamp: 1_700_000_000,
             memo: None,
-            fee_msat: None,
+            fee_msat: Some(0),
         })
     }
 
@@ -665,7 +683,7 @@ impl LightningProvider for StubLightning {
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
             memo: None,
-            fee_msat: Some(1),
+            fee_msat: Some(0),
         })
     }
 
@@ -691,10 +709,16 @@ impl LightningProvider for StubLightning {
         _peer_pubkey: &str,
         _peer_addr: &str,
         _amount_sats: u64,
-        _announce: bool,
-        _fee_rate_sat_per_vb: Option<f32>,
+        announce: bool,
+        fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        Ok("stub-channel-id".into())
+        // Model LDK's unsupported fee override rather than false success.
+        if fee_rate_sat_per_vb.is_some() {
+            return Err(LightningError::PaymentNotDispatched(
+                "stub cannot enforce a per-channel funding fee rate".into(),
+            ));
+        }
+        Ok(if announce { "stub-announced-channel-id" } else { "stub-channel-id" }.into())
     }
 
     async fn close_channel(
@@ -1421,6 +1445,14 @@ impl CountingLightning {
 
 #[async_trait]
 impl LightningProvider for CountingLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn create_invoice(
         &self,
         amount_msat: u64,

@@ -1,4 +1,4 @@
-//! Capped principal amounts: decide once, then pay exactly the checked snapshot.
+//! Capped all-in debit amounts: decide once, then pay exactly the checked snapshot.
 use std::collections::HashMap;
 use crate::error::ApiError;
 
@@ -47,4 +47,18 @@ mod first_contact_tests {
         assert!(first_contact_total(u64::MAX, 1, None).is_err());
         assert_eq!(first_contact_total(2000, 0, Some(2000)).unwrap(), 2000);
     }
+}
+
+/// Snapshot principal plus the policy-approved routing fee before any dispatch.
+pub fn all_in(state: &crate::state::AppState, principal: u64, caller: Option<u64>) -> Result<u64, ApiError> {
+    let fee = state.lightning.routing_fee_policy().ceiling(principal, caller);
+    principal.checked_add(fee).ok_or_else(|| ApiError::PriceCapExceeded(format!("all-in amount overflow; max_routing_fee_msat={fee}")))
+}
+pub fn check_payment(state: &crate::state::AppState, principal: u64, caller: Option<u64>, cap: Option<u64>) -> Result<u64, ApiError> {
+    let total = all_in(state, principal, caller)?;
+    let fee = total - principal;
+    if cap.is_some_and(|cap| total > cap) {
+        return Err(ApiError::PriceCapExceeded(format!("required {total} msat including max_routing_fee_msat={fee} exceeds the confirmed cap")).with_routing_fee(fee));
+    }
+    Ok(total)
 }

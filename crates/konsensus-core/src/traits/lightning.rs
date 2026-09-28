@@ -7,6 +7,33 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+
+/// Routing-fee authorization, independent of the recipient's principal price.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutingFeePolicy {
+    /// Minimum ordinary fee allowance, msat.
+    pub minimum_msat: u64,
+    /// Proportional allowance in parts per million (10,000 = 1%).
+    pub proportional_millionths: u64,
+    /// Absolute ordinary fee ceiling, msat.
+    pub maximum_msat: u64,
+}
+impl Default for RoutingFeePolicy {
+    fn default() -> Self {
+        Self { minimum_msat: 5_000, proportional_millionths: 10_000, maximum_msat: 10_000 }
+    }
+}
+impl RoutingFeePolicy {
+    /// A caller may tighten, never widen, ordinary routing authority.
+    pub fn ceiling(&self, principal: u64, caller: Option<u64>) -> u64 {
+        if principal == 0 { return 0; }
+        let proportional = (u128::from(principal) * u128::from(self.proportional_millionths) / 1_000_000)
+            .min(u128::from(u64::MAX)) as u64;
+        proportional.max(self.minimum_msat).min(self.maximum_msat).min(caller.unwrap_or(u64::MAX))
+    }
+}
+
 /// Status of a Lightning payment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PaymentStatus {
@@ -120,11 +147,26 @@ pub struct InboundPayment {
 /// Errors from Lightning operations.
 #[derive(Debug, Error)]
 pub enum LightningError {
+    /// The bounded startup fee barrier could not obtain usable chain data.
+    #[error("BOOT_CHAIN_SOURCE_UNAVAILABLE: BitSov could not obtain usable fees from a Bitcoin chain service. Your local identity is saved. Check your connection and try again. (network={network}, service={service}, attempts={attempts}, elapsed_ms={elapsed_ms}, cause={cause})")]
+    ChainSourceUnavailable {
+        network: String,
+        /// Host only; never an authenticated URL or response body.
+        service: String,
+        attempts: usize,
+        elapsed_ms: u64,
+        cause: String,
+    },
+
+    /// A local startup setting is invalid; retrying the network cannot fix it.
+    #[error("BOOT_INVALID_CONFIG: Invalid Lightning configuration: {0}. Check konsensus.toml and try again.")]
+    InvalidStartupConfig(String),
+
     /// This backend cannot issue a quote without retaining unpaid state.
     #[error("stateless_quote_unsupported")]
     StatelessQuoteUnsupported,
 
-    /// Positively proven to have failed BEFORE payment dispatch. Only this
+    /// Positively proven to have failed BEFORE payment or channel-open dispatch. Only this
     /// variant permits a caller to try another payment path. Never use it for
     /// a response error, timeout, or an unclassified backend/connection error.
     #[error("payment not dispatched: {0}")]
@@ -247,6 +289,16 @@ pub trait LightningProvider: Send + Sync {
         _expiry_secs: u32,
     ) -> Result<Invoice, LightningError> {
         Err(LightningError::StatelessQuoteUnsupported)
+    }
+
+    /// The policy used by ordinary outgoing payments and pre-dispatch budgets.
+    fn routing_fee_policy(&self) -> RoutingFeePolicy { RoutingFeePolicy::default() }
+
+    /// Send with a routing ceiling enforced before dispatch; unsupported backends refuse.
+    async fn keysend_with_fee_limit(
+        &self, _dest: &str, _amount: u64, _memo: Option<&str>, _max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
+        Err(LightningError::PaymentNotDispatched("backend cannot enforce keysend routing fee limit".into()))
     }
 
     /// Pay a BOLT11 invoice.
@@ -561,8 +613,9 @@ pub trait LightningProvider: Send + Sync {
     /// * `announce` — Whether to announce the channel publicly.
     /// * `fee_rate_sat_per_vb` — Optional fee rate override in sat/vB for the
     ///   funding transaction. If `None`, the backend selects a rate from its
-    ///   fee estimator. Must be > 0 if provided. Not all backends support this;
-    ///   unsupported backends silently ignore it.
+    ///   fee estimator. A supplied rate and the announce flag must be honored.
+    ///   If either cannot be enforced, return `PaymentNotDispatched` before
+    ///   initiating the channel; never silently fall back to backend defaults.
     ///
     /// Returns the temporary channel ID on success.
     async fn open_channel(
@@ -573,7 +626,7 @@ pub trait LightningProvider: Send + Sync {
         _announce: bool,
         _fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        Err(LightningError::Backend(
+        Err(LightningError::PaymentNotDispatched(
             "open_channel not supported by this provider".into(),
         ))
     }
@@ -660,5 +713,22 @@ mod tests {
     #[tokio::test]
     async fn wallet_sync_defaults_to_live() {
         assert_eq!(QueryPerCall.wallet_sync().await, WalletSync::Live);
+    }
+}
+
+#[cfg(test)]
+mod routing_fee_policy_tests {
+    use super::*;
+    #[test]
+    fn default_policy_bounds_small_large_and_overflowing_inputs() {
+        let p = RoutingFeePolicy::default();
+        for (amount, expected) in [(0,0), (1,5000), (1000,5000), (100_000,5000), (500_000,5000), (1_000_000,10000), (u64::MAX,10000)] {
+            assert_eq!(p.ceiling(amount, None), expected);
+            assert_eq!(p.ceiling(amount, Some(0)), 0);
+            assert_eq!(p.ceiling(amount, Some(u64::MAX)), expected);
+        }
+        let p = RoutingFeePolicy { minimum_msat: 300, proportional_millionths: u64::MAX, maximum_msat: 700 };
+        assert_eq!(p.ceiling(u64::MAX, None), 700);
+        assert_eq!(p.ceiling(u64::MAX, Some(500)), 500);
     }
 }

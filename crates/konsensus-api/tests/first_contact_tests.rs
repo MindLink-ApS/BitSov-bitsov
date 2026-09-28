@@ -90,14 +90,14 @@ async fn admission_case(
 }
 #[tokio::test]
 async fn target_aggregate_above_cap_is_refused_before_dispatch() {
-    let (status, body, spent) = admission_case(3999, 2000, false, false, false).await;
+    let (status, body, spent) = admission_case(13999, 2000, false, false, false).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "price_cap_exceeded");
     assert_eq!(spent, 0);
 }
 #[tokio::test(start_paused = true)]
 async fn target_aggregate_at_cap_pays_admission_and_reports_later_timeout_as_paid() {
-    let (status, body, spent) = admission_case(4000, 2000, false, false, false).await;
+    let (status, body, spent) = admission_case(14000, 2000, false, false, false).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert!(
         body["error"].as_str().unwrap().contains("payment settled"),
@@ -108,13 +108,13 @@ async fn target_aggregate_at_cap_pays_admission_and_reports_later_timeout_as_pai
 }
 #[tokio::test]
 async fn other_noise_recipient_cannot_redirect_admission_payment() {
-    let (status, _, spent) = admission_case(4000, 2000, true, false, false).await;
+    let (status, _, spent) = admission_case(14000, 2000, true, false, false).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(spent, 0);
 }
 #[tokio::test]
 async fn admission_invoice_hash_must_match_authenticated_response() {
-    let (status, _, spent) = admission_case(4000, 2000, false, true, false).await;
+    let (status, _, spent) = admission_case(14000, 2000, false, true, false).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(spent, 0);
 }
@@ -127,7 +127,7 @@ async fn malicious_subminimum_quote_cannot_bypass_aggregate_cap() {
 }
 #[tokio::test(start_paused = true)]
 async fn complete_first_contact_reports_both_payments_under_one_cap() {
-    let (status, body, spent) = admission_case(4000, 2000, false, false, true).await;
+    let (status, body, spent) = admission_case(14000, 2000, false, false, true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["amount_msat"], 4000);
     assert_eq!(spent, 4000);
@@ -179,7 +179,7 @@ async fn durable_unknown_attempt_is_reconciled_without_requesting_or_paying_agai
     for _ in 0..2 {
         let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/v1/messages/compose")
             .header("authorization",format!("Bearer {token}")).header("content-type","application/json")
-            .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"retry","max_total_msat":4000}).to_string())).unwrap()).await.unwrap();
+            .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"retry","max_total_msat":14000}).to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let bytes = axum::body::to_bytes(response.into_body(), 16384)
             .await
@@ -206,6 +206,14 @@ struct FaultBackend {
 }
 #[async_trait::async_trait]
 impl LightningProvider for FaultBackend {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn create_invoice(
         &self,
         amount: u64,
@@ -305,7 +313,7 @@ async fn lost_admission_response_never_pays_twice_but_explicit_non_dispatch_can_
         for attempt in 0..2 {
             let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/v1/messages/compose")
                 .header("authorization",format!("Bearer {token}")).header("content-type","application/json")
-                .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"retry","max_total_msat":4000}).to_string())).unwrap()).await.unwrap();
+                .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"retry","max_total_msat":14000}).to_string())).unwrap()).await.unwrap();
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             let bytes = axum::body::to_bytes(response.into_body(), 16384)
                 .await
@@ -394,7 +402,7 @@ async fn admission_invoice_time_case(future_timestamp: bool) {
         .method("POST").uri("/api/v1/messages/compose")
         .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"hello","max_total_msat":4000}).to_string())).unwrap()).await.unwrap();
+        .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"hello","max_total_msat":14000}).to_string())).unwrap()).await.unwrap();
     let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{}", String::from_utf8_lossy(&body));
@@ -437,7 +445,7 @@ async fn unsupported_quote_surfaces_code_without_payment() {
     let response = common::test_router(state.clone()).oneshot(Request::builder().method("POST")
         .uri("/api/v1/messages/compose").header("authorization",format!("Bearer {token}"))
         .header("content-type","application/json")
-        .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"hello","max_total_msat":4000}).to_string())).unwrap()).await.unwrap();
+        .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"hello","max_total_msat":14000}).to_string())).unwrap()).await.unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
     let error: serde_json::Value = serde_json::from_slice(&body).unwrap();

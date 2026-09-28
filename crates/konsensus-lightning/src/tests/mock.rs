@@ -604,3 +604,21 @@ async fn capped_payment_keeps_known_fee_in_the_reconciliation_record() {
     let stored = payer.get_payment_status(&invoice.payment_hash).await.unwrap();
     assert_eq!(stored.fee_msat, Some(0));
 }
+
+#[tokio::test]
+async fn routing_fee_limit_refuses_before_debit_and_settles_actual_fee() {
+    let mock = MockLightningProvider::new().with_routing_fee_msat(700);
+    let before = mock.get_balance_msat().await.unwrap();
+    let invoice = MockLightningProvider::new().create_invoice(1000, "fee", 3600).await.unwrap();
+    assert!(matches!(mock.pay_invoice_with_fee_limit(&invoice.bolt11, 699).await,
+        Err(LightningError::PaymentNotDispatched(_))));
+    let dest = format!("02{}", "aa".repeat(32));
+    assert!(matches!(mock.keysend_with_fee_limit(&dest, 1000, None, 699).await,
+        Err(LightningError::PaymentNotDispatched(_))));
+    assert_eq!(mock.get_balance_msat().await.unwrap(), before);
+    let invoice_paid = mock.pay_invoice_with_fee_limit(&invoice.bolt11, 700).await.unwrap();
+    let keysend_paid = mock.keysend_with_fee_limit(&dest, 1000, None, 700).await.unwrap();
+    assert_eq!(invoice_paid.fee_msat, Some(700));
+    assert_eq!(keysend_paid.fee_msat, Some(700));
+    assert_eq!(mock.get_balance_msat().await.unwrap(), before - 3400);
+}
