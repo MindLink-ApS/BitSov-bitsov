@@ -164,8 +164,63 @@ const MIN_INVOICE_AMOUNT_MSAT: u64 = 1_000;
 /// seconds, so the window is generous.
 const PAYMENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Interval between settlement-status polls.
+/// Longest wait between settlement-status polls.
 const PAYMENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// First settlement re-check after dispatch. Waits double from here up to
+/// [`PAYMENT_POLL_INTERVAL`]: a routed HTLC settles in a few hundred ms, and a
+/// fixed 2 s first wait was most of every paid send on real LDK.
+const PAYMENT_POLL_INITIAL: Duration = Duration::from_millis(50);
+
+/// Paces the settlement polls of one outgoing payment. Each wait ends at the
+/// backoff timer or at the backend's update hint for this payment, whichever
+/// comes first; the caller then re-reads `get_payment_status`, which stays the
+/// only thing it acts on (a hint is never proof of settlement).
+struct SettlementPoll {
+    updates: Option<futures::stream::BoxStream<'static, String>>,
+    payment_hash: String,
+    next: Duration,
+    started: tokio::time::Instant,
+}
+
+impl SettlementPoll {
+    /// Subscribe before the caller's first status re-read, so no hint is lost.
+    fn new(lightning: &dyn LightningProvider, payment_hash: &str) -> Self {
+        Self {
+            updates: lightning.outgoing_payment_updates(),
+            payment_hash: payment_hash.to_owned(),
+            next: PAYMENT_POLL_INITIAL,
+            started: tokio::time::Instant::now(),
+        }
+    }
+
+    async fn wait(&mut self) {
+        use futures::StreamExt;
+        let delay = self.next;
+        self.next = (self.next * 2).min(PAYMENT_POLL_INTERVAL);
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        let Some(updates) = self.updates.as_mut() else {
+            return sleep.await;
+        };
+        loop {
+            tokio::select! {
+                () = &mut sleep => return,
+                hint = updates.next() => match hint {
+                    Some(hash) if hash.is_empty() || hash == self.payment_hash => return,
+                    Some(_) => {}
+                    None => break,
+                },
+            }
+        }
+        self.updates = None;
+        sleep.await;
+    }
+
+    fn timed_out(&self) -> bool {
+        self.started.elapsed() >= PAYMENT_SETTLE_TIMEOUT
+    }
+}
 
 /// Outcome of a keysend attempt, distinguishing the two cases the caller must
 /// treat very differently:
@@ -220,10 +275,9 @@ async fn await_settlement(
         )));
     }
 
-    let mut waited = Duration::ZERO;
+    let mut poll = SettlementPoll::new(lightning.as_ref(), &initial.payment_hash);
     loop {
-        tokio::time::sleep(PAYMENT_POLL_INTERVAL).await;
-        waited += PAYMENT_POLL_INTERVAL;
+        poll.wait().await;
 
         let details = lightning
             .get_payment_status(&initial.payment_hash)
@@ -241,7 +295,7 @@ async fn await_settlement(
                 )));
             }
             PaymentStatus::Pending | PaymentStatus::InFlight => {
-                if waited >= PAYMENT_SETTLE_TIMEOUT {
+                if poll.timed_out() {
                     return Err(ApiError::PaymentUnresolved(format!(
                         "{method} payment still in flight after {}s — not retrying to avoid a double payment",
                         PAYMENT_SETTLE_TIMEOUT.as_secs()
@@ -1306,10 +1360,9 @@ async fn await_admission_settlement(
         ));
     }
 
-    let mut waited = Duration::ZERO;
+    let mut poll = SettlementPoll::new(state.lightning.as_ref(), &initial.payment_hash);
     loop {
-        tokio::time::sleep(PAYMENT_POLL_INTERVAL).await;
-        waited += PAYMENT_POLL_INTERVAL;
+        poll.wait().await;
 
         let details = state
             .lightning
@@ -1333,7 +1386,7 @@ async fn await_admission_settlement(
                 )));
             }
             PaymentStatus::Pending | PaymentStatus::InFlight => {
-                if waited >= PAYMENT_SETTLE_TIMEOUT {
+                if poll.timed_out() {
                     return Err(ApiError::Lightning(format!(
                         "admission invoice payment {} still in flight after {}s -- \
                          not paying another invoice; retry will resume polling this payment",
@@ -3171,6 +3224,112 @@ mod settlement_tests {
             format!("{err}").contains("double payment"),
             "expected the double-pay guard message, got: {err}"
         );
+    }
+
+    /// REAL-LATENCY: without update hints the first re-checks come fast
+    /// (50, 100, 200 ms ...), not after a fixed 2 s.
+    #[tokio::test(start_paused = true)]
+    async fn await_settlement_backs_off_from_a_fast_first_recheck() {
+        let mock = Arc::new(MockLightningProvider::new());
+        mock.defer_next_keysend_settlement(2).await;
+        let lightning: Arc<dyn LightningProvider> = mock;
+        let initial = lightning
+            .keysend(&format!("02{}", "ef".repeat(32)), 5_000, None)
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let settled = await_settlement(&lightning, initial, "keysend")
+            .await
+            .unwrap();
+        assert_eq!(settled.status, PaymentStatus::Settled);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(350),
+            "third poll at 50+100+200 ms"
+        );
+    }
+
+    async fn deferred_keysend(mock: &MockLightningProvider, polls: u32) -> PaymentDetails {
+        mock.defer_next_keysend_settlement(polls).await;
+        let initial = mock
+            .keysend(&format!("02{}", "aa".repeat(32)), 5_000, None)
+            .await
+            .unwrap();
+        assert_eq!(initial.status, PaymentStatus::InFlight);
+        initial
+    }
+
+    async fn let_run() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// REAL-LATENCY: the backend's hint for this payment ends the wait at
+    /// once; a hint for another payment does not.
+    #[tokio::test(start_paused = true)]
+    async fn await_settlement_wakes_on_this_payments_update_hint() {
+        let mock = Arc::new(MockLightningProvider::new());
+        let initial = deferred_keysend(&mock, 0).await;
+        let hash = initial.payment_hash.clone();
+        let lightning: Arc<dyn LightningProvider> = mock.clone();
+        let started = tokio::time::Instant::now();
+        let waiting =
+            tokio::spawn(async move { await_settlement(&lightning, initial, "keysend").await });
+        let_run().await;
+        mock.hint_outgoing(&"bb".repeat(32));
+        let_run().await;
+        // The next status read would report Settled: no read happened.
+        assert!(
+            !waiting.is_finished(),
+            "another payment's hint is not a reason to poll"
+        );
+
+        mock.hint_outgoing(&hash);
+        let settled = waiting.await.unwrap().unwrap();
+        assert_eq!(settled.status, PaymentStatus::Settled);
+        assert!(
+            started.elapsed() < PAYMENT_POLL_INITIAL,
+            "woken by the hint, not the timer"
+        );
+    }
+
+    /// A hint is never proof: it only triggers a status re-read, and a payment
+    /// still reported in flight keeps waiting (and times out unresolved).
+    #[tokio::test(start_paused = true)]
+    async fn await_settlement_update_hint_is_not_settlement() {
+        let mock = Arc::new(MockLightningProvider::new());
+        let initial = deferred_keysend(&mock, 1).await;
+        let hash = initial.payment_hash.clone();
+        let lightning: Arc<dyn LightningProvider> = mock.clone();
+        let waiting =
+            tokio::spawn(async move { await_settlement(&lightning, initial, "keysend").await });
+        let_run().await;
+        mock.hint_outgoing(&hash);
+        let_run().await;
+        assert!(
+            !waiting.is_finished(),
+            "the re-read said in flight: keep waiting"
+        );
+        mock.hint_outgoing(&hash);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            waiting.await.unwrap().unwrap().status,
+            PaymentStatus::Settled
+        );
+        assert!(started.elapsed() < PAYMENT_POLL_INITIAL);
+
+        let initial = deferred_keysend(&mock, u32::MAX).await;
+        let hash = initial.payment_hash.clone();
+        let lightning: Arc<dyn LightningProvider> = mock.clone();
+        let started = tokio::time::Instant::now();
+        let waiting =
+            tokio::spawn(async move { await_settlement(&lightning, initial, "keysend").await });
+        let_run().await;
+        mock.hint_outgoing(&hash);
+        let err = waiting.await.unwrap().expect_err("never settled");
+        assert!(matches!(err, ApiError::PaymentUnresolved(_)), "{err}");
+        assert!(started.elapsed() >= PAYMENT_SETTLE_TIMEOUT);
     }
 }
 

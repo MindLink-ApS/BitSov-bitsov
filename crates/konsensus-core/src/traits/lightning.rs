@@ -324,6 +324,19 @@ pub trait LightningProvider: Send + Sync {
         payment_hash: &str,
     ) -> Result<PaymentDetails, LightningError>;
 
+    /// Wake-up hints for outgoing payments: each item is the hex payment hash
+    /// of an outgoing payment that may just have reached a terminal state, or
+    /// an empty string when hints were dropped (re-check every payment).
+    ///
+    /// A hint is never proof. Callers re-read
+    /// [`get_payment_status`](LightningProvider::get_payment_status) and act
+    /// only on what it returns, so a missed or spurious hint changes when they
+    /// poll, never what they conclude. Subscribe before the status read the
+    /// hint should shortcut. Defaults to `None`: poll on a timer.
+    fn outgoing_payment_updates(&self) -> Option<BoxStream<'static, String>> {
+        None
+    }
+
     /// Verify that a payment has been settled and return the preimage.
     ///
     /// This is the core method for the payment gate: given a payment hash,

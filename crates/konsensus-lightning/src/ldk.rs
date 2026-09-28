@@ -93,6 +93,10 @@ const BITSOV_BINDING_TLV_TYPE: u64 = 0x4253_4F56_0001; // "BSOV" + 0x0001, odd
 /// fail-closed downstream; the event drainer itself remains backpressured.
 const INBOUND_BROADCAST_CAPACITY: usize = 256;
 
+/// Fan-out for outgoing settle/fail wake-up hints. Lag only costs a spurious
+/// re-check (see [`LightningProvider::outgoing_payment_updates`]).
+const OUTGOING_BROADCAST_CAPACITY: usize = 256;
+
 /// ADR-037 binding values are pointers/digests, not envelopes. Keep the copy
 /// into `InboundPayment` bounded so a peer cannot turn a paid contact into a
 /// large allocation/logging surface.
@@ -274,6 +278,9 @@ pub struct LdkProvider {
     /// (it FEEDS the stream from the single mpsc consumer, preserving the
     /// drainer's backpressure for the log/SCB path — the broadcast is fan-out).
     inbound_tx: broadcast::Sender<InboundPayment>,
+    /// Hex payment hash of each outgoing `PaymentSuccessful`/`PaymentFailed`,
+    /// fed by the same consumer; a wake-up hint for settlement polls only.
+    outgoing_tx: broadcast::Sender<String>,
 }
 
 impl std::fmt::Debug for LdkProvider {
@@ -504,11 +511,13 @@ impl LdkProvider {
         // R2 seam-2: inbound-payment fan-out. The initial receiver is dropped;
         // subscribers come from `watch_inbound_keysend` via `.subscribe()`.
         let (inbound_tx, _) = broadcast::channel(INBOUND_BROADCAST_CAPACITY);
+        let (outgoing_tx, _) = broadcast::channel(OUTGOING_BROADCAST_CAPACITY);
         Self::spawn_event_drainer(
             Arc::clone(&node),
             Arc::clone(&drainer_shutdown),
             Arc::clone(&scb_producer),
             inbound_tx.clone(),
+            outgoing_tx.clone(),
         );
         Self::spawn_scb_timer(Arc::clone(&drainer_shutdown), scb_producer);
 
@@ -524,6 +533,7 @@ impl LdkProvider {
             esplora_url: chosen_esplora_url,
             drainer_shutdown,
             inbound_tx,
+            outgoing_tx,
         })
     }
 
@@ -539,6 +549,7 @@ impl LdkProvider {
         // Test path does not spawn the drainer, so nothing emits here; the
         // inbound stream simply stays empty.
         let (inbound_tx, _) = broadcast::channel(INBOUND_BROADCAST_CAPACITY);
+        let (outgoing_tx, _) = broadcast::channel(OUTGOING_BROADCAST_CAPACITY);
         Self {
             routing_fee_policy: Default::default(),
             liquidity: None,
@@ -553,6 +564,7 @@ impl LdkProvider {
             // provider sees the drainer as already-shutdown.
             drainer_shutdown: Arc::new(AtomicBool::new(true)),
             inbound_tx,
+            outgoing_tx,
         }
     }
 
@@ -582,6 +594,7 @@ impl LdkProvider {
         shutdown: Arc<AtomicBool>,
         scb_producer: Arc<ScbProducer>,
         inbound_tx: broadcast::Sender<InboundPayment>,
+        outgoing_tx: broadcast::Sender<String>,
     ) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ldk_node::Event>(64);
 
@@ -618,6 +631,10 @@ impl LdkProvider {
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 Self::log_event(&event);
+                if let Some(hash) = outgoing_update_hash(&event) {
+                    // Err only means no settlement poll is waiting right now.
+                    let _ = outgoing_tx.send(hash);
+                }
                 if let ldk_node::Event::PaymentReceived {
                     payment_id,
                     payment_hash,
@@ -838,6 +855,27 @@ impl LdkProvider {
                 a no-op kept for API back-compat.")]
     pub fn process_events(&self) {
         // No-op. See doc comment + spawn_event_drainer.
+    }
+}
+
+/// The hash a settlement poll tracks (`get_payment_status` key) for an
+/// outgoing payment that just settled or failed. ldk-node updates its payment
+/// store before queueing these events, so the re-read sees the new state.
+fn outgoing_update_hash(event: &ldk_node::Event) -> Option<String> {
+    match event {
+        ldk_node::Event::PaymentSuccessful { payment_hash, .. } => {
+            Some(hex::encode(payment_hash.0))
+        }
+        ldk_node::Event::PaymentFailed {
+            payment_hash: Some(hash),
+            ..
+        } => Some(hex::encode(hash.0)),
+        // Payment ids of invoice payments are their hashes; for any other
+        // payment an empty hint re-checks whatever is waiting.
+        ldk_node::Event::PaymentFailed { payment_id, .. } => {
+            Some(payment_id.map(|id| hex::encode(id.0)).unwrap_or_default())
+        }
+        _ => None,
     }
 }
 
@@ -1254,6 +1292,21 @@ impl LightningProvider for LdkProvider {
             }
         });
         Ok(stream.boxed())
+    }
+
+    fn outgoing_payment_updates(&self) -> Option<BoxStream<'static, String>> {
+        let rx = self.outgoing_tx.subscribe();
+        Some(
+            futures::stream::unfold(rx, |mut rx| async move {
+                match rx.recv().await {
+                    Ok(hash) => Some((hash, rx)),
+                    // Dropped hints: wake every waiter to re-check.
+                    Err(broadcast::error::RecvError::Lagged(_)) => Some((String::new(), rx)),
+                    Err(broadcast::error::RecvError::Closed) => None,
+                }
+            })
+            .boxed(),
+        )
     }
 
     async fn get_node_pubkey(&self) -> Option<String> {

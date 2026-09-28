@@ -84,6 +84,8 @@ pub struct MockLightningProvider {
     keysend_defer_polls: Arc<Mutex<Option<u32>>>,
     /// Per-hash remaining `InFlight` polls for the deferred-settlement knob.
     pending_settle: Arc<Mutex<HashMap<String, u32>>>,
+    /// Outgoing-payment wake-up hints; test code sends them via `hint_outgoing`.
+    outgoing_tx: broadcast::Sender<String>,
 }
 
 impl MockLightningProvider {
@@ -116,7 +118,14 @@ impl MockLightningProvider {
             sent_bindings: Arc::new(Mutex::new(Vec::new())),
             keysend_defer_polls: Arc::new(Mutex::new(None)),
             pending_settle: Arc::new(Mutex::new(HashMap::new())),
+            outgoing_tx: broadcast::channel(256).0,
         }
+    }
+
+    /// Test-only: emit an [`LightningProvider::outgoing_payment_updates`] hint.
+    /// It changes nothing the mock reports, as a real hint is never proof.
+    pub fn hint_outgoing(&self, payment_hash: &str) {
+        let _ = self.outgoing_tx.send(payment_hash.to_owned());
     }
 
     /// Test-only: arm the next [`LightningProvider::keysend`] to return
@@ -412,6 +421,16 @@ impl LightningProvider for MockLightningProvider {
 
     async fn is_available(&self) -> bool {
         true
+    }
+
+    fn outgoing_payment_updates(&self) -> Option<BoxStream<'static, String>> {
+        let rx = self.outgoing_tx.subscribe();
+        Some(
+            futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.ok().map(|hash| (hash, rx))
+            })
+            .boxed(),
+        )
     }
 
     async fn watch_inbound_keysend(
