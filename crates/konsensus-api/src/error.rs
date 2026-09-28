@@ -175,6 +175,20 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Check before parsing payment details, consuming grants, or issuing invoices.
+pub(crate) async fn require_money_ready(state: &crate::state::AppState) -> Result<(), ApiError> {
+    if state.lightning.money_ready().await { Ok(()) } else { Err(ApiError::NotReady) }
+}
+
+impl From<konsensus_core::traits::lightning::LightningError> for ApiError {
+    fn from(error: konsensus_core::traits::lightning::LightningError) -> Self {
+        match error {
+            konsensus_core::traits::lightning::LightningError::NotReady => Self::NotReady,
+            other => Self::Lightning(other.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,19 +344,5 @@ mod tests {
         let msg = "unicod\u{00e9} err\u{00f6}r m\u{00e8}ssage";
         let (_, json) = error_body(ApiError::BadRequest(msg.into())).await;
         assert_eq!(json["error"], msg);
-    }
-}
-
-/// Check before parsing payment details, consuming grants, or issuing invoices.
-pub(crate) async fn require_money_ready(state: &crate::state::AppState) -> Result<(), ApiError> {
-    if state.lightning.money_ready().await { Ok(()) } else { Err(ApiError::NotReady) }
-}
-
-impl From<konsensus_core::traits::lightning::LightningError> for ApiError {
-    fn from(error: konsensus_core::traits::lightning::LightningError) -> Self {
-        match error {
-            konsensus_core::traits::lightning::LightningError::NotReady => Self::NotReady,
-            other => Self::Lightning(other.to_string()),
-        }
     }
 }
