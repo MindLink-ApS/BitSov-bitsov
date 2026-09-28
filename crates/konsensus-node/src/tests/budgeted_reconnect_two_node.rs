@@ -569,7 +569,8 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
 
     // B refused out loud (N2) and never saw a replayed admission proof.
     let codes = net.b_codes();
-    assert!(codes.contains(&Code::AdmissionRequired), "explicit refusal event: {codes:?}");
+    assert!(!codes.contains(&Code::AdmissionRequired), "unpaid refusals are aggregate only");
+    assert!(net.audit_b.membrane().pre_payment_refusals().buckets.iter().any(|b| b.counts.get(&konsensus_api::membrane::PrePaymentReason::AdmissionRequired).copied().unwrap_or(0) > 0));
     assert!(!codes.contains(&Code::ProofReused), "stale admission proof re-sent: {codes:?}");
     assert_eq!(codes.iter().filter(|c| **c == Code::Settled).count(), 4, "{codes:?}");
     net.shutdown();
@@ -614,7 +615,8 @@ async fn budgeted_contact_is_readmitted_from_the_budget_without_a_prompt() {
     assert_eq!(grant.used_by_recipient.get(&bob.to_hex()), Some(&8_000));
 
     // N2: B refused out loud; A logged each paid re-admission with the cap.
-    assert!(net.b_codes().contains(&Code::AdmissionRequired));
+    assert!(!net.b_codes().contains(&Code::AdmissionRequired));
+    assert!(net.audit_b.membrane().pre_payment_refusals().buckets.iter().any(|b| b.counts.get(&konsensus_api::membrane::PrePaymentReason::AdmissionRequired).copied().unwrap_or(0) > 0));
     let readmissions = net.sender.membrane(Code::Readmission);
     assert_eq!(readmissions.len(), 2, "{readmissions:?}");
     for event in &readmissions {

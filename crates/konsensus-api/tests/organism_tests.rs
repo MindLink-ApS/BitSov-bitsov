@@ -544,3 +544,55 @@ fn energy_excludes_future_rows() {
         0
     );
 }
+
+#[tokio::test]
+async fn membrane_exposes_empty_pre_payment_aggregate_on_restart() {
+    let (_tmp, state) = paired_state();
+    let (status, body) = get(
+        &state,
+        "/api/v1/membrane?since=18446744073709551615&limit=0",
+        Some(bearer_with(&state, vec![auth::Scope::Read])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["pre_payment_refusals"],
+        json!({
+            "bucket_ms": 3600000, "capacity": 24, "buckets": []
+        })
+    );
+}
+
+#[tokio::test]
+async fn membrane_reads_pre_payment_counts_without_event_pagination_or_secrets() {
+    use konsensus_api::membrane::PrePaymentReason;
+    let (_tmp, state) = paired_state();
+    for _ in 0..3 {
+        state
+            .audit_log
+            .membrane()
+            .pre_payment_refused(PrePaymentReason::SessionBeforePayment);
+    }
+    let (status, body) = get(
+        &state,
+        "/api/v1/membrane?since=18446744073709551615&limit=0",
+        Some(bearer_with(&state, vec![auth::Scope::Read])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["events"], json!([]));
+    assert_eq!(body["totals"]["refused"], 0);
+    let buckets = body["pre_payment_refusals"]["buckets"].as_array().unwrap();
+    assert_eq!(
+        buckets
+            .iter()
+            .map(|b| b["counts"]["session_before_payment"].as_u64().unwrap())
+            .sum::<u64>(),
+        3
+    );
+    for bucket in buckets {
+        assert_eq!(bucket.as_object().unwrap().len(), 2);
+        assert_eq!(bucket["start_ms"].as_u64().unwrap() % 3_600_000, 0);
+        assert_eq!(bucket["counts"].as_object().unwrap().len(), 1);
+    }
+}

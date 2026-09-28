@@ -7,9 +7,9 @@
 //!
 //! - Every inbound gate verdict (admitted by settlement, or refused with a reason
 //!   code) and every outbound refusal of our own sends (`price_cap_exceeded`,
-//!   `budget_exceeded`) becomes one [`MembraneEvent`], and so does every
-//!   explicit `admission_required` refusal of a paid invoice request from a
-//!   connection that has not paid its way in.
+//!   `budget_exceeded`) becomes one [`MembraneEvent`]. Pre-payment control
+//!   refusals (including `admission_required`) instead increment anonymous,
+//!   fixed-size hourly counters: no per-peer state or per-event storage.
 //! - Events go to `/ws` as `{"type":"membrane", ...}` and into a bounded
 //!   in-memory ring buffer ([`MEMBRANE_CAPACITY`]) read by
 //!   `GET /api/v1/membrane` (read scope). Nothing here is written to disk; the
@@ -27,6 +27,10 @@
 //! shared by the API state and receive loop. Gate outcomes are emitted before
 //! post-gate routing/storage, and every component holding the audit log can emit
 //! without a new dependency being threaded through.
+
+mod pre_payment;
+pub use pre_payment::{PrePaymentReason, PrePaymentRefusals};
+use pre_payment::PrePaymentCounters;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,9 +109,8 @@ pub enum Code {
     PriceCapExceeded,
     /// Outbound: a paired client's budget grant refused the debit (G1).
     BudgetExceeded,
-    /// A peer asked for a paid invoice on a connection that has not paid its
-    /// way in (a reconnect starts unprivileged). Refused out loud: the peer is
-    /// told to pay admission again, and nothing was issued on our wallet.
+    /// Legacy event code. New pre-payment invoice refusals are aggregate-only
+    /// in `pre_payment_refusals`, never named events.
     AdmissionRequired,
     /// Outbound: we paid a contact's admission again after a reconnect (the
     /// connection starts unpaid), from its signed quote. Admitted: money left.
@@ -231,6 +234,7 @@ struct Ring {
 /// Bounded, in-memory membrane log with a `/ws` fan-out.
 pub struct Membrane {
     ring: Mutex<Ring>,
+    pre_payment: Mutex<PrePaymentCounters>,
     seq: AtomicU64,
     capacity: usize,
     tx: broadcast::Sender<Arc<MembraneEvent>>,
@@ -249,6 +253,7 @@ impl Membrane {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             ring: Mutex::new(Ring::default()),
+            pre_payment: Mutex::new(PrePaymentCounters::default()),
             seq: AtomicU64::new(1),
             capacity: capacity.max(1),
             tx,
@@ -304,26 +309,21 @@ impl Membrane {
         })
     }
 
-    /// A connected peer asked for a paid invoice before its connection paid
-    /// admission, and was refused with an explicit `admission_required` reply.
-    ///
-    /// The counterparty is named: the transport authenticated it in the Noise
-    /// handshake, so the id is proven even though no envelope was signed.
-    pub fn admission_required(&self, peer: &NodeId) -> Arc<MembraneEvent> {
-        self.push(|seq| MembraneEvent {
-            event_type: "membrane",
-            seq,
-            at: now_ms(),
-            direction: Direction::Inbound,
-            verdict: Verdict::Refused,
-            code: Code::AdmissionRequired,
-            kind: None,
-            counterparty: Some(peer.to_hex()),
-            first_contact: false,
-            required_msat: None,
-            paid_msat: None,
-            cap_msat: None,
-        })
+    /// Count a refused pre-payment frame without retaining an event or identity.
+    pub fn pre_payment_refused(&self, reason: PrePaymentReason) {
+        self.pre_payment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(reason, now_ms());
+    }
+
+    /// Current coarse counts, expiring old hours even when traffic is idle.
+    #[must_use]
+    pub fn pre_payment_refusals(&self) -> PrePaymentRefusals {
+        self.pre_payment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot(now_ms())
     }
 
     /// We paid `peer`'s admission again after a reconnect: `paid_msat` from
@@ -694,5 +694,74 @@ mod tests {
             assert!(!value.to_string().contains("SECRET IN ERROR"));
         }
         assert!(parse_recipient(&"x".repeat(100_000), false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod pre_payment_tests {
+    use super::pre_payment::*;
+    use super::*;
+
+    #[test]
+    fn counts_reasons_in_coarse_buckets_without_events_or_identity() {
+        let m = Membrane::default();
+        let mut rx = m.subscribe();
+        m.pre_payment
+            .lock()
+            .unwrap()
+            .record(PrePaymentReason::SessionBeforePayment, 3_600_123);
+        m.pre_payment
+            .lock()
+            .unwrap()
+            .record(PrePaymentReason::SessionBeforePayment, 3_600_999);
+        m.pre_payment
+            .lock()
+            .unwrap()
+            .record(PrePaymentReason::PriceBeforePayment, 7_200_001);
+        let value =
+            serde_json::to_value(m.pre_payment.lock().unwrap().snapshot(7_200_123)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "bucket_ms": 3600000, "capacity": 24,
+                "buckets": [
+                    {"start_ms": 3600000, "counts": {"session_before_payment": 2}},
+                    {"start_ms": 7200000, "counts": {"price_before_payment": 1}}
+                ]
+            })
+        );
+        assert!(m.read(None, 500).0.is_empty());
+        assert_eq!(m.read(None, 500).1, Totals::default());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn fixed_storage_evicts_old_hours_expires_on_read_and_handles_clock_rollback() {
+        let mut counts = PrePaymentCounters::default();
+        for hour in 0..1000 {
+            for _ in 0..100 {
+                counts.record(PrePaymentReason::AdmissionRequired, hour * 3_600_000);
+            }
+        }
+        let view = counts.snapshot(999 * 3_600_000);
+        assert_eq!(view.buckets.len(), 24);
+        assert_eq!(view.buckets[0].start_ms, 976 * 3_600_000);
+        assert!(view
+            .buckets
+            .iter()
+            .all(|b| b.counts[&PrePaymentReason::AdmissionRequired] == 100));
+        // A clock rollback must neither resurrect evicted hours nor grow storage.
+        counts.record(PrePaymentReason::AdmissionRequired, 0);
+        let view = counts.snapshot(0);
+        assert_eq!(view.buckets.len(), 24);
+        assert_eq!(
+            view.buckets[23].counts[&PrePaymentReason::AdmissionRequired],
+            101
+        );
+        assert!(counts.snapshot(1023 * 3_600_000).buckets.is_empty());
+        assert!(counts.snapshot(0).buckets.is_empty());
     }
 }

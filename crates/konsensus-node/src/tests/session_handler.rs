@@ -272,7 +272,7 @@ async fn unprivileged_invoice_error_does_not_drop_sender_channel() {
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
-    handle_invoice_error_received(&peer_id, &request_id, "attacker-forged error", false, &map).await;
+    assert!(handle_invoice_error_received(&peer_id, &request_id, "attacker-forged error", false, &map).await);
 
     let sender = map
         .lock()
@@ -1280,8 +1280,7 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
 #[tokio::test]
 async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
     // P2: an unprivileged peer asking for an ordinary message invoice gets no
-    // invoice on our wallet. The refusal is explicit: one N2 membrane event per
-    // peer per cooldown, however many requests it sends.
+    // invoice on our wallet. Every refusal is counted without per-peer telemetry.
     let peer_id = test_peer_id();
     let transport = make_gossip_test_transport();
     let lightning: Arc<dyn LightningProvider> =
@@ -1299,10 +1298,19 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
     let payments = lightning.list_payments(10).await.unwrap();
     assert!(payments.is_empty(), "no invoice may be created for an unprivileged non-admission request");
     let (events, totals) = membrane.read(None, 10);
-    assert_eq!(events.len(), 1, "one membrane event per peer per cooldown");
-    assert_eq!(events[0].code, konsensus_api::membrane::Code::AdmissionRequired);
-    assert_eq!(events[0].counterparty.as_deref(), Some(peer_id.to_hex().as_str()));
-    assert_eq!(totals.refused, 1);
+    assert!(events.is_empty(), "unpaid requests must not create per-event state");
+    assert_eq!(totals.refused, 0, "event totals exclude aggregate-only refusals");
+    assert_eq!(membrane.pre_payment_refusals().buckets[0].counts[&konsensus_api::membrane::PrePaymentReason::AdmissionRequired], 1);
+    for _ in 0..100 {
+        handle_invoice_requested_gated(
+            &peer_id, "req-strange", 1_000_000, "konsensus message", false,
+            &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &membrane, &mut last_refusal,
+        ).await;
+    }
+    assert_eq!(membrane.pre_payment_refusals().buckets.iter().map(|b| b.counts[&konsensus_api::membrane::PrePaymentReason::AdmissionRequired]).sum::<u64>(), 101, "count even when refusal replies are throttled");
+    assert!(membrane.read(None, 500).0.is_empty());
+
 }
 
 // ── Price query handler tests ──────────────────────────────
@@ -1729,4 +1737,143 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
     let (events, totals) = membrane.read(None, 100);
     assert!(events.len() <= 1); assert!(totals.refused <= 1);
     handler.abort(); attacker.shutdown(); healthy.shutdown(); target.shutdown();
+}
+
+#[test]
+fn demo_pre_payment_frames_count_without_retaining_strangers() {
+    use konsensus_api::membrane::{Membrane, PrePaymentReason};
+    let membrane = Membrane::default();
+    let mut rx = membrane.subscribe();
+    for n in 0..100u8 {
+        let peer_id = NodeId::from_bytes([n; 32]);
+        for privileged in [false, true] {
+            let message_id = konsensus_core::MessageId::from_bytes([n; 32]);
+            let envelope = konsensus_core::UkmEnvelopeBuilder::new(
+                1,
+                peer_id,
+                konsensus_core::Recipient::Node(test_peer_id()),
+                b"do not retain".to_vec(),
+                konsensus_core::PaymentProof::new([0; 32], [0; 32], 0),
+            )
+            .build();
+            let events = [
+                ControlEvent::SessionInit {
+                    peer_id,
+                    init_data: serde_json::json!({"secret": "do not retain"}),
+                    privileged,
+                },
+                ControlEvent::SessionAck {
+                    peer_id,
+                    privileged,
+                },
+                ControlEvent::RatchetInit {
+                    peer_id,
+                    payload: b"do not retain".to_vec(),
+                    privileged,
+                },
+                ControlEvent::MessageAcked {
+                    peer_id,
+                    message_id,
+                    privileged,
+                },
+                ControlEvent::MessageRejected {
+                    peer_id,
+                    message_id,
+                    reason: "do not retain".into(),
+                    privileged,
+                },
+                ControlEvent::PriceQueryReceived {
+                    peer_id,
+                    kind: 1,
+                    privileged,
+                },
+                ControlEvent::PriceResponseReceived {
+                    peer_id,
+                    kind: 1,
+                    price_msat: 1,
+                    block_height: 1,
+                    privileged,
+                },
+                ControlEvent::PeerExchangeReceived {
+                    peer_id,
+                    peers: vec![],
+                    privileged,
+                },
+                ControlEvent::GossipReceived {
+                    from_peer: peer_id,
+                    envelope: Box::new(envelope),
+                    privileged,
+                },
+                ControlEvent::PrekeyOffer {
+                    peer_id,
+                    bundle: serde_json::json!({"secret": "do not retain"}),
+                    privileged,
+                },
+                ControlEvent::PriceTableReceived {
+                    peer_id,
+                    prices: Default::default(),
+                    block_height: 1,
+                    valid_blocks: 1,
+                    trust_discount: 0.0,
+                    privileged,
+                },
+                ControlEvent::LightningInfoReceived {
+                    peer_id,
+                    ln_pubkey: "private-ln-key".into(),
+                    ln_addr: Some("192.0.2.123:9735".into()),
+                    privileged,
+                },
+                ControlEvent::PeerExchangeRequested {
+                    peer_id,
+                    privileged,
+                },
+            ];
+            for event in events {
+                assert_eq!(refuse_unpaid_control(&event, &membrane), !privileged);
+            }
+        }
+    }
+    let snapshot = membrane.pre_payment_refusals();
+    for (reason, expected) in [
+        (PrePaymentReason::SessionBeforePayment, 400),
+        (PrePaymentReason::DeliveryBeforePayment, 200),
+        (PrePaymentReason::PriceBeforePayment, 300),
+        (PrePaymentReason::LightningInfoBeforePayment, 100),
+        (PrePaymentReason::PeerExchangeBeforePayment, 200),
+        (PrePaymentReason::GossipBeforePayment, 100),
+    ] {
+        assert_eq!(
+            snapshot
+                .buckets
+                .iter()
+                .map(|b| b.counts.get(&reason).copied().unwrap_or(0))
+                .sum::<u64>(),
+            expected
+        );
+    }
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    for secret in [
+        "do not retain",
+        "private-ln-key",
+        "192.0.2.123",
+        &test_peer_id().to_hex(),
+        "peer_id",
+        "counterparty",
+        "source_ip",
+        "request_id",
+    ] {
+        assert!(!serialized.contains(secret), "aggregate leaked {secret}");
+    }
+    assert!(membrane.read(None, 500).0.is_empty());
+    assert!(rx.try_recv().is_err());
+    assert!(
+        !refuse_unpaid_control(
+            &ControlEvent::PeerConnected {
+                peer_id: test_peer_id(),
+                privileged: false
+            },
+            &membrane
+        ),
+        "connecting is not a refused frame"
+    );
 }
