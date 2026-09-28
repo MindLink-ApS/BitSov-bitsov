@@ -782,3 +782,75 @@ fn jit_purpose_fee_and_net_survive_ldk_serialization_without_admission_proof() {
         assert!(!is_admittable_inbound_payment(&public));
     }
 }
+
+
+const CHANNEL_PEER: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+#[test]
+fn channel_fee_explicit_rate_never_dispatches() {
+    for announce in [false, true] {
+        for rate in [5.0, 1.5, 0.0, -1.0, f32::NAN, f32::INFINITY, f32::MAX] {
+            let mut node = MockChannelOpener::new();
+            node.expect_open_channel().never();
+            node.expect_open_announced_channel().never();
+            let result = open_ldk_channel(
+                &node,
+                CHANNEL_PEER,
+                "127.0.0.1:9735",
+                50_000,
+                announce,
+                Some(rate),
+            );
+            assert!(
+                matches!(result, Err(LightningError::PaymentNotDispatched(_))),
+                "fee {rate}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn channel_fee_announcement_selects_ldk_method_and_preserves_args() {
+    for announce in [false, true] {
+        let mut node = MockChannelOpener::new();
+        let matches_args =
+            |peer: &bitcoin::secp256k1::PublicKey,
+             addr: &ldk_node::lightning::ln::msgs::SocketAddress,
+             amount: &u64,
+             push: &Option<u64>,
+             config: &Option<ldk_node::config::ChannelConfig>| {
+                peer.to_string() == CHANNEL_PEER
+                    && *addr
+                        == ldk_node::lightning::ln::msgs::SocketAddress::TcpIpV4 {
+                            addr: [127, 0, 0, 1],
+                            port: 9735,
+                        }
+                    && *amount == 50_000
+                    && push.is_none()
+                    && config.is_none()
+            };
+        if announce {
+            node.expect_open_channel().never();
+            node.expect_open_announced_channel()
+                .times(1)
+                .withf(matches_args)
+                .returning(|_, _, _, _, _| Ok(ldk_node::UserChannelId(42)));
+        } else {
+            node.expect_open_announced_channel().never();
+            node.expect_open_channel()
+                .times(1)
+                .withf(matches_args)
+                .returning(|_, _, _, _, _| Ok(ldk_node::UserChannelId(42)));
+        }
+        let id = open_ldk_channel(
+            &node,
+            CHANNEL_PEER,
+            "127.0.0.1:9735",
+            50_000,
+            announce,
+            None,
+        )
+        .unwrap();
+        assert_eq!(id, ldk_node::UserChannelId(42).to_string());
+    }
+}

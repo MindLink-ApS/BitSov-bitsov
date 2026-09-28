@@ -1374,44 +1374,17 @@ impl LightningProvider for LdkProvider {
         peer_pubkey: &str,
         peer_addr: &str,
         amount_sats: u64,
-        _announce: bool,
+        announce: bool,
         fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        if fee_rate_sat_per_vb.is_some() {
-            tracing::debug!(
-                fee_rate = ?fee_rate_sat_per_vb,
-                "open_channel: fee_rate_sat_per_vb provided but ldk-node 0.7 does not \
-                 support per-channel funding fee rate override; parameter ignored"
-            );
-        }
-        use std::str::FromStr;
-        let node_pubkey = ldk_node::bitcoin::secp256k1::PublicKey::from_str(peer_pubkey)
-            .map_err(|e| LightningError::Backend(format!("invalid pubkey: {e}")))?;
-
-        // Parse address into LDK SocketAddress
-        let socket_addr: std::net::SocketAddr = peer_addr
-            .parse()
-            .map_err(|e| LightningError::Backend(format!("invalid address: {e}")))?;
-        let ldk_addr = match socket_addr {
-            std::net::SocketAddr::V4(a) => ldk_node::lightning::ln::msgs::SocketAddress::TcpIpV4 {
-                addr: a.ip().octets(),
-                port: a.port(),
-            },
-            std::net::SocketAddr::V6(a) => ldk_node::lightning::ln::msgs::SocketAddress::TcpIpV6 {
-                addr: a.ip().octets(),
-                port: a.port(),
-            },
-        };
-
-        // Open channel (connect + open in one call)
-        let user_channel_id = self
-            .node
-            .open_channel(node_pubkey, ldk_addr, amount_sats, None, None)
-            .map_err(|e| LightningError::Backend(format!("open_channel failed: {e}")))?;
-
-        let channel_id = format!("{}", user_channel_id);
-        tracing::info!(channel_id = %channel_id, amount_sats, peer = %peer_pubkey, "Lightning channel opening initiated");
-        Ok(channel_id)
+        open_ldk_channel(
+            self.node.as_ref(),
+            peer_pubkey,
+            peer_addr,
+            amount_sats,
+            announce,
+            fee_rate_sat_per_vb,
+        )
     }
 
     async fn close_channel(
@@ -1802,4 +1775,98 @@ fn jit_receipt(p: &ldk_node::payment::PaymentDetails) -> Result<Option<Liquidity
         }
     }
     Ok(None)
+}
+
+// Keep the LDK API boundary injectable so tests observe calls without connecting
+// peers or funding channels. The production implementation uses LDK's methods.
+#[cfg_attr(test, mockall::automock)]
+trait ChannelOpener {
+    fn open_channel(
+        &self,
+        peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress,
+        amount_sats: u64,
+        push_msat: Option<u64>,
+        config: Option<ldk_node::config::ChannelConfig>,
+    ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError>;
+    fn open_announced_channel(
+        &self,
+        peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress,
+        amount_sats: u64,
+        push_msat: Option<u64>,
+        config: Option<ldk_node::config::ChannelConfig>,
+    ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError>;
+}
+
+impl ChannelOpener for LdkNode {
+    fn open_channel(
+        &self,
+        peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress,
+        amount_sats: u64,
+        push_msat: Option<u64>,
+        config: Option<ldk_node::config::ChannelConfig>,
+    ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError> {
+        LdkNode::open_channel(self, peer, addr, amount_sats, push_msat, config)
+    }
+    fn open_announced_channel(
+        &self,
+        peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress,
+        amount_sats: u64,
+        push_msat: Option<u64>,
+        config: Option<ldk_node::config::ChannelConfig>,
+    ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError> {
+        LdkNode::open_announced_channel(self, peer, addr, amount_sats, push_msat, config)
+    }
+}
+
+fn open_ldk_channel(
+    node: &impl ChannelOpener,
+    peer_pubkey: &str,
+    peer_addr: &str,
+    amount_sats: u64,
+    announce: bool,
+    fee_rate_sat_per_vb: Option<f32>,
+) -> Result<String, LightningError> {
+    if fee_rate_sat_per_vb.is_some() {
+        // ldk-node 0.7 / lightning 0.2.2: ChannelConfig controls forwarding
+        // and commitment policy, not funding fees. FundingGenerationReady
+        // uses the wallet's ChannelFunding estimator later. A quote checked
+        // here cannot bound that rate, so reject BEFORE connecting a peer.
+        return Err(LightningError::PaymentNotDispatched(
+            "LDK cannot enforce a per-channel funding fee rate".into(),
+        ));
+    }
+    use std::str::FromStr;
+    let node_pubkey = ldk_node::bitcoin::secp256k1::PublicKey::from_str(peer_pubkey)
+        .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid pubkey: {e}")))?;
+
+    // Parse address into LDK SocketAddress
+    let socket_addr: std::net::SocketAddr = peer_addr
+        .parse()
+        .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid address: {e}")))?;
+    let ldk_addr = match socket_addr {
+        std::net::SocketAddr::V4(a) => ldk_node::lightning::ln::msgs::SocketAddress::TcpIpV4 {
+            addr: a.ip().octets(),
+            port: a.port(),
+        },
+        std::net::SocketAddr::V6(a) => ldk_node::lightning::ln::msgs::SocketAddress::TcpIpV6 {
+            addr: a.ip().octets(),
+            port: a.port(),
+        },
+    };
+
+    // Open channel (connect + open in one call)
+    let user_channel_id = if announce {
+        node.open_announced_channel(node_pubkey, ldk_addr, amount_sats, None, None)
+    } else {
+        node.open_channel(node_pubkey, ldk_addr, amount_sats, None, None)
+    }
+    .map_err(|e| LightningError::Backend(format!("open_channel failed: {e}")))?;
+
+    let channel_id = format!("{}", user_channel_id);
+    tracing::info!(channel_id = %channel_id, amount_sats, peer = %peer_pubkey, "Lightning channel opening initiated");
+    Ok(channel_id)
 }

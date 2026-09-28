@@ -173,7 +173,8 @@ pub async fn handle_peer_lightning_info(
     }
     let max_fee_rate = invite
         .max_fee_rate_sat_per_vb
-        .unwrap_or(DEFAULT_MAX_FEE_RATE_SAT_PER_VB);
+        .unwrap_or(DEFAULT_MAX_FEE_RATE_SAT_PER_VB)
+        .min(subsidy.max_funding_fee_rate_sat_per_vb);
 
     let current_fee_rate = estimate_fee_rate_sat_per_vb(chain.as_ref()).await?;
     if current_fee_rate > max_fee_rate {
@@ -415,15 +416,19 @@ pub async fn handle_peer_lightning_info(
 async fn estimate_fee_rate_sat_per_vb(chain: &dyn ChainProvider) -> Result<u32, AutoChannelError> {
     let estimate = chain.estimate_fee(FEE_ESTIMATE_TARGET_BLOCKS).await?;
     let fee = estimate.sat_per_vbyte.ceil();
-    if !fee.is_finite() || fee <= 0.0 {
+    if !fee.is_finite()
+        || fee < 1.0
+        || fee > f64::from(konsensus_core::fee_rate::MAX_FEE_RATE_SAT_PER_VB)
+    {
         return Err(AutoChannelError::Chain(
             konsensus_core::traits::chain::ChainError::FeeEstimationFailed(format!(
-                "non-positive fee estimate: {}",
+                "invalid funding fee estimate: {}",
                 estimate.sat_per_vbyte
             )),
         ));
     }
-    Ok(fee.min(u32::MAX as f64) as u32)
+    // The sanity bound also makes the later u32 -> f32 dispatch lossless.
+    Ok(fee as u32)
 }
 
 fn funding_fee_buffer_sats(max_fee_rate_sat_per_vb: u32) -> u64 {
@@ -567,7 +572,8 @@ mod tests {
     struct TestLightning {
         balance_msat: u64,
         channels: Mutex<Vec<ChannelInfo>>,
-        opens: Mutex<Vec<(String, String, u64, Option<f32>)>>,
+        opens: Mutex<Vec<(String, String, u64, Option<f32>, bool)>>,
+        reject_fee_requests: bool,
         open_started: Option<Arc<Notify>>,
         release_open: Option<Arc<Notify>>,
     }
@@ -620,14 +626,24 @@ mod tests {
             peer_pubkey: &str,
             peer_addr: &str,
             amount_sats: u64,
-            _announce: bool,
+            announce: bool,
             fee_rate_sat_per_vb: Option<f32>,
         ) -> Result<String, LightningError> {
+            if self.reject_fee_requests && fee_rate_sat_per_vb.is_some() {
+                return Err(LightningError::PaymentNotDispatched(
+                    "funding fee override unsupported".into(),
+                ));
+            }
+            if let Some(rate) = fee_rate_sat_per_vb {
+                konsensus_core::fee_rate::validate_fee_rate_sat_per_vb(rate)
+                    .map_err(|e| LightningError::PaymentNotDispatched(e.to_string()))?;
+            }
             self.opens.lock().await.push((
                 peer_pubkey.to_string(),
                 peer_addr.to_string(),
                 amount_sats,
                 fee_rate_sat_per_vb,
+                announce,
             ));
             if let Some(open_started) = &self.open_started {
                 open_started.notify_waiters();
@@ -710,8 +726,122 @@ mod tests {
             enabled: true,
             max_channel_sats: 1_000_000,
             max_total_budget_sats: 100_000_000,
+            max_funding_fee_rate_sat_per_vb: 50,
             per_peer_max_opens: 1,
             allowlist: (1u8..=9u8).map(|n| hex::encode([n; 32])).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_fee_operator_cap_and_rounded_quote_are_enforced() {
+        for (quote, operator_cap, invite_cap, expected_rate) in [
+            (5.0, 4, 50, None),
+            (5.0, 0, 50, None),
+            (4.01, 4, 50, None),
+            (4.0, 4, 50, Some(4.0)),
+            (5.0, 50, 4, None),
+            (4.0, 50, 4, Some(4.0)),
+            (3.1, 4, 50, Some(4.0)),
+        ] {
+            let peer = NodeId::from_bytes([1; 32]);
+            let storage =
+                storage_with_invite(peer, invite_cap, Some(10_000), now_unix() + 60).await;
+            let lightning = Arc::new(TestLightning {
+                balance_msat: 100_000_000,
+                ..Default::default()
+            });
+            let notifier = Arc::new(RecordingNotifier::default());
+            let mut policy = serde_json::to_value(test_subsidy()).unwrap();
+            policy["max_funding_fee_rate_sat_per_vb"] = operator_cap.into();
+            let subsidy = serde_json::from_value(policy).unwrap();
+            let (s, l, c, n) = deps(storage.clone(), lightning.clone(), quote, notifier.clone());
+            handle_peer_lightning_info(
+                peer,
+                LN_PUBKEY.into(),
+                Some("127.0.0.1:9735".into()),
+                s,
+                l,
+                c,
+                n,
+                subsidy,
+            )
+            .await
+            .unwrap();
+            let opens = lightning.opens.lock().await;
+            match expected_rate {
+                Some(rate) => {
+                    assert_eq!(opens.len(), 1);
+                    assert_eq!(opens[0].3, Some(rate));
+                    assert!(!opens[0].4);
+                }
+                None => {
+                    assert!(
+                        opens.is_empty(),
+                        "quote {quote}, operator cap {operator_cap}, invite cap {invite_cap}"
+                    );
+                    assert_eq!(
+                        storage.list_invites_issued().await.unwrap()[0].state,
+                        InviteState::Pending
+                    );
+                    assert_eq!(notifier.notices.lock().await[0].status, "aborted");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_fee_unsupported_backend_leaves_invite_pending_without_open() {
+        let peer = NodeId::from_bytes([1; 32]);
+        let storage = storage_with_invite(peer, 50, Some(10_000), now_unix() + 60).await;
+        let lightning = Arc::new(TestLightning {
+            balance_msat: 100_000_000,
+            reject_fee_requests: true,
+            ..Default::default()
+        });
+        let notifier = Arc::new(RecordingNotifier::default());
+        let (s, l, c, n) = deps(storage.clone(), lightning.clone(), 5.0, notifier.clone());
+        let err = handle_peer_lightning_info(
+            peer,
+            LN_PUBKEY.into(),
+            Some("127.0.0.1:9735".into()),
+            s,
+            l,
+            c,
+            n,
+            test_subsidy(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AutoChannelError::Lightning(LightningError::PaymentNotDispatched(_))
+        ));
+        assert!(lightning.opens.lock().await.is_empty());
+        assert_eq!(
+            storage.list_invites_issued().await.unwrap()[0].state,
+            InviteState::Pending
+        );
+        assert!(notifier
+            .notices
+            .lock()
+            .await
+            .iter()
+            .all(|n| n.status != "opened"));
+    }
+
+    #[tokio::test]
+    async fn channel_fee_invalid_estimates_fail_closed() {
+        for fee_rate in [
+            f64::NAN,
+            f64::INFINITY,
+            0.0,
+            -1.0,
+            10_000.1,
+            u32::MAX as f64,
+        ] {
+            assert!(estimate_fee_rate_sat_per_vb(&TestChain { fee_rate })
+                .await
+                .is_err());
         }
     }
 
@@ -1039,6 +1169,7 @@ mod tests {
                 enabled: true,
                 max_channel_sats: 1_000_000,
                 max_total_budget_sats: 100_000_000,
+                max_funding_fee_rate_sat_per_vb: 50,
                 per_peer_max_opens: 1,
                 allowlist: Vec::new(),
             },
@@ -1077,6 +1208,7 @@ mod tests {
                 enabled: true,
                 max_channel_sats: 50_000,
                 max_total_budget_sats: 100_000_000,
+                max_funding_fee_rate_sat_per_vb: 50,
                 per_peer_max_opens: 1,
                 allowlist: vec![hex::encode(peer.as_bytes())],
             },
@@ -1117,6 +1249,7 @@ mod tests {
                 enabled: true,
                 max_channel_sats: 50_000,
                 max_total_budget_sats: 10_000,
+                max_funding_fee_rate_sat_per_vb: 50,
                 per_peer_max_opens: 1,
                 allowlist: vec![hex::encode(peer.as_bytes())],
             },
@@ -1195,6 +1328,7 @@ mod tests {
                 enabled: true,
                 max_channel_sats: 1_000_000,
                 max_total_budget_sats: 100_000_000,
+                max_funding_fee_rate_sat_per_vb: 50,
                 per_peer_max_opens: 1,
                 allowlist: vec![hex::encode(peer.as_bytes())],
             },
@@ -1256,6 +1390,7 @@ mod tests {
                 enabled: true,
                 max_channel_sats: 50_000,
                 max_total_budget_sats: 1,
+                max_funding_fee_rate_sat_per_vb: 50,
                 per_peer_max_opens: 1,
                 allowlist: vec![hex::encode(peer.as_bytes())],
             },

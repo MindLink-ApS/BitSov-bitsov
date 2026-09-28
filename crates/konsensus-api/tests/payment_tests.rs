@@ -2378,3 +2378,54 @@ async fn liquidity_is_discoverable_and_off_by_default() {
     assert_eq!(json["enabled"], false);
     assert_eq!(json["providers"], serde_json::json!([]));
 }
+
+
+#[tokio::test]
+async fn channel_fee_unsupported_rate_returns_not_dispatched() {
+    let state = test_state();
+    let auth = auth_header(&state);
+    let app = build_router(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/payments/open-channel")
+        .header("authorization", &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "peer_pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "peer_addr": "127.0.0.1:9735", "amount_sats": 50_000,
+                "announce": true, "fee_rate_sat_per_vb": 5.0
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "not_dispatched");
+}
+
+#[tokio::test]
+async fn channel_fee_api_preserves_announce_without_override() {
+    for (announce, expected_id) in [
+        (false, "stub-channel-id"),
+        (true, "stub-announced-channel-id"),
+    ] {
+        let state = test_state();
+        let auth = auth_header(&state);
+        let app = build_router(state);
+        let req = Request::builder().method("POST")
+            .uri("/api/v1/payments/open-channel")
+            .header("authorization", &auth).header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({
+                "peer_pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "peer_addr": "127.0.0.1:9735", "amount_sats": 50_000, "announce": announce
+            }).to_string())).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["channel_id"], expected_id);
+    }
+}

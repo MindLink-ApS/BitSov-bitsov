@@ -124,7 +124,7 @@ pub enum LightningError {
     #[error("stateless_quote_unsupported")]
     StatelessQuoteUnsupported,
 
-    /// Positively proven to have failed BEFORE payment dispatch. Only this
+    /// Positively proven to have failed BEFORE payment or channel-open dispatch. Only this
     /// variant permits a caller to try another payment path. Never use it for
     /// a response error, timeout, or an unclassified backend/connection error.
     #[error("payment not dispatched: {0}")]
@@ -561,8 +561,9 @@ pub trait LightningProvider: Send + Sync {
     /// * `announce` — Whether to announce the channel publicly.
     /// * `fee_rate_sat_per_vb` — Optional fee rate override in sat/vB for the
     ///   funding transaction. If `None`, the backend selects a rate from its
-    ///   fee estimator. Must be > 0 if provided. Not all backends support this;
-    ///   unsupported backends silently ignore it.
+    ///   fee estimator. A supplied rate and the announce flag must be honored.
+    ///   If either cannot be enforced, return `PaymentNotDispatched` before
+    ///   initiating the channel; never silently fall back to backend defaults.
     ///
     /// Returns the temporary channel ID on success.
     async fn open_channel(
@@ -573,7 +574,7 @@ pub trait LightningProvider: Send + Sync {
         _announce: bool,
         _fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        Err(LightningError::Backend(
+        Err(LightningError::PaymentNotDispatched(
             "open_channel not supported by this provider".into(),
         ))
     }

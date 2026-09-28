@@ -625,6 +625,13 @@ pub struct SubsidyConfig {
     #[serde(default)]
     pub max_total_budget_sats: u64,
 
+    /// Maximum funding fee rate (sat/vB). Zero (default) forbids new opens.
+    /// The worker enforces the lower of this operator ceiling and the invite's
+    /// ceiling, and requests the checked rate from the Lightning backend.
+    /// Backends unable to enforce that request must refuse before dispatch.
+    #[serde(default)]
+    pub max_funding_fee_rate_sat_per_vb: u32,
+
     /// Maximum subsidised channel opens per invited peer. Defaults to 1.
     #[serde(default = "default_per_peer_max_opens")]
     pub per_peer_max_opens: u32,
@@ -642,6 +649,7 @@ impl Default for SubsidyConfig {
             enabled: false,
             max_channel_sats: 0,
             max_total_budget_sats: 0,
+            max_funding_fee_rate_sat_per_vb: 0,
             per_peer_max_opens: default_per_peer_max_opens(),
             allowlist: Vec::new(),
         }
