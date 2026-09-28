@@ -34,6 +34,7 @@ use konsensus_core::traits::lightning::{LightningProvider, PaymentDirection};
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::{NodeId, NodeIdentity};
 use konsensus_crypto::SessionManager;
+use konsensus_api::membrane::PrePaymentReason;
 use konsensus_lightning::shared_mock::SharedMockProvider;
 use konsensus_message::{ControlEvent, Frame, NoiseTransport, PeerRegistry, ReachabilityMode, TransportConfig};
 
@@ -94,9 +95,13 @@ fn logged_since(from: usize, needles: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Our P2 gate's drops of `peer`'s `frame` logged after `from`.
-fn drops(from: usize, frame: &str, peer: &NodeId) -> usize {
-    logged_since(from, &[&format!("DROP {frame}"), &format!("peer={peer}")]).len()
+/// Our P2 gate's refusals so far, by reason. Since #96 a pre-payment refusal
+/// is only counted, anonymously (no peer, no frame log line): tests compare
+/// these counters before and after, on a node whose unpaid traffic they control.
+type Refused = std::collections::BTreeMap<PrePaymentReason, u64>;
+
+fn refused_delta(before: &Refused, after: &Refused, reason: PrePaymentReason) -> u64 {
+    after.get(&reason).copied().unwrap_or(0) - before.get(&reason).copied().unwrap_or(0)
 }
 
 // ── Nodes ────────────────────────────────────────────────────────────────
@@ -140,6 +145,17 @@ struct Faulty {
     calls: std::sync::atomic::AtomicUsize,
 }
 
+impl Faulty {
+    /// `FlapAfterFirstPayment`: drop the payee right after the first payment settles.
+    async fn after_payment(&self) {
+        if matches!(self.kind, Wallet::FlapAfterFirstPayment)
+            && self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+        {
+            let _ = self.transport.disconnect(&self.peer.expect("the peer to flap")).await;
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl LightningProvider for Faulty {
     async fn create_invoice(&self, amount: u64, description: &str, expiry: u32)
@@ -157,12 +173,26 @@ impl LightningProvider for Faulty {
         -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>
     {
         let paid = self.wallet.pay_invoice(bolt11).await?;
-        if matches!(self.kind, Wallet::FlapAfterFirstPayment)
-            && self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
-        {
-            let _ = self.transport.disconnect(&self.peer.expect("the peer to flap")).await;
-        }
+        self.after_payment().await;
         Ok(paid)
+    }
+    /// Every payment is fee-limited since #99; the shared mock enforces it.
+    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64)
+        -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>
+    {
+        let paid = self.wallet.pay_invoice_with_fee_limit(bolt11, max_fee_msat).await?;
+        self.after_payment().await;
+        Ok(paid)
+    }
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, max_fee_msat: u64)
+        -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>
+    {
+        let paid = self.wallet.keysend_with_fee_limit(dest, amount, memo, max_fee_msat).await?;
+        self.after_payment().await;
+        Ok(paid)
+    }
+    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy {
+        self.wallet.routing_fee_policy()
     }
     async fn get_payment_status(&self, hash: &str)
         -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>
@@ -300,6 +330,7 @@ impl MessageTransport for Hooked {
 struct Node {
     id: NodeId,
     pause: Arc<PauseAfterMark>,
+    audit: Arc<konsensus_api::audit::AuditLog>,
     identity: Arc<NodeIdentity>,
     transport: Arc<NoiseTransport>,
     sessions: Arc<SessionManager>,
@@ -502,6 +533,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
     Node {
         id,
         pause,
+        audit,
         identity,
         transport,
         sessions,
@@ -563,6 +595,17 @@ impl Node {
             .collect();
         paid.sort();
         paid.into_iter().map(|(_, msat)| msat).collect()
+    }
+
+    /// This node's P2 refusals so far, summed over the hourly buckets.
+    fn refused(&self) -> Refused {
+        let mut total = Refused::new();
+        for bucket in self.audit.membrane().pre_payment_refusals().buckets {
+            for (reason, n) in bucket.counts {
+                *total.entry(reason).or_default() += n;
+            }
+        }
+        total
     }
 
     /// Fully privileged (whitelisted or promoted by the peer's payment). An
@@ -720,19 +763,28 @@ async fn first_contact_delivers_once(shape: Shape, order: Order) {
     let mut net = pair(shape, order, Wallet::Plain, Wallet::Plain).await;
     let payee = net.payee.id;
 
-    let (status, body) = net.payer.compose(&payee, "hello").await;
+    // Snapshot the payer's refusals the moment our admission is marked paid
+    // (the after-mark hook, released at once): the reply-to-dialler payee may
+    // offer its prekey before we paid, and that drop is expected.
+    net.payer.pause.arm();
+    let ((status, body), before) = tokio::join!(net.payer.compose(&payee, "hello"), async {
+        net.payer.pause.reached().await;
+        let before = net.payer.refused();
+        net.payer.pause.release();
+        before
+    });
     assert_eq!(status, StatusCode::OK, "{shape:?}/{order:?}: {body}");
     assert_eq!(body["delivered"], true, "{body}");
     net.payee.delivered_once("hello").await;
     assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT, CHAT_MSAT], "one admission + the message");
 
     // After our admission settled, our gate dropped nothing the payee sent to
-    // complete it.
+    // complete it (the payee is the only peer here).
     let settled = logged_since(mark, &["first-contact admission: settled", &format!("peer={payee}")]);
     assert_eq!(settled.len(), 1, "{shape:?}/{order:?}: one admission settled");
-    let after = mark + logged_since(mark, &[]).iter().position(|l| l == &settled[0]).unwrap();
-    for frame in ["PrekeyOffer", "SessionInit", "SessionAck", "RatchetInit", "MessageAck", "PriceTable"] {
-        assert_eq!(drops(after, frame, &payee), 0, "{shape:?}/{order:?}: dropped the paid payee's {frame}");
+    let after = net.payer.refused();
+    for reason in [PrePaymentReason::SessionBeforePayment, PrePaymentReason::DeliveryBeforePayment, PrePaymentReason::PriceBeforePayment] {
+        assert_eq!(refused_delta(&before, &after, reason), 0, "{shape:?}/{order:?}: dropped the paid payee's frame ({reason:?})");
     }
 
     // The session holds: the next message pays the message only.
@@ -884,13 +936,13 @@ async fn m11_payer_restart_inside_the_window_pays_once_per_connection() {
 // ── 7, 8, 12: nothing for anyone who did not complete a paid act ─────────
 
 /// 7: an unpaid stranger Z on the payer while it pays B. Z's prekey, prices
-/// and peer-exchange request are dropped (each drop logged against Z), Z gets
-/// nothing back, and no state is kept for Z.
+/// and peer-exchange request are dropped (each counted by the payer's gate,
+/// and B's frames are not), Z gets nothing back, and no state is kept for Z.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn m7_unpaid_stranger_gets_nothing_while_the_payer_pays_someone_else() {
-    let mark = log_mark();
     let mut net = pair(Shape::CardOnly, Order::PayerLower, Wallet::Plain, Wallet::Plain).await;
     let (payer, payee) = (net.payer.id, net.payee.id);
+    let before = net.payer.refused();
     let (z_identity, z) = stranger();
     let z_id = *z_identity.node_id();
     z.connect(&payer, &net.payer.addr()).await.unwrap();
@@ -925,9 +977,12 @@ async fn m7_unpaid_stranger_gets_nothing_while_the_payer_pays_someone_else() {
     assert!(!net.payer.sessions.has_session(&z_id).await);
     assert!(!net.payer.privileged(&z_id).await && !net.payer.paid_on_connection(&z_id).await);
     assert!(net.payer.peer_prices.get_peer_price(&z_id, 0).await.is_none(), "Z's prices were cached");
-    assert_eq!(drops(mark, "PrekeyOffer", &z_id), 2);
-    assert_eq!(drops(mark, "PriceTable", &z_id), 2);
-    assert_eq!(drops(mark, "PeerExchange request", &z_id), 2);
+    // Exactly Z's frames: two of each, nothing of B's paid exchange.
+    let after = net.payer.refused();
+    assert_eq!(refused_delta(&before, &after, PrePaymentReason::SessionBeforePayment), 2, "{after:?}");
+    assert_eq!(refused_delta(&before, &after, PrePaymentReason::PriceBeforePayment), 2, "{after:?}");
+    assert_eq!(refused_delta(&before, &after, PrePaymentReason::PeerExchangeBeforePayment), 2, "{after:?}");
+    assert_eq!(refused_delta(&before, &after, PrePaymentReason::DeliveryBeforePayment), 0, "{after:?}");
     z.shutdown();
     net.stop();
 }
@@ -943,7 +998,7 @@ async fn m8_paid_payee_gets_no_peer_exchange_lightning_or_gossip() {
     net.payee.delivered_once("hello").await;
     assert!(net.payer.paid_on_connection(&payee).await);
 
-    let mark = log_mark();
+    let before = net.payer.refused();
     let gossip = {
         let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
             konsensus_core::kind::KIND_CHAT,
@@ -961,9 +1016,10 @@ async fn m8_paid_payee_gets_no_peer_exchange_lightning_or_gossip() {
     net.payee.transport.send_frame(&payer, &Frame::LightningInfo { ln_pubkey: "02".repeat(33), ln_addr: None }).await.unwrap();
     net.payee.transport.send_frame(&payer, &Frame::Gossip(Box::new(gossip))).await.unwrap();
     wait_until("the payer dropped all three", Duration::from_secs(5), || async {
-        drops(mark, "PeerExchange request", &payee) == 1
-            && drops(mark, "LightningInfo", &payee) == 1
-            && drops(mark, "Gossip", &payee) == 1
+        let after = net.payer.refused();
+        refused_delta(&before, &after, PrePaymentReason::PeerExchangeBeforePayment) == 1
+            && refused_delta(&before, &after, PrePaymentReason::LightningInfoBeforePayment) == 1
+            && refused_delta(&before, &after, PrePaymentReason::GossipBeforePayment) == 1
     })
     .await;
     assert!(!net.payer.peer_ln_pubkeys.lock().await.contains_key(&payee), "onboarding write from a payee");
@@ -1032,7 +1088,7 @@ async fn m9_m10_reconnect_needs_readmission_then_acks_count() {
     net.flap().await;
     assert!(!net.payer.paid_on_connection(&payee).await);
     assert!(!net.payer.privileged(&payee).await);
-    let mark = log_mark();
+    let before = net.payer.refused();
     let bundle = serde_json::to_value(net.payee.sessions.prekey_bundle().await).unwrap();
     net.payee.transport.send_frame(&payer, &Frame::PrekeyOffer { bundle }).await.unwrap();
     net.payee
@@ -1041,7 +1097,9 @@ async fn m9_m10_reconnect_needs_readmission_then_acks_count() {
         .await
         .unwrap();
     wait_until("the payer dropped both", Duration::from_secs(5), || async {
-        drops(mark, "PrekeyOffer", &payee) == 1 && drops(mark, "MessageAck", &payee) == 1
+        let after = net.payer.refused();
+        refused_delta(&before, &after, PrePaymentReason::SessionBeforePayment) == 1
+            && refused_delta(&before, &after, PrePaymentReason::DeliveryBeforePayment) == 1
     })
     .await;
     assert!(net.payer.sessions.can_send(&payee).await, "a dropped frame left the session alone");
