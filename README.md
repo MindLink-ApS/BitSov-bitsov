@@ -87,7 +87,15 @@ cargo test --workspace
 
 # Check for issues
 cargo clippy --workspace -- -D warnings
+
+# PostgreSQL storage tests (ignored by default; need a disposable server)
+BITSOV_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/postgres \
+  cargo test -p konsensus-storage --locked -- --ignored postgres
 ```
+
+CI runs the PostgreSQL tests in the separate, non-blocking
+[`PostgreSQL Tests`](.github/workflows/postgres.yml) workflow against a
+`postgres:16` service container.
 
 ## License
 
