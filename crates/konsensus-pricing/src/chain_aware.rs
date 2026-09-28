@@ -727,6 +727,11 @@ impl ChainAwarePricingEngine {
 
 #[async_trait]
 impl PricingEngine for ChainAwarePricingEngine {
+    fn category_price_overrides(&self) -> Option<Vec<u16>> {
+        // The multiplier is shared by every kind in a category.
+        self.base_engine.category_price_overrides()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

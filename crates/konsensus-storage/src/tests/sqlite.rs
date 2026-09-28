@@ -641,7 +641,7 @@ async fn clear_pending_for_peer_removes_all() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
-async fn cleanup_stale_pending_removes_high_attempt_entries()
+async fn cleanup_stale_pending_stalls_high_attempt_entries()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = SqliteStorage::in_memory().await?;
     let sender = NodeId::from_bytes([1u8; 32]);
@@ -666,20 +666,21 @@ async fn cleanup_stale_pending_removes_high_attempt_entries()
         db.increment_pending_attempts(&env2.id, &peer).await?;
     }
 
-    // Cleanup with max_attempts=10 should only remove env1
-    let removed = db.cleanup_stale_pending(10).await?;
-    assert_eq!(removed, 1);
-    assert_eq!(db.count_pending_deliveries().await?, 2);
+    // Cleanup with max_attempts=10 should only stall env1
+    let stalled = db.cleanup_stale_pending(10).await?;
+    assert_eq!(stalled, 1);
+    assert_eq!(db.count_pending_deliveries().await?, 3);
 
-    // Cleanup with max_attempts=5 should remove env2
-    let removed = db.cleanup_stale_pending(5).await?;
-    assert_eq!(removed, 1);
-    assert_eq!(db.count_pending_deliveries().await?, 1);
+    // Cleanup with max_attempts=5 should stall env2
+    let stalled = db.cleanup_stale_pending(5).await?;
+    assert_eq!(stalled, 1);
+    assert_eq!(db.count_pending_deliveries().await?, 3);
 
     // env3 (0 attempts) should still be there
     let pending = db.get_pending_for_peer(&peer).await?;
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].0, env3.id);
+    assert_eq!(pending.len(), 3);
+    assert!(pending.iter().any(|(id, _)| *id == env3.id));
+    assert_eq!(db.cleanup_stale_pending(5).await?, 0);
     Ok(())
 }
 
@@ -1150,7 +1151,7 @@ async fn cleanup_stale_pending_zero_max() -> Result<(), Box<dyn std::error::Erro
     db.store_message(&envelope).await?;
     db.queue_pending_delivery(&envelope.id, &peer).await?;
 
-    // max_attempts=0 should remove entries with attempts >= 0
+    // max_attempts=0 should stall entries with attempts >= 0
     // (i.e., everything)
     let removed = db.cleanup_stale_pending(0).await?;
     assert_eq!(removed, 1);

@@ -119,14 +119,15 @@ pub enum ControlEvent {
 
     /// Peer acknowledged receipt of a message.
     MessageAcked {
+        /// Recipient had already durably accepted the paid envelope.
+        duplicate: bool,
         /// The peer who acknowledged.
         peer_id: NodeId,
         /// The acknowledged message ID.
         message_id: konsensus_core::types::MessageId,
-        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
-        /// `false` => the session handler DROPS this ack so an unprivileged
-        /// stranger cannot pump their own Hebbian routing/trust weight (which
-        /// lowers their gate `required_msat`) before paying — a P2 bypass.
+        /// Bought on this receiving connection: `privileged || admission_paid`.
+        /// Completion requires a matching dispatched outbox entry. Only bought
+        /// replies may update routing weight; unmatched unbought replies are refused.
         privileged: bool,
     },
 
@@ -138,9 +139,9 @@ pub enum ControlEvent {
         message_id: konsensus_core::types::MessageId,
         /// Reason for rejection.
         reason: String,
-        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
-        /// `false` => the session handler DROPS this so an unprivileged stranger
-        /// cannot drive our routing-weight bookkeeping before paying (P2).
+        /// Bought on this receiving connection: `privileged || admission_paid`.
+        /// Completion requires a matching dispatched outbox entry. Only bought
+        /// replies may update routing weight; unmatched unbought replies are refused.
         privileged: bool,
     },
 
@@ -608,6 +609,8 @@ struct PeerConnection {
     /// and `NoiseTransport::promote_to_privileged` flips it to `true` once the
     /// message-plane PaymentGate accepts a settled payment from this peer.
     privileged: bool,
+    /// Last price-table discount successfully published on this connection.
+    advertised_trust_discount: Option<f64>,
     /// The Noise session for encrypt/decrypt.
     noise: NoiseSession,
     /// TCP write half — protected by mutex for send serialization.
@@ -1988,7 +1991,7 @@ mod tests {
             b"test",
             &konsensus_core::types::Nonce::generate(),
         );
-        let ack = Frame::MessageAck { id: test_id };
+        let ack = Frame::MessageAck { id: test_id, duplicate: false };
         transport_b.send_frame(&node_a_id, &ack).await.unwrap();
 
         let event = tokio::time::timeout(
@@ -2001,7 +2004,7 @@ mod tests {
 
         match event {
             ControlEvent::MessageAcked {
-                peer_id,
+                duplicate: false,                peer_id,
                 message_id,
                 ..
             } => {
@@ -2678,7 +2681,7 @@ mod tests {
             (Frame::SessionInit { init_data: serde_json::json!({}) }, true),
             (Frame::SessionAck, true),
             (Frame::RatchetInit { payload: vec![1, 2, 3] }, true),
-            (Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([1u8; 32]) }, true),
+            (Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([1u8; 32]), duplicate: false }, true),
             (Frame::MessageReject { id: konsensus_core::types::MessageId::from_bytes([2u8; 32]), reason: "r".into() }, true),
             (
                 Frame::PriceTable {

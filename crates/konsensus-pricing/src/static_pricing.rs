@@ -115,6 +115,12 @@ impl StaticPricingEngine {
 
 #[async_trait]
 impl PricingEngine for StaticPricingEngine {
+    fn category_price_overrides(&self) -> Option<Vec<u16>> {
+        Some(if self.config.longform_msat != self.config.chat_msat {
+            vec![konsensus_core::kind::KIND_LONGFORM]
+        } else { Vec::new() })
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

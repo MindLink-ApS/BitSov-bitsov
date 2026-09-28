@@ -89,6 +89,18 @@ pub struct UkmEnvelope {
 }
 
 impl UkmEnvelope {
+    /// Renew only the signed wrapper for an already-paid retry after four minutes.
+    /// The ciphertext, nonce, ID, references and payment proof never change.
+    pub fn refresh_for_resend(&mut self, identity: &crate::identity::NodeIdentity, now_ms: u64) -> Result<bool, CoreError> {
+        if self.sender != *identity.node_id() {
+            return Err(CoreError::EnvelopeValidation("cannot re-sign another sender's envelope".into()));
+        }
+        if now_ms.saturating_sub(self.timestamp) <= 240_000 { return Ok(false); }
+        self.timestamp = now_ms;
+        self.signature = Signature::from_ed25519(&identity.sign(&self.signable_bytes()));
+        Ok(true)
+    }
+
     /// Compute the bytes that are covered by the Ed25519 signature.
     ///
     /// The signature covers:

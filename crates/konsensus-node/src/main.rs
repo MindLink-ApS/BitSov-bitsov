@@ -9,6 +9,7 @@ mod content_server;
 mod housekeeping;
 mod mnemonic_crypto;
 mod msg_handler;
+mod delivery_prices;
 mod node;
 mod onboarding;
 mod pending_handler;
@@ -1031,6 +1032,7 @@ async fn cmd_start(
     // Pending delivery flusher — delivers queued messages when peers reconnect
     let (pending_tx, pending_rx) = tokio::sync::mpsc::channel::<NodeId>(64);
     let pending_handle = tokio::spawn(pending_handler::run(pending_handler::PendingHandlerDeps {
+        identity: Arc::clone(node.identity()),
         storage: Arc::clone(node.storage()),
         transport: Arc::clone(node.transport()) as Arc<dyn MessageTransport>,
         audit_log: Arc::clone(&audit_log),
@@ -1177,6 +1179,7 @@ async fn cmd_start(
     ));
 
     let price_refresh_handle = tokio::spawn(housekeeping::run_price_refresh(
+        Arc::clone(node.storage()),
         Arc::clone(node.transport()),
         Arc::clone(node.pricing()),
         Arc::clone(node.chain()),

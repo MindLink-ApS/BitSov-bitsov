@@ -78,11 +78,11 @@ fn encode_decode_roundtrip_session_ack() {
 #[test]
 fn encode_decode_roundtrip_message_ack() {
     let id = MessageId::from_bytes([0xBB; 32]);
-    let frame = Frame::MessageAck { id };
+    let frame = Frame::MessageAck { id, duplicate: false };
     let encoded = encode_frame(&frame).unwrap();
     let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
     match decoded {
-        Frame::MessageAck { id: decoded_id } => assert_eq!(decoded_id, id),
+        Frame::MessageAck { id: decoded_id, .. } => assert_eq!(decoded_id, id),
         _ => panic!("expected MessageAck"),
     }
 }
