@@ -131,7 +131,8 @@ removed.
    live connection; B pays the message price only; A decrypts it.
 9. **Over-ceiling refusal:** a 2,001-msat B invoice paid through
    `/api/v1/payments/pay` with `max_routing_fee_msat` = C's fee − 1. A route
-   exists but costs more: 502 `payment not dispatched`, budget unchanged
+   exists but costs more: 400 with `code: "not_dispatched"` and the effective
+   `max_routing_fee_msat`, budget unchanged
    (reservation released), A's record `Failed`, B's `Pending`, A's channel unchanged.
 10. **Fee-capped payment:** same route, cap = C's fee exactly: settles.
 11. **Reconciliation (msat-exact):** channel outbound capacities A −(4×2,001 +
@@ -160,3 +161,42 @@ so asynchronous wallet sync cannot turn the expected refusal into a 503.
 | First contact latency | ~16 s for admission + session + first message; later messages ~2 s. |
 | Payment list | `list_payments` includes on-chain funding/receipts as hashless records. |
 | Precision | `get_balance_msat` is whole-satoshi; exact accounting uses records and channel capacities. |
+
+## Non-dispatch API contract audit (2026-09-28)
+
+`LightningError::PaymentNotDispatched` now survives the shared `ApiError`
+conversion as HTTP 400 with `code: "not_dispatched"` and the backend reason.
+`/payments/pay` and `/payments/keysend` retain `max_routing_fee_msat`, including
+zero; their metered reservations are released as before. `/payments/close-channel`
+inherits the shared mapping, `/payments/open-channel` already maps explicitly,
+and `/payments/send-onchain` now preserves the code in its custom error match.
+The shared conversion (including pay/keysend) keeps ambiguous Lightning errors
+at 502; readiness remains 503 `not_ready`. Existing open-channel/send-onchain
+catch-alls still return generic 400 without `not_dispatched`, which does not
+prove non-dispatch. On-chain `BroadcastUnconfirmed` remains 202 with its
+transaction ID.
+
+Other generic conversion sites were audited: liquidity quote/accept, invoice
+creation, payment status/liquidity receipt, balances, channel/payment lists,
+and sponsor claim invoice creation all inherit the typed mapping. Liquidity
+accept's synchronous quote lookup still reports bad input as generic 400;
+it occurs before the debit or publication. Its asynchronous accept call
+releases proven non-dispatch reservations and now preserves the code.
+
+Separate follow-up candidates outside direct-send routes: message compose's
+invoice and admission payment branches explicitly stringify non-dispatch as
+`ApiError::Lightning`; sponsor approval merges non-dispatch and terminal
+failed payments into a generic failure. These are not generic-conversion
+sites. Changing their contracts requires preserving aggregate admission,
+message and prior-payment accounting (including partial settlement), rather
+than claiming the whole operation was never dispatched. Compose's keysend
+fallback already distinguishes typed non-dispatch from uncertain outcomes.
+
+**bitsov-app needs a separate mapping PR.** At app main `e151910`,
+`src-tauri/src/main.rs`'s spend path recognizes readiness, grant and price-cap
+refusals, but all other non-success responses become unknown-spend journals
+(around lines 2330–2377). Even the corrected 400 will stay locked until the
+app recognizes the structured `not_dispatched` contract, releases its local
+reservation and abandons the journal. That change should test invoice pay
+and keysend, allow a subsequent spend, and retain journals for ambiguous
+502 responses. No app behavior is changed by this genome PR.

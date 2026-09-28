@@ -748,6 +748,7 @@ async fn send_onchain(
             ))
         }
         Err(LightningError::NotReady) => Err(ApiError::NotReady),
+        Err(LightningError::PaymentNotDispatched(reason)) => Err(ApiError::NotDispatched(reason)),
         Err(e) => Err(ApiError::BadRequest(format!("send_onchain failed: {e}"))),
     }
 }

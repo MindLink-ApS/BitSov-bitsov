@@ -328,14 +328,8 @@ async fn real_ldk_regtest_e2e() {
             false,
         )
         .await;
-    assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap()
-            .contains("payment not dispatched"),
-        "{body}"
-    );
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "not_dispatched", "{body}");
     assert_eq!(body["max_routing_fee_msat"], fee_b - 1);
     assert_eq!(alice.used(), used_a, "reservation must be released");
     assert_eq!(
@@ -480,14 +474,8 @@ async fn real_ldk_predispatch_refusal() {
             false,
         )
         .await;
-    assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap()
-            .contains("payment not dispatched"),
-        "{body}"
-    );
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "not_dispatched", "{body}");
     assert_eq!(body["max_routing_fee_msat"], 37);
     assert_eq!(
         alice.used(),
