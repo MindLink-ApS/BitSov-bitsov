@@ -287,6 +287,42 @@ impl PaymentGate {
         // envelope is legitimately addressed to a peer.
         our_node_id: Option<&NodeId>,
     ) -> Result<(), GateRejection> {
+        self.validate_paid_envelope(envelope, pricing, whitelist, lightning, trust_discount, our_node_id).await?;
+        // Persist replay guards only after price and settlement validation.
+        // A signed, self-generated hash/preimage is not payment: recording it
+        // earlier gives unpaid strangers a durable storage primitive.
+        // Nonce and payment-hash insert-or-reject checks still run before any
+        // accepted envelope is delivered, including concurrent replays.
+        match nonce_store.check_and_store_paid(
+            &envelope.nonce, &envelope.payment_proof.payment_hash, &envelope.sender, &envelope.id,
+        ).await.map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))? {
+            PaidReplay::Accepted => {},
+            PaidReplay::NonceReused => return Err(GateRejection::ReplayDetected),
+            PaidReplay::PaymentReused => return Err(GateRejection::PaymentProofReused {
+                payment_hash: hex::encode(envelope.payment_proof.payment_hash),
+            }),
+        }
+
+        debug!("gate: ALL CHECKS PASSED — message accepted");
+        Ok(())
+    }
+
+    /// Validate all signed fields, pricing and settlement without consuming replay
+    /// keys. The recipient MUST follow this with atomic durable acceptance.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn validate_paid_envelope(
+        &self,
+        envelope: &UkmEnvelope,
+        pricing: &dyn PricingEngine,
+        whitelist: Option<&HashSet<NodeId>>,
+        lightning: Option<&dyn LightningProvider>,
+        trust_discount: f64,
+        // This node's own NodeId. Threaded into settlement to bind the signed
+        // `envelope.recipient` to THIS node so a settlement proof for another
+        // node is non-transferable. Pass `None` only on the send path, where the
+        // envelope is legitimately addressed to a peer.
+        our_node_id: Option<&NodeId>,
+    ) -> Result<(), GateRejection> {
         // ── Step 1: Envelope integrity ─────────────────────────────────
         // Validates: ID matches blake3(ciphertext||nonce), ciphertext non-empty,
         // preimage matches payment_hash via SHA-256.
@@ -384,22 +420,6 @@ impl PaymentGate {
             }
         }
 
-        // Persist replay guards only after price and settlement validation.
-        // A signed, self-generated hash/preimage is not payment: recording it
-        // earlier gives unpaid strangers a durable storage primitive.
-        // Nonce and payment-hash insert-or-reject checks still run before any
-        // accepted envelope is delivered, including concurrent replays.
-        match nonce_store.check_and_store_paid(
-            &envelope.nonce, &envelope.payment_proof.payment_hash, &envelope.sender, &envelope.id,
-        ).await.map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))? {
-            PaidReplay::Accepted => {},
-            PaidReplay::NonceReused => return Err(GateRejection::ReplayDetected),
-            PaidReplay::PaymentReused => return Err(GateRejection::PaymentProofReused {
-                payment_hash: hex::encode(envelope.payment_proof.payment_hash),
-            }),
-        }
-
-        debug!("gate: ALL CHECKS PASSED — message accepted");
         Ok(())
     }
 

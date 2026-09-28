@@ -127,7 +127,7 @@ async fn pending_cleanup_shuts_down_on_signal() {
 
 /// Verify cleanup_stale_pending removes high-attempt entries, keeping low-attempt ones.
 #[tokio::test]
-async fn pending_cleanup_removes_high_attempt_keeps_low() {
+async fn pending_cleanup_marks_high_attempt_keeps_both() {
     let storage = SqliteStorage::in_memory().await.unwrap();
     let sender = NodeId::from_bytes([1u8; 32]);
     let peer = NodeId::from_bytes([2u8; 32]);
@@ -148,8 +148,7 @@ async fn pending_cleanup_removes_high_attempt_keeps_low() {
     assert_eq!(removed, 1);
 
     let pending = storage.get_pending_for_peer(&peer).await.unwrap();
-    assert_eq!(pending.len(), 1, "only the fresh entry should remain");
-    assert_eq!(pending[0].0, env_fresh.id);
+    assert_eq!(pending.len(), 2, "stalled and fresh entries both remain");
 }
 
 /// Empty pending_deliveries table — cleanup returns zero without error.
@@ -207,7 +206,7 @@ async fn pending_cleanup_multi_peer() {
     let removed = storage.cleanup_stale_pending(10).await.unwrap();
     assert_eq!(removed, 1);
 
-    assert!(storage.get_pending_for_peer(&peer_a).await.unwrap().is_empty());
+    assert_eq!(storage.get_pending_for_peer(&peer_a).await.unwrap().len(), 1);
     assert_eq!(storage.get_pending_for_peer(&peer_b).await.unwrap().len(), 1);
 }
 
@@ -396,7 +395,7 @@ async fn retention_cutoff_zero_deletes_nothing() {
 
 /// Retention cleans up associated pending deliveries via FK cascade.
 #[tokio::test]
-async fn retention_cascades_to_pending_deliveries() {
+async fn retention_preserves_pending_deliveries() {
     let storage = SqliteStorage::in_memory().await.unwrap();
     let sender = NodeId::from_bytes([1u8; 32]);
     let recipient = NodeId::from_bytes([2u8; 32]);
@@ -415,7 +414,7 @@ async fn retention_cascades_to_pending_deliveries() {
 
     // Pending delivery should be gone too (FK cascade)
     let pending = storage.get_pending_for_peer(&recipient).await.unwrap();
-    assert!(pending.is_empty(), "pending delivery should cascade-delete with message");
+    assert_eq!(pending.len(), 1, "retention must preserve unacknowledged delivery");
 }
 
 // ── Gossip eviction ──────────────────────────────────────

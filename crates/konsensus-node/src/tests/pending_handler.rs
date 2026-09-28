@@ -110,7 +110,7 @@ async fn flush_peer_delivers_pending_messages() {
     storage.store_message(&env).await.unwrap();
     storage.queue_pending_delivery(&msg_id, &bob_id).await.unwrap();
 
-    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps).await;
+    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")).await;
 
     assert_eq!(transport.send_count.load(Ordering::SeqCst), 1);
     let sent = transport.sent.lock().await;
@@ -118,7 +118,7 @@ async fn flush_peer_delivers_pending_messages() {
     drop(sent);
 
     let pending = storage.get_pending_for_peer(&bob_id).await.unwrap();
-    assert!(pending.is_empty(), "pending should be cleared after delivery");
+    assert_eq!(pending.len(), 1, "pending must survive a transport write until ACK");
 
     let ts = timestamps.lock().await;
     assert!(ts.contains_key(&msg_id), "send timestamp should be recorded");
@@ -136,7 +136,7 @@ async fn flush_peer_no_pending_is_noop() {
         "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
     );
 
-    flush_peer(id_bob.node_id(), storage.as_ref(), transport.as_ref(), &audit, &timestamps).await;
+    flush_peer(id_bob.node_id(), storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")).await;
     assert_eq!(transport.send_count.load(Ordering::SeqCst), 0);
 }
 
@@ -162,7 +162,7 @@ async fn flush_peer_removes_stale_when_message_deleted() {
     storage.queue_pending_delivery(&msg_id, &bob_id).await.unwrap();
     storage.delete_message(&msg_id).await.unwrap();
 
-    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps).await;
+    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")).await;
 
     assert_eq!(transport.send_count.load(Ordering::SeqCst), 0);
     let pending = storage.get_pending_for_peer(&bob_id).await.unwrap();
@@ -191,8 +191,8 @@ async fn flush_peer_increments_attempts_on_send_failure() {
     storage.store_message(&env).await.unwrap();
     storage.queue_pending_delivery(&msg_id, &bob_id).await.unwrap();
 
-    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps).await;
-    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps).await;
+    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")).await;
+    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")).await;
 
     let pending = storage.get_pending_for_peer(&bob_id).await.unwrap();
     assert_eq!(pending.len(), 1, "pending entry should still exist after failures");
@@ -220,11 +220,11 @@ async fn flush_peer_delivers_multiple_pending() {
         storage.queue_pending_delivery(&env.id, &bob_id).await.unwrap();
     }
 
-    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps).await;
+    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")).await;
 
     assert_eq!(transport.send_count.load(Ordering::SeqCst), 3);
     let pending = storage.get_pending_for_peer(&bob_id).await.unwrap();
-    assert!(pending.is_empty());
+    assert_eq!(pending.len(), 3);
 }
 
 #[tokio::test]
@@ -238,6 +238,7 @@ async fn run_shuts_down_on_signal() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let handle = tokio::spawn(run(PendingHandlerDeps {
+        identity: Arc::new(make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")),
         storage,
         transport,
         audit_log: audit,
@@ -278,6 +279,7 @@ async fn run_flushes_on_channel_notification() {
     storage.queue_pending_delivery(&env.id, &bob_id).await.unwrap();
 
     let handle = tokio::spawn(run(PendingHandlerDeps {
+        identity: Arc::new(make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")),
         storage,
         transport,
         audit_log: audit,
@@ -329,12 +331,12 @@ async fn flush_multiple_connected_peers() {
     // Simulate periodic scan: iterate connected peers and flush each
     let connected = vec![bob_id, charlie_id];
     for peer_id in &connected {
-        flush_peer(peer_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps).await;
+        flush_peer(peer_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")).await;
     }
 
     assert_eq!(transport.send_count.load(Ordering::SeqCst), 2);
-    assert!(storage.get_pending_for_peer(&bob_id).await.unwrap().is_empty());
-    assert!(storage.get_pending_for_peer(&charlie_id).await.unwrap().is_empty());
+    assert!(!storage.get_pending_for_peer(&bob_id).await.unwrap().is_empty());
+    assert!(!storage.get_pending_for_peer(&charlie_id).await.unwrap().is_empty());
 }
 
 /// When transport fails for a pending message, the attempt counter
@@ -366,9 +368,9 @@ async fn flush_peer_partial_failure_increments_failed_only() {
     let transport = Arc::new(MockTransport::new());
 
     // First flush: both succeed
-    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps).await;
+    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")).await;
     assert_eq!(transport.send_count.load(Ordering::SeqCst), 2);
-    assert!(storage.get_pending_for_peer(&bob_id).await.unwrap().is_empty());
+    assert!(!storage.get_pending_for_peer(&bob_id).await.unwrap().is_empty());
 }
 
 /// Verify that flush_peer records send timestamps for delivered messages.
@@ -397,7 +399,7 @@ async fn flush_peer_records_send_timestamps() {
     storage.queue_pending_delivery(&env1.id, &bob_id).await.unwrap();
     storage.queue_pending_delivery(&env2.id, &bob_id).await.unwrap();
 
-    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps).await;
+    flush_peer(&bob_id, storage.as_ref(), transport.as_ref(), &audit, &timestamps, &make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")).await;
 
     let ts = timestamps.lock().await;
     assert!(ts.contains_key(&msg_id1), "should record timestamp for msg1");

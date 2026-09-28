@@ -353,6 +353,22 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.store_message(&encrypted).await
     }
 
+    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
+    }
+
+    async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
+        self.inner.update_message_wrapper(envelope).await
+    }
+
+    async fn mark_pending_sent(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
+        self.inner.mark_pending_sent(id, peer).await
+    }
+
+    async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        self.inner.acknowledge_pending(id, peer, sender).await
+    }
+
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
         // The stored ID is based on encrypted ciphertext, so we can't look up
         // by the original ID directly. We need to search differently.

@@ -368,8 +368,7 @@ async fn message_acked_records_routing_success() {
     send_timestamps.lock().await.insert(msg_id, std::time::Instant::now());
 
     handle_message_acked(
-        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx,
-    ).await;
+        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx, true).await;
 
     // Routing weight should be updated (> 0)
     let weight = routing.get_peer_weight(&peer_id).await;
@@ -396,8 +395,7 @@ async fn message_acked_without_timestamp_uses_zero_latency() {
 
     // No timestamp registered — should still succeed with 0 latency
     handle_message_acked(
-        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx,
-    ).await;
+        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx, true).await;
 
     let weight = routing.get_peer_weight(&peer_id).await;
     assert!(weight.is_some());
@@ -418,8 +416,7 @@ async fn message_acked_broadcasts_delivery_status() {
     let (ws_tx, mut ws_rx) = broadcast::channel::<Arc<WsDeliveryStatus>>(16);
 
     handle_message_acked(
-        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx,
-    ).await;
+        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx, true).await;
 
     let status = ws_rx.recv().await.unwrap();
     assert_eq!(status.status, "delivered");
@@ -455,8 +452,7 @@ async fn message_acked_prunes_stale_timestamps() {
     }
 
     handle_message_acked(
-        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx,
-    ).await;
+        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx, true).await;
 
     // Stale entries (>5 min old) should be pruned; only fresh ones remain
     let remaining = send_timestamps.lock().await.len();
@@ -477,8 +473,7 @@ async fn message_rejected_records_routing_failure() {
     let weight_before = routing.get_peer_weight(&peer_id).await.unwrap();
 
     handle_message_rejected(
-        &peer_id, &msg_id, "InsufficientPayment", &routing, &ws_tx,
-    ).await;
+        &peer_id, &msg_id, "InsufficientPayment", &routing, &ws_tx, true).await;
 
     let weight_after = routing.get_peer_weight(&peer_id).await.unwrap();
     assert!(
@@ -497,8 +492,7 @@ async fn message_rejected_broadcasts_status_with_reason() {
     let (ws_tx, mut ws_rx) = broadcast::channel::<Arc<WsDeliveryStatus>>(16);
 
     handle_message_rejected(
-        &peer_id, &msg_id, "InsufficientPayment", &routing, &ws_tx,
-    ).await;
+        &peer_id, &msg_id, "InsufficientPayment", &routing, &ws_tx, true).await;
 
     let status = ws_rx.recv().await.unwrap();
     assert_eq!(status.status, "rejected");
@@ -523,8 +517,7 @@ async fn message_acked_no_ws_subscribers_is_handled() {
     drop(ws_rx);
 
     handle_message_acked(
-        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx,
-    ).await;
+        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx, true).await;
 
     // No panic = success
     let weight = routing.get_peer_weight(&peer_id).await;
@@ -1772,7 +1765,7 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     privileged,
                 },
                 ControlEvent::MessageAcked {
-                    peer_id,
+                    duplicate: false,                    peer_id,
                     message_id,
                     privileged,
                 },
@@ -1829,14 +1822,15 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                 },
             ];
             for event in events {
-                assert_eq!(refuse_unpaid_control(&event, &membrane), !privileged);
+                let delivery = matches!(event, ControlEvent::MessageAcked { .. } | ControlEvent::MessageRejected { .. });
+                assert_eq!(refuse_unpaid_control(&event, &membrane), !privileged && !delivery);
             }
         }
     }
     let snapshot = membrane.pre_payment_refusals();
     for (reason, expected) in [
         (PrePaymentReason::SessionBeforePayment, 400),
-        (PrePaymentReason::DeliveryBeforePayment, 200),
+        (PrePaymentReason::DeliveryBeforePayment, 0),
         (PrePaymentReason::PriceBeforePayment, 300),
         (PrePaymentReason::LightningInfoBeforePayment, 100),
         (PrePaymentReason::PeerExchangeBeforePayment, 200),

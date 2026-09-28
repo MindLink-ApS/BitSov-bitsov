@@ -118,6 +118,8 @@ pub enum ControlEvent {
 
     /// Peer acknowledged receipt of a message.
     MessageAcked {
+        /// Recipient had already durably accepted the paid envelope.
+        duplicate: bool,
         /// The peer who acknowledged.
         peer_id: NodeId,
         /// The acknowledged message ID.
@@ -1931,7 +1933,7 @@ mod tests {
             b"test",
             &konsensus_core::types::Nonce::generate(),
         );
-        let ack = Frame::MessageAck { id: test_id };
+        let ack = Frame::MessageAck { id: test_id, duplicate: false };
         transport_b.send_frame(&node_a_id, &ack).await.unwrap();
 
         let event = tokio::time::timeout(
@@ -1944,7 +1946,7 @@ mod tests {
 
         match event {
             ControlEvent::MessageAcked {
-                peer_id,
+                duplicate: false,                peer_id,
                 message_id,
                 ..
             } => {

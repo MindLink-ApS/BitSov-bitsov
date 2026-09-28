@@ -321,11 +321,11 @@ pub(super) fn spawn_reader_task(
                     info!(peer = %peer_id, %reason, "peer disconnected gracefully");
                     break;
                 }
-                Frame::MessageAck { id } => {
+                Frame::MessageAck { id, duplicate } => {
                     debug!(peer = %peer_id, msg_id = %id, "received message ack");
                     if let Err(e) = control_tx
                         .send(ControlEvent::MessageAcked {
-                            peer_id,
+                            duplicate,                            peer_id,
                             message_id: id,
                             privileged,
                         })

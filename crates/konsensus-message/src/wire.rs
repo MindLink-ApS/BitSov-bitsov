@@ -708,6 +708,9 @@ pub enum Frame {
     MessageAck {
         /// The ID of the acknowledged message.
         id: MessageId,
+        /// True when this paid envelope was durably accepted previously.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        duplicate: bool,
     },
 
     /// Message was rejected by the recipient's payment gate.
@@ -1226,13 +1229,13 @@ mod tests {
     #[test]
     fn frame_message_ack_roundtrip() {
         let id = MessageId::compute(b"test", &Nonce::from_bytes([1u8; 24]));
-        let frame = Frame::MessageAck { id };
+        let frame = Frame::MessageAck { id, duplicate: false };
 
         let bytes = frame.to_bytes().unwrap();
         let decoded = Frame::from_bytes(&bytes).unwrap();
 
         match decoded {
-            Frame::MessageAck { id: decoded_id } => assert_eq!(decoded_id, id),
+            Frame::MessageAck { id: decoded_id, .. } => assert_eq!(decoded_id, id),
             _ => panic!("expected MessageAck frame"),
         }
     }

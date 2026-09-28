@@ -162,6 +162,7 @@ pub(super) async fn send_message(
     // Attempt to deliver to connected peer; queue for later if offline
     let delivered = match &recipient {
         Recipient::Node(peer_id) => {
+            state.storage.prepare_delivery(&envelope.id, peer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
             if state.transport.is_connected(peer_id).await {
                 state
                     .transport
@@ -171,9 +172,6 @@ pub(super) async fn send_message(
                 true
             } else {
                 // Peer offline — queue for delivery when they reconnect
-                if let Err(e) = state.storage.queue_pending_delivery(&envelope.id, peer_id).await {
-                    tracing::warn!(error = %e, "failed to queue pending delivery");
-                }
                 false
             }
         }
@@ -199,6 +197,7 @@ pub(super) async fn send_message(
                 if member == state.identity.node_id() {
                     continue;
                 }
+                state.storage.prepare_delivery(&envelope.id, member).await.map_err(|e| ApiError::Storage(e.to_string()))?;
                 if state.transport.is_connected(member).await {
                     if let Err(e) = state.transport.send(member, &envelope).await {
                         tracing::warn!(
@@ -211,9 +210,6 @@ pub(super) async fn send_message(
                     }
                 } else {
                     // Queue for this room member
-                    if let Err(e) = state.storage.queue_pending_delivery(&envelope.id, member).await {
-                        tracing::warn!(peer = %member, error = %e, "failed to queue pending room delivery");
-                    }
                 }
             }
             any_delivered

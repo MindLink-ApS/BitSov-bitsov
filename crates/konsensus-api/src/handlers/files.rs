@@ -509,6 +509,7 @@ async fn send_file_inner(
     // We don't have an update_file method, but the association is recorded
     // in the audit log below.
 
+    state.storage.prepare_delivery(&envelope.id, &peer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
     // Deliver
     let delivered = if state.transport.is_connected(&peer_id).await {
         state
@@ -518,13 +519,6 @@ async fn send_file_inner(
             .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("file payment settled but delivery failed: {e}") })?;
         true
     } else {
-        if let Err(e) = state
-            .storage
-            .queue_pending_delivery(&envelope.id, &peer_id)
-            .await
-        {
-            tracing::warn!(error = %e, "failed to queue pending file delivery");
-        }
         false
     };
 

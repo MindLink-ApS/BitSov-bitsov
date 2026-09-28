@@ -158,6 +158,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     ),
     (18, "onboarding state scope", include_str!("../migrations/018_onboarding_state_scope.sql")),
     (19, "payment receipts", include_str!("../migrations/019_payment_receipts.sql")),
+    (20, "pending delivery state", include_str!("../migrations/020_pending_delivery_state.sql")),
 ];
 
 impl EmbeddedMigrations {
@@ -559,6 +560,89 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        use crate::PaidAcceptance::*;
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ts = i64::try_from(envelope.timestamp)
+            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ciphertext = &envelope.ciphertext;
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let sig = hex::encode(envelope.signature.as_bytes());
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let mut tx = self.pool.begin().await?;
+        let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
+            .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
+        if receipt.rows_affected() == 0 {
+            // Receipt alone is insufficient: legacy failures and relay controls
+            // can have consumed keys without ever storing a message.
+            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            tx.rollback().await?;
+            return Ok(if matched == 1 { AlreadyAccepted } else { PaymentReused });
+        }
+        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES (?, ?) ON CONFLICT DO NOTHING")
+            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(NonceReused);
+        }
+        sqlx::query(
+            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(&sender)
+        .bind(rtype)
+        .bind(&rid)
+        .bind(ts)
+        .bind(ciphertext)
+        .bind(&ph)
+        .bind(&pi)
+        .bind(amt)
+        .bind(&sig)
+        .bind(&nonce)
+        .bind(&refs_json)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Accepted)
+    }
+
+    async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
+        let ts = i64::try_from(envelope.timestamp).map_err(|_| StorageError::Conversion("timestamp overflow".into()))?;
+        let result = sqlx::query("UPDATE messages SET timestamp_ms = ?, signature = ? WHERE id = ? AND sender = ? AND payment_hash = ?")
+            .bind(ts).bind(hex::encode(envelope.signature.as_bytes())).bind(envelope.id.to_hex())
+            .bind(envelope.sender.to_hex()).bind(hex::encode(envelope.payment_proof.payment_hash))
+            .execute(&self.pool).await?;
+        if result.rows_affected() != 1 { return Err(StorageError::Conversion("missing paid envelope".into())); }
+        Ok(())
+    }
+
+    async fn mark_pending_sent(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
+        sqlx::query("UPDATE pending_deliveries SET dispatched = 1 WHERE message_id = ? AND recipient_id = ?").bind(id.to_hex()).bind(peer.to_hex()).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        Ok(sqlx::query("DELETE FROM pending_deliveries WHERE message_id = ? AND recipient_id = ? AND dispatched = 1 AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = ?)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+            .execute(&self.pool).await?.rows_affected() == 1)
+    }
+
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
         let id_hex = id.to_hex();
 
@@ -733,18 +817,8 @@ impl Storage for SqliteStorage {
     }
 
     async fn delete_messages_older_than(&self, before_ms: u64) -> Result<u64, StorageError> {
-        // Clean up pending deliveries for messages about to be deleted
-        sqlx::query(
-            "DELETE FROM pending_deliveries WHERE message_id IN \
-             (SELECT id FROM messages WHERE timestamp_ms < ?)",
-        )
-        .bind(before_ms.min(i64::MAX as u64) as i64)
-        .execute(&self.pool)
-        .await?;
-        let result = sqlx::query("DELETE FROM messages WHERE timestamp_ms < ?")
-            .bind(before_ms.min(i64::MAX as u64) as i64)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query("DELETE FROM messages WHERE timestamp_ms < ? AND NOT EXISTS (SELECT 1 FROM pending_deliveries WHERE message_id = messages.id)")
+            .bind(before_ms.min(i64::MAX as u64) as i64).execute(&self.pool).await?;
         Ok(result.rows_affected())
     }
 
@@ -1268,7 +1342,7 @@ impl Storage for SqliteStorage {
 
     async fn cleanup_stale_pending(&self, max_attempts: u32) -> Result<u64, StorageError> {
         let result = sqlx::query(
-            "DELETE FROM pending_deliveries WHERE attempts >= ?",
+            "UPDATE pending_deliveries SET state = 'stalled' WHERE attempts >= ? AND state != 'stalled'",
         )
         .bind(max_attempts as i64)
         .execute(&self.pool)

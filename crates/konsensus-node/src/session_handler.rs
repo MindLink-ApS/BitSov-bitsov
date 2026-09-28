@@ -100,9 +100,9 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
         | SessionInit { privileged, .. }
         | SessionAck { privileged, .. }
         | RatchetInit { privileged, .. } => (privileged, PrePaymentReason::SessionBeforePayment),
-        MessageAcked { privileged, .. } | MessageRejected { privileged, .. } => {
-            (privileged, PrePaymentReason::DeliveryBeforePayment)
-        }
+        // These carry no admission authority: the handler requires a durable
+        // outbox match and unprivileged delivery events never change weights.
+        MessageAcked { .. } | MessageRejected { .. } => return false,
         PriceTableReceived { privileged, .. }
         | PriceQueryReceived { privileged, .. }
         | PriceResponseReceived { privileged, .. } => {
@@ -250,25 +250,13 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::MessageAcked { peer_id, message_id, privileged } => {
-                        if !privileged {
-                            warn!(peer = %peer_id, "DROP MessageAck from unprivileged peer (P2: no free trust-weight pump before payment)");
-                            continue;
-                        }
-                        handle_message_acked(
-                            &peer_id, &message_id, &send_timestamps, &storage,
-                            &routing, &ws_delivery_tx,
-                        ).await;
+                    ControlEvent::MessageAcked { peer_id, message_id, privileged, .. } => {
+                        handle_delivery_confirmation(&peer_id, &message_id, None, privileged,
+                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log).await;
                     }
-
                     ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
-                        if !privileged {
-                            warn!(peer = %peer_id, "DROP MessageReject from unprivileged peer (P2: no free trust-weight pump before payment)");
-                            continue;
-                        }
-                        handle_message_rejected(
-                            &peer_id, &message_id, &reason, &routing, &ws_delivery_tx,
-                        ).await;
+                        handle_delivery_confirmation(&peer_id, &message_id, Some(&reason), privileged,
+                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log).await;
                     }
 
                     ControlEvent::PriceTableReceived { peer_id, prices, block_height, valid_blocks, trust_discount, privileged } => {
@@ -818,6 +806,33 @@ async fn send_prekey_offer(
         .map_err(|e| e.to_string())
 }
 
+/// Delivery confirmations cannot grant admission or mutate unrelated deliveries.
+#[allow(clippy::too_many_arguments)]
+async fn handle_delivery_confirmation(
+    peer: &NodeId, id: &konsensus_core::MessageId, rejection: Option<&str>, privileged: bool,
+    own_id: &NodeId, storage: &Arc<dyn konsensus_storage::Storage>,
+    timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::MessageId, std::time::Instant>>,
+    routing: &konsensus_routing::RoutingTable, ws: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    audit: &konsensus_api::audit::AuditLog,
+) {
+    let legacy = rejection == Some("replay detected: nonce already used");
+    if rejection.is_none() || legacy {
+        // One atomic DELETE is the idempotency boundary for repeated/racing ACKs.
+        if !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) { return; }
+        if legacy {
+            audit.record("acked_legacy", &peer.to_hex(), Some(serde_json::json!({"message_id": id.to_hex()})));
+        }
+        handle_message_acked(peer, id, timestamps, storage, routing, ws, privileged && !legacy).await;
+    } else {
+        let matches_outbox = matches!(storage.get_pending_for_peer(peer).await,
+            Ok(rows) if rows.iter().any(|(pending, _)| pending == id))
+            && matches!(storage.get_message(id).await, Ok(Some(env)) if env.sender == *own_id);
+        if !matches_outbox { return; }
+        // A transient rejection keeps the paid envelope available for retry.
+        handle_message_rejected(peer, id, rejection.unwrap_or_default(), routing, ws, privileged).await;
+    }
+}
+
 async fn handle_message_acked(
     peer_id: &NodeId,
     message_id: &konsensus_core::types::MessageId,
@@ -825,6 +840,7 @@ async fn handle_message_acked(
     storage: &Arc<dyn konsensus_storage::Storage>,
     routing: &konsensus_routing::RoutingTable,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    update_weights: bool,
 ) {
     // Compute STDP latency from send timestamp.
     let latency_ms = {
@@ -855,7 +871,7 @@ async fn handle_message_acked(
     );
 
     // Hebbian learning: successful delivery strengthens routing weight.
-    routing.record_success(peer_id, latency_ms, payment_msat).await;
+    if update_weights { routing.record_success(peer_id, latency_ms, payment_msat).await; }
 
     // Broadcast delivery confirmation to WebSocket clients.
     if let Err(e) = ws_delivery_tx.send(Arc::new(
@@ -876,9 +892,10 @@ async fn handle_message_rejected(
     reason: &str,
     routing: &konsensus_routing::RoutingTable,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    update_weights: bool,
 ) {
     warn!(peer = %peer_id, msg_id = %message_id, %reason, "message rejected by peer");
-    routing.record_failure(peer_id).await;
+    if update_weights { routing.record_failure(peer_id).await; }
 
     if let Err(e) = ws_delivery_tx.send(Arc::new(
         WsDeliveryStatus {

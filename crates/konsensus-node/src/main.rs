@@ -1008,6 +1008,7 @@ async fn cmd_start(
     // Pending delivery flusher — delivers queued messages when peers reconnect
     let (pending_tx, pending_rx) = tokio::sync::mpsc::channel::<NodeId>(64);
     let pending_handle = tokio::spawn(pending_handler::run(pending_handler::PendingHandlerDeps {
+        identity: Arc::clone(node.identity()),
         storage: Arc::clone(node.storage()),
         transport: Arc::clone(node.transport()) as Arc<dyn MessageTransport>,
         audit_log: Arc::clone(&audit_log),

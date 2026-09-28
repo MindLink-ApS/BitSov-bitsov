@@ -15,6 +15,10 @@ use crate::invites::{
 use crate::models::{EnergyRow, FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
 use crate::reactions::ReactionRecord;
 
+/// Outcome of the durable recipient acceptance transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused }
+
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -22,6 +26,34 @@ pub trait Storage: Send + Sync {
 
     /// Store a UKM envelope.
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError>;
+
+    /// Commit replay keys and the validated envelope together, or write nothing.
+    /// Call only after full payment-gate validation. At-rest wrappers may encrypt
+    /// ciphertext; backends compare the validated ID and immutable metadata.
+    async fn accept_paid_envelope(&self, _envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
+        Err(StorageError::Unsupported("accept_paid_envelope".into()))
+    }
+
+    /// Persist only a renewed timestamp/signature, preserving the paid identity.
+    async fn update_message_wrapper(&self, _envelope: &UkmEnvelope) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("update_message_wrapper".into()))
+    }
+
+    /// Persist a dispatch intent BEFORE transport can return an immediate ACK.
+    async fn mark_pending_sent(&self, _id: &MessageId, _peer: &NodeId) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("mark_pending_sent".into()))
+    }
+
+    /// Atomically consume a dispatched outbox entry bound to our identity and peer.
+    async fn acknowledge_pending(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("acknowledge_pending".into()))
+    }
+
+    /// Queue before every first dispatch; retries retain the same row until ACK.
+    async fn prepare_delivery(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
+        self.queue_pending_delivery(id, peer).await?;
+        self.mark_pending_sent(id, peer).await
+    }
 
     /// Retrieve a message by its ID.
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError>;

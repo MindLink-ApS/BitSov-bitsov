@@ -811,8 +811,7 @@ async fn whitelist_read_guard_released_before_gate_await() {
             None,
             // M1a: Whitelist mode keeps this lock-release test passing Some(&whitelist)
             // into the gate (HARD-11 seam preserved); the new arg does not change it.
-            konsensus_message::ReachabilityMode::Whitelist,
-        )
+            konsensus_message::ReachabilityMode::Whitelist, true)
         .await
     });
 
@@ -990,8 +989,7 @@ async fn membrane_records_gate_admission_before_relay_and_storage_outcomes() {
         None,
         0.0,
         None,
-        konsensus_message::ReachabilityMode::PriceOpen,
-    )
+        konsensus_message::ReachabilityMode::PriceOpen, true)
     .await
     .unwrap();
     assert_eq!(
@@ -1019,8 +1017,7 @@ async fn membrane_records_gate_admission_before_relay_and_storage_outcomes() {
         None,
         0.0,
         None,
-        konsensus_message::ReachabilityMode::PriceOpen
-    )
+        konsensus_message::ReachabilityMode::PriceOpen, true)
     .await
     .is_err());
     let (events, totals) = membrane.read(None, 500);
@@ -1042,8 +1039,7 @@ async fn membrane_records_gate_admission_before_relay_and_storage_outcomes() {
         None,
         0.0,
         None,
-        konsensus_message::ReachabilityMode::PriceOpen,
-    )
+        konsensus_message::ReachabilityMode::PriceOpen, true)
     .await
     .unwrap();
     store2.pool().close().await;
@@ -1102,8 +1098,7 @@ async fn membrane_observes_unpaid_insufficient_stale_and_first_contact_decisions
             konsensus_message::ReachabilityMode::PriceOpen
         };
         let _ = whitelist_then_verify(
-            &env, &membrane, &registry, &gate, &nonce, &pricing, None, 0.0, None, mode,
-        )
+            &env, &membrane, &registry, &gate, &nonce, &pricing, None, 0.0, None, mode, true)
         .await;
         let (events, _) = membrane.read(None, 500);
         assert_eq!(events[0].code, expected, "{case}");

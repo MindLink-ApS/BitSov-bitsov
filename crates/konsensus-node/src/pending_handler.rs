@@ -16,6 +16,7 @@ use konsensus_core::types::NodeId;
 
 /// All dependencies needed by the pending delivery flusher task.
 pub(crate) struct PendingHandlerDeps {
+    pub identity: Arc<konsensus_core::identity::NodeIdentity>,
     pub storage: Arc<dyn konsensus_storage::Storage>,
     pub transport: Arc<dyn MessageTransport>,
     pub audit_log: Arc<AuditLog>,
@@ -27,6 +28,7 @@ pub(crate) struct PendingHandlerDeps {
 /// Runs the pending delivery flusher loop.
 pub(crate) async fn run(deps: PendingHandlerDeps) {
     let PendingHandlerDeps {
+        identity,
         storage,
         transport,
         audit_log: audit,
@@ -44,13 +46,13 @@ pub(crate) async fn run(deps: PendingHandlerDeps) {
     loop {
         tokio::select! {
             Some(peer_id) = pending_rx.recv() => {
-                flush_peer(&peer_id, storage.as_ref(), transport.as_ref(), &audit, &send_timestamps).await;
+                flush_peer(&peer_id, storage.as_ref(), transport.as_ref(), &audit, &send_timestamps, &identity).await;
             }
             _ = periodic_scan.tick() => {
                 // Check all connected peers for pending deliveries
                 let connected = transport.connected_peers().await;
                 for peer_id in &connected {
-                    flush_peer(peer_id, storage.as_ref(), transport.as_ref(), &audit, &send_timestamps).await;
+                    flush_peer(peer_id, storage.as_ref(), transport.as_ref(), &audit, &send_timestamps, &identity).await;
                 }
             }
             _ = shutdown_rx.changed() => {
@@ -68,6 +70,7 @@ async fn flush_peer(
     transport: &dyn MessageTransport,
     audit: &AuditLog,
     send_timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>,
+    identity: &konsensus_core::identity::NodeIdentity,
 ) {
     let pending = match storage.get_pending_for_peer(peer_id).await {
         Ok(p) => p,
@@ -89,18 +92,10 @@ async fn flush_peer(
 
     for (message_id, _recipient_id) in &pending {
         // Load the full envelope from storage
-        let envelope = match storage.get_message(message_id).await {
+        let mut envelope = match storage.get_message(message_id).await {
             Ok(Some(env)) => env,
             Ok(None) => {
-                // Envelope was deleted (retention cleanup?) — remove stale pending entry
-                debug!(
-                    peer = %peer_id,
-                    msg_id = %message_id,
-                    "pending message no longer in storage, removing"
-                );
-                if let Err(e) = storage.remove_pending_delivery(message_id, peer_id).await {
-                    warn!(error = %e, "failed to remove stale pending delivery");
-                }
+                warn!(peer = %peer_id, msg_id = %message_id, "pending envelope missing; retaining unresolved delivery");
                 continue;
             }
             Err(e) => {
@@ -117,20 +112,33 @@ async fn flush_peer(
             }
         };
 
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
+        match envelope.refresh_for_resend(identity, now_ms) {
+            Ok(true) => {
+                if let Err(e) = storage.update_message_wrapper(&envelope).await {
+                    warn!(error = %e, "cannot persist renewed paid envelope");
+                    continue;
+                }
+            }
+            Ok(false) => {}
+            Err(e) => { warn!(error = %e, "cannot rewrap paid envelope"); continue; }
+        }
+        if let Err(e) = storage.mark_pending_sent(message_id, peer_id).await {
+            warn!(error = %e, "cannot persist dispatch intent");
+            continue;
+        }
+        // Record before send: ACK can arrive before the write returns.
+        send_timestamps.lock().await.insert(*message_id, std::time::Instant::now());
         match transport.send(peer_id, &envelope).await {
             Ok(()) => {
                 info!(
                     peer = %peer_id,
                     msg_id = %message_id,
-                    "delivered pending message"
+                    "dispatched pending message; awaiting ACK"
                 );
-                if let Err(e) = storage.remove_pending_delivery(message_id, peer_id).await {
-                    warn!(error = %e, "failed to remove delivered pending entry");
-                }
-                // Record send timestamp for STDP latency measurement
-                send_timestamps.lock().await.insert(*message_id, std::time::Instant::now());
                 audit.record(
-                    "pending_delivered",
+                    "pending_dispatched",
                     &peer_id.to_hex(),
                     Some(serde_json::json!({
                         "message_id": message_id.to_hex(),

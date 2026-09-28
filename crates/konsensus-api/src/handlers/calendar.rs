@@ -598,16 +598,15 @@ async fn create_event(
 
         let msg_id_hex = envelope.id.to_hex();
 
+        state.storage.prepare_delivery(&envelope.id, peer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
         if state.transport.is_connected(peer_id).await {
             if let Err(e) = state.transport.send(peer_id, &envelope).await {
                 tracing::warn!(peer = %peer_id, error = %e, "calendar event delivery failed, queuing");
-                let _ = state.storage.queue_pending_delivery(&envelope.id, peer_id).await;
                 queued_for.push(peer_id.to_hex());
             } else {
                 delivered_to.push(peer_id.to_hex());
             }
         } else {
-            let _ = state.storage.queue_pending_delivery(&envelope.id, peer_id).await;
             queued_for.push(peer_id.to_hex());
         }
 
@@ -777,16 +776,15 @@ async fn update_event(
 
         let msg_id_hex = envelope.id.to_hex();
 
+        state.storage.prepare_delivery(&envelope.id, peer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
         if state.transport.is_connected(peer_id).await {
             if let Err(e) = state.transport.send(peer_id, &envelope).await {
                 tracing::warn!(peer = %peer_id, error = %e, "update delivery failed, queuing");
-                let _ = state.storage.queue_pending_delivery(&envelope.id, peer_id).await;
                 queued_for.push(peer_id.to_hex());
             } else {
                 delivered_to.push(peer_id.to_hex());
             }
         } else {
-            let _ = state.storage.queue_pending_delivery(&envelope.id, peer_id).await;
             queued_for.push(peer_id.to_hex());
         }
 
@@ -919,23 +917,16 @@ async fn create_rsvp(
     // Best effort — the event may not be stored locally if this node is an attendee
     let _ = state.storage.store_rsvp(&rsvp_record).await;
 
+    state.storage.prepare_delivery(&envelope.id, &organizer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
     let delivered = if state.transport.is_connected(&organizer_id).await {
         match state.transport.send(&organizer_id, &envelope).await {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(peer = %organizer_id, error = %e, "RSVP delivery failed, queuing");
-                let _ = state
-                    .storage
-                    .queue_pending_delivery(&envelope.id, &organizer_id)
-                    .await;
                 false
             }
         }
     } else {
-        let _ = state
-            .storage
-            .queue_pending_delivery(&envelope.id, &organizer_id)
-            .await;
         false
     };
 

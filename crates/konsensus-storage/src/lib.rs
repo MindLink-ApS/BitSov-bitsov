@@ -31,7 +31,7 @@ pub use recovery::{
     RecoveryTrustee, SqliteRecoveryStore,
 };
 pub use sqlite::SqliteStorage;
-pub use traits::Storage;
+pub use traits::{PaidAcceptance, Storage};
 pub use whitelist_backup::WhitelistBackup;
 
 pub mod invites {

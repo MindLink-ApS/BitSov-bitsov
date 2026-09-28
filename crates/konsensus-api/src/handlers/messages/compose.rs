@@ -1298,6 +1298,15 @@ fn report_readmission_settlement(state: &AppState, peer: &NodeId, amount_msat: u
 /// Record a settled admission, build its signed proof envelope, attach it to the
 /// ledger, and deliver it. The settlement is recorded before proof construction
 /// so any malformed-preimage/backend-contract error still suppresses re-pay.
+async fn persist_admission_delivery(state: &AppState, peer: &NodeId, envelope: &konsensus_core::UkmEnvelope) -> Result<(), ApiError> {
+    if state.storage.get_message(&envelope.id).await.map_err(|e| ApiError::Storage(e.to_string()))?.is_some() {
+        state.storage.update_message_wrapper(envelope).await
+    } else {
+        state.storage.store_message(envelope).await
+    }.map_err(|e| ApiError::Storage(e.to_string()))?;
+    state.storage.prepare_delivery(&envelope.id, peer).await.map_err(|e| ApiError::Storage(e.to_string()))
+}
+
 async fn deliver_settled_admission(
     state: &AppState,
     peer_id: &NodeId,
@@ -1359,6 +1368,7 @@ async fn deliver_settled_admission(
         settled_at_unix: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
     })?;
 
+    persist_admission_delivery(state, peer_id, &envelope).await?;
     state
         .transport
         .send(peer_id, &envelope)
@@ -1993,14 +2003,19 @@ async fn first_contact_admission(
                 }
             }
         }
-        PriorAdmission::SettledWithProof(envelope) => {
+        PriorAdmission::SettledWithProof(mut envelope) => {
             report_readmission_settlement(state, peer_id, envelope.payment_proof.amount_msat)?;
             charge.prior_settled_msat = envelope.payment_proof.amount_msat;
-            // Re-deliver the already-paid proof. If the target already consumed
-            // this payment hash (envelope arrived the first time), its replay
-            // table rejects the duplicate — harmless to us, and we are already
-            // promoted there. If the first delivery was lost after settlement,
-            // this re-send is exactly the heal that makes the payment count.
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
+            envelope.refresh_for_resend(&state.identity, now)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if let Some(mut attempt) = super::admission_journal::load(state, peer_id)? {
+                attempt.envelope = Some(*envelope.clone());
+                super::admission_journal::save(state, peer_id, &attempt)?;
+            }
+            lock_admission_ledger().attach_envelope(peer_id, *envelope.clone());
+            persist_admission_delivery(state, peer_id, &envelope).await?;
             if let Err(e) = state.transport.send(peer_id, &envelope).await {
                 // Do NOT swallow this into Ok: if re-delivery fails we cannot
                 // claim the envelope was delivered (review finding #5,
@@ -2337,6 +2352,9 @@ async fn compose_room_member(
         }
     }
 
+    if let Err(e) = state.storage.prepare_delivery(&envelope.id, &member).await {
+        return RoomMemberOutcome::stopped(member, "settled", amount_msat, format!("Cannot persist delivery: {e}"));
+    }
     // Deliver or queue — try sending directly to avoid TOCTOU race.
     let delivered = match state.transport.send(&member, &envelope).await {
         Ok(()) => {
@@ -2349,9 +2367,6 @@ async fn compose_room_member(
             true
         }
         Err(_) => {
-            if let Err(qe) = state.storage.queue_pending_delivery(&envelope.id, &member).await {
-                tracing::warn!(peer = %member, error = %qe, "failed to queue pending room delivery");
-            }
             false
         }
     };
@@ -2765,7 +2780,9 @@ pub(super) async fn compose_message(
             }
         }
 
-        // Deliver via transport; queue for later if peer offline or send fails.
+        state.storage.prepare_delivery(&envelope.id, &peer_id).await
+            .map_err(|e| ApiError::Storage(e.to_string()))?;
+        // Deliver via transport; keep queued until ACK.
         // Try sending directly — avoids TOCTOU race where peer disconnects
         // between an is_connected check and the actual send.
         let delivered = match state.transport.send(&peer_id, &envelope).await {
@@ -2778,11 +2795,6 @@ pub(super) async fn compose_message(
                 true
             }
             Err(_) => {
-                if let Err(e) =
-                    state.storage.queue_pending_delivery(&envelope.id, &peer_id).await
-                {
-                    tracing::warn!(error = %e, "failed to queue pending delivery");
-                }
                 false
             }
         };
