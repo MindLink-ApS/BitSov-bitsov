@@ -205,8 +205,9 @@ check is used for the successful admission/file flows.
 
 This does not prove LND/LDK routing, liquidity, fees, HTLC timing, a room with two
 remote recipients, or the live Tauri UI. A peer price table can remain unknown
-immediately after admission, and existing startup ratchet repair can delay
-readiness; the harness records both rather than claiming those are fixed.
+immediately after admission; the harness records that rather than claiming it is fixed.
+After #102, first-contact session setup is offered immediately on promotion/proof; do not
+treat the old self-heal-tick delay as expected.
 
 The first-contact approval endpoint requires the independent owner's credential,
 plus the target paired `client_id` and exact budget `grant_op_id`. Paired spend
