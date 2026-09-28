@@ -306,9 +306,13 @@ pub(crate) async fn create_payment_proof_with_fee_report(
 #[derive(Debug, Default)]
 pub(crate) struct Readmission {
     /// Confirmed all-in ceiling for admission + message + both fee ceilings.
-    /// `None` means uncapped (protocol `ADMISSION_MAX_MSAT` still bounds the
-    /// quote path). `Some(0)` keeps a capped call fail-closed when only a
-    /// per-recipient room map is known and no aggregate amount can be checked.
+    ///
+    /// - `None`: uncapped (protocol `ADMISSION_MAX_MSAT` still bounds the quote).
+    /// - `Some(n)` with `n > 0`: quoted capped re-admission for **single-recipient
+    ///   chat only** — the payee's signed quote must fit this ceiling.
+    /// - `Some(0)`: capped call that must refuse before any quote (rooms, files,
+    ///   and other non-chat kinds keep pre-#111 fail-closed behaviour until a
+    ///   member-/kind-scoped budget exists).
     caller_cap: Option<u64>,
     /// Single-recipient compose already holds the per-peer admission lock.
     lock_held: bool,
@@ -446,13 +450,17 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
 /// admission invoice and its signed proof), then ask for the message invoice
 /// again. The E2EE session is untouched; both sides still hold it.
 ///
-/// A capped call may re-admit only when the payee returns a fresh signed
-/// re-admission quote whose admission principal, message principal, and both
-/// routing fee ceilings fit the caller cap (and any grant). That all-in amount
-/// is reserved before dispatch and reconciled after, exactly like first-contact
-/// admission. No quote, or a quote that does not fit, is refused before payment.
-/// An uncapped request may use existing admission authority under the same
-/// G1 contact/call/grant limits. Mark and proof send stay generation-bound (#100).
+/// Quoted capped re-admission is only for **single-recipient chat**: the payee
+/// must return a fresh signed quote whose admission principal, message
+/// principal, and both routing fee ceilings fit the caller cap (and any grant).
+/// That all-in amount is reserved before dispatch and reconciled after, exactly
+/// like first-contact admission. Rooms, files, and other kinds keep refusing a
+/// capped reconnect (`caller_cap = Some(0)`) before any quote. A chat call with
+/// `Some(0)` or a cap below the message all-in also refuses before asking,
+/// preserving the payee's quote window. No quote, or a quote that does not fit,
+/// is refused before payment. An uncapped request may use existing admission
+/// authority under the same G1 contact/call/grant limits. Mark and proof send
+/// stay generation-bound (#100).
 async fn readmit_then_pay(
     state: &AppState,
     amount_msat: u64,
@@ -463,6 +471,25 @@ async fn readmit_then_pay(
     charge: &mut FirstContactCharge,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     let peer_key = peer_id.to_hex();
+    // Capped non-chat (rooms/files/kind != chat) uses Some(0). Refuse before any
+    // quote so we do not spend the payee's per-source admission window.
+    let message_all_in = amount_msat
+        .checked_add(debit.fee_limit(state, amount_msat))
+        .ok_or_else(|| ApiError::PriceCapExceeded("message all-in overflow".into()))?;
+    let refuse_capped = match readmission.caller_cap {
+        Some(0) => true,
+        Some(_) if kind != Some(konsensus_core::kind::KIND_CHAT) => true,
+        Some(cap) if cap < message_all_in => true,
+        _ => false,
+    };
+    if refuse_capped {
+        return Err(ApiError::PriceCapExceeded(format!(
+            "{peer_id} requires admission again on a new connection, and the confirmed cap \
+             cannot cover a quoted re-admission for this send; no invoice was paid. \
+             Send without a cap, or (for single-recipient chat) confirm an all-in total \
+             that fits admission plus the message."
+        )));
+    }
     debit.readmission_allowed(&peer_key)?;
     tracing::info!(
         peer = %peer_id,
@@ -487,6 +514,7 @@ async fn readmit_then_pay(
         let mut attempt = FirstContactCharge::default();
         let mut readmit = Readmit { parent: debit, reserved: None, fee_ceiling: &readmission.fee_ceiling_msat };
         charge.readmission_blocks_message = true;
+        // Only chat passes a positive caller_cap; rooms/files already refused above.
         let result = first_contact_admission(
             state, peer_id, konsensus_core::kind::KIND_CHAT, readmission.caller_cap, &mut attempt,
             debit, Some(&mut readmit),
@@ -2771,10 +2799,14 @@ pub(super) async fn compose_message(
         // the canonical `message_id` and the single WS broadcast stay
         // deterministic regardless of completion order.
         use futures::stream::StreamExt;
-        // Aggregate when known; per-recipient-only stays fail-closed (Some(0))
-        // until a member-scoped quoted path exists — same refuse-before-pay.
+        // Rooms keep fail-closed capped re-admission (Some(0)) until a
+        // member-scoped remaining budget exists — refuse before any quote.
         let readmission = Readmission::for_cap(
-            req.max_total_msat.or_else(|| req.max_recipient_msat.as_ref().map(|_| 0)),
+            if req.max_total_msat.is_some() || req.max_recipient_msat.is_some() {
+                Some(0)
+            } else {
+                None
+            },
         );
         let ctx = RoomFanoutCtx {
             debit: &debit,
@@ -3014,7 +3046,14 @@ pub(super) async fn compose_message(
             }
         }
         admission.current_dispatch = true;
-        let readmission = Readmission { lock_held: true, ..Readmission::for_cap(cap) };
+        // Quoted capped re-admission is priced only for single-recipient chat.
+        // Other kinds keep Some(0) refuse-before-quote when a cap is present.
+        let readmission_cap = if req.kind == konsensus_core::kind::KIND_CHAT {
+            cap
+        } else {
+            cap.map(|_| 0)
+        };
+        let readmission = Readmission { lock_held: true, ..Readmission::for_cap(readmission_cap) };
         let (payment_hash, preimage_bytes, amount_msat) =
             create_metered_payment_proof(&state, price_msat, &peer_id, &debit, &readmission, Some(req.kind), &mut admission).await?;
         admission.message_settled = amount_msat;

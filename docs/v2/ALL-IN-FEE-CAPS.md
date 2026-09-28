@@ -27,12 +27,13 @@ G1 reservations, like the sponsor purse, cover gift plus maximum fee.
 
 A first-contact quote includes both admission and message fee ceilings in
 `total_msat`. A room reserves the sum of individual all-in payments before
-fanout. Reconnect re-admission needs a fresh signed quote: a capped request
-pays only when that quote's all-in admission + message fit the caller cap (and
-any grant), reserved before dispatch. No quote or a non-fitting quote is
-refused before payment. An uncapped request may use existing admission
-authority, but G1 still reserves its all-in amount and applies the caller's
-tighter routing limit.
+fanout. Reconnect re-admission needs a fresh signed quote: a capped
+**single-recipient chat** request pays only when that quote's all-in admission +
+message fit the caller cap (and any grant), reserved before dispatch. Rooms,
+files, and other non-chat kinds refuse a capped reconnect before any quote. No
+quote or a non-fitting quote is refused before payment. An uncapped request may
+use existing admission authority, but G1 still reserves its all-in amount and
+applies the caller's tighter routing limit.
 
 G1 reserves before dispatch and reconciles principal plus actual fee after
 settlement. Missing fees and ambiguous outcomes retain the full reservation;

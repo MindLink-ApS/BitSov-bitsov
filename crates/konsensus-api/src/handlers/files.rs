@@ -412,7 +412,9 @@ async fn send_file(
     // Keep authorized ceilings outside the cancelled future, including any
     // separately approved re-admission recorded before its wallet dispatch.
     let ceiling = std::sync::Mutex::new(None);
-    let readmission = super::messages::Readmission::for_cap(req.max_total_msat);
+    // Files are not chat: a confirmed cap refuses reconnect re-admission before
+    // any quote (Some(0)), matching pre-#111 fail-closed behaviour.
+    let readmission = super::messages::Readmission::for_cap(req.max_total_msat.map(|_| 0));
     let result = tokio::time::timeout_at(deadline, send_file_inner(auth, state, file_id, req, &ceiling, &readmission)).await
         .unwrap_or_else(|_| Err(ApiError::PaymentUnresolved("file send deadline exceeded; payment may have dispatched; do not retry automatically".into())));
     let approved = *ceiling.lock().unwrap_or_else(|e| e.into_inner());

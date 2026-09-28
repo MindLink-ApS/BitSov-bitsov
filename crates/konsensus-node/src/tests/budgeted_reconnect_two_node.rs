@@ -912,7 +912,12 @@ async fn capped_reconnect_refuses_with_no_quote() {
     net.drop_and_reconnect().await;
     net.refuse_admission_quote.store(true, std::sync::atomic::Ordering::Release);
     let (status, body) = net.sender.compose_capped(&bob, "no quote", 4_000).await;
-    assert!(status.is_server_error() || status == StatusCode::CONFLICT || status == StatusCode::TOO_MANY_REQUESTS, "{status} {body}");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{status} {body}");
+    assert_eq!(body["code"], 502, "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("target refused admission quote"),
+        "{body}"
+    );
     assert_eq!(net.sender.paid_out().await, vec![2_000; 2], "nothing paid without a quote");
     assert_eq!(net.sender.grant().used_msat, 4_000);
     assert!(!privileged_on(&net.transport_b, &net.alice_id).await);

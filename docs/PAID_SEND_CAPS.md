@@ -28,12 +28,15 @@ Omitting total/recipient caps leaves principal uncapped; the routing policy stil
 First-contact compose checks the aggregate admission/message principal and
 both fee ceilings against the confirmed cap. The app confirms `quote.total_msat`
 and displays `quote.max_routing_fee_msat` separately (already included in total).
-A capped reconnect re-admission is allowed only when the payee returns a fresh
-signed quote whose admission, message, and both fee ceilings fit that same
-caller cap (and any grant); the all-in amount is reserved before dispatch.
-No quote, or a quote that does not fit, is refused before payment. An uncapped
-authorized request may reserve and pay that additional all-in admission under
-existing G1 admission authority.
+A capped reconnect re-admission is allowed for **single-recipient chat** only,
+and only when the payee returns a fresh signed quote whose admission, message,
+and both fee ceilings fit that same caller cap (and any grant); the all-in
+amount is reserved before dispatch. Rooms, files, and other non-chat kinds keep
+refusing a capped reconnect before any quote (`caller_cap = Some(0)`). A chat
+call with `Some(0)` or a cap below the message all-in also refuses before
+asking. No quote, or a quote that does not fit, is refused before payment. An
+uncapped authorized request may reserve and pay that additional all-in
+admission under existing G1 admission authority.
 
 Room compose returns `member_outcomes` for every non-self recipient, including
 when no message could be stored. Each row has `recipient`, `status`,
