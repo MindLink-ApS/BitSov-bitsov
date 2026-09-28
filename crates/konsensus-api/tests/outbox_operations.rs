@@ -91,12 +91,14 @@ use konsensus_core::{
     NodeId,
 };
 use konsensus_storage::Storage;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 struct Wallet {
     inner: konsensus_lightning::MockLightningProvider,
     calls: AtomicUsize,
     mode: AtomicU8,
+    pause_next_status_poll: AtomicBool,
+    status_poll_started: tokio::sync::Notify,
     pool: sqlx::SqlitePool,
 }
 #[async_trait::async_trait]
@@ -165,6 +167,10 @@ impl LightningProvider for Wallet {
         Ok(details)
     }
     async fn get_payment_status(&self, hash: &str) -> Result<PaymentDetails, LightningError> {
+        if self.pause_next_status_poll.swap(false, Ordering::SeqCst) {
+            self.status_poll_started.notify_one();
+            return futures::future::pending().await;
+        }
         let mut details = self.inner.get_payment_status(hash).await?;
         match self.mode.load(Ordering::SeqCst) {
             1 => {
@@ -208,6 +214,8 @@ impl Fixture {
             inner: konsensus_lightning::MockLightningProvider::new(),
             calls: AtomicUsize::new(0),
             mode: AtomicU8::new(0),
+            pause_next_status_poll: AtomicBool::new(false),
+            status_poll_started: tokio::sync::Notify::new(),
             pool: db.pool().clone(),
         });
         let mut state = common::test_state_with_lightning(wallet.clone());
@@ -453,28 +461,26 @@ async fn confirmed_failed_payment_releases_and_invalid_settled_proof_reports_pai
     for failure in [2, 5, 7, 8, 9] {
         let mut f = Fixture::new().await;
         f.wallet.mode.store(1, Ordering::SeqCst);
+        f.wallet.pause_next_status_poll.store(true, Ordering::SeqCst);
         let old_sessions = f.state.session_manager.clone();
         let old_keys = f.state.peer_ln_pubkeys.clone();
         let app = common::test_router(f.state.clone());
         let request = f.request();
         let job = tokio::spawn(async move { app.oneshot(request).await });
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if f.db
-                    .get_outbox_operation(&f.id)
-                    .await
-                    .unwrap()
-                    .is_some_and(|p| p.payment_hash.is_some())
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
+        // A visible hash can precede another journal write. Aborting then can
+        // leave SQLx's SQLite worker writing after the task has stopped, racing
+        // recovery's version CAS. Park in the wallet poll instead: all earlier
+        // checkpoints have completed and no further write can start.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            f.wallet.status_poll_started.notified(),
+        )
         .await
-        .unwrap();
+        .expect("compose must reach the post-checkpoint payment status poll");
+        assert_eq!(f.op().await.state, "paying");
+        assert!(f.op().await.payment_hash.is_some());
         job.abort();
-        let _ = job.await;
+        assert!(job.await.unwrap_err().is_cancelled());
         f.restart().await;
         f.wallet.mode.store(failure, Ordering::SeqCst);
         konsensus_api::handlers::messages::reconcile_operations(&f.state)
