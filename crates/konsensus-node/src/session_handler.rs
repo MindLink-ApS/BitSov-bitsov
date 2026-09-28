@@ -775,7 +775,13 @@ async fn heal_connected_e2ee_sessions(
     // This mirrors the `PeerConnected` withholding above (line ~166); without it,
     // the periodic self-heal would re-offer the prekey to every connected peer
     // regardless of privilege, leaking free X3DH to an unpaid peer.
-    let connected_peers = transport.connected_privileged_peers().await;
+    //
+    // BUG-PSI: this includes a payee whose admission WE settled on the live
+    // connection (`connected_session_peers`, never `connected_privileged_peers`,
+    // which stays strictly privileged for security callers). Offering it our
+    // prekey is part of the act we bought, and it is how the session forms when
+    // the payee is the X3DH initiator.
+    let connected_peers = transport.connected_session_peers().await;
     for peer_id in connected_peers {
         if !e2ee_needs_self_heal(session_manager, &peer_id).await {
             continue;
@@ -1611,3 +1617,7 @@ mod reconnect_two_node;
 #[cfg(test)]
 #[path = "tests/budgeted_reconnect_two_node.rs"]
 mod budgeted_reconnect_two_node;
+
+#[cfg(test)]
+#[path = "tests/paid_first_contact_two_node.rs"]
+mod paid_first_contact_two_node;
