@@ -598,7 +598,10 @@ async fn create_event(
 
         let msg_id_hex = envelope.id.to_hex();
 
-        state.storage.prepare_delivery(&envelope.id, peer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+        state.storage.prepare_delivery(&envelope.id, peer_id).await.map_err(|e| ApiError::PaymentProofUnavailable {
+            amount_msat: total_msat.saturating_add(amount_msat),
+            reason: format!("calendar payment settled; saved envelope {} requires delivery reconciliation: {e}", envelope.id.to_hex()),
+        })?;
         if state.transport.is_connected(peer_id).await {
             if let Err(e) = state.transport.send(peer_id, &envelope).await {
                 tracing::warn!(peer = %peer_id, error = %e, "calendar event delivery failed, queuing");
@@ -776,7 +779,10 @@ async fn update_event(
 
         let msg_id_hex = envelope.id.to_hex();
 
-        state.storage.prepare_delivery(&envelope.id, peer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+        state.storage.prepare_delivery(&envelope.id, peer_id).await.map_err(|e| ApiError::PaymentProofUnavailable {
+            amount_msat: total_msat.saturating_add(amount_msat),
+            reason: format!("calendar payment settled; saved envelope {} requires delivery reconciliation: {e}", envelope.id.to_hex()),
+        })?;
         if state.transport.is_connected(peer_id).await {
             if let Err(e) = state.transport.send(peer_id, &envelope).await {
                 tracing::warn!(peer = %peer_id, error = %e, "update delivery failed, queuing");
@@ -917,7 +923,10 @@ async fn create_rsvp(
     // Best effort — the event may not be stored locally if this node is an attendee
     let _ = state.storage.store_rsvp(&rsvp_record).await;
 
-    state.storage.prepare_delivery(&envelope.id, &organizer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+    state.storage.prepare_delivery(&envelope.id, &organizer_id).await.map_err(|e| ApiError::PaymentProofUnavailable {
+            amount_msat,
+            reason: format!("calendar payment settled; saved envelope {} requires delivery reconciliation: {e}", envelope.id.to_hex()),
+        })?;
     let delivered = if state.transport.is_connected(&organizer_id).await {
         match state.transport.send(&organizer_id, &envelope).await {
             Ok(()) => true,

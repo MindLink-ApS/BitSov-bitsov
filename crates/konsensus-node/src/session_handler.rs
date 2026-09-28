@@ -855,10 +855,22 @@ async fn handle_delivery_confirmation(
         audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
         return;
     }
-    let legacy = rejection == Some("replay detected: nonce already used");
+    let nonce_replay = rejection == Some("replay detected: nonce already used");
+    let hash_replay = rejection.and_then(|reason| reason.strip_prefix("payment proof already used: "))
+        .filter(|hash| hash.len() == 64)
+        .and_then(|hash| hex::decode(hash).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+    // The hash compatibility exception must consume the row atomically with
+    // the exact payment binding; unrelated PaymentReused remains terminal.
+    let hash_acked = if let Some(hash) = hash_replay {
+        match storage.acknowledge_pending_payment(id, peer, own_id, &hash).await {
+            Ok(acked) => acked,
+            Err(_) => return,
+        }
+    } else { false };
+    let legacy = nonce_replay || hash_acked;
     if rejection.is_none() || legacy {
-        // One atomic DELETE is the idempotency boundary for repeated/racing ACKs.
-        if !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) { return; }
+        if !hash_acked && !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) { return; }
         if legacy {
             audit.record("acked_legacy", &peer.to_hex(), Some(serde_json::json!({"message_id": id.to_hex()})));
         }

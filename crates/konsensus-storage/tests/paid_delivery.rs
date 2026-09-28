@@ -45,7 +45,7 @@ async fn acceptance_rolls_back_both_keys_if_message_insert_fails() {
 }
 
 #[tokio::test]
-async fn paid_duplicates_bind_immutable_metadata_and_require_durable_message() {
+async fn paid_duplicates_bind_immutable_metadata_after_content_deletion() {
     use konsensus_storage::PaidAcceptance::*;
     let db = SqliteStorage::in_memory().await.unwrap();
     let env = envelope();
@@ -54,6 +54,13 @@ async fn paid_duplicates_bind_immutable_metadata_and_require_durable_message() {
     renewed.timestamp += 360_000;
     renewed.signature = Signature::from_bytes([9; 64]);
     assert_eq!(db.accept_paid_envelope(&renewed).await.unwrap(), AlreadyAccepted);
+    let peer = NodeId::from_bytes([2; 32]);
+    db.prepare_delivery(&env.id, &peer).await.unwrap();
+    assert!(!db.acknowledge_pending_payment(&env.id, &peer, &env.sender, &[8; 32]).await.unwrap());
+    assert!(db.acknowledge_pending_payment(&env.id, &peer, &env.sender, &env.payment_proof.payment_hash).await.unwrap());
+    db.delete_message(&env.id).await.unwrap();
+    assert_eq!(db.accept_paid_envelope(&renewed).await.unwrap(), AlreadyAccepted);
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
     for variant in 0..5 {
         let mut changed = env.clone();
         match variant {
@@ -66,8 +73,9 @@ async fn paid_duplicates_bind_immutable_metadata_and_require_durable_message() {
         assert_eq!(db.accept_paid_envelope(&changed).await.unwrap(), PaymentReused);
     }
     db.delete_message(&env.id).await.unwrap();
-    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), PaymentReused,
-        "an accepted receipt remains spent after explicit message deletion");
+    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), AlreadyAccepted,
+        "an accepted receipt remains ACKable without resurrecting deleted content");
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -102,6 +110,13 @@ async fn encrypted_storage_acceptance_and_rewrap_preserve_ciphertext() {
     db.update_message_wrapper(&renewed).await.unwrap();
     assert_eq!(db.get_message(&env.id).await.unwrap().unwrap(), renewed);
     assert_eq!(db.accept_paid_envelope(&renewed).await.unwrap(), AlreadyAccepted);
+    let peer = NodeId::from_bytes([2; 32]);
+    db.prepare_delivery(&env.id, &peer).await.unwrap();
+    assert!(!db.acknowledge_pending_payment(&env.id, &peer, &env.sender, &[8; 32]).await.unwrap());
+    assert!(db.acknowledge_pending_payment(&env.id, &peer, &env.sender, &env.payment_proof.payment_hash).await.unwrap());
+    db.delete_message(&env.id).await.unwrap();
+    assert_eq!(db.accept_paid_envelope(&renewed).await.unwrap(), AlreadyAccepted);
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -193,7 +208,8 @@ async fn retention_cannot_turn_an_accepted_receipt_into_legacy_limbo() {
     assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted);
     db.delete_messages_older_than(10).await.unwrap();
     assert!(db.get_message(&env.id).await.unwrap().is_none());
-    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::PaymentReused);
+    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::AlreadyAccepted);
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -203,6 +219,7 @@ async fn upgrade_from_original_slice_one_preserves_checksums_and_spent_receipts(
     std::fs::create_dir(&migrations).unwrap();
     for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")).unwrap() {
         let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_file() { continue; }
         let name = entry.file_name();
         if name.to_str().unwrap()[..3].parse::<u32>().unwrap() <= 20 {
             std::fs::copy(entry.path(), migrations.join(name)).unwrap();
@@ -227,7 +244,8 @@ async fn upgrade_from_original_slice_one_preserves_checksums_and_spent_receipts(
     let db = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
     assert!(!db.acknowledge_pending(&env.id, &NodeId::from_bytes([2; 32]), &env.sender).await.unwrap());
     db.delete_message(&env.id).await.unwrap();
-    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::PaymentReused);
+    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::AlreadyAccepted);
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -250,4 +268,30 @@ async fn encrypted_terminal_rejection_survives_restart_and_housekeeping() {
     assert!(db.get_pending_peers().await.unwrap().is_empty());
     assert!(db.mark_pending_sent(&env.id, &peer).await.is_err());
     assert_eq!(db.get_message(&env.id).await.unwrap().unwrap(), env);
+}
+
+#[tokio::test]
+async fn retained_receipt_matches_all_immutable_fields_after_content_deletion() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let env = envelope();
+    db.accept_paid_envelope(&env).await.unwrap();
+    db.delete_messages_older_than(10).await.unwrap();
+    for variant in 0..8 {
+        let mut other = env.clone();
+        match variant {
+            0 => other.id = konsensus_core::MessageId::from_bytes([9; 32]),
+            1 => other.sender = NodeId::from_bytes([9; 32]),
+            2 => other.kind += 1,
+            3 => other.recipient = Recipient::Node(NodeId::from_bytes([9; 32])),
+            4 => other.nonce = Nonce::from_bytes([9; 24]),
+            5 => other.references.push(konsensus_core::MessageId::from_bytes([9; 32])),
+            6 => other.payment_proof.amount_msat += 1,
+            _ => other.payment_proof.preimage = [9; 32],
+        }
+        assert_eq!(db.accept_paid_envelope(&other).await.unwrap(), konsensus_storage::PaidAcceptance::PaymentReused, "variant {variant}");
+    }
+    let mut renewed = env.clone(); renewed.timestamp += 7 * 86400_000;
+    renewed.signature = Signature::from_bytes([8; 64]);
+    assert_eq!(db.accept_paid_envelope(&renewed).await.unwrap(), konsensus_storage::PaidAcceptance::AlreadyAccepted);
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
 }

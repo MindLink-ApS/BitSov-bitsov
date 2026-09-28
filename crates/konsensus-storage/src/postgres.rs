@@ -66,7 +66,7 @@ impl PostgresStorage {
             // Check if this is an existing database (messages table already exists)
             let table_exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-                 WHERE table_name = 'messages')",
+                 WHERE table_schema = current_schema() AND table_name = 'messages')",
             )
             .fetch_one(&self.pool)
             .await
@@ -108,12 +108,18 @@ impl PostgresStorage {
             if applied.contains(&version) {
                 continue;
             }
-            sqlx::query(sql).execute(&self.pool).await?;
-            sqlx::query("INSERT INTO _konsensus_migrations (version, name) VALUES ($1, $2)")
-                .bind(version)
-                .bind(name)
-                .execute(&self.pool)
-                .await?;
+            let mut tx = self.pool.begin().await?;
+            // Serialize concurrent startups and recheck after acquiring the lock.
+            sqlx::query("LOCK TABLE _konsensus_migrations IN EXCLUSIVE MODE").execute(&mut *tx).await?;
+            let recorded: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _konsensus_migrations WHERE version = $1)")
+                .bind(version).fetch_one(&mut *tx).await?;
+            if !recorded {
+                // Migrations contain multiple statements; use the simple protocol.
+                sqlx::raw_sql(sql).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO _konsensus_migrations (version, name) VALUES ($1, $2)")
+                    .bind(version).bind(name).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
         }
 
         Ok(())
@@ -425,8 +431,9 @@ impl PostgresStorage {
                     ON payment_receipts(sender, received_at DESC);
                 "#,
             ),
-            (20, "pending_delivery_state", "ALTER TABLE pending_deliveries ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'; ALTER TABLE pending_deliveries ADD COLUMN dispatched INTEGER NOT NULL DEFAULT 0; UPDATE pending_deliveries SET dispatched = 1;"),
-            (21, "paid_delivery_rejections", include_str!("../migrations/021_paid_delivery_rejections.sql")),
+            (20, "pending_delivery_state", "ALTER TABLE pending_deliveries ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'pending'; ALTER TABLE pending_deliveries ADD COLUMN IF NOT EXISTS dispatched INTEGER NOT NULL DEFAULT 0;"),
+            (21, "paid_delivery_rejections", include_str!("../migrations/postgres/021_paid_delivery_rejections.sql")),
+            (22, "receipt bindings", include_str!("../migrations/022_receipt_bindings.sql")),
         ]
     }
 
@@ -790,12 +797,24 @@ impl Storage for PostgresStorage {
                 tx.rollback().await?;
                 return Ok(PaymentReused);
             }
+            // Receipt metadata is independent of retained message content and
+            // excludes only the timestamp/signature wrapper refreshed on retry.
+            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = 1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if durable == 1 {
+                tx.rollback().await?;
+                return Ok(AlreadyAccepted);
+            }
             let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = $1 AND r.message_id = $2 AND r.sender = $3 AND m.sender = r.sender AND m.kind = $4 AND m.recipient_type = $5 AND m.recipient_id = $6 AND m.payment_hash = r.payment_hash AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10")
                 .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
                 .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
                 .fetch_one(&mut *tx).await?;
             if matched == 1 {
-                tx.rollback().await?;
+                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
+                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+                tx.commit().await?;
                 return Ok(AlreadyAccepted);
             }
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = $1")
@@ -838,8 +857,8 @@ impl Storage for PostgresStorage {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE payment_hash = $1")
-            .bind(&ph).execute(&mut *tx).await?;
+        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(Accepted)
     }
@@ -874,6 +893,11 @@ impl Storage for PostgresStorage {
 
     async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
         Ok(sqlx::query("DELETE FROM pending_deliveries WHERE message_id = $1 AND recipient_id = $2 AND dispatched = 1 AND state != 'failed_paid' AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = $3)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+            .execute(&self.pool).await?.rows_affected() == 1)
+    }
+
+    async fn acknowledge_pending_payment(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        Ok(sqlx::query("DELETE FROM pending_deliveries WHERE message_id = $1 AND recipient_id = $2 AND dispatched = 1 AND state != 'failed_paid' AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = $3 AND payment_hash = $4)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).bind(hex::encode(hash))
             .execute(&self.pool).await?.rows_affected() == 1)
     }
 
@@ -3084,5 +3108,70 @@ mod accepted_invites_guard {
             "postgres ACTIVE_ACCEPTED_INVITES_SELECT must not contain LIMIT (AUTHORITY fail-open guard): {}",
             super::ACTIVE_ACCEPTED_INVITES_SELECT
         );
+    }
+}
+
+#[cfg(test)]
+mod migration_recovery_tests {
+    use super::*;
+
+    // This test creates and removes its own databases on a disposable server.
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn interrupted_upgrade_is_atomic_and_old_partial_020_resumes() {
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+        let admin = PgPool::connect(&url).await.unwrap();
+        for partial in [0, 1, 2] {
+            let name = format!("migration_{}", uuid::Uuid::new_v4().simple());
+            sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+            let base = url.rsplit_once('/').unwrap().0;
+            let db = PostgresStorage { pool: PgPool::connect(&format!("{base}/{name}")).await.unwrap() };
+            sqlx::raw_sql("CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)").execute(&db.pool).await.unwrap();
+            for (v, name, sql) in PostgresStorage::pg_migrations().into_iter().filter(|(v, _, _)| *v < 20) {
+                sqlx::raw_sql(sql).execute(&db.pool).await.unwrap();
+                sqlx::query("INSERT INTO _konsensus_migrations VALUES ($1, $2)").bind(v).bind(name).execute(&db.pool).await.unwrap();
+            }
+            if partial == 0 {
+                // Kill the migration connection precisely between DDL and bookkeeping.
+                sqlx::raw_sql("CREATE FUNCTION interrupt_upgrade() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.version = 20 THEN PERFORM pg_terminate_backend(pg_backend_pid()); END IF; RETURN NEW; END $$; CREATE TRIGGER interrupt_upgrade BEFORE INSERT ON _konsensus_migrations FOR EACH ROW EXECUTE FUNCTION interrupt_upgrade();").execute(&db.pool).await.unwrap();
+                assert!(db.run_migrations().await.is_err());
+                let columns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'pending_deliveries' AND column_name IN ('state', 'dispatched')").fetch_one(&db.pool).await.unwrap();
+                // Clean up before asserting, so a red run leaves no orphan database.
+                sqlx::raw_sql("DROP TRIGGER interrupt_upgrade ON _konsensus_migrations; DROP FUNCTION interrupt_upgrade()").execute(&db.pool).await.unwrap();
+                if columns != 0 {
+                    db.pool.close().await;
+                    sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+                    panic!("interrupted migration committed {columns} columns without its version record");
+                }
+            } else {
+                sqlx::raw_sql("ALTER TABLE pending_deliveries ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'").execute(&db.pool).await.unwrap();
+                if partial == 2 {
+                    sqlx::raw_sql("ALTER TABLE pending_deliveries ADD COLUMN dispatched INTEGER NOT NULL DEFAULT 0").execute(&db.pool).await.unwrap();
+                }
+            }
+            let result = db.run_migrations().await;
+            if result.is_ok() {
+                db.run_migrations().await.unwrap();
+                let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _konsensus_migrations WHERE version >= 20").fetch_one(&db.pool).await.unwrap();
+                assert_eq!(versions, 3);
+                // Exercise retained receipt acceptance on PostgreSQL too.
+                let sender = NodeId::from_bytes([1; 32]);
+                let peer = NodeId::from_bytes([2; 32]);
+                let env = konsensus_core::UkmEnvelopeBuilder::new(0, sender, Recipient::Node(peer), vec![7], PaymentProof::new([3; 32], [4; 32], 1000)).build();
+                assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), crate::PaidAcceptance::Accepted);
+                db.prepare_delivery(&env.id, &peer).await.unwrap();
+                assert!(!db.acknowledge_pending_payment(&env.id, &peer, &sender, &[8; 32]).await.unwrap());
+                assert!(db.acknowledge_pending_payment(&env.id, &peer, &sender, &env.payment_proof.payment_hash).await.unwrap());
+                db.delete_messages_older_than(env.timestamp + 1).await.unwrap();
+                assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), crate::PaidAcceptance::AlreadyAccepted);
+                assert!(db.get_message(&env.id).await.unwrap().is_none());
+                let mut changed = env.clone(); changed.kind += 1;
+                assert_eq!(db.accept_paid_envelope(&changed).await.unwrap(), crate::PaidAcceptance::PaymentReused);
+            }
+            db.pool.close().await;
+            sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+            result.unwrap();
+        }
+        admin.close().await;
     }
 }

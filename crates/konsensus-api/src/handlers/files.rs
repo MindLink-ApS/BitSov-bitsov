@@ -509,7 +509,10 @@ async fn send_file_inner(
     // We don't have an update_file method, but the association is recorded
     // in the audit log below.
 
-    state.storage.prepare_delivery(&envelope.id, &peer_id).await.map_err(|e| ApiError::Storage(e.to_string()))?;
+    state.storage.prepare_delivery(&envelope.id, &peer_id).await.map_err(|e| ApiError::PaymentProofUnavailable {
+        amount_msat,
+        reason: format!("file payment settled; saved envelope {} requires delivery reconciliation: {e}", envelope.id.to_hex()),
+    })?;
     // Deliver
     let delivered = if state.transport.is_connected(&peer_id).await {
         state

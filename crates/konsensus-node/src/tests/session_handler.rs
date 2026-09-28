@@ -1999,3 +1999,53 @@ async fn unpaid_confirmation_flood_is_bounded_before_storage_even_across_peer_ch
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
 }
+
+#[tokio::test]
+async fn legacy_lost_ack_recovers_after_nonce_expiry_and_sender_restart() {
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder, Signature};
+    use konsensus_core::gate::{PaymentGate, GateConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let (_, alice) = konsensus_core::NodeIdentity::generate().unwrap();
+    let own = *alice.node_id(); let peer = make_peer_id(62);
+    let mut env = UkmEnvelopeBuilder::new(0, own, Recipient::Node(peer), vec![1], PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000)).build();
+    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+    let recipient = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let gate = PaymentGate::with_config(GateConfig { verify_lightning_settlement: false, ..Default::default() });
+    let pricing = konsensus_pricing::StaticPricingEngine::new(Default::default());
+    gate.verify(&env, &recipient, &pricing, None, None, 0.0, Some(&peer)).await.unwrap();
+    recipient.store_message(&env).await.unwrap();
+    let before = gate.verify(&env, &recipient, &pricing, None, None, 0.0, Some(&peer)).await.unwrap_err();
+    assert_eq!(before.to_string(), "replay detected: nonce already used");
+    sqlx::query("UPDATE nonces SET received_at = '2000-01-01T00:00:00.000Z'").execute(recipient.pool()).await.unwrap();
+    assert_eq!(recipient.cleanup_expired_nonces(3600).await.unwrap(), 1);
+    let reason = gate.verify(&env, &recipient, &pricing, None, None, 0.0, Some(&peer)).await.unwrap_err().to_string();
+    assert_eq!(reason, format!("payment proof already used: {}", hex::encode(env.payment_proof.payment_hash)));
+    for case in ["exact", "peer", "id", "sender", "unsent", "hash", "suffix"] {
+        let path = dir.path().join(format!("{case}.sqlite"));
+        let db = konsensus_storage::SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+        db.store_message(&env).await.unwrap();
+        db.queue_pending_delivery(&env.id, &peer).await.unwrap();
+        if case != "unsent" { db.mark_pending_sent(&env.id, &peer).await.unwrap(); }
+        db.pool().close().await;
+        let db = Arc::new(konsensus_storage::SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+        let storage: Arc<dyn Storage> = db.clone();
+        let routing = konsensus_routing::RoutingTable::new(Default::default());
+        let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (ws, mut updates) = broadcast::channel(16);
+        let audit = AuditLog::open(dir.path().join(format!("{case}.jsonl"))).unwrap();
+        let mut budget = DeliveryConfirmationBudget::default();
+        let other = make_peer_id(63);
+        let other_id = konsensus_core::MessageId::from_bytes([9; 32]);
+        let response = match case { "hash" => format!("payment proof already used: {}", "ab".repeat(32)), "suffix" => format!("{reason} extra"), _ => reason.clone() };
+        handle_delivery_confirmation(if case == "peer" { &other } else { &peer }, if case == "id" { &other_id } else { &env.id }, Some(&response), case == "exact", if case == "sender" { &other } else { &own }, &storage, &timestamps, &routing, &ws, &audit, &mut budget).await;
+        if case == "exact" {
+            assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
+            assert_eq!(updates.try_recv().unwrap().status, "delivered");
+            assert!(std::fs::read_to_string(dir.path().join(format!("{case}.jsonl"))).unwrap().contains("acked_legacy"));
+        } else {
+            assert_eq!(db.count_pending_deliveries().await.unwrap(), 1, "{case}");
+            if let Ok(update) = updates.try_recv() { assert_eq!(update.status, "failed_paid"); }
+        }
+        assert!(routing.get_peer_weight(&peer).await.is_none());
+    }
+}

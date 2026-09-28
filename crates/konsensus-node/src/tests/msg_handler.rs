@@ -1114,15 +1114,20 @@ async fn membrane_observes_unpaid_insufficient_stale_and_first_contact_decisions
 /// commit. A failed commit and a lost ACK must never consume a second payment.
 #[tokio::test]
 async fn paid_acceptance_storage_retry_and_lost_ack_are_idempotent() {
-    paid_acceptance_retry_case(false).await;
+    paid_acceptance_retry_case(false, false).await;
 }
 
 #[tokio::test]
 async fn legacy_limbo_heals_only_after_signature_and_settlement_gate() {
-    paid_acceptance_retry_case(true).await;
+    paid_acceptance_retry_case(true, false).await;
 }
 
-async fn paid_acceptance_retry_case(legacy: bool) {
+#[tokio::test]
+async fn lost_ack_survives_recipient_retention_and_sender_restart() {
+    paid_acceptance_retry_case(false, true).await;
+}
+
+async fn paid_acceptance_retry_case(legacy: bool, retained: bool) {
     use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
     use std::time::Duration;
     let dir = tempfile::tempdir().unwrap();
@@ -1197,6 +1202,20 @@ async fn paid_acceptance_retry_case(legacy: bool) {
     assert_eq!(message.plaintext.as_deref(), Some("paid exactly once"));
     assert_eq!(audit.membrane().read(None, 100).1.admitted, 1);
     assert!(target.connected_privileged_peers().await.contains(alice.node_id()));
+    if retained {
+        assert_eq!(db.delete_messages_older_than(env.timestamp + 1).await.unwrap(), 1);
+        let path = dir.path().join("sender.sqlite");
+        let sender_db = konsensus_storage::SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+        sender_db.store_message(&env).await.unwrap();
+        sender_db.prepare_delivery(&env.id, bob.node_id()).await.unwrap();
+        sender_db.pool().close().await;
+        let reopened = konsensus_storage::SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+        env = reopened.get_message(&env.id).await.unwrap().unwrap();
+        env.timestamp += 1;
+        env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+        reopened.update_message_wrapper(&env).await.unwrap();
+        assert_eq!(reopened.get_pending_for_peer(bob.node_id()).await.unwrap().len(), 1);
+    }
     // Treat the first ACK as dropped. Reconnect so a second promotion would be observable.
     source.disconnect(bob.node_id()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1210,7 +1229,7 @@ async fn paid_acceptance_retry_case(legacy: bool) {
     assert!(!target.connected_privileged_peers().await.contains(alice.node_id()));
     assert!(ws_rx.try_recv().is_err());
     assert_eq!(audit.membrane().read(None, 100).1.admitted, 1);
-    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages").fetch_one(db.pool()).await.unwrap(), 1);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages").fetch_one(db.pool()).await.unwrap(), if retained { 0 } else { 1 });
     assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payment_receipts").fetch_one(db.pool()).await.unwrap(), 1);
     // Even a previously accepted id must still pass full signature validation.
     let mut tampered = env.clone(); tampered.signature = Signature::from_bytes([0; 64]);

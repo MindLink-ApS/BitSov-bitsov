@@ -160,6 +160,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (19, "payment receipts", include_str!("../migrations/019_payment_receipts.sql")),
     (20, "pending delivery state", include_str!("../migrations/020_pending_delivery_state.sql")),
     (21, "paid delivery rejections", include_str!("../migrations/021_paid_delivery_rejections.sql")),
+    (22, "receipt bindings", include_str!("../migrations/022_receipt_bindings.sql")),
 ];
 
 impl EmbeddedMigrations {
@@ -593,12 +594,24 @@ impl Storage for SqliteStorage {
                 tx.rollback().await?;
                 return Ok(PaymentReused);
             }
+            // Receipt metadata is independent of retained message content and
+            // excludes only the timestamp/signature wrapper refreshed on retry.
+            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = 1 AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if durable == 1 {
+                tx.rollback().await?;
+                return Ok(AlreadyAccepted);
+            }
             let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
                 .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
                 .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
                 .fetch_one(&mut *tx).await?;
             if matched == 1 {
-                tx.rollback().await?;
+                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ?")
+                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+                tx.commit().await?;
                 return Ok(AlreadyAccepted);
             }
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
@@ -641,8 +654,8 @@ impl Storage for SqliteStorage {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE payment_hash = ?")
-            .bind(&ph).execute(&mut *tx).await?;
+        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ?")
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(Accepted)
     }
@@ -677,6 +690,11 @@ impl Storage for SqliteStorage {
 
     async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
         Ok(sqlx::query("DELETE FROM pending_deliveries WHERE message_id = ? AND recipient_id = ? AND dispatched = 1 AND state != 'failed_paid' AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = ?)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+            .execute(&self.pool).await?.rows_affected() == 1)
+    }
+
+    async fn acknowledge_pending_payment(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        Ok(sqlx::query("DELETE FROM pending_deliveries WHERE message_id = ? AND recipient_id = ? AND dispatched = 1 AND state != 'failed_paid' AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = ? AND payment_hash = ?)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).bind(hex::encode(hash))
             .execute(&self.pool).await?.rows_affected() == 1)
     }
 

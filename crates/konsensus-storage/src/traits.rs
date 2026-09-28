@@ -60,6 +60,11 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("acknowledge_pending".into()))
     }
 
+    /// Legacy hash-reuse completion additionally binds the exact stored payment.
+    async fn acknowledge_pending_payment(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId, _hash: &[u8; 32]) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("acknowledge_pending_payment".into()))
+    }
+
     /// Queue before every first dispatch; retries retain the same row until ACK.
     async fn prepare_delivery(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
         self.queue_pending_delivery(id, peer).await?;

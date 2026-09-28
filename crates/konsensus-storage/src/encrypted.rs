@@ -377,6 +377,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.acknowledge_pending(id, peer, sender).await
     }
 
+    async fn acknowledge_pending_payment(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        self.inner.acknowledge_pending_payment(id, peer, sender, hash).await
+    }
+
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
         // The stored ID is based on encrypted ciphertext, so we can't look up
         // by the original ID directly. We need to search differently.
