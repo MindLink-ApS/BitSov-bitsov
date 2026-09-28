@@ -836,6 +836,27 @@ async fn read_noise_message(
         "read timed out (slowloris protection)",
     )))?
 }
+/// Encrypt and write one envelope on an already captured connection.
+async fn write_envelope(conn: &Connection, envelope: &UkmEnvelope) -> Result<(), TransportError> {
+    let frame = Frame::Message(Box::new(envelope.clone()));
+    let frame_bytes = frame
+        .to_bytes()
+        .map_err(|e| TransportError::WireProtocol(e.to_string()))?;
+
+    let mut conn = conn.lock().await;
+    let encrypted = conn
+        .noise
+        .encrypt(&frame_bytes)
+        .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+
+    write_noise_message(&mut conn.writer, &encrypted)
+        .await
+        .map_err(|e| TransportError::Other(e.to_string()))?;
+
+    debug!(msg_id = %envelope.id, "sent envelope to peer");
+    Ok(())
+}
+
 #[async_trait]
 impl MessageTransport for NoiseTransport {
     #[instrument(skip(self, envelope), fields(peer = %peer))]
@@ -856,23 +877,7 @@ impl MessageTransport for NoiseTransport {
             )
         };
 
-        let frame = Frame::Message(Box::new(envelope.clone()));
-        let frame_bytes = frame
-            .to_bytes()
-            .map_err(|e| TransportError::WireProtocol(e.to_string()))?;
-
-        let mut conn = conn.lock().await;
-        let encrypted = conn
-            .noise
-            .encrypt(&frame_bytes)
-            .map_err(|e| TransportError::NoiseError(e.to_string()))?;
-
-        write_noise_message(&mut conn.writer, &encrypted)
-            .await
-            .map_err(|e| TransportError::Other(e.to_string()))?;
-
-        debug!(msg_id = %envelope.id, "sent envelope to peer");
-        Ok(())
+        write_envelope(&conn, envelope).await
     }
 
     async fn recv(&self) -> Result<UkmEnvelope, TransportError> {
@@ -1001,6 +1006,28 @@ impl MessageTransport for NoiseTransport {
         if let Some(conn) = self.peers.read().await.get(peer) {
             if conn.connected_at == since { conn.admission_paid.store(true, std::sync::atomic::Ordering::Release); }
         }
+    }
+
+    async fn send_on_connection(
+        &self,
+        peer: &NodeId,
+        since: Option<Instant>,
+        envelope: &UkmEnvelope,
+    ) -> Result<(), TransportError> {
+        // One lookup: the connection captured here is the one written to. A
+        // replacement registered after this point never receives the envelope.
+        let conn = {
+            let peers = self.peers.read().await;
+            peers
+                .get(peer)
+                .filter(|conn| Some(conn.connected_at) == since)
+                .map(Arc::clone)
+                .ok_or_else(|| TransportError::NotConnected(format!(
+                    "{}: connection generation replaced or gone",
+                    peer.to_hex()
+                )))?
+        };
+        write_envelope(&conn, envelope).await
     }
 
     /// Adding a peer is the owner's explicit admission of that NodeId, so it
@@ -2720,8 +2747,10 @@ mod tests {
             assert_eq!(next_stamp(&transport_a).await, *bought, "paid: {frame:?}");
         }
         // Self-heal offers our prekey to the node we paid; `privileged` itself
-        // is untouched, and the payee gets nothing from our payment.
-        assert_eq!(transport_a.connected_privileged_peers().await, vec![node_b_id]);
+        // is untouched (the privileged list stays strict for security
+        // callers), and the payee gets nothing from our payment.
+        assert_eq!(transport_a.connected_session_peers().await, vec![node_b_id]);
+        assert!(transport_a.connected_privileged_peers().await.is_empty());
         assert!(!transport_a.peers.read().await.get(&node_b_id).unwrap().lock().await.privileged);
         assert!(transport_b.connected_privileged_peers().await.is_empty());
         assert!(!transport_b.admission_paid_on_connection(&node_a_id).await);
@@ -2733,9 +2762,27 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         transport_a.mark_admission_paid(&node_b_id, since).await;
         assert!(!transport_a.admission_paid_on_connection(&node_b_id).await);
-        assert!(transport_a.connected_privileged_peers().await.is_empty());
+        assert!(transport_a.connected_session_peers().await.is_empty());
         transport_b.send_frame(&node_a_id, &Frame::PrekeyOffer { bundle: serde_json::json!({}) }).await.unwrap();
         assert!(!next_stamp(&transport_a).await, "a new connection starts unpaid");
+
+        // Review P1: a proof bound to the old generation is never written to
+        // its replacement; `NotConnected` proves nothing went out.
+        let proof = make_test_envelope(&id_a, &node_b_id);
+        let replaced = transport_a.send_on_connection(&node_b_id, Some(since), &proof).await;
+        assert!(matches!(replaced, Err(TransportError::NotConnected(_))), "{replaced:?}");
+        assert!(matches!(
+            transport_a.send_on_connection(&node_b_id, None, &proof).await,
+            Err(TransportError::NotConnected(_))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), transport_b.recv()).await.is_err(),
+            "the proof reached the replacement connection"
+        );
+        let live = transport_a.connected_since(&node_b_id).await;
+        transport_a.send_on_connection(&node_b_id, live, &proof).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), transport_b.recv()).await.unwrap().unwrap();
+        assert_eq!(got.id, proof.id, "sent on the live generation");
 
         transport_a.shutdown();
         transport_b.shutdown();

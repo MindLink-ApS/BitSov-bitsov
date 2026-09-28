@@ -452,11 +452,11 @@ async fn readmit_then_pay(
     };
     recover_admission_attempt(state, peer_id)?;
     let connected_since = state.transport.connected_since(peer_id).await;
-    let had_settled = matches!(lock_admission_ledger().entries.get(peer_id), Some(AdmissionRecord::Settled { .. }));
-    let covered = state.transport.admission_paid_on_connection(peer_id).await
-        || lock_admission_ledger().settled_on_connection(peer_id, connected_since, Instant::now());
+    let paid_on_live = state.transport.admission_paid_on_connection(peer_id).await;
+    let coverage = lock_admission_ledger().settled_coverage(peer_id, connected_since, paid_on_live, Instant::now());
+    let covered = coverage == SettledCoverage::Covered;
     if !covered {
-        if had_settled {
+        if coverage == SettledCoverage::Consumed {
             reconcile_admission_budget(state, peer_id, debit.reservation().as_ref()).await?;
             super::admission_journal::clear(state, peer_id)?;
             lock_admission_ledger().quotes.remove(peer_id);
@@ -907,7 +907,27 @@ enum AdmissionRecord {
         /// The signed admission envelope, attached once built. Kept so a retry can
         /// re-deliver the PROOF without re-paying (heals settled-but-envelope-lost).
         envelope: Option<Box<konsensus_core::UkmEnvelope>>,
+        /// Whether the envelope may have reached a connection. Set before the
+        /// write and cleared only when the transport proves nothing was written
+        /// (`NotConnected` from `send_on_connection`). An undelivered proof is
+        /// unspent: a retry delivers it on the live connection instead of paying.
+        delivered: bool,
     },
+}
+
+/// How a settled admission relates to the live connection (see
+/// [`AdmissionLedger::settled_coverage`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettledCoverage {
+    /// No settled admission is recorded.
+    NoRecord,
+    /// It covers the live connection: never pay again.
+    Covered,
+    /// The proof never went out: deliver it on the live connection, never pay again.
+    Unsent,
+    /// The proof went out on an earlier connection (a flap, or before a
+    /// restart) and was consumed there: this connection needs its own admission.
+    Consumed,
 }
 
 /// Sender-side ledger of first-contact admission attempts.
@@ -996,6 +1016,7 @@ impl AdmissionLedger {
                 settled_at: now,
                 recovered: false,
                 envelope: None,
+                delivered: false,
             },
         );
     }
@@ -1025,27 +1046,54 @@ impl AdmissionLedger {
         }
     }
 
-    /// For a re-admission: whether a settled admission covers our current
-    /// connection to `peer`, established at `connected_since` (unknown counts
-    /// as covered, so an untracked transport never pays twice). A settlement
-    /// older than the connection, or recovered without connection identity,
-    /// paid for a previous one: it is forgotten here so the paid path runs again.
-    /// The transport's live paid flag takes precedence at the caller.
-    fn settled_on_connection(
+    /// Whether the settled proof to `peer` may already have gone out.
+    fn delivered(&self, peer: &NodeId) -> bool {
+        matches!(self.entries.get(peer), Some(AdmissionRecord::Settled { delivered: true, .. }))
+    }
+
+    /// Record whether the settled proof to `peer` may have gone out.
+    fn set_delivered(&mut self, peer: &NodeId, value: bool) {
+        if let Some(AdmissionRecord::Settled { delivered, .. }) = self.entries.get_mut(peer) {
+            *delivered = value;
+        }
+    }
+
+    /// How a settled admission relates to our connection to `peer`,
+    /// established at `connected_since`, on which our live paid flag is
+    /// `paid_on_live`.
+    ///
+    /// Another payment is authorized (`Consumed`, and the record is forgotten)
+    /// only with evidence that the proof went out on an EARLIER connection: it
+    /// may have been written, the live connection is not the one marked paid,
+    /// and it is a different connection (recovered after a restart, or opened
+    /// after the settlement). A proof that never went out is `Unsent`, whatever
+    /// the timestamps say, so a flap between settlement and send never buys the
+    /// admission twice. An unknown generation counts as covered, so an
+    /// untracked transport never pays twice.
+    fn settled_coverage(
         &mut self,
         peer: &NodeId,
         connected_since: Option<Instant>,
+        paid_on_live: bool,
         now: Instant,
-    ) -> bool {
-        let Some(AdmissionRecord::Settled { settled_at, recovered, .. }) = self.entries.get(peer) else {
+    ) -> SettledCoverage {
+        // The live paid flag wins over any record (or none): this connection
+        // was paid for, whatever the cache still holds.
+        if paid_on_live {
+            return SettledCoverage::Covered;
+        }
+        let Some(AdmissionRecord::Settled { settled_at, recovered, delivered, .. }) = self.entries.get(peer) else {
             self.prune(now);
-            return false;
+            return SettledCoverage::NoRecord;
         };
+        if !*delivered {
+            return SettledCoverage::Unsent;
+        }
         if connected_since.is_some_and(|since| *recovered || *settled_at < since) {
             self.entries.remove(peer);
-            return false;
+            return SettledCoverage::Consumed;
         }
-        true
+        SettledCoverage::Covered
     }
 
     /// What we know about a prior admission to `peer` as of `now`.
@@ -1295,6 +1343,53 @@ fn report_readmission_settlement(state: &AppState, peer: &NodeId, amount_msat: u
     Ok(())
 }
 
+/// Record in the ledger and the journal whether the settled proof to `peer`
+/// may have gone out.
+fn set_proof_delivered(state: &AppState, peer: &NodeId, delivered: bool) -> Result<(), ApiError> {
+    lock_admission_ledger().set_delivered(peer, delivered);
+    if let Some(mut attempt) = super::admission_journal::load(state, peer)? {
+        if attempt.envelope.is_some() && attempt.proof_delivered != delivered {
+            attempt.proof_delivered = delivered;
+            super::admission_journal::save(state, peer, &attempt)?;
+        }
+    }
+    Ok(())
+}
+
+/// Send the admission proof on connection generation `since` (captured by the
+/// caller, who marked that generation paid) and on no other.
+///
+/// The proof is recorded as possibly delivered BEFORE the write, so a crash
+/// mid-send errs toward "consumed". If the transport proves nothing was
+/// written (the generation was replaced or is gone), the record goes back to
+/// what it was before this attempt: a proof that never went out stays unspent
+/// (a retry delivers it on the live connection instead of paying again), and
+/// a re-send of a proof that already went out never makes it look unspent.
+async fn send_admission_proof(
+    state: &AppState,
+    peer_id: &NodeId,
+    since: Option<Instant>,
+    envelope: &konsensus_core::UkmEnvelope,
+    on_error: impl FnOnce(konsensus_core::traits::transport::TransportError) -> ApiError,
+) -> Result<(), ApiError> {
+    let before = lock_admission_ledger().delivered(peer_id);
+    set_proof_delivered(state, peer_id, true)?;
+    match state.transport.send_on_connection(peer_id, since, envelope).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if matches!(e, konsensus_core::traits::transport::TransportError::NotConnected(_)) {
+                tracing::warn!(
+                    peer = %peer_id,
+                    error = %e,
+                    "admission proof not sent: the connection it was bound to is gone"
+                );
+                set_proof_delivered(state, peer_id, before)?;
+            }
+            Err(on_error(e))
+        }
+    }
+}
+
 /// Record a settled admission, build its signed proof envelope, attach it to the
 /// ledger, and deliver it. The settlement is recorded before proof construction
 /// so any malformed-preimage/backend-contract error still suppresses re-pay.
@@ -1309,7 +1404,12 @@ async fn deliver_settled_admission(
     // payment, this is what lets the payee's replies that complete the act we
     // paid for (its prekey and session handshake, acks, prices) through our own
     // P2 gate on this connection (BUG-PSI). It dies with the connection.
-    if let Some(since) = state.transport.connected_since(peer_id).await {
+    //
+    // The generation is captured ONCE: the proof below is sent on this same
+    // connection or not at all (`send_on_connection`), so the connection marked
+    // paid and the connection the proof admits cannot differ.
+    let since = state.transport.connected_since(peer_id).await;
+    if let Some(since) = since {
         state.transport.mark_admission_paid(peer_id, since).await;
     }
 
@@ -1361,18 +1461,16 @@ async fn deliver_settled_admission(
         payment_hash: settled.payment_hash.clone(), amount_msat: settled.amount_msat,
         quote: lock_admission_ledger().quotes.get(peer_id).copied(), envelope: Some(envelope.clone()),
         settled_at_unix: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+        proof_delivered: false,
     })?;
 
-    state
-        .transport
-        .send(peer_id, &envelope)
-        .await
-        .map_err(|e| {
-            ApiError::Internal(format!(
-                "admission payment settled but delivering the admission envelope failed \
+    send_admission_proof(state, peer_id, since, &envelope, |e| {
+        ApiError::Internal(format!(
+            "admission payment settled but delivering the admission envelope failed \
              (a retry will re-send the paid proof, not pay again): {e}"
-            ))
-        })?;
+        ))
+    })
+    .await?;
 
     tracing::info!(
         peer = %peer_id,
@@ -1831,8 +1929,9 @@ fn recover_admission_attempt(state: &AppState, peer_id: &NodeId) -> Result<(), A
                 if let Some(envelope) = attempt.envelope {
                     let settled_at = Instant::now().checked_sub(settled_age.unwrap_or_default()).unwrap_or_else(Instant::now);
                     ledger.record_settled(*peer_id, settled_at);
-                    if let Some(AdmissionRecord::Settled { recovered, .. }) = ledger.entries.get_mut(peer_id) {
+                    if let Some(AdmissionRecord::Settled { recovered, delivered, .. }) = ledger.entries.get_mut(peer_id) {
                         *recovered = true;
+                        *delivered = attempt.proof_delivered;
                     }
                     ledger.attach_envelope(peer_id, envelope);
                 } else {
@@ -1873,17 +1972,17 @@ async fn first_contact_admission(
     //     error → user retries → without this guard the stranger pays full
     //     admission on every retry.
     recover_admission_attempt(state, peer_id)?;
-    // 0a. A settlement from an OLDER connection (a flap, a reconnect, a restart
-    //     that reloaded the journal) cannot admit us on this one: the recipient
-    //     admits per connection, and its replay table (durable) refuses the old
-    //     proof, so re-sending it could only end in a 502. As in
-    //     `readmit_then_pay`, forget it and pay this connection's admission once.
+    // 0a. A proof that went out on an OLDER connection (a flap, a reconnect, a
+    //     restart that reloaded the journal) was consumed there and cannot admit
+    //     us on this one: the recipient admits per connection, and its replay
+    //     table (durable) refuses the old proof, so re-sending it could only end
+    //     in a 502. As in `readmit_then_pay`, forget it and pay this connection's
+    //     admission once. A proof that never went out is kept and delivered
+    //     below (`SettledWithProof`), never paid for twice.
     let connected_since = state.transport.connected_since(peer_id).await;
-    let had_settled = matches!(lock_admission_ledger().entries.get(peer_id), Some(AdmissionRecord::Settled { .. }));
-    if had_settled
-        && !state.transport.admission_paid_on_connection(peer_id).await
-        && !lock_admission_ledger().settled_on_connection(peer_id, connected_since, Instant::now())
-    {
+    let paid_on_live = state.transport.admission_paid_on_connection(peer_id).await;
+    let coverage = lock_admission_ledger().settled_coverage(peer_id, connected_since, paid_on_live, Instant::now());
+    if coverage == SettledCoverage::Consumed {
         reconcile_admission_budget(state, peer_id, debit.reservation().as_ref()).await?;
         super::admission_journal::clear(state, peer_id)?;
         lock_admission_ledger().quotes.remove(peer_id);
@@ -2020,7 +2119,14 @@ async fn first_contact_admission(
             // table rejects the duplicate — harmless to us, and we are already
             // promoted there. If the first delivery was lost after settlement,
             // this re-send is exactly the heal that makes the payment count.
-            if let Err(e) = state.transport.send(peer_id, &envelope).await {
+            //
+            // As on first delivery, the live generation is captured once, marked
+            // paid, and the proof goes out on it or not at all.
+            let since = state.transport.connected_since(peer_id).await;
+            if let Some(since) = since {
+                state.transport.mark_admission_paid(peer_id, since).await;
+            }
+            send_admission_proof(state, peer_id, since, &envelope, |e| {
                 // Do NOT swallow this into Ok: if re-delivery fails we cannot
                 // claim the envelope was delivered (review finding #5,
                 // 2026-07-07). Return a precise error — the paid proof is safe in
@@ -2031,11 +2137,12 @@ async fn first_contact_admission(
                     "admission retry: re-sending already-paid admission envelope failed \
                      (will NOT re-pay; a later retry re-sends the same proof)"
                 );
-                return Err(ApiError::PaymentUnresolved(format!(
+                ApiError::PaymentUnresolved(format!(
                     "an already-paid admission proof for {peer_id} exists but re-delivering it \
                      failed ({e}) — no second payment was made; retry shortly"
-                )));
-            }
+                ))
+            })
+            .await?;
             tracing::info!(
                 peer = %peer_id,
                 "admission retry: re-sent already-paid admission envelope (no second payment)"
@@ -2138,6 +2245,7 @@ async fn first_contact_admission(
             original_reservation: debit.reservation(),
             message_may_have_dispatched: false,
             readmission: readmission_event.clone(),
+            proof_delivered: false,
         },
     )?;
     lock_admission_ledger()
@@ -3552,11 +3660,34 @@ mod reviewer_same_connection_ttl {
         let settled_at = connected_at + Duration::from_secs(1);
         let mut ledger = AdmissionLedger::default();
         ledger.record_settled(peer, settled_at);
-        assert!(ledger.settled_on_connection(
-            &peer, Some(connected_at), settled_at + ADMISSION_SETTLED_TTL - Duration::from_secs(1)
-        ));
-        assert!(ledger.settled_on_connection(
-            &peer, Some(connected_at), settled_at + ADMISSION_SETTLED_TTL
-        ), "same connection must not reopen admission payment solely because 15 minutes passed");
+        ledger.set_delivered(&peer, true);
+        assert_eq!(ledger.settled_coverage(
+            &peer, Some(connected_at), false, settled_at + ADMISSION_SETTLED_TTL - Duration::from_secs(1)
+        ), SettledCoverage::Covered);
+        assert_eq!(ledger.settled_coverage(
+            &peer, Some(connected_at), false, settled_at + ADMISSION_SETTLED_TTL
+        ), SettledCoverage::Covered, "same connection must not reopen admission payment solely because 15 minutes passed");
+    }
+
+    /// Review P1 (#100): a proof that never went out is unspent. However the
+    /// settlement time compares to the live connection, it is delivered, never
+    /// paid for again; only a proof that went out on an earlier connection
+    /// authorizes another admission.
+    #[test]
+    fn only_a_sent_proof_on_an_earlier_connection_authorizes_another_payment() {
+        let peer = NodeId::from_bytes([174; 32]);
+        let settled_at = Instant::now();
+        let replacement = settled_at + Duration::from_secs(1);
+        let mut ledger = AdmissionLedger::default();
+        assert_eq!(ledger.settled_coverage(&peer, Some(replacement), true, replacement), SettledCoverage::Covered, "the live flag wins");
+        assert_eq!(ledger.settled_coverage(&peer, Some(replacement), false, replacement), SettledCoverage::NoRecord);
+        ledger.record_settled(peer, settled_at);
+        assert_eq!(ledger.settled_coverage(&peer, Some(replacement), false, replacement), SettledCoverage::Unsent);
+        assert!(ledger.entries.contains_key(&peer), "unsent proof evidence is kept");
+        assert_eq!(ledger.settled_coverage(&peer, Some(replacement), true, replacement), SettledCoverage::Covered);
+        ledger.set_delivered(&peer, true);
+        assert_eq!(ledger.settled_coverage(&peer, Some(settled_at), false, replacement), SettledCoverage::Covered);
+        assert_eq!(ledger.settled_coverage(&peer, Some(replacement), false, replacement), SettledCoverage::Consumed);
+        assert_eq!(ledger.settled_coverage(&peer, Some(replacement), false, replacement), SettledCoverage::NoRecord);
     }
 }

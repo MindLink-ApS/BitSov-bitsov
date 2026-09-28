@@ -190,9 +190,103 @@ impl LightningProvider for Faulty {
     }
 }
 
+/// The reviewer's pause-after-mark hook, without touching production code:
+/// the payer's API sees its transport through [`Hooked`], which, when armed,
+/// suspends the compose task right after `mark_admission_paid` (before the
+/// proof is built and sent) until the test releases it. It changes no wallet,
+/// journal, transport or privilege state.
+#[derive(Default)]
+struct PauseAfterMark {
+    armed: std::sync::atomic::AtomicBool,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl PauseAfterMark {
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    async fn reached(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.reached.notified())
+            .await
+            .expect("compose reached mark_admission_paid");
+    }
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+/// The node's transport as its API sees it: pure delegation, plus the hook.
+struct Hooked {
+    inner: Arc<NoiseTransport>,
+    pause: Arc<PauseAfterMark>,
+}
+
+#[async_trait::async_trait]
+impl MessageTransport for Hooked {
+    async fn send(&self, peer: &NodeId, envelope: &konsensus_core::UkmEnvelope) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.send(peer, envelope).await
+    }
+    async fn recv(&self) -> Result<konsensus_core::UkmEnvelope, konsensus_core::traits::transport::TransportError> {
+        self.inner.recv().await
+    }
+    async fn connect(&self, peer: &NodeId, addr: &str) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.connect(peer, addr).await
+    }
+    async fn disconnect(&self, peer: &NodeId) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.disconnect(peer).await
+    }
+    async fn is_connected(&self, peer: &NodeId) -> bool {
+        self.inner.is_connected(peer).await
+    }
+    async fn connected_peers(&self) -> Vec<NodeId> {
+        self.inner.connected_peers().await
+    }
+    async fn request_peer_exchange(&self, peer: &NodeId) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.request_peer_exchange(peer).await
+    }
+    async fn send_raw_frame(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.send_raw_frame(peer, frame_bytes).await
+    }
+    async fn peer_info(&self, peer: &NodeId) -> Option<konsensus_core::traits::transport::ConnectedPeerInfo> {
+        self.inner.peer_info(peer).await
+    }
+    async fn connected_since(&self, peer: &NodeId) -> Option<std::time::Instant> {
+        self.inner.connected_since(peer).await
+    }
+    async fn admission_paid_on_connection(&self, peer: &NodeId) -> bool {
+        self.inner.admission_paid_on_connection(peer).await
+    }
+    async fn mark_admission_paid(&self, peer: &NodeId, since: std::time::Instant) {
+        self.inner.mark_admission_paid(peer, since).await;
+        if self.pause.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.pause.reached.notify_one();
+            self.pause.release.notified().await;
+        }
+    }
+    async fn send_on_connection(
+        &self,
+        peer: &NodeId,
+        since: Option<std::time::Instant>,
+        envelope: &konsensus_core::UkmEnvelope,
+    ) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        self.inner.send_on_connection(peer, since, envelope).await
+    }
+    async fn add_to_whitelist(&self, peer: &NodeId) {
+        self.inner.add_to_whitelist(peer).await
+    }
+    async fn remove_from_whitelist(&self, peer: &NodeId) {
+        self.inner.remove_from_whitelist(peer).await
+    }
+    async fn supervise_peer(&self, peer: &NodeId, addr: &str) {
+        self.inner.supervise_peer(peer, addr).await
+    }
+}
+
 /// One node: real session handler, real message handler, real API router.
 struct Node {
     id: NodeId,
+    pause: Arc<PauseAfterMark>,
     identity: Arc<NodeIdentity>,
     transport: Arc<NoiseTransport>,
     sessions: Arc<SessionManager>,
@@ -273,6 +367,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
     let send_timestamps = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_ln_pubkeys = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let (shutdown, shutdown_rx) = watch::channel(false);
+    let pause = Arc::new(PauseAfterMark::default());
     // As a node on a real backend: the gate checks settlement with the wallet,
     // so an unpaid envelope (e.g. the peer's mock-priced profile) promotes nothing.
     let gate = Arc::new(konsensus_core::PaymentGate::with_config(konsensus_core::gate::GateConfig {
@@ -288,7 +383,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         pricing: Arc::clone(&pricing),
         gate: Arc::clone(&gate),
         peer_registry: Arc::clone(&registry),
-        transport: Arc::clone(&transport) as Arc<dyn MessageTransport>,
+        transport: Arc::new(Hooked { inner: Arc::clone(&transport), pause: Arc::clone(&pause) }) as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&sessions),
         jwt_secret: JWT_SECRET.into(),
         auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -393,6 +488,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50_000))));
     Node {
         id,
+        pause,
         identity,
         transport,
         sessions,
@@ -456,7 +552,8 @@ impl Node {
         paid.into_iter().map(|(_, msat)| msat).collect()
     }
 
-    /// Fully privileged, or holding an admission we paid on the live connection.
+    /// Fully privileged (whitelisted or promoted by the peer's payment). An
+    /// admission WE paid does not count: see `paid_on_connection`.
     async fn privileged(&self, peer: &NodeId) -> bool {
         self.transport.connected_privileged_peers().await.contains(peer)
     }
@@ -685,9 +782,11 @@ async fn m4_retry_on_the_same_connection_does_not_repay() {
 }
 
 /// 5: the connection flaps after the admission settled, before its proof went
-/// out. Chosen behaviour (review item 7): the old proof is not re-sent on the
-/// new connection (the payee admits per connection and would refuse it as
-/// reused); the retry pays this connection's admission once and delivers.
+/// out. The proof never reached the payee, so it is unspent: the retry
+/// delivers it on the new connection and pays the message only (Codex review
+/// of b424ac5, P1: never pay again on settlement time vs connection time
+/// alone). A proof that DID go out on an older connection is covered by m9
+/// and the restart tests in `reconnect_recovery_tests.rs`.
 async fn retry_after_flap_readmits_once(order: Order) {
     let mark = log_mark();
     let mut net = pair(Shape::CardOnly, order, Wallet::FlapAfterFirstPayment, Wallet::Plain).await;
@@ -710,10 +809,10 @@ async fn retry_after_flap_readmits_once(order: Order) {
     net.payee.delivered_once("retry").await;
     assert_eq!(
         net.payer.paid_out().await,
-        vec![CHAT_MSAT; 3],
-        "one admission per connection, then the message; never two on one connection"
+        vec![CHAT_MSAT, CHAT_MSAT],
+        "the unsent admission proof admits the new connection; then the message"
     );
-    assert!(logged_since(mark, &["re-sent already-paid admission envelope", &format!("peer={payee}")]).is_empty());
+    assert_eq!(logged_since(mark, &["re-sent already-paid admission envelope", &format!("peer={payee}")]).len(), 1);
     net.stop();
 }
 
@@ -733,8 +832,9 @@ async fn m5_retry_after_flap_readmits_once_payee_initiates() {
 // `settled_on_connection`); a 15-minute wall-clock wait is not run here.
 
 /// 11: the payer restarts inside the window after a settled admission whose
-/// proof never went out. The journal is recovered, nothing is paid twice for
-/// one connection, and the new connection's first contact delivers.
+/// proof never went out. The journal is recovered with the proof marked
+/// unsent, so the new connection is admitted by that proof: nothing is paid
+/// twice, and the new connection's first contact delivers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn m11_payer_restart_inside_the_window_pays_once_per_connection() {
     let mut net = pair(Shape::CardOnly, Order::PayerHigher, Wallet::FlapAfterFirstPayment, Wallet::Plain).await;
@@ -764,7 +864,7 @@ async fn m11_payer_restart_inside_the_window_pays_once_per_connection() {
     let (status, body) = net.payer.compose(&payee, "after the restart").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     net.payee.delivered_once("after the restart").await;
-    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT; 3], "one admission per connection, then the message");
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT, CHAT_MSAT], "the one admission, then the message");
     net.stop();
 }
 
@@ -979,5 +1079,131 @@ async fn post_peers_whitelist_takes_effect_on_the_live_connection() {
     assert_eq!(status, StatusCode::OK, "{body}");
     net.payee.delivered_once("reply").await;
     assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT], "the message only, no admission");
+    net.stop();
+}
+
+// ── Codex review of b424ac5 ──────────────────────────────────────────────
+
+/// P1: the connection is replaced between `mark_admission_paid` and the proof
+/// send (the reviewer's pause-after-mark hook). The proof is bound to the
+/// marked generation, so it is NOT sent on the replacement; the first compose
+/// fails with the settled amount disclosed, the unspent proof is kept, and the
+/// retry delivers it on the replacement. Outgoing: one admission, one message.
+async fn replacement_between_mark_and_send_pays_admission_once(order: Order) {
+    let mut net = pair(Shape::CardOnly, order, Wallet::Plain, Wallet::Plain).await;
+    let (payer, payee) = (net.payer.id, net.payee.id);
+    let original = net.payer.transport.connected_since(&payee).await.unwrap();
+    net.payer.pause.arm();
+    let ((status, body), replacement) = tokio::join!(net.payer.compose(&payee, "first"), async {
+        net.payer.pause.reached().await;
+        assert!(net.payer.paid_on_connection(&payee).await, "marked before the pause");
+        net.flap().await;
+        let replacement = net.payer.transport.connected_since(&payee).await.unwrap();
+        assert_ne!(original, replacement, "a new generation");
+        assert!(!net.payer.paid_on_connection(&payee).await, "the mark died with its connection");
+        net.payer.pause.release();
+        replacement
+    });
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{order:?}: {body}");
+    assert_eq!(body["amount_msat"], CHAT_MSAT, "the settled admission is disclosed: {body}");
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT]);
+    // Nothing went out on the replacement: the payee has not been admitted on it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!net.payee.privileged(&payer).await, "{order:?}: the proof went out on the replacement");
+
+    let (status, body) = net.payer.compose(&payee, "retry").await;
+    assert_eq!(status, StatusCode::OK, "{order:?}: {body}");
+    assert_eq!(net.payer.transport.connected_since(&payee).await, Some(replacement), "no further reconnect");
+    net.payee.delivered_once("retry").await;
+    assert!(net.payer.paid_on_connection(&payee).await);
+    assert_eq!(
+        net.payer.paid_out().await,
+        vec![CHAT_MSAT, CHAT_MSAT],
+        "{order:?}: exactly one admission plus one message"
+    );
+    net.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p1_replacement_between_mark_and_send_pays_admission_once_payer_initiates() {
+    replacement_between_mark_and_send_pays_admission_once(Order::PayerLower).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p1_replacement_between_mark_and_send_pays_admission_once_payee_initiates() {
+    replacement_between_mark_and_send_pays_admission_once(Order::PayerHigher).await;
+}
+
+/// A self-signed envelope from `from` to `to` with a zero-amount proof over a
+/// preimage it made up: it never paid anything.
+fn unpaid_envelope(from: &Node, to: &NodeId, seed: u8) -> konsensus_core::UkmEnvelope {
+    use sha2::{Digest, Sha256};
+    let preimage = [seed; 32];
+    let hash: [u8; 32] = Sha256::digest(preimage).into();
+    let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CHAT,
+        from.id,
+        konsensus_core::types::Recipient::Node(*to),
+        b"underpaid".to_vec(),
+        konsensus_core::PaymentProof::new(hash, preimage, 0),
+    )
+    .build();
+    envelope.signature = konsensus_core::Signature::from_ed25519(&from.identity.sign(&envelope.signable_bytes()));
+    envelope
+}
+
+/// P2: a payee we paid (bought frames only, never privileged) sends us an
+/// unpaid envelope. It gets what any unpaid stranger gets: no rejection
+/// record, no MessageReject and no corrective price table. Control: once the
+/// owner privileges the payee, the same kind of envelope does get both, which
+/// also proves the first one was processed (the handler is in order).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2_paid_payee_gets_no_rejection_or_prices_for_an_unpaid_envelope() {
+    let mut net = pair(Shape::CardOnly, Order::PayerLower, Wallet::Plain, Wallet::Plain).await;
+    let (payer, payee) = (net.payer.id, net.payee.id);
+    let (status, body) = net.payer.compose(&payee, "hello").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    net.payee.delivered_once("hello").await;
+    assert!(net.payer.paid_on_connection(&payee).await);
+    assert!(!net.payer.privileged(&payee).await, "paying does not privilege the payee");
+    assert!(net.payee.paid_out().await.is_empty(), "the payee never paid the payer");
+
+    let mark = log_mark();
+    let unpaid = unpaid_envelope(&net.payee, &payer, 57);
+    net.payee.transport.send(&payer, &unpaid).await.unwrap();
+    // The gate logs every rejection, privileged or not: wait until the payer
+    // has refused it before privileging the payee for the control.
+    let gate_refusals = || logged_since(mark, &["rejected: insufficient payment", &format!("sender={payee}")]).len();
+    wait_until("the payer's gate refused the unpaid envelope", Duration::from_secs(5), || async { gate_refusals() == 1 }).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Control: the owner privileges the payee; its next unpaid envelope is answered.
+    let (status, body) = net
+        .payer
+        .post(
+            "/api/v1/peers",
+            serde_json::json!({ "node_id": payee.to_hex(), "addr": net.payee.addr(), "auto_connect": false }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let control = unpaid_envelope(&net.payee, &payer, 58);
+    net.payee.transport.send(&payer, &control).await.unwrap();
+    wait_until("the privileged control is answered", Duration::from_secs(5), || async {
+        !logged_since(mark, &["sent corrective price table after payment mismatch", &format!("peer={payee}")]).is_empty()
+    })
+    .await;
+
+    let rejected = logged_since(mark, &["payment gate REJECTED incoming message", &format!("sender={payee}")]);
+    assert_eq!(rejected.len(), 1, "only the privileged control is recorded: {rejected:?}");
+    let tables = logged_since(mark, &["sent corrective price table after payment mismatch", &format!("peer={payee}")]);
+    assert_eq!(tables.len(), 1, "only the privileged control gets prices: {tables:?}");
+    let rejects = |id: &konsensus_core::types::MessageId| {
+        logged_since(mark, &["message rejected by peer", &format!("peer={payer}"), &format!("msg_id={id}")]).len()
+    };
+    wait_until("the payee sees the control's MessageReject", Duration::from_secs(5), || async {
+        rejects(&control.id) > 0
+    })
+    .await;
+    assert_eq!(rejects(&unpaid.id), 0, "the unpaid envelope from the paid-for payee got a MessageReject");
     net.stop();
 }

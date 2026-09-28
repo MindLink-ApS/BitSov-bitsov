@@ -105,12 +105,12 @@ impl NoiseTransport {
     /// to every connected peer regardless of privilege (P2: no free X3DH before
     /// payment — no prekey before settlement).
     ///
-    /// BUG-PSI: also a peer whose admission WE settled on this live connection
-    /// (`Connection::admission_paid`). Self-heal then offers our prekey to the
-    /// node we paid — our own choice, and how the session forms when the payee
-    /// is the X3DH initiator. It never adds an unpaid stranger.
+    /// Strictly `conn.privileged`: security callers (the rejection/corrective
+    /// price-table gate in the message handler) rely on it. A peer whose
+    /// admission WE paid is NOT in this list; see [`connected_session_peers`].
     ///
     /// [`promote_to_privileged`]: NoiseTransport::promote_to_privileged
+    /// [`connected_session_peers`]: NoiseTransport::connected_session_peers
     pub async fn connected_privileged_peers(&self) -> Vec<NodeId> {
         // Scoped-clone the Arcs first so the `peers` read guard is not held across
         // each `conn.lock().await` (same lock-ordering discipline as `send_frame`
@@ -121,11 +121,35 @@ impl NoiseTransport {
         };
         let mut privileged = Vec::with_capacity(conns.len());
         for (id, conn) in conns {
-            if conn.admission_paid.load(std::sync::atomic::Ordering::Acquire) || conn.lock().await.privileged {
+            if conn.lock().await.privileged {
                 privileged.push(id);
             }
         }
         privileged
+    }
+
+    /// Connected peers eligible for E2EE session setup: privileged ones, plus
+    /// a peer whose admission WE settled on this live connection
+    /// (`Connection::admission_paid`, BUG-PSI). Offering our prekey to the node
+    /// we paid is our own choice and completes the act we bought; it is how
+    /// the session forms when the payee is the X3DH initiator.
+    ///
+    /// Use this ONLY for self-heal / prekey offers. It confers no other
+    /// authority: anything gated on privilege uses
+    /// [`connected_privileged_peers`](NoiseTransport::connected_privileged_peers).
+    /// It never adds an unpaid stranger.
+    pub async fn connected_session_peers(&self) -> Vec<NodeId> {
+        let conns: Vec<(NodeId, Arc<Connection>)> = {
+            let peers = self.peers.read().await;
+            peers.iter().map(|(id, c)| (*id, Arc::clone(c))).collect()
+        };
+        let mut eligible = Vec::with_capacity(conns.len());
+        for (id, conn) in conns {
+            if conn.admission_paid.load(std::sync::atomic::Ordering::Acquire) || conn.lock().await.privileged {
+                eligible.push(id);
+            }
+        }
+        eligible
     }
 
     /// Send raw bytes to a peer (for testing frame validation budget).
