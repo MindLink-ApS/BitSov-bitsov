@@ -653,7 +653,7 @@ pub(crate) async fn approve_owner(
         pending.state = KitState::Paying;
         pending.approved_at = Some(now);
         pending.reserved_msat = kit.gift_msat.saturating_add(kit.fee_msat);
-        let debit = auth.debit_linked(&state, vec![Charge { recipient: payee, amount_msat: gift_msat }], |reservation| {
+        let debit = auth.debit_linked(&state, vec![Charge { recipient: payee, amount_msat: gift_msat.saturating_add(kit.fee_msat) }], |reservation| {
             ledger.kit_mut(&body.intro_id).map_err(|e| BudgetRefusal::Ledger(e.to_string()))?
                 .grant_reservation = reservation.cloned();
             save(&dir, &ledger).map_err(|e| BudgetRefusal::Ledger(e.to_string()))
@@ -764,7 +764,7 @@ fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>
 /// and idempotent; retrying a terminal kit repairs a failed grant-store write.
 fn resolve_grant(state: &AppState, kit: &Kit) {
     let actual = match kit.state {
-        KitState::Funded => kit.paid_msat,
+        KitState::Funded if kit.reserved_msat == 0 => kit.paid_msat.saturating_add(kit.fee_paid_msat),
         KitState::Failed => 0,
         _ => return,
     };

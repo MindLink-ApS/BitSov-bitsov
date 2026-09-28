@@ -150,7 +150,7 @@ fn manifest_lists_files() {
     std::fs::write(dir.path().join("index.md"), "# Home\n\nWelcome").unwrap();
     std::fs::write(dir.path().join("about.md"), "# About\n\nInfo").unwrap();
     std::fs::write(dir.path().join("notes.txt"), "Some notes").unwrap();
-    std::fs::write(dir.path().join("image.png"), &[0u8; 10]).unwrap(); // not served
+    std::fs::write(dir.path().join("image.png"), [0u8; 10]).unwrap(); // not served
 
     let manifest = server.build_manifest(942_000, 50);
 
@@ -436,9 +436,9 @@ fn manifest_file_without_h1_uses_filename() {
 #[test]
 fn manifest_ignores_non_text_files() {
     let (dir, server) = setup();
-    std::fs::write(dir.path().join("image.png"), &[0u8; 10]).unwrap();
+    std::fs::write(dir.path().join("image.png"), [0u8; 10]).unwrap();
     std::fs::write(dir.path().join("data.json"), "{}").unwrap();
-    std::fs::write(dir.path().join("binary.bin"), &[0xFF; 10]).unwrap();
+    std::fs::write(dir.path().join("binary.bin"), [0xFF; 10]).unwrap();
     std::fs::write(dir.path().join("actual.md"), "# Real Page").unwrap();
 
     let manifest = server.build_manifest(0, 50);

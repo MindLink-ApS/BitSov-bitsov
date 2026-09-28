@@ -315,9 +315,7 @@ pub(super) fn spawn_reader_task(
             // BUG-PSI: `bought` also admits the frames of a peer whose admission
             // WE settled on this connection (`admission_paid`, set before our
             // proof goes out): the replies that complete the act we paid for —
-            // its session handshake and its prices. ACK/reject events retain
-            // strict privilege: the outbox handler accepts matching deliveries
-            // without granting paid payees routing weights or unlimited DB work.
+            // its session handshake, acks/rejects of our messages and its prices.
             // Every other frame (peer exchange, Lightning info, gossip, price
             // queries, invoice requests) keeps plain `privileged`.
             let (privileged, bought, source_ip) = {
@@ -367,7 +365,7 @@ pub(super) fn spawn_reader_task(
                             duplicate,
                             peer_id,
                             message_id: id,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -381,7 +379,7 @@ pub(super) fn spawn_reader_task(
                             peer_id,
                             message_id: id,
                             reason,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {

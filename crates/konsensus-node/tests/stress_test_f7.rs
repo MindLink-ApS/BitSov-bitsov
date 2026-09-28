@@ -211,9 +211,9 @@ impl konsensus_core::gate::NonceStore for InMemoryNonceStore {
 
 struct MessageTiming {
     /// Index of this message (0-based)
-    index: usize,
+    _index: usize,
     /// Direction: true = alpha→beta, false = beta→alpha
-    alpha_to_beta: bool,
+    _alpha_to_beta: bool,
     /// Round-trip from send() call to recv() returning the envelope
     message_latency_ms: u128,
     /// Time to run payment gate verification
@@ -221,7 +221,7 @@ struct MessageTiming {
     /// Whether all checks passed
     ok: bool,
     /// Failure note if any
-    failure: Option<String>,
+    _failure: Option<String>,
 }
 
 // ── Main stress test ──────────────────────────────────────────────────────────
@@ -289,7 +289,7 @@ async fn f7_stress_20_messages_alternating() {
         let send_start = Instant::now();
 
         // Encrypt and send
-        let (envelope, receiver_transport, receiver_session, sender_id, receiver_id, nonce_store, whitelist) =
+        let (envelope, receiver_transport, receiver_session, sender_id, _receiver_id, nonce_store, whitelist) =
             if alpha_to_beta {
                 let rm = session_alpha.encrypt(&beta_id, plaintext_bytes).await.unwrap();
                 let ct = ratchet_message_to_bytes(&rm);
@@ -331,12 +331,12 @@ async fn f7_stress_20_messages_alternating() {
                 eprintln!("  FAIL: {msg}");
                 failures.push(msg.clone());
                 timings.push(MessageTiming {
-                    index: i,
-                    alpha_to_beta,
+                    _index: i,
+                    _alpha_to_beta: alpha_to_beta,
                     message_latency_ms,
                     payment_verify_ms: 0,
                     ok: false,
-                    failure: Some(msg),
+                    _failure: Some(msg),
                 });
                 continue;
             }
@@ -345,12 +345,12 @@ async fn f7_stress_20_messages_alternating() {
                 eprintln!("  FAIL: {msg}");
                 failures.push(msg.clone());
                 timings.push(MessageTiming {
-                    index: i,
-                    alpha_to_beta,
+                    _index: i,
+                    _alpha_to_beta: alpha_to_beta,
                     message_latency_ms,
                     payment_verify_ms: 0,
                     ok: false,
-                    failure: Some(msg),
+                    _failure: Some(msg),
                 });
                 continue;
             }
@@ -365,12 +365,12 @@ async fn f7_stress_20_messages_alternating() {
             eprintln!("  FAIL: {msg}");
             failures.push(msg.clone());
             timings.push(MessageTiming {
-                index: i,
-                alpha_to_beta,
+                _index: i,
+                _alpha_to_beta: alpha_to_beta,
                 message_latency_ms,
                 payment_verify_ms: 0,
                 ok: false,
-                failure: Some(msg),
+                _failure: Some(msg),
             });
             continue;
         }
@@ -380,12 +380,12 @@ async fn f7_stress_20_messages_alternating() {
             eprintln!("  FAIL: {msg}");
             failures.push(msg.clone());
             timings.push(MessageTiming {
-                index: i,
-                alpha_to_beta,
+                _index: i,
+                _alpha_to_beta: alpha_to_beta,
                 message_latency_ms,
                 payment_verify_ms: 0,
                 ok: false,
-                failure: Some(msg),
+                _failure: Some(msg),
             });
             continue;
         }
@@ -423,12 +423,12 @@ async fn f7_stress_20_messages_alternating() {
                     eprintln!("  FAIL: {msg}");
                     failures.push(msg.clone());
                     timings.push(MessageTiming {
-                        index: i,
-                        alpha_to_beta,
+                        _index: i,
+                        _alpha_to_beta: alpha_to_beta,
                         message_latency_ms,
                         payment_verify_ms,
                         ok: false,
-                        failure: Some(msg),
+                        _failure: Some(msg),
                     });
                     continue;
                 }
@@ -459,12 +459,12 @@ async fn f7_stress_20_messages_alternating() {
         }
 
         timings.push(MessageTiming {
-            index: i,
-            alpha_to_beta,
+            _index: i,
+            _alpha_to_beta: alpha_to_beta,
             message_latency_ms,
             payment_verify_ms,
             ok,
-            failure,
+            _failure: failure,
         });
     }
 

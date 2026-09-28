@@ -308,14 +308,14 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
             println!("  1. Run: konsensus start -c {}", config_path.display());
             println!("     (starts with mock Lightning — works immediately)");
             println!("  2. Edit {} for production:", config_path.display());
-            println!("     - Switch lightning backend to 'ldk', 'lnbits', or another provider you control");
+            println!("     - Switch lightning backend to 'ldk' or 'lnd' with a node you control");
             println!("     - Add peer entries for nodes you want to connect to");
         }
         NodeTier::Full => {
             println!("Next steps:");
-            println!("  1. Set up LND or CLN for Lightning payments");
+            println!("  1. Use embedded LDK or set up your own LND for Lightning payments");
             println!("  2. Edit {} to configure:", config_path.display());
-            println!("     - Switch lightning backend to 'lnbits' (pointing to your LND)");
+            println!("     - Keep lightning backend 'ldk', or use 'lnd' for direct LND REST access");
             println!("     - Chain backend is set to 'esplora'; use your own provider for full sovereignty");
             println!("     - Storage encryption is ON by default");
             println!("  3. Run: konsensus start -c {}", config_path.display());
@@ -702,10 +702,33 @@ async fn cmd_start(
         "starting konsensus node"
     );
 
-    // Build the node
-    let node = KonsensusNode::from_config(config.clone(), mnemonic_password.as_deref())
-        .await
-        .context("failed to build node")?;
+    // Install shutdown handling before construction: startup may now be waiting
+    // in bounded chain-source backoff. Dropping construction cancels that retry;
+    // readiness/API serving is only established after construction succeeds.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install SIGTERM handler")?;
+    let shutdown_signal = async {
+        #[cfg(unix)]
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("failed to listen for Ctrl+C"),
+            _ = sigterm.recv() => Ok(()),
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await.context("failed to listen for Ctrl+C")
+    };
+    tokio::pin!(shutdown_signal);
+    let node = tokio::select! {
+        biased;
+        result = &mut shutdown_signal => {
+            result?;
+            info!(code = "BOOT_CANCELLED", "startup cancelled before readiness");
+            return Ok(());
+        }
+        result = KonsensusNode::from_config(config.clone(), mnemonic_password.as_deref()) => {
+            result.context("failed to build node")?
+        }
+    };
 
     info!(node_id = %node.node_id(), "node built");
 
@@ -732,14 +755,14 @@ async fn cmd_start(
                         "Cloud tier: check your hosted node URL and ensure the service is running."
                     }
                     crate::config::NodeTier::Light => {
-                        "Light tier: check your LNbits API URL and admin key in konsensus.toml.\n  \
+                        "Light tier: check your LDK or LND settings in konsensus.toml.\n  \
                          If using hosted Lightning, ensure your configured provider is reachable.\n  \
                          You can switch to mock Lightning for testing: set [lightning] backend = \"mock\"."
                     }
                     crate::config::NodeTier::Full => {
                         "Full tier: LDK embedded Lightning is enabled by default. Your node IS its own Lightning node.\n  \
                          Keys are derived from your mnemonic. Fund the on-chain wallet to open channels.\n  \
-                         To use LNbits instead, edit konsensus.toml and set [lightning] backend = \"lnbits\"."
+                         To use your own LND instead, set [lightning] backend = \"lnd\" and configure its REST credentials."
                     }
                 };
                 warn!(
@@ -1219,7 +1242,7 @@ async fn cmd_start(
             tier = ?config.tier,
             "running with mock Lightning — payments are simulated. \
              Edit konsensus.toml to configure a real Lightning backend \
-             (LNbits or LDK) for production use."
+             (LDK or LND) for production use. LNbits cannot enforce routing-fee ceilings and is rejected at startup."
         );
     }
 
@@ -1228,38 +1251,11 @@ async fn cmd_start(
     // SIGINT is Ctrl+C in a terminal.
     // API fatal error means the API server could not start (e.g. port in use)
     // and the node is unusable without it.
-    {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate())
-                .context("failed to install SIGTERM handler")?;
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("received SIGINT (Ctrl+C)");
-                }
-                _ = sigterm.recv() => {
-                    info!("received SIGTERM");
-                }
-                result = api_fatal_rx => {
-                    if let Ok(err_msg) = result {
-                        error!(error = %err_msg, "API server failed to start — shutting down node");
-                    }
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::select! {
-                result = tokio::signal::ctrl_c() => {
-                    result.context("failed to listen for Ctrl+C")?;
-                    info!("received SIGINT (Ctrl+C)");
-                }
-                result = api_fatal_rx => {
-                    if let Ok(err_msg) = result {
-                        error!(error = %err_msg, "API server failed to start — shutting down node");
-                    }
-                }
+    tokio::select! {
+        result = &mut shutdown_signal => { result?; }
+        result = api_fatal_rx => {
+            if let Ok(err_msg) = result {
+                error!(error = %err_msg, "API server failed to start — shutting down node");
             }
         }
     }

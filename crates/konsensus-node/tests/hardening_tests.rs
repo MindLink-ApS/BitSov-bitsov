@@ -154,7 +154,7 @@ fn content_server_binary_file_rejected_from_manifest() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("image.png"),
-        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
     )
     .unwrap();
     std::fs::write(dir.path().join("page.md"), "# Test\nContent").unwrap();

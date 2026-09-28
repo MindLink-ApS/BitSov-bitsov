@@ -46,7 +46,9 @@ pub struct LndConfig {
 /// run their own LND daemon.
 pub struct LndProvider {
     config: LndConfig,
+    routing_fee_policy: konsensus_core::traits::lightning::RoutingFeePolicy,
     client: Client,
+    invoice_attempts: tokio::sync::Mutex<std::collections::HashSet<String>>,
     /// Set to `false` when a payment fails due to wallet/channel issues.
     /// Reset to `true` on successful payment.
     pub(crate) payment_capable: AtomicBool,
@@ -95,8 +97,8 @@ struct SendPaymentRequest {
     payment_request: String,
     /// Timeout in seconds for finding a route.
     timeout_seconds: String,
-    /// Maximum fee in satoshis.
-    fee_limit_sat: String,
+    /// Maximum total routing fee in millisatoshis (including an explicit zero).
+    fee_limit_msat: String,
 }
 
 /// Response from POST /v2/router/send (streaming, we read first line).
@@ -207,6 +209,36 @@ struct LndPaymentEntry {
 }
 
 impl LndProvider {
+    pub fn with_routing_fee_policy(mut self, policy: konsensus_core::traits::lightning::RoutingFeePolicy) -> Self {
+        self.routing_fee_policy = policy;
+        self
+    }
+
+    /// Track exactly this outgoing hash. Only LND's explicit NOT_FOUND permits
+    /// a fresh dispatch. Read one JSON frame: tracking a live payment never ends.
+    async fn require_fresh_invoice(&self, hash: &[u8]) -> Result<(), LightningError> {
+        use base64::Engine;
+        let hash = base64::engine::general_purpose::URL_SAFE.encode(hash);
+        let mut response = self.client.get(self.api_url(&format!("/v2/router/track/{hash}?no_inflight_updates=false")))
+            .header("Grpc-Metadata-macaroon", &self.config.macaroon_hex).send().await
+            .map_err(|e| LightningError::PaymentNotDispatched(format!("cannot verify fresh invoice: {e}")))?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| LightningError::PaymentNotDispatched(e.to_string()))? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > 16384 { break; }
+            let first = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
+            if let Ok(frame) = serde_json::from_slice::<serde_json::Value>(first) {
+                let code = frame.get("code").or_else(|| frame.get("error").and_then(|e| e.get("code"))).and_then(|c| c.as_i64());
+                if (status.is_success() || status == reqwest::StatusCode::NOT_FOUND) && code == Some(5) {
+                    return Ok(());
+                }
+                return Err(LightningError::PaymentNotDispatched("capped payments require a fresh invoice hash; track/reconcile existing payments".into()));
+            }
+        }
+        Err(LightningError::PaymentNotDispatched("cannot verify fresh invoice: missing or invalid LND tracking response".into()))
+    }
+
     /// Create a new LND provider with the given configuration.
     ///
     /// If `tls_cert_path` is provided, the custom CA cert is added to the
@@ -241,7 +273,9 @@ impl LndProvider {
 
         Ok(Self {
             config,
+            routing_fee_policy: Default::default(),
             client,
+            invoice_attempts: Default::default(),
             payment_capable: AtomicBool::new(true),
         })
     }
@@ -250,7 +284,9 @@ impl LndProvider {
     pub fn with_client(config: LndConfig, client: Client) -> Self {
         Self {
             config,
+            routing_fee_policy: Default::default(),
             client,
+            invoice_attempts: Default::default(),
             payment_capable: AtomicBool::new(true),
         }
     }
@@ -434,10 +470,37 @@ impl LightningProvider for LndProvider {
 
     #[instrument(skip(self, bolt11))]
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+        let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse()
+            .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
+        let amount = invoice.amount_milli_satoshis()
+            .ok_or_else(|| LightningError::PaymentNotDispatched("amountless invoice".into()))?;
+        self.pay_invoice_with_fee_limit(bolt11, self.routing_fee_policy.ceiling(amount, None)).await
+    }
+
+    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy { self.routing_fee_policy }
+
+    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
+        use bitcoin::hashes::Hash;
+        let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse()
+            .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
+        if invoice.amount_milli_satoshis().is_none() {
+            return Err(LightningError::PaymentNotDispatched("amountless invoice".into()));
+        }
+        let hash = invoice.payment_hash().to_string();
+        let mut attempts = self.invoice_attempts.lock().await;
+        if attempts.contains(&hash) {
+            return Err(LightningError::PaymentNotDispatched("capped payments require a fresh invoice hash".into()));
+        }
+        self.require_fresh_invoice(invoice.payment_hash().as_byte_array()).await?;
+        // Mark BEFORE POST: cancellation or an ambiguous response cannot retry
+        // while LND may still be processing the first request.
+        attempts.insert(hash);
+        drop(attempts); // Unrelated invoices must not wait for this payment stream.
+
         let body = SendPaymentRequest {
             payment_request: bolt11.to_string(),
             timeout_seconds: "60".to_string(),
-            fee_limit_sat: "100".to_string(),
+            fee_limit_msat: max_fee_msat.to_string(),
         };
 
         // POST /v2/router/send returns a streaming response.
@@ -492,12 +555,6 @@ impl LightningProvider for LndProvider {
 
         let status_str = result.status.as_deref().unwrap_or("UNKNOWN");
         let status = Self::payment_status_to_status(status_str);
-
-        if status == PaymentStatus::Failed {
-            return Err(LightningError::PaymentFailed(format!(
-                "payment failed with status: {status_str}"
-            )));
-        }
 
         // Successful payment — mark as capable
         self.payment_capable.store(true, Ordering::Relaxed);
@@ -818,6 +875,12 @@ impl LightningProvider for LndProvider {
         amount_msat: u64,
         memo: Option<&str>,
     ) -> Result<PaymentDetails, LightningError> {
+        self.keysend_with_fee_limit(dest_pubkey, amount_msat, memo, self.routing_fee_policy.ceiling(amount_msat, None)).await
+    }
+
+    async fn keysend_with_fee_limit(
+        &self, dest_pubkey: &str, amount_msat: u64, memo: Option<&str>, max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
         // Generate random preimage for keysend
         let preimage_bytes: [u8; 32] = rand::random();
         let preimage_hex = hex::encode(preimage_bytes);
@@ -859,7 +922,7 @@ impl LightningProvider for LndProvider {
             dest: dest_b64,
             amt_msat: amount_msat.to_string(),
             timeout_seconds: "60".to_string(),
-            fee_limit_msat: "10000".to_string(),
+            fee_limit_msat: max_fee_msat.to_string(),
             payment_hash: payment_hash_b64,
             dest_custom_records: custom_records,
         };
@@ -906,12 +969,6 @@ impl LightningProvider for LndProvider {
 
         let status_str = result.status.as_deref().unwrap_or("UNKNOWN");
         let status = Self::payment_status_to_status(status_str);
-
-        if status == PaymentStatus::Failed {
-            return Err(LightningError::PaymentFailed(format!(
-                "keysend failed with status: {status_str}"
-            )));
-        }
 
         self.payment_capable.store(true, Ordering::Relaxed);
 

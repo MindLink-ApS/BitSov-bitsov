@@ -25,7 +25,7 @@ use konsensus_storage::{CalendarEventRecord, RsvpRecord};
 
 use crate::audit::events;
 use crate::error::ApiError;
-use crate::handlers::messages::create_payment_proof;
+use crate::handlers::messages::create_payment_proof_with_fee_report;
 use crate::state::AppState;
 
 const MAX_CALENDAR_LIST_RECURRING_MASTERS: usize = 512;
@@ -236,6 +236,7 @@ impl TryFrom<CalendarEventRecord> for EventResponse {
 /// Response for create / update operations.
 #[derive(Serialize)]
 pub struct EventActionResponse {
+    pub max_routing_fee_msat: u64,
     pub event_id: String,
     pub message_id: Option<String>,
     pub delivered_to: Vec<String>,
@@ -246,6 +247,7 @@ pub struct EventActionResponse {
 /// Response for RSVP.
 #[derive(Serialize)]
 pub struct RsvpActionResponse {
+    pub max_routing_fee_msat: u64,
     pub event_id: String,
     pub response: String,
     pub message_id: String,
@@ -531,6 +533,8 @@ async fn create_event(
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
     // Send to each attendee
+    let mut max_routing_fee_msat: u64 = 0;
+    let result = async {
     let mut delivered_to = Vec::new();
     let mut queued_for = Vec::new();
     let mut total_msat: u64 = 0;
@@ -573,8 +577,14 @@ async fn create_event(
             .await
             .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
 
-        let (payment_hash, preimage, amount_msat) =
-            create_payment_proof(&state, price_msat, peer_id).await?;
+        let paid = create_payment_proof_with_fee_report(&state, price_msat, peer_id).await;
+        let fee_ceiling = match &paid {
+            Ok((_, fee)) => *fee,
+            Err(ApiError::RoutingFee { max_routing_fee_msat, .. }) => *max_routing_fee_msat,
+            Err(_) => 0,
+        };
+        max_routing_fee_msat = max_routing_fee_msat.saturating_add(fee_ceiling);
+        let ((payment_hash, preimage, amount_msat), _) = paid?;
         let proof = konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
 
         let sender = *state.identity.node_id();
@@ -631,12 +641,15 @@ async fn create_event(
     );
 
     Ok(Json(EventActionResponse {
+        max_routing_fee_msat,
         event_id,
         message_id: last_message_id,
         delivered_to,
         queued_for,
         amount_msat: total_msat,
     }))
+    }.await;
+    result.map_err(|error: ApiError| error.with_routing_fee(max_routing_fee_msat))
 }
 
 /// `PUT /api/v1/calendar/events/:id` — update an event and notify attendees.
@@ -718,6 +731,8 @@ async fn update_event(
         .filter_map(|a| NodeId::from_hex(a).ok())
         .collect();
 
+    let mut max_routing_fee_msat: u64 = 0;
+    let result = async {
     let mut delivered_to = Vec::new();
     let mut queued_for = Vec::new();
     let mut total_msat: u64 = 0;
@@ -754,8 +769,14 @@ async fn update_event(
             .get_price_msat(KIND_CALENDAR_UPDATE)
             .await
             .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
-        let (payment_hash, preimage, amount_msat) =
-            create_payment_proof(&state, price_msat, peer_id).await?;
+        let paid = create_payment_proof_with_fee_report(&state, price_msat, peer_id).await;
+        let fee_ceiling = match &paid {
+            Ok((_, fee)) => *fee,
+            Err(ApiError::RoutingFee { max_routing_fee_msat, .. }) => *max_routing_fee_msat,
+            Err(_) => 0,
+        };
+        max_routing_fee_msat = max_routing_fee_msat.saturating_add(fee_ceiling);
+        let ((payment_hash, preimage, amount_msat), _) = paid?;
         let proof = konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
 
         let sender = *state.identity.node_id();
@@ -799,12 +820,15 @@ async fn update_event(
     }
 
     Ok(Json(EventActionResponse {
+        max_routing_fee_msat,
         event_id,
         message_id: last_message_id,
         delivered_to,
         queued_for,
         amount_msat: total_msat,
     }))
+    }.await;
+    result.map_err(|error: ApiError| error.with_routing_fee(max_routing_fee_msat))
 }
 
 /// `DELETE /api/v1/calendar/events/:id` — delete a local event record.
@@ -886,8 +910,9 @@ async fn create_rsvp(
         .get_price_msat(KIND_RSVP)
         .await
         .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
-    let (payment_hash, preimage, amount_msat) =
-        create_payment_proof(&state, price_msat, &organizer_id).await?;
+    let ((payment_hash, preimage, amount_msat), max_routing_fee_msat) =
+        create_payment_proof_with_fee_report(&state, price_msat, &organizer_id).await?;
+    let result = async {
     let proof = konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
 
     let sender = *state.identity.node_id();
@@ -953,12 +978,15 @@ async fn create_rsvp(
     );
 
     Ok(Json(RsvpActionResponse {
+        max_routing_fee_msat,
         event_id,
         response: response_str,
         message_id: msg_id_hex,
         delivered,
         amount_msat,
     }))
+    }.await;
+    result.map_err(|error: ApiError| error.with_routing_fee(max_routing_fee_msat))
 }
 
 /// Register calendar routes.

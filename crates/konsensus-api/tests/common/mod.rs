@@ -1,4 +1,6 @@
 #![allow(unused_imports)]
+// Each integration test compiles this shared fixture module independently.
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +37,7 @@ use konsensus_api::state::AppState;
 // ─── Stub: In-memory Storage ────────────────────────────────────────
 
 pub struct MemStorage {
+    calendar: Mutex<HashMap<String, konsensus_storage::calendar::CalendarEventRecord>>,
     messages: Mutex<HashMap<String, UkmEnvelope>>,
     /// AES-GCM-encrypted plaintext blobs keyed by message id hex (mirrors prod).
     message_plaintext: Mutex<HashMap<String, Vec<u8>>>,
@@ -52,6 +55,7 @@ pub struct MemStorage {
 impl MemStorage {
     pub fn new() -> Self {
         Self {
+            calendar: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             message_plaintext: Mutex::new(HashMap::new()),
             rooms: Mutex::new(HashMap::new()),
@@ -80,6 +84,14 @@ impl MemStorage {
 
 #[async_trait]
 impl Storage for MemStorage {
+    async fn store_calendar_event(&self, event: &konsensus_storage::calendar::CalendarEventRecord) -> Result<(), StorageError> {
+        self.calendar.lock().unwrap().insert(event.id.clone(), event.clone());
+        Ok(())
+    }
+    async fn get_calendar_event(&self, id: &str) -> Result<Option<konsensus_storage::calendar::CalendarEventRecord>, StorageError> {
+        Ok(self.calendar.lock().unwrap().get(id).cloned())
+    }
+
     async fn invite_schema_capabilities(&self) -> Result<InviteSchemaCapabilities, StorageError> {
         Ok(self.invite_schema_capabilities)
     }
@@ -584,6 +596,14 @@ pub struct StubLightning;
 
 #[async_trait]
 impl LightningProvider for StubLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn create_invoice(
         &self,
         amount_msat: u64,
@@ -610,7 +630,7 @@ impl LightningProvider for StubLightning {
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
             memo: None,
-            fee_msat: None,
+            fee_msat: Some(0),
         })
     }
 
@@ -626,7 +646,7 @@ impl LightningProvider for StubLightning {
             direction: PaymentDirection::Incoming,
             timestamp: 1_700_000_000,
             memo: None,
-            fee_msat: None,
+            fee_msat: Some(0),
         })
     }
 
@@ -675,7 +695,7 @@ impl LightningProvider for StubLightning {
             direction: PaymentDirection::Outgoing,
             timestamp: 1_700_000_000,
             memo: None,
-            fee_msat: Some(1),
+            fee_msat: Some(0),
         })
     }
 
@@ -701,10 +721,16 @@ impl LightningProvider for StubLightning {
         _peer_pubkey: &str,
         _peer_addr: &str,
         _amount_sats: u64,
-        _announce: bool,
-        _fee_rate_sat_per_vb: Option<f32>,
+        announce: bool,
+        fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        Ok("stub-channel-id".into())
+        // Model LDK's unsupported fee override rather than false success.
+        if fee_rate_sat_per_vb.is_some() {
+            return Err(LightningError::PaymentNotDispatched(
+                "stub cannot enforce a per-channel funding fee rate".into(),
+            ));
+        }
+        Ok(if announce { "stub-announced-channel-id" } else { "stub-channel-id" }.into())
     }
 
     async fn close_channel(
@@ -1118,15 +1144,16 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
 // this transport tracks which peers are "connected" and records sent
 // envelopes/frames for verification.
 
+type InvoiceResponder =
+    dyn Fn(String, u64) -> Option<konsensus_api::state::InvoiceResponseData> + Send + Sync;
+
 pub struct ConnectedStubTransport {
     pub connected: std::sync::Mutex<std::collections::HashSet<NodeId>>,
     pub sent_envelopes: std::sync::Mutex<Vec<(NodeId, UkmEnvelope)>>,
     /// Invoice request fulfiller: when send_raw_frame receives a
     /// RequestInvoice frame, this closure produces the InvoiceResponseData.
     /// Used to simulate the peer responding to invoice requests.
-    pub invoice_responder: Option<
-        Box<dyn Fn(String, u64) -> Option<konsensus_api::state::InvoiceResponseData> + Send + Sync>,
-    >,
+    pub invoice_responder: Option<Box<InvoiceResponder>>,
     /// Shared reference to the invoice_requests map so the transport can
     /// fulfill pending requests (simulating the peer responding).
     pub invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
@@ -1196,27 +1223,25 @@ impl MessageTransport for ConnectedStubTransport {
         frame_bytes: &[u8],
     ) -> Result<(), TransportError> {
         // Parse the frame to detect invoice requests and auto-respond.
-        if let Ok(frame) = konsensus_message::wire::Frame::from_bytes(frame_bytes) {
-            if let konsensus_message::wire::Frame::RequestInvoice {
-                ref request_id,
-                amount_msat,
-                ..
-            } = frame
-            {
-                if let Some(ref responder) = self.invoice_responder {
-                    if let Some(response_data) = responder(request_id.clone(), amount_msat) {
-                        let invoice_requests = Arc::clone(&self.invoice_requests);
-                        let req_id = request_id.clone();
-                        // Fulfill the pending request asynchronously.
-                        tokio::spawn(async move {
-                            // Brief delay to simulate network round-trip.
-                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                            let mut map = invoice_requests.lock().await;
-                            if let Some(tx) = map.remove(&req_id) {
-                                let _ = tx.send(Ok(response_data));
-                            }
-                        });
-                    }
+        if let Ok(konsensus_message::wire::Frame::RequestInvoice {
+            ref request_id,
+            amount_msat,
+            ..
+        }) = konsensus_message::wire::Frame::from_bytes(frame_bytes)
+        {
+            if let Some(ref responder) = self.invoice_responder {
+                if let Some(response_data) = responder(request_id.clone(), amount_msat) {
+                    let invoice_requests = Arc::clone(&self.invoice_requests);
+                    let req_id = request_id.clone();
+                    // Fulfill the pending request asynchronously.
+                    tokio::spawn(async move {
+                        // Brief delay to simulate network round-trip.
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        let mut map = invoice_requests.lock().await;
+                        if let Some(tx) = map.remove(&req_id) {
+                            let _ = tx.send(Ok(response_data));
+                        }
+                    });
                 }
             }
         }
@@ -1431,6 +1456,14 @@ impl CountingLightning {
 
 #[async_trait]
 impl LightningProvider for CountingLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
     async fn create_invoice(
         &self,
         amount_msat: u64,

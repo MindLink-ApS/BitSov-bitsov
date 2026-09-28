@@ -57,7 +57,7 @@ pub const FIRST_CONTACT_GRANT_TTL_SECS: i64 = 120;
 pub const FIRST_CONTACT_MAX_MSAT: u64 = 100_000;
 
 /// The owner's one-time OK to pay a first contact to exactly one recipient,
-/// for at most `max_total_msat` (admission plus the first message).
+/// for at most `max_total_msat` (admission, first message, and both routing fees).
 ///
 /// First contact is never paid from a budget on its own: every new contact
 /// needs one of these, issued only while the client holds a live budget grant
@@ -69,7 +69,7 @@ pub const FIRST_CONTACT_MAX_MSAT: u64 = 100_000;
 pub struct FirstContactGrant {
     /// Canonical recipient key (lowercase hex node id).
     pub recipient: String,
-    /// Admission plus first message, msat.
+    /// Admission plus first message and approved routing fees, msat.
     pub max_total_msat: u64,
     /// Absolute expiry, unix seconds.
     pub expires_at: i64,
@@ -321,8 +321,7 @@ impl GrantBudget {
 pub struct Charge {
     /// Canonical recipient key (see [`canonical_recipient`]).
     pub recipient: String,
-    /// Principal, msat. Routing fees are provider-controlled and, as in the
-    /// #80 caps, not part of the principal.
+    /// All-in maximum wallet debit, including approved routing fees, msat.
     pub amount_msat: u64,
 }
 

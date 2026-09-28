@@ -2663,16 +2663,15 @@ mod tests {
         transport_b.shutdown();
     }
 
-    /// Each frame B can send A, and whether it needs bought session eligibility.
-    /// Delivery confirmations carry strict privilege and are matched to the outbox.
+    /// Each frame B can send A, and whether it completes an act A paid for.
     fn frames_from_payee(payee: &NodeIdentity, payer: &NodeId) -> Vec<(Frame, bool)> {
         vec![
             (Frame::PrekeyOffer { bundle: serde_json::json!({}) }, true),
             (Frame::SessionInit { init_data: serde_json::json!({}) }, true),
             (Frame::SessionAck, true),
             (Frame::RatchetInit { payload: vec![1, 2, 3] }, true),
-            (Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([1u8; 32]), duplicate: false }, false),
-            (Frame::MessageReject { id: konsensus_core::types::MessageId::from_bytes([2u8; 32]), reason: "r".into() }, false),
+            (Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([1u8; 32]), duplicate: false }, true),
+            (Frame::MessageReject { id: konsensus_core::types::MessageId::from_bytes([2u8; 32]), reason: "r".into() }, true),
             (
                 Frame::PriceTable {
                     prices: HashMap::from([("chat".to_string(), 2_000)]),

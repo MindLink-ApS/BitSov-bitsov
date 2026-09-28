@@ -14,7 +14,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use rand::Rng;
 
 use async_trait::async_trait;
 use bip39::Mnemonic;
@@ -64,7 +66,7 @@ pub struct LdkConfig {
     /// Optional fallback Esplora server URL. If the primary `esplora_url` is
     /// unreachable at startup (L4b — covers the 2026-04-23 alpha crash-loop
     /// caused by mempool.space fee-fetch timeouts), `LdkProvider::new`
-    /// switches to this URL before handing the chain source to LDK.
+    /// switches to this URL on preflight or actual startup fee-fetch failure.
     pub esplora_url_fallback: Option<String>,
     /// Optional RapidGossipSync server URL.
     pub rgs_url: Option<String>,
@@ -249,6 +251,7 @@ fn inbound_payment_from_received_event(
 /// on any successful payment. This ensures `is_available()` reflects actual
 /// payment capability, not just whether the LDK node is running.
 pub struct LdkProvider {
+    routing_fee_policy: konsensus_core::traits::lightning::RoutingFeePolicy,
     liquidity: Option<LiquidityClient>,
     liquidity_info: LiquidityInfo,
     node: Arc<LdkNode>,
@@ -291,9 +294,15 @@ impl std::fmt::Debug for LdkProvider {
 static INVOICE_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl LdkProvider {
+    /// Configure the ordinary payment fee ceiling before sharing this provider.
+    pub fn with_routing_fee_policy(mut self, policy: konsensus_core::traits::lightning::RoutingFeePolicy) -> Self {
+        self.routing_fee_policy = policy;
+        self
+    }
+
     async fn pay_invoice_routed(
         &self, bolt11: &str,
-        route_parameters: Option<ldk_node::lightning::routing::router::RouteParametersConfig>,
+        max_fee_msat: u64, fresh_hash: bool,
     ) -> Result<PaymentDetails, LightningError> {
         let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11
             .parse()
@@ -306,20 +315,13 @@ impl LdkProvider {
             .map_err(|_| LightningError::PaymentNotDispatched("invoice dispatch lock poisoned".into()))?;
         let payment_id_bytes: [u8; 32] = AsRef::<[u8]>::as_ref(invoice.payment_hash()).try_into()
             .map_err(|_| LightningError::PaymentNotDispatched("invalid payment hash".into()))?;
-        if route_parameters.is_some()
+        if fresh_hash
             && self.node.payment(&ldk_node::lightning::ln::channelmanager::PaymentId(payment_id_bytes)).is_some() {
             return Err(LightningError::PaymentNotDispatched("capped payments require a fresh invoice hash".into()));
         }
-        let payment_id = self
-            .node
-            .bolt11_payment()
-            .send(&invoice, route_parameters)
-            .map_err(|e| {
-                // Mark as payment-incapable on channel/funding errors
-                self.payment_capable.store(false, Ordering::Relaxed);
-                warn!(error = %e, "LDK payment failed — marking as payment-incapable");
-                LightningError::PaymentFailed(format!("{e}"))
-            })?;
+        let payment_id = dispatch_invoice_with_fee_limit(&invoice, max_fee_msat,
+            |invoice, route| self.node.bolt11_payment().send(invoice, route))
+            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         // Successful send — ensure the capability flag is set
         self.payment_capable.store(true, Ordering::Relaxed);
@@ -372,7 +374,7 @@ impl LdkProvider {
         // itself `ZeroizeOnDrop`.
         let mnemonic_phrase = Zeroizing::new(std::mem::take(&mut config.mnemonic));
         let mnemonic = Mnemonic::from_str(&mnemonic_phrase)
-            .map_err(|e| LightningError::Backend(format!("invalid mnemonic: {e}")))?;
+            .map_err(|e| LightningError::InvalidStartupConfig(format!("invalid mnemonic: {e}")))?;
 
         // Derive BIP-39 seed (64 bytes) from mnemonic + passphrase.
         //
@@ -390,6 +392,13 @@ impl LdkProvider {
         let ldk_seed = Zeroizing::new(derive_ldk_entropy(&*bip39_seed));
 
         let network = parse_network(&config.network)?;
+        validate_startup_url("esplora_url", &config.esplora_url)?;
+        if let Some(url) = &config.esplora_url_fallback {
+            validate_startup_url("esplora_url_fallback", url)?;
+        }
+        if let Some(url) = &config.rgs_url {
+            validate_startup_url("rgs_url", url)?;
+        }
 
         // Ensure the LDK storage directory exists
         std::fs::create_dir_all(&config.storage_dir).map_err(|e| {
@@ -418,21 +427,6 @@ impl LdkProvider {
                 .to_string(),
         );
 
-        // L4b (2026-05-11): Choose primary or fallback Esplora endpoint
-        // BEFORE handing it to LDK. LDK's startup fee-estimate fetch will
-        // crash-loop the node if its esplora endpoint is unreachable
-        // (root cause of the 2026-04-23 alpha incident). We probe the
-        // primary; on failure, log INFO and switch to the fallback.
-        let chosen_esplora_url =
-            select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref())
-                .await;
-
-        // Chain data source — Esplora (same as BitSov ChainProvider default)
-        builder.set_chain_source_esplora(
-            chosen_esplora_url.clone(),
-            Some(EsploraSyncConfig::default()),
-        );
-
         // Gossip source — RGS if configured, otherwise P2P
         if let Some(ref rgs_url) = config.rgs_url {
             builder.set_gossip_source_rgs(rgs_url.clone());
@@ -444,12 +438,14 @@ impl LdkProvider {
         // new explicit switch, and reject ambiguous migrations instead of silently
         // choosing a peer. Existing operators get a clear configuration error.
         if config.lsp_node_id.is_some() || config.lsp_address.is_some() || config.lsp_token.is_some() {
-            return Err(LightningError::Backend("migrate legacy lsp_* fields to liquidity.providers and explicitly enable liquidity".into()));
+            return Err(LightningError::InvalidStartupConfig("migrate legacy lsp_* fields to liquidity.providers and explicitly enable liquidity".into()));
         }
-        if let Some(lsp) = config.liquidity.selected()? {
+        if let Some(lsp) = config.liquidity.selected().map_err(|e| {
+            LightningError::InvalidStartupConfig(e.to_string())
+        })? {
             builder.set_liquidity_source_lsps2(
-                lsp.node_id.parse().map_err(|_| LightningError::Backend("invalid LSP key".into()))?,
-                lsp.address.parse().map_err(|_| LightningError::Backend("invalid LSP address".into()))?,
+                lsp.node_id.parse().map_err(|_| LightningError::InvalidStartupConfig("invalid LSP key".into()))?,
+                lsp.address.parse().map_err(|_| LightningError::InvalidStartupConfig("invalid LSP address".into()))?,
                 lsp.token.clone(),
             );
             // LDK logs the full JIT invoice at INFO. Private previews must never
@@ -461,20 +457,22 @@ impl LdkProvider {
         if let Some(ref addr) = config.listening_address {
             let socket_addr = addr
                 .parse()
-                .map_err(|e| LightningError::Backend(format!("invalid listening address: {e}")))?;
+                .map_err(|e| LightningError::InvalidStartupConfig(format!("invalid listening address: {e}")))?;
             builder
                 .set_listening_addresses(vec![socket_addr])
                 .map_err(|e| {
-                    LightningError::Backend(format!("failed to set listening address: {e}"))
+                    LightningError::InvalidStartupConfig(format!("failed to set listening address: {e}"))
                 })?;
         }
 
-        let node = builder
-            .build()
-            .map_err(|e| LightningError::Backend(format!("failed to build LDK node: {e}")))?;
-
-        node.start()
-            .map_err(|e| LightningError::Backend(format!("failed to start LDK node: {e}")))?;
+        // Validate all local settings before the first network request. The budget
+        // includes preflight; only the two Esplora fee-barrier errors are retried.
+        let started = Instant::now();
+        let chosen_esplora_url =
+            select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref())
+                .await;
+        let (node, chosen_esplora_url) =
+            start_esplora_with_retry(builder, &config, chosen_esplora_url, started).await?;
 
         info!(
             network = %config.network,
@@ -518,6 +516,7 @@ impl LdkProvider {
             p.node_id.clone(), Arc::new(LdkJitBackend(Arc::clone(&node))),
         ));
         Ok(Self {
+            routing_fee_policy: Default::default(),
             liquidity,
             liquidity_info: config.liquidity.info(),
             node,
@@ -541,6 +540,7 @@ impl LdkProvider {
         // inbound stream simply stays empty.
         let (inbound_tx, _) = broadcast::channel(INBOUND_BROADCAST_CAPACITY);
         Self {
+            routing_fee_policy: Default::default(),
             liquidity: None,
             liquidity_info: LiquidityInfo::default(),
             node,
@@ -909,6 +909,7 @@ impl Drop for LdkProvider {
     /// as a defensive cleanup for panic / abort paths where the explicit
     /// shutdown didn't run, but treat it as best-effort.
     fn drop(&mut self) {
+        self.drainer_shutdown.store(true, Ordering::Relaxed);
         if let Err(e) = self.node.stop() {
             error!(
                 error = %e,
@@ -922,6 +923,7 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
+    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy { self.routing_fee_policy }
     fn liquidity_info(&self) -> LiquidityInfo { self.liquidity_info.clone() }
 
     async fn quote_liquidity(&self, owner: &str, gross_msat: u64, max_fee_msat: u64) -> Result<LiquidityQuote, LightningError> {
@@ -1029,15 +1031,14 @@ impl LightningProvider for LdkProvider {
     }
 
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
-        self.pay_invoice_routed(bolt11, None).await
+        let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11.parse()
+            .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
+        let amount = invoice.amount_milli_satoshis().ok_or_else(|| LightningError::PaymentNotDispatched("amountless invoice".into()))?;
+        self.pay_invoice_routed(bolt11, self.routing_fee_policy.ceiling(amount, None), false).await
     }
 
     async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
-        let route = ldk_node::lightning::routing::router::RouteParametersConfig {
-            max_total_routing_fee_msat: Some(max_fee_msat),
-            ..Default::default()
-        };
-        self.pay_invoice_routed(bolt11, Some(route)).await
+        self.pay_invoice_routed(bolt11, max_fee_msat, true).await
     }
 
     #[instrument(skip(self), fields(payment_hash))]
@@ -1141,21 +1142,21 @@ impl LightningProvider for LdkProvider {
         &self,
         dest_pubkey: &str,
         amount_msat: u64,
-        _memo: Option<&str>,
+        memo: Option<&str>,
+    ) -> Result<PaymentDetails, LightningError> {
+        self.keysend_with_fee_limit(dest_pubkey, amount_msat, memo, self.routing_fee_policy.ceiling(amount_msat, None)).await
+    }
+
+    async fn keysend_with_fee_limit(
+        &self, dest_pubkey: &str, amount_msat: u64, _memo: Option<&str>, max_fee_msat: u64,
     ) -> Result<PaymentDetails, LightningError> {
         let pubkey: bitcoin::secp256k1::PublicKey = dest_pubkey
             .parse()
             .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid destination pubkey: {e}")))?;
 
-        let payment_id = self
-            .node
-            .spontaneous_payment()
-            .send(amount_msat, pubkey, None)
-            .map_err(|e| {
-                self.payment_capable.store(false, Ordering::Relaxed);
-                warn!(error = %e, "LDK keysend failed — marking as payment-incapable");
-                LightningError::PaymentFailed(format!("keysend failed: {e}"))
-            })?;
+        let payment_id = dispatch_keysend_with_fee_limit(amount_msat, pubkey, max_fee_msat,
+            |amount, dest, route| self.node.spontaneous_payment().send(amount, dest, route))
+            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         // Successful send — ensure the capability flag is set
         self.payment_capable.store(true, Ordering::Relaxed);
@@ -1207,15 +1208,9 @@ impl LightningProvider for LdkProvider {
             .parse()
             .map_err(|e| LightningError::Backend(format!("invalid destination pubkey: {e}")))?;
 
-        let payment_id = self
-            .node
-            .spontaneous_payment()
-            .send_with_custom_tlvs(amount_msat, pubkey, None, custom_tlvs)
-            .map_err(|e| {
-                self.payment_capable.store(false, Ordering::Relaxed);
-                warn!(error = %e, "LDK keysend_with_binding failed — marking as payment-incapable");
-                LightningError::PaymentFailed(format!("keysend_with_binding failed: {e}"))
-            })?;
+        let payment_id = dispatch_keysend_with_fee_limit(amount_msat, pubkey, self.routing_fee_policy.ceiling(amount_msat, None),
+            |amount, dest, route| self.node.spontaneous_payment().send_with_custom_tlvs(amount, dest, route, custom_tlvs))
+            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1374,44 +1369,17 @@ impl LightningProvider for LdkProvider {
         peer_pubkey: &str,
         peer_addr: &str,
         amount_sats: u64,
-        _announce: bool,
+        announce: bool,
         fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        if fee_rate_sat_per_vb.is_some() {
-            tracing::debug!(
-                fee_rate = ?fee_rate_sat_per_vb,
-                "open_channel: fee_rate_sat_per_vb provided but ldk-node 0.7 does not \
-                 support per-channel funding fee rate override; parameter ignored"
-            );
-        }
-        use std::str::FromStr;
-        let node_pubkey = ldk_node::bitcoin::secp256k1::PublicKey::from_str(peer_pubkey)
-            .map_err(|e| LightningError::Backend(format!("invalid pubkey: {e}")))?;
-
-        // Parse address into LDK SocketAddress
-        let socket_addr: std::net::SocketAddr = peer_addr
-            .parse()
-            .map_err(|e| LightningError::Backend(format!("invalid address: {e}")))?;
-        let ldk_addr = match socket_addr {
-            std::net::SocketAddr::V4(a) => ldk_node::lightning::ln::msgs::SocketAddress::TcpIpV4 {
-                addr: a.ip().octets(),
-                port: a.port(),
-            },
-            std::net::SocketAddr::V6(a) => ldk_node::lightning::ln::msgs::SocketAddress::TcpIpV6 {
-                addr: a.ip().octets(),
-                port: a.port(),
-            },
-        };
-
-        // Open channel (connect + open in one call)
-        let user_channel_id = self
-            .node
-            .open_channel(node_pubkey, ldk_addr, amount_sats, None, None)
-            .map_err(|e| LightningError::Backend(format!("open_channel failed: {e}")))?;
-
-        let channel_id = format!("{}", user_channel_id);
-        tracing::info!(channel_id = %channel_id, amount_sats, peer = %peer_pubkey, "Lightning channel opening initiated");
-        Ok(channel_id)
+        open_ldk_channel(
+            self.node.as_ref(),
+            peer_pubkey,
+            peer_addr,
+            amount_sats,
+            announce,
+            fee_rate_sat_per_vb,
+        )
     }
 
     async fn close_channel(
@@ -1464,6 +1432,140 @@ impl LightningProvider for LdkProvider {
 
 // --- Helper functions ---
 
+fn validate_startup_url(field: &str, value: &str) -> Result<(), LightningError> {
+    let valid = reqwest::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+    if !valid {
+        // Do not include potentially authenticated URLs in user-facing errors.
+        return Err(LightningError::InvalidStartupConfig(format!(
+            "{field} must be an absolute HTTP(S) URL with a host"
+        )));
+    }
+    Ok(())
+}
+
+fn startup_build_error(error: ldk_node::BuildError) -> LightningError {
+    use ldk_node::BuildError;
+    match error {
+        BuildError::InvalidSeedBytes
+        | BuildError::InvalidSeedFile
+        | BuildError::InvalidListeningAddresses
+        | BuildError::InvalidAnnouncementAddresses
+        | BuildError::InvalidNodeAlias
+        | BuildError::NetworkMismatch
+        | BuildError::AsyncPaymentsConfigMismatch => {
+            LightningError::InvalidStartupConfig(error.to_string())
+        }
+        _ => LightningError::Backend(format!("failed to build LDK node: {error}")),
+    }
+}
+
+/// Retry ONLY Esplora's startup fee barrier. In pinned LDK 0.7 these two
+/// errors return before any background task is spawned, and Esplora's
+/// ChainSource::start is a no-op. Never extend this to arbitrary start errors
+/// or Electrum without re-auditing that ordering.
+///
+/// Five fee requests (LDK bounds each at 5s) and 2/4/8/8s backoff with ±20%
+/// jitter fit in ~60s including the two 4s preflight probes. A deadline check
+/// reserves a full fee-request window before each attempt. Local disk I/O is
+/// outside the network timeouts. No detached retry/spawn_blocking job is used:
+/// dropping this future during backoff drops the unstarted node. Cancellation
+/// during synchronous Node::start is observed at the next yield (at most the
+/// in-flight fee timeout on a failing chain service).
+async fn start_esplora_with_retry(
+    mut builder: LdkBuilder,
+    config: &LdkConfig,
+    mut endpoint: String,
+    started: Instant,
+) -> Result<(LdkNode, String), LightningError> {
+    const BUDGET: Duration = Duration::from_secs(60);
+    const FEE_WINDOW: Duration = Duration::from_secs(5);
+    const DELAYS: [u64; 4] = [2, 4, 8, 8];
+    let mut node = None;
+    let mut attempts = 0;
+    let mut cause = "startup connectivity budget exhausted".to_string();
+    loop {
+        if started.elapsed() + FEE_WINDOW > BUDGET {
+            break;
+        }
+        if node.is_none() {
+            builder.set_chain_source_esplora(endpoint.clone(), Some(EsploraSyncConfig::default()));
+            node = Some(builder.build().map_err(startup_build_error)?);
+        }
+        if started.elapsed() + FEE_WINDOW > BUDGET {
+            break;
+        }
+        attempts += 1;
+        let result = node.as_ref().expect("node was built").start();
+        // Deliver pending cancellation even if the synchronous call succeeded.
+        // Dropping a successfully started Node invokes stop before returning.
+        tokio::task::yield_now().await;
+        match result {
+            Ok(()) => return Ok((node.expect("node was built"), endpoint)),
+            Err(
+                error @ (ldk_node::NodeError::FeerateEstimationUpdateFailed
+                | ldk_node::NodeError::FeerateEstimationUpdateTimeout),
+            ) => {
+                cause = error.to_string();
+                warn!(
+                    code = "BOOT_CHAIN_SOURCE_RETRY",
+                    attempt = attempts,
+                    network = %config.network,
+                    service = %startup_service(&endpoint),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %error,
+                    "Bitcoin chain service unavailable during startup; node remains not ready"
+                );
+            }
+            Err(ldk_node::NodeError::InvalidSocketAddress) => {
+                return Err(LightningError::InvalidStartupConfig(
+                    "listening_address could not be resolved or bound; use a local address and an available port".into(),
+                ));
+            }
+            Err(error) => {
+                // Later start phases may already own tasks. Never retry them.
+                return Err(LightningError::Backend(format!(
+                    "failed to start LDK node: {error}"
+                )));
+            }
+        }
+        let Some(delay_secs) = DELAYS.get(attempts - 1) else {
+            break;
+        };
+        let jitter = rand::thread_rng().gen_range(0.8..=1.2);
+        let delay = Duration::from_secs_f64(*delay_secs as f64 * jitter);
+        if started.elapsed() + delay + FEE_WINDOW > BUDGET {
+            break;
+        }
+        tokio::time::sleep(delay).await;
+        if let Some(fallback) = config
+            .esplora_url_fallback
+            .as_ref()
+            .filter(|url| **url != endpoint)
+        {
+            // Only switch away from the primary. Never re-probe and bounce back.
+            // Drop the old instance/store before rebuilding with the SAME
+            // builder entropy and directory; no reinitialization or new identity.
+            drop(node.take());
+            endpoint = fallback.clone();
+        }
+    }
+    Err(LightningError::ChainSourceUnavailable {
+        network: config.network.clone(),
+        service: startup_service(&endpoint),
+        attempts,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        cause,
+    })
+}
+
+fn startup_service(endpoint: &str) -> String {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "configured chain service".into())
+}
+
 /// blake3 KDF context for LDK Lightning entropy derivation.
 ///
 /// This context string provides domain separation from the BitSov identity
@@ -1490,7 +1592,7 @@ fn parse_network(network: &str) -> Result<bitcoin::Network, LightningError> {
         "testnet" | "testnet3" => Ok(bitcoin::Network::Testnet),
         "signet" => Ok(bitcoin::Network::Signet),
         "regtest" => Ok(bitcoin::Network::Regtest),
-        other => Err(LightningError::Backend(format!("unknown network: {other}"))),
+        other => Err(LightningError::InvalidStartupConfig(format!("unknown network: {other}"))),
     }
 }
 
@@ -1802,4 +1904,163 @@ fn jit_receipt(p: &ldk_node::payment::PaymentDetails) -> Result<Option<Liquidity
         }
     }
     Ok(None)
+}
+
+/// Always provide an explicit LDK override: its default includes a 50,000 msat floor.
+fn routing_fee_parameters(max_fee_msat: u64) -> ldk_node::lightning::routing::router::RouteParametersConfig {
+    ldk_node::lightning::routing::router::RouteParametersConfig {
+        max_total_routing_fee_msat: Some(max_fee_msat), ..Default::default()
+    }
+}
+
+// Small dispatch seams let tests capture the exact arguments delivered to LDK.
+fn dispatch_invoice_with_fee_limit<T>(
+    invoice: &ldk_node::lightning_invoice::Bolt11Invoice, max_fee_msat: u64,
+    send: impl FnOnce(&ldk_node::lightning_invoice::Bolt11Invoice, Option<ldk_node::lightning::routing::router::RouteParametersConfig>) -> T,
+) -> T {
+    send(invoice, Some(routing_fee_parameters(max_fee_msat)))
+}
+fn dispatch_keysend_with_fee_limit<T>(
+    amount: u64, dest: bitcoin::secp256k1::PublicKey, max_fee_msat: u64,
+    send: impl FnOnce(u64, bitcoin::secp256k1::PublicKey, Option<ldk_node::lightning::routing::router::RouteParametersConfig>) -> T,
+) -> T {
+    send(amount, dest, Some(routing_fee_parameters(max_fee_msat)))
+}
+
+/// Pinned ldk-node bolt11/spontaneous send paths return PaymentSendingFailed
+/// only for RetryableSendFailure BEFORE any HTLC dispatch (including RouteNotFound).
+/// PersistenceFailed can occur after dispatch; DuplicatePayment can refer to an
+/// earlier live attempt. Neither proves that the liability is absent.
+fn classify_dispatch_error(error: ldk_node::NodeError, payment_capable: &AtomicBool) -> LightningError {
+    use ldk_node::NodeError::*;
+    match error {
+        PaymentSendingFailed | InvalidInvoice | InvalidAmount | InvalidCustomTlvs | NotRunning => {
+            LightningError::PaymentNotDispatched(error.to_string())
+        }
+        DuplicatePayment => LightningError::PaymentFailed(error.to_string()),
+        _ => {
+            payment_capable.store(false, Ordering::Relaxed);
+            LightningError::PaymentFailed(error.to_string())
+        }
+    }
+}
+
+// Keep the LDK API boundary injectable so tests observe calls without connecting
+// peers or funding channels. The production implementation uses LDK's methods.
+#[cfg_attr(test, mockall::automock)]
+trait ChannelOpener {
+    fn has_node_alias(&self) -> bool;
+    fn has_listening_addresses(&self) -> bool;
+    fn open_channel(
+        &self,
+        peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress,
+        amount_sats: u64,
+        push_msat: Option<u64>,
+        config: Option<ldk_node::config::ChannelConfig>,
+    ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError>;
+    fn open_announced_channel(
+        &self,
+        peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress,
+        amount_sats: u64,
+        push_msat: Option<u64>,
+        config: Option<ldk_node::config::ChannelConfig>,
+    ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError>;
+}
+
+impl ChannelOpener for LdkNode {
+    fn has_node_alias(&self) -> bool {
+        self.node_alias().is_some()
+    }
+
+    fn has_listening_addresses(&self) -> bool {
+        self.listening_addresses().is_some_and(|addrs| !addrs.is_empty())
+    }
+
+    fn open_channel(
+        &self,
+        peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress,
+        amount_sats: u64,
+        push_msat: Option<u64>,
+        config: Option<ldk_node::config::ChannelConfig>,
+    ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError> {
+        LdkNode::open_channel(self, peer, addr, amount_sats, push_msat, config)
+    }
+    fn open_announced_channel(
+        &self,
+        peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress,
+        amount_sats: u64,
+        push_msat: Option<u64>,
+        config: Option<ldk_node::config::ChannelConfig>,
+    ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError> {
+        LdkNode::open_announced_channel(self, peer, addr, amount_sats, push_msat, config)
+    }
+}
+
+fn open_ldk_channel(
+    node: &impl ChannelOpener,
+    peer_pubkey: &str,
+    peer_addr: &str,
+    amount_sats: u64,
+    announce: bool,
+    fee_rate_sat_per_vb: Option<f32>,
+) -> Result<String, LightningError> {
+    if fee_rate_sat_per_vb.is_some() {
+        // ldk-node 0.7 / lightning 0.2.2: ChannelConfig controls forwarding
+        // and commitment policy, not funding fees. FundingGenerationReady
+        // uses the wallet's ChannelFunding estimator later. A quote checked
+        // here cannot bound that rate, so reject BEFORE connecting a peer.
+        return Err(LightningError::PaymentNotDispatched(
+            "LDK cannot enforce a per-channel funding fee rate".into(),
+        ));
+    }
+    // Mirror vendored ldk-node's may_announce_channel before any open call.
+    // Public-channel support requires operator configuration; do not invent an alias.
+    if announce && (!node.has_node_alias() || !node.has_listening_addresses()) {
+        return Err(LightningError::PaymentNotDispatched(
+            "announce_unavailable: public channel announcement requires a node alias and nonempty listening addresses".into(),
+        ));
+    }
+    use std::str::FromStr;
+    let node_pubkey = ldk_node::bitcoin::secp256k1::PublicKey::from_str(peer_pubkey)
+        .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid pubkey: {e}")))?;
+
+    // Parse address into LDK SocketAddress
+    let socket_addr: std::net::SocketAddr = peer_addr
+        .parse()
+        .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid address: {e}")))?;
+    let ldk_addr = match socket_addr {
+        std::net::SocketAddr::V4(a) => ldk_node::lightning::ln::msgs::SocketAddress::TcpIpV4 {
+            addr: a.ip().octets(),
+            port: a.port(),
+        },
+        std::net::SocketAddr::V6(a) => ldk_node::lightning::ln::msgs::SocketAddress::TcpIpV6 {
+            addr: a.ip().octets(),
+            port: a.port(),
+        },
+    };
+
+    // Open channel (connect + open in one call)
+    let user_channel_id = if announce {
+        node.open_announced_channel(node_pubkey, ldk_addr, amount_sats, None, None)
+    } else {
+        node.open_channel(node_pubkey, ldk_addr, amount_sats, None, None)
+    }
+    .map_err(|e| match e {
+        // In vendored ldk-node 0.7 this means announcement preflight failed or
+        // lightning 0.2.2's create_channel returned Err, before queuing an open
+        // message. Other errors (e.g. peer persistence AFTER creation) may be
+        // post-dispatch and must retain the conservative Backend classification.
+        ldk_node::NodeError::ChannelCreationFailed => {
+            LightningError::PaymentNotDispatched(format!("open_channel failed: {e}"))
+        }
+        _ => LightningError::Backend(format!("open_channel failed: {e}")),
+    })?;
+
+    let channel_id = format!("{}", user_channel_id);
+    tracing::info!(channel_id = %channel_id, amount_sats, peer = %peer_pubkey, "Lightning channel opening initiated");
+    Ok(channel_id)
 }

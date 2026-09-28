@@ -1,35 +1,24 @@
 mod common;
-use common::*;
-
-use std::collections::HashMap;
-use std::sync::Arc;
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use base64::Engine;
-use tower::ServiceExt;
-
-use konsensus_core::identity::NodeIdentity;
-use konsensus_core::gate::PaymentGate;
-use konsensus_core::traits::chain::{BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel};
-use konsensus_core::traits::lightning::{
-    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection,
-    PaymentStatus,
-};
-use konsensus_core::traits::pricing::{PricingEngine, PricingError};
-use konsensus_core::traits::transport::{MessageTransport, TransportError};
-use konsensus_core::types::{MessageId, NodeId, Nonce, Recipient, RoomId};
-use konsensus_core::UkmEnvelope;
-use konsensus_message::PeerRegistry;
-use konsensus_storage::error::StorageError;
-use konsensus_storage::models::{Peer, Room};
-use konsensus_storage::Storage;
-use async_trait::async_trait;
-
+use common::test_router as build_router;
+use common::*;
 use konsensus_api::audit::AuditLog;
-use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use common::test_router as build_router;
+use konsensus_core::gate::PaymentGate;
+use konsensus_core::traits::chain::{
+    BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel,
+};
+use konsensus_core::traits::lightning::{
+    Invoice, LightningError, LightningProvider, PaymentDetails,
+};
+use konsensus_core::types::NodeId;
+use konsensus_message::PeerRegistry;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tower::ServiceExt;
 
 fn test_dest_pubkey() -> String {
     format!("02{}", "11".repeat(32))
@@ -371,7 +360,7 @@ async fn pricing_peer_by_id() {
     let app = build_router(Arc::clone(&state));
 
     let req = Request::builder()
-        .uri(&format!("/api/v1/pricing/peers/{}", peer_id.to_hex()))
+        .uri(format!("/api/v1/pricing/peers/{}", peer_id.to_hex()))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();
@@ -393,7 +382,7 @@ async fn pricing_peer_not_found() {
 
     let fake_peer = "aa".repeat(32);
     let req = Request::builder()
-        .uri(&format!("/api/v1/pricing/peers/{fake_peer}"))
+        .uri(format!("/api/v1/pricing/peers/{fake_peer}"))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();
@@ -447,7 +436,7 @@ async fn pay_invoice_success() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "bolt11": "lnbc1test..."
+                "bolt11": create_test_bolt11(1000)
             })
             .to_string(),
         ))
@@ -473,7 +462,7 @@ async fn pay_invoice_requires_auth() {
         .uri("/api/v1/payments/pay")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({"bolt11": "lnbc1test..."}).to_string(),
+            serde_json::json!({"bolt11": create_test_bolt11(1000)}).to_string(),
         ))
         .unwrap();
 
@@ -694,7 +683,7 @@ async fn payment_status_returns_pending() {
     let app = build_router(Arc::clone(&state));
 
     let req = Request::builder()
-        .uri(&format!("/api/v1/payments/{}", "aa".repeat(32)))
+        .uri(format!("/api/v1/payments/{}", "aa".repeat(32)))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();
@@ -1222,6 +1211,14 @@ async fn health_lightning_unavailable_shows_null_balance() {
 
     #[async_trait]
     impl LightningProvider for UnavailableLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
         async fn create_invoice(
             &self, _: u64, _: &str, _: u32,
         ) -> Result<Invoice, LightningError> {
@@ -1411,7 +1408,7 @@ async fn payments_pay_returns_preimage_and_hash() {
         .header("authorization", &auth)
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({ "bolt11": "lnbc1stub..." }).to_string(),
+            serde_json::json!({ "bolt11": create_test_bolt11(1000) }).to_string(),
         ))
         .unwrap();
 
@@ -1420,7 +1417,7 @@ async fn payments_pay_returns_preimage_and_hash() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["payment_hash"], "bb".repeat(32));
+    assert_eq!(json["payment_hash"].as_str().unwrap().len(), 64);
     assert_eq!(json["preimage"], "cc".repeat(32));
     assert_eq!(json["amount_msat"], 1000);
 }
@@ -2149,6 +2146,14 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
 
     #[async_trait]
     impl LightningProvider for UnconfirmedLightning {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
         async fn create_invoice(
             &self,
             _amount_msat: u64,
@@ -2377,4 +2382,55 @@ async fn liquidity_is_discoverable_and_off_by_default() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["enabled"], false);
     assert_eq!(json["providers"], serde_json::json!([]));
+}
+
+
+#[tokio::test]
+async fn channel_fee_unsupported_rate_returns_not_dispatched() {
+    let state = test_state();
+    let auth = auth_header(&state);
+    let app = build_router(state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/payments/open-channel")
+        .header("authorization", &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "peer_pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "peer_addr": "127.0.0.1:9735", "amount_sats": 50_000,
+                "announce": true, "fee_rate_sat_per_vb": 5.0
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "not_dispatched");
+}
+
+#[tokio::test]
+async fn channel_fee_api_preserves_announce_without_override() {
+    for (announce, expected_id) in [
+        (false, "stub-channel-id"),
+        (true, "stub-announced-channel-id"),
+    ] {
+        let state = test_state();
+        let auth = auth_header(&state);
+        let app = build_router(state);
+        let req = Request::builder().method("POST")
+            .uri("/api/v1/payments/open-channel")
+            .header("authorization", &auth).header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({
+                "peer_pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "peer_addr": "127.0.0.1:9735", "amount_sats": 50_000, "announce": announce
+            }).to_string())).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["channel_id"], expected_id);
+    }
 }
