@@ -43,7 +43,10 @@ v2 compiles to a single `konsensus` binary that adapts behavior based on configu
 │  │ Bitcoin Core │  │  LDK embed  │  │  Native P2P          │  │
 │  │ Electrum     │  │  LND gRPC   │  │  Transport           │  │
 │  │ Neutrino     │  │  CLN gRPC   │  │  E2EE (PQXDH + MLS) │  │
-│  │              │  │  LNbits API  │  │  Room management     │  │
+│  │              │  │  LNbits:    │  │  Room management     │  │
+│  │              │  │  legacy /   │  │                      │  │
+│  │              │  │  rejected   │  │                      │  │
+│  │              │  │  (#99/#104) │  │                      │  │
 │  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
 │         │                 │                      │              │
 │  ┌──────┴─────────────────┴──────────────────────┴───────────┐  │
@@ -77,7 +80,9 @@ fn build_node(config: &Config) -> Node {
         LnBackend::Ldk    => Box::new(LdkProvider::new(&config.ldk)),
         LnBackend::Lnd    => Box::new(LndProvider::new(&config.lnd)),
         LnBackend::Cln    => Box::new(ClnProvider::new(&config.cln)),
-        LnBackend::Lnbits => Box::new(LnbitsProvider::new(&config.lnbits)),
+        // LNbits: rejected at config/startup after #99/#104 — legacy adapter only,
+        // not a selectable production backend.
+        LnBackend::Lnbits => unreachable!("lnbits rejected before provider init"),
     };
 
     let transport: Box<dyn MessagingTransport> = Box::new(
@@ -169,7 +174,7 @@ Manages Lightning Network operations — invoices, payments, channel state.
 
 ```rust
 /// Abstraction over Lightning Network backends.
-/// Implementations: LDK (embedded), LND (gRPC), CLN (gRPC), LNbits (HTTP API).
+/// Implementations: LDK (embedded), LND (external). LNbits is legacy and rejected at startup (#99/#104).
 #[async_trait]
 pub trait LightningProvider: Send + Sync {
     /// Creates a new invoice for the given amount and description.
@@ -206,7 +211,7 @@ pub trait LightningProvider: Send + Sync {
     async fn subscribe_payments(&self) -> Result<PaymentStream, LightningError>;
 
     /// Returns whether this provider runs in-process (LDK) or connects
-    /// to an external daemon (LND, CLN, LNbits).
+    /// to an external daemon (LND; CLN if/when supported). LNbits is not selectable (#99/#104).
     fn is_embedded(&self) -> bool;
 }
 
@@ -226,7 +231,7 @@ pub enum PaymentStatus {
 | `LdkProvider` | T1 | Yes | In-process Lightning node via LDK |
 | `LndProvider` | T2-4 | No | gRPC connection to external `lnd` |
 | `ClnProvider` | T2-4 | No | gRPC connection to external `lightningd` |
-| `LnbitsProvider` | Any | No | HTTP API to LNbits (v1 compatibility) |
+| `LnbitsProvider` | — | No | Legacy only; config/startup rejects `lnbits` (#99/#104). |
 
 ### 2.3 PricingEngine
 
@@ -855,7 +860,7 @@ konsensus/
 │   │       ├── ldk.rs          # LDK embedded
 │   │       ├── lnd.rs          # LND gRPC
 │   │       ├── cln.rs          # CLN gRPC
-│   │       └── lnbits.rs       # LNbits HTTP (v1 compat)
+│   │       └── lnbits.rs       # LNbits legacy / rejected at startup (#99/#104)
 │   │
 │   ├── konsensus-pricing/      # PricingEngine impl (chain-aware message pricing · ADR-027)
 │   │   └── src/
@@ -1153,11 +1158,11 @@ During the transition period, v2 nodes must federate with v1 nodes. This require
 
 ### v1 Federation Protocol
 
-v1 federation uses:
+v1 federation uses (historical interop — not a v2 production Lightning choice):
 - **HTTP POST** with JSON body to federation endpoints
 - **Ed25519 signatures** on request body with nonce
 - **`.well-known/konsensus-server.json`** for discovery
-- **LNbits API** for Lightning operations
+- **LNbits-shaped invoices** as used by v1 peers (v2 production Lightning is LDK or LND with all-in fee caps; LNbits is rejected at startup — #99/#104)
 
 ### Compatibility Approach
 
@@ -1170,7 +1175,7 @@ v2 Node                                        v1 Node
      │                                              │
      │  If v1 peer:                                 │
      │  ├── Use HTTP federation (not native P2P)    │
-     │  ├── Use LNbits-compatible invoice format    │
+     │  ├── Use v1-compatible invoice format        │
      │  ├── Skip E2EE (v1 doesn't support it)       │
      │  ├── Use DNS-based discovery                 │
      │  └── Downgrade gracefully                    │
@@ -1188,7 +1193,7 @@ v2 Node                                        v1 Node
 ```rust
 /// Determines the federation protocol to use with a peer.
 pub enum PeerProtocol {
-    /// v1 — HTTP federation, no E2EE, LNbits invoices
+    /// v1 — HTTP federation, no E2EE, historical LNbits-shaped invoices
     V1 {
         base_url: Url,
         ed25519_pubkey: Ed25519PublicKey,

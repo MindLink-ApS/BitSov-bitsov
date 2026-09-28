@@ -84,8 +84,9 @@ not mean the LSP is online or that capacity is available. Tokens are never retur
 6. Obtain the stranger's current quote and use the existing capped message send.
    The newly funded usable channel can route that separate payment. Existing
    principal caps, G1 message accounting and recipient binding remain in force.
-   This pilot does not advertise an all-in route-fee cap on the later send; LDK's
-   existing outgoing route policy is unchanged.
+   After funding, use the normal capped compose/pay path (#99): quotes report
+   `max_routing_fee_msat` and caps cover principal + routing fee. JIT funding
+   fees remain a separate LSP skim.
 
 The vendored LDK receive handler enforces the fixed funding minimum **before
 claiming any HTLC or releasing its preimage**. It reads the original gross and

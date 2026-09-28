@@ -166,6 +166,22 @@ pub enum KindCategory {
 }
 
 impl KindCategory {
+    /// Canonical category key in authenticated price tables.
+    pub fn price_table_key(self) -> &'static str {
+    match self {
+        Self::Communication => "communication",
+        Self::StructuredData => "structured_data",
+        Self::FilesMedia => "files_media",
+        Self::Collaboration => "collaboration",
+        Self::RealTimeSignaling => "realtime_signaling",
+        Self::WebContent => "web_content",
+        Self::Storage => "relay_storage",
+        Self::Control => "control",
+        Self::AppExtension => "app_extension",
+        Self::Unknown => "unknown",
+    }
+    }
+
     /// Classify a kind value into its category.
     pub fn from_kind(kind: u16) -> Self {
         match kind {

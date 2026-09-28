@@ -92,6 +92,17 @@ impl Storage for MemStorage {
         Ok(self.calendar.lock().unwrap().get(id).cloned())
     }
 
+    async fn list_calendar_events_in_range(
+        &self, from_ms: u64, to_ms: u64, limit: u32,
+    ) -> Result<Vec<konsensus_storage::calendar::CalendarEventRecord>, StorageError> {
+        let mut events: Vec<_> = self.calendar.lock().unwrap().values()
+            .filter(|event| event.start_ms < to_ms && event.end_ms > from_ms)
+            .cloned().collect();
+        events.sort_by_key(|event| event.start_ms);
+        events.truncate(limit as usize);
+        Ok(events)
+    }
+
     async fn invite_schema_capabilities(&self) -> Result<InviteSchemaCapabilities, StorageError> {
         Ok(self.invite_schema_capabilities)
     }
@@ -323,6 +334,16 @@ impl Storage for MemStorage {
 
     async fn list_sessions(&self) -> Result<Vec<NodeId>, StorageError> {
         Ok(Vec::new())
+    }
+
+    async fn mark_pending_sent(&self, _: &MessageId, _: &NodeId) -> Result<(), StorageError> { Ok(()) }
+    async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
+        let mut messages = self.messages.lock().unwrap();
+        if let Some(stored) = messages.get_mut(&envelope.id.to_hex()) {
+            stored.timestamp = envelope.timestamp;
+            stored.signature = envelope.signature;
+        }
+        Ok(())
     }
 
     async fn queue_pending_delivery(&self, _: &MessageId, _: &NodeId) -> Result<(), StorageError> {

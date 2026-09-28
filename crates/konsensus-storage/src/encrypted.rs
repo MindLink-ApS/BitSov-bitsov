@@ -353,6 +353,47 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.store_message(&encrypted).await
     }
 
+    async fn record_delivery_prices(&self, sender: &NodeId, prices: &[(String, u64)], excluded_kinds: &[u16], issued_at: u64, expires_at: u64) -> Result<(), StorageError> {
+        self.inner.record_delivery_prices(sender, prices, excluded_kinds, issued_at, expires_at).await
+    }
+
+    async fn delivery_price_floor(&self, envelope: &UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, StorageError> {
+        self.inner.delivery_price_floor(envelope, paid_at, now).await
+    }
+
+    async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        // Receipt matching uses immutable metadata, never randomized at-rest ciphertext.
+        self.inner.is_paid_envelope_accepted(envelope).await
+    }
+
+    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
+    }
+
+    async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
+        self.inner.update_message_wrapper(envelope).await
+    }
+
+    async fn mark_pending_sent(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
+        self.inner.mark_pending_sent(id, peer).await
+    }
+
+    async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        self.inner.is_pending_dispatched(id, peer, sender).await
+    }
+
+    async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {
+        self.inner.reject_pending(id, peer, sender, reason, terminal).await
+    }
+
+    async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        self.inner.acknowledge_pending(id, peer, sender).await
+    }
+
+    async fn acknowledge_pending_payment(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        self.inner.acknowledge_pending_payment(id, peer, sender, hash).await
+    }
+
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
         // The stored ID is based on encrypted ciphertext, so we can't look up
         // by the original ID directly. We need to search differently.

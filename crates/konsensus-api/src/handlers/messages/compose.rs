@@ -92,10 +92,24 @@ pub struct MemberPaymentOutcome {
 }
 
 async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, height: u64) -> Result<u64, ApiError> {
-    let price = match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
-        Some(price) => price,
-        None => state.pricing.get_price_msat(kind).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?,
+    let ready = state.lightning.money_ready().await;
+    if !ready && !state.session_manager.has_session(peer).await {
+        return Err(ApiError::NotReady);
+    }
+    let quote = async {
+        match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
+            Some(price) => Ok(price),
+            None => state.pricing.get_price_msat(kind).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}"))),
+        }
     };
+    // Preserve established zero-price conversations when a local quote is
+    // available. Never wait on dynamic chain pricing or assume a free price.
+    let price = if ready { quote.await? } else {
+        tokio::time::timeout(Duration::from_millis(100), quote).await.map_err(|_| ApiError::NotReady)??
+    };
+    if super::caps::payable(price) > 0 || !state.session_manager.has_session(peer).await {
+        crate::error::require_money_ready(state).await?;
+    }
     Ok(super::caps::payable(price))
 }
 
@@ -326,18 +340,23 @@ pub async fn create_payment_proof(
     price_msat: u64,
     peer_id: &NodeId,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
-    create_payment_proof_with_fee_report(state, price_msat, peer_id).await.map(|(proof, _)| proof)
+    create_payment_proof_with_fee_report(state, price_msat, peer_id).await.map(|(proof, _, _)| proof)
 }
 
+/// Return message proof, combined routing-fee ceiling, and all principal settled
+/// by this call (including re-admission). Admission never inflates the proof.
 pub(crate) async fn create_payment_proof_with_fee_report(
     state: &AppState, price_msat: u64, peer_id: &NodeId,
-) -> Result<(([u8; 32], [u8; 32], u64), u64), ApiError> {
+) -> Result<(([u8; 32], [u8; 32], u64), u64, u64), ApiError> {
     let mut charge = FirstContactCharge::default();
     let readmission = Readmission::for_cap(false);
     let fee = state.lightning.routing_fee_policy().ceiling(super::caps::payable(price_msat), None);
     let result = create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), &readmission, None, &mut charge).await;
     let ceiling = fee.saturating_add(readmission.fee_ceiling_msat());
-    result.map(|proof| (proof, ceiling)).map_err(|error| charge.error(error).with_routing_fee(ceiling))
+    result.map(|proof| {
+        let settled_msat = proof.2.saturating_add(charge.settled_msat);
+        (proof, ceiling, settled_msat)
+    }).map_err(|error| charge.error(error).with_routing_fee(ceiling))
 }
 
 /// How a paid send may pay admission again when the recipient refuses it with
@@ -384,12 +403,8 @@ pub(crate) async fn create_metered_payment_proof(
         return Ok(generate_valid_proof(0));
     }
 
-    // Lightning must be available for non-zero payments.
-    if !state.lightning.is_available().await {
-        return Err(ApiError::Lightning(
-            "Lightning wallet is unavailable — cannot create payment proof".into(),
-        ));
-    }
+    // Recheck after quoting: readiness may have changed before dispatch.
+    crate::error::require_money_ready(state).await?;
 
     // Peer must be connected to receive the invoice request.
     if !state.transport.is_connected(peer_id).await {
@@ -612,6 +627,7 @@ async fn try_keysend(
         .await?
     {
         Ok(details) => details,
+        Err(LightningError::NotReady) => return Err(ApiError::NotReady),
         Err(LightningError::PaymentNotDispatched(reason)) => {
             tracing::warn!(peer = %peer_id, %reason, "keysend rejected before dispatch");
             return Ok(KeysendOutcome::NotDispatched);
@@ -793,6 +809,7 @@ async fn create_payment_proof_via_invoice(
         .pay_invoice_with_fee_limit(&response.bolt11, debit.fee_limit(state, invoice_amount_msat)))
         .await?
         .map_err(|e| match e {
+            LightningError::NotReady => ApiError::NotReady,
             LightningError::PaymentNotDispatched(reason) => ApiError::Lightning(format!("payment not dispatched: {reason}")),
             other => ApiError::PaymentUnresolved(format!("failed to pay recipient invoice: {other}")),
         })?;
@@ -2270,7 +2287,7 @@ async fn first_contact_admission_at(
                 }
             }
         }
-        PriorAdmission::SettledWithProof(envelope) => {
+        PriorAdmission::SettledWithProof(mut envelope) => {
             // The proof's coverage was classified against `connected_since`.
             // If that connection was replaced since, the classification is
             // stale: the proof may have been consumed on the old connection,
@@ -2290,6 +2307,15 @@ async fn first_contact_admission_at(
             }
             report_readmission_settlement(state, peer_id, envelope.payment_proof.amount_msat)?;
             charge.prior_settled_msat = envelope.payment_proof.amount_msat;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
+            envelope.refresh_for_resend(&state.identity, now)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if let Some(mut attempt) = super::admission_journal::load(state, peer_id)? {
+                attempt.envelope = Some(*envelope.clone());
+                super::admission_journal::save(state, peer_id, &attempt)?;
+            }
+            lock_admission_ledger().attach_envelope(peer_id, *envelope.clone());
             // Re-deliver the already-paid proof. If the target already consumed
             // this payment hash (envelope arrived the first time), its replay
             // table rejects the duplicate — harmless to us, and we are already
@@ -2463,6 +2489,12 @@ async fn first_contact_admission_at(
     };
     let details = match dispatched {
         Ok(details) => details,
+        Err(LightningError::NotReady) => {
+            super::admission_journal::clear_failed(state, peer_id)?;
+            lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
+            charge.reserved_msat = 0;
+            return Err(ApiError::NotReady);
+        }
         Err(LightningError::PaymentNotDispatched(reason)) => {
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
@@ -2649,24 +2681,17 @@ async fn compose_room_member(
         }
     }
 
+    if let Err(e) = state.storage.prepare_delivery(&envelope.id, &member).await {
+        return RoomMemberOutcome::stopped(member, "settled", amount_msat, format!("Cannot persist delivery: {e}"));
+    }
     // Deliver or queue — try sending directly to avoid TOCTOU race.
-    let delivered = match state.transport.send(&member, &envelope).await {
-        Ok(()) => {
-            // Record send timestamp for STDP latency measurement.
-            let mut ts = state.send_timestamps.lock().await;
-            if ts.len() < MAX_SEND_TIMESTAMPS {
-                ts.insert(envelope.id, std::time::Instant::now());
-            }
-            drop(ts);
-            true
+    {
+        let mut ts = state.send_timestamps.lock().await;
+        if ts.len() < MAX_SEND_TIMESTAMPS {
+            ts.insert(envelope.id, std::time::Instant::now());
         }
-        Err(_) => {
-            if let Err(qe) = state.storage.queue_pending_delivery(&envelope.id, &member).await {
-                tracing::warn!(peer = %member, error = %qe, "failed to queue pending room delivery");
-            }
-            false
-        }
-    };
+    }
+    let delivered = state.transport.send(&member, &envelope).await.is_ok();
 
     RoomMemberOutcome {
         receipt: MemberPaymentOutcome { recipient: member.to_hex(), status: "settled", amount_msat,
@@ -2768,13 +2793,13 @@ pub(super) async fn compose_message(
             )));
         }
 
-        let current_block_height = match state.chain.get_block_height().await {
+        let current_block_height = if !state.lightning.money_ready().await { 0 } else { match state.chain.get_block_height().await {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to get block height for room compose, using fallback 0");
                 0
             }
-        };
+        }};
 
         let mut prices = Vec::new();
         for member in members.iter().filter(|m| *m != state.identity.node_id()) {
@@ -2907,7 +2932,7 @@ pub(super) async fn compose_message(
         let mut admission = FirstContactCharge::default();
         let recipient = Recipient::Node(peer_id);
 
-        let height = state.chain.get_block_height().await.unwrap_or(0);
+        let height = if state.lightning.money_ready().await { state.chain.get_block_height().await.unwrap_or(0) } else { 0 };
         let mut price_msat = quoted_price(&state, &peer_id, req.kind, height).await?;
         let mut cap = req.max_total_msat;
         if let Some(per) = &req.max_recipient_msat {
@@ -3090,27 +3115,18 @@ pub(super) async fn compose_message(
             }
         }
 
-        // Deliver via transport; queue for later if peer offline or send fails.
+        state.storage.prepare_delivery(&envelope.id, &peer_id).await
+            .map_err(|e| ApiError::Storage(e.to_string()))?;
+        // Deliver via transport; keep queued until ACK.
         // Try sending directly — avoids TOCTOU race where peer disconnects
         // between an is_connected check and the actual send.
-        let delivered = match state.transport.send(&peer_id, &envelope).await {
-            Ok(()) => {
-                // Record send timestamp for STDP latency measurement.
-                let mut ts = state.send_timestamps.lock().await;
-                if ts.len() < MAX_SEND_TIMESTAMPS {
-                    ts.insert(envelope.id, std::time::Instant::now());
-                }
-                true
+        {
+            let mut ts = state.send_timestamps.lock().await;
+            if ts.len() < MAX_SEND_TIMESTAMPS {
+                ts.insert(envelope.id, std::time::Instant::now());
             }
-            Err(_) => {
-                if let Err(e) =
-                    state.storage.queue_pending_delivery(&envelope.id, &peer_id).await
-                {
-                    tracing::warn!(error = %e, "failed to queue pending delivery");
-                }
-                false
-            }
-        };
+        }
+        let delivered = state.transport.send(&peer_id, &envelope).await.is_ok();
 
         // Broadcast to WebSocket clients (with plaintext — we composed this message)
         if let Err(e) = state.ws_broadcast.send(Arc::new(crate::state::WsMessage {

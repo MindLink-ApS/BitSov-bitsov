@@ -147,6 +147,10 @@ pub struct InboundPayment {
 /// Errors from Lightning operations.
 #[derive(Debug, Error)]
 pub enum LightningError {
+    /// No operation was dispatched: the backend has not completed safe startup.
+    #[error("not_ready: Lightning is offline or synchronizing; retry when money_ready is true")]
+    NotReady,
+
     /// The bounded startup fee barrier could not obtain usable chain data.
     #[error("BOOT_CHAIN_SOURCE_UNAVAILABLE: BitSov could not obtain usable fees from a Bitcoin chain service. Your local identity is saved. Check your connection and try again. (network={network}, service={service}, attempts={attempts}, elapsed_ms={elapsed_ms}, cause={cause})")]
     ChainSourceUnavailable {
@@ -233,12 +237,39 @@ pub enum WalletSync {
     NeverSynced,
 }
 
+/// A bounded, process-local transition history for status polling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadinessEvent {
+    pub sequence: u64,
+    pub timestamp: u64,
+    pub state: String,
+    pub money_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightningReadiness {
+    pub money_ready: bool,
+    pub state: String,
+    pub retry_attempt: u64,
+    pub retry_after_secs: Option<u64>,
+    pub events: Vec<ReadinessEvent>,
+}
+
 /// Abstraction over Lightning Network payment backends.
 ///
 /// This is the critical trait for Principle 2 (Lightning Clearance = Message Gate).
 /// Every message must have its payment verified through this interface.
 #[async_trait]
 pub trait LightningProvider: Send + Sync {
+    /// Safe to perform money operations, distinct from sufficient liquidity.
+    async fn money_ready(&self) -> bool { self.is_available().await }
+
+    async fn readiness(&self) -> LightningReadiness {
+        let money_ready = self.money_ready().await;
+        LightningReadiness { money_ready, state: if money_ready { "ready" } else { "offline" }.into(),
+            retry_attempt: 0, retry_after_secs: None, events: Vec::new() }
+    }
+
     /// Whether LSPS2 funding is explicitly enabled on this backend.
     fn liquidity_info(&self) -> super::liquidity::LiquidityInfo { Default::default() }
 
