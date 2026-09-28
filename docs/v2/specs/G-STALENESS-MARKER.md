@@ -62,7 +62,7 @@ tolerance, but no node sends it.
 
 | Route | `BitSov-Data-As-Of` | `BitSov-Data-Stale: 1` when |
 |---|---|---|
-| `/payments/balance`, `/payments/channels` | LDK: older of last Lightning and last on-chain wallet sync; absent until both have synced once. LNbits/LND/mock: time just before the backend read | LDK only: sync ≥ 10 min old (`WALLET_SYNC_STALE_AFTER`), or never synced |
+| `/payments/balance`, `/payments/channels` | LDK: older of last Lightning and last on-chain wallet sync; absent until both have synced once. LND/mock (LNbits not selectable — #99/#104): time just before the backend read | LDK only: sync ≥ 10 min old (`WALLET_SYNC_STALE_AFTER`), or never synced |
 | `/health` | time the chain backend was queried for `block_height`; absent when `block_height` is null | never |
 | `/messages` | time the local message store was read ("read just now", present for uniformity) | never |
 | `/pricing` | chain-aware: the oldest real chain fetch among the served values (per-target fee rates + block height); values reused after a failed fetch keep their old time, seeded values count as `cache_ttl` old; static: time of the read | chain-aware only: that oldest fetch at/past `cache_ttl` (default 60 s), or no cache, i.e. prices fell back to the static table or are built on reused inputs |

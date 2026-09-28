@@ -51,7 +51,7 @@ From `LightningProvider::wallet_sync()`:
   Stale bound: 10 minutes (`WALLET_SYNC_STALE_AFTER`). LDK's background sync
   runs every 30 s (Lightning) / 80 s (on-chain) by default, so 10 minutes is
   several missed syncs, e.g. the chain backend has been unreachable.
-- **LNbits, LND, mock** (query the backend on every call): the time just before
+- **LND, mock** (and legacy LNbits code paths if ever forced in tests; LNbits is not selectable after #99/#104) (query the backend on every call): the time just before
   the backend was asked. Never stale.
 
 The sync status is read *before* the balance/channel read, so the header

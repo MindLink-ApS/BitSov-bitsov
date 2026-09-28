@@ -80,3 +80,18 @@ The stock mock now issues signed regtest BOLT11 invoices. Their mock-only
 metadata carries the simulated preimage for cross-instance testing; these
 invoices never represent real funds. Synthetic or unrelated invoice strings
 are rejected. Mock settlement and fee-limit enforcement remain active.
+
+## Channel open fee and announcement (#101)
+
+On-chain channel opens are outside Lightning routing-fee caps. For
+`POST /payments/open-channel` (and the LDK opener):
+
+- An explicit per-channel funding `fee_rate_sat_per_vb` (sat/vB) is **refused
+  before dispatch** (`PaymentNotDispatched`: LDK cannot enforce that ceiling).
+  Omit the override and use the node's fee estimator.
+- `announce: true` is refused before dispatch when the node cannot honour
+  announcement prerequisites (no alias / listening addresses) —
+  `announce_unavailable`. Private opens (`announce: false`) remain the
+  supported path for BitSov nodes without an alias.
+- A successful open return means initiation, not confirmed usable capacity;
+  wait for confirmations and both ends reporting the channel active.
