@@ -104,7 +104,7 @@ impl Wallet {
             }
         };
         Ok(PaymentDetails {
-            payment_hash: "ab".repeat(32),
+            payment_hash: hex::encode(<sha2::Sha256 as sha2::Digest>::digest([0xcd; 32])),
             preimage: (status == PaymentStatus::Settled).then(|| "cd".repeat(32)),
             amount_msat,
             status,
@@ -1368,4 +1368,31 @@ async fn invoice_fee_refusal_releases_message_reservation() {
     assert_eq!(receipt["max_routing_fee_msat"], 0);
     assert_eq!(fx.wallet.money(), 0);
     assert_eq!(fx.used(), 0, "positive non-dispatch releases all authority");
+}
+
+#[tokio::test]
+async fn operation_journal_failure_after_dispatch_keeps_original_grant_reserved() {
+    use konsensus_storage::SqliteStorage;
+    let mut fx = fixture().await;
+    let db = Arc::new(SqliteStorage::open(fx.tmp.path().join("outbox.db").to_str().unwrap()).await.unwrap());
+    fx.state = Arc::new(AppState { storage: db.clone(), ..(*fx.state).clone() });
+    let token = fx.grant(None, GrantTerms::new(2500)).await;
+    sqlx::raw_sql("CREATE TRIGGER crash BEFORE UPDATE ON outbox_operations WHEN NEW.payment_hash IS NOT NULL AND OLD.payment_hash IS NULL BEGIN SELECT RAISE(ABORT, 'lost settlement journal'); END").execute(db.pool()).await.unwrap();
+    let (status, receipt) = fx.compose(&token).await;
+    assert_eq!(fx.wallet.money(), 1);
+    assert_eq!(fx.used(), 1000, "a dispatched payment stays reserved when journaling fails");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{receipt}");
+}
+
+#[tokio::test]
+async fn operation_insert_failure_precedes_budget_debit_and_payment() {
+    use konsensus_storage::SqliteStorage;
+    let mut fx = fixture().await;
+    let db = Arc::new(SqliteStorage::open(fx.tmp.path().join("outbox.db").to_str().unwrap()).await.unwrap());
+    fx.state = Arc::new(AppState { storage: db.clone(), ..(*fx.state).clone() });
+    let token = fx.grant(None, GrantTerms::new(2500)).await;
+    sqlx::raw_sql("CREATE TRIGGER crash BEFORE INSERT ON outbox_operations BEGIN SELECT RAISE(ABORT, 'cannot prepare'); END").execute(db.pool()).await.unwrap();
+    let (status, _) = fx.compose(&token).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(fx.wallet.money(), 0); assert_eq!(fx.used(), 0);
 }

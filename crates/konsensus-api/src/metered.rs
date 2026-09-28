@@ -201,6 +201,7 @@ impl MeteredSpend {
 /// mid-payment. Resolve explicitly to release or settle.
 #[must_use = "resolve each charge once its outcome is known; dropping keeps it reserved"]
 pub struct Debit {
+    operation: Option<crate::handlers::messages::operations::Operation>,
     held: Option<(Arc<PairingService>, Reservation)>,
     max_routing_fee_msat: Option<u64>,
     // None means a settled payment's fee is still unknown. Never release that liability.
@@ -211,6 +212,18 @@ pub struct Debit {
 }
 
 impl Debit {
+    pub(crate) fn with_operation(mut self, operation: crate::handlers::messages::operations::Operation) -> Self {
+        self.operation = Some(operation); self
+    }
+    pub(crate) fn operation(&self) -> Option<&crate::handlers::messages::operations::Operation> { self.operation.as_ref() }
+    pub(crate) async fn dispatch_message<F>(&self, _state: &AppState, hash: Option<String>, amount: u64, future: F) -> Result<F::Output, ApiError>
+    where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
+        match &self.operation {
+            Some(op) => op.dispatch(self, hash, amount, future).await,
+            None => self.dispatch(future).await,
+        }
+    }
+
     pub(crate) fn with_fee_limit(mut self, limit: Option<u64>) -> Self {
         self.max_routing_fee_msat = limit;
         self
@@ -226,12 +239,12 @@ impl Debit {
 
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { max_routing_fee_msat: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self { operation: None, max_routing_fee_msat: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { max_routing_fee_msat: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        Self { operation: None, max_routing_fee_msat: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.

@@ -184,6 +184,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         readiness,
         api_capabilities: vec![
             "offline_readiness_v1",
+            "message_operations_v1",
             super::messages::caps::CAPABILITY,
             super::messages::caps::ROOM_CAPABILITY,
             super::organism::ENERGY_CAPABILITY,

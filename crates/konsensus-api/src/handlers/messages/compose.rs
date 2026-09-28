@@ -39,6 +39,11 @@ use crate::state::{AppState, InvoiceRequestOutcome, InvoiceResponseData};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComposeRequest {
+    /// Client-generated UUIDv4; omitted ids are generated and returned by the node.
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub wait_ack_ms: Option<u64>,
     #[serde(default)]
     pub max_routing_fee_msat: Option<u64>,
     #[serde(default)]
@@ -62,6 +67,11 @@ pub struct ComposeRequest {
 /// Response after composing and sending a message.
 #[derive(Serialize)]
 pub struct ComposeResponse {
+    pub operation_id: Option<String>,
+    pub state: String,
+    pub accepted: bool,
+    pub payment_hash: Option<String>,
+    pub retry_allowed: bool,
     /// Sum of approved routing ceilings for this call.
     pub max_routing_fee_msat: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,6 +273,25 @@ async fn await_settlement(
                 }
             }
         }
+    }
+}
+
+async fn await_message_settlement(state: &AppState, debit: &Debit, mut details: PaymentDetails, method: &str) -> Result<PaymentDetails, ApiError> {
+    let Some(operation) = debit.operation() else { return await_settlement(&state.lightning, details, method).await; };
+    let deadline = tokio::time::Instant::now() + PAYMENT_SETTLE_TIMEOUT;
+    loop {
+        operation.record(&details).await.map_err(|e| ApiError::PaymentUnresolved(format!("payment polled but journal failed: {e}")))?;
+        match details.status {
+            PaymentStatus::Settled => return Ok(details),
+            PaymentStatus::Failed | PaymentStatus::Expired => return Err(ApiError::Lightning(format!("{method} payment failed"))),
+            _ => {}
+        }
+        if details.payment_hash.is_empty() || tokio::time::Instant::now() >= deadline {
+            return Err(ApiError::PaymentUnresolved(format!("{method} outcome unknown; reconcile operation")));
+        }
+        tokio::time::sleep(PAYMENT_POLL_INTERVAL).await;
+        details = state.lightning.get_payment_status(&details.payment_hash).await
+            .map_err(|e| ApiError::PaymentUnresolved(format!("{method} status: {e}")))?;
     }
 }
 
@@ -489,7 +518,7 @@ async fn readmit_then_pay(
             super::admission_journal::clear(state, peer_id)?;
             lock_admission_ledger().quotes.remove(peer_id);
         }
-        let mut attempt = FirstContactCharge::default();
+        let mut attempt = FirstContactCharge { operation: charge.operation.clone(), ..Default::default() };
         let mut readmit = Readmit { parent: debit, reserved: None, fee_ceiling: &readmission.fee_ceiling_msat };
         charge.readmission_blocks_message = true;
         let result = first_contact_admission(
@@ -567,7 +596,7 @@ async fn try_keysend(
     peer_id: &NodeId,
     debit: &Debit,
 ) -> Result<KeysendOutcome, ApiError> {
-    let details = match debit.dispatch(state
+    let details = match debit.dispatch_message(state, None, amount_msat, state
         .lightning
         .keysend_with_fee_limit(ln_pubkey, amount_msat, Some("konsensus message"), debit.fee_limit(state, amount_msat)))
         .await?
@@ -590,7 +619,7 @@ async fn try_keysend(
 
     // A payment record exists: never re-dispatch by another path. Poll any
     // in-flight payment to terminal settlement.
-    let settled = await_settlement(&state.lightning, details, "keysend").await?;
+    let settled = await_message_settlement(state, debit, details, "keysend").await?;
     debit.record_payment(&peer_id.to_hex(), &settled);
 
     let preimage_hex = settled.preimage.ok_or_else(|| {
@@ -750,7 +779,7 @@ async fn create_payment_proof_via_invoice(
     // Pay the recipient's invoice, then poll the in-flight payment to terminal
     // settlement (it commonly returns Pending/InFlight before the preimage is
     // known; treating that as failure dropped settling messages).
-    let details = debit.dispatch(state
+    let details = debit.dispatch_message(state, Some(invoice.payment_hash().to_string()), invoice_amount_msat, state
         .lightning
         .pay_invoice_with_fee_limit(&response.bolt11, debit.fee_limit(state, invoice_amount_msat)))
         .await?
@@ -760,7 +789,7 @@ async fn create_payment_proof_via_invoice(
             other => ApiError::PaymentUnresolved(format!("failed to pay recipient invoice: {other}")),
         })?;
 
-    let details = await_settlement(&state.lightning, details, "invoice payment").await?;
+    let details = await_message_settlement(state, debit, details, "invoice payment").await?;
     debit.record_payment(&peer_id.to_hex(), &details);
 
     // Extract and validate the preimage.
@@ -1615,6 +1644,7 @@ async fn deliver_settled_admission(
 /// first-contact aggregate once; re-admission owns a separate budget debit.
 #[derive(Default)]
 pub(crate) struct FirstContactCharge {
+    operation: Option<super::operations::Operation>,
     fee_ceiling_msat: u64,
     reserved_msat: u64,
     pub(crate) settled_msat: u64,
@@ -2414,6 +2444,9 @@ async fn first_contact_admission_at(
         admission_msat,
         Instant::now(),
     );
+    if let Some(operation) = &charge.operation {
+        operation.admission_started(bolt11_payment_hash.clone(), admission_msat, readmission_event.is_some(), debit).await?;
+    }
     if let Some(event) = readmission_event {
         lock_admission_ledger().readmissions.insert(*peer_id, event);
     } else {
@@ -2427,6 +2460,7 @@ async fn first_contact_admission_at(
     let dispatched = match debit.dispatch(state.lightning.pay_invoice_with_fee_limit(&response.bolt11, debit.fee_limit(state, admission_msat))).await {
         Ok(result) => result,
         Err(error @ ApiError::BudgetExceeded(_)) => {
+            if let Some(operation) = &charge.operation { operation.admission_not_dispatched().await?; }
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
             charge.reserved_msat = 0;
@@ -2437,12 +2471,14 @@ async fn first_contact_admission_at(
     let details = match dispatched {
         Ok(details) => details,
         Err(LightningError::NotReady) => {
+            if let Some(operation) = &charge.operation { operation.admission_not_dispatched().await?; }
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
             charge.reserved_msat = 0;
             return Err(ApiError::NotReady);
         }
         Err(LightningError::PaymentNotDispatched(reason)) => {
+            if let Some(operation) = &charge.operation { operation.admission_not_dispatched().await?; }
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
             charge.reserved_msat = 0;
@@ -2491,6 +2527,7 @@ async fn first_contact_admission_at(
             "admission settlement identity mismatch".into(),
         ));
     }
+    if let Some(operation) = &charge.operation { operation.admission_settled(&settled).await?; }
     debit.record_payment(&peer_id.to_hex(), &settled);
     charge.settled_msat = admission_msat;
     deliver_settled_admission(state, peer_id, settled).await
@@ -2693,6 +2730,9 @@ pub(super) async fn compose_message(
     let sender = *state.identity.node_id();
 
     if req.is_room {
+        if req.operation_id.is_some() {
+            return Err(ApiError::BadRequest("operation_id for rooms requires per-member operations (slice 4)".into()));
+        }
         // ── Room compose: encrypt + pay + deliver to each member individually ──
         let room_id = konsensus_core::RoomId::parse(&req.recipient)
             .map_err(|e| ApiError::BadRequest(format!("invalid room ID: {e}")))?;
@@ -2862,6 +2902,7 @@ pub(super) async fn compose_message(
         );
 
         Ok(Json(ComposeResponse {
+            operation_id: None, state: "untracked".into(), accepted: false, payment_hash: None, retry_allowed: false,
             max_routing_fee_msat: max_routing_fee_msat.saturating_add(readmission.fee_ceiling_msat()),
             member_outcomes: Some(outcomes.into_iter().map(|(_, o)| o.receipt).collect()),
             message_id,
@@ -2870,13 +2911,22 @@ pub(super) async fn compose_message(
             readmission_msat: readmission.paid_msat(),
         }))
     } else {
+        super::operations::compose(auth, state, req, references).await
+    }
+}
+
+pub(super) async fn compose_peer(
+    auth: MeteredSpend, state: Arc<AppState>, req: ComposeRequest,
+    references: Vec<MessageId>, operation: super::operations::Operation,
+) -> Result<Json<ComposeResponse>, ApiError> {
+    let sender = *state.identity.node_id();
         // ── Peer compose: existing single-recipient path ──
         let peer_id = NodeId::from_hex(&req.recipient)
             .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
         let _admission_guard = acquire_peer_admission_lock(&peer_id).await.ok_or_else(||
             ApiError::Internal("too many concurrent peer sends".into()))?;
         reconcile_admission_budget(&state, &peer_id, None).await?;
-        let mut admission = FirstContactCharge::default();
+        let mut admission = FirstContactCharge { operation: Some(operation.clone()), ..Default::default() };
         let recipient = Recipient::Node(peer_id);
 
         let height = if state.lightning.money_ready().await { state.chain.get_block_height().await.unwrap_or(0) } else { 0 };
@@ -2913,6 +2963,12 @@ pub(super) async fn compose_message(
                 amount_msat: if first_contact { cap.unwrap_or(ADMISSION_MAX_MSAT) } else { super::caps::all_in(&state, price_msat, req.max_routing_fee_msat)? },
             }],
         ).map_err(|e| e.with_routing_fee(state.lightning.routing_fee_policy().ceiling(price_msat, req.max_routing_fee_msat)))? }.with_fee_limit(req.max_routing_fee_msat);
+        let debit = debit.with_operation(operation.clone());
+        if let Err(error) = operation.attach_debit(&debit).await {
+            // No payment/invoice future has been polled under this debit.
+            debit.released(&peer_key);
+            return Err(error);
+        }
         let result = async {
 
         // Encrypt via Double Ratchet.
@@ -3011,6 +3067,14 @@ pub(super) async fn compose_message(
             super::caps::all_in(&state, price_msat, req.max_routing_fee_msat)?, cap)?;
         let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
+        let draft = konsensus_core::UkmEnvelopeBuilder::new(
+            req.kind, sender, recipient, ciphertext,
+            konsensus_core::PaymentProof::new([0; 32], [0; 32], 0),
+        ).references(references).build();
+        operation.draft(draft, price_msat,
+            debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat),
+            admission.settled_msat.saturating_sub(admission.readmission_msat), admission.readmission_msat).await?;
+
         // Create payment proof — requests invoice from recipient's wallet (Principle 2).
         if let Some(mut attempt) = super::admission_journal::load(&state, &peer_id)? {
             if attempt.original_reservation == debit.reservation() {
@@ -3026,23 +3090,7 @@ pub(super) async fn compose_message(
         let proof =
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
 
-        // Build envelope
-        let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
-            req.kind, sender, recipient, ciphertext, proof,
-        )
-        .references(references)
-        .build();
-
-        // Sign
-        let sig = state.identity.sign(&envelope.signable_bytes());
-        envelope.signature = konsensus_core::Signature::from_ed25519(&sig);
-
-        // Store
-        state
-            .storage
-            .store_message(&envelope)
-            .await
-            .map_err(|e| ApiError::Storage(e.to_string()))?;
+        let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
 
         // Cache plaintext (encrypted at rest) for API retrieval
         if let Some(ref cipher) = state.plaintext_cipher {
@@ -3062,8 +3110,8 @@ pub(super) async fn compose_message(
             }
         }
 
-        state.storage.prepare_delivery(&envelope.id, &peer_id).await
-            .map_err(|e| ApiError::Storage(e.to_string()))?;
+        // The paid transaction already queued this envelope. Do not insert again:
+        // a concurrent flusher may already have received its ACK.
         // Deliver via transport; keep queued until ACK.
         // Try sending directly — avoids TOCTOU race where peer disconnects
         // between an is_connected check and the actual send.
@@ -3073,7 +3121,7 @@ pub(super) async fn compose_message(
                 ts.insert(envelope.id, std::time::Instant::now());
             }
         }
-        let delivered = state.transport.send(&peer_id, &envelope).await.is_ok();
+        let delivered = operation.resend().await?;
 
         // Broadcast to WebSocket clients (with plaintext — we composed this message)
         if let Err(e) = state.ws_broadcast.send(Arc::new(crate::state::WsMessage {
@@ -3100,6 +3148,8 @@ pub(super) async fn compose_message(
         );
 
         Ok(Json(ComposeResponse {
+            operation_id: Some(operation.id.clone()), state: "sent".into(), accepted: false,
+            payment_hash: Some(hex::encode(payment_hash)), retry_allowed: true,
             max_routing_fee_msat: debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat),
             member_outcomes: None,
             message_id: envelope.id.to_hex(),
@@ -3117,7 +3167,6 @@ pub(super) async fn compose_message(
             Err(_) => debit.released(&peer_key),
         }
         result.map_err(|e| e.with_routing_fee(debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat)))
-    }
 }
 
 #[cfg(test)]

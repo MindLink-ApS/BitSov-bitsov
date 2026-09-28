@@ -348,6 +348,36 @@ impl<S: Storage> EncryptedStorage<S> {
 
 #[async_trait]
 impl<S: Storage> Storage for EncryptedStorage<S> {
+    async fn record_outbox_sent(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
+        self.inner.record_outbox_sent(id, peer).await
+    }
+
+    async fn commit_outbox_envelope(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        let mut encrypted = op.clone(); encrypted.recovery = self.encrypt(&op.recovery)?;
+        self.inner.commit_outbox_envelope(&encrypted, &self.encrypt_envelope(envelope)?).await
+    }
+
+    async fn insert_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+        let mut encrypted = op.clone();
+        encrypted.recovery = self.encrypt(&op.recovery)?;
+        self.inner.insert_outbox_operation(&encrypted).await
+    }
+    async fn update_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+        let mut encrypted = op.clone();
+        encrypted.recovery = self.encrypt(&op.recovery)?;
+        self.inner.update_outbox_operation(&encrypted).await
+    }
+    async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        let mut op = self.inner.get_outbox_operation(id).await?;
+        if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        Ok(op)
+    }
+    async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        let mut ops = self.inner.list_recoverable_operations().await?;
+        for op in &mut ops { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        Ok(ops)
+    }
+
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
         let encrypted = self.encrypt_envelope(envelope)?;
         self.inner.store_message(&encrypted).await

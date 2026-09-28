@@ -248,3 +248,6 @@ impl<S: Storage + ?Sized> konsensus_core::gate::NonceStore for StorageNonceAdapt
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 }
+
+pub mod outbox;
+pub use outbox::OutboxOperation;
