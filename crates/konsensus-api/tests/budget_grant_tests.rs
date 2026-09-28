@@ -1396,3 +1396,118 @@ async fn operation_insert_failure_precedes_budget_debit_and_payment() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(fx.wallet.money(), 0); assert_eq!(fx.used(), 0);
 }
+
+
+/// Holds the request after the paid commit, before compose's debit-resolution tail.
+struct HoldPaidSend(NodeId);
+#[async_trait]
+impl konsensus_core::traits::transport::MessageTransport for HoldPaidSend {
+    async fn send(&self, _: &NodeId, _: &konsensus_core::UkmEnvelope) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        futures::future::pending().await
+    }
+    async fn recv(&self) -> Result<konsensus_core::UkmEnvelope, konsensus_core::traits::transport::TransportError> {
+        futures::future::pending().await
+    }
+    async fn connect(&self, _: &NodeId, _: &str) -> Result<(), konsensus_core::traits::transport::TransportError> { Ok(()) }
+    async fn disconnect(&self, _: &NodeId) -> Result<(), konsensus_core::traits::transport::TransportError> { Ok(()) }
+    async fn is_connected(&self, peer: &NodeId) -> bool { peer == &self.0 }
+    async fn connected_peers(&self) -> Vec<NodeId> { vec![self.0] }
+}
+
+#[tokio::test]
+async fn recovery_resolves_paid_commit_reservation_once_and_keeps_unknown_fees() {
+    use konsensus_storage::{SqliteStorage, Storage};
+    for (unknown_fee, delivered) in [(false, "paid"), (true, "paid"), (false, "sent"), (false, "acked"), (false, "rejected_retryable"), (false, "failed_paid")] {
+        let mut fx = fixture().await;
+        let path = fx.tmp.path().join("outbox.db");
+        let db = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+        fx.wallet.fee.store(100, Ordering::SeqCst);
+        fx.wallet.unknown_fee.store(unknown_fee, Ordering::SeqCst);
+        fx.state = Arc::new(AppState {
+            storage: db.clone(), transport: Arc::new(HoldPaidSend(fx.peer)),
+            ..(*fx.state).clone()
+        });
+        let token = fx.grant(None, GrantTerms::new(3000)).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = json!({"operation_id":id, "recipient":fx.peer.to_hex(), "kind":100,
+            "plaintext":"paid crash", "max_total_msat":1500, "max_routing_fee_msat":500, "wait_ack_ms":0});
+        let state = fx.state.clone();
+        let job = tokio::spawn(async move {
+            call(&state, "POST", "/api/v1/messages/compose", Some(body), Some(&token)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if db.get_outbox_operation(&id).await.unwrap().is_some_and(|op| op.state == "paid") { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        assert_eq!(fx.used(), 1500, "crash leaves the full ceiling reserved");
+        assert_eq!(fx.service.reload_from_disk().unwrap().grants[0].budget.as_ref().unwrap().pending.len(), 1);
+        // A pending-delivery worker can send/ACK/reject after the paid commit
+        // even while the original compose request remains interrupted.
+        let op = db.get_outbox_operation(&id).await.unwrap().unwrap();
+        let message = konsensus_core::MessageId::from_hex(op.message_id.as_deref().unwrap()).unwrap();
+        if delivered != "paid" {
+            db.mark_pending_sent(&message, &fx.peer).await.unwrap();
+            db.record_outbox_sent(&message, &fx.peer).await.unwrap();
+            match delivered {
+                "acked" => { assert!(db.acknowledge_pending(&message, &fx.peer, fx.state.identity.node_id()).await.unwrap()); }
+                "rejected_retryable" | "failed_paid" => { assert!(db.reject_pending(&message, &fx.peer, fx.state.identity.node_id(), "injected rejection", delivered == "failed_paid").await.unwrap()); }
+                _ => {}
+            }
+        }
+        fx.restart(); // reopen durable pairing ledger
+        fx.state = Arc::new(AppState {
+            storage: Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap()),
+            transport: Arc::new(StubTransport), // resolution cannot depend on delivery
+            ..(*fx.state).clone()
+        });
+        for _ in 0..3 {
+            konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+            assert_eq!(fx.used(), if unknown_fee { 1500 } else { 1100 });
+            let ledger = fx.service.reload_from_disk().unwrap();
+            assert_eq!(ledger.grants[0].budget.as_ref().unwrap().pending.len(), usize::from(unknown_fee));
+        }
+        assert_eq!(fx.wallet.money(), 1);
+        assert_eq!(db.get_outbox_operation(&id).await.unwrap().unwrap().state, delivered);
+    }
+}
+
+#[tokio::test]
+async fn recovery_free_message_resolves_recorded_admission_but_keeps_unknown_fee() {
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    use konsensus_storage::{OutboxOperation, SqliteStorage, Storage};
+    for admission_fee in [Some(100), None] {
+        let mut fx = fixture().await;
+        fx.grant(None, GrantTerms::new(3000)).await;
+        let epoch = fx.service.snapshot().clients.iter().find(|c| c.client_id == fx.client_id).unwrap().epoch;
+        let reservation = fx.service.reserve_spend(&fx.client_id, epoch, vec![Charge {
+            recipient: fx.peer.to_hex(), amount_msat: 1500,
+        }]).unwrap();
+        let db = Arc::new(SqliteStorage::open(fx.tmp.path().join("free.db").to_str().unwrap()).await.unwrap());
+        let env = UkmEnvelopeBuilder::new(1, *fx.state.identity.node_id(), Recipient::Node(fx.peer), vec![42], PaymentProof::new([0; 32], [0; 32], 0)).build();
+        let mut op = OutboxOperation::prepared(uuid::Uuid::new_v4().to_string(), fx.peer.to_hex(), 1, "free after admission".into());
+        op.message_id = Some(env.id.to_hex());
+        // Persist the crash snapshot: admission is settled, free message has no
+        // Lightning dispatch or settlement record, and debit tail has not run.
+        op.recovery = serde_json::to_vec(&json!({
+            "caller":null, "draft":env, "envelope_ready":true, "dispatched":false,
+            "expected_msat":0, "settlement":null, "reservation":reservation,
+            "fee_ceiling_msat":500, "admission_msat":1000, "budget_admission_msat":1000,
+            "admission_fee_msat":admission_fee
+        })).unwrap();
+        assert!(db.insert_outbox_operation(&op).await.unwrap());
+        op.state = "paid".into();
+        assert!(db.commit_outbox_envelope(&op, &env).await.unwrap());
+        fx.restart();
+        fx.state = Arc::new(AppState { storage:db, transport:Arc::new(StubTransport), ..(*fx.state).clone() });
+        for _ in 0..2 {
+            konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+            assert_eq!(fx.used(), if admission_fee.is_some() { 1100 } else { 1500 });
+            assert_eq!(fx.service.reload_from_disk().unwrap().grants[0].budget.as_ref().unwrap().pending.len(), usize::from(admission_fee.is_none()));
+        }
+        assert_eq!(fx.wallet.money(), 0, "recovery must never pay the free message or admission");
+    }
+}

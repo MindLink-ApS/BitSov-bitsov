@@ -43,6 +43,8 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
     /// Complete recovery authority: never silently truncate unpaid/paid work.
+    /// Include delivered/terminal receipts: their pairing reservation may still
+    /// need crash recovery even though delivery itself is complete.
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
