@@ -293,7 +293,7 @@ pub(crate) async fn create_payment_proof_with_fee_report(
     state: &AppState, price_msat: u64, peer_id: &NodeId,
 ) -> Result<(([u8; 32], [u8; 32], u64), u64), ApiError> {
     let mut charge = FirstContactCharge::default();
-    let readmission = Readmission::for_cap(false);
+    let readmission = Readmission::for_cap(None);
     let fee = state.lightning.routing_fee_policy().ceiling(super::caps::payable(price_msat), None);
     let result = create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), &readmission, None, &mut charge).await;
     let ceiling = fee.saturating_add(readmission.fee_ceiling_msat());
@@ -305,8 +305,11 @@ pub(crate) async fn create_payment_proof_with_fee_report(
 /// it paid for that.
 #[derive(Debug, Default)]
 pub(crate) struct Readmission {
-    /// A quoted all-in cap cannot authorize an additional unquoted admission.
-    capped: bool,
+    /// Confirmed all-in ceiling for admission + message + both fee ceilings.
+    /// `None` means uncapped (protocol `ADMISSION_MAX_MSAT` still bounds the
+    /// quote path). `Some(0)` keeps a capped call fail-closed when only a
+    /// per-recipient room map is known and no aggregate amount can be checked.
+    caller_cap: Option<u64>,
     /// Single-recipient compose already holds the per-peer admission lock.
     lock_held: bool,
     /// Admission paid again during this send, msat.
@@ -318,8 +321,8 @@ impl Readmission {
     pub(crate) fn fee_ceiling_msat(&self) -> u64 {
         self.fee_ceiling_msat.load(std::sync::atomic::Ordering::Relaxed)
     }
-    pub(crate) fn for_cap(capped: bool) -> Self {
-        Self { capped, ..Self::default() }
+    pub(crate) fn for_cap(caller_cap: Option<u64>) -> Self {
+        Self { caller_cap, ..Self::default() }
     }
 
     /// Admission paid again during this send, if any, msat.
@@ -443,10 +446,13 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
 /// admission invoice and its signed proof), then ask for the message invoice
 /// again. The E2EE session is untouched; both sides still hold it.
 ///
-/// Any confirmed total/recipient cap refuses an additional unquoted admission,
-/// including a paired caller whose grant otherwise budgets the contact. An
-/// uncapped request may use existing admission authority; G1 reserves admission
-/// principal plus the approved fee against the same contact/call/grant limits.
+/// A capped call may re-admit only when the payee returns a fresh signed
+/// re-admission quote whose admission principal, message principal, and both
+/// routing fee ceilings fit the caller cap (and any grant). That all-in amount
+/// is reserved before dispatch and reconciled after, exactly like first-contact
+/// admission. No quote, or a quote that does not fit, is refused before payment.
+/// An uncapped request may use existing admission authority under the same
+/// G1 contact/call/grant limits. Mark and proof send stay generation-bound (#100).
 async fn readmit_then_pay(
     state: &AppState,
     amount_msat: u64,
@@ -456,12 +462,6 @@ async fn readmit_then_pay(
     kind: Option<u16>,
     charge: &mut FirstContactCharge,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
-    if readmission.capped {
-        return Err(ApiError::PriceCapExceeded(format!(
-            "{peer_id} requires admission again on a new connection, and the confirmed cap \
-             covers the message only; no invoice was paid. Send without a cap to pay admission."
-        )));
-    }
     let peer_key = peer_id.to_hex();
     debit.readmission_allowed(&peer_key)?;
     tracing::info!(
@@ -488,7 +488,7 @@ async fn readmit_then_pay(
         let mut readmit = Readmit { parent: debit, reserved: None, fee_ceiling: &readmission.fee_ceiling_msat };
         charge.readmission_blocks_message = true;
         let result = first_contact_admission(
-            state, peer_id, konsensus_core::kind::KIND_CHAT, None, &mut attempt,
+            state, peer_id, konsensus_core::kind::KIND_CHAT, readmission.caller_cap, &mut attempt,
             debit, Some(&mut readmit),
         ).await;
         if result.is_err() && matches!(lock_admission_ledger().prior_admission(peer_id, Instant::now()), PriorAdmission::None) {
@@ -2771,8 +2771,10 @@ pub(super) async fn compose_message(
         // the canonical `message_id` and the single WS broadcast stay
         // deterministic regardless of completion order.
         use futures::stream::StreamExt;
+        // Aggregate when known; per-recipient-only stays fail-closed (Some(0))
+        // until a member-scoped quoted path exists — same refuse-before-pay.
         let readmission = Readmission::for_cap(
-            req.max_total_msat.is_some() || req.max_recipient_msat.is_some(),
+            req.max_total_msat.or_else(|| req.max_recipient_msat.as_ref().map(|_| 0)),
         );
         let ctx = RoomFanoutCtx {
             debit: &debit,
@@ -3012,7 +3014,7 @@ pub(super) async fn compose_message(
             }
         }
         admission.current_dispatch = true;
-        let readmission = Readmission { lock_held: true, ..Readmission::for_cap(cap.is_some()) };
+        let readmission = Readmission { lock_held: true, ..Readmission::for_cap(cap) };
         let (payment_hash, preimage_bytes, amount_msat) =
             create_metered_payment_proof(&state, price_msat, &peer_id, &debit, &readmission, Some(req.kind), &mut admission).await?;
         admission.message_settled = amount_msat;
