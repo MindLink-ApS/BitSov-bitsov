@@ -141,7 +141,7 @@ fn bootstrap_partial_state_refuses() {
                 r.repair
             );
             assert!(
-                r.detail.contains("before #76"),
+                r.detail.contains("before #76/#77"),
                 "detail should mention legacy upgrades, got: {}",
                 r.detail
             );

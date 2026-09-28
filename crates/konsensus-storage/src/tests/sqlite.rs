@@ -1652,8 +1652,13 @@ fn embedded_migrations_match_migrations_dir() {
 /// second run against the same database applies nothing and raises no checksum complaint.
 #[tokio::test]
 async fn embedded_migrations_apply_and_are_idempotent() -> Result<(), Box<dyn std::error::Error>> {
-    std::env::remove_var("KONSENSUS_SQLITE_MIGRATIONS_DIR");
-    let db = SqliteStorage::in_memory().await?;
+    // Force embedded migrations via the parameterized open path — never touch process env.
+    let db_path = std::env::temp_dir().join(format!(
+        "konsensus-embedded-migrations-{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&db_path);
+    let db = SqliteStorage::open_with_migrations_dir(db_path.to_str().unwrap(), None).await?;
     let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
         .fetch_one(db.pool())
         .await?;
@@ -1669,6 +1674,7 @@ async fn embedded_migrations_apply_and_are_idempotent() -> Result<(), Box<dyn st
         .fetch_one(db.pool())
         .await?;
     assert_eq!(applied, again);
+    let _ = std::fs::remove_file(db_path);
     Ok(())
 }
 
@@ -1760,17 +1766,16 @@ async fn sqlite_open_refuses_stale_external_migrations_dir() {
             std::fs::copy(&path, stale.path().join(name)).unwrap();
         }
     }
-    std::env::set_var(
-        "KONSENSUS_SQLITE_MIGRATIONS_DIR",
-        stale.path().to_str().unwrap(),
-    );
     let db_path = std::env::temp_dir().join(format!(
         "konsensus-stale-migrations-{}.db",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&db_path);
-    let result = SqliteStorage::open(db_path.to_str().unwrap()).await;
-    std::env::remove_var("KONSENSUS_SQLITE_MIGRATIONS_DIR");
+    // Pass the stale dir as a parameter — never mutate process-global env (libtest
+    // runs sibling SqliteStorage::open/in_memory tests concurrently).
+    let result =
+        SqliteStorage::open_with_migrations_dir(db_path.to_str().unwrap(), Some(stale.path()))
+            .await;
     let err = match result {
         Err(e) => e,
         Ok(_) => panic!("stale migrations dir must refuse startup"),

@@ -54,7 +54,23 @@ pub fn sqlite_file_path(connection: &str) -> Option<std::path::PathBuf> {
 
 impl SqliteStorage {
     /// Open (or create) a SQLite database at the given path.
+    ///
+    /// When `KONSENSUS_SQLITE_MIGRATIONS_DIR` is set, migrations are loaded from that
+    /// directory (must be a superset of the embedded versions); otherwise the embedded
+    /// set is used.
     pub async fn open(path: &str) -> Result<Self, StorageError> {
+        let dir = std::env::var_os("KONSENSUS_SQLITE_MIGRATIONS_DIR").map(std::path::PathBuf::from);
+        Self::open_with_migrations_dir(path, dir.as_deref()).await
+    }
+
+    /// Like [`Self::open`], with an explicit migrations directory (or embedded when `None`).
+    ///
+    /// Used by tests so they never mutate process-global environment variables that other
+    /// concurrent `open` / `in_memory` callers also read.
+    pub(crate) async fn open_with_migrations_dir(
+        path: &str,
+        migrations_dir: Option<&std::path::Path>,
+    ) -> Result<Self, StorageError> {
         // `busy_timeout` and `cache_size` are PER-CONNECTION pragmas: set them on
         // the connect options so every connection the pool opens inherits them.
         // The previous `execute(&pool)` form configured only a single pooled
@@ -75,7 +91,7 @@ impl SqliteStorage {
             .await?;
 
         let storage = Self { pool };
-        storage.run_migrations().await?;
+        storage.run_migrations(migrations_dir).await?;
         Ok(storage)
     }
 
@@ -92,25 +108,28 @@ impl SqliteStorage {
             .await?;
 
         let storage = Self { pool };
-        storage.run_migrations().await?;
+        let dir = std::env::var_os("KONSENSUS_SQLITE_MIGRATIONS_DIR").map(std::path::PathBuf::from);
+        storage.run_migrations(dir.as_deref()).await?;
         Ok(storage)
     }
 
-    /// Run the schema migrations embedded in the binary (genome #57).
+    /// Run schema migrations (genome #57).
     ///
-    /// `KONSENSUS_SQLITE_MIGRATIONS_DIR` remains a development override for running
-    /// migrations from a directory; a released binary needs no files on disk. When set,
+    /// `migrations_dir` is the development override (from `KONSENSUS_SQLITE_MIGRATIONS_DIR`
+    /// on the public `open` path); a released binary needs no files on disk. When `Some`,
     /// the directory must include **every** embedded migration version (extras are allowed).
-    async fn run_migrations(&self) -> Result<(), StorageError> {
+    async fn run_migrations(
+        &self,
+        migrations_dir: Option<&std::path::Path>,
+    ) -> Result<(), StorageError> {
         // Runtime sources on purpose: the sqlx `macros` feature (`sqlx::migrate!`) pulls
         // in MySQL support and the vulnerable `rsa` crate.
-        let migrator = match std::env::var("KONSENSUS_SQLITE_MIGRATIONS_DIR") {
-            Ok(dir) => {
-                let path = std::path::Path::new(&dir);
+        let migrator = match migrations_dir {
+            Some(path) => {
                 validate_external_migrations_dir(path)?;
                 Migrator::new(path).await?
             }
-            Err(_) => Migrator::new(EmbeddedMigrations).await?,
+            None => Migrator::new(EmbeddedMigrations).await?,
         };
         migrator.run(&self.pool).await?;
         Ok(())
@@ -214,6 +233,9 @@ fn migration_versions_in_dir(dir: &std::path::Path) -> Result<std::collections::
             dir.display()
         )))?;
         let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
         if path.extension().and_then(|e| e.to_str()) != Some("sql") {
             continue;
         }

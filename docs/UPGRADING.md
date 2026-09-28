@@ -3,9 +3,9 @@
 This note covers two common failure modes when replacing the `konsensus` binary on a
 production data directory without re-running `konsensus init`.
 
-## Missing `NODE_INITIALIZED` after upgrade (pre-#76 nodes)
+## Missing `NODE_INITIALIZED` after upgrade (pre-#76/#77 nodes)
 
-Nodes deployed before bootstrap (#76) never wrote a `NODE_INITIALIZED` marker. After
+Nodes deployed before bootstrap (#76/#77) never wrote a `NODE_INITIALIZED` marker. After
 upgrading the binary, `konsensus start` refuses with reason
 `identity_and_state_without_marker`: identity material and wallet/channel state are present,
 but the marker is absent.
@@ -42,5 +42,5 @@ version embedded in the binary. The error names the directory and the missing ve
 2. Point it at a directory that includes **every** migration version the binary embeds (extra
    files are fine; the directory must be a superset).
 
-After fixing the migrations source, restart the node. Apply any pending schema migrations on
-first open before serving traffic.
+After fixing the migrations source, restart the node. The node applies any pending schema
+migrations itself on first open before serving traffic.

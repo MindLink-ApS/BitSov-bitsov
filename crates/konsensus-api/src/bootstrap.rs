@@ -268,7 +268,7 @@ pub fn classify(probe: &DataDirProbe) -> StartupMode {
                 reason: "identity_and_state_without_marker",
                 detail: "identity material and wallet/channel state exist but the \
                          NODE_INITIALIZED marker is absent — common when upgrading a production \
-                         node from before #76 (the marker did not exist yet), or after a crash \
+                         node from before #76/#77 (the marker did not exist yet), or after a crash \
                          between renaming identity into place and writing the marker"
                     .into(),
                 repair: repair_mark_initialized(),
