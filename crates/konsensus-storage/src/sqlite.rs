@@ -163,6 +163,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (22, "receipt bindings", include_str!("../migrations/022_receipt_bindings.sql")),
     (23, "delivery price quotes", include_str!("../migrations/023_delivery_price_quotes.sql")),
     (24, "outbox operations", include_str!("../migrations/024_outbox_operations.sql")),
+    (25, "outbox recovery", include_str!("../migrations/025_outbox_recovery.sql")),
 ];
 
 impl EmbeddedMigrations {
@@ -527,7 +528,7 @@ impl Storage for SqliteStorage {
     }
 
     async fn insert_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
-        Ok(sqlx::query("INSERT INTO outbox_operations (operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO NOTHING")
+        Ok(sqlx::query("INSERT INTO outbox_operations (operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO NOTHING")
             .bind(&op.operation_id)
             .bind(&op.recipient)
             .bind(op.kind)
@@ -545,10 +546,12 @@ impl Storage for SqliteStorage {
             .bind(&op.last_error)
             .bind(op.version)
             .bind(&op.recovery)
+            .bind(op.accounting_pending)
+            .bind(op.recovery_compacted)
             .execute(&self.pool).await?.rows_affected() == 1)
     }
     async fn update_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
-        Ok(sqlx::query("UPDATE outbox_operations SET state = ?, payment_hash = ?, admission_payment_hash = ?, message_id = ?, settled_msat = ?, readmission_msat = ?, updated_at = ?, last_sent_at = ?, attempts = ?, last_error = ?, recovery = ?, version = version + 1 WHERE operation_id = ? AND version = ?")
+        Ok(sqlx::query("UPDATE outbox_operations SET state = ?, payment_hash = ?, admission_payment_hash = ?, message_id = ?, settled_msat = ?, readmission_msat = ?, updated_at = ?, last_sent_at = ?, attempts = ?, last_error = ?, recovery = ?, accounting_pending = ?, recovery_compacted = ?, version = version + 1 WHERE operation_id = ? AND version = ?")
             .bind(&op.state)
             .bind(&op.payment_hash)
             .bind(&op.admission_payment_hash)
@@ -560,16 +563,25 @@ impl Storage for SqliteStorage {
             .bind(op.attempts)
             .bind(&op.last_error)
             .bind(&op.recovery)
+            .bind(op.accounting_pending)
+            .bind(op.recovery_compacted)
             .bind(&op.operation_id).bind(op.version)
             .execute(&self.pool).await?.rows_affected() == 1)
     }
 
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery FROM outbox_operations WHERE operation_id = ?").bind(id).fetch_optional(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery FROM outbox_operations WHERE state IN ('prepared', 'released', 'paying', 'payment_unknown', 'paid', 'sent', 'acked', 'rejected_retryable', 'failed_paid') ORDER BY created_at").fetch_all(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_recovery WHERE accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable') ORDER BY created_at").fetch_all(&self.pool).await?)
     }
+    // Pin the partial index: without statistics SQLite can prefer the old
+    // state index, walking all terminal history and sorting before LIMIT.
+    async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_retention WHERE accounting_pending = FALSE AND recovery_compacted = FALSE AND state IN ('acked', 'failed_paid') AND updated_at < ? ORDER BY updated_at LIMIT ?")
+            .bind(before_ms).bind(i64::from(limit)).fetch_all(&self.pool).await?)
+    }
+
 
     // ── Messages ───────────────────────────────────────────────────────
 
@@ -578,7 +590,7 @@ impl Storage for SqliteStorage {
             return Err(StorageError::Conversion("invalid paid operation binding".into()));
         }
         let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE outbox_operations SET state = ?, payment_hash = ?, admission_payment_hash = ?, message_id = ?, settled_msat = ?, readmission_msat = ?, updated_at = ?, last_sent_at = ?, attempts = ?, last_error = ?, recovery = ?, version = version + 1 WHERE operation_id = ? AND version = ?")
+        let changed = sqlx::query("UPDATE outbox_operations SET state = ?, payment_hash = ?, admission_payment_hash = ?, message_id = ?, settled_msat = ?, readmission_msat = ?, updated_at = ?, last_sent_at = ?, attempts = ?, last_error = ?, recovery = ?, accounting_pending = ?, recovery_compacted = ?, version = version + 1 WHERE operation_id = ? AND version = ?")
             .bind(&op.state)
             .bind(&op.payment_hash)
             .bind(&op.admission_payment_hash)
@@ -590,6 +602,8 @@ impl Storage for SqliteStorage {
             .bind(op.attempts)
             .bind(&op.last_error)
             .bind(&op.recovery)
+            .bind(op.accounting_pending)
+            .bind(op.recovery_compacted)
             .bind(&op.operation_id).bind(op.version)
             .execute(&mut *tx).await?.rows_affected() == 1;
         if !changed { tx.rollback().await?; return Ok(false); }
