@@ -1437,21 +1437,26 @@ async fn speed_payer_higher_first_compose_delivers_while_ratchet_init_is_in_flig
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn speed_eager_offer_never_reaches_an_unpaid_replacement() {
     let mut net = pair(Shape::CardOnly, Order::PayerLower, Wallet::Plain, Wallet::Plain).await;
-    let (payer, payee) = (net.payer.id, net.payee.id);
+    let payee = net.payee.id;
     let original = net.payer.transport.connected_since(&payee).await.unwrap();
     net.payer.pause.arm_before_eager_offer();
     let mark = log_mark();
-    let ((status, body), ()) = tokio::join!(net.payer.compose(&payee, "first"), async {
+    let ((status, body), (payee_before, payer_before)) = tokio::join!(net.payer.compose(&payee, "first"), async {
         net.payer.pause.reached().await;
+        // Each side's session refusals from here on: an eager offer on the
+        // unpaid replacement is refused (and counted) by the other side's gate.
+        let before = (net.payee.refused(), net.payer.refused());
         net.flap().await;
         let replacement = net.payer.transport.connected_since(&payee).await.unwrap();
         assert_ne!(original, replacement, "a new generation");
         assert!(!net.payer.paid_on_connection(&payee).await, "the replacement is unpaid");
         net.payer.pause.release();
+        before
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(drops(mark, "PrekeyOffer", &payer), 0, "the payer's eager offer reached the unpaid replacement");
-    assert_eq!(drops(mark, "PrekeyOffer", &payee), 0, "the payee offered on the unpaid replacement");
+    let session = PrePaymentReason::SessionBeforePayment;
+    assert_eq!(refused_delta(&payee_before, &net.payee.refused(), session), 0, "the payer's eager offer reached the unpaid replacement");
+    assert_eq!(refused_delta(&payer_before, &net.payer.refused(), session), 0, "the payee offered on the unpaid replacement");
     assert!(
         logged_since(mark, &["sent PrekeyOffer right after the admission proof", &format!("peer={payee}")]).is_empty(),
         "an eager offer was written after the paid connection was replaced"
