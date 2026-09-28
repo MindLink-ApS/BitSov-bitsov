@@ -1003,10 +1003,24 @@ impl MessageTransport for NoiseTransport {
         }
     }
 
+    /// Adding a peer is the owner's explicit admission of that NodeId, so it
+    /// also applies to a live connection that authenticated as that NodeId:
+    /// the connection is privileged at once, exactly as it would be after a
+    /// reconnect, instead of only at the next handshake. Removal does not
+    /// demote a live connection: its privilege may have been paid for.
     async fn add_to_whitelist(&self, peer: &NodeId) {
         let mut wl = self.whitelist.write().await;
         if wl.insert(*peer) {
             info!(peer = %peer.to_hex(), "added peer to transport whitelist");
+        }
+        drop(wl);
+        let conn = self.peers.read().await.get(peer).map(Arc::clone);
+        if let Some(conn) = conn {
+            let mut conn = conn.lock().await;
+            if !conn.privileged {
+                conn.privileged = true;
+                info!(peer = %peer, "whitelisted a live connection: privileged without a reconnect");
+            }
         }
     }
 
@@ -2609,6 +2623,148 @@ mod tests {
             !transport_b.promote_to_privileged(&stranger).await,
             "promote on a sender with no live connection must return false"
         );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    /// Each frame B can send A, and whether it completes an act A paid for.
+    fn frames_from_payee(payee: &NodeIdentity, payer: &NodeId) -> Vec<(Frame, bool)> {
+        vec![
+            (Frame::PrekeyOffer { bundle: serde_json::json!({}) }, true),
+            (Frame::SessionInit { init_data: serde_json::json!({}) }, true),
+            (Frame::SessionAck, true),
+            (Frame::RatchetInit { payload: vec![1, 2, 3] }, true),
+            (Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([1u8; 32]) }, true),
+            (Frame::MessageReject { id: konsensus_core::types::MessageId::from_bytes([2u8; 32]), reason: "r".into() }, true),
+            (
+                Frame::PriceTable {
+                    prices: HashMap::from([("chat".to_string(), 2_000)]),
+                    block_height: 1,
+                    valid_blocks: 10,
+                    trust_discount: 0.0,
+                },
+                true,
+            ),
+            (Frame::PriceResponse { kind: 0, price_msat: 2_000, block_height: 1 }, true),
+            (Frame::PriceQuery { kind: 0 }, false),
+            (Frame::RequestInvoice { request_id: "r".into(), amount_msat: 1_000, purpose: "konsensus message".into() }, false),
+            (Frame::PeerExchangeRequest, false),
+            (Frame::PeerExchangeResponse { peers: vec![] }, false),
+            (Frame::LightningInfo { ln_pubkey: "02".repeat(33), ln_addr: None }, false),
+            (Frame::Gossip(Box::new(make_test_envelope(payee, payer))), false),
+        ]
+    }
+
+    /// The next control event on `transport` that carries a privilege stamp.
+    async fn next_stamp(transport: &NoiseTransport) -> bool {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), transport.recv_control())
+                .await
+                .expect("control event")
+                .expect("control channel open");
+            let stamp = match event {
+                ControlEvent::PeerConnected { .. } => continue,
+                ControlEvent::PrekeyOffer { privileged, .. }
+                | ControlEvent::SessionInit { privileged, .. }
+                | ControlEvent::SessionAck { privileged, .. }
+                | ControlEvent::RatchetInit { privileged, .. }
+                | ControlEvent::MessageAcked { privileged, .. }
+                | ControlEvent::MessageRejected { privileged, .. }
+                | ControlEvent::PriceTableReceived { privileged, .. }
+                | ControlEvent::PriceQueryReceived { privileged, .. }
+                | ControlEvent::PriceResponseReceived { privileged, .. }
+                | ControlEvent::InvoiceRequested { privileged, .. }
+                | ControlEvent::PeerExchangeRequested { privileged, .. }
+                | ControlEvent::PeerExchangeReceived { privileged, .. }
+                | ControlEvent::LightningInfoReceived { privileged, .. }
+                | ControlEvent::GossipReceived { privileged, .. } => privileged,
+                other => panic!("unexpected control event {other:?}"),
+            };
+            return stamp;
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_paid_connection_accepts_only_the_bought_frames() {
+        // BUG-PSI: A (payer) dials B (payee) as a stranger; nobody lists anybody.
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let (node_a_id, node_b_id) = (*id_a.node_id(), *id_b.node_id());
+        let open = || TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            admission_mode: ReachabilityMode::PriceOpen,
+            ..Default::default()
+        };
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), open());
+        transport_b.start_listener().await.unwrap();
+        let addr_b = transport_b.listen_addr().unwrap().to_string();
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), open());
+        transport_a.connect(&node_b_id, &addr_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let frames = frames_from_payee(&id_b, &node_a_id);
+
+        // Before A pays: every frame from B is stamped unprivileged.
+        for (frame, _) in &frames {
+            transport_b.send_frame(&node_a_id, frame).await.unwrap();
+            assert!(!next_stamp(&transport_a).await, "unpaid: {frame:?}");
+        }
+
+        // A settles B's admission on this connection: exactly the frames that
+        // complete the paid act pass; peer exchange, Lightning info, gossip,
+        // price queries and invoice requests stay privileged-only.
+        let since = transport_a.connected_since(&node_b_id).await.unwrap();
+        transport_a.mark_admission_paid(&node_b_id, since).await;
+        for (frame, bought) in &frames {
+            transport_b.send_frame(&node_a_id, frame).await.unwrap();
+            assert_eq!(next_stamp(&transport_a).await, *bought, "paid: {frame:?}");
+        }
+        // Self-heal offers our prekey to the node we paid; `privileged` itself
+        // is untouched, and the payee gets nothing from our payment.
+        assert_eq!(transport_a.connected_privileged_peers().await, vec![node_b_id]);
+        assert!(!transport_a.peers.read().await.get(&node_b_id).unwrap().lock().await.privileged);
+        assert!(transport_b.connected_privileged_peers().await.is_empty());
+        assert!(!transport_b.admission_paid_on_connection(&node_a_id).await);
+
+        // A reconnect is a new connection: nothing carries over (no durable
+        // admission object), and a mark for the old generation is ignored.
+        transport_a.disconnect(&node_b_id).await.unwrap();
+        transport_a.connect(&node_b_id, &addr_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        transport_a.mark_admission_paid(&node_b_id, since).await;
+        assert!(!transport_a.admission_paid_on_connection(&node_b_id).await);
+        assert!(transport_a.connected_privileged_peers().await.is_empty());
+        transport_b.send_frame(&node_a_id, &Frame::PrekeyOffer { bundle: serde_json::json!({}) }).await.unwrap();
+        assert!(!next_stamp(&transport_a).await, "a new connection starts unpaid");
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn whitelisting_a_live_peer_privileges_its_connection() {
+        let id_a = make_identity(TEST_MNEMONIC_A);
+        let id_b = make_identity(TEST_MNEMONIC_B);
+        let (node_a_id, node_b_id) = (*id_a.node_id(), *id_b.node_id());
+        let open = || TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            admission_mode: ReachabilityMode::PriceOpen,
+            ..Default::default()
+        };
+        let transport_b = NoiseTransport::new(Arc::clone(&id_b), open());
+        transport_b.start_listener().await.unwrap();
+        let transport_a = NoiseTransport::new(Arc::clone(&id_a), open());
+        transport_a.connect(&node_b_id, &transport_b.listen_addr().unwrap().to_string()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(transport_b.connected_privileged_peers().await.is_empty());
+
+        // The owner adds A: B's live connection to A is privileged at once.
+        transport_b.add_to_whitelist(&node_a_id).await;
+        assert_eq!(transport_b.connected_privileged_peers().await, vec![node_a_id]);
+        // Only on B's side, and removal does not demote a live connection.
+        assert!(transport_a.connected_privileged_peers().await.is_empty());
+        transport_b.remove_from_whitelist(&node_a_id).await;
+        assert_eq!(transport_b.connected_privileged_peers().await, vec![node_a_id]);
 
         transport_a.shutdown();
         transport_b.shutdown();

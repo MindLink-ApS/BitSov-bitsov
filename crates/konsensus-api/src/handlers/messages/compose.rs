@@ -1305,6 +1305,10 @@ async fn deliver_settled_admission(
 ) -> Result<(), ApiError> {
     report_readmission_settlement(state, peer_id, settled.amount_msat)?;
     lock_admission_ledger().record_settled(*peer_id, Instant::now());
+    // Marked BEFORE the proof goes out. Besides guarding against a second
+    // payment, this is what lets the payee's replies that complete the act we
+    // paid for (its prekey and session handshake, acks, prices) through our own
+    // P2 gate on this connection (BUG-PSI). It dies with the connection.
     if let Some(since) = state.transport.connected_since(peer_id).await {
         state.transport.mark_admission_paid(peer_id, since).await;
     }
@@ -1869,6 +1873,21 @@ async fn first_contact_admission(
     //     error → user retries → without this guard the stranger pays full
     //     admission on every retry.
     recover_admission_attempt(state, peer_id)?;
+    // 0a. A settlement from an OLDER connection (a flap, a reconnect, a restart
+    //     that reloaded the journal) cannot admit us on this one: the recipient
+    //     admits per connection, and its replay table (durable) refuses the old
+    //     proof, so re-sending it could only end in a 502. As in
+    //     `readmit_then_pay`, forget it and pay this connection's admission once.
+    let connected_since = state.transport.connected_since(peer_id).await;
+    let had_settled = matches!(lock_admission_ledger().entries.get(peer_id), Some(AdmissionRecord::Settled { .. }));
+    if had_settled
+        && !state.transport.admission_paid_on_connection(peer_id).await
+        && !lock_admission_ledger().settled_on_connection(peer_id, connected_since, Instant::now())
+    {
+        reconcile_admission_budget(state, peer_id, debit.reservation().as_ref()).await?;
+        super::admission_journal::clear(state, peer_id)?;
+        lock_admission_ledger().quotes.remove(peer_id);
+    }
     if let Some((quoted_kind, price)) = lock_admission_ledger().quotes.get(peer_id) {
         if *quoted_kind == kind {
             charge.message_price = Some(*price);

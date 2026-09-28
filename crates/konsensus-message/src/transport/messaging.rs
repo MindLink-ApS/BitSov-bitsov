@@ -105,6 +105,11 @@ impl NoiseTransport {
     /// to every connected peer regardless of privilege (P2: no free X3DH before
     /// payment — no prekey before settlement).
     ///
+    /// BUG-PSI: also a peer whose admission WE settled on this live connection
+    /// (`Connection::admission_paid`). Self-heal then offers our prekey to the
+    /// node we paid — our own choice, and how the session forms when the payee
+    /// is the X3DH initiator. It never adds an unpaid stranger.
+    ///
     /// [`promote_to_privileged`]: NoiseTransport::promote_to_privileged
     pub async fn connected_privileged_peers(&self) -> Vec<NodeId> {
         // Scoped-clone the Arcs first so the `peers` read guard is not held across
@@ -116,7 +121,7 @@ impl NoiseTransport {
         };
         let mut privileged = Vec::with_capacity(conns.len());
         for (id, conn) in conns {
-            if conn.lock().await.privileged {
+            if conn.admission_paid.load(std::sync::atomic::Ordering::Acquire) || conn.lock().await.privileged {
                 privileged.push(id);
             }
         }
@@ -282,10 +287,18 @@ pub(super) fn spawn_reader_task(
             // promote_to_privileged flips this flag; reading it per frame means a
             // promotion is honoured on the very next frame. In Whitelist mode this
             // is always `true`, so every stamped arm behaves byte-identically.
-            let (privileged, source_ip) = {
-                let mut conn = conn.lock().await;
-                conn.last_recv = Instant::now();
-                (conn.privileged, conn.source_ip)
+            //
+            // BUG-PSI: `bought` also admits the frames of a peer whose admission
+            // WE settled on this connection (`admission_paid`, set before our
+            // proof goes out): the replies that complete the act we paid for —
+            // its session handshake, acks/rejects of our messages and its prices.
+            // Every other frame (peer exchange, Lightning info, gossip, price
+            // queries, invoice requests) keeps plain `privileged`.
+            let (privileged, bought, source_ip) = {
+                let mut state = conn.lock().await;
+                state.last_recv = Instant::now();
+                let paid = conn.admission_paid.load(std::sync::atomic::Ordering::Acquire);
+                (state.privileged, state.privileged || paid, state.source_ip)
             };
 
             // Handle frame
@@ -327,7 +340,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::MessageAcked {
                             peer_id,
                             message_id: id,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -341,7 +354,7 @@ pub(super) fn spawn_reader_task(
                             peer_id,
                             message_id: id,
                             reason,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -354,7 +367,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::PrekeyOffer {
                             peer_id,
                             bundle,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -367,7 +380,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::SessionInit {
                             peer_id,
                             init_data,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -377,7 +390,7 @@ pub(super) fn spawn_reader_task(
                 Frame::SessionAck => {
                     debug!(peer = %peer_id, "received session ack");
                     if let Err(e) = control_tx
-                        .send(ControlEvent::SessionAck { peer_id, privileged })
+                        .send(ControlEvent::SessionAck { peer_id, privileged: bought })
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send SessionAck control event");
@@ -389,7 +402,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::RatchetInit {
                             peer_id,
                             payload,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -489,7 +502,7 @@ pub(super) fn spawn_reader_task(
                             block_height,
                             valid_blocks,
                             trust_discount,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -523,7 +536,7 @@ pub(super) fn spawn_reader_task(
                             kind,
                             price_msat,
                             block_height,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
