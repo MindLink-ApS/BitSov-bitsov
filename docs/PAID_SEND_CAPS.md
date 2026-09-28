@@ -9,9 +9,10 @@ optional `max_total_msat`. Message endpoints also accept optional
 For room compose, the map must match every current non-self member exactly. A joined
 or removed member therefore requires a fresh quote before any payment.
 
-The cap covers recipient payment principal, including the 1-sat minimum for
-nonzero prices. A zero-price proof stays zero. Lightning routing fees remain
-provider-controlled and are not included in this principal cap. The raw
+The cap covers all-in wallet debit: recipient principal (including the 1-sat
+minimum for nonzero prices) plus the approved maximum routing fee. The default
+fee ceiling is `min(max(5000, floor(P / 100)), 10000)` msat; an optional
+`max_routing_fee_msat` tightens it. Zero-price proofs reserve no fee. The raw
 `/messages` endpoint receives an already-paid proof; it checks that proof's
 amount before storage/delivery and does not create or pay an invoice itself.
 It cannot undo a payment the caller made before submitting the proof.
@@ -22,12 +23,14 @@ amounts. Concurrent pricing updates cannot increase the dispatched amount.
 An invoice response must still match the exact amount requested. Cap refusal
 returns HTTP 409 with `{"code":"price_cap_exceeded","error":"…"}` and no
 invoice or payment dispatch. Existing errors retain their numeric HTTP code.
-Omitting caps preserves the uncapped principal behavior for existing clients.
+Omitting total/recipient caps leaves principal uncapped; the routing policy still applies.
 
-Capped first-contact compose refuses before requesting an admission invoice
-when no session exists: admission has a separate recipient-set price that is
-not included in the message quote. Establish admission separately before a
-capped send. An uncapped client retains the existing paid-admission behavior.
+First-contact compose checks the aggregate admission/message principal and
+both fee ceilings against the confirmed cap. The app confirms `quote.total_msat`
+and displays `quote.max_routing_fee_msat` separately (already included in total).
+A later reconnect admission is unquoted: any capped request refuses it before
+payment, even when a G1 contact grant could otherwise pay. An uncapped authorized
+request may reserve and pay that additional all-in admission.
 
 Room compose returns `member_outcomes` for every non-self recipient, including
 when no message could be stored. Each row has `recipient`, `status`,
@@ -39,8 +42,8 @@ when no message could be stored. Each row has `recipient`, `status`,
 - `refused`: nothing was dispatched, or the payment was confirmed failed or
   expired. Amount is zero.
 - `unknown`: payment may be in flight or its terminal state cannot be verified.
-  Amount reserves the entire attempted principal against the member and total
-  caps. This is not a settled amount and is never released for another attempt.
+  The response amount describes attempted principal. The held liability includes
+  that principal plus the approved fee ceiling and is not released for retry.
 
 Top-level `amount_msat` sums settled amounts plus the reserved principal of
 unknown members. An unknown row does not establish settlement.
@@ -62,3 +65,11 @@ including response read/parse failures and timeouts, are unknown; they never
 trigger an invoice request or a second payment. Even generic connection errors
 are conservative unless the provider can positively prove pre-dispatch failure.
 A room member with such an error remains unknown with its checked price reserved.
+
+`amount_msat` always describes principal. `max_routing_fee_msat` reports the
+aggregate authorized fee ceiling, including paid or unresolved file errors and
+calendar fanout/RSVP. Known settlement reconciles actual principal plus actual
+fees; unknown outcomes or missing fee records retain the all-in reservation.
+Capped invoice payments require a fresh hash, including after a route miss;
+request a new invoice to try a wider fee allowance. See
+[all-in fee policy and backend support](v2/ALL-IN-FEE-CAPS.md).

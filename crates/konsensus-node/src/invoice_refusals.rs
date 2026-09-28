@@ -1,5 +1,4 @@
 //! Bound refusal traffic across identities and source addresses.
-use konsensus_core::NodeId;
 use std::{collections::HashMap, net::IpAddr, time::Duration};
 use tokio::time::Instant;
 
@@ -12,7 +11,6 @@ const MAX_SOURCES: usize = 1024;
 pub(crate) struct RefusalLimits {
     sources: HashMap<IpAddr, (Instant, usize)>,
     global: Option<(Instant, usize)>,
-    events: HashMap<NodeId, Instant>,
 }
 impl RefusalLimits {
     pub(crate) fn permit(&mut self, source: IpAddr, now: Instant) -> bool {
@@ -38,19 +36,6 @@ impl RefusalLimits {
         count.1 += 1;
         global.1 += 1;
         true
-    }
-    pub(crate) fn event(
-        &mut self,
-        peer: &NodeId,
-        now: Instant,
-        membrane: &konsensus_api::membrane::Membrane,
-    ) {
-        self.events
-            .retain(|_, at| now.duration_since(*at) < Duration::from_secs(10));
-        if self.events.len() < 32 && !self.events.contains_key(peer) {
-            self.events.insert(*peer, now);
-            membrane.admission_required(peer);
-        }
     }
 }
 

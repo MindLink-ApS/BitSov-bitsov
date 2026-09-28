@@ -523,7 +523,7 @@ async fn staged_send_consumes_success_and_failure_but_cap_refusal_preserves_uplo
             .status(),
         StatusCode::OK
     );
-    let body = serde_json::json!({"recipient":peer.to_hex(),"max_total_msat":1000});
+    let body = serde_json::json!({"recipient":peer.to_hex(),"max_routing_fee_msat":0,"max_total_msat":1000});
     // Missing session fails before payment but consumes the attempted send.
     assert_eq!(
         app.clone()
@@ -586,6 +586,14 @@ async fn stalled_staged_send_times_out_unknown_and_releases_blob() {
     }
     #[async_trait]
     impl LightningProvider for Stalled {
+    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.pay_invoice(invoice).await
+    }
+
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
+        self.keysend(dest, amount, memo).await
+    }
+
         async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
             unreachable!()
         }
@@ -659,7 +667,7 @@ async fn stalled_staged_send_times_out_unknown_and_releases_blob() {
         .oneshot(req(
             "POST",
             &format!("{path}/send"),
-            serde_json::json!({"recipient":peer.to_hex(),"max_total_msat":1000}),
+            serde_json::json!({"recipient":peer.to_hex(),"max_routing_fee_msat":0,"max_total_msat":1000}),
         ))
         .await
         .unwrap();
@@ -731,7 +739,7 @@ async fn pending_pricing_cannot_retain_deleted_staging_outside_quota() {
     let token = auth_header(&state);
     let request=Request::builder().method("POST").uri("/api/v1/files/stage-pending/send")
         .header("authorization",token).header("content-type","application/json")
-        .body(Body::from(serde_json::json!({"recipient":NodeId::from_bytes([2;32]).to_hex(),"max_total_msat":1000}).to_string())).unwrap();
+        .body(Body::from(serde_json::json!({"recipient":NodeId::from_bytes([2;32]).to_hex(),"max_routing_fee_msat":0,"max_total_msat":1000}).to_string())).unwrap();
     let sending = tokio::spawn(async move { app.oneshot(request).await });
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
