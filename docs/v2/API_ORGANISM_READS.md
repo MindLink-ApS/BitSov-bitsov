@@ -77,6 +77,7 @@ payment. `GET /api/v1/membrane` now also returns:
 { "pre_payment_refusals": {
   "bucket_ms": 3600000,
   "capacity": 24,
+  "effective_hour_start_ms": 1790553600000,
   "buckets": [
     { "start_ms": 1790553600000,
       "counts": { "session_before_payment": 2, "price_before_payment": 1,
@@ -108,6 +109,17 @@ on reads as well as writes; restart clears them. `since` and `limit` apply only
 to the event ring, **not** these buckets. Reads neither consume nor reset counts.
 Counters saturate at `u64::MAX`. On clock rollback, counts stay in the most recent
 observed hour until the clock catches up; expired hours cannot reappear.
+
+`effective_hour_start_ms` is the node's effective current UTC-hour start in Unix
+milliseconds after that rollback clamp. It advances on reads as well as writes,
+including reads during quiet hours, and is returned even when `buckets` is empty.
+Use it to select the current-hour bucket and the inclusive preceding 23 hours;
+missing buckets/reasons in that window mean zero. A quiet read at hour 101 after
+a refusal at hour 100 pins this anchor to hour 101 even if the clock rolls back
+to hour 99. The newest nonempty bucket alone cannot establish the current hour.
+This field is additive: older consumers can ignore it. Older nodes omit it;
+consumers can still sum all returned buckets for the retained 24-hour total, but
+must treat the exact current-hour count/anchor as unavailable.
 
 Doctrine: an unpaid stranger must not buy stored state about themselves. Even a
 bounded event ring or identity-indexed cooldown would retain individual unpaid
