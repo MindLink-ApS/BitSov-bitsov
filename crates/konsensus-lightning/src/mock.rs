@@ -86,6 +86,9 @@ pub struct MockLightningProvider {
     pending_settle: Arc<Mutex<HashMap<String, u32>>>,
     /// Outgoing-payment wake-up hints; test code sends them via `hint_outgoing`.
     outgoing_tx: broadcast::Sender<String>,
+    /// Test knob: the next deferred keysend emits its terminal hint *during*
+    /// dispatch, before returning its earlier `InFlight` snapshot.
+    hint_during_deferred_keysend: std::sync::atomic::AtomicBool,
 }
 
 impl MockLightningProvider {
@@ -119,6 +122,7 @@ impl MockLightningProvider {
             keysend_defer_polls: Arc::new(Mutex::new(None)),
             pending_settle: Arc::new(Mutex::new(HashMap::new())),
             outgoing_tx: broadcast::channel(256).0,
+            hint_during_deferred_keysend: Default::default(),
         }
     }
 
@@ -134,6 +138,15 @@ impl MockLightningProvider {
     /// that settles asynchronously a moment after dispatch.
     pub async fn defer_next_keysend_settlement(&self, polls: u32) {
         *self.keysend_defer_polls.lock().await = Some(polls);
+    }
+
+    /// Test-only: make the next deferred keysend (see
+    /// [`Self::defer_next_keysend_settlement`]) send its update hint before it
+    /// returns `InFlight`, as a backend whose HTLC settles while the dispatch
+    /// call is still returning would.
+    pub fn hint_during_next_deferred_keysend(&self) {
+        self.hint_during_deferred_keysend
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Test/inspection-only: the `(payment_hash, binding_tlv)` pairs pushed via
@@ -514,6 +527,12 @@ impl LightningProvider for MockLightningProvider {
                 .insert(payment_hash.clone(), details.clone());
             self.pending_settle.lock().await.insert(payment_hash.clone(), n);
             debug!(payment_hash = %payment_hash, polls = n, "mock keysend in-flight (deferred settle)");
+            if self
+                .hint_during_deferred_keysend
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.hint_outgoing(&payment_hash);
+            }
             return Ok(PaymentDetails {
                 status: PaymentStatus::InFlight,
                 preimage: None,
