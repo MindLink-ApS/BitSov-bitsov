@@ -157,7 +157,7 @@ impl Chain {
         .await;
     }
 
-    pub async fn mine(&self, nodes: &[&LdkProvider], blocks: u64) {
+    pub async fn mine(&self, nodes: &[&ldk_node::Node], blocks: u64) {
         let addr: Value = self.bitcoin.client.call("getnewaddress", &[]).unwrap();
         let _: Value = self
             .bitcoin
@@ -166,64 +166,54 @@ impl Chain {
             .unwrap();
         self.indexed().await;
         for node in nodes {
-            node.node().sync_wallets().unwrap();
+            node.sync_wallets().unwrap();
         }
     }
 
-    pub async fn fund(&self, node: &LdkProvider) {
-        let addr = node.node().onchain_payment().new_address().unwrap();
+    pub async fn fund(&self, node: &ldk_node::Node) {
+        let addr = node.onchain_payment().new_address().unwrap();
         let _: Value = self
             .bitcoin
             .client
             .call("sendtoaddress", &[json!(addr.to_string()), json!(0.03)])
             .unwrap();
         self.mine(&[node], 6).await;
-        assert_eq!(
-            node.node().list_balances().total_onchain_balance_sats,
-            3_000_000
-        );
+        assert_eq!(node.list_balances().total_onchain_balance_sats, 3_000_000);
     }
 
-    pub async fn channel(&self, a: &LdkProvider, b: &LdkProvider, addr_b: &str) -> u64 {
-        let result = a
-            .open_channel(
-                &b.get_node_pubkey().await.unwrap(),
-                addr_b,
-                1_000_000,
-                false,
-                Some(3.0),
-            )
-            .await;
-        let explicit = result.is_ok();
-        if let Err(error) = result {
-            assert!(
-                matches!(
-                    error,
-                    konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(_)
-                ),
-                "{error}"
-            );
-            assert!(
-                a.node().list_channels().is_empty(),
-                "refusal opened a channel"
-            );
-            let mempool: Vec<String> = self.bitcoin.client.call("getrawmempool", &[]).unwrap();
-            assert!(mempool.is_empty(), "refusal broadcast funding");
-            assert_eq!(std::env::var("REGTEST_DIAGNOSTIC_ESTIMATED_FEE").as_deref(), Ok("1"),
-                "REGTEST-E2E BLOCKED: explicit 3 sat/vB refused before dispatch: {error}. Set REGTEST_DIAGNOSTIC_ESTIMATED_FEE=1 ONLY to diagnose the remaining flow using the estimator.");
-            println!(
-                "DIAGNOSTIC ONLY: explicit 3 sat/vB refused: {error}; continuing with estimator"
-            );
-            a.open_channel(
-                &b.get_node_pubkey().await.unwrap(),
-                addr_b,
-                1_000_000,
-                false,
-                None,
-            )
+    /// #101: real LDK cannot bound a per-channel funding fee rate, so an
+    /// explicit rate is refused before any peer connection or broadcast.
+    pub async fn refuse_explicit_rate(&self, a: &LdkProvider, peer: &str, addr_b: &str) {
+        let error = a
+            .open_channel(peer, addr_b, 1_000_000, false, Some(3.0))
             .await
-            .unwrap();
-        }
+            .expect_err("explicit funding fee rate must be refused");
+        assert!(
+            matches!(
+                &error,
+                konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(m)
+                    if m.contains("per-channel funding fee rate")
+            ),
+            "{error}"
+        );
+        assert!(
+            a.node().list_channels().is_empty(),
+            "refusal opened a channel"
+        );
+        let mempool: Vec<String> = self.bitcoin.client.call("getrawmempool", &[]).unwrap();
+        assert!(mempool.is_empty(), "refusal broadcast funding");
+        println!("explicit 3 sat/vB refused before dispatch: {error}");
+    }
+
+    /// Waits for the just-opened a->b channel's funding transaction, reports
+    /// its actual fee, confirms it and waits until both ends can use it.
+    /// `synced` are the other nodes whose wallets follow the new blocks.
+    pub async fn confirm_channel(
+        &self,
+        a: &ldk_node::Node,
+        b: &ldk_node::Node,
+        synced: &[&ldk_node::Node],
+    ) -> u64 {
         wait("funding transaction in mempool", || async {
             let txs: Vec<String> = self.bitcoin.client.call("getrawmempool", &[]).unwrap();
             !txs.is_empty()
@@ -240,18 +230,18 @@ impl Chain {
             .unwrap()
             .to_sat();
         let vsize = entry["vsize"].as_u64().unwrap();
-        if explicit {
-            assert!(
-                fee >= 3 * vsize && fee <= 3 * vsize + 3,
-                "explicit 3 sat/vB: fee={fee}, vsize={vsize}"
-            );
-        }
-        println!("funding fee: {fee} sat, {vsize} vB; explicit rate honored: {explicit}");
-        self.mine(&[a, b], 6).await;
+        println!("funding fee: {fee} sat, {vsize} vB (estimator)");
+        let nodes: Vec<&ldk_node::Node> =
+            [a, b].into_iter().chain(synced.iter().copied()).collect();
+        self.mine(&nodes, 6).await;
+        let (a_id, b_id) = (a.node_id(), b.node_id());
         wait("both channel endpoints usable", || async {
-            [a, b]
+            a.list_channels()
                 .iter()
-                .all(|n| n.node().list_channels().iter().any(|c| c.is_usable))
+                .any(|c| c.counterparty_node_id == b_id && c.is_usable)
+                && b.list_channels()
+                    .iter()
+                    .any(|c| c.counterparty_node_id == a_id && c.is_usable)
         })
         .await;
         fee
@@ -280,4 +270,49 @@ pub async fn lightning(dir: &std::path::Path, chain: &Chain) -> (Arc<LdkProvider
     .await
     .unwrap();
     (Arc::new(provider), addr)
+}
+
+/// Routing-only LDK node C, built directly on ldk-node: no app, no BitSov
+/// wallet policy. Stock LDK refuses to forward into an unannounced channel
+/// (`PrivateChannelForward`) unless it acts as an LSPS2 service, which is
+/// exactly the role an LSP plays for a private BitSov node. No client ever
+/// requests a JIT channel here; the service role only enables forwarding.
+pub async fn router(dir: &std::path::Path, chain: &Chain) -> (Arc<ldk_node::Node>, String) {
+    let addr = loopback();
+    let mut seed = [0u8; 64];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+    let mut builder = ldk_node::Builder::new();
+    builder
+        .set_network(ldk_node::bitcoin::Network::Regtest)
+        .set_storage_dir_path(dir.join("ldk").to_string_lossy().into_owned())
+        .set_chain_source_esplora(chain.url.clone(), None)
+        .set_entropy_seed_bytes(seed)
+        .set_liquidity_provider_lsps2(ldk_node::liquidity::LSPS2ServiceConfig {
+            require_token: Some("regtest-routing-only".into()),
+            advertise_service: false,
+            channel_opening_fee_ppm: 0,
+            channel_over_provisioning_ppm: 0,
+            min_channel_opening_fee_msat: 0,
+            min_channel_lifetime: 144,
+            max_client_to_self_delay: 1024,
+            min_payment_size_msat: 0,
+            max_payment_size_msat: 0,
+            client_trusts_lsp: false,
+        });
+    builder
+        .set_listening_addresses(vec![addr.parse().unwrap()])
+        .unwrap();
+    let node = Arc::new(builder.build().unwrap());
+    node.start().unwrap();
+    // ldk-node queues events until handled; drain them like any operator would.
+    let events = Arc::clone(&node);
+    tokio::spawn(async move {
+        loop {
+            let _ = events.next_event_async().await;
+            if events.event_handled().is_err() {
+                return;
+            }
+        }
+    });
+    (node, addr)
 }

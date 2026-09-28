@@ -2173,6 +2173,7 @@ dependencies = [
  "konsensus-pricing",
  "konsensus-routing",
  "konsensus-storage",
+ "ldk-node",
  "lightning-invoice",
  "metrics",
  "rand 0.8.6",

@@ -331,7 +331,7 @@ impl App {
                 "/api/v1/messages/compose",
                 json!({
                     "recipient": receiver.state.identity.node_id().to_hex(), "kind": 0,
-                    "plaintext": text, "max_routing_fee_msat": 0
+                    "plaintext": text
                 }),
                 false,
             )
@@ -341,6 +341,10 @@ impl App {
         let message = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let message = receiver.received.recv().await.unwrap();
+                // The receiver's feed also echoes its own outbound messages.
+                if message.envelope.sender != *self.state.identity.node_id() {
+                    continue;
+                }
                 if message.envelope.ciphertext == b"konsensus:admission:v1" {
                     assert!(
                         message.plaintext.is_none(),

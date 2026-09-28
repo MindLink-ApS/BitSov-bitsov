@@ -60,6 +60,7 @@ lightning-invoice.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 async-trait.workspace = true
 tempfile = "3"
+ldk-node.workspace = true
 axum.workspace = true
 tower = { workspace = true, features = ["util"] }
 bitcoin.workspace = true

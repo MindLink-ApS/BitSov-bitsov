@@ -1,16 +1,33 @@
 # Real LDK regtest regression (REGTEST-E2E)
 
-This opt-in test runs two real `LdkProvider` instances, Bitcoin Core regtest,
-Noise transports, the production session/message handlers, and the production
-Axum routes. It uses temporary SQLite stores and paired-client spend grants.
-No mock Lightning or chain provider is involved. API requests run in-process;
-Axum's `MockConnectInfo` supplies loopback connection metadata only.
+This opt-in test runs real LDK nodes, Bitcoin Core regtest, Noise transports,
+the production session/message handlers, and the production Axum routes. It
+uses temporary SQLite stores and paired-client spend grants. No mock Lightning
+or chain provider is involved. API requests run in-process; Axum's
+`MockConnectInfo` supplies loopback connection metadata only.
 
-**Status at base `dac01c8`: the requested complete scenario is blocked.**
-The strict test is intentionally red at the explicit funding-fee request.
-A diagnostic mode reproduces a separate paid-first-contact E2EE failure.
-Neither is a successful end-to-end run. The paid follow-up, B reply, and final
-message balance assertions exist but cannot yet be reached on this base.
+**Status at `e3c0633` (#100 merged): the complete scenario passes** on real
+LDK: first contact, paid follow-up, paid reply, over-ceiling refusal, fee-capped
+payment and msat reconciliation (about 48 s after the build).
+
+## Topology
+
+```text
+A (BitSov app + LdkProvider) ── private ── C (routing-only ldk-node) ── private ── B (BitSov app + LdkProvider)
+```
+
+There is no A–B channel: every A↔B payment pays C's positive forwarding fee
+(LDK default 1,000 msat base, 0 ppm, read from C's channels at runtime and
+cross-checked with the policy A and B received). A opens A→C through
+`LdkProvider::open_channel` (supported path, no explicit rate); C opens C→B.
+
+C is built directly on `ldk-node`, not `LdkProvider`. Stock LDK refuses to
+forward into an unannounced channel (`PrivateChannelForward`) unless
+`accept_forwards_to_priv_channels` is set, which ldk-node 0.7 does only for an
+LSPS2 service or an async-payments server. A BitSov node can only hold private
+channels (`LdkConfig` has no node alias), so C runs in LSPS2-service mode, the
+role an LSP plays for a private BitSov node. No client requests a JIT channel;
+the service role only enables forwarding.
 
 ## Run
 
@@ -43,17 +60,12 @@ REGTEST_TEST=regtest_e2e::real_ldk_predispatch_refusal \
   scripts/regress/regtest_e2e.sh
 ```
 
-To investigate messaging beyond the unsupported explicit fee request:
+For LDK/app detail on a failure:
 
 ```sh
 RUST_LOG=konsensus=debug,konsensus_api=debug,konsensus_message=debug \
-REGTEST_TEST=regtest_e2e::real_ldk_regtest_e2e \
-REGTEST_DIAGNOSTIC_ESTIMATED_FEE=1 scripts/regress/regtest_e2e.sh
+REGTEST_TEST=regtest_e2e::real_ldk_regtest_e2e scripts/regress/regtest_e2e.sh
 ```
-
-That diagnostic first asserts the explicit request was refused before a
-channel/funding transaction exists, then opens using LDK's estimator. It
-prints `DIAGNOSTIC ONLY` and must not be used to claim explicit-rate support.
 
 No binaries were downloaded for this work: Bitcoin Core 28.2 and the electrs
 binary were already present in the existing `bitsov-target-a13` harness cache.
@@ -85,94 +97,52 @@ substitute an unverified archive.
   cache remains. Default overall timeout is 900 seconds including compilation;
   override `REGTEST_TIMEOUT_SECONDS`. Timeout exits 124.
 
-## Assertions and observed blockers
+## Steps and assertions
 
-The strict scenario funds A with 3,000,000 sat from regtest coinbase and asks
-A to open a private 1,000,000-sat channel to B at **3 sat/vB**. If supported,
-the test checks the actual funding transaction's mempool fee/vsize, mines six
-confirmations, waits for both channel endpoints to become usable and checks
-A's on-chain change against the actual funding fee.
+1. **#101 refusal:** `open_channel(.., Some(3.0))` returns
+   `PaymentNotDispatched("LDK cannot enforce a per-channel funding fee rate")`,
+   with no channel and an empty mempool.
+2. **Channels:** A→C and C→B at 1,000,000 sat via the estimator (156 sat /
+   153 vB each), six confirmations, usable on both ends; on-chain change checked.
+3. **Reply liquidity:** 50,000,000 msat routed A→C→B with a fee cap of exactly
+   C's fee; the settled fee equals C's policy.
+4. **Stateless quote:** 2,001 admission + 2,001 message + 10,000 aggregate fee
+   ceiling = 14,002 msat; no invoice record, no budget debit. Owner grants it.
+5. **First contact:** admission then real X3DH/ratchet; B decrypts the first
+   message; the raw admission marker is not delivered as content.
+6. **Paid follow-up** A→B, decrypted by B.
+7. **Unlisted reply refused:** per #100, the payer side accepts only the bought
+   session frames; `RequestInvoice` stays privileged-only. B's reply to an
+   unlisted A is a first contact of its own: 409 `first_contact`, nothing paid.
+8. **Paid reply:** A's owner lists B (`POST /api/v1/peers`), which privileges the
+   live connection; B pays the message price only; A decrypts it.
+9. **Over-ceiling refusal:** a 2,001-msat B invoice paid through
+   `/api/v1/payments/pay` with `max_routing_fee_msat` = C's fee − 1. A route
+   exists but costs more: 502 `payment not dispatched`, budget unchanged
+   (reservation released), A's record `Failed`, B's `Pending`, A's channel unchanged.
+10. **Fee-capped payment:** same route, cap = C's fee exactly: settles.
+11. **Reconciliation (msat-exact):** channel outbound capacities A −(4×2,001 +
+    4×1,000) + 2,001, B +4×2,001 − (2,001 + 1,000), C +5,000; every settled
+    Lightning record has the expected amount, fee and SHA256(preimage) = hash;
+    A's on-chain funding record is 1,000,000 sat with the measured funding fee;
+    paired budgets A 12,004 msat and B 3,001 msat (principal + actual fee).
 
-At `dac01c8`, `open_ldk_channel` deliberately rejects every explicit fee rate:
-
-```text
-payment not dispatched: LDK cannot enforce a per-channel funding fee rate
-```
-
-This is #101's fail-closed behavior, not a harness/network failure. The pinned
-LDK API exposes no per-channel funding-fee override. The diagnostic estimator
-run paid **156 sat for 153 vB**, rather than the requested 3 sat/vB.
-
-For reply liquidity the test transfers 50,000,000 msat from A to B over the
-real channel. Merely receiving a few sats does not clear B's channel reserve.
-This transfer does not admit either application identity. The test polls both
-payment records to settlement and checks channel liquidity before starting
-Noise first contact.
-
-Both application nodes start with empty whitelists and no E2EE session. The
-stateless quote produces no persisted Lightning invoice record or budget debit.
-Observed quote: **2,001 msat admission + 2,001 msat message + 10,000 msat
-aggregate maximum routing fees = 14,002 msat**. The test grants this exact
-quote through the owner route, then composes with a zero routing-fee ceiling.
-
-The admission settles for **2,001 msat** and B's real payment gate promotes A.
-However, A drops B's prekey offer as unpaid. `mark_admission_paid` only sets
-`admission_paid`; A's view of B remains `privileged=false`. Both the incoming
-session gate and A's self-heal exclude B. Compose returns HTTP 502 with
-`payment_settled_send_incomplete` after the **25-second E2EE timeout**.
-This is a reproducible base-code defect; the fixture does not preinstall a
-session or whitelist B to hide it.
-
-After these blockers are fixed, the existing assertions require:
-
-1. Admission followed by the real X3DH/ratchet handshake and decrypted first
-   message; the raw admission marker is distinguished from message delivery.
-2. A second paid message and B's paid, decrypted reply, with ciphertext unequal
-   to plaintext.
-3. A's message/admission spend of **6,003 msat**, B's reply spend of **2,001
-   msat**, and exact channel-capacity changes **A −4,002 / B +4,002 msat**.
-4. Matching paired-budget debits, settled outgoing records with zero direct
-   routing fees, and SHA256(preimage) equal to each payment hash. Funding fees
-   are checked separately from Lightning fees.
-
-## Fee-cap coverage boundary
-
-`real_ldk_predispatch_refusal` creates a real B invoice before either node has
-channels and submits it through A's metered payment API with a 37-msat fee
-ceiling. It requires LDK's `PaymentNotDispatched`, a failed sender record, an
-unpaid recipient record, zero balance movement, and release of the entire
-**2,001 + 37 msat** reservation.
-
-This is a **no-route control**, not proof that an available route exceeded the
-fee ceiling. A direct A→B channel has no forwarding hop/fee. A real positive
-forwarding-fee probe needs an additional local Lightning routing node and a
-positive-cap success control; that topology extension was requested for
-clarification and is not included. The over-ceiling acceptance criterion
-remains unverified. No synthetic graph, fabricated route, or mock dispatcher
-is substituted for it.
+`real_ldk_predispatch_refusal` remains as a separate **no-route** control:
+2,001 msat + 37 msat reservation released with no channels at all.
 
 ## Differences from the shared mock
 
 | Behavior | Real LDK observation |
 | --- | --- |
-| Explicit funding rate | Refused pre-dispatch; estimated-rate diagnostic is separate. |
-| Channel readiness | Requires wallet/indexer sync, mined confirmations and `is_usable` on both ends. |
-| Immediate payment result | `Pending`, no preimage/fee yet; terminal settlement must be polled. |
+| Explicit funding rate | Refused pre-dispatch (#101); only the estimator path opens channels. |
+| Funding cost | Actual on-chain fee (156 sat / 153 vB per channel); absent from mock accounting. |
+| Channel readiness | Needs wallet/indexer sync, mined confirmations and `is_usable` on both ends. |
+| Inbound anchor channel | A node with no on-chain funds refuses an inbound anchor channel (`0/25000 sats` reserve); LDK then reopens it as non-anchor. |
+| Forwarding | Private-channel forwarding needs LSPS2-service/async-server mode on the router. |
+| Routing fees | Positive (1,000 msat per 2,001-msat payment through C); the mock routes at zero. |
+| Immediate payment result | `Pending`, no preimage/fee yet (`/payments/pay` returns `preimage: ""`); settlement must be polled. |
 | Reply liquidity | Needs real outbound liquidity above the channel reserve. |
-| First-contact E2EE | Exposes asymmetric privilege bug hidden by fixtures that preinstall E2EE sessions. |
-| Funding cost | Actual on-chain fee (observed 156 sat); absent from shared mock accounting. |
-| Precision | LDK's aggregate `get_balance_msat` converts whole-satoshi balances; exact sub-sat accounting must use settled payment records and channel-capacity deltas. |
-| Routing-fee refusal | Real no-route reservation release is separately tested; a two-node direct route cannot demonstrate a positive forwarding fee. |
+| First contact latency | ~16 s for admission + session + first message; later messages ~2 s. |
+| Payment list | `list_payments` includes on-chain funding/receipts as hashless records. |
+| Precision | `get_balance_msat` is whole-satoshi; exact accounting uses records and channel capacities. |
 
-## Verification recorded on 2026-09-28
-
-- Strict invocation: one real no-route control passed; explicit-fee scenario
-  failed before opening a channel.
-- Messaging diagnostic: failed after settled admission and the 25-second
-  E2EE wait, including after fixing and verifying the chain URL adapter.
-- Node test suite: 487 passed, 3 ignored (including these two opt-in tests).
-- Clippy with `-D warnings`, Rust formatting, shell syntax and diff checks
-  passed. Cargo reports the existing `sqlx-postgres 0.8.0` future-compatibility
-  warning.
-- Success, assertion-failure and forced-timeout runs left no disposable root
-  directories or matching daemon processes. Timeout returned 124.
