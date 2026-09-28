@@ -43,10 +43,16 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
     /// Complete recovery authority: never silently truncate unpaid/paid work.
-    /// Include delivered/terminal receipts: their pairing reservation may still
-    /// need crash recovery even though delivery itself is complete.
+    /// Select unresolved accounting/payment intents and undelivered envelopes
+    /// through the recovery index; resolved terminal history is excluded.
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Err(StorageError::Unsupported("outbox operations".into()))
+    }
+
+    /// Bounded terminal payload retention. Permanent operation identity and
+    /// recipient receipt bindings must never be deleted by this maintenance.
+    async fn list_compactable_operations(&self, _before_ms: i64, _limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        Ok(Vec::new())
     }
 
     // ── Messages ───────────────────────────────────────────────────────

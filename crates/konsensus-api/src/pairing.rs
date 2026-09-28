@@ -1753,13 +1753,12 @@ impl PairingService {
     }
 
     /// Discover even reservations whose async SQL attachment never ran.
-    pub(crate) fn operation_reservations(&self, operation_id: &str) -> Vec<(crate::spend_budget::OperationReservationLink, Reservation)> {
+    pub(crate) fn pending_operation_reservations(&self) -> Vec<(crate::spend_budget::OperationReservationLink, Reservation)> {
         let inner = self.lock();
         let mut result = Vec::new();
         for grant in &inner.file.grants {
             let Some(budget) = &grant.budget else { continue; };
             for (id, link) in &budget.operation_links {
-                if link.operation_id != operation_id { continue; }
                 let Some(pending) = budget.pending.get(id) else { continue; };
                 result.push((link.clone(), Reservation {
                     id: id.clone(), client_id: grant.client_id.clone(), op_id: grant.op_id.clone(),

@@ -436,6 +436,7 @@ impl PostgresStorage {
             (22, "receipt bindings", include_str!("../migrations/022_receipt_bindings.sql")),
             (23, "delivery price quotes", include_str!("../migrations/023_delivery_price_quotes.sql")),
     (24, "outbox operations", include_str!("../migrations/postgres/024_outbox_operations.sql")),
+    (25, "outbox recovery", include_str!("../migrations/postgres/025_outbox_recovery.sql")),
         ]
     }
 
@@ -732,7 +733,7 @@ impl Storage for PostgresStorage {
     }
 
     async fn insert_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
-        Ok(sqlx::query("INSERT INTO outbox_operations (operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) ON CONFLICT(operation_id) DO NOTHING")
+        Ok(sqlx::query("INSERT INTO outbox_operations (operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) ON CONFLICT(operation_id) DO NOTHING")
             .bind(&op.operation_id)
             .bind(&op.recipient)
             .bind(op.kind)
@@ -750,10 +751,12 @@ impl Storage for PostgresStorage {
             .bind(&op.last_error)
             .bind(op.version)
             .bind(&op.recovery)
+            .bind(op.accounting_pending)
+            .bind(op.recovery_compacted)
             .execute(&self.pool).await?.rows_affected() == 1)
     }
     async fn update_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
-        Ok(sqlx::query("UPDATE outbox_operations SET state = $1, payment_hash = $2, admission_payment_hash = $3, message_id = $4, settled_msat = $5, readmission_msat = $6, updated_at = $7, last_sent_at = $8, attempts = $9, last_error = $10, recovery = $11, version = version + 1 WHERE operation_id = $12 AND version = $13")
+        Ok(sqlx::query("UPDATE outbox_operations SET state = $1, payment_hash = $2, admission_payment_hash = $3, message_id = $4, settled_msat = $5, readmission_msat = $6, updated_at = $7, last_sent_at = $8, attempts = $9, last_error = $10, recovery = $11, accounting_pending = $12, recovery_compacted = $13, version = version + 1 WHERE operation_id = $14 AND version = $15")
             .bind(&op.state)
             .bind(&op.payment_hash)
             .bind(&op.admission_payment_hash)
@@ -765,23 +768,30 @@ impl Storage for PostgresStorage {
             .bind(op.attempts)
             .bind(&op.last_error)
             .bind(&op.recovery)
+            .bind(op.accounting_pending)
+            .bind(op.recovery_compacted)
             .bind(&op.operation_id).bind(op.version)
             .execute(&self.pool).await?.rows_affected() == 1)
     }
 
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery FROM outbox_operations WHERE operation_id = $1").bind(id).fetch_optional(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = $1").bind(id).fetch_optional(&self.pool).await?)
     }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery FROM outbox_operations WHERE state IN ('prepared', 'released', 'paying', 'payment_unknown', 'paid', 'sent', 'acked', 'rejected_retryable', 'failed_paid') ORDER BY created_at").fetch_all(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable') ORDER BY created_at").fetch_all(&self.pool).await?)
     }
+    async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE accounting_pending = FALSE AND recovery_compacted = FALSE AND state IN ('acked', 'failed_paid') AND updated_at < $1 ORDER BY updated_at LIMIT $2")
+            .bind(before_ms).bind(i64::from(limit)).fetch_all(&self.pool).await?)
+    }
+
 
     async fn commit_outbox_envelope(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         if op.state != "paid" || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str()) || envelope.recipient != Recipient::Node(NodeId::from_hex(&op.recipient).map_err(|e| StorageError::Conversion(e.to_string()))?) {
             return Err(StorageError::Conversion("invalid paid operation binding".into()));
         }
         let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE outbox_operations SET state = $1, payment_hash = $2, admission_payment_hash = $3, message_id = $4, settled_msat = $5, readmission_msat = $6, updated_at = $7, last_sent_at = $8, attempts = $9, last_error = $10, recovery = $11, version = version + 1 WHERE operation_id = $12 AND version = $13")
+        let changed = sqlx::query("UPDATE outbox_operations SET state = $1, payment_hash = $2, admission_payment_hash = $3, message_id = $4, settled_msat = $5, readmission_msat = $6, updated_at = $7, last_sent_at = $8, attempts = $9, last_error = $10, recovery = $11, accounting_pending = $12, recovery_compacted = $13, version = version + 1 WHERE operation_id = $14 AND version = $15")
             .bind(&op.state)
             .bind(&op.payment_hash)
             .bind(&op.admission_payment_hash)
@@ -793,6 +803,8 @@ impl Storage for PostgresStorage {
             .bind(op.attempts)
             .bind(&op.last_error)
             .bind(&op.recovery)
+            .bind(op.accounting_pending)
+            .bind(op.recovery_compacted)
             .bind(&op.operation_id).bind(op.version)
             .execute(&mut *tx).await?.rows_affected() == 1;
         if !changed { tx.rollback().await?; return Ok(false); }
@@ -3361,7 +3373,7 @@ mod migration_recovery_tests {
             if result.is_ok() {
                 db.run_migrations().await.unwrap();
                 let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _konsensus_migrations WHERE version >= 20").fetch_one(&db.pool).await.unwrap();
-                assert_eq!(versions, 5);
+                assert_eq!(versions, 6);
                 // Slice 2 backend contract: insert/CAS, atomic paid publication,
                 // transport receipt, and ACK cannot regress across stale writers.
                 let sender = NodeId::from_bytes([1; 32]);
@@ -3385,6 +3397,30 @@ mod migration_recovery_tests {
                 assert!(db.acknowledge_pending(&paid.id, &peer, &sender).await.unwrap());
                 assert!(!db.update_outbox_operation(&stale).await.unwrap());
                 assert_eq!(db.get_outbox_operation(&operation.operation_id).await.unwrap().unwrap().state, "acked");
+                // Accounting survives ACK, and clearing it removes terminal
+                // history from the indexed recovery query without deleting IDs.
+                let mut terminal = db.get_outbox_operation(&operation.operation_id).await.unwrap().unwrap();
+                assert!(terminal.accounting_pending);
+                assert_eq!(db.list_recoverable_operations().await.unwrap().len(), 1);
+                terminal.accounting_pending = false;
+                terminal.updated_at = 0;
+                assert!(db.update_outbox_operation(&terminal).await.unwrap());
+                assert!(db.list_recoverable_operations().await.unwrap().is_empty());
+                let mut batch = db.list_compactable_operations(1, 100).await.unwrap();
+                assert_eq!(batch.len(), 1);
+                batch[0].recovery_compacted = true;
+                batch[0].recovery = b"receipt".to_vec();
+                assert!(db.update_outbox_operation(&batch[0]).await.unwrap());
+                assert!(db.list_compactable_operations(1, 100).await.unwrap().is_empty());
+                for state in ["prepared", "released", "paying", "payment_unknown", "paid", "sent", "acked", "rejected_retryable", "failed_paid"] {
+                    for pending in [false, true] {
+                        let mut row = crate::OutboxOperation::prepared(format!("{state}-{pending}"), peer.to_hex(), 1, "request".into());
+                        row.state = state.into();
+                        row.accounting_pending = pending;
+                        assert!(db.insert_outbox_operation(&row).await.unwrap());
+                    }
+                }
+                assert_eq!(db.list_recoverable_operations().await.unwrap().len(), 14);
                 // Exercise retained receipt acceptance on PostgreSQL too.
                 let sender = NodeId::from_bytes([1; 32]);
                 let peer = NodeId::from_bytes([2; 32]);
