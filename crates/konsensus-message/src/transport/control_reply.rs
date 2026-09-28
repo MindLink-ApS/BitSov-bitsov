@@ -70,6 +70,12 @@ impl Connection {
         self.state.lock().await
     }
 
+    /// Closed (replaced, removed or failed). Read under [`Self::lock`] so a
+    /// writer never writes to a connection closed before it got the lock.
+    pub(super) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     pub(super) fn close(&self) {
         self.closed.store(true, Ordering::Release);
         let _ = self.socket.shutdown(std::net::Shutdown::Both);

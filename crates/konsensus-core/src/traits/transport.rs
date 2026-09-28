@@ -133,6 +133,26 @@ pub trait MessageTransport: Send + Sync {
     /// Mark settlement only if the connection generation still matches.
     async fn mark_admission_paid(&self, _peer: &NodeId, _since: std::time::Instant) {}
 
+    /// Send `envelope` on the connection generation `since` (as returned by
+    /// [`connected_since`](Self::connected_since)) and on no other: the peer is
+    /// looked up once, and if that connection is gone or was replaced, nothing
+    /// is written and `NotConnected` is returned. `NotConnected` therefore
+    /// means the envelope certainly did not go out; any other error means it
+    /// may have.
+    ///
+    /// Used for the admission proof, so the connection marked paid and the
+    /// connection the proof admits are the same one. The default, for
+    /// transports that track no generations, is a plain [`send`](Self::send).
+    async fn send_on_connection(
+        &self,
+        peer: &NodeId,
+        since: Option<std::time::Instant>,
+        envelope: &UkmEnvelope,
+    ) -> Result<(), TransportError> {
+        let _ = since;
+        self.send(peer, envelope).await
+    }
+
     /// Add a peer to the transport whitelist (Principle 3: Closed Mesh).
     ///
     /// Called when a peer is added via invite redemption or manual peer add.
