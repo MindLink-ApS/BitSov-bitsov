@@ -9,6 +9,9 @@ use thiserror::Error;
 /// API errors — converted to appropriate HTTP status codes.
 #[derive(Debug, Error)]
 pub enum ApiError {
+    /// The backend positively refused the operation before any dispatch.
+    #[error("not dispatched: {0}")]
+    NotDispatched(String),
     #[error("recipient backend does not support stateless first-contact quotes")]
     StatelessQuoteUnsupported,
 
@@ -87,6 +90,11 @@ struct ErrorBody {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::NotDispatched(reason) = &self {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": reason, "code": "not_dispatched"
+            }))).into_response();
+        }
         if matches!(self, ApiError::StatelessQuoteUnsupported) {
             return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
                 "error": self.to_string(), "code": "stateless_quote_unsupported"
@@ -118,7 +126,7 @@ impl IntoResponse for ApiError {
             }))).into_response();
         }
         let (status, message) = match &self {
-            ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
+            ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
