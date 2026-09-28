@@ -40,4 +40,20 @@ pub enum StorageError {
     /// Operation is not supported by this storage backend.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+
+    /// `KONSENSUS_SQLITE_MIGRATIONS_DIR` does not contain every migration this binary embeds.
+    #[error(
+        "KONSENSUS_SQLITE_MIGRATIONS_DIR={dir} is missing migration version(s) {missing:?} \
+         required by this binary (embedded through version {max_embedded}). Unset the variable \
+         to apply embedded migrations, or point it at a directory that is a superset of the \
+         embedded set."
+    )]
+    IncompleteMigrationsDir {
+        /// Directory named in the environment variable.
+        dir: String,
+        /// Embedded versions with no matching file in the directory.
+        missing: Vec<i64>,
+        /// Highest embedded migration version.
+        max_embedded: i64,
+    },
 }

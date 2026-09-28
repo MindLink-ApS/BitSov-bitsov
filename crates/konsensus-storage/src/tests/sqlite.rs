@@ -1700,3 +1700,84 @@ async fn db_migrated_from_files_is_accepted_by_embedded_source()
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
+
+fn migrations_source_dir() -> &'static std::path::Path {
+    std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+}
+
+#[test]
+fn external_migrations_dir_must_include_all_embedded_versions() {
+    let stale = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(migrations_source_dir()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let version: i64 = name.split_once('_').unwrap().0.parse().unwrap();
+        if version <= 19 {
+            std::fs::copy(&path, stale.path().join(name)).unwrap();
+        }
+    }
+    let err = crate::sqlite::validate_external_migrations_dir(stale.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("KONSENSUS_SQLITE_MIGRATIONS_DIR=") && msg.contains("20"),
+        "expected stale-dir refusal naming missing versions, got: {msg}"
+    );
+}
+
+#[test]
+fn external_migrations_dir_may_include_extra_versions() {
+    let superset = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(migrations_source_dir()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let name = path.file_name().unwrap();
+        std::fs::copy(&path, superset.path().join(name)).unwrap();
+    }
+    std::fs::write(
+        superset.path().join("999_future_placeholder.sql"),
+        "-- no-transaction\nSELECT 1;",
+    )
+    .unwrap();
+    crate::sqlite::validate_external_migrations_dir(superset.path()).unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_open_refuses_stale_external_migrations_dir() {
+    let stale = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(migrations_source_dir()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let version: i64 = name.split_once('_').unwrap().0.parse().unwrap();
+        if version <= 19 {
+            std::fs::copy(&path, stale.path().join(name)).unwrap();
+        }
+    }
+    std::env::set_var(
+        "KONSENSUS_SQLITE_MIGRATIONS_DIR",
+        stale.path().to_str().unwrap(),
+    );
+    let db_path = std::env::temp_dir().join(format!(
+        "konsensus-stale-migrations-{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&db_path);
+    let result = SqliteStorage::open(db_path.to_str().unwrap()).await;
+    std::env::remove_var("KONSENSUS_SQLITE_MIGRATIONS_DIR");
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("stale migrations dir must refuse startup"),
+    };
+    assert!(
+        err.to_string().contains("missing migration version"),
+        "got: {err}"
+    );
+    let _ = std::fs::remove_file(db_path);
+}

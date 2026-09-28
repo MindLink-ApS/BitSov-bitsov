@@ -127,6 +127,28 @@ fn bootstrap_partial_state_refuses() {
         other => panic!("expected a refusal, got {other:?}"),
     }
 
+    let legacy_with_state = DataDirProbe {
+        identity_material_present: true,
+        wallet_or_channel_state_present: true,
+        ..empty_probe()
+    };
+    match bootstrap::classify(&legacy_with_state) {
+        StartupMode::Refuse(r) => {
+            assert_eq!(r.reason, "identity_and_state_without_marker");
+            assert!(
+                r.repair.contains("konsensus repair mark-initialized"),
+                "repair must name mark-initialized, got: {}",
+                r.repair
+            );
+            assert!(
+                r.detail.contains("before #76"),
+                "detail should mention legacy upgrades, got: {}",
+                r.detail
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
     // An existing config is not permission to adopt a missing marker.
     let legacy = tempfile::tempdir().unwrap();
     std::fs::write(legacy.path().join("mnemonic.txt"), MNEMONIC).unwrap();
