@@ -33,6 +33,11 @@ on macOS `sandbox-exec` with network limited to loopback. It stops only the
 processes it starts. Usage:
 
   scripts/regress/bug_psi.py --bin target/debug/konsensus [scenario ...]
+  scripts/regress/bug_psi.py --bin ./konsensus --keep ./bug-psi-out reply
+
+Path note: ``--bin`` and ``--keep`` are resolved to absolute paths at parse
+time. Nodes start with ``cwd`` set to their data root, so a relative
+``loopback.sb`` (or binary) would not be found by ``sandbox-exec``.
 """
 import argparse, base64, hashlib, hmac, json, os, shutil, socket, subprocess, sys, tempfile, time
 import urllib.error, urllib.request
@@ -268,14 +273,19 @@ def scenario(name, binary, workdir, sandbox):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--bin", required=True, help="konsensus binary under test")
-    ap.add_argument("--keep", help="keep node dirs and logs here (default: a temp dir, removed on pass)")
+    ap.add_argument("--bin", required=True, help="konsensus binary under test (absolute after parse)")
+    ap.add_argument("--keep", help="keep node dirs and logs here (default: a temp dir, removed on pass; absolute after parse)")
     ap.add_argument("--no-sandbox", action="store_true", help="do not wrap nodes in sandbox-exec (non-macOS)")
     ap.add_argument("scenarios", nargs="*", default=["reply", "reply_unlisted", "control"],
                     choices=["reply", "reply_unlisted", "control"])
     args = ap.parse_args()
+    # Absolute before any node start: sandbox-exec -f and the binary are resolved
+    # from each node's data-dir cwd, not from the caller's cwd.
+    args.bin = os.path.abspath(args.bin)
+    if args.keep:
+        args.keep = os.path.abspath(args.keep)
 
-    workdir = args.keep or tempfile.mkdtemp(prefix="bug-psi-")
+    workdir = os.path.abspath(args.keep or tempfile.mkdtemp(prefix="bug-psi-"))
     os.makedirs(workdir, exist_ok=True)
     sandbox = None
     if not args.no_sandbox and shutil.which("sandbox-exec"):
@@ -286,7 +296,7 @@ def main():
     failures = []
     for name in args.scenarios:
         log(f"── {name}")
-        failures += scenario(name, os.path.abspath(args.bin), workdir, sandbox)
+        failures += scenario(name, args.bin, workdir, sandbox)
     if failures:
         for f in failures:
             log("FAIL", f)
