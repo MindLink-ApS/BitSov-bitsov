@@ -507,7 +507,8 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     // B refused out loud (N2) and never saw a replayed admission proof.
     let (events, totals) = audit_b.membrane().read(None, 50);
     let codes: Vec<Code> = events.iter().map(|e| e.code).collect();
-    assert!(codes.contains(&Code::AdmissionRequired), "explicit refusal event: {codes:?}");
+    assert!(!codes.contains(&Code::AdmissionRequired), "unpaid refusals are aggregate only");
+    assert!(audit_b.membrane().pre_payment_refusals().buckets.iter().any(|b| b.counts.get(&konsensus_api::membrane::PrePaymentReason::AdmissionRequired).copied().unwrap_or(0) > 0));
     assert!(!codes.contains(&Code::ProofReused), "stale admission proof re-sent: {codes:?}");
     assert_eq!(totals.admitted, 4, "two admissions and two messages admitted: {codes:?}");
 
