@@ -101,6 +101,22 @@ impl MeteredSpend {
         self.debit_purpose(state, charges, false)
     }
 
+    /// Link an operation's durable journal before committing its G1 debit.
+    /// The callback is synchronous and cannot call the pairing service.
+    pub(crate) fn debit_linked(
+        &self, state: &AppState, charges: Vec<Charge>,
+        persist_link: impl FnOnce(Option<&Reservation>) -> Result<(), BudgetRefusal>,
+    ) -> Result<Debit, ApiError> {
+        let Meter::Grant { client_id, epoch } = &self.meter else {
+            persist_link(None).map_err(ApiError::BudgetExceeded)?;
+            return Ok(Debit::unmetered());
+        };
+        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service.reserve_spend_linked(client_id, *epoch, charges, |r| persist_link(Some(r)))
+            .map_err(ApiError::BudgetExceeded)?;
+        Ok(Debit { held: Some((Arc::clone(service), reservation)) })
+    }
+
     /// Reserve an explicitly approved LSP fee under total/call/recipient bounds.
     pub fn debit_liquidity(&self, state: &AppState, charge: Charge) -> Result<Debit, ApiError> {
         self.debit_purpose(state, vec![charge], true)

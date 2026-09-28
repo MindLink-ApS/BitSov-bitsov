@@ -95,3 +95,79 @@ async fn a_failed_payment_closes_the_kit_and_releases_both_holds() {
     let (s, _) = approve(&fx, &token, &cand).await;
     assert_eq!(s, StatusCode::CONFLICT);
 }
+
+#[tokio::test]
+async fn regression_definitive_reconcile_releases_grant_hold_after_restart() {
+    let (mut fx, token, cand) = kit(50_000).await;
+    fx.wallet.set(UNKNOWN);
+    let (s, body) = approve(&fx, &token, &cand).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(fx.used(), GIFT);
+    fx.restart();
+    fx.wallet.set(FAILED);
+    let token = fx.token().await;
+    let (s, body) = fx.call("POST", &format!("/api/v1/sponsor/kits/{}/reconcile", cand["intro_id"].as_str().unwrap()), None, Some(&token)).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "failed");
+    assert_eq!(fx.used(), 0, "definitively failed sponsor operation must release G1 hold; pending={:?}", fx.service.snapshot().grants[0].budget.as_ref().unwrap().pending);
+    fx.restart();
+    let token = fx.token().await;
+    let (s, _) = fx.call("POST", &format!("/api/v1/sponsor/kits/{}/reconcile", cand["intro_id"].as_str().unwrap()), None, Some(&token)).await;
+    assert_eq!(s, StatusCode::OK, "terminal reconciliation is idempotent after restart");
+    assert_eq!(fx.used(), 0);
+}
+
+#[tokio::test]
+async fn sponsor_journal_failure_never_orphans_a_grant_debit_or_dispatches() {
+    let (fx, token, cand) = kit(50_000).await;
+    let dir = fx.state.data_dir.as_ref().unwrap().join("sponsor");
+    std::fs::create_dir(dir.join("kits.json.tmp")).unwrap();
+    let (s, _) = approve(&fx, &token, &cand).await;
+    assert_ne!(s, StatusCode::OK);
+    assert_eq!(fx.wallet.money(), 0);
+    assert_eq!(fx.used(), 0);
+    assert!(fx.service.snapshot().grants[0].budget.as_ref().unwrap().pending.is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_dispatch_retains_its_durable_grant_reference_for_restart() {
+    let (mut fx, token, cand) = kit(50_000).await;
+    fx.wallet.pause_dispatch.store(true, Ordering::SeqCst);
+    let state = fx.state.clone();
+    let request = json!({"intro_id":cand["intro_id"], "code":cand["code"]});
+    let pending = tokio::spawn(async move {
+        call(&state, "POST", "/api/v1/sponsor/approve", Some(request), Some(&token)).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fx.wallet.waiting.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let ledger: Value = serde_json::from_slice(&std::fs::read(fx.state.data_dir.as_ref().unwrap().join("sponsor/kits.json")).unwrap()).unwrap();
+    let id = ledger["kits"][0]["grant_reservation"]["id"].as_str().unwrap();
+    assert!(fx.service.snapshot().grants[0].budget.as_ref().unwrap().pending.contains_key(id));
+    assert_eq!(fx.wallet.money(), 0, "reference exists before first dispatch");
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    fx.restart();
+    assert_eq!(fx.used(), GIFT);
+    fx.wallet.set(FAILED);
+    let token = fx.token().await;
+    let (s, body) = fx.call("POST", &format!("/api/v1/sponsor/kits/{}/reconcile", cand["intro_id"].as_str().unwrap()), None, Some(&token)).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(fx.used(), 0);
+}
+
+#[tokio::test]
+async fn reconciliation_needs_read_authority_but_never_a_new_spend_grant() {
+    let (fx, token, cand) = kit(50_000).await;
+    fx.wallet.set(UNKNOWN);
+    assert_eq!(approve(&fx, &token, &cand).await.0, StatusCode::OK);
+    fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
+    fx.wallet.set(FAILED);
+    let read_token = fx.token().await;
+    let (s, body) = fx.call("POST", &format!("/api/v1/sponsor/kits/{}/reconcile", cand["intro_id"].as_str().unwrap()), None, Some(&read_token)).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "failed");
+    assert_eq!(fx.wallet.money(), 1, "reconciliation never sends another payment");
+}

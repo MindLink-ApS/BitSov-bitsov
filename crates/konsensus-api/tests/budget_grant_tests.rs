@@ -53,6 +53,7 @@ const FAILED: u8 = 3;
 /// Counts every money-moving call and settles, loses, refuses or fails it.
 #[derive(Default)]
 struct Wallet {
+    outgoing: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
     liquidity: std::sync::Mutex<Option<Arc<konsensus_lightning::liquidity::LiquidityClient>>>,
     mode: AtomicU8,
     pause_dispatch: AtomicBool,
@@ -136,15 +137,39 @@ impl LightningProvider for Wallet {
             .create_invoice(amount_msat, description, expiry_secs)
             .await
     }
+    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, _max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
+        let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
+        let mut paid = self.pay_invoice(bolt11).await?;
+        paid.payment_hash = invoice.payment_hash().to_string();
+        paid.fee_msat = Some(0);
+        Ok(paid)
+    }
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         let amount = bolt11
             .parse::<lightning_invoice::Bolt11Invoice>()
             .ok()
             .and_then(|i| i.amount_milli_satoshis())
             .unwrap_or(0);
+        let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().ok();
+        if let Some(invoice) = &invoice {
+            self.outgoing.lock().unwrap().insert(invoice.payment_hash().to_string(), amount);
+        }
         self.outcome(amount).await
     }
     async fn get_payment_status(&self, hash: &str) -> Result<PaymentDetails, LightningError> {
+        let amount = self.outgoing.lock().unwrap().get(hash).copied();
+        if let Some(amount_msat) = amount {
+            return Ok(PaymentDetails {
+                payment_hash: hash.into(), preimage: None, amount_msat,
+                status: match self.mode.load(Ordering::SeqCst) {
+                    FAILED => PaymentStatus::Failed,
+                    UNKNOWN => PaymentStatus::InFlight,
+                    _ => PaymentStatus::Settled,
+                },
+                direction: PaymentDirection::Outgoing, timestamp: 1_700_000_000,
+                memo: None, fee_msat: Some(0),
+            });
+        }
         StubLightning.get_payment_status(hash).await
     }
     async fn get_balance_msat(&self) -> Result<u64, LightningError> {

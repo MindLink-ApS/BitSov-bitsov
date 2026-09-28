@@ -1696,15 +1696,25 @@ impl PairingService {
         charges: Vec<Charge>,
         clock: impl FnMut() -> i64,
     ) -> Result<Reservation, BudgetRefusal> {
-        self.reserve_spend_for_purpose(client_id, epoch, charges, false, clock)
+        self.reserve_spend_for_purpose(client_id, epoch, charges, false, clock, |_| Ok(()))
     }
 
     /// Liquidity authority is checked inside the SAME transaction as its debit.
     pub fn reserve_liquidity_fee(&self, client_id: &str, epoch: u64, charges: Vec<Charge>) -> Result<Reservation, BudgetRefusal> {
-        self.reserve_spend_for_purpose(client_id, epoch, charges, true, || chrono::Utc::now().timestamp())
+        self.reserve_spend_for_purpose(client_id, epoch, charges, true, || chrono::Utc::now().timestamp(), |_| Ok(()))
     }
 
-    fn reserve_spend_for_purpose(&self, client_id: &str, epoch: u64, charges: Vec<Charge>, liquidity: bool, mut clock: impl FnMut() -> i64) -> Result<Reservation, BudgetRefusal> {
+    /// Persist an operation's reconciliation reference before its grant debit.
+    /// The callback must not re-enter this service. A crash can leave the
+    /// operation reserved without a debit, but never an orphaned grant debit.
+    pub(crate) fn reserve_spend_linked(
+        &self, client_id: &str, epoch: u64, charges: Vec<Charge>,
+        before_persist: impl FnOnce(&Reservation) -> Result<(), BudgetRefusal>,
+    ) -> Result<Reservation, BudgetRefusal> {
+        self.reserve_spend_for_purpose(client_id, epoch, charges, false, || chrono::Utc::now().timestamp(), before_persist)
+    }
+
+    fn reserve_spend_for_purpose(&self, client_id: &str, epoch: u64, charges: Vec<Charge>, liquidity: bool, mut clock: impl FnMut() -> i64, before_persist: impl FnOnce(&Reservation) -> Result<(), BudgetRefusal>) -> Result<Reservation, BudgetRefusal> {
         if !self.owner_control_enabled {
             return Err(BudgetRefusal::NoGrant);
         }
@@ -1747,6 +1757,11 @@ impl PairingService {
         if !recipients.is_empty() {
             budget.pending.insert(id.clone(), recipients);
         }
+        let reservation = Reservation { id, client_id: client_id.to_string(), op_id: op_id.clone(), charges };
+        if let Err(e) = before_persist(&reservation) {
+            inner.file.grants[idx].budget = before;
+            return Err(e);
+        }
         if let Err(e) = self.persist_with_clock(&mut inner.file, &mut clock) {
             if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
                 g.budget = before;
@@ -1765,12 +1780,7 @@ impl PairingService {
         {
             return Err(BudgetRefusal::NoGrant);
         }
-        Ok(Reservation {
-            id,
-            client_id: client_id.to_string(),
-            op_id,
-            charges,
-        })
+        Ok(reservation)
     }
 
     /// Validate a persisted reservation and run one synchronous dispatch step

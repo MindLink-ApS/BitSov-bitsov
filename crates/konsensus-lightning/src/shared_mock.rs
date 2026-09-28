@@ -135,6 +135,13 @@ impl LightningProvider for SharedMockProvider {
             created_at: signed.duration_since_epoch().as_secs(),
         })
     }
+    // This test backend has no route and charges zero routing fees.
+    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, _max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
+        let mut paid = self.pay_invoice(bolt11).await?;
+        paid.fee_msat = Some(0);
+        Ok(paid)
+    }
+
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
         let invoice: Bolt11Invoice = bolt11.parse().map_err(err)?;
         if invoice.currency() != Currency::Regtest || invoice.is_expired() {
