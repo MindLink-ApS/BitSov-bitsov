@@ -468,6 +468,9 @@ async fn real_ldk_predispatch_refusal() {
         .create_invoice(2_001, "no-route refusal control", 600)
         .await
         .unwrap();
+    // Startup sync is asynchronous. Reach the payment dispatch gate, rather
+    // than racing its wallet-readiness guard and receiving 503/not_ready.
+    wait("payer ready", || a.money_ready()).await;
     let (status, body) = alice
         .post(
             "/api/v1/payments/pay",

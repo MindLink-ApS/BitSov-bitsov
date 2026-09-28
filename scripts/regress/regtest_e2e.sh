@@ -20,24 +20,34 @@ export ELECTRS_EXE="${ELECTRS_EXE:-$(find_binary electrs)}"
 echo "Bitcoin Core: $BITCOIND_EXE"
 echo "electrs: $ELECTRS_EXE"
 # Own the whole process group: Rust RAII handles normal exits and panics;
-# this supervisor also handles timeout, SIGINT and SIGTERM (including daemons).
-python3 - <<'PYTHON'
+# exec keeps the runner PID: signals reach the supervisor's cleanup handlers.
+# They cover timeout, SIGINT, SIGTERM and SIGHUP (including daemons).
+exec python3 - <<'PYTHON'
 import os
 import shutil
 import signal
 import subprocess
 import tempfile
 
-root = tempfile.mkdtemp(prefix="bitsov-regtest-")
+root = None
 child = None
-print(f"Disposable regtest data: {root}", flush=True)
+pending_signal = None
 
 def interrupted(signum, _frame):
-    raise SystemExit(128 + signum)
+    global pending_signal
+    # Popen may already have spawned Cargo before returning its handle. Defer
+    # cancellation until assignment so finally can always kill that group.
+    if pending_signal is None:
+        pending_signal = signum
+    if child is not None:
+        raise SystemExit(128 + pending_signal)
 
-for sig in (signal.SIGINT, signal.SIGTERM):
+signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+for sig in signals:
     signal.signal(sig, interrupted)
 try:
+    root = tempfile.mkdtemp(prefix="bitsov-regtest-")
+    print(f"Disposable regtest data: {root}", flush=True)
     env = {k: v for k, v in os.environ.items() if k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}}
     env.update(TMPDIR=root, TEMPDIR_ROOT=root, NO_PROXY="*", no_proxy="*")
     child = subprocess.Popen([
@@ -45,12 +55,17 @@ try:
         "--features", "regtest-e2e", "--bin", "konsensus",
         os.environ.get("REGTEST_TEST", "regtest_e2e::"), "--", "--ignored", "--nocapture", "--test-threads=1",
     ], env=env, start_new_session=True)
+    if pending_signal is not None:
+        raise SystemExit(128 + pending_signal)
     try:
         raise SystemExit(child.wait(timeout=int(os.environ.get("REGTEST_TIMEOUT_SECONDS", "900"))))
     except subprocess.TimeoutExpired:
         print("REGTEST-E2E timeout; terminating the test and its daemons", flush=True)
         raise SystemExit(124)
 finally:
+    # A repeated cancellation must not interrupt process-group/data cleanup.
+    for sig in signals:
+        signal.signal(sig, signal.SIG_IGN)
     if child is not None:
         try:
             os.killpg(child.pid, signal.SIGTERM)
@@ -65,5 +80,6 @@ finally:
         except ProcessLookupError:
             pass
         child.wait()
-    shutil.rmtree(root)
+    if root is not None:
+        shutil.rmtree(root)
 PYTHON

@@ -92,10 +92,23 @@ substitute an unverified archive.
   whereas the raw RPC succeeded.
 - The supervisor clears inherited HTTP/HTTPS/ALL proxy settings and forces
   proxy bypass. It owns a new process group, kills remaining children on exit,
-  timeout, SIGINT or SIGTERM, and removes its temporary root. Rust owners also
-  stop/wait daemons and remove data on ordinary completion/panic. The build
+  timeout, SIGINT, SIGTERM or SIGHUP sent to the runner PID or process group,
+  and removes its temporary root. Rust owners also stop/wait daemons and remove
+  data on ordinary completion/panic. The build
   cache remains. Default overall timeout is 900 seconds including compilation;
   override `REGTEST_TIMEOUT_SECONDS`. Timeout exits 124.
+
+Check runner cleanup without building Rust or starting Bitcoin Core/electrs:
+
+```sh
+python3 scripts/regress/test_regtest_e2e_runner.py -v
+```
+
+This exercises successful/failed exits, timeout, and each cancellation signal
+sent to the runner PID and process group, including cancellation during child
+launch. It checks that the supervisor, fake Cargo, and daemon descendants
+(including SIGTERM-resistant children) exit and the disposable data root is
+removed.
 
 ## Steps and assertions
 
@@ -128,7 +141,9 @@ substitute an unverified archive.
     paired budgets A 12,004 msat and B 3,001 msat (principal + actual fee).
 
 `real_ldk_predispatch_refusal` remains as a separate **no-route** control:
-2,001 msat + 37 msat reservation released with no channels at all.
+2,001 msat + 37 msat reservation released with no channels at all. It polls
+the payer's `money_ready` state with a bounded wait before attempting payment,
+so asynchronous wallet sync cannot turn the expected refusal into a 503.
 
 ## Differences from the shared mock
 
@@ -145,4 +160,3 @@ substitute an unverified archive.
 | First contact latency | ~16 s for admission + session + first message; later messages ~2 s. |
 | Payment list | `list_payments` includes on-chain funding/receipts as hashless records. |
 | Precision | `get_balance_msat` is whole-satoshi; exact accounting uses records and channel capacities. |
-
