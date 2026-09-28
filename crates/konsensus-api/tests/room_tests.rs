@@ -902,6 +902,7 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 

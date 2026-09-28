@@ -273,6 +273,7 @@ async fn start_sender(
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
+        introduction: Default::default(),
         gossip_validator: None,
     });
 

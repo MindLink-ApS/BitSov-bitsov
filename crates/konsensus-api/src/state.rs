@@ -247,6 +247,10 @@ pub struct AppState {
     /// oneshot channel, unblocking the compose handler.
     pub invoice_requests:
         Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<InvoiceRequestOutcome>>>>,
+
+    /// K1: the network and peer endpoint this node signs into its
+    /// introduction (`GET /api/v1/introduction`). Default: none offered.
+    pub introduction: crate::handlers::introduction::IntroductionSettings,
 }
 
 /// Authenticated terminal result of an invoice request.

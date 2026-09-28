@@ -970,7 +970,8 @@ async fn handle_invoice_requested_gated(
         else {
             return;
         };
-        let message = if price == 0 { 0 } else { price.max(1000) };
+        // Same rule as the signed introduction's display prices.
+        let (admission, message) = konsensus_core::introduction::first_contact_prices(price);
         let description = format!("konsensus:{request_id}:message={message}");
         let unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -988,7 +989,7 @@ async fn handle_invoice_requested_gated(
         }
         let invoice = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            lightning.create_stateless_invoice(price.max(1000), &description, expiry),
+            lightning.create_stateless_invoice(admission, &description, expiry),
         )
         .await;
         if matches!(&invoice, Ok(Err(konsensus_core::traits::lightning::LightningError::StatelessQuoteUnsupported))) {
@@ -1013,7 +1014,7 @@ async fn handle_invoice_requested_gated(
                 || signed
                     .expires_at()
                     .is_none_or(|end| end.as_secs() > attempt_end)
-                || signed.amount_milli_satoshis() != Some(price.max(1000))
+                || signed.amount_milli_satoshis() != Some(admission)
                 || signed.description().to_string() != description
                 || signed.payment_hash().to_string() != invoice.payment_hash
             {
