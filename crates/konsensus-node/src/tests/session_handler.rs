@@ -1506,6 +1506,7 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
     let (pending, _pending_rx) = mpsc::channel(8);
     let (auto, _auto_rx) = mpsc::channel(8);
     let worker = tokio::spawn(run(SessionHandlerDeps {
+        receptor: Default::default(),
         transport: target.clone(),
         session_manager: sessions.clone(),
         storage: storage.clone(),
@@ -1610,6 +1611,211 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
     source.shutdown();
     target.shutdown();
 }
+
+#[tokio::test]
+async fn enabled_second_act_quote_over_noise_creates_no_application_state() {
+    second_act_quote_over_noise(
+        r#"
+        [[acts]]
+        kind = 200
+        enabled = true
+    "#,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn disabled_second_act_quote_over_noise_is_refused_without_state() {
+    second_act_quote_over_noise(
+        r#"
+        [[acts]]
+        kind = 200
+    "#,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn default_second_act_quote_over_noise_is_refused_without_state() {
+    second_act_quote_over_noise("", false).await;
+}
+
+async fn second_act_quote_over_noise(config: &str, enabled: bool) {
+    use konsensus_core::admission_quote;
+    use konsensus_message::{ReachabilityMode, TransportConfig};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, a) = NodeIdentity::generate().unwrap();
+    let (_, b) = NodeIdentity::generate().unwrap();
+    let a = Arc::new(a);
+    let b = Arc::new(b);
+    let peer = *a.node_id();
+    let recipient = *b.node_id();
+    let transport = |id: Arc<NodeIdentity>| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                whitelist: vec![],
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(a);
+    let target = transport(b.clone());
+    target.start_listener().await.unwrap();
+    let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let initial_onboarding = storage.get_onboarding_state().await.unwrap();
+    let sessions = Arc::new(SessionManager::new(b.clone()));
+    let registry = Arc::new(tokio::sync::RwLock::new(PeerRegistry::new()));
+    let prices = Arc::new(PeerPriceCache::new());
+    let provider = Arc::new(
+        konsensus_lightning::shared_mock::SharedMockProvider::new(
+            &dir.path().join("mock.sqlite"),
+            "b",
+            0,
+        )
+        .unwrap(),
+    );
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws, _ws_rx) = broadcast::channel(8);
+    let (delivery, _delivery_rx) = broadcast::channel(8);
+    let (pending, _pending_rx) = mpsc::channel(8);
+    let (auto, _auto_rx) = mpsc::channel(8);
+    let worker = tokio::spawn(run(SessionHandlerDeps {
+        receptor: toml::from_str(config).unwrap(),
+        transport: target.clone(),
+        session_manager: sessions.clone(),
+        storage: storage.clone(),
+        our_node_id: recipient,
+        identity: b,
+        audit_log: Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap()),
+        pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            konsensus_pricing::StaticPricingConfig {
+                chat_msat: 2000,
+                file_ref_msat: 123_456,
+                ..Default::default()
+            },
+        )),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_prices: prices.clone(),
+        peer_registry: registry.clone(),
+        routing: Arc::new(konsensus_routing::RoutingTable::new(Default::default())),
+        gossip_validator: Arc::new(konsensus_gossip::GossipValidator::new(Default::default())),
+        send_timestamps: Default::default(),
+        lightning: provider.clone(),
+        lightning_addr: None,
+        invoice_requests: Default::default(),
+        peer_ln_pubkeys: Default::default(),
+        ws_broadcast: ws,
+        ws_delivery_tx: delivery,
+        pending_tx: pending,
+        auto_channel_tx: auto,
+        shutdown_rx,
+    }));
+    source
+        .connect(&recipient, &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = admission_quote::request_id(&recipient, &peer, unix);
+    let request = Frame::RequestInvoice {
+        request_id: id.clone(),
+        amount_msat: 1,
+        purpose: "konsensus:admission:200".into(),
+    };
+    source.send_frame(&recipient, &request).await.unwrap();
+    let bolt11 = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match source.recv_control().await.unwrap() {
+                ControlEvent::PeerConnected { privileged, .. } => assert!(!privileged),
+                ControlEvent::InvoiceResponseReceived {
+                    peer_id,
+                    request_id,
+                    bolt11,
+                    ..
+                } => {
+                    assert!(enabled, "disabled act minted an invoice");
+                    assert_eq!(peer_id, recipient);
+                    assert_eq!(request_id, id);
+                    break Some(bolt11);
+                }
+                ControlEvent::InvoiceErrorReceived {
+                    peer_id,
+                    request_id,
+                    reason,
+                    ..
+                } if !enabled => {
+                    assert_eq!(peer_id, recipient);
+                    assert_eq!(request_id, id);
+                    assert_eq!(reason, konsensus_api::invoice_refusal::ADMISSION_REQUIRED);
+                    break None;
+                }
+                event => panic!("unexpected pre-settlement disclosure: {event:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    if let Some(bolt11) = bolt11 {
+        let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
+        assert!(invoice.route_hints().is_empty());
+        assert_eq!(invoice.amount_milli_satoshis(), Some(123_456));
+        assert!(invoice.expiry_time().as_secs() <= 60);
+        assert_eq!(
+            invoice.description().to_string(),
+            format!("konsensus:{id}:act=200:price=123456")
+        );
+        assert_eq!(
+            invoice.recover_payee_pub_key().to_string(),
+            provider.get_node_pubkey().await.unwrap()
+        );
+        source.send_frame(&recipient, &request).await.unwrap();
+        let refusal = tokio::time::timeout(Duration::from_secs(2), source.recv_control())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(refusal, ControlEvent::InvoiceErrorReceived { request_id, reason, .. }
+        if request_id == id && reason == konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED),
+            "a repeated attempt receives a bounded refusal, never a second quote or service"
+        );
+    }
+    let invoices = provider.list_payments(10).await.unwrap();
+    assert!(
+        invoices.is_empty(),
+        "stranger quote wrote pending backend state"
+    );
+    assert_eq!(provider.get_balance_msat().await.unwrap(), 0);
+    assert!(registry.read().await.is_empty());
+    assert!(storage.list_peers().await.unwrap().is_empty());
+    assert!(storage.list_sessions().await.unwrap().is_empty());
+    assert!(storage.list_files(10).await.unwrap().is_empty());
+    assert_eq!(
+        storage.get_onboarding_state().await.unwrap(),
+        initial_onboarding
+    );
+    assert!(storage
+        .get_messages_for_recipient(&konsensus_core::Recipient::Node(recipient), 10, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!sessions.has_session(&peer).await);
+    assert!(prices.get_peer_entry(&peer).await.is_none());
+    assert!(target.connected_privileged_peers().await.is_empty());
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    source.shutdown();
+    target.shutdown();
+}
+
 
 #[tokio::test]
 async fn bound_unsupported_quote_error_preserves_provenance() {

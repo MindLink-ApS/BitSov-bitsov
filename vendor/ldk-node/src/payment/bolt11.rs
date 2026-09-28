@@ -432,6 +432,12 @@ impl Bolt11Payment {
 		};
 		let invoice = self.channel_manager.create_bolt11_invoice(params)
 			.map_err(|_| Error::InvoiceCreationFailed)?;
+        self.sign_stateless_quote(invoice, amount_msat)
+    }
+
+    // Apply the receptor disclosure policy and authenticate settlement metadata
+    // in the same node signature. Called only for stateless invoice preparation.
+    fn sign_stateless_quote(&self, invoice: LdkBolt11Invoice, amount_msat: u64) -> Result<Bolt11Invoice, Error> {
         let deadline = invoice.expires_at().ok_or(Error::InvoiceCreationFailed)?.as_secs();
         let mut metadata = Vec::from(b"BSQ1".as_slice());
         metadata.extend_from_slice(&deadline.to_be_bytes());
@@ -439,6 +445,11 @@ impl Bolt11Payment {
         let payload = stateless_quote_payload(&metadata, invoice.payment_hash().as_byte_array(), &invoice.payment_secret().0);
         metadata.extend_from_slice(self.keys_manager.sign_message(&payload).as_bytes());
         let (mut raw, _, _) = invoice.into_signed_raw().into_parts();
+        // Receptor floor: do not disclose unannounced channel topology to an
+        // unpaid requester. Strip hints BEFORE signing; one-LSP policy is pending.
+        raw.data.tagged_fields.retain(|field| !matches!(field,
+            lightning_invoice::RawTaggedField::KnownSemantics(
+                lightning_invoice::TaggedField::PrivateRoute(_))));
         for field in &mut raw.data.tagged_fields {
             if let lightning_invoice::RawTaggedField::KnownSemantics(lightning_invoice::TaggedField::Features(features)) = field {
                 features.set_payment_metadata_required();
@@ -932,4 +943,52 @@ pub(crate) fn stateless_quote_valid(
     lightning::util::message_signing::verify(
         &stateless_quote_payload(&metadata[..20], hash, secret), signature, node_id,
     )
+}
+
+#[cfg(all(test, not(feature = "uniffi")))]
+mod receptor_tests {
+    use super::*;
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret, RouteHint, RouteHintHop, RoutingFees};
+
+    #[test]
+    fn stateless_signature_omits_private_routes_and_preserves_quote() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = crate::Builder::new();
+        builder.set_network(bitcoin::Network::Regtest);
+        builder.set_entropy_seed_bytes([42; 64]);
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+        let node = builder.build().unwrap();
+        let key = SecretKey::from_slice(&[7; 32]).unwrap();
+        let secp = Secp256k1::new();
+        let hinted = InvoiceBuilder::new(Currency::Regtest)
+            .description("bound receptor quote".into())
+            .payment_hash(Sha256::hash(&[1; 32]))
+            .payment_secret(PaymentSecret([2; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(18)
+            .amount_milli_satoshis(2000)
+            .expiry_time(std::time::Duration::from_secs(55))
+            .private_route(RouteHint(vec![RouteHintHop {
+                src_node_id: PublicKey::from_secret_key(&secp, &key),
+                short_channel_id: 42,
+                fees: RoutingFees { base_msat: 1, proportional_millionths: 10 },
+                cltv_expiry_delta: 18,
+                htlc_minimum_msat: None,
+                htlc_maximum_msat: None,
+            }]))
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &key)).unwrap();
+        assert_eq!(hinted.route_hints().len(), 1);
+        let hash = *hinted.payment_hash();
+        let deadline = hinted.expires_at();
+        let signed = node.bolt11_payment().sign_stateless_quote(hinted, 2000).unwrap();
+        assert!(signed.route_hints().is_empty());
+        assert_eq!(signed.recover_payee_pub_key(), node.node_id());
+        assert_eq!(signed.payment_hash(), &hash);
+        assert_eq!(signed.amount_milli_satoshis(), Some(2000));
+        assert_eq!(signed.description().to_string(), "bound receptor quote");
+        assert_eq!(signed.expires_at(), deadline);
+        assert!(signed.payment_metadata().is_some());
+        assert!(node.list_payments().is_empty());
+    }
 }
