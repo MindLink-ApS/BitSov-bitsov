@@ -708,7 +708,17 @@ pub(crate) async fn approve_owner(
     }).await?;
     resolve_grant(&state, &outcome);
     if outcome.state == KitState::Failed {
-        return Err(ApiError::Lightning("the gift was definitively not paid".into()));
+        // Resolve this kit before exposing non-dispatch. A terminal payment
+        // failure proves nonpayment, but does not prove it was never dispatched.
+        return Err(match paid {
+            Err(error) => ApiError::from(error),
+            Ok(_) => ApiError::Lightning("the gift was definitively not paid".into()),
+        });
+    }
+    if outcome.state == KitState::Unknown {
+        if let Err(error) = paid {
+            return Err(ApiError::PaymentUnresolved(format!("sponsor payment outcome unknown: {error}")));
+        }
     }
     Ok(Json(ApproveResponse {
         intro_id: outcome.intro_id,

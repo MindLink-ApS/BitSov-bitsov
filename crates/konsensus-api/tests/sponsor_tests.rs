@@ -516,9 +516,10 @@ async fn approval_refuses_an_invoice_with_an_existing_outgoing_attempt() {
     let (ask, candidate) = up_to_candidate(&p).await;
     let request = FundingRequest::parse(ask["request"].as_str().unwrap()).unwrap();
     p.sponsor_ln.pay_invoice(&request.bolt11).await.unwrap();
-    let (status, _) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve",
+    let (status, body) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve",
         Some(approval(&candidate))).await;
-    assert_ne!(status, StatusCode::OK, "a prior attempt must not be claimed as this gift");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "not_dispatched");
     assert_eq!(call(&p.sponsor, "GET", "/api/v1/sponsor", None).await.1["purse_used_msat"], 0);
 }
 

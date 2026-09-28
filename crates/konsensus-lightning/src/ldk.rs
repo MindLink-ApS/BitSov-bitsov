@@ -1363,7 +1363,7 @@ impl LightningProvider for LdkProvider {
     ) -> Result<String, LightningError> {
         use std::str::FromStr;
         let addr = ldk_node::bitcoin::Address::from_str(address)
-            .map_err(|e| LightningError::Backend(format!("invalid address: {e}")))?
+            .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid address: {e}")))?
             .assume_checked();
         // Track L0a (2026-04-30): the previous `r as u64` cast silently
         // floored fractional rates (`0.5 → 0`), producing transactions LDK
@@ -1372,9 +1372,9 @@ impl LightningProvider for LdkProvider {
         let fee_rate = fee_rate_sat_per_vb
             .map(|r| {
                 let rate_u64 = validate_fee_rate_sat_per_vb(r)
-                    .map_err(|e| LightningError::Backend(e.to_string()))?;
+                    .map_err(|e| LightningError::PaymentNotDispatched(e.to_string()))?;
                 ldk_node::bitcoin::FeeRate::from_sat_per_vb(rate_u64).ok_or_else(|| {
-                    LightningError::Backend(format!(
+                    LightningError::PaymentNotDispatched(format!(
                         "fee_rate_sat_per_vb {rate_u64} overflows FeeRate"
                     ))
                 })

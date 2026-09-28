@@ -207,6 +207,9 @@ impl LightningProvider for Wallet {
             return Err(LightningError::PaymentNotDispatched("local refusal".into()));
         }
         self.money.fetch_add(1, Ordering::SeqCst);
+        if self.mode.load(Ordering::SeqCst) == UNKNOWN {
+            return Err(LightningError::Backend("not dispatched (untrusted backend text)".into()));
+        }
         Ok("deadbeef".repeat(8))
     }
     async fn open_channel(
@@ -221,6 +224,9 @@ impl LightningProvider for Wallet {
             return Err(LightningError::PaymentNotDispatched("local refusal".into()));
         }
         self.money.fetch_add(1, Ordering::SeqCst);
+        if self.mode.load(Ordering::SeqCst) == UNKNOWN {
+            return Err(LightningError::Connection("response lost after dispatch".into()));
+        }
         Ok("chan".into())
     }
     async fn close_channel(&self, _id: &str, _force: bool) -> Result<Option<String>, LightningError> {
@@ -1373,7 +1379,8 @@ async fn invoice_fee_refusal_releases_message_reservation() {
     fx.state.peer_ln_pubkeys.lock().await.clear();
     let token = fx.grant(None, GrantTerms::new(2000)).await;
     let (status, receipt) = fx.compose(&token).await; // explicitly requests a zero-fee route
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{receipt}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{receipt}");
+    assert_eq!(receipt["code"], "not_dispatched");
     assert_eq!(receipt["max_routing_fee_msat"], 0);
     assert_eq!(fx.wallet.money(), 0);
     assert_eq!(fx.used(), 0, "positive non-dispatch releases all authority");
@@ -1864,3 +1871,6 @@ async fn late_unattached_ledger_debits_recover_outside_sql_scan_even_after_reten
         assert_eq!(fx.wallet.money(), 0);
     }
 }
+
+#[path = "budget_grant/not_dispatched.rs"]
+mod not_dispatched;

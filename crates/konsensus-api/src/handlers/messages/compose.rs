@@ -857,7 +857,7 @@ async fn create_payment_proof_via_invoice(
         .await?
         .map_err(|e| match e {
             LightningError::NotReady => ApiError::NotReady,
-            LightningError::PaymentNotDispatched(reason) => ApiError::Lightning(format!("payment not dispatched: {reason}")),
+            LightningError::PaymentNotDispatched(reason) => ApiError::NotDispatched(reason),
             other => ApiError::PaymentUnresolved(format!("failed to pay recipient invoice: {other}")),
         })?;
 
@@ -2594,7 +2594,7 @@ async fn first_contact_admission_at(
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
             charge.reserved_msat = 0;
-            return Err(ApiError::Lightning(format!("admission payment not dispatched: {reason}")));
+            return Err(ApiError::NotDispatched(reason));
         }
         Err(error) => return Err(ApiError::PaymentUnresolved(format!(
             "admission dispatch outcome unknown for {bolt11_payment_hash}; retry will reconcile the same invoice: {error}"

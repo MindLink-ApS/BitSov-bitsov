@@ -170,11 +170,12 @@ conversion as HTTP 400 with `code: "not_dispatched"` and the backend reason.
 zero; their metered reservations are released as before. `/payments/close-channel`
 inherits the shared mapping, `/payments/open-channel` already maps explicitly,
 and `/payments/send-onchain` now preserves the code in its custom error match.
-The shared conversion (including pay/keysend) keeps ambiguous Lightning errors
-at 502; readiness remains 503 `not_ready`. Existing open-channel/send-onchain
-catch-alls still return generic 400 without `not_dispatched`, which does not
-prove non-dispatch. On-chain `BroadcastUnconfirmed` remains 202 with its
-transaction ID.
+The shared conversion (including pay/keysend, open-channel and send-onchain)
+keeps ambiguous Lightning errors at 502; readiness remains 503 `not_ready`.
+Local channel/on-chain fee validation and LDK on-chain address/fee preflight
+return `not_dispatched` before invoking the wallet. An unclassified wallet
+error remains ambiguous, regardless of its text. On-chain
+`BroadcastUnconfirmed` remains 202 with its transaction ID.
 
 Other generic conversion sites were audited: liquidity quote/accept, invoice
 creation, payment status/liquidity receipt, balances, channel/payment lists,
@@ -183,14 +184,21 @@ accept's synchronous quote lookup still reports bad input as generic 400;
 it occurs before the debit or publication. Its asynchronous accept call
 releases proven non-dispatch reservations and now preserves the code.
 
-Separate follow-up candidates outside direct-send routes: message compose's
-invoice and admission payment branches explicitly stringify non-dispatch as
-`ApiError::Lightning`; sponsor approval merges non-dispatch and terminal
-failed payments into a generic failure. These are not generic-conversion
-sites. Changing their contracts requires preserving aggregate admission,
-message and prior-payment accounting (including partial settlement), rather
-than claiming the whole operation was never dispatched. Compose's keysend
-fallback already distinguishes typed non-dispatch from uncertain outcomes.
+Message compose preserves typed invoice/admission refusals and the operation
+ID, state and effective fee ceiling. The operation journal clears only a
+proven undispatched attempt; its exact reservation is released and recovery
+cannot apply that release to a later attempt. An uncertain message or admission
+keeps its reservation and returns 502. If admission already settled, a later
+message refusal remains `payment_settled_send_incomplete` (502), with admission
+still charged; it never claims aggregate non-dispatch. Compose's keysend
+fallback continues to require positive non-dispatch evidence.
+
+Sponsor approval records and resolves the exact kit before returning
+`not_dispatched` for a proven refusal. A dispatched terminal failure remains
+502 without that code. Ambiguous backend errors return 502 and retain the
+kit's purse hold across restart; callers reconcile that kit instead of
+approving it again. Successful provider responses with a pending/unknown
+payment record keep the existing response body and held reservation.
 
 **bitsov-app needs a separate mapping PR.** At app main `e151910`,
 `src-tauri/src/main.rs`'s spend path recognizes readiness, grant and price-cap

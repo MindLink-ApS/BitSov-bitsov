@@ -348,3 +348,64 @@ async fn failed_admission_operation_journal_does_not_poison_unpaid_retry() {
     }
     }
 }
+
+/// Preserve real admission settlement; interrupt only the selected wallet call.
+struct RefusingLeg {
+    inner: Arc<SharedMockProvider>,
+    calls: AtomicUsize,
+    leg: usize,
+    unknown: bool,
+}
+#[async_trait]
+impl LightningProvider for RefusingLeg {
+    async fn create_invoice(&self, a: u64, d: &str, e: u32) -> Result<Invoice, LightningError> {
+        self.inner.create_invoice(a, d, e).await
+    }
+    async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+        panic!("uncapped payment")
+    }
+    async fn pay_invoice_with_fee_limit(&self, b: &str, fee: u64) -> Result<PaymentDetails, LightningError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == self.leg {
+            return if self.unknown {
+                Err(LightningError::Backend("not dispatched (untrusted backend text)".into()))
+            } else {
+                Err(LightningError::PaymentNotDispatched("route exceeds fee ceiling".into()))
+            };
+        }
+        self.inner.pay_invoice_with_fee_limit(b, fee).await
+    }
+    async fn get_payment_status(&self, h: &str) -> Result<PaymentDetails, LightningError> {
+        self.inner.get_payment_status(h).await
+    }
+    async fn get_balance_msat(&self) -> Result<u64, LightningError> { self.inner.get_balance_msat().await }
+    async fn is_available(&self) -> bool { true }
+}
+
+#[tokio::test]
+async fn first_contact_non_dispatch_preserves_partial_settlement_and_unknown_holds() {
+    for (leg, unknown, expected_used) in [(0, false, 0), (0, true, 6000), (1, false, 2000), (1, true, 6000)] {
+        let (mut fx, sender, _, _) = stranger(leg == 1).await;
+        let wallet = Arc::new(RefusingLeg { inner: sender, calls: AtomicUsize::new(0), leg, unknown });
+        fx.state = Arc::new(AppState {
+            lightning: wallet.clone(),
+            storage: Arc::new(konsensus_storage::SqliteStorage::open(fx.tmp.path().join("outbox.db").to_str().unwrap()).await.unwrap()),
+            ..(*fx.state).clone()
+        });
+        let token = fx.grant(None, GrantTerms::new(10000)).await;
+        let (status, body) = send(&fx, &token, 6000).await;
+        if leg == 0 && !unknown {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["code"], "not_dispatched");
+            assert_eq!(body["state"], "prepared");
+        } else {
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            assert_ne!(body["code"], "not_dispatched", "a paid admission or unknown leg prevents an aggregate non-dispatch claim");
+        }
+        assert_eq!(fx.used(), expected_used, "{body}");
+        for _ in 0..2 {
+            super::not_dispatched::recover(&mut fx).await;
+            assert_eq!(fx.used(), expected_used, "recovery must retain paid admissions and unknown attempts");
+        }
+        assert_eq!(wallet.calls.load(Ordering::SeqCst), leg + 1);
+    }
+}
