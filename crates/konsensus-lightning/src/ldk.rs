@@ -1781,6 +1781,8 @@ fn jit_receipt(p: &ldk_node::payment::PaymentDetails) -> Result<Option<Liquidity
 // peers or funding channels. The production implementation uses LDK's methods.
 #[cfg_attr(test, mockall::automock)]
 trait ChannelOpener {
+    fn has_node_alias(&self) -> bool;
+    fn has_listening_addresses(&self) -> bool;
     fn open_channel(
         &self,
         peer: bitcoin::secp256k1::PublicKey,
@@ -1800,6 +1802,14 @@ trait ChannelOpener {
 }
 
 impl ChannelOpener for LdkNode {
+    fn has_node_alias(&self) -> bool {
+        self.node_alias().is_some()
+    }
+
+    fn has_listening_addresses(&self) -> bool {
+        self.listening_addresses().is_some_and(|addrs| !addrs.is_empty())
+    }
+
     fn open_channel(
         &self,
         peer: bitcoin::secp256k1::PublicKey,
@@ -1839,6 +1849,13 @@ fn open_ldk_channel(
             "LDK cannot enforce a per-channel funding fee rate".into(),
         ));
     }
+    // Mirror vendored ldk-node's may_announce_channel before any open call.
+    // Public-channel support requires operator configuration; do not invent an alias.
+    if announce && (!node.has_node_alias() || !node.has_listening_addresses()) {
+        return Err(LightningError::PaymentNotDispatched(
+            "announce_unavailable: public channel announcement requires a node alias and nonempty listening addresses".into(),
+        ));
+    }
     use std::str::FromStr;
     let node_pubkey = ldk_node::bitcoin::secp256k1::PublicKey::from_str(peer_pubkey)
         .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid pubkey: {e}")))?;
@@ -1864,7 +1881,16 @@ fn open_ldk_channel(
     } else {
         node.open_channel(node_pubkey, ldk_addr, amount_sats, None, None)
     }
-    .map_err(|e| LightningError::Backend(format!("open_channel failed: {e}")))?;
+    .map_err(|e| match e {
+        // In vendored ldk-node 0.7 this means announcement preflight failed or
+        // lightning 0.2.2's create_channel returned Err, before queuing an open
+        // message. Other errors (e.g. peer persistence AFTER creation) may be
+        // post-dispatch and must retain the conservative Backend classification.
+        ldk_node::NodeError::ChannelCreationFailed => {
+            LightningError::PaymentNotDispatched(format!("open_channel failed: {e}"))
+        }
+        _ => LightningError::Backend(format!("open_channel failed: {e}")),
+    })?;
 
     let channel_id = format!("{}", user_channel_id);
     tracing::info!(channel_id = %channel_id, amount_sats, peer = %peer_pubkey, "Lightning channel opening initiated");
