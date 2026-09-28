@@ -845,13 +845,19 @@ async fn write_envelope(conn: &Connection, envelope: &UkmEnvelope) -> Result<(),
         .to_bytes()
         .map_err(|e| TransportError::WireProtocol(e.to_string()))?;
 
-    let mut conn = conn.lock().await;
-    let encrypted = conn
+    let mut state = conn.lock().await;
+    // Checked under the connection lock: a connection closed (replaced or gone)
+    // before we got here fails as NotConnected, so nothing was written and the
+    // caller may treat the envelope as unsent.
+    if conn.is_closed() {
+        return Err(TransportError::NotConnected("connection closed".into()));
+    }
+    let encrypted = state
         .noise
         .encrypt(&frame_bytes)
         .map_err(|e| TransportError::NoiseError(e.to_string()))?;
 
-    write_noise_message(&mut conn.writer, &encrypted)
+    write_noise_message(&mut state.writer, &encrypted)
         .await
         .map_err(|e| TransportError::Other(e.to_string()))?;
 
@@ -2786,6 +2792,13 @@ mod tests {
         transport_a.send_on_connection(&node_b_id, live, &proof).await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(5), transport_b.recv()).await.unwrap().unwrap();
         assert_eq!(got.id, proof.id, "sent on the live generation");
+
+        // A connection captured before it was replaced (closed) is refused
+        // under its lock as NotConnected: nothing is written to it.
+        let captured = Arc::clone(transport_a.peers.read().await.get(&node_b_id).unwrap());
+        captured.close();
+        let closed = write_envelope(&captured, &make_test_envelope(&id_a, &node_b_id)).await;
+        assert!(matches!(closed, Err(TransportError::NotConnected(_))), "{closed:?}");
 
         transport_a.shutdown();
         transport_b.shutdown();

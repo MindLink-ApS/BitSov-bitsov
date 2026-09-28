@@ -190,14 +190,17 @@ impl LightningProvider for Faulty {
     }
 }
 
-/// The reviewer's pause-after-mark hook, without touching production code:
-/// the payer's API sees its transport through [`Hooked`], which, when armed,
-/// suspends the compose task right after `mark_admission_paid` (before the
-/// proof is built and sent) until the test releases it. It changes no wallet,
-/// journal, transport or privilege state.
+/// The reviewers' scheduling hooks, without touching production code: the
+/// payer's API sees its transport through [`Hooked`], which, when armed,
+/// suspends the compose task until the test releases it, either right after
+/// `mark_admission_paid` (before the proof is built and sent) or right after
+/// `admission_paid_on_connection` (after the coverage of a settled proof was
+/// read, before it is acted on). It changes no wallet, journal, transport or
+/// privilege state.
 #[derive(Default)]
 struct PauseAfterMark {
     armed: std::sync::atomic::AtomicBool,
+    armed_query: std::sync::atomic::AtomicBool,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -205,6 +208,17 @@ struct PauseAfterMark {
 impl PauseAfterMark {
     fn arm(&self) {
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Pause after the next paid-flag read: the connection used to classify
+    /// the proof has been read, nothing has been marked or sent.
+    fn arm_after_classification(&self) {
+        self.armed_query.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    async fn hold(&self, armed: &std::sync::atomic::AtomicBool) {
+        if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
     }
     async fn reached(&self) {
         tokio::time::timeout(Duration::from_secs(10), self.reached.notified())
@@ -255,14 +269,13 @@ impl MessageTransport for Hooked {
         self.inner.connected_since(peer).await
     }
     async fn admission_paid_on_connection(&self, peer: &NodeId) -> bool {
-        self.inner.admission_paid_on_connection(peer).await
+        let paid = self.inner.admission_paid_on_connection(peer).await;
+        self.pause.hold(&self.pause.armed_query).await;
+        paid
     }
     async fn mark_admission_paid(&self, peer: &NodeId, since: std::time::Instant) {
         self.inner.mark_admission_paid(peer, since).await;
-        if self.pause.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            self.pause.reached.notify_one();
-            self.pause.release.notified().await;
-        }
+        self.pause.hold(&self.pause.armed).await;
     }
     async fn send_on_connection(
         &self,
@@ -1274,4 +1287,46 @@ async fn sixteen_minute_flap_with_legacy_outbox_accepts_only_one_new_admission()
     assert!(net.payer.paid_on_connection(&payee).await);
     assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT; 3], "old settlement, new admission, message");
     stop.send(true).unwrap(); flusher.await.unwrap(); net.stop();
+}
+
+/// Codex review of e56d018 (P2): the connection is replaced after a settled,
+/// already-delivered proof was classified against it and before the proof is
+/// re-sent. The re-send must not mark the replacement paid for a proof that
+/// was consumed on the old connection (that would block the admission the
+/// replacement needs). It classifies again on the live connection: the proof
+/// was consumed, so exactly one more admission is paid and the message goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2_replacement_after_classification_readmits_once_and_delivers() {
+    let mut net = pair(Shape::CardOnly, Order::PayerHigher, Wallet::Plain, Wallet::FailFirstMessageInvoice).await;
+    let (payer, payee) = (net.payer.id, net.payee.id);
+    let (status, body) = net.payer.compose(&payee, "invoice fails").await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT], "the admission settled once");
+    assert!(net.payee.privileged(&payer).await, "the proof was delivered and consumed on the first connection");
+    let original = net.payer.transport.connected_since(&payee).await.unwrap();
+    // No E2EE session: the retry takes the first-contact path and re-sends the proof.
+    net.payer.sessions.remove_session(&payee).await;
+    net.payee.sessions.remove_session(&payer).await;
+
+    net.payer.pause.arm_after_classification();
+    let ((status, body), replacement) = tokio::join!(net.payer.compose(&payee, "racing retry"), async {
+        net.payer.pause.reached().await;
+        net.flap().await;
+        let replacement = net.payer.transport.connected_since(&payee).await.unwrap();
+        assert_ne!(original, replacement, "a new generation");
+        assert!(!net.payer.paid_on_connection(&payee).await, "a new connection starts unpaid");
+        net.payer.pause.release();
+        replacement
+    });
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(net.payer.transport.connected_since(&payee).await, Some(replacement), "no further reconnect");
+    net.payee.delivered_once("racing retry").await;
+    assert!(net.payer.paid_on_connection(&payee).await, "the replacement was paid for on its own");
+    assert!(net.payee.privileged(&payer).await, "the replacement was admitted");
+    assert_eq!(
+        net.payer.paid_out().await,
+        vec![CHAT_MSAT; 3],
+        "one admission per admitted connection, plus the message"
+    );
+    net.stop();
 }
