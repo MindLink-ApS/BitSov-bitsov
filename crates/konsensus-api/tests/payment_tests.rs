@@ -1,35 +1,24 @@
 mod common;
-use common::*;
-
-use std::collections::HashMap;
-use std::sync::Arc;
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use base64::Engine;
-use tower::ServiceExt;
-
-use konsensus_core::identity::NodeIdentity;
-use konsensus_core::gate::PaymentGate;
-use konsensus_core::traits::chain::{BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel};
-use konsensus_core::traits::lightning::{
-    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection,
-    PaymentStatus,
-};
-use konsensus_core::traits::pricing::{PricingEngine, PricingError};
-use konsensus_core::traits::transport::{MessageTransport, TransportError};
-use konsensus_core::types::{MessageId, NodeId, Nonce, Recipient, RoomId};
-use konsensus_core::UkmEnvelope;
-use konsensus_message::PeerRegistry;
-use konsensus_storage::error::StorageError;
-use konsensus_storage::models::{Peer, Room};
-use konsensus_storage::Storage;
-use async_trait::async_trait;
-
+use common::test_router as build_router;
+use common::*;
 use konsensus_api::audit::AuditLog;
-use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use common::test_router as build_router;
+use konsensus_core::gate::PaymentGate;
+use konsensus_core::traits::chain::{
+    BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel,
+};
+use konsensus_core::traits::lightning::{
+    Invoice, LightningError, LightningProvider, PaymentDetails,
+};
+use konsensus_core::types::NodeId;
+use konsensus_message::PeerRegistry;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tower::ServiceExt;
 
 fn test_dest_pubkey() -> String {
     format!("02{}", "11".repeat(32))
@@ -371,7 +360,7 @@ async fn pricing_peer_by_id() {
     let app = build_router(Arc::clone(&state));
 
     let req = Request::builder()
-        .uri(&format!("/api/v1/pricing/peers/{}", peer_id.to_hex()))
+        .uri(format!("/api/v1/pricing/peers/{}", peer_id.to_hex()))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();
@@ -393,7 +382,7 @@ async fn pricing_peer_not_found() {
 
     let fake_peer = "aa".repeat(32);
     let req = Request::builder()
-        .uri(&format!("/api/v1/pricing/peers/{fake_peer}"))
+        .uri(format!("/api/v1/pricing/peers/{fake_peer}"))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();
@@ -694,7 +683,7 @@ async fn payment_status_returns_pending() {
     let app = build_router(Arc::clone(&state));
 
     let req = Request::builder()
-        .uri(&format!("/api/v1/payments/{}", "aa".repeat(32)))
+        .uri(format!("/api/v1/payments/{}", "aa".repeat(32)))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();

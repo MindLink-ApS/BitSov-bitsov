@@ -144,9 +144,7 @@ async fn persistent_fee_failure_is_bounded_and_actionable() {
     )
     .await
     .unwrap();
-    let err = result
-        .err()
-        .expect("unreachable chain must not become ready");
+    let err = result.expect_err("unreachable chain must not become ready");
     assert!(
         err.to_string().contains("BOOT_CHAIN_SOURCE_UNAVAILABLE"),
         "{err}"

@@ -308,14 +308,14 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
             println!("  1. Run: konsensus start -c {}", config_path.display());
             println!("     (starts with mock Lightning — works immediately)");
             println!("  2. Edit {} for production:", config_path.display());
-            println!("     - Switch lightning backend to 'ldk', 'lnbits', or another provider you control");
+            println!("     - Switch lightning backend to 'ldk' or 'lnd' with a node you control");
             println!("     - Add peer entries for nodes you want to connect to");
         }
         NodeTier::Full => {
             println!("Next steps:");
-            println!("  1. Set up LND or CLN for Lightning payments");
+            println!("  1. Use embedded LDK or set up your own LND for Lightning payments");
             println!("  2. Edit {} to configure:", config_path.display());
-            println!("     - Switch lightning backend to 'lnbits' (pointing to your LND)");
+            println!("     - Keep lightning backend 'ldk', or use 'lnd' for direct LND REST access");
             println!("     - Chain backend is set to 'esplora'; use your own provider for full sovereignty");
             println!("     - Storage encryption is ON by default");
             println!("  3. Run: konsensus start -c {}", config_path.display());
@@ -755,14 +755,14 @@ async fn cmd_start(
                         "Cloud tier: check your hosted node URL and ensure the service is running."
                     }
                     crate::config::NodeTier::Light => {
-                        "Light tier: check your LNbits API URL and admin key in konsensus.toml.\n  \
+                        "Light tier: check your LDK or LND settings in konsensus.toml.\n  \
                          If using hosted Lightning, ensure your configured provider is reachable.\n  \
                          You can switch to mock Lightning for testing: set [lightning] backend = \"mock\"."
                     }
                     crate::config::NodeTier::Full => {
                         "Full tier: LDK embedded Lightning is enabled by default. Your node IS its own Lightning node.\n  \
                          Keys are derived from your mnemonic. Fund the on-chain wallet to open channels.\n  \
-                         To use LNbits instead, edit konsensus.toml and set [lightning] backend = \"lnbits\"."
+                         To use your own LND instead, set [lightning] backend = \"lnd\" and configure its REST credentials."
                     }
                 };
                 warn!(
@@ -1241,7 +1241,7 @@ async fn cmd_start(
             tier = ?config.tier,
             "running with mock Lightning — payments are simulated. \
              Edit konsensus.toml to configure a real Lightning backend \
-             (LNbits or LDK) for production use."
+             (LDK or LND) for production use. LNbits cannot enforce routing-fee ceilings and is rejected at startup."
         );
     }
 

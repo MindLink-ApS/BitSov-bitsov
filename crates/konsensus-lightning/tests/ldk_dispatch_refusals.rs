@@ -14,7 +14,7 @@ async fn real_ldk_route_refusals_are_not_dispatched_and_preserve_capability() {
     builder.set_listening_addresses(vec![]).unwrap();
     builder.set_gossip_source_p2p();
     builder.set_chain_source_esplora(server.url(), Some(ldk_node::config::EsploraSyncConfig {
-        background_sync_config: None, ..Default::default()
+        background_sync_config: None,
     }));
     let node = Arc::new(builder.build().unwrap());
     node.start().unwrap();

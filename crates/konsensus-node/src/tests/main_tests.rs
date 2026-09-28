@@ -33,7 +33,7 @@ fn init_light_tier_creates_config_and_mnemonic() -> Result<()> {
 
     // Mnemonic must be 24 words
     let mnemonic = std::fs::read_to_string(&mnemonic_path)?;
-    assert_eq!(mnemonic.trim().split_whitespace().count(), 24);
+    assert_eq!(mnemonic.split_whitespace().count(), 24);
     Ok(())
 }
 

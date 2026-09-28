@@ -153,7 +153,7 @@ async fn the_gift_hash_is_funding_only_and_never_admits_a_message() {
         .check_and_store_paid(&Nonce::from_bytes([7; 24]), &hash, p.sponsor.identity.node_id(), &MessageId::from_bytes([9; 32]))
         .await
         .unwrap();
-    assert!(matches!(reuse, PaidReplay::PaymentReused { .. }), "{reuse:?}");
+    assert!(matches!(reuse, PaidReplay::PaymentReused), "{reuse:?}");
     // Control: an unrelated payment is still accepted by the same store.
     let fresh = adapter
         .check_and_store_paid(&Nonce::from_bytes([8; 24]), &[0x42; 32], p.sponsor.identity.node_id(), &MessageId::from_bytes([10; 32]))
