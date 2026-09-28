@@ -327,6 +327,9 @@ impl Sender {
                     "recipient": recipient.to_hex(),
                     "kind": konsensus_core::kind::KIND_CHAT,
                     "plaintext": text,
+                    // This test measures invoice/readmission latency; its stub
+                    // sender loop does not process message ACKs.
+                    "wait_ack_ms": 0,
                 })
                 .to_string(),
             ))

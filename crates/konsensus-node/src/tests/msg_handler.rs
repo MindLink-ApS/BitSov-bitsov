@@ -1291,7 +1291,7 @@ async fn paid_acceptance_retry_case(legacy: bool, retained: bool, price_rise: bo
     assert!(ws_rx.try_recv().is_err());
     pricing.0.store(100, std::sync::atomic::Ordering::SeqCst);
     // A different valid id cannot reuse that payment or be promoted.
-    let mut reused = UkmEnvelopeBuilder::new(env.kind, env.sender, env.recipient.clone(), vec![8], env.payment_proof.clone()).build();
+    let mut reused = UkmEnvelopeBuilder::new(env.kind, env.sender, env.recipient, vec![8], env.payment_proof.clone()).build();
     reused.signature = Signature::from_ed25519(&alice.sign(&reused.signable_bytes()));
     source.send(bob.node_id(), &reused).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {

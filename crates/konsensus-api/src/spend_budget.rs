@@ -215,6 +215,9 @@ pub struct GrantBudget {
     /// Outstanding reservations; terminal resolution consumes each recipient once.
     #[serde(default)]
     pub pending: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Written atomically with the debit, before async operation attachment.
+    #[serde(default)]
+    pub operation_links: BTreeMap<String, OperationReservationLink>,
 }
 
 impl GrantBudget {
@@ -228,6 +231,7 @@ impl GrantBudget {
             used_msat: 0,
             used_by_recipient: BTreeMap::new(),
             pending: BTreeMap::new(),
+            operation_links: BTreeMap::new(),
         }
     }
 
@@ -615,4 +619,13 @@ mod tests {
         assert_eq!(human_duration(5_400), "1 h 30 min");
         assert_eq!(sats(1_500), "1.500");
     }
+}
+
+
+/// Reconciliation identity only; never restores dispatch authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationReservationLink {
+    pub operation_id: String,
+    pub execution_id: String,
+    pub readmission: bool,
 }

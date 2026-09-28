@@ -37,6 +37,7 @@ use konsensus_api::state::AppState;
 // ─── Stub: In-memory Storage ────────────────────────────────────────
 
 pub struct MemStorage {
+    outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
     calendar: Mutex<HashMap<String, konsensus_storage::calendar::CalendarEventRecord>>,
     messages: Mutex<HashMap<String, UkmEnvelope>>,
     /// AES-GCM-encrypted plaintext blobs keyed by message id hex (mirrors prod).
@@ -55,6 +56,7 @@ pub struct MemStorage {
 impl MemStorage {
     pub fn new() -> Self {
         Self {
+            outbox: Mutex::new(HashMap::new()),
             calendar: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
             message_plaintext: Mutex::new(HashMap::new()),
@@ -84,6 +86,64 @@ impl MemStorage {
 
 #[async_trait]
 impl Storage for MemStorage {
+    async fn insert_outbox_operation(
+        &self,
+        op: &konsensus_storage::OutboxOperation,
+    ) -> Result<bool, StorageError> {
+        let mut rows = self.outbox.lock().unwrap();
+        if rows.contains_key(&op.operation_id) {
+            return Ok(false);
+        }
+        rows.insert(op.operation_id.clone(), op.clone());
+        Ok(true)
+    }
+    async fn update_outbox_operation(
+        &self,
+        op: &konsensus_storage::OutboxOperation,
+    ) -> Result<bool, StorageError> {
+        let mut rows = self.outbox.lock().unwrap();
+        if rows
+            .get(&op.operation_id)
+            .is_none_or(|p| p.version != op.version)
+        {
+            return Ok(false);
+        }
+        let mut next = op.clone();
+        next.version += 1;
+        rows.insert(op.operation_id.clone(), next);
+        Ok(true)
+    }
+    async fn get_outbox_operation(
+        &self,
+        id: &str,
+    ) -> Result<Option<konsensus_storage::OutboxOperation>, StorageError> {
+        Ok(self.outbox.lock().unwrap().get(id).cloned())
+    }
+    async fn list_recoverable_operations(
+        &self,
+    ) -> Result<Vec<konsensus_storage::OutboxOperation>, StorageError> {
+        Ok(self
+            .outbox
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|p| matches!(p.state.as_str(), "paying" | "payment_unknown" | "paid"))
+            .cloned()
+            .collect())
+    }
+    async fn commit_outbox_envelope(
+        &self,
+        op: &konsensus_storage::OutboxOperation,
+        env: &UkmEnvelope,
+    ) -> Result<bool, StorageError> {
+        if !self.update_outbox_operation(op).await? {
+            return Ok(false);
+        }
+        self.store_message(env).await?;
+        Ok(true)
+    }
+
+
     async fn store_calendar_event(&self, event: &konsensus_storage::calendar::CalendarEventRecord) -> Result<(), StorageError> {
         self.calendar.lock().unwrap().insert(event.id.clone(), event.clone());
         Ok(())
@@ -699,7 +759,7 @@ impl LightningProvider for StubLightning {
         _memo: Option<&str>,
     ) -> Result<PaymentDetails, LightningError> {
         Ok(PaymentDetails {
-            payment_hash: "ab".repeat(32),
+            payment_hash: hex::encode(<sha2::Sha256 as sha2::Digest>::digest([0xcd; 32])),
             preimage: Some("cd".repeat(32)),
             amount_msat,
             status: PaymentStatus::Settled,

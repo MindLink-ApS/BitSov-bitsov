@@ -291,7 +291,7 @@ async fn retained_receipt_matches_all_immutable_fields_after_content_deletion() 
         assert!(!db.is_paid_envelope_accepted(&other).await.unwrap(), "read-only binding variant {variant}");
         assert_eq!(db.accept_paid_envelope(&other).await.unwrap(), konsensus_storage::PaidAcceptance::PaymentReused, "variant {variant}");
     }
-    let mut renewed = env.clone(); renewed.timestamp += 7 * 86400_000;
+    let mut renewed = env.clone(); renewed.timestamp += 7 * 86_400_000;
     renewed.signature = Signature::from_bytes([8; 64]);
     assert_eq!(db.accept_paid_envelope(&renewed).await.unwrap(), konsensus_storage::PaidAcceptance::AlreadyAccepted);
     assert!(db.get_message(&env.id).await.unwrap().is_none());
