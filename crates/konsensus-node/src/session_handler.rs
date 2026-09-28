@@ -127,6 +127,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
+    // PSI-SPEED: bounds our prekey replies to a paid payee's offer.
+    let mut eager_offers = konsensus_message::EagerOfferLimiter::new();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
     let mut cooldown_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -173,6 +175,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             warn!(peer = %peer_id, "DROP PrekeyOffer from unprivileged peer (P2: no free X3DH before payment)");
                             continue;
                         }
+                        reply_prekey_offer_to_paid_payee(
+                            &peer_id, our_node_id, &session_manager, &transport, &mut eager_offers,
+                        ).await;
                         handle_prekey_offer(
                             &peer_id, bundle, our_node_id, &session_manager, &storage,
                             &transport, &audit_log, &mut last_negotiation,
@@ -760,6 +765,38 @@ async fn heal_connected_e2ee_sessions(
                 );
             }
         }
+    }
+}
+
+/// PSI-SPEED: the payee offers its prekey the moment our paid admission
+/// promotes us, but when the payee has the LOWER NodeId it is the X3DH
+/// initiator and needs OUR bundle, and the offer we sent right after our proof
+/// usually reached it before its promotion and was dropped. So when the node
+/// whose admission WE settled on this live connection offers, and we are not
+/// the initiator and have no sending chain, answer with our offer at once
+/// instead of on the next self-heal tick. Only a connection we paid on
+/// (`admission_paid`) qualifies, never a stranger, and replies are
+/// rate-limited; self-heal remains the fallback.
+async fn reply_prekey_offer_to_paid_payee(
+    peer_id: &NodeId,
+    our_node_id: NodeId,
+    session_manager: &SessionManager,
+    transport: &Arc<NoiseTransport>,
+    limiter: &mut konsensus_message::EagerOfferLimiter,
+) {
+    if our_node_id.as_bytes() < peer_id.as_bytes()
+        || !transport.admission_paid_on_connection(peer_id).await
+        || !e2ee_needs_self_heal(session_manager, peer_id).await
+    {
+        return;
+    }
+    if !limiter.allow(peer_id, std::time::Instant::now()) {
+        debug!(peer = %peer_id, "prekey reply to paid payee rate-limited; self-heal will offer");
+        return;
+    }
+    match send_prekey_offer(session_manager, transport, peer_id).await {
+        Ok(()) => info!(peer = %peer_id, "answered the paid payee's PrekeyOffer with ours (PSI-SPEED)"),
+        Err(e) => warn!(peer = %peer_id, error = %e, "failed to answer the paid payee's PrekeyOffer"),
     }
 }
 

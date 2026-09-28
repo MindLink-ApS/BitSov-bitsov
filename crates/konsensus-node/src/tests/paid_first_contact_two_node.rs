@@ -1207,3 +1207,60 @@ async fn p2_paid_payee_gets_no_rejection_or_prices_for_an_unpaid_envelope() {
     assert_eq!(rejects(&unpaid.id), 0, "the unpaid envelope from the paid-for payee got a MessageReject");
     net.stop();
 }
+
+// ── PSI-SPEED: first contact without waiting for a self-heal tick ────────
+
+/// First contact used to wait up to one 15 s self-heal tick (about 12 s
+/// observed). Now the payee offers its prekey on promotion, the payer offers
+/// right after its proof, and answers the payee's offer when the payee is the
+/// X3DH initiator.
+const FIRST_CONTACT_BUDGET: Duration = Duration::from_secs(2);
+
+/// The paid first contact completes (compose returns delivered) well inside
+/// [`FIRST_CONTACT_BUDGET`], paying one admission plus the message. A
+/// stranger connected to the payee throughout gets nothing out of it.
+async fn first_contact_is_fast(order: Order) {
+    let mut net = pair(Shape::CardOnly, order, Wallet::Plain, Wallet::Plain).await;
+    let payee = net.payee.id;
+    let (z_identity, z) = stranger();
+    let z_id = *z_identity.node_id();
+    z.connect(&payee, &net.payee.addr()).await.unwrap();
+    wait_until("the payee sees the stranger", Duration::from_secs(5), || async {
+        net.payee.transport.is_connected(&z_id).await
+    })
+    .await;
+
+    let started = std::time::Instant::now();
+    let (status, body) = net.payer.compose(&payee, "fast").await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK, "{order:?}: {body}");
+    assert_eq!(body["delivered"], true, "{body}");
+    println!("PSI-SPEED first contact {order:?}: {elapsed:?}");
+    assert!(elapsed < FIRST_CONTACT_BUDGET, "{order:?}: first contact took {elapsed:?}");
+    net.payee.delivered_once("fast").await;
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT, CHAT_MSAT], "one admission + the message");
+
+    // The stranger, unpaid, got no prekey, handshake or prices.
+    let back = received(&z, Duration::from_secs(2)).await;
+    assert!(
+        !back.iter().any(|e| matches!(
+            e,
+            ControlEvent::PrekeyOffer { .. } | ControlEvent::SessionInit { .. }
+                | ControlEvent::PriceTableReceived { .. } | ControlEvent::PeerExchangeReceived { .. }
+        )),
+        "the payee answered an unpaid stranger: {back:?}"
+    );
+    assert!(!net.payee.sessions.has_session(&z_id).await);
+    z.shutdown();
+    net.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speed_first_contact_is_fast_payer_initiates() {
+    first_contact_is_fast(Order::PayerLower).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speed_first_contact_is_fast_payee_initiates() {
+    first_contact_is_fast(Order::PayerHigher).await;
+}
