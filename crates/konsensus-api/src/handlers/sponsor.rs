@@ -143,6 +143,10 @@ pub struct Kit {
     /// Reconciliation only; this does not confer dispatch authority.
     #[serde(default)]
     pub grant_reservation: Option<Reservation>,
+    /// A lookup proved the invoice had no prior attempt before dispatch.
+    /// Legacy ambiguous operations cannot release holds on failed lookups.
+    #[serde(default)]
+    pub fresh_payment_hash: bool,
     /// Gift + fee ceiling held from approval until a definitive outcome.
     pub reserved_msat: u64,
     pub paid_msat: u64,
@@ -382,6 +386,7 @@ async fn create_offer(_auth: MeteredSpend, State(state): State<Arc<AppState>>) -
             approved_at: None,
             settled_at: None,
             grant_reservation: None,
+            fresh_payment_hash: false,
             reserved_msat: 0,
             paid_msat: 0,
             fee_paid_msat: 0,
@@ -555,7 +560,23 @@ async fn approve(
         let active = ActiveDispatch::start(dir, body.intro_id.clone());
         (candidate, kit.fee_msat, deadline, debit, active)
     };
+    // A hash alone cannot distinguish two attempts (nor can second-resolution
+    // timestamps). Sponsor gifts only dispatch fresh invoices. Persist the
+    // proof before calling the backend so failure reconciliation survives a
+    // process restart. Lookup errors other than absence fail before dispatch.
+    let preflight = match state.lightning.get_payment_status(&candidate.payment_hash).await {
+        Err(LightningError::PaymentNotFound(_)) => {
+            with_ledger(&state, |ledger| {
+                ledger.kit_mut(&body.intro_id)?.fresh_payment_hash = true;
+                Ok(())
+            }).await?;
+            Ok(())
+        }
+        Ok(_) => Err(LightningError::PaymentNotDispatched("sponsor invoice already has a payment record; request a fresh invoice".into())),
+        Err(e) => Err(LightningError::PaymentNotDispatched(format!("cannot establish a fresh sponsor invoice: {e}"))),
+    };
     let result = debit.dispatch(async {
+        preflight?;
         if now_unix().map_err(|e| LightningError::PaymentNotDispatched(e.to_string()))? >= deadline {
             return Err(LightningError::PaymentNotDispatched("sponsor request expired before dispatch".into()));
         }
@@ -568,7 +589,7 @@ async fn approve(
     };
     let outcome = with_ledger(&state, |ledger| {
         let kit = ledger.kit_mut(&body.intro_id)?;
-        record_outcome(kit, &paid, now_unix()?);
+        record_outcome(kit, &paid, now_unix()?, true);
         Ok(kit.clone())
     }).await?;
     resolve_grant(&state, &outcome);
@@ -586,7 +607,7 @@ async fn approve(
 
 /// Only the outgoing record for the exact approved operation may release a
 /// reservation. Terminal outcomes are monotonic across concurrent callers.
-fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>, now: u64) {
+fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>, now: u64, from_dispatch: bool) {
     if matches!(kit.state, KitState::Failed | KitState::Cancelled)
         || (kit.state == KitState::Funded && kit.reserved_msat == 0) {
         return;
@@ -613,7 +634,7 @@ fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>
             }
         }
         Ok(d) if valid(d) && matches!(d.status, PaymentStatus::Failed | PaymentStatus::Expired)
-            && kit.state != KitState::Funded => {
+            && kit.state != KitState::Funded && (from_dispatch || kit.fresh_payment_hash) => {
                 kit.state = KitState::Failed;
                 kit.reserved_msat = 0;
             }
@@ -690,7 +711,7 @@ async fn reconcile(
     // may have completed while the backend was awaited.
     let outcome = with_ledger(&state, |ledger| {
         let kit = ledger.kit_mut(&intro_id)?;
-        record_outcome(kit, &details, now_unix()?);
+        record_outcome(kit, &details, now_unix()?, false);
         Ok(kit.clone())
     }).await?;
     resolve_grant(&state, &outcome);
@@ -878,6 +899,7 @@ mod tests {
             approved_at,
             settled_at: None,
             grant_reservation: None,
+            fresh_payment_hash: false,
             reserved_msat: reserved,
             paid_msat: paid,
             fee_paid_msat: 0,
@@ -933,11 +955,11 @@ mod tests {
     #[test]
     fn stale_pending_or_failed_results_cannot_undo_a_known_settlement() {
         let (mut k, mut d) = pending_with_record();
-        record_outcome(&mut k, &Ok(d.clone()), NOW);
+        record_outcome(&mut k, &Ok(d.clone()), NOW, true);
         assert_eq!(k.charge(NOW), 20_100);
         for status in [PaymentStatus::InFlight, PaymentStatus::Failed] {
             d.status = status;
-            record_outcome(&mut k, &Ok(d.clone()), NOW + 1);
+            record_outcome(&mut k, &Ok(d.clone()), NOW + 1, true);
             assert_eq!(k.state, KitState::Funded);
             assert_eq!(k.charge(NOW + 1), 20_100);
             assert_eq!(k.settled_at, Some(NOW));
@@ -950,15 +972,15 @@ mod tests {
         let mut wrong = d.clone();
         wrong.payment_hash = "44".repeat(32);
         wrong.status = PaymentStatus::Failed;
-        record_outcome(&mut k, &Ok(wrong), NOW);
+        record_outcome(&mut k, &Ok(wrong), NOW, true);
         assert_eq!(k.charge(NOW), 21_000);
         let mut wrong = d.clone();
         wrong.direction = PaymentDirection::Incoming;
-        record_outcome(&mut k, &Ok(wrong), NOW);
+        record_outcome(&mut k, &Ok(wrong), NOW, true);
         assert_eq!(k.charge(NOW), 21_000);
         let mut wrong = d;
         wrong.amount_msat = 1;
-        record_outcome(&mut k, &Ok(wrong), NOW);
+        record_outcome(&mut k, &Ok(wrong), NOW, true);
         assert_eq!(k.state, KitState::Unknown);
         assert_eq!(k.charge(NOW), 21_000);
     }

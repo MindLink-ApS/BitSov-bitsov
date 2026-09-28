@@ -340,7 +340,7 @@ impl LightningProvider for MockLightningProvider {
             direction: PaymentDirection::Outgoing,
             timestamp: now,
             memo: None,
-            fee_msat: None,
+            fee_msat: Some(0),
         };
 
         self.payments
@@ -380,10 +380,9 @@ impl LightningProvider for MockLightningProvider {
                 pending.remove(payment_hash);
             }
         }
-        self.payments
-            .lock()
-            .await
-            .get(payment_hash)
+        let payments = self.payments.lock().await;
+        payments.get(payment_hash)
+            .or_else(|| payments.get(&format!("out-{payment_hash}")))
             .cloned()
             .ok_or_else(|| LightningError::PaymentNotFound(payment_hash.to_string()))
     }

@@ -155,7 +155,7 @@ impl MeteredSpend {
         let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
         let reservation = service.reserve_spend_linked(client_id, *epoch, charges, |r| persist_link(Some(r)))
             .map_err(ApiError::BudgetExceeded)?;
-        Ok(Debit { held: Some((Arc::clone(service), reservation)) })
+        Ok(Debit::reserved(Arc::clone(service), reservation))
     }
 
     /// Reserve an explicitly approved LSP fee under total/call/recipient bounds.

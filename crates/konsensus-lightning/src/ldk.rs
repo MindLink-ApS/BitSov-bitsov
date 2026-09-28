@@ -285,6 +285,11 @@ impl std::fmt::Debug for LdkProvider {
     }
 }
 
+// The fresh-hash check and send share a lock with ordinary invoice payments.
+// A capped sponsor payment must never retry an older failed attempt: LDK may
+// initiate HTLCs before persisting its replacement Pending record.
+static INVOICE_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl LdkProvider {
     async fn pay_invoice_routed(
         &self, bolt11: &str,
@@ -297,6 +302,14 @@ impl LdkProvider {
         let payment_hash_hex = hex::encode(AsRef::<[u8]>::as_ref(invoice.payment_hash()));
         let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0);
 
+        let _dispatch = INVOICE_DISPATCH_LOCK.lock()
+            .map_err(|_| LightningError::PaymentNotDispatched("invoice dispatch lock poisoned".into()))?;
+        let payment_id_bytes: [u8; 32] = AsRef::<[u8]>::as_ref(invoice.payment_hash()).try_into()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid payment hash".into()))?;
+        if route_parameters.is_some()
+            && self.node.payment(&ldk_node::lightning::ln::channelmanager::PaymentId(payment_id_bytes)).is_some() {
+            return Err(LightningError::PaymentNotDispatched("capped payments require a fresh invoice hash".into()));
+        }
         let payment_id = self
             .node
             .bolt11_payment()

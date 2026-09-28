@@ -255,6 +255,9 @@ pub trait LightningProvider: Send + Sync {
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError>;
 
     /// Pay with an exact routing-fee ceiling enforced BEFORE dispatch.
+    /// This single-use operation must not retry an existing failed payment
+    /// hash: callers reconcile by hash across crashes. Serialize any freshness
+    /// check with dispatch so an old failure cannot stand for a new attempt.
     /// Unsupported backends fail closed; never use unbounded pay_invoice as
     /// a fallback or discover an overspend only after it has occurred.
     async fn pay_invoice_with_fee_limit(

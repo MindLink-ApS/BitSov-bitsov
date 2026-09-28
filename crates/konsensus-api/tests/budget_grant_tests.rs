@@ -170,7 +170,7 @@ impl LightningProvider for Wallet {
                 memo: None, fee_msat: Some(0),
             });
         }
-        StubLightning.get_payment_status(hash).await
+        Err(LightningError::PaymentNotFound(hash.into()))
     }
     async fn get_balance_msat(&self) -> Result<u64, LightningError> {
         StubLightning.get_balance_msat().await

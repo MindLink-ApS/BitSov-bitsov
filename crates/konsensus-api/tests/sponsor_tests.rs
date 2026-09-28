@@ -354,7 +354,8 @@ impl LightningProvider for ReportedFeeProvider {
         Ok(paid)
     }
     async fn get_payment_status(&self,h:&str)->Result<konsensus_core::traits::lightning::PaymentDetails,konsensus_core::traits::lightning::LightningError>{
-        if self.pause.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.pause.load(std::sync::atomic::Ordering::SeqCst)
+            && self.waiting.load(std::sync::atomic::Ordering::SeqCst) {
             // A definitive prior attempt for this invoice is not the outcome
             // of the currently paused new dispatch.
             return Ok(konsensus_core::traits::lightning::PaymentDetails {
@@ -462,4 +463,48 @@ async fn legacy_funded_kits_without_a_settlement_time_are_reconciled_before_reus
     let reconcile = format!("/api/v1/sponsor/kits/{}/reconcile", candidate["intro_id"].as_str().unwrap());
     assert_eq!(call(&restarted,"POST",&reconcile,None).await.0, StatusCode::OK);
     assert_eq!(call(&restarted,"GET","/api/v1/sponsor",None).await.1["purse_used_msat"], GIFT);
+}
+
+
+#[tokio::test]
+async fn legacy_ambiguous_failure_cannot_release_the_purse_after_restart() {
+    let p = pair(policy(GIFT + FEE, 2)).await;
+    let (ask, candidate) = up_to_candidate(&p).await;
+    let path = p.sponsor.data_dir.as_ref().unwrap().join("sponsor/kits.json");
+    let mut ledger: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    ledger["kits"][0]["state"] = json!("unknown");
+    ledger["kits"][0]["approved_at"] = json!(1);
+    ledger["kits"][0]["reserved_msat"] = json!(GIFT + FEE);
+    std::fs::write(path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let wallet = Arc::new(ReportedFeeProvider {
+        inner: p.sponsor_ln.clone(), fee: 0.into(), cap: u64::MAX.into(),
+        pause: true.into(), waiting: true.into(), resume: tokio::sync::Notify::new(),
+    });
+    let restarted = Arc::new(AppState { lightning: wallet.clone(), ..(*p.sponsor).clone() });
+    let reconcile = format!("/api/v1/sponsor/kits/{}/reconcile", candidate["intro_id"].as_str().unwrap());
+    // Same-second timestamps cannot distinguish two attempts. There is no
+    // durable proof that the failed provider record belongs to this approval.
+    let (status, body) = call(&restarted, "POST", &reconcile, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "unknown", "an ambiguous failure must retain the hold");
+    assert_eq!(call(&restarted, "GET", "/api/v1/sponsor", None).await.1["purse_used_msat"], GIFT + FEE);
+    assert_eq!(call(&restarted, "POST", "/api/v1/sponsor/offer", None).await.0, StatusCode::CONFLICT);
+    let request = FundingRequest::parse(ask["request"].as_str().unwrap()).unwrap();
+    p.sponsor_ln.pay_invoice(&request.bolt11).await.unwrap();
+    wallet.pause.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (_, settled) = call(&restarted, "POST", &reconcile, None).await;
+    assert_eq!(settled["state"], "funded", "the late settlement must still be recorded");
+    assert_eq!(call(&restarted, "GET", "/api/v1/sponsor", None).await.1["purse_used_msat"], GIFT);
+}
+
+#[tokio::test]
+async fn approval_refuses_an_invoice_with_an_existing_outgoing_attempt() {
+    let p = pair(policy(GIFT + FEE, 2)).await;
+    let (ask, candidate) = up_to_candidate(&p).await;
+    let request = FundingRequest::parse(ask["request"].as_str().unwrap()).unwrap();
+    p.sponsor_ln.pay_invoice(&request.bolt11).await.unwrap();
+    let (status, _) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve",
+        Some(json!({"intro_id":candidate["intro_id"],"code":candidate["code"]}))).await;
+    assert_ne!(status, StatusCode::OK, "a prior attempt must not be claimed as this gift");
+    assert_eq!(call(&p.sponsor, "GET", "/api/v1/sponsor", None).await.1["purse_used_msat"], 0);
 }

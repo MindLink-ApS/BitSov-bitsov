@@ -593,3 +593,14 @@ async fn default_keysend_with_binding_fails_closed() {
         "default keysend_with_binding must fail closed, never send an unbindable payment"
     );
 }
+
+
+#[tokio::test]
+async fn capped_payment_keeps_known_fee_in_the_reconciliation_record() {
+    let payer = MockLightningProvider::new();
+    let receiver = MockLightningProvider::new();
+    let invoice = receiver.create_invoice(1_000, "capped", 600).await.unwrap();
+    payer.pay_invoice_with_fee_limit(&invoice.bolt11, 0).await.unwrap();
+    let stored = payer.get_payment_status(&invoice.payment_hash).await.unwrap();
+    assert_eq!(stored.fee_msat, Some(0));
+}

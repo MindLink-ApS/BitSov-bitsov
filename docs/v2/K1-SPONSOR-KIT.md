@@ -41,6 +41,9 @@ The funding request travels in person rather than over the peer transport. That 
 - **Clock rollback:** it cannot refresh the purse. A reservation dated after the node's current clock still counts.
 - **Failed approvals:** a failed approval still used one of the day's kits.
 - **Consumed introductions:** a consumed `intro_id` never pays twice.
+- **Fresh invoices only:** before dispatch, the sponsor requires an authoritative absence of a prior payment record and persists that fact. The capped LDK send also checks the hash under the invoice-dispatch lock, so it cannot retry an older failed attempt. Existing invoices and unavailable lookups close the kit without paying.
+- **Ambiguous legacy failures:** old ledgers lack fresh-invoice proof. A failed lookup for one of those operations cannot release its reservation: it might describe an earlier attempt for the same hash. A verified settlement can still reconcile it. New operations retain their freshness proof across restarts, allowing definitive failure to release both holds.
+- **Unknown fees:** a settlement without an authoritative fee retains the full approved maximum. Once known, its principal and fee count for 24 hours from reconciliation, even if approval was more than a day ago. G1 continues to meter principal only, as specified by the budget grant contract.
 - **The ledger:** `<data_dir>/sponsor/kits.json` (0600, atomic replace, versioned).
 
 ## Records

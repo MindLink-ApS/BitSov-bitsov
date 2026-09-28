@@ -501,12 +501,14 @@ struct Inner {
     first_contact: HashMap<String, PendingFirstContact>,
 }
 
+type ReservationJournal<'a> = Box<dyn FnOnce(&Reservation) -> Result<(), BudgetRefusal> + 'a>;
+
 /// Authority constraints checked inside the same transaction as the debit.
 #[derive(Default)]
 struct ReservationAuthority<'a> {
     expected_op_id: Option<&'a str>,
     liquidity: bool,
-    before_persist: Option<Box<dyn FnOnce(&Reservation) -> Result<(), BudgetRefusal> + 'a>>,
+    before_persist: Option<ReservationJournal<'a>>,
 }
 
 /// Consumed, single-use authorization. Its grant identity survives the handoff
