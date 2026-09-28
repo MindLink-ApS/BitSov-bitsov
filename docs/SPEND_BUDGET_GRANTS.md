@@ -155,9 +155,13 @@ backs that one answer with a short, single-use **first-contact grant**.
    already paid or in flight. For a contact that needs admission again after a
    reconnect (see below), it returns that contact's quote, reusing one the node
    already holds.
-2. **Confirm.** `POST /api/v1/pair/first-contact-grant {"recipient",
-   "max_total_msat", "contact_budget_msat"?}` is sent after the owner confirms in
-   the app.
+2. **Confirm.** The owner sends `POST /api/v1/pair/first-contact-grant`
+   with their independent owner credential and `{ "client_id", "grant_op_id",
+   "recipient", "max_total_msat", "contact_budget_msat"? }`.
+   Paired tokens are refused, including tokens with a live spend budget. The
+   owner's credential must stay outside the delegated paired app. The client
+   and exact budget operation ID bind the approved terms; a stale operation ID
+   cannot authorize a replacement grant.
    - `contact_budget_msat` is the contact's budget the owner chose on the door
      card. If the budget grant has no cap for this contact yet, it becomes one
      (bounded by the grant's total). This only narrows the grant, and it makes
@@ -174,6 +178,8 @@ backs that one answer with a short, single-use **first-contact grant**.
 3. **Send.** `POST /api/v1/messages/compose` to that stranger consumes the grant.
    - The grant's amount caps the whole first contact: admission plus first
      message, together with any `max_total_msat`.
+   - Consumption carries the original grant identity into reservation. Grant
+     replacement or expiry during that handoff refuses the send.
    - The node reserves that cap **once** against the budget grant before
      requesting the admission invoice.
    - The same reservation is carried through the invoice request
@@ -205,11 +211,17 @@ the owner already budgeted**, without a prompt.
   first-contact confirmation.
 - The node first asks for the recipient's signed quote, then reserves exactly
   the quoted admission against the grant before paying anything. The
-  reservation must fit the contact's cap, the per-call maximum and what is left.
-  The message is its own reservation, as for every send.
+  reservation must fit the contact's cap and what is left. The message and
+  every re-admission in the same API call share one per-call maximum, including
+  all members of a room fan-out. Separate reservations track their financial
+  outcomes without granting a separate per-call allowance. Eligibility and
+  reservation use the same ledger transaction and the same original grant.
 - The payment is resolved once (settled, released if never dispatched, kept
   reserved if unknown). The sender records it as an outbound N2 membrane event
-  `readmission`, with the amount and the contact's cap.
+  `readmission`, with the amount and the original contact's cap. A recovered
+  settlement emits that event once; reusing its proof does not emit it again.
+  Payment-attempt metadata retains that notification context across restart;
+  it does not grant admission.
 - A contact the grant does not budget is refused with `budget_exceeded` /
   `first_contact` before the recipient is asked for anything. The owner's
   one-time confirmation for exactly that contact (steps 1 and 2 above) then
@@ -221,8 +233,7 @@ the owner already budgeted**, without a prompt.
   owner's own key has no such bound, so a capped owner send is refused
   (`price_cap_exceeded`) and an uncapped one pays.
 
-That the owner, not a program, confirmed is the app's contract, the same as for
-every budgeted send. The node enforces the rest: an explicit call per contact,
-exact recipient, bounded amount, single use, short life, and inside a budget the
-owner granted at the node.
-
+The node enforces independent owner authority for confirmation, exact client
+and grant binding, exact recipient, bounded amount, single use, short life, and
+reservation inside that same budget. A delegated paired program cannot issue
+its own first-contact approval.

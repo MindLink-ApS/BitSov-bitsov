@@ -24,8 +24,8 @@ use axum::response::{IntoResponse, Response};
 
 use crate::auth::{AuthUser, Scope};
 use crate::error::ApiError;
-use crate::pairing::PairingService;
-use crate::spend_budget::{BudgetRefusal, Charge, FirstContactGrant, Reservation};
+use crate::pairing::{FirstContactAuthorization, PairingService};
+use crate::spend_budget::{BudgetRefusal, Charge, Reservation};
 use crate::state::AppState;
 
 /// An authenticated caller holding `spend`, with the meter that applies to it.
@@ -106,35 +106,11 @@ impl MeteredSpend {
         }
     }
 
-    /// Issue the owner's one-time first-contact confirmation for `recipient`
-    /// (see [`FirstContactGrant`]). Only a paired client needs one; the
-    /// owner's own key is not metered and is refused here as a misuse.
-    pub fn grant_first_contact(
-        &self,
-        state: &AppState,
-        recipient: &str,
-        max_total_msat: u64,
-        contact_budget_msat: Option<u64>,
-    ) -> Result<FirstContactGrant, ApiError> {
-        let Meter::Grant { client_id, epoch } = &self.meter else {
-            return Err(ApiError::BadRequest(
-                "the owner's key is not metered; a first-contact grant is for a paired client".into(),
-            ));
-        };
-        let service = state
-            .pairing
-            .as_ref()
-            .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
-        service
-            .grant_first_contact(client_id, *epoch, recipient, max_total_msat, contact_budget_msat)
-            .map_err(ApiError::BudgetExceeded)
-    }
-
-    /// For a first contact: the amount the owner confirmed for `recipient`,
-    /// consumed (single use). `Ok(None)` for the owner's own key, which is not
+    /// For a first contact: the owner's approval for `recipient`, consumed
+    /// once and still bound to its original budget until reservation. `Ok(None)` for the owner's own key, which is not
     /// metered. A paired client without a live matching first-contact grant is
     /// refused before anything is requested or paid.
-    pub fn take_first_contact(&self, state: &AppState, recipient: &str) -> Result<Option<u64>, ApiError> {
+    pub fn take_first_contact(&self, state: &AppState, recipient: &str) -> Result<Option<FirstContactAuthorization>, ApiError> {
         let Meter::Grant { client_id, epoch } = &self.meter else {
             return Ok(None);
         };
@@ -150,6 +126,12 @@ impl MeteredSpend {
                         .into(),
                 ))
             })
+    }
+
+    pub(crate) fn debit_first_contact(&self, state: &AppState, approval: FirstContactAuthorization, cap: Option<u64>) -> Result<Debit, ApiError> {
+        let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service.reserve_first_contact(approval, cap).map_err(ApiError::BudgetExceeded)?;
+        Ok(Debit::reserved(Arc::clone(service), reservation))
     }
 
     /// Debit a call's charges before anything is dispatched.
@@ -172,9 +154,7 @@ impl MeteredSpend {
             reserved_msat = reservation.charges.iter().map(|c| c.amount_msat).sum::<u64>(),
             "spend grant debited before dispatch"
         );
-        Ok(Debit {
-            held: Some((Arc::clone(service), reservation)),
-        })
+        Ok(Debit::reserved(Arc::clone(service), reservation))
     }
 }
 
@@ -186,12 +166,20 @@ impl MeteredSpend {
 #[must_use = "resolve each charge once its outcome is known; dropping keeps it reserved"]
 pub struct Debit {
     held: Option<(Arc<PairingService>, Reservation)>,
+    // Shared by every member of a room fan-out. Reservations consume this
+    // call's allowance even when a sibling finishes before another starts.
+    call_reserved_msat: std::sync::Mutex<u64>,
 }
 
 impl Debit {
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { held: None }
+        Self { held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+    }
+
+    fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
+        let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
+        Self { held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.
@@ -214,11 +202,7 @@ impl Debit {
     /// The contact's budget cap in the grant behind this debit, msat, if any.
     pub(crate) fn contact_budget(&self, recipient: &str) -> Option<u64> {
         let (service, reservation) = self.held.as_ref()?;
-        service
-            .grant_view_for(&reservation.client_id)?
-            .per_recipient_msat
-            .get(recipient)
-            .copied()
+        service.reservation_contact_budget(reservation, recipient)
     }
 
     /// Reserve a re-admission to `recipient` of exactly `amount_msat` (the
@@ -228,12 +212,12 @@ impl Debit {
         let Some((service, reservation)) = &self.held else {
             return Ok(Debit::unmetered());
         };
+        let mut call_total = self.call_reserved_msat.lock().unwrap_or_else(|e| e.into_inner());
         let readmission = service
-            .reserve_readmission(reservation, recipient, amount_msat)
+            .reserve_readmission(reservation, recipient, amount_msat, *call_total)
             .map_err(ApiError::BudgetExceeded)?;
-        Ok(Debit {
-            held: Some((Arc::clone(service), readmission)),
-        })
+        *call_total += amount_msat; // checked against the grant limit under its ledger lock
+        Ok(Debit::reserved(Arc::clone(service), readmission))
     }
 
     /// Reconciliation reference only; never restores dispatch authority.

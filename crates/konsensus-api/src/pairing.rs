@@ -501,6 +501,18 @@ struct Inner {
     first_contact: HashMap<String, PendingFirstContact>,
 }
 
+/// Consumed, single-use authorization. Its grant identity survives the handoff
+/// to reservation; neither replacement nor a different client can reuse it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FirstContactAuthorization {
+    pub(crate) max_total_msat: u64,
+    recipient: String,
+    client_id: String,
+    epoch: u64,
+    budget_op_id: String,
+    expires_at: i64,
+}
+
 /// A first-contact grant plus the budget grant it was issued under.
 struct PendingFirstContact {
     grant: crate::spend_budget::FirstContactGrant,
@@ -1705,12 +1717,22 @@ impl PairingService {
         client_id: &str,
         epoch: u64,
         charges: Vec<Charge>,
+        clock: impl FnMut() -> i64,
+    ) -> Result<Reservation, BudgetRefusal> {
+        let mut inner = self.lock();
+        self.reserve_spend_locked(&mut inner, client_id, epoch, charges, None, clock)
+    }
+
+    fn reserve_spend_locked(
+        &self,
+        inner: &mut Inner,
+        client_id: &str,
+        epoch: u64,
+        charges: Vec<Charge>,
+        expected_op_id: Option<&str>,
         mut clock: impl FnMut() -> i64,
     ) -> Result<Reservation, BudgetRefusal> {
-        if !self.owner_control_enabled {
-            return Err(BudgetRefusal::NoGrant);
-        }
-        let mut inner = self.lock();
+        if !self.owner_control_enabled { return Err(BudgetRefusal::NoGrant); }
         let now = clock();
         let fingerprint = inner.identity_fingerprint.clone();
         let current_epoch = inner
@@ -1723,6 +1745,7 @@ impl PairingService {
             return Err(BudgetRefusal::NoGrant);
         }
         let Some(idx) = inner.file.grants.iter().position(|g| {
+            if expected_op_id.is_some_and(|op_id| g.op_id != op_id) { return false; }
             g.client_id == client_id
                 && g.epoch == epoch
                 && g.identity_fingerprint == fingerprint
@@ -1773,6 +1796,8 @@ impl PairingService {
     }
 
     /// Issue the owner's one-time first-contact confirmation for `recipient`.
+    /// The caller must authenticate the independent owner; paired HTTP callers
+    /// cannot reach this operation. `grant_op_id` binds the reviewed budget.
     ///
     /// Only for a client holding a live budget grant, and only within it: the
     /// amount must fit the grant's per-call maximum, what is left of the
@@ -1789,7 +1814,7 @@ impl PairingService {
     pub fn grant_first_contact(
         &self,
         client_id: &str,
-        epoch: u64,
+        grant_op_id: &str,
         recipient: &str,
         max_total_msat: u64,
         contact_budget_msat: Option<u64>,
@@ -1812,22 +1837,12 @@ impl PairingService {
         let mut inner = self.lock();
         let now = chrono::Utc::now().timestamp();
         let fingerprint = inner.identity_fingerprint.clone();
-        if !inner
-            .file
-            .clients
-            .iter()
-            .any(|c| c.client_id == client_id && c.epoch == epoch)
-        {
-            return Err(BudgetRefusal::NoGrant);
-        }
         let Some(grant) = inner.file.grants.iter().find(|g| {
-            g.client_id == client_id
-                && g.epoch == epoch
-                && g.identity_fingerprint == fingerprint
-                && g.is_live(now)
-        }) else {
-            return Err(BudgetRefusal::NoGrant);
-        };
+            g.client_id == client_id && g.op_id == grant_op_id
+                && g.identity_fingerprint == fingerprint && g.is_live(now)
+                && inner.file.clients.iter().any(|c| c.client_id == client_id && c.epoch == g.epoch)
+        }) else { return Err(BudgetRefusal::NoGrant); };
+        let epoch = grant.epoch;
         let budget = grant.budget.as_ref().ok_or(BudgetRefusal::NoGrant)?;
         if max_total_msat > budget.per_call_max_msat {
             return Err(BudgetRefusal::PerCall {
@@ -1958,40 +1973,59 @@ impl PairingService {
         parent: &Reservation,
         recipient: &str,
         amount_msat: u64,
+        call_reserved_msat: u64,
     ) -> Result<Reservation, BudgetRefusal> {
         let recipient = crate::spend_budget::canonical_recipient(recipient)
             .ok_or(BudgetRefusal::NoGrant)?;
-        let epoch = {
-            let mut inner = self.lock();
-            let (epoch, confirmed) =
-                Self::readmission_basis(&inner, parent, &recipient, chrono::Utc::now().timestamp())?;
-            if let Some(max_msat) = confirmed {
-                // Single use, whatever happens next (fail closed).
-                inner.first_contact.remove(&parent.client_id);
-                if amount_msat > max_msat {
-                    return Err(BudgetRefusal::FirstContact(format!(
-                        "the recipient asks {amount_msat} msat to admit you again, more than the \
-                         {max_msat} msat you confirmed — nothing was paid"
-                    )));
-                }
+        let mut inner = self.lock();
+        let (epoch, confirmed) =
+            Self::readmission_basis(&inner, parent, &recipient, chrono::Utc::now().timestamp())?;
+        let budget = inner.file.grants.iter().find(|g| g.op_id == parent.op_id)
+            .and_then(|g| g.budget.as_ref()).ok_or(BudgetRefusal::NoGrant)?;
+        // A resolved parent cannot start more payments. This also binds the
+        // admission to a recipient in the original API call.
+        if !budget.pending.get(&parent.id).is_some_and(|p| p.contains_key(&recipient)) {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        let max_msat = budget.per_call_max_msat;
+        let total = call_reserved_msat.checked_add(amount_msat)
+            .ok_or(BudgetRefusal::PerCall { max_msat })?;
+        if total > max_msat { return Err(BudgetRefusal::PerCall { max_msat }); }
+        if let Some(max_msat) = confirmed {
+            inner.first_contact.remove(&parent.client_id);
+            if amount_msat > max_msat {
+                return Err(BudgetRefusal::FirstContact(format!(
+                    "the recipient asks {amount_msat} msat to admit you again, more than the {max_msat} msat you confirmed — nothing was paid"
+                )));
             }
-            epoch
-        };
-        self.reserve_spend(
-            &parent.client_id,
-            epoch,
-            vec![Charge {
-                recipient,
-                amount_msat,
-            }],
-        )
+        }
+        // Eligibility and reservation share the replacement/revocation mutex.
+        self.reserve_spend_locked(&mut inner, &parent.client_id, epoch,
+            vec![Charge { recipient, amount_msat }], Some(&parent.op_id),
+            || chrono::Utc::now().timestamp())
+    }
+
+    /// Reserve a consumed approval against its exact original grant. The
+    /// opaque value is not cloneable and cannot be deserialized from a request.
+    pub fn reserve_first_contact(
+        &self,
+        approval: FirstContactAuthorization,
+        cap: Option<u64>,
+    ) -> Result<Reservation, BudgetRefusal> {
+        let amount_msat = cap.unwrap_or(approval.max_total_msat).min(approval.max_total_msat);
+        let mut inner = self.lock();
+        if approval.expires_at <= chrono::Utc::now().timestamp() { return Err(BudgetRefusal::NoGrant); }
+        self.reserve_spend_locked(&mut inner, &approval.client_id, approval.epoch,
+            vec![Charge { recipient: approval.recipient, amount_msat }],
+            Some(&approval.budget_op_id), || chrono::Utc::now().timestamp())
     }
 
     /// Consume this client's first-contact grant for `recipient`, returning
-    /// its amount. `None` when there is none, it is for someone else, it has
+    /// an opaque authorization bound to its original grant. `None` when absent,
+    /// for someone else, or when it has
     /// expired, or the budget grant it was issued under is no longer live
     /// (revoked, replaced, rotated). Single use: a match is removed.
-    pub fn take_first_contact(&self, client_id: &str, epoch: u64, recipient: &str) -> Option<u64> {
+    pub fn take_first_contact(&self, client_id: &str, epoch: u64, recipient: &str) -> Option<FirstContactAuthorization> {
         let recipient = crate::spend_budget::canonical_recipient(recipient)?;
         let mut inner = self.lock();
         let now = chrono::Utc::now().timestamp();
@@ -2013,7 +2047,11 @@ impl PairingService {
                 && g.is_live(now)
         });
         let taken = inner.first_contact.remove(client_id)?;
-        live.then_some(taken.grant.max_total_msat)
+        live.then_some(FirstContactAuthorization {
+            max_total_msat: taken.grant.max_total_msat, recipient,
+            client_id: client_id.to_owned(), epoch, budget_op_id: taken.budget_op_id,
+            expires_at: taken.grant.expires_at,
+        })
     }
 
     /// Validate a persisted reservation and run one synchronous dispatch step
@@ -2045,6 +2083,12 @@ impl PairingService {
             return Err(BudgetRefusal::NoGrant);
         }
         Ok(action())
+    }
+
+    pub(crate) fn reservation_contact_budget(&self, reservation: &Reservation, recipient: &str) -> Option<u64> {
+        let inner = self.lock();
+        inner.file.grants.iter().find(|g| g.op_id == reservation.op_id && g.client_id == reservation.client_id)
+            .and_then(|g| g.budget.as_ref())?.per_recipient_msat.get(recipient).copied()
     }
 
     /// Resolve one recipient's part of a reservation to what was actually

@@ -2,7 +2,9 @@
 //!
 //! # What is deliberately absent
 //!
-//! There is no route here that writes a grant or consumes an approval. The app
+//! Budget elevation is not writable over HTTP. First-contact approval is an
+//! owner-authenticated exception bound to an already approved budget; paired
+//! tokens cannot invoke it. The app
 //! may **create a pending request** and **read its status**; that separation is
 //! the whole mechanism. Elevation is written only by the owner CLI over
 //! `<data_dir>/control.sock` (see [`crate::control`]), which is not reachable
@@ -29,7 +31,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::audit::events;
-use crate::auth::scoped::{Admin, Read, ScopedAuth};
+use crate::auth::scoped::{Admin, Read, ScopedAuth, Spend};
 use crate::auth::Scope;
 use crate::error::ApiError;
 use crate::pairing::{self, ElevationStatus, PairingError, PairingService};
@@ -483,6 +485,10 @@ async fn own_grant(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirstContactGrantBody {
+    /// Paired client for whom the owner approves this contact.
+    pub client_id: String,
+    /// Exact live budget grant the owner reviewed; replacement invalidates approval.
+    pub grant_op_id: String,
     /// The new contact's node id (64 hex).
     pub recipient: String,
     /// The most the first contact may cost: admission plus the first message,
@@ -495,27 +501,32 @@ pub struct FirstContactGrantBody {
     pub contact_budget_msat: Option<u64>,
 }
 
-/// `POST /api/v1/pair/first-contact-grant` — the owner's one-time OK, given in
-/// the app, to pay a first contact to exactly this recipient for at most this
+/// `POST /api/v1/pair/first-contact-grant` — owner-authenticated approval for
+/// a specific paired client and live budget, to contact this recipient for this
 /// amount. Needs a live budget grant and fits inside it; single use; expires
 /// after two minutes; memory only. The send then debits the budget grant once.
 /// A first contact without one is refused (`budget_exceeded`, reason
 /// `first_contact`). See `docs/SPEND_BUDGET_GRANTS.md`.
 async fn first_contact_grant(
-    auth: crate::metered::MeteredSpend,
+    auth: ScopedAuth<Spend>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<FirstContactGrantBody>,
 ) -> Result<Json<crate::spend_budget::FirstContactGrant>, ApiError> {
-    let grant = auth.grant_first_contact(
-        &state,
+    // ScopedAuth<Spend> rejects every paired token. Only the independent
+    // owner's credential can issue this approval; spend delegation cannot mint it.
+    let grant = service(&state)?.grant_first_contact(
+        &body.client_id,
+        &body.grant_op_id,
         &body.recipient,
         body.max_total_msat,
         body.contact_budget_msat,
-    )?;
+    ).map_err(ApiError::BudgetExceeded)?;
     state.audit_log.record(
         events::SPEND_FIRST_CONTACT_GRANTED,
         &auth.node_id,
         Some(serde_json::json!({
+            "client_id": body.client_id,
+            "grant_op_id": body.grant_op_id,
             "recipient": grant.recipient,
             "max_total_msat": grant.max_total_msat,
             "contact_budget_msat": body.contact_budget_msat,

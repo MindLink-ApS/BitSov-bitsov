@@ -39,9 +39,8 @@ async fn stranger(establish: bool) -> FirstContactFixture {
 /// The owner's one-time OK for this stranger (#85): without it a budget never
 /// pays a first contact, whatever the cap. Its own refusals (a cap the budget
 /// cannot cover) are left for the send to report.
-async fn confirm(fx: &Fx, token: &str, cap: u64) {
-    fx.call("POST", "/api/v1/pair/first-contact-grant",
-        Some(json!({"recipient": fx.peer.to_hex(), "max_total_msat": cap})), Some(token)).await;
+async fn confirm(fx: &Fx, _token: &str, cap: u64) {
+    fx.owner_confirm(&fx.peer.to_hex(), cap).await;
 }
 
 async fn send(fx: &Fx, token: &str, cap: u64) -> (StatusCode, Value) {

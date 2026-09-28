@@ -206,3 +206,9 @@ This does not prove LND/LDK routing, liquidity, fees, HTLC timing, a room with t
 remote recipients, or the live Tauri UI. A peer price table can remain unknown
 immediately after admission, and existing startup ratchet repair can delay
 readiness; the harness records both rather than claiming those are fixed.
+
+The first-contact approval endpoint requires the independent owner's credential,
+plus the target paired `client_id` and exact budget `grant_op_id`. Paired spend
+tokens can fetch quotes and send within approved terms, but cannot mint owner
+approval. Cached quotes remain chat-only and expire at the signed BOLT11 expiry,
+which may be earlier than the admission request deadline.

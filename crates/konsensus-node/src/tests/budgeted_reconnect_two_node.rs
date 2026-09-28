@@ -162,7 +162,7 @@ async fn start_sender(
     sessions: &Arc<SessionManager>,
     wallet: Arc<SharedMockProvider>,
     grant: Option<konsensus_api::spend_budget::GrantTerms>,
-    admission_failure: Option<bool>,
+    admission_failure: Option<AdmissionFailure>,
 ) -> Sender {
     let pairing = grant.map(|terms| paired_client(&dir.join("pairing"), identity, terms));
     let invoice_requests: InvoiceRequests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -170,7 +170,7 @@ async fn start_sender(
         identity: Arc::clone(identity),
         storage: storage().await,
         lightning: match admission_failure {
-            Some(unknown) => Arc::new(UnsettledAdmission { wallet: Arc::clone(&wallet), unknown }),
+            Some(failure) => Arc::new(UnsettledAdmission { wallet: Arc::clone(&wallet), failure, lost_response: std::sync::atomic::AtomicBool::new(false) }),
             None => Arc::clone(&wallet) as Arc<dyn LightningProvider>,
         },
         chain: Arc::new(konsensus_chain::mock::MockChainProvider::new()),
@@ -264,6 +264,19 @@ impl Sender {
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn owner_confirm(&self, mut body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let (_, client_id) = self.pairing.as_ref().unwrap();
+        body["client_id"] = serde_json::json!(client_id);
+        body["grant_op_id"] = serde_json::json!(self.grant().op_id);
+        let owner = konsensus_api::auth::create_token(&self.state.identity.node_id().to_hex(), &self.state.jwt_secret, konsensus_api::auth::Scope::all()).unwrap();
+        let response = self.router.clone().oneshot(Request::builder().method("POST")
+            .uri("/api/v1/pair/first-contact-grant").header("authorization", format!("Bearer {owner}"))
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
     }
 
     /// A paired sender confirms the message's price as its cap, as the app
@@ -441,7 +454,7 @@ async fn two_nodes_with_price(
 async fn two_nodes_with_outcome(
     grant: impl FnOnce(&NodeId) -> Option<konsensus_api::spend_budget::GrantTerms>,
     recipient_msat: u64,
-    admission_failure: Option<bool>,
+    admission_failure: Option<AdmissionFailure>,
 ) -> TwoNodes {
     let (alice, bob) = (identity(), identity());
     let grant = grant(bob.node_id());
@@ -634,8 +647,7 @@ async fn a_contact_without_a_budget_needs_the_one_time_confirmation_once() {
     assert_eq!(quote["total_msat"], 4_000, "{quote}");
     let (status, grant) = net
         .sender
-        .post(
-            "/api/v1/pair/first-contact-grant",
+        .owner_confirm(
             serde_json::json!({
                 "recipient": bob.to_hex(),
                 "max_total_msat": quote["total_msat"],
@@ -693,9 +705,13 @@ async fn fresh_quote_cannot_exceed_the_reserved_message_budget() {
 }
 
 
+#[derive(Clone, Copy)]
+enum AdmissionFailure { Failed, Unknown, SettledResponseLost }
+
 struct UnsettledAdmission {
     wallet: Arc<SharedMockProvider>,
-    unknown: bool,
+    failure: AdmissionFailure,
+    lost_response: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -709,7 +725,14 @@ impl LightningProvider for UnsettledAdmission {
         -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>
     {
         use konsensus_core::traits::lightning::{LightningError, PaymentDetails, PaymentStatus};
-        if self.unknown { return Err(LightningError::Connection("test: admission outcome unknown".into())); }
+        if matches!(self.failure, AdmissionFailure::SettledResponseLost) {
+            let paid = self.wallet.pay_invoice(bolt11).await?;
+            if !self.lost_response.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(LightningError::Connection("test: settled but response lost".into()));
+            }
+            return Ok(paid);
+        }
+        if matches!(self.failure, AdmissionFailure::Unknown) { return Err(LightningError::Connection("test: admission outcome unknown".into())); }
         let invoice: lightning_invoice::Bolt11Invoice = bolt11.parse().unwrap();
         Ok(PaymentDetails {
             payment_hash: invoice.payment_hash().to_string(), preimage: None,
@@ -728,7 +751,7 @@ impl LightningProvider for UnsettledAdmission {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_admission_releases_the_undispatched_message_reservation() {
-    let net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000, Some(false)).await;
+    let net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000, Some(AdmissionFailure::Failed)).await;
     let bob = net.bob_id;
     net.connect().await;
     let (status, body) = net.sender.compose(&bob, "admission failed").await;
@@ -742,7 +765,7 @@ async fn failed_admission_releases_the_undispatched_message_reservation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_admission_keeps_only_its_own_reservation() {
-    let net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000, Some(true)).await;
+    let net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000, Some(AdmissionFailure::Unknown)).await;
     let bob = net.bob_id;
     net.connect().await;
     let (status, body) = net.sender.compose(&bob, "admission unknown").await;
@@ -751,5 +774,38 @@ async fn unknown_admission_keeps_only_its_own_reservation() {
     assert_eq!(net.sender.grant().used_msat, 2_000, "only admission may have dispatched");
     assert!(net.sender.paid_out().await.is_empty());
     assert!(net.sender.state.data_dir.as_ref().unwrap().join("admission-attempts").join(bob.to_hex()).exists());
+    net.shutdown();
+}
+
+// The grant per-call limit covers admission plus the message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn regression_readmission_respects_aggregate_grant_per_call_limit() {
+    let net = two_nodes(|bob| Some(budget(bob, Some(50_000)).per_call(3_000))).await;
+    net.connect().await;
+    let (status, body) = net.sender.compose(&net.bob_id, "one call").await;
+    let paid: u64 = net.sender.paid_out().await.iter().sum();
+    println!("compose={status} {body}; total paid={paid}; grant used={}", net.sender.grant().used_msat);
+    net.shutdown();
+    assert!(paid <= 3_000, "one compose exceeded the grant per-call maximum: {paid}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn regression_recovered_admission_emits_one_n2_event() {
+    let net = two_nodes_with_outcome(|bob| Some(budget(bob, Some(50_000))), 2_000,
+        Some(AdmissionFailure::SettledResponseLost)).await;
+    net.connect().await;
+    let (status, body) = net.sender.compose(&net.bob_id, "lost response").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(net.sender.paid_out().await, vec![2_000]);
+    let (status, body) = net.sender.compose(&net.bob_id, "recover").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    wait_until("recipient promoted", || privileged_on(&net.transport_b, &net.alice_id)).await;
+    let events = net.sender.membrane(Code::Readmission);
+    assert_eq!(events.len(), 1, "a recovered settled admission must emit its N2 event");
+    assert_eq!(events[0].paid_msat, Some(2_000));
+    assert_eq!(events[0].cap_msat, Some(50_000));
+    let (status, body) = net.sender.compose(&net.bob_id, "already admitted").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(net.sender.membrane(Code::Readmission).len(), 1, "proof reuse must not duplicate settlement");
     net.shutdown();
 }

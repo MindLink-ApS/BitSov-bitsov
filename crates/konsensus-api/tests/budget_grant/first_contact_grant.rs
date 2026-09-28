@@ -94,15 +94,8 @@ impl Stranger {
         100_000 - self.sender_wallet.get_balance_msat().await.unwrap()
     }
 
-    async fn confirm(&self, token: &str, recipient: &NodeId, max_total_msat: u64) -> (StatusCode, Value) {
-        self.fx
-            .call(
-                "POST",
-                "/api/v1/pair/first-contact-grant",
-                Some(json!({"recipient": recipient.to_hex(), "max_total_msat": max_total_msat})),
-                Some(token),
-            )
-            .await
+    async fn confirm(&self, _token: &str, recipient: &NodeId, max_total_msat: u64) -> (StatusCode, Value) {
+        self.fx.owner_confirm(&recipient.to_hex(), max_total_msat).await
     }
 
     async fn send(&self, token: &str, cap: Option<u64>) -> (StatusCode, Value) {
@@ -194,15 +187,7 @@ async fn a_confirmation_must_fit_the_budget_grant() {
     let token = s.fx.grant(None, GrantTerms::new(1_000_000)).await;
     let (status, body) = s.confirm(&token, &s.peer, 100_001).await;
     assert_budget_exceeded(status, &body, "first_contact");
-    let (status, body) = s
-        .fx
-        .call(
-            "POST",
-            "/api/v1/pair/first-contact-grant",
-            Some(json!({"recipient": "not-a-node", "max_total_msat": 4000})),
-            Some(&token),
-        )
-        .await;
+    let (status, body) = s.fx.owner_confirm("not-a-node", 4000).await;
     assert_budget_exceeded(status, &body, "first_contact");
 }
 
@@ -210,12 +195,13 @@ async fn a_confirmation_must_fit_the_budget_grant() {
 async fn no_budget_grant_means_no_confirmation_and_no_quote() {
     let s = stranger(2000).await;
     let read = s.fx.token().await;
-    let (status, _) = s.confirm(&read, &s.peer, 4000).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "a read+receive client cannot even ask");
+    let (status, _) = s.fx.call("POST", "/api/v1/pair/first-contact-grant",
+        Some(json!({"recipient": s.peer.to_hex(), "max_total_msat": 4000})), Some(&read)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a paired client cannot mint owner approval");
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
     s.fx.service.revoke_grants(Some(&s.fx.client_id)).unwrap();
-    let (status, _) = s.confirm(&token, &s.peer, 4000).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "revoked: the token lost spend");
+    let (status, body) = s.confirm(&token, &s.peer, 4000).await;
+    assert_budget_exceeded(status, &body, "no_grant");
     assert_eq!(s.invoices.load(Ordering::SeqCst), 0);
 }
 
@@ -291,4 +277,77 @@ async fn admission_paid_then_no_session_keeps_exactly_the_admission_charged() {
     assert_eq!(body["amount_msat"], 2000);
     assert_eq!(s.spent().await, 2000, "only the admission left the wallet");
     assert_eq!(s.fx.used(), 2000, "resolved once: the paid admission stays charged, the rest is released");
+}
+
+// Regressions for authorization and signed quote boundaries.
+#[tokio::test(start_paused = true)]
+async fn regression_cached_chat_quote_does_not_pay_non_chat_first_contact() {
+    let uncached = stranger(2000).await;
+    let uncached_token = uncached.fx.grant(None, GrantTerms::new(10_000)).await;
+    assert_eq!(uncached.confirm(&uncached_token, &uncached.peer, 4000).await.0, StatusCode::OK);
+    let (status, body) = uncached.fx.call("POST", "/api/v1/messages/compose",
+        Some(json!({"recipient": uncached.peer.to_hex(), "kind": 200, "plaintext": "non-chat", "max_total_msat": 4000})),
+        Some(&uncached_token)).await;
+    println!("uncached control: {status} {body}; paid={}", uncached.spent().await);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(uncached.spent().await, 0);
+    let s = stranger(2000).await;
+    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
+    let (status, quote) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
+        Some(json!({"recipient": s.peer.to_hex()})), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{quote}");
+    assert_eq!(s.confirm(&token, &s.peer, 4000).await.0, StatusCode::OK);
+    let (status, body) = s.fx.call("POST", "/api/v1/messages/compose",
+        Some(json!({"recipient": s.peer.to_hex(), "kind": 200, "plaintext": "non-chat", "max_total_msat": 4000})),
+        Some(&token)).await;
+    println!("non-chat response: {status} {body}; paid={}", s.spent().await);
+    assert_eq!(s.spent().await, 0, "chat-only quote must not authorize a file-kind first contact");
+}
+
+#[tokio::test(start_paused = true)]
+async fn regression_advertised_expiry_does_not_outlive_signed_invoice() {
+    let s = stranger(2000).await;
+    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
+    let (status, quote) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
+        Some(json!({"recipient": s.peer.to_hex()})), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{quote}");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // This fixture issues a BOLT11 with a signed 55-second expiry.
+    let advertised = quote["expires_at"].as_u64().unwrap();
+    println!("advertised={advertised}; latest possible signed expiry={}", now + 55);
+    assert!(advertised <= now + 55, "advertised quote validity exceeds signed invoice expiry");
+}
+
+#[tokio::test(start_paused = true)]
+async fn regression_paired_budget_token_cannot_self_confirm_stranger() {
+    let s = stranger(2000).await;
+    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
+    // All remaining operations are ordinary paired-client HTTP requests.
+    // No owner terminal/control operation or owner proof is supplied.
+    let (status, confirmation) = s.fx.call("POST", "/api/v1/pair/first-contact-grant", Some(json!({
+        "client_id": s.fx.client_id,
+        "grant_op_id": s.fx.service.grant_view_for(&s.fx.client_id).unwrap().op_id,
+        "recipient": s.peer.to_hex(), "max_total_msat": 4000,
+    })), Some(&token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    println!("paired self-confirmation: {status} {confirmation}");
+    let (status, body) = s.send(&token, Some(4000)).await;
+    println!("paired send: {status} {body}; paid={}", s.spent().await);
+    assert_eq!(s.spent().await, 0, "paired program must not replace owner confirmation");
+}
+
+#[tokio::test]
+async fn regression_consumed_confirmation_cannot_move_to_replacement_grant() {
+    let s = stranger(2000).await;
+    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
+    assert_eq!(s.confirm(&token, &s.peer, 4000).await.0, StatusCode::OK);
+    let approval = s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()).unwrap();
+    let original = s.fx.service.grant_view_for(&s.fx.client_id).unwrap().op_id;
+    // Exact interleaving: consumption under A, replacement by B, then debit.
+    s.fx.grant(None, GrantTerms::new(10_000)).await;
+    assert_ne!(s.fx.service.grant_view_for(&s.fx.client_id).unwrap().op_id, original);
+    let debit = s.fx.service.reserve_first_contact(approval, None);
+    assert_eq!(debit, Err(BudgetRefusal::NoGrant));
+    assert_eq!(s.fx.used(), 0);
+    assert_eq!(s.spent().await, 0);
 }

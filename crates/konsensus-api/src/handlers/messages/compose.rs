@@ -480,9 +480,6 @@ async fn readmit_then_pay(
         }
         if attempt.settled_msat > 0 {
             readmission.paid_msat.fetch_add(attempt.settled_msat, std::sync::atomic::Ordering::Relaxed);
-            state.audit_log.membrane().readmission_paid(
-                peer_id, attempt.settled_msat, debit.contact_budget(&peer_key),
-            );
         }
         charge.readmission_msat = charge.readmission_msat.saturating_add(attempt.settled_msat);
         charge.include_attempt(attempt);
@@ -922,6 +919,7 @@ enum AdmissionRecord {
 /// Methods take `now` explicitly so TTL behaviour is unit-testable.
 #[derive(Debug, Default)]
 struct AdmissionLedger {
+    readmissions: std::collections::HashMap<NodeId, super::admission_journal::ReadmissionSettlement>,
     quotes: std::collections::HashMap<NodeId, (u16, u64)>,
     entries: std::collections::HashMap<NodeId, AdmissionRecord>,
 }
@@ -1103,6 +1101,7 @@ impl AdmissionLedger {
             }
         });
         self.quotes.retain(|peer, _| self.entries.contains_key(peer));
+        self.readmissions.retain(|peer, _| self.entries.contains_key(peer));
     }
 }
 
@@ -1278,6 +1277,24 @@ async fn await_admission_settlement(
     }
 }
 
+/// Called under the per-peer admission lock for both immediate and recovered
+/// settlement. The notification belongs to the original attempt, not the
+/// retrying client's grant. The journal marker prevents proof replay duplicates.
+fn report_readmission_settlement(state: &AppState, peer: &NodeId, amount_msat: u64) -> Result<(), ApiError> {
+    let mut journal = super::admission_journal::load(state, peer)?;
+    let event = journal.as_ref().and_then(|a| a.readmission.clone())
+        .or_else(|| lock_admission_ledger().readmissions.get(peer).cloned());
+    let Some(mut event) = event.filter(|e| !e.reported) else { return Ok(()); };
+    event.reported = true;
+    if let Some(attempt) = &mut journal {
+        attempt.readmission = Some(event.clone());
+        super::admission_journal::save(state, peer, attempt)?;
+    }
+    lock_admission_ledger().readmissions.insert(*peer, event.clone());
+    state.audit_log.membrane().readmission_paid(peer, amount_msat, event.budget_msat);
+    Ok(())
+}
+
 /// Record a settled admission, build its signed proof envelope, attach it to the
 /// ledger, and deliver it. The settlement is recorded before proof construction
 /// so any malformed-preimage/backend-contract error still suppresses re-pay.
@@ -1286,6 +1303,7 @@ async fn deliver_settled_admission(
     peer_id: &NodeId,
     settled: PaymentDetails,
 ) -> Result<(), ApiError> {
+    report_readmission_settlement(state, peer_id, settled.amount_msat)?;
     lock_admission_ledger().record_settled(*peer_id, Instant::now());
     if let Some(since) = state.transport.connected_since(peer_id).await {
         state.transport.mark_admission_paid(peer_id, since).await;
@@ -1332,6 +1350,8 @@ async fn deliver_settled_admission(
     lock_admission_ledger().attach_envelope(peer_id, envelope.clone());
     let previous = super::admission_journal::load(state, peer_id)?;
     super::admission_journal::save(state, peer_id, &super::admission_journal::Attempt {
+        readmission: previous.as_ref().and_then(|a| a.readmission.clone())
+            .or_else(|| lock_admission_ledger().readmissions.get(peer_id).cloned()),
         original_reservation: previous.as_ref().and_then(|a| a.original_reservation.clone()),
         message_may_have_dispatched: previous.as_ref().is_some_and(|a| a.message_may_have_dispatched),
         payment_hash: settled.payment_hash.clone(), amount_msat: settled.amount_msat,
@@ -1621,11 +1641,12 @@ async fn validate_admission_invoice(
     // See docs/v2/F1-CAPPED-FIRST-CONTACT.md; never debit only the message.
     // The target is authoritative for BOTH prices. A stale local price cannot
     // spuriously reject a stranger or cause an additional unchecked payment.
+    let expires_at_unix = invoice.expires_at().ok_or_else(|| ApiError::Lightning("admission invoice expiry overflow".into()))?.as_secs();
     Ok(AdmissionQuote {
         invoice,
         admission_msat,
         message_price,
-        expires_at_unix: attempt_expiry.unwrap_or(0),
+        expires_at_unix,
     })
 }
 
@@ -1768,7 +1789,10 @@ async fn reconcile_admission_budget(
     if details.payment_hash != attempt.payment_hash || details.amount_msat != attempt.amount_msat
         || details.direction != PaymentDirection::Outgoing { return Ok(()); }
     let actual = match details.status {
-        PaymentStatus::Settled => attempt.amount_msat,
+        PaymentStatus::Settled => {
+            report_readmission_settlement(state, peer, attempt.amount_msat)?;
+            attempt.amount_msat
+        },
         PaymentStatus::Failed | PaymentStatus::Expired => 0,
         _ => return Ok(()),
     };
@@ -1833,6 +1857,10 @@ async fn first_contact_admission(
     debit: &Debit,
     readmit: Option<&mut Readmit<'_>>,
 ) -> Result<(), ApiError> {
+    // The stateless quote signs a chat price, including when cached or recovered.
+    if kind != konsensus_core::kind::KIND_CHAT {
+        return Err(ApiError::BadRequest("first contact must be a chat message".into()));
+    }
     // 0b. Idempotence guard (now race-free under the per-peer lock): if we
     //     already SETTLED an admission payment to this peer within the TTL, do
     //     not pay again — re-send the proof envelope (best-effort) and let the
@@ -1966,6 +1994,7 @@ async fn first_contact_admission(
             }
         }
         PriorAdmission::SettledWithProof(envelope) => {
+            report_readmission_settlement(state, peer_id, envelope.payment_proof.amount_msat)?;
             charge.prior_settled_msat = envelope.payment_proof.amount_msat;
             // Re-deliver the already-paid proof. If the target already consumed
             // this payment hash (envelope arrived the first time), its replay
@@ -2063,6 +2092,9 @@ async fn first_contact_admission(
     // A re-admission reserves exactly the quoted admission against the grant
     // (a paired caller) before anything is dispatched; the owner's key is not
     // metered. A refusal here leaves nothing requested on our wallet or paid.
+    let readmission_event = readmit.as_ref().map(|r| super::admission_journal::ReadmissionSettlement {
+        budget_msat: r.parent.contact_budget(&peer_id.to_hex()), reported: false,
+    });
     let debit: &Debit = match readmit {
         Some(r) => r.reserved.insert(r.parent.readmission(&peer_id.to_hex(), admission_msat)?),
         None => debit,
@@ -2086,6 +2118,7 @@ async fn first_contact_admission(
             settled_at_unix: None,
             original_reservation: debit.reservation(),
             message_may_have_dispatched: false,
+            readmission: readmission_event.clone(),
         },
     )?;
     lock_admission_ledger()
@@ -2097,6 +2130,11 @@ async fn first_contact_admission(
         admission_msat,
         Instant::now(),
     );
+    if let Some(event) = readmission_event {
+        lock_admission_ledger().readmissions.insert(*peer_id, event);
+    } else {
+        lock_admission_ledger().readmissions.remove(peer_id);
+    }
     reservation.committed = true;
     charge.reserved_msat = admission_msat;
 
@@ -2563,10 +2601,9 @@ pub(super) async fn compose_message(
         // confirmation for exactly this recipient (a first-contact grant,
         // consumed here), which bounds the cap. The owner's own key is not
         // metered (the #80 caps still apply).
-        if first_contact {
-            if let Some(confirmed) = auth.take_first_contact(&state, &peer_id.to_hex())? {
-                cap = Some(cap.map_or(confirmed, |asked| asked.min(confirmed)));
-            }
+        let confirmation = if first_contact { auth.take_first_contact(&state, &peer_id.to_hex())? } else { None };
+        if let Some(confirmed) = &confirmation {
+            cap = Some(cap.map_or(confirmed.max_total_msat, |asked| asked.min(confirmed.max_total_msat)));
         }
         if !first_contact {
             super::caps::check(price_msat, cap)?;
@@ -2576,13 +2613,15 @@ pub(super) async fn compose_message(
 
         // Reject budget limits before advancing the ratchet or requesting an invoice.
         let peer_key = peer_id.to_hex();
-        let debit = auth.debit(
+        let debit = if let Some(approval) = confirmation {
+            auth.debit_first_contact(&state, approval, cap)?
+        } else { auth.debit(
             &state,
             vec![Charge {
                 recipient: peer_key.clone(),
                 amount_msat: if first_contact { cap.unwrap_or(ADMISSION_MAX_MSAT) } else { price_msat },
             }],
-        )?;
+        )? };
         let result = async {
 
         // Encrypt via Double Ratchet.
