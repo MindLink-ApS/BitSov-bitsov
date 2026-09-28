@@ -309,3 +309,91 @@ async fn cancel_in_flight_fee_timeout_does_not_leave_startup_work() {
     assert_eq!(server.requests.load(Ordering::SeqCst), 2);
     assert_eq!(server.background_requests.load(Ordering::SeqCst), 0);
 }
+
+/// Exercise recovery across the *exhausted* startup boundary, including real
+/// mainnet genesis wallet synchronization. All HTTP and all funds are local/empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_boot_recovers_after_sync_without_duplicate_ldk_tasks() {
+    use std::sync::{atomic::AtomicBool, Mutex};
+    use konsensus_lightning::RecoveringLightning;
+    let fees_live = Arc::new(AtomicBool::new(false));
+    let chain_live = Arc::new(AtomicBool::new(false));
+    let fee_flag = fees_live.clone();
+    let chain_flag = chain_live.clone();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
+    let hash = genesis.block_hash().to_string();
+    let header = hex::encode(bitcoin::consensus::serialize(&genesis.header));
+    let app = Router::new().fallback(move |uri: axum::http::Uri| {
+        let fees = fee_flag.load(Ordering::SeqCst);
+        let chain = chain_flag.load(Ordering::SeqCst);
+        let hash = hash.clone();
+        let header = header.clone();
+        async move {
+            let path = uri.path();
+            if path == "/fee-estimates" {
+                return if fees { (StatusCode::OK, "{\"1\":10.0,\"6\":5.0,\"144\":2.0}".into()) }
+                    else { (StatusCode::BAD_GATEWAY, "offline".into()) };
+            }
+            if !chain { return (StatusCode::BAD_GATEWAY, "offline".into()); }
+            let body = if path == "/blocks/tip/hash" || path == "/block-height/0" { hash }
+                else if path == "/blocks/tip/height" { "0".into() }
+                else if path.ends_with("/header") { header }
+                else if path.starts_with("/scripthash/") { "[]".into() }
+                else if path.ends_with("/status") { "{\"in_best_chain\":true,\"height\":0,\"next_best\":null}".into() }
+                else if path == "/blocks" || path == "/blocks/0" { format!("[{{\"id\":\"{hash}\",\"height\":0,\"version\":1,\"timestamp\":1231006505,\"tx_count\":1,\"size\":285,\"weight\":1140,\"merkle_root\":\"{}\",\"previousblockhash\":null,\"mediantime\":1231006505,\"nonce\":2083236893,\"bits\":486604799,\"difficulty\":1.0}}]", "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b") }
+                else { return (StatusCode::NOT_FOUND, format!("unsupported fixture path: {path}")); };
+            (StatusCode::OK, body)
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(&dir, &url);
+    let store = cfg.storage_dir.clone();
+    let started = Arc::new(Mutex::new(Vec::<Arc<LdkProvider>>::new()));
+    let providers = started.clone();
+    let provider = RecoveringLightning::new(move || {
+        let cfg = cfg.clone();
+        let providers = providers.clone();
+        async move {
+            let p = Arc::new(LdkProvider::new(cfg).await?);
+            providers.lock().unwrap().push(p.clone());
+            Ok(p as Arc<dyn LightningProvider>)
+        }
+    }, Default::default()).await.unwrap();
+    assert!(!provider.money_ready().await);
+    assert_eq!(provider.readiness().await.state, "offline");
+    assert!(matches!(provider.pay_invoice("unused").await, Err(LightningError::NotReady)));
+    assert!(matches!(provider.create_invoice(1000, "offline", 60).await, Err(LightningError::NotReady)));
+    assert!(matches!(provider.keysend("unused", 1000, None).await, Err(LightningError::NotReady)));
+    assert!(matches!(provider.open_channel("unused", "unused", 1000, false, None).await, Err(LightningError::NotReady)));
+    assert!(matches!(provider.close_channel("unused", false).await, Err(LightningError::NotReady)));
+    fees_live.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while started.lock().unwrap().is_empty() { tokio::time::sleep(Duration::from_millis(50)).await; }
+    }).await.unwrap();
+    assert!(!provider.money_ready().await, "fees alone must not enable money");
+    chain_live.store(true, Ordering::SeqCst);
+    let backend = started.lock().unwrap()[0].clone();
+    tokio::task::spawn_blocking(move || backend.node().sync_wallets()).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !provider.money_ready().await { tokio::time::sleep(Duration::from_millis(50)).await; }
+    }).await.unwrap();
+    let invoice = provider.create_invoice(1000, "recovered", 60).await.unwrap();
+    assert!(!invoice.bolt11.is_empty());
+    for _ in 0..100 { assert!(provider.readiness().await.money_ready); }
+    assert_eq!(started.lock().unwrap().len(), 1, "one backend successfully started");
+    let log = std::fs::read_to_string(store.join("ldk_node.log")).unwrap();
+    assert_eq!(log.matches("Startup complete.").count(), 1);
+    let identities: Vec<_> = log.lines().filter_map(|line| line.split("Starting up LDK Node with node ID ").nth(1))
+        .map(|rest| rest.split_whitespace().next().unwrap()).collect();
+    assert!(identities.len() >= 6);
+    assert!(identities.iter().all(|id| *id == identities[0]), "retry changed Lightning identity");
+    let states: Vec<_> = provider.readiness().await.events.into_iter().map(|e| e.state).collect();
+    assert_eq!(states, ["offline", "retrying", "synchronizing", "ready"]);
+    provider.shutdown().await.unwrap();
+    assert!(!provider.money_ready().await);
+    provider.shutdown().await.unwrap();
+    server.abort();
+}

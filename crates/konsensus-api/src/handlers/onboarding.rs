@@ -188,6 +188,7 @@ async fn start_onboarding(
             let required = req
                 .funding_amount_sats
                 .ok_or_else(|| ApiError::BadRequest("funding_amount_sats required for full tier".into()))?;
+            crate::error::require_money_ready(&state).await?;
             let funding_address = state
                 .lightning
                 .get_funding_address()
