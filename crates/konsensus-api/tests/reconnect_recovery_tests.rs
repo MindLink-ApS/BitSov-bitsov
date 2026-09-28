@@ -506,8 +506,8 @@ async fn fourteen_minute_admission_resend_renews_same_paid_envelope() {
     assert!(renewed.timestamp > old.timestamp);
     let mut expected = old.clone(); expected.timestamp = renewed.timestamp; expected.signature = renewed.signature;
     assert_eq!(renewed, expected);
-    assert_eq!(db.get_message(&old.id).await.unwrap().unwrap(), renewed);
-    assert_eq!(db.count_pending_deliveries().await.unwrap(), 1);
+    assert!(db.get_message(&old.id).await.unwrap().is_none(), "admission must not appear as outgoing chat");
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(journal.join(peer.to_hex())).unwrap()).unwrap();
     assert_eq!(serde_json::from_value::<UkmEnvelope>(saved["envelope"].clone()).unwrap(), renewed);
     let recipient_db = SqliteStorage::in_memory().await.unwrap();

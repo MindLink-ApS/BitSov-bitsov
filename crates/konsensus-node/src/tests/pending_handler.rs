@@ -454,3 +454,28 @@ async fn six_minute_queue_and_eleven_failures_preserve_paid_identity_until_ack()
     assert!(db.acknowledge_pending(&env.id, bob.node_id(), alice.node_id()).await.unwrap());
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn generic_flusher_never_sends_legacy_admission_after_sixteen_minute_flap() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let alice = make_identity("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+    let bob = make_identity("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
+    let proof = PaymentProof::new(Sha256::digest([4; 32]).into(), [4; 32], 1000);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let mut old = UkmEnvelopeBuilder::new(konsensus_core::kind::KIND_CHAT, *alice.node_id(),
+        Recipient::Node(*bob.node_id()), b"konsensus:admission:v1".to_vec(), proof)
+        .timestamp(now - 960_000).build();
+    old.signature = Signature::from_ed25519(&alice.sign(&old.signable_bytes()));
+    // A database left by the pre-rework #103 can still contain this row.
+    db.store_message(&old).await.unwrap();
+    db.prepare_delivery(&old.id, bob.node_id()).await.unwrap();
+    let transport = MockTransport::new();
+    let dir = tempfile::tempdir().unwrap(); let audit = make_audit(&dir);
+    let timestamps = tokio::sync::Mutex::new(HashMap::new());
+    for periodic in [false, true] {
+        flush_peer(bob.node_id(), &db, &transport, &audit, &timestamps, &alice, periodic).await;
+    }
+    assert_eq!(transport.send_count.load(Ordering::SeqCst), 0, "only the generation-bound journal path can send admission");
+    assert!(db.get_pending_for_peer(bob.node_id()).await.unwrap().is_empty());
+    assert!(db.get_message(&old.id).await.unwrap().is_none(), "legacy marker must not be visible as chat");
+}

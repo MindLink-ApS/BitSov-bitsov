@@ -426,6 +426,7 @@ impl PostgresStorage {
                 "#,
             ),
             (20, "pending_delivery_state", "ALTER TABLE pending_deliveries ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'; ALTER TABLE pending_deliveries ADD COLUMN dispatched INTEGER NOT NULL DEFAULT 0; UPDATE pending_deliveries SET dispatched = 1;"),
+            (21, "paid_delivery_rejections", include_str!("../migrations/021_paid_delivery_rejections.sql")),
         ]
     }
 
@@ -617,7 +618,7 @@ const SESSIONS_SELECT: &str = "SELECT peer_id FROM sessions ORDER BY updated_at 
 /// here means a node with queued mail to more than the cap of distinct peers never
 /// flushes the overflow recipients on reconnect, a Principle-2 fail-open. Guarded by
 /// code symmetry with SQLite plus the `dbh2_guard` test below.
-const PENDING_PEERS_SELECT: &str = "SELECT DISTINCT recipient_id FROM pending_deliveries";
+const PENDING_PEERS_SELECT: &str = "SELECT DISTINCT recipient_id FROM pending_deliveries WHERE state != 'failed_paid'";
 
 /// Room-membership query for the Postgres backend. Returns ALL members of a room —
 /// deliberately **no `LIMIT`** (DBH2), mirroring SQLite. The room message fan-out
@@ -641,7 +642,7 @@ const ROOM_MEMBERS_SELECT: &str =
 /// peer.
 const PENDING_FOR_PEER_SELECT: &str =
     "SELECT message_id, attempts FROM pending_deliveries \
-     WHERE recipient_id = $1 ORDER BY queued_at ASC";
+     WHERE recipient_id = $1 AND state != 'failed_paid' AND retry_after_ms <= CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) ORDER BY queued_at ASC";
 
 /// `list_invites_issued` — AUTHORITY. Duplicate-pending-invite gate and
 /// acceptance lookup; must be complete.
@@ -779,21 +780,42 @@ impl Storage for PostgresStorage {
         let mut tx = self.pool.begin().await?;
         let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
             .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
-        if receipt.rows_affected() == 0 {
-            // Receipt alone is insufficient: legacy failures and relay controls
-            // can have consumed keys without ever storing a message.
+        let healing = receipt.rows_affected() == 0;
+        if healing {
+            // Serialize legacy healers on the receipt binding (SQLite already
+            // holds the writer lock from the INSERT above).
+            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = $1 FOR UPDATE")
+                .bind(&ph).fetch_one(&mut *tx).await?;
+            if binding.0 != id || binding.1 != sender {
+                tx.rollback().await?;
+                return Ok(PaymentReused);
+            }
             let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = $1 AND r.message_id = $2 AND r.sender = $3 AND m.sender = r.sender AND m.kind = $4 AND m.recipient_type = $5 AND m.recipient_id = $6 AND m.payment_hash = r.payment_hash AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10")
                 .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
                 .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
                 .fetch_one(&mut *tx).await?;
-            tx.rollback().await?;
-            return Ok(if matched == 1 { AlreadyAccepted } else { PaymentReused });
+            if matched == 1 {
+                tx.rollback().await?;
+                return Ok(AlreadyAccepted);
+            }
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = $1")
+                .bind(&id).fetch_one(&mut *tx).await?;
+            if exists != 0 || binding.2 != 0 {
+                tx.rollback().await?;
+                return Ok(PaymentReused);
+            }
+            // Full gate validation precedes this transaction. The receipt
+            // binds this paid identity; repair only its missing message row.
         }
         let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES ($1, $2) ON CONFLICT DO NOTHING")
             .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
         if inserted.rows_affected() == 0 {
-            tx.rollback().await?;
-            return Ok(NonceReused);
+            let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = $1")
+                .bind(&nonce).fetch_one(&mut *tx).await?;
+            if !healing || owner != sender {
+                tx.rollback().await?;
+                return Ok(NonceReused);
+            }
         }
         sqlx::query(
             "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
@@ -816,6 +838,8 @@ impl Storage for PostgresStorage {
         .execute(&mut *tx)
         .await?;
 
+        sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE payment_hash = $1")
+            .bind(&ph).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(Accepted)
     }
@@ -831,16 +855,25 @@ impl Storage for PostgresStorage {
     }
 
     async fn mark_pending_sent(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
-        sqlx::query("UPDATE pending_deliveries SET dispatched = 1 WHERE message_id = $1 AND recipient_id = $2").bind(id.to_hex()).bind(peer.to_hex()).execute(&self.pool).await?;
+        let changed = sqlx::query("UPDATE pending_deliveries SET dispatched = 1, retry_after_ms = 0 WHERE message_id = $1 AND recipient_id = $2 AND state != 'failed_paid' AND retry_after_ms <= CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)")
+            .bind(id.to_hex()).bind(peer.to_hex()).execute(&self.pool).await?.rows_affected();
+        if changed != 1 { return Err(StorageError::Conversion("delivery is not eligible for dispatch".into())); }
         Ok(())
     }
 
     async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
-        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = $1 AND p.recipient_id = $2 AND p.dispatched = 1 AND m.sender = $3)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).fetch_one(&self.pool).await?)
+        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = $1 AND p.recipient_id = $2 AND p.dispatched = 1 AND p.state != 'failed_paid' AND m.sender = $3)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).fetch_one(&self.pool).await?)
+    }
+
+    async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {
+        Ok(sqlx::query("UPDATE pending_deliveries SET state = $1, rejection_reason = $2, retry_after_ms = CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) + LEAST(3600000, 60000 * (1 << LEAST(attempts, 6))), attempts = attempts + 1 WHERE message_id = $3 AND recipient_id = $4 AND dispatched = 1 AND state != 'failed_paid' AND retry_after_ms = 0 AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = $5)")
+            .bind(if terminal { "failed_paid" } else { "pending" }).bind(reason)
+            .bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+            .execute(&self.pool).await?.rows_affected() == 1)
     }
 
     async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
-        Ok(sqlx::query("DELETE FROM pending_deliveries WHERE message_id = $1 AND recipient_id = $2 AND dispatched = 1 AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = $3)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+        Ok(sqlx::query("DELETE FROM pending_deliveries WHERE message_id = $1 AND recipient_id = $2 AND dispatched = 1 AND state != 'failed_paid' AND EXISTS (SELECT 1 FROM messages WHERE id = pending_deliveries.message_id AND sender = $3)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
             .execute(&self.pool).await?.rows_affected() == 1)
     }
 
@@ -1479,7 +1512,7 @@ impl Storage for PostgresStorage {
 
         sqlx::query(
             "UPDATE pending_deliveries SET attempts = attempts + 1 \
-             WHERE message_id = $1 AND recipient_id = $2",
+             WHERE message_id = $1 AND recipient_id = $2 AND state != 'failed_paid'",
         )
         .bind(&mid)
         .bind(&rid)
@@ -1529,7 +1562,7 @@ impl Storage for PostgresStorage {
 
     async fn cleanup_stale_pending(&self, max_attempts: u32) -> Result<u64, StorageError> {
         let result = sqlx::query(
-            "UPDATE pending_deliveries SET state = 'stalled' WHERE attempts >= $1 AND state != 'stalled'",
+            "UPDATE pending_deliveries SET state = 'stalled' WHERE attempts >= $1 AND state = 'pending'",
         )
         .bind(max_attempts as i64)
         .execute(&self.pool)

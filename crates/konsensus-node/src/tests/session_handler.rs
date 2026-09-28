@@ -1875,6 +1875,7 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
 #[tokio::test]
 async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weights() {
     use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    let mut limits = DeliveryConfirmationBudget::default();
     let own = make_peer_id(61); let peer = make_peer_id(62); let impostor = make_peer_id(63);
     let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let storage: Arc<dyn Storage> = db.clone();
@@ -1888,27 +1889,113 @@ async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weig
     db.store_message(&env).await.unwrap();
     db.queue_pending_delivery(&env.id, &peer).await.unwrap();
     for rejection in [None, Some("storage error"), Some("replay detected: nonce already used")] {
-        handle_delivery_confirmation(&peer, &env.id, rejection, false, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+        handle_delivery_confirmation(&peer, &env.id, rejection, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
     }
     assert!(updates.try_recv().is_err(), "unsent ids are not delivery receipts");
     db.mark_pending_sent(&env.id, &peer).await.unwrap();
-    handle_delivery_confirmation(&impostor, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit).await;
-    handle_delivery_confirmation(&peer, &konsensus_core::MessageId::from_bytes([9; 32]), None, false, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    handle_delivery_confirmation(&impostor, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+    handle_delivery_confirmation(&peer, &konsensus_core::MessageId::from_bytes([9; 32]), None, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
     assert!(updates.try_recv().is_err());
-    handle_delivery_confirmation(&peer, &env.id, Some("storage error"), false, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    handle_delivery_confirmation(&peer, &env.id, Some("storage error"), false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
     assert_eq!(updates.try_recv().unwrap().status, "rejected");
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 1);
-    handle_delivery_confirmation(&peer, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    handle_delivery_confirmation(&peer, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
-    handle_delivery_confirmation(&peer, &env.id, None, true, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    handle_delivery_confirmation(&peer, &env.id, None, true, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
     assert!(updates.try_recv().is_err(), "duplicate ACK cannot update weights or emit twice");
     assert!(routing.get_peer_weight(&peer).await.is_none());
     // Explicit compatibility mapping consumes only an own, dispatched row.
     db.prepare_delivery(&env.id, &peer).await.unwrap();
-    handle_delivery_confirmation(&peer, &env.id, Some("replay detected: nonce already used"), true, &own, &storage, &timestamps, &routing, &ws, &audit).await;
+    handle_delivery_confirmation(&peer, &env.id, Some("replay detected: nonce already used"), true, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
     assert!(routing.get_peer_weight(&peer).await.is_none());
     assert!(std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap().contains("acked_legacy"));
+}
+
+#[tokio::test]
+async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    for reason in ["payment proof already used: hash", "insufficient payment: required 2000 msat, got 1000 msat",
+        "recipient mismatch: envelope addressed to a, this node is b", "invalid signature: bad signature", "storage error", "lightning verification failed: offline"] {
+        let mut limits = DeliveryConfirmationBudget::default();
+    let own = make_peer_id(61); let peer = make_peer_id(62);
+        let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+        let storage: Arc<dyn Storage> = db.clone();
+        let routing = konsensus_routing::RoutingTable::new(Default::default());
+        let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (ws, mut updates) = broadcast::channel(16);
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+        let env = UkmEnvelopeBuilder::new(0, own, Recipient::Node(peer), vec![1],
+            PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000)).build();
+        db.store_message(&env).await.unwrap();
+        db.prepare_delivery(&env.id, &peer).await.unwrap();
+        handle_delivery_confirmation(&peer, &env.id, Some(reason), false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+        let terminal = !matches!(reason, "storage error" | "lightning verification failed: offline");
+        assert_eq!(updates.try_recv().unwrap().status, if terminal { "failed_paid" } else { "rejected" });
+        assert!(db.get_pending_for_peer(&peer).await.unwrap().is_empty(), "no immediate resend: {reason}");
+        let (state, attempts): (String, i64) = sqlx::query_as("SELECT state, attempts FROM pending_deliveries").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(state, if terminal { "failed_paid" } else { "pending" });
+        assert_eq!(attempts, 1);
+        assert!(db.mark_pending_sent(&env.id, &peer).await.is_err(), "stale flusher snapshot cannot bypass rejection");
+        handle_delivery_confirmation(&peer, &env.id, Some(reason), false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+        assert!(updates.try_recv().is_err(), "one rejection per dispatch");
+        if terminal {
+            db.cleanup_stale_pending(1).await.unwrap();
+            assert!(db.get_pending_for_peer(&peer).await.unwrap().is_empty());
+            assert!(!db.acknowledge_pending(&env.id, &peer, &own).await.unwrap(), "terminal state cannot regress");
+        } else {
+            let retry: i64 = sqlx::query_scalar("SELECT retry_after_ms FROM pending_deliveries").fetch_one(db.pool()).await.unwrap();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+            assert!(retry > now + 50_000);
+            sqlx::query("UPDATE pending_deliveries SET retry_after_ms = 1").execute(db.pool()).await.unwrap();
+            assert_eq!(db.get_pending_for_peer(&peer).await.unwrap().len(), 1);
+            db.mark_pending_sent(&env.id, &peer).await.unwrap();
+            handle_delivery_confirmation(&peer, &env.id, Some(reason), false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+            let retry: i64 = sqlx::query_scalar("SELECT retry_after_ms FROM pending_deliveries").fetch_one(db.pool()).await.unwrap();
+            assert!(retry > now + 110_000, "successive transient rejects increase the delay");
+        }
+        assert!(db.get_message(&env.id).await.unwrap().is_some());
+        assert!(routing.get_peer_weight(&peer).await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn unpaid_confirmation_flood_is_bounded_before_storage_even_across_peer_churn() {
+    let mut limits = DeliveryConfirmationBudget::default();
+    let own = make_peer_id(61); let peer = make_peer_id(62);
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    let env = konsensus_core::UkmEnvelopeBuilder::new(0, own, konsensus_core::Recipient::Node(peer), vec![1],
+        konsensus_core::PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000)).build();
+    db.store_message(&env).await.unwrap();
+    db.prepare_delivery(&env.id, &peer).await.unwrap();
+    let routing = konsensus_routing::RoutingTable::new(Default::default());
+    let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+    let (ws, mut updates) = broadcast::channel(16);
+    let dir = tempfile::tempdir().unwrap();
+    let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+    // Both unknown ACKs and rejects consume the shared per-peer allowance.
+    for n in 0..32 {
+        handle_delivery_confirmation(&peer, &konsensus_core::MessageId::from_bytes([9; 32]),
+            if n % 2 == 0 { None } else { Some("storage error") }, false,
+            &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+    }
+    handle_delivery_confirmation(&peer, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 1, "exhausted peer cannot reach the ACK DELETE");
+    assert!(updates.try_recv().is_err());
+    let now = tokio::time::Instant::now();
+    let allowed = (0..1000).filter(|n| {
+        let mut bytes = [0; 32]; bytes[..4].copy_from_slice(&(*n as u32).to_le_bytes());
+        limits.allow(&NodeId::from_bytes(bytes), false, now)
+    }).count();
+    assert_eq!(allowed, 96, "peer churn cannot exceed the global 128/s budget");
+    assert!(limits.peers.len() <= 128, "attacker identities cannot grow memory without bound");
+    assert!(limits.allow(&peer, true, now), "privileged confirmations remain available");
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    handle_delivery_confirmation(&peer, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
+    assert_eq!(updates.try_recv().unwrap().status, "delivered");
 }

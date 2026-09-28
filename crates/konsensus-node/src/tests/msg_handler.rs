@@ -1114,6 +1114,15 @@ async fn membrane_observes_unpaid_insufficient_stale_and_first_contact_decisions
 /// commit. A failed commit and a lost ACK must never consume a second payment.
 #[tokio::test]
 async fn paid_acceptance_storage_retry_and_lost_ack_are_idempotent() {
+    paid_acceptance_retry_case(false).await;
+}
+
+#[tokio::test]
+async fn legacy_limbo_heals_only_after_signature_and_settlement_gate() {
+    paid_acceptance_retry_case(true).await;
+}
+
+async fn paid_acceptance_retry_case(legacy: bool) {
     use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
     use std::time::Duration;
     let dir = tempfile::tempdir().unwrap();
@@ -1159,12 +1168,25 @@ async fn paid_acceptance_storage_retry_and_lost_ack_are_idempotent() {
     }));
     source.connect(bob.node_id(), &target.listen_addr().unwrap().to_string()).await.unwrap();
     assert!(matches!(source.recv_control().await.unwrap(), ControlEvent::PeerConnected { privileged: false, .. }));
+    if legacy {
+        db.store_payment_receipt(&env.payment_proof.payment_hash, &env.sender, &env.id).await.unwrap();
+        db.store_nonce(&env.nonce, &env.sender).await.unwrap();
+        let mut forged = env.clone(); forged.signature = Signature::from_bytes([0; 64]);
+        source.send(bob.node_id(), &forged).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while audit.membrane().read(None, 100).0.first().is_none_or(|e| e.code != konsensus_api::membrane::Code::BadSignature) {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(db.get_message(&env.id).await.unwrap().is_none());
+        assert!(!target.connected_privileged_peers().await.contains(alice.node_id()));
+    }
     sqlx::query("CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
         .execute(db.pool()).await.unwrap();
     source.send(bob.node_id(), &env).await.unwrap();
     let rejected = tokio::time::timeout(Duration::from_secs(5), source.recv_control()).await.unwrap().unwrap();
     assert!(matches!(rejected, ControlEvent::MessageRejected { reason, .. } if reason == "storage error"));
-    assert!(!db.has_nonce(&env.nonce).await.unwrap());
+    assert_eq!(db.has_nonce(&env.nonce).await.unwrap(), legacy);
     assert_eq!(audit.membrane().read(None, 100).1.admitted, 0);
     assert!(!target.connected_privileged_peers().await.contains(alice.node_id()));
     sqlx::query("DROP TRIGGER fail_message").execute(db.pool()).await.unwrap();

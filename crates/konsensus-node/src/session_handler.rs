@@ -162,6 +162,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
+    let mut delivery_budget = DeliveryConfirmationBudget::default();
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
@@ -252,11 +253,11 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::MessageAcked { peer_id, message_id, privileged, .. } => {
                         handle_delivery_confirmation(&peer_id, &message_id, None, privileged,
-                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log).await;
+                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget).await;
                     }
                     ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
                         handle_delivery_confirmation(&peer_id, &message_id, Some(&reason), privileged,
-                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log).await;
+                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget).await;
                     }
 
                     ControlEvent::PriceTableReceived { peer_id, prices, block_height, valid_blocks, trust_discount, privileged } => {
@@ -757,7 +758,13 @@ async fn heal_connected_e2ee_sessions(
     // This mirrors the `PeerConnected` withholding above (line ~166); without it,
     // the periodic self-heal would re-offer the prekey to every connected peer
     // regardless of privilege, leaking free X3DH to an unpaid peer.
-    let connected_peers = transport.connected_privileged_peers().await;
+    //
+    // BUG-PSI: this includes a payee whose admission WE settled on the live
+    // connection (`connected_session_peers`, never `connected_privileged_peers`,
+    // which stays strictly privileged for security callers). Offering it our
+    // prekey is part of the act we bought, and it is how the session forms when
+    // the payee is the X3DH initiator.
+    let connected_peers = transport.connected_session_peers().await;
     for peer_id in connected_peers {
         if !e2ee_needs_self_heal(session_manager, &peer_id).await {
             continue;
@@ -800,6 +807,40 @@ async fn send_prekey_offer(
         .map_err(|e| e.to_string())
 }
 
+/// Wire reasons are the gate's stable Display prefixes; unknown reasons stay
+/// retryable so older peers and temporary gate failures cannot burn delivery.
+fn terminal_paid_rejection(reason: &str) -> bool {
+    ["payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:"]
+        .iter().any(|prefix| reason.starts_with(prefix))
+}
+
+/// Bound storage work before looking up an unprivileged confirmation. A
+/// process-wide window caps identity churn; per-peer windows survive reconnects.
+/// Only budgeted frames allocate entries, so the map has at most 128 keys.
+#[derive(Default)]
+struct DeliveryConfirmationBudget {
+    window: Option<tokio::time::Instant>,
+    used: u32,
+    peers: std::collections::HashMap<NodeId, u32>,
+}
+
+impl DeliveryConfirmationBudget {
+    fn allow(&mut self, peer: &NodeId, privileged: bool, now: tokio::time::Instant) -> bool {
+        if privileged { return true; }
+        if self.window.is_none_or(|start| now.duration_since(start) >= std::time::Duration::from_secs(1)) {
+            self.window = Some(now);
+            self.used = 0;
+            self.peers.clear();
+        }
+        if self.used >= 128 { return false; }
+        let used = self.peers.entry(*peer).or_default();
+        if *used >= 32 { return false; }
+        *used += 1;
+        self.used += 1;
+        true
+    }
+}
+
 /// Delivery confirmations cannot grant admission or mutate unrelated deliveries.
 #[allow(clippy::too_many_arguments)]
 async fn handle_delivery_confirmation(
@@ -808,7 +849,12 @@ async fn handle_delivery_confirmation(
     timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::MessageId, std::time::Instant>>,
     routing: &konsensus_routing::RoutingTable, ws: &broadcast::Sender<Arc<WsDeliveryStatus>>,
     audit: &konsensus_api::audit::AuditLog,
+    budget: &mut DeliveryConfirmationBudget,
 ) {
+    if !budget.allow(peer, privileged, tokio::time::Instant::now()) {
+        audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
+        return;
+    }
     let legacy = rejection == Some("replay detected: nonce already used");
     if rejection.is_none() || legacy {
         // One atomic DELETE is the idempotency boundary for repeated/racing ACKs.
@@ -818,9 +864,11 @@ async fn handle_delivery_confirmation(
         }
         handle_message_acked(peer, id, timestamps, storage, routing, ws, privileged && !legacy).await;
     } else {
-        if !matches!(storage.is_pending_dispatched(id, peer, own_id).await, Ok(true)) { return; }
-        // A transient rejection keeps the paid envelope available for retry.
-        handle_message_rejected(peer, id, rejection.unwrap_or_default(), routing, ws, privileged).await;
+        let reason = rejection.unwrap_or_default();
+        let terminal = terminal_paid_rejection(reason);
+        if !matches!(storage.reject_pending(id, peer, own_id, reason, terminal).await, Ok(true)) { return; }
+        timestamps.lock().await.remove(id);
+        handle_message_rejected(peer, id, reason, routing, ws, privileged).await;
     }
 }
 
@@ -892,7 +940,7 @@ async fn handle_message_rejected(
         WsDeliveryStatus {
             event_type: "delivery_status",
             message_id: message_id.to_hex(),
-            status: "rejected".to_string(),
+            status: if terminal_paid_rejection(reason) { "failed_paid" } else { "rejected" }.to_string(),
             reason: Some(reason.to_string()),
         },
     )) {
@@ -1619,3 +1667,7 @@ mod reconnect_two_node;
 #[cfg(test)]
 #[path = "tests/budgeted_reconnect_two_node.rs"]
 mod budgeted_reconnect_two_node;
+
+#[cfg(test)]
+#[path = "tests/paid_first_contact_two_node.rs"]
+mod paid_first_contact_two_node;

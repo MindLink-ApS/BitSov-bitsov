@@ -116,6 +116,19 @@ async fn flush_peer(
             }
         };
 
+        // Pre-rework slice-one databases may contain admission sentinels.
+        // They belong exclusively to the generation-bound admission journal;
+        // never renew/send one on this generic reconnect path.
+        if envelope.sender == *identity.node_id()
+            && envelope.kind == konsensus_core::kind::KIND_CHAT
+            && envelope.ciphertext == b"konsensus:admission:v1"
+        {
+            if let Err(e) = storage.delete_message(message_id).await {
+                warn!(error = %e, "cannot remove legacy admission outbox entry");
+            }
+            continue;
+        }
+
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
         match envelope.refresh_for_resend(identity, now_ms) {

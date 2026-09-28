@@ -49,6 +49,12 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("is_pending_dispatched".into()))
     }
 
+    /// Record one rejection per dispatch, retaining the paid envelope. Terminal
+    /// failures never retry; transient failures back off durably (60s to 1h).
+    async fn reject_pending(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId, _reason: &str, _terminal: bool) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("reject_pending".into()))
+    }
+
     /// Atomically consume a dispatched outbox entry bound to our identity and peer.
     async fn acknowledge_pending(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("acknowledge_pending".into()))
