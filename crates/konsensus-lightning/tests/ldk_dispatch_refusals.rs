@@ -35,3 +35,22 @@ async fn real_ldk_route_refusals_are_not_dispatched_and_preserve_capability() {
     node.stop().unwrap();
     fees.assert_async().await;
 }
+
+#[tokio::test]
+async fn onchain_preflight_refusals_are_typed_before_the_wallet_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::new();
+    builder.set_network(bitcoin::Network::Regtest);
+    builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+    builder.set_entropy_seed_bytes([43; 64]);
+    builder.set_listening_addresses(vec![]).unwrap();
+    let node = Arc::new(builder.build().unwrap());
+    let address = node.onchain_payment().new_address().unwrap().to_string();
+    let provider = LdkProvider::from_node(node);
+    assert!(matches!(provider.send_onchain("invalid address", 1000, None).await,
+        Err(LightningError::PaymentNotDispatched(_))));
+    for rate in [0.0, 0.5, f32::NAN, f32::INFINITY, 10001.0] {
+        assert!(matches!(provider.send_onchain(&address, 1000, Some(rate)).await,
+            Err(LightningError::PaymentNotDispatched(_))), "rate={rate}");
+    }
+}

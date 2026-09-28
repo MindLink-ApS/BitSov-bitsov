@@ -314,7 +314,7 @@ async fn lost_admission_response_never_pays_twice_but_explicit_non_dispatch_can_
             let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/v1/messages/compose")
                 .header("authorization",format!("Bearer {token}")).header("content-type","application/json")
                 .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"retry","max_total_msat":14000}).to_string())).unwrap()).await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(response.status(), if attempt == 0 && !lose_response { StatusCode::BAD_REQUEST } else { StatusCode::BAD_GATEWAY });
             let bytes = axum::body::to_bytes(response.into_body(), 16384)
                 .await
                 .unwrap();
@@ -327,14 +327,13 @@ async fn lost_admission_response_never_pays_twice_but_explicit_non_dispatch_can_
                         .exists(),
                     lose_response
                 );
-                assert!(
-                    error["error"].as_str().unwrap().contains(if lose_response {
-                        "unknown"
-                    } else {
-                        "not dispatched"
-                    }),
-                    "{error}"
-                );
+                if lose_response {
+                    assert_ne!(error["code"], "not_dispatched");
+                    assert!(error["error"].as_str().unwrap().contains("unknown"), "{error}");
+                } else {
+                    assert_eq!(error["code"], "not_dispatched");
+                    assert_eq!(error["error"], "local rejection");
+                }
             } else {
                 assert_eq!(error["code"], "payment_settled_send_incomplete", "{error}");
                 assert_eq!(error["amount_msat"], if lose_response { 0 } else { 2000 });
