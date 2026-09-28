@@ -683,9 +683,7 @@ mod startup_tests {
         let config = NodeConfig::default_for_tier(NodeTier::Full, phrase, dir.path());
         let path = dir.path().join("konsensus.toml");
         config.save(&path).unwrap();
-        let err = prepare_start(&path)
-            .err()
-            .expect("markerless identity must refuse");
+        let err = prepare_start(&path).expect_err("markerless identity must refuse");
         assert!(err.to_string().contains("refusing to start"));
         assert!(!DataDirLayout::new(dir.path()).marker().exists());
     }

@@ -37,18 +37,6 @@ pub fn first_contact_total(admission: u64, message: u64, cap: Option<u64>) -> Re
     Ok(total)
 }
 
-#[cfg(test)]
-mod first_contact_tests {
-    use super::*;
-    #[test]
-    fn admission_and_message_share_one_cap() {
-        assert_eq!(first_contact_total(2000, 2000, Some(4000)).unwrap(), 4000);
-        assert!(matches!(first_contact_total(2000, 2000, Some(3999)), Err(ApiError::PriceCapExceeded(_))));
-        assert!(first_contact_total(u64::MAX, 1, None).is_err());
-        assert_eq!(first_contact_total(2000, 0, Some(2000)).unwrap(), 2000);
-    }
-}
-
 /// Snapshot principal plus the policy-approved routing fee before any dispatch.
 pub fn all_in(state: &crate::state::AppState, principal: u64, caller: Option<u64>) -> Result<u64, ApiError> {
     let fee = state.lightning.routing_fee_policy().ceiling(principal, caller);
@@ -61,4 +49,16 @@ pub fn check_payment(state: &crate::state::AppState, principal: u64, caller: Opt
         return Err(ApiError::PriceCapExceeded(format!("required {total} msat including max_routing_fee_msat={fee} exceeds the confirmed cap")).with_routing_fee(fee));
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod first_contact_tests {
+    use super::*;
+    #[test]
+    fn admission_and_message_share_one_cap() {
+        assert_eq!(first_contact_total(2000, 2000, Some(4000)).unwrap(), 4000);
+        assert!(matches!(first_contact_total(2000, 2000, Some(3999)), Err(ApiError::PriceCapExceeded(_))));
+        assert!(first_contact_total(u64::MAX, 1, None).is_err());
+        assert_eq!(first_contact_total(2000, 0, Some(2000)).unwrap(), 2000);
+    }
 }

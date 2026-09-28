@@ -133,6 +133,104 @@ async fn pair_and_token(
 }
 
 #[tokio::test]
+async fn live_pairing_flows_never_mint_admin() {
+    // POST /peers grants a live connection privilege. Pairing must never
+    // confer the Admin scope that authorizes it, even with an owner grant.
+    assert!(!pairing::grantable_scopes().contains(&Scope::Admin));
+    assert_eq!(pairing::grantable_scopes(), &[Scope::Spend]);
+
+    for owner_control in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, service, console) = state_with_pairing(tmp.path(), owner_control);
+        let app = test_router(state.clone());
+        let key = SigningKey::from_bytes(&[22u8; 32]);
+        let (client_id, token) = pair_and_token(&app, &service, &key).await;
+        let claims = konsensus_api::auth::validate_token(&token, &state.jwt_secret).unwrap();
+        assert!(!claims.scp.contains(&Scope::Admin));
+        assert_eq!(claims.scp, vec![Scope::Read, Scope::Receive]);
+
+        for scopes in [vec!["admin"], vec!["spend", "admin"]] {
+            let (status, _) = post(
+                &app,
+                "/api/v1/pair/elevation-request",
+                serde_json::json!({"scopes": scopes}),
+                Some(&token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        assert!(service.reload_from_disk().unwrap().grants.is_empty());
+
+        let mut tokens = vec![token];
+        if owner_control {
+            // Positive control: a real owner-approved Spend grant works,
+            // but it must not confer Admin as a side effect.
+            let op = service
+                .create_elevation_request(&client_id, vec![Scope::Spend])
+                .unwrap();
+            service
+                .grant_elevation(
+                    &op.op_id,
+                    &console.confirmation(&pairing::grant_confirmation_phrase(&op)),
+                    konsensus_api::spend_budget::GrantTerms::new(100_000),
+                )
+                .unwrap();
+            let challenge = service.issue_token_challenge(&client_id).unwrap();
+            let (status, json) = post(
+                &app,
+                "/api/v1/pair/token",
+                serde_json::json!({
+                    "client_id": client_id,
+                    "challenge": challenge,
+                    "signature": hex::encode(key.sign(challenge.as_bytes()).to_bytes())
+                }),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let token = json["token"].as_str().unwrap().to_string();
+            let claims = konsensus_api::auth::validate_token(&token, &state.jwt_secret).unwrap();
+            assert!(claims.scp.contains(&Scope::Spend));
+            assert!(!claims.scp.contains(&Scope::Admin));
+            tokens.push(token);
+        }
+
+        for token in tokens {
+            let (status, _) = post(
+                &app,
+                "/api/v1/peers",
+                serde_json::json!({"node_id": "ab".repeat(32), "addr": "127.0.0.1:9735"}),
+                Some(&token),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_pairing_never_mints_admin() {
+    use konsensus_api::bootstrap::{build_bootstrap_router, BootstrapState, DataDirLayout};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let service = Arc::new(
+        PairingService::open(tmp.path(), String::new(), false)
+            .unwrap()
+            .without_stdout_code(),
+    );
+    let state = Arc::new(BootstrapState::new(
+        DataDirLayout::new(tmp.path()),
+        service.clone(),
+    ));
+    let app = build_bootstrap_router(state.clone());
+    let key = SigningKey::from_bytes(&[23u8; 32]);
+    let (_, token) = pair_and_token(&app, &service, &key).await;
+    let claims = konsensus_api::auth::validate_token(&token, &state.jwt_secret).unwrap();
+    assert!(!claims.scp.contains(&Scope::Admin));
+    assert_eq!(claims.scp, vec![Scope::Read, Scope::Receive, Scope::Identity]);
+}
+
+#[tokio::test]
 async fn ceremony_pairs_and_issues_a_bound_token() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, service, _console) = state_with_pairing(tmp.path(), false);

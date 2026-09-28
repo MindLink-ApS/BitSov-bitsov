@@ -38,7 +38,7 @@ cargo build --release -p konsensus-node
 `konsensus init` writes `konsensus.toml` into the selected node data directory.
 
 Key settings:
-- **Lightning backend**: LNbits (production) or Mock (development)
+- **Lightning backend**: LDK (embedded) or LND (direct REST) for production; Mock for development. LNbits cannot enforce per-payment routing-fee ceilings: fee-limited payments fail closed, and selecting LNbits is rejected at configuration/startup (see [all-in fee caps](docs/v2/ALL-IN-FEE-CAPS.md)).
 - **Storage**: SQLite (single node) or PostgreSQL (production)
 - **Pricing**: Per-message-kind sat costs
 - **Peers**: Opt-in peers. Node IDs are the protocol identity; network addresses are reachability hints obtained out-of-band.
@@ -66,7 +66,7 @@ BitSov's public protocol/core export is a Rust workspace with 13 crates (interna
 | `konsensus-core` | Types, traits, identity, UKM envelope, payment gate |
 | `konsensus-crypto` | X3DH key agreement, Double Ratchet E2EE, Sender Keys |
 | `konsensus-message` | Noise_XX transport, wire protocol, P2P mesh |
-| `konsensus-lightning` | LightningProvider trait + LNbits implementation |
+| `konsensus-lightning` | LDK/LND providers, development mocks, and a legacy LNbits adapter (no fee-limited payments) |
 | `konsensus-chain` | Bitcoin chain provider + Esplora implementation |
 | `konsensus-pricing` | Static and chain-aware pricing engines |
 | `konsensus-storage` | SQLite/PostgreSQL with optional at-rest encryption |
