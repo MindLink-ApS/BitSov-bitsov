@@ -310,6 +310,15 @@ impl Fx {
         }
     }
 
+    async fn owner_confirm(&self, recipient: &str, max_total_msat: u64) -> (StatusCode, Value) {
+        let owner = konsensus_api::auth::create_token(&self.state.identity.node_id().to_hex(), &self.state.jwt_secret, Scope::all()).unwrap();
+        let op_id = self.service.grant_view_for(&self.client_id).map(|g| g.op_id).unwrap_or_default();
+        self.call("POST", "/api/v1/pair/first-contact-grant", Some(json!({
+            "client_id": self.client_id, "grant_op_id": op_id,
+            "recipient": recipient, "max_total_msat": max_total_msat,
+        })), Some(&owner)).await
+    }
+
     /// A paired token, freshly issued (so it carries whatever grant is live).
     async fn token(&self) -> String {
         let challenge = self.service.issue_token_challenge(&self.client_id).unwrap();
@@ -823,7 +832,8 @@ async fn first_contact_admission_is_not_paid_from_a_budget() {
             Some(&token),
         )
         .await;
-    assert_budget_exceeded(status, &body, "unpriced");
+    // #85: without the owner's one-time confirmation, before anything else.
+    assert_budget_exceeded(status, &body, "first_contact");
     assert_eq!(fx.wallet.money(), 0);
     assert!(fx.state.invoice_requests.lock().await.is_empty());
 }
@@ -1266,6 +1276,8 @@ mod first_contact;
 
 #[path = "budget_grant/sponsor.rs"]
 mod sponsor;
+#[path = "budget_grant/first_contact_grant.rs"]
+mod first_contact_grant;
 
 #[tokio::test]
 async fn zero_charge_resolution_consumes_its_durable_reservation() {

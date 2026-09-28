@@ -179,6 +179,14 @@ unknown retry/restart, original-grant reconciliation, exactly-once resolution,
 paired staging, and N2 refusal events. The existing G1 cancellation, expiry,
 rotation, fanout and fallback tests run on the combined tree.
 
+**On top of that (#85):** the aggregate cap alone never lets a budget pay a
+stranger. A paired first contact also needs the owner's one-time first-contact
+grant for exactly that recipient, which bounds the cap
+(`docs/SPEND_BUDGET_GRANTS.md`, "First contact"). After a reconnect, a contact
+the grant budgets is admitted again from the budget without a prompt, at its
+signed quote and within its cap. Anyone else needs that one-time confirmation
+("Re-admission after a reconnect").
+
 ## Local proof and limits
 
 `bitsov-app` PR #46's `scripts/two-node-mock-harness.sh` uses two fresh local
@@ -198,3 +206,9 @@ This does not prove LND/LDK routing, liquidity, fees, HTLC timing, a room with t
 remote recipients, or the live Tauri UI. A peer price table can remain unknown
 immediately after admission, and existing startup ratchet repair can delay
 readiness; the harness records both rather than claiming those are fixed.
+
+The first-contact approval endpoint requires the independent owner's credential,
+plus the target paired `client_id` and exact budget `grant_op_id`. Paired spend
+tokens can fetch quotes and send within approved terms, but cannot mint owner
+approval. Cached quotes remain chat-only and expire at the signed BOLT11 expiry,
+which may be earlier than the admission request deadline.

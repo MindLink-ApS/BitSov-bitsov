@@ -43,6 +43,38 @@ use serde::{Deserialize, Serialize};
 /// Capability advertised on `/api/v1/status` once this node meters grants.
 pub const CAPABILITY: &str = "spend_budget_grant_v1";
 
+/// `GET /api/v1/status` advertises this when a paired client can pay a first
+/// contact through a one-time first-contact grant (see [`FirstContactGrant`]).
+pub const FIRST_CONTACT_CAPABILITY: &str = "first_contact_grant_v1";
+
+/// How long the owner's one-time first-contact confirmation stays usable.
+/// Long enough to send right after confirming, short enough that an
+/// unused confirmation does not linger as standing authority.
+pub const FIRST_CONTACT_GRANT_TTL_SECS: i64 = 120;
+
+/// Largest first contact (admission + first message) a grant may cover:
+/// F1's aggregate safety ceiling for first contact, 100 sats.
+pub const FIRST_CONTACT_MAX_MSAT: u64 = 100_000;
+
+/// The owner's one-time OK to pay a first contact to exactly one recipient,
+/// for at most `max_total_msat` (admission plus the first message).
+///
+/// First contact is never paid from a budget on its own: every new contact
+/// needs one of these, issued only while the client holds a live budget grant
+/// and only within that budget. It is single-use, expires after
+/// [`FIRST_CONTACT_GRANT_TTL_SECS`] (or with the budget grant, if sooner),
+/// lives in memory only and is never persisted, so a restart drops it.
+/// Paying it still debits the budget grant, once, for what actually settled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirstContactGrant {
+    /// Canonical recipient key (lowercase hex node id).
+    pub recipient: String,
+    /// Admission plus first message, msat.
+    pub max_total_msat: u64,
+    /// Absolute expiry, unix seconds.
+    pub expires_at: i64,
+}
+
 /// Longest a spend grant may live: 24 hours. Also the default.
 pub const MAX_SPEND_GRANT_TTL_SECS: i64 = 24 * 3600;
 
@@ -351,6 +383,10 @@ pub enum BudgetRefusal {
     /// The ledger could not be written; refusing is the only safe answer.
     #[error("the spend ledger could not be written: {0}")]
     Ledger(String),
+    /// A first contact without the owner's one-time confirmation for this
+    /// recipient (no live, matching first-contact grant).
+    #[error("{0}")]
+    FirstContact(String),
 }
 
 impl BudgetRefusal {
@@ -363,6 +399,7 @@ impl BudgetRefusal {
             BudgetRefusal::Recipient { .. } => "recipient",
             BudgetRefusal::Unpriced(_) => "unpriced",
             BudgetRefusal::Ledger(_) => "ledger",
+            BudgetRefusal::FirstContact(_) => "first_contact",
         }
     }
 }
