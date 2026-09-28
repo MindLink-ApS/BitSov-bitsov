@@ -447,9 +447,16 @@ impl<P: TypedValueParser> TypedValueParser for ApprovalValueParser<P> {
 }
 
 fn approval_string(value: &str) -> Result<String, String> {
-    if value.chars().any(char::is_control) || value.trim() != value {
+    // Unicode formatting controls are not covered by char::is_control().
+    if value.chars().any(|c| {
+        c.is_control()
+            || matches!(c,
+                '\u{061c}' | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+    }) || value.trim() != value
+    {
         return Err(
-            "approval values must not contain control characters or surrounding whitespace".into(),
+            "approval values must not contain control characters, bidi or invisible formatting controls, or surrounding whitespace".into(),
         );
     }
     Ok(value.to_owned())

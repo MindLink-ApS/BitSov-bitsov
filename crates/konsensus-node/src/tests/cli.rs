@@ -407,7 +407,12 @@ fn owner_approval_strings_reject_controls_and_surrounding_whitespace() {
             "konsensus.toml",
         ],
     ];
-    let controls = ('\u{0}'..='\u{1f}').chain('\u{7f}'..='\u{9f}');
+    let controls = ('\u{0}'..='\u{1f}')
+        .chain('\u{7f}'..='\u{9f}')
+        .chain(['\u{061c}', '\u{feff}'])
+        .chain('\u{200b}'..='\u{200f}')
+        .chain('\u{202a}'..='\u{202e}')
+        .chain('\u{2066}'..='\u{2069}');
     let characters: Vec<char> = controls
         .chain([' ', '\u{a0}', '\u{2003}', '\u{2028}', '\u{2029}'])
         .collect();
@@ -424,7 +429,7 @@ fn owner_approval_strings_reject_controls_and_surrounding_whitespace() {
                     format!("{character}{original}"),
                     format!("{original}{character}"),
                 ];
-                if character.is_control() {
+                if character.is_control() || !character.is_whitespace() {
                     values.push(format!("{}{character}{}", &original[..1], &original[1..]));
                 }
                 for value in values {
@@ -432,7 +437,7 @@ fn owner_approval_strings_reject_controls_and_surrounding_whitespace() {
                     args[index] = &value;
                     match Cli::try_parse_from(args) {
                         Ok(_) => accepted.push(format!("{} {flag} {value:?}", command[2])),
-                        Err(error) if character.is_control() => assert!(
+                        Err(error) if character.is_control() || !character.is_whitespace() => assert!(
                             !error.to_string().contains(&value),
                             "diagnostic echoed {} {flag} {value:?}",
                             command[2]

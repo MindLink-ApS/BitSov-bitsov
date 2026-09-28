@@ -125,11 +125,11 @@ async fn send(config_path: &Path, req: ControlRequest) -> Result<ControlResponse
     let socket = socket_path(config_path);
     control::send(&socket, &req).await.with_context(|| {
         format!(
-            "could not reach the owner control socket at {}.\n\
+            "could not reach the owner control socket at {:?}.\n\
              The node must be running and must have been started with `--owner-control`.\n\
              A packaged sidecar node does not create this socket: in that deployment the app \
              is a read+receive client and elevation is unavailable by design.",
-            socket.display()
+            socket
         )
     })
 }
@@ -1085,4 +1085,27 @@ pub async fn cmd_approve(command: crate::cli::ApprovalCommand) -> Result<()> {
     println!("{summary}");
     std::io::stdout().flush()?;
     report(send(&config, request).await?)
+}
+
+
+#[cfg(all(test, unix))]
+mod connection_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn socket_errors_escape_controls_even_without_approval_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        for control in ['\u{061c}', '\u{feff}', '\r', '\n', '\u{1b}'].into_iter()
+            .chain('\u{200b}'..='\u{200f}')
+            .chain('\u{202a}'..='\u{202e}')
+            .chain('\u{2066}'..='\u{2069}')
+        {
+            let config = dir.path().join(format!("missing{control}dir")).join("konsensus.toml");
+            let error = send(&config, ControlRequest::Status).await.unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("owner control socket"));
+            assert!(!diagnostic.contains(&format!("missing{control}dir")), "{diagnostic:?}");
+            assert!(diagnostic.contains(&control.escape_debug().to_string()), "{diagnostic:?}");
+        }
+    }
 }
