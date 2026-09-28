@@ -257,19 +257,30 @@ impl Debit {
         service.reservation_contact_budget(reservation, recipient)
     }
 
-    /// Reserve a re-admission to `recipient` of exactly `amount_msat` (the
-    /// recipient's signed quote) against the same grant, as its own debit.
-    /// Unmetered for the owner's own key.
-    pub(crate) fn readmission(&self, recipient: &str, amount_msat: u64) -> Result<Debit, ApiError> {
+    /// Raise the message reservation to `quoted_message_all_in` and reserve
+    /// `admission_all_in` before any re-admission payment. Refuses if the grant
+    /// cannot cover both; unmetered for the owner's own key.
+    pub(crate) fn reserve_quoted_readmission(
+        &self,
+        recipient: &str,
+        quoted_message_all_in: u64,
+        admission_all_in: u64,
+    ) -> Result<Debit, ApiError> {
         let Some((service, reservation)) = &self.held else {
             return Ok(Debit::unmetered().with_fee_limit(self.max_routing_fee_msat));
         };
         let mut call_total = self.call_reserved_msat.lock().unwrap_or_else(|e| e.into_inner());
-        let readmission = service
-            .reserve_readmission(reservation, recipient, amount_msat, *call_total)
+        let (new_total, admission) = service
+            .reserve_quoted_readmission(
+                reservation,
+                recipient,
+                quoted_message_all_in,
+                admission_all_in,
+                *call_total,
+            )
             .map_err(ApiError::BudgetExceeded)?;
-        *call_total += amount_msat; // checked against the grant limit under its ledger lock
-        Ok(Debit::reserved(Arc::clone(service), readmission).with_fee_limit(self.max_routing_fee_msat))
+        *call_total = new_total;
+        Ok(Debit::reserved(Arc::clone(service), admission).with_fee_limit(self.max_routing_fee_msat))
     }
 
     /// Reconciliation reference only; never restores dispatch authority.

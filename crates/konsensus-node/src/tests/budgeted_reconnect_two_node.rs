@@ -724,18 +724,21 @@ async fn failed_message_after_readmission_charges_admission_only_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fresh_quote_cannot_exceed_the_reserved_message_budget() {
+async fn fresh_quote_is_reserved_into_the_grant_before_admission_pay() {
+    // Sender prices locally at 2_000; recipient quotes admission=7_000 and
+    // message=7_000. Both must be reserved against the grant before any pay
+    // (Codex #111 finding 3) — previously admission paid then message refused.
     let net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000))), 7_000).await;
     let bob = net.bob_id;
     net.connect().await;
     let (status, body) = net.sender.compose(&bob, "higher recipient price").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(body["code"], "payment_settled_send_incomplete", "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["amount_msat"], 7_000, "{body}");
-    assert_eq!(net.sender.paid_out().await, vec![7_000], "only the separately reserved admission may be paid");
+    assert_eq!(body["readmission_msat"], 7_000, "{body}");
+    assert_eq!(net.sender.paid_out().await, vec![7_000, 7_000]);
     let grant = net.sender.grant();
-    assert_eq!(grant.used_msat, 7_000);
-    assert_eq!(grant.used_by_recipient.get(&bob.to_hex()), Some(&7_000));
+    assert_eq!(grant.used_msat, 14_000);
+    assert_eq!(grant.used_by_recipient.get(&bob.to_hex()), Some(&14_000));
     net.shutdown();
 }
 
@@ -971,4 +974,52 @@ async fn capped_paired_send_cannot_add_unquoted_reconnection_debit() {
     assert!(net.sender.paid_out().await.is_empty());
     assert_eq!(net.sender.grant().used_msat, 0);
     net.shutdown();
+}
+
+/// Codex #111 finding 3: a higher fresh message quote must fail the grant
+/// before any admission payment, not after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capped_reconnect_refuses_when_quoted_all_in_exceeds_grant_before_pay() {
+    // Sender prices locally at 2_000; recipient quotes admission=3_000 and
+    // message=3_000. Cap 6_000 fits the quote; grant per_call 5_000 does not.
+    let net = two_nodes_with_price(|bob| Some(budget(bob, Some(50_000)).per_call(5_000)), 3_000).await;
+    net.connect().await;
+    let (status, body) = net.sender.compose_capped(&net.bob_id, "higher quote", 6_000).await;
+    let paid = net.sender.paid_out().await;
+    net.shutdown();
+    assert!(
+        paid.is_empty(),
+        "quote all-in=6000 grant per_call=5000 must refuse before pay; paid={paid:?}, status={status}, body={body}"
+    );
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "budget_exceeded", "{body}");
+}
+
+/// Codex #111 finding 5: a quote obtained on a prior connection generation
+/// must not be paid after reconnect when the replacement refuses fresh quotes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capped_reconnect_rejects_quote_from_prior_connection_generation() {
+    let net = two_nodes(|_| None).await;
+    net.connect().await;
+    let (status, body) = net
+        .sender
+        .post(
+            "/api/v1/messages/first-contact/quote",
+            serde_json::json!({"recipient": net.bob_id.to_hex()}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    net.drop_and_reconnect().await;
+    net.refuse_admission_quote
+        .store(true, std::sync::atomic::Ordering::Release);
+    let (status, body) = net
+        .sender
+        .compose_capped(&net.bob_id, "stale generation", 4_000)
+        .await;
+    let paid = net.sender.paid_out().await;
+    net.shutdown();
+    assert!(
+        paid.is_empty(),
+        "no quote on current generation may be paid; paid={paid:?}, status={status}, body={body}"
+    );
 }
