@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use clap::builder::TypedValueParser;
 use clap::{Parser, Subcommand};
 
 /// BitSov v2 — sovereign mesh network node.
@@ -377,13 +378,13 @@ pub enum ApprovalCommand {
     /// Authorize one first contact within a live paired client's budget grant.
     FirstContact {
         /// Paired client id whose budget may pay this first contact.
-        #[arg(long)]
+        #[arg(long, value_parser = ApprovalValueParser(approval_string))]
         client: String,
         /// Exact current budget grant operation id.
-        #[arg(long)]
+        #[arg(long, value_parser = ApprovalValueParser(approval_string))]
         op: String,
         /// Recipient node key (64 hex characters).
-        #[arg(long)]
+        #[arg(long, value_parser = ApprovalValueParser(approval_string))]
         to: String,
         /// Maximum admission plus first-message cost, in millisatoshis.
         #[arg(long)]
@@ -392,19 +393,19 @@ pub enum ApprovalCommand {
         #[arg(long)]
         contact_budget_msat: Option<u64>,
         /// Config location selects the adjacent owner control socket.
-        #[arg(short, long, default_value = "konsensus.toml")]
+        #[arg(short, long, default_value = "konsensus.toml", value_parser = ApprovalValueParser(clap::builder::PathBufValueParser::new().try_map(approval_config)))]
         config: PathBuf,
     },
     /// Pay the exact frozen sponsor candidate after comparing its six-digit code.
     Gift {
         /// Introduction id of the frozen sponsor candidate.
-        #[arg(long)]
+        #[arg(long, value_parser = ApprovalValueParser(approval_string))]
         intro: String,
         /// Exact newcomer node key from that candidate.
-        #[arg(long)]
+        #[arg(long, value_parser = ApprovalValueParser(approval_string))]
         newcomer: String,
         /// Exact invoice payment hash from that candidate.
-        #[arg(long)]
+        #[arg(long, value_parser = ApprovalValueParser(approval_string))]
         hash: String,
         /// Exact gift amount from the candidate, in millisatoshis.
         #[arg(long)]
@@ -413,17 +414,63 @@ pub enum ApprovalCommand {
         #[arg(long)]
         fee_max_msat: u64,
         /// Six ASCII digits compared with the newcomer; preserve leading zeros.
-        #[arg(long, value_parser = approval_code)]
+        #[arg(long, value_parser = ApprovalValueParser(approval_code))]
         code: String,
         /// Config location selects the adjacent owner control socket.
-        #[arg(short, long, default_value = "konsensus.toml")]
+        #[arg(short, long, default_value = "konsensus.toml", value_parser = ApprovalValueParser(clap::builder::PathBufValueParser::new().try_map(approval_config)))]
         config: PathBuf,
     },
 }
 
+// Clap's function-parser adapter echoes the rejected input in its diagnostic.
+// Escape that context too, so rejecting a control character cannot print it.
+#[derive(Clone)]
+struct ApprovalValueParser<P>(P);
+
+impl<P: TypedValueParser> TypedValueParser for ApprovalValueParser<P> {
+    type Value = P::Value;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        self.0.parse_ref(cmd, arg, value).map_err(|mut error| {
+            error.insert(
+                clap::error::ContextKind::InvalidValue,
+                clap::error::ContextValue::String(format!("{value:?}")),
+            );
+            error
+        })
+    }
+}
+
+fn approval_string(value: &str) -> Result<String, String> {
+    // Unicode formatting controls are not covered by char::is_control().
+    if value.chars().any(|c| {
+        c.is_control()
+            || matches!(c,
+                '\u{061c}' | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+    }) || value.trim() != value
+    {
+        return Err(
+            "approval values must not contain control characters, bidi or invisible formatting controls, or surrounding whitespace".into(),
+        );
+    }
+    Ok(value.to_owned())
+}
+
+fn approval_config(value: PathBuf) -> Result<PathBuf, String> {
+    approval_string(&value.as_os_str().to_string_lossy())?;
+    Ok(value)
+}
+
 fn approval_code(value: &str) -> Result<String, String> {
+    let value = approval_string(value)?;
     if value.len() == 6 && value.bytes().all(|b| b.is_ascii_digit()) {
-        Ok(value.to_owned())
+        Ok(value)
     } else {
         Err("code must be exactly six ASCII digits".into())
     }

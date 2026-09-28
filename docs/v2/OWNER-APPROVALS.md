@@ -5,6 +5,15 @@ owner's terminal on the machine running the node. Each prints the complete
 approval tuple before submitting it and exits nonzero if the node refuses it.
 The explicit arguments are the approval: there is no additional yes/no prompt.
 
+Both commands reject control characters, Unicode bidi controls, and invisible
+formatting controls (U+061C, U+200B–U+200F, U+202A–U+202E, U+2066–U+2069, and
+U+FEFF) anywhere in string arguments, including in `--config`, and reject
+leading or trailing whitespace. Values are never
+silently trimmed. Summary strings are quoted and escaped (for example, a literal
+backslash is displayed as `\\`); the control socket receives the original values.
+Parse errors for these string/path fields also escape rejected values so they
+cannot alter terminal output. Socket connection errors quote and escape paths.
+
 Start the owner-managed node with its existing configuration:
 
 ```sh
