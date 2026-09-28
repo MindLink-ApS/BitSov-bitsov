@@ -36,7 +36,15 @@ async fn stranger(establish: bool) -> FirstContactFixture {
     (fx, sender, target, requests)
 }
 
+/// The owner's one-time OK for this stranger (#85): without it a budget never
+/// pays a first contact, whatever the cap. Its own refusals (a cap the budget
+/// cannot cover) are left for the send to report.
+async fn confirm(fx: &Fx, _token: &str, cap: u64) {
+    fx.owner_confirm(&fx.peer.to_hex(), cap).await;
+}
+
 async fn send(fx: &Fx, token: &str, cap: u64) -> (StatusCode, Value) {
+    confirm(fx, token, cap).await;
     fx.call("POST", "/api/v1/messages/compose", Some(json!({"recipient":fx.peer.to_hex(),"kind":0,"plaintext":"first contact","max_total_msat":cap})), Some(token)).await
 }
 
@@ -138,6 +146,7 @@ async fn revoking_grant_while_admission_quote_is_pending_prevents_payment() {
         ..(*fx.state).clone()
     });
     let token = fx.grant(None, GrantTerms::new(10_000)).await;
+    confirm(&fx, &token, 4000).await;
     let state = fx.state.clone();
     let peer = fx.peer;
     let request = tokio::spawn(async move {

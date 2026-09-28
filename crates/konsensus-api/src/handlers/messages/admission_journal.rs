@@ -9,6 +9,14 @@ use std::{
     path::Path,
 };
 
+/// Original context for the N2 settlement notification, never admission authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ReadmissionSettlement {
+    pub budget_msat: Option<u64>,
+    #[serde(default)]
+    pub reported: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct Attempt {
     pub payment_hash: String,
@@ -21,6 +29,8 @@ pub(super) struct Attempt {
     pub original_reservation: Option<crate::spend_budget::Reservation>,
     #[serde(default)]
     pub message_may_have_dispatched: bool,
+    #[serde(default)]
+    pub readmission: Option<ReadmissionSettlement>,
 }
 fn error(e: impl std::fmt::Display) -> ApiError {
     ApiError::Storage(format!("admission journal: {e}"))

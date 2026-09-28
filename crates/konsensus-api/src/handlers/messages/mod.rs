@@ -88,6 +88,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/v1/messages/search", get(query::search_messages))
         .route("/api/v1/messages/compose", post(compose_observed))
         .route("/api/v1/messages/resync", post(resync::resync_messages))
+        .route("/api/v1/messages/first-contact/quote", post(compose::first_contact_quote))
         .route(
             "/api/v1/messages/:id",
             get(query::get_message).delete(query::delete_message),

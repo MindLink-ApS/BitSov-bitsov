@@ -1564,3 +1564,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/reconnect_two_node.rs"]
 mod reconnect_two_node;
+
+#[cfg(test)]
+#[path = "tests/budgeted_reconnect_two_node.rs"]
+mod budgeted_reconnect_two_node;

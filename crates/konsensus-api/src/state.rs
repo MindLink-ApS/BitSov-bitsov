@@ -262,7 +262,7 @@ pub struct InvoiceResponseError {
 }
 
 /// Data returned via the invoice request oneshot channel.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InvoiceResponseData {
     /// Authenticated Noise peer that supplied this invoice.
     pub recipient: NodeId,

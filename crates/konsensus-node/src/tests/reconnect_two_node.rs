@@ -468,7 +468,7 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     let (status, body) = sender.compose(&bob_id, "before the drop").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["delivered"], true, "{body}");
-    assert_eq!(body["amount_msat"], 14_000, "admission plus message must both be reported: {body}");
+    assert_eq!(body["amount_msat"].as_u64().unwrap() + body["readmission_msat"].as_u64().unwrap_or(0), 14_000, "admission plus message must both be reported: {body}");
     assert_eq!(delivered.recv().await.as_deref(), Some("before the drop"));
     assert!(privileged_on(&transport_b, &alice_id).await, "admission promoted A's connection");
 
@@ -485,7 +485,7 @@ async fn paid_message_after_reconnect_is_delivered_not_silently_dropped() {
     let (status, body) = sender.compose(&bob_id, "after the reconnect").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["delivered"], true, "{body}");
-    assert_eq!(body["amount_msat"], 14_000, "admission plus message must both be reported: {body}");
+    assert_eq!(body["amount_msat"].as_u64().unwrap() + body["readmission_msat"].as_u64().unwrap_or(0), 14_000, "admission plus message must both be reported: {body}");
     assert!(
         started.elapsed() < Duration::from_secs(15),
         "no silent drop: the refusal is answered at once, not by a 30 s timeout ({:?})",
