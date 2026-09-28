@@ -14,7 +14,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use rand::Rng;
 
 use async_trait::async_trait;
 use bip39::Mnemonic;
@@ -64,7 +66,7 @@ pub struct LdkConfig {
     /// Optional fallback Esplora server URL. If the primary `esplora_url` is
     /// unreachable at startup (L4b — covers the 2026-04-23 alpha crash-loop
     /// caused by mempool.space fee-fetch timeouts), `LdkProvider::new`
-    /// switches to this URL before handing the chain source to LDK.
+    /// switches to this URL on preflight or actual startup fee-fetch failure.
     pub esplora_url_fallback: Option<String>,
     /// Optional RapidGossipSync server URL.
     pub rgs_url: Option<String>,
@@ -372,7 +374,7 @@ impl LdkProvider {
         // itself `ZeroizeOnDrop`.
         let mnemonic_phrase = Zeroizing::new(std::mem::take(&mut config.mnemonic));
         let mnemonic = Mnemonic::from_str(&mnemonic_phrase)
-            .map_err(|e| LightningError::Backend(format!("invalid mnemonic: {e}")))?;
+            .map_err(|e| LightningError::InvalidStartupConfig(format!("invalid mnemonic: {e}")))?;
 
         // Derive BIP-39 seed (64 bytes) from mnemonic + passphrase.
         //
@@ -390,6 +392,13 @@ impl LdkProvider {
         let ldk_seed = Zeroizing::new(derive_ldk_entropy(&*bip39_seed));
 
         let network = parse_network(&config.network)?;
+        validate_startup_url("esplora_url", &config.esplora_url)?;
+        if let Some(url) = &config.esplora_url_fallback {
+            validate_startup_url("esplora_url_fallback", url)?;
+        }
+        if let Some(url) = &config.rgs_url {
+            validate_startup_url("rgs_url", url)?;
+        }
 
         // Ensure the LDK storage directory exists
         std::fs::create_dir_all(&config.storage_dir).map_err(|e| {
@@ -418,21 +427,6 @@ impl LdkProvider {
                 .to_string(),
         );
 
-        // L4b (2026-05-11): Choose primary or fallback Esplora endpoint
-        // BEFORE handing it to LDK. LDK's startup fee-estimate fetch will
-        // crash-loop the node if its esplora endpoint is unreachable
-        // (root cause of the 2026-04-23 alpha incident). We probe the
-        // primary; on failure, log INFO and switch to the fallback.
-        let chosen_esplora_url =
-            select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref())
-                .await;
-
-        // Chain data source — Esplora (same as BitSov ChainProvider default)
-        builder.set_chain_source_esplora(
-            chosen_esplora_url.clone(),
-            Some(EsploraSyncConfig::default()),
-        );
-
         // Gossip source — RGS if configured, otherwise P2P
         if let Some(ref rgs_url) = config.rgs_url {
             builder.set_gossip_source_rgs(rgs_url.clone());
@@ -444,12 +438,14 @@ impl LdkProvider {
         // new explicit switch, and reject ambiguous migrations instead of silently
         // choosing a peer. Existing operators get a clear configuration error.
         if config.lsp_node_id.is_some() || config.lsp_address.is_some() || config.lsp_token.is_some() {
-            return Err(LightningError::Backend("migrate legacy lsp_* fields to liquidity.providers and explicitly enable liquidity".into()));
+            return Err(LightningError::InvalidStartupConfig("migrate legacy lsp_* fields to liquidity.providers and explicitly enable liquidity".into()));
         }
-        if let Some(lsp) = config.liquidity.selected()? {
+        if let Some(lsp) = config.liquidity.selected().map_err(|e| {
+            LightningError::InvalidStartupConfig(e.to_string())
+        })? {
             builder.set_liquidity_source_lsps2(
-                lsp.node_id.parse().map_err(|_| LightningError::Backend("invalid LSP key".into()))?,
-                lsp.address.parse().map_err(|_| LightningError::Backend("invalid LSP address".into()))?,
+                lsp.node_id.parse().map_err(|_| LightningError::InvalidStartupConfig("invalid LSP key".into()))?,
+                lsp.address.parse().map_err(|_| LightningError::InvalidStartupConfig("invalid LSP address".into()))?,
                 lsp.token.clone(),
             );
             // LDK logs the full JIT invoice at INFO. Private previews must never
@@ -461,20 +457,22 @@ impl LdkProvider {
         if let Some(ref addr) = config.listening_address {
             let socket_addr = addr
                 .parse()
-                .map_err(|e| LightningError::Backend(format!("invalid listening address: {e}")))?;
+                .map_err(|e| LightningError::InvalidStartupConfig(format!("invalid listening address: {e}")))?;
             builder
                 .set_listening_addresses(vec![socket_addr])
                 .map_err(|e| {
-                    LightningError::Backend(format!("failed to set listening address: {e}"))
+                    LightningError::InvalidStartupConfig(format!("failed to set listening address: {e}"))
                 })?;
         }
 
-        let node = builder
-            .build()
-            .map_err(|e| LightningError::Backend(format!("failed to build LDK node: {e}")))?;
-
-        node.start()
-            .map_err(|e| LightningError::Backend(format!("failed to start LDK node: {e}")))?;
+        // Validate all local settings before the first network request. The budget
+        // includes preflight; only the two Esplora fee-barrier errors are retried.
+        let started = Instant::now();
+        let chosen_esplora_url =
+            select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref())
+                .await;
+        let (node, chosen_esplora_url) =
+            start_esplora_with_retry(builder, &config, chosen_esplora_url, started).await?;
 
         info!(
             network = %config.network,
@@ -909,6 +907,7 @@ impl Drop for LdkProvider {
     /// as a defensive cleanup for panic / abort paths where the explicit
     /// shutdown didn't run, but treat it as best-effort.
     fn drop(&mut self) {
+        self.drainer_shutdown.store(true, Ordering::Relaxed);
         if let Err(e) = self.node.stop() {
             error!(
                 error = %e,
@@ -1464,6 +1463,140 @@ impl LightningProvider for LdkProvider {
 
 // --- Helper functions ---
 
+fn validate_startup_url(field: &str, value: &str) -> Result<(), LightningError> {
+    let valid = reqwest::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+    if !valid {
+        // Do not include potentially authenticated URLs in user-facing errors.
+        return Err(LightningError::InvalidStartupConfig(format!(
+            "{field} must be an absolute HTTP(S) URL with a host"
+        )));
+    }
+    Ok(())
+}
+
+fn startup_build_error(error: ldk_node::BuildError) -> LightningError {
+    use ldk_node::BuildError;
+    match error {
+        BuildError::InvalidSeedBytes
+        | BuildError::InvalidSeedFile
+        | BuildError::InvalidListeningAddresses
+        | BuildError::InvalidAnnouncementAddresses
+        | BuildError::InvalidNodeAlias
+        | BuildError::NetworkMismatch
+        | BuildError::AsyncPaymentsConfigMismatch => {
+            LightningError::InvalidStartupConfig(error.to_string())
+        }
+        _ => LightningError::Backend(format!("failed to build LDK node: {error}")),
+    }
+}
+
+/// Retry ONLY Esplora's startup fee barrier. In pinned LDK 0.7 these two
+/// errors return before any background task is spawned, and Esplora's
+/// ChainSource::start is a no-op. Never extend this to arbitrary start errors
+/// or Electrum without re-auditing that ordering.
+///
+/// Five fee requests (LDK bounds each at 5s) and 2/4/8/8s backoff with ±20%
+/// jitter fit in ~60s including the two 4s preflight probes. A deadline check
+/// reserves a full fee-request window before each attempt. Local disk I/O is
+/// outside the network timeouts. No detached retry/spawn_blocking job is used:
+/// dropping this future during backoff drops the unstarted node. Cancellation
+/// during synchronous Node::start is observed at the next yield (at most the
+/// in-flight fee timeout on a failing chain service).
+async fn start_esplora_with_retry(
+    mut builder: LdkBuilder,
+    config: &LdkConfig,
+    mut endpoint: String,
+    started: Instant,
+) -> Result<(LdkNode, String), LightningError> {
+    const BUDGET: Duration = Duration::from_secs(60);
+    const FEE_WINDOW: Duration = Duration::from_secs(5);
+    const DELAYS: [u64; 4] = [2, 4, 8, 8];
+    let mut node = None;
+    let mut attempts = 0;
+    let mut cause = "startup connectivity budget exhausted".to_string();
+    loop {
+        if started.elapsed() + FEE_WINDOW > BUDGET {
+            break;
+        }
+        if node.is_none() {
+            builder.set_chain_source_esplora(endpoint.clone(), Some(EsploraSyncConfig::default()));
+            node = Some(builder.build().map_err(startup_build_error)?);
+        }
+        if started.elapsed() + FEE_WINDOW > BUDGET {
+            break;
+        }
+        attempts += 1;
+        let result = node.as_ref().expect("node was built").start();
+        // Deliver pending cancellation even if the synchronous call succeeded.
+        // Dropping a successfully started Node invokes stop before returning.
+        tokio::task::yield_now().await;
+        match result {
+            Ok(()) => return Ok((node.expect("node was built"), endpoint)),
+            Err(
+                error @ (ldk_node::NodeError::FeerateEstimationUpdateFailed
+                | ldk_node::NodeError::FeerateEstimationUpdateTimeout),
+            ) => {
+                cause = error.to_string();
+                warn!(
+                    code = "BOOT_CHAIN_SOURCE_RETRY",
+                    attempt = attempts,
+                    network = %config.network,
+                    service = %startup_service(&endpoint),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %error,
+                    "Bitcoin chain service unavailable during startup; node remains not ready"
+                );
+            }
+            Err(ldk_node::NodeError::InvalidSocketAddress) => {
+                return Err(LightningError::InvalidStartupConfig(
+                    "listening_address could not be resolved or bound; use a local address and an available port".into(),
+                ));
+            }
+            Err(error) => {
+                // Later start phases may already own tasks. Never retry them.
+                return Err(LightningError::Backend(format!(
+                    "failed to start LDK node: {error}"
+                )));
+            }
+        }
+        let Some(delay_secs) = DELAYS.get(attempts - 1) else {
+            break;
+        };
+        let jitter = rand::thread_rng().gen_range(0.8..=1.2);
+        let delay = Duration::from_secs_f64(*delay_secs as f64 * jitter);
+        if started.elapsed() + delay + FEE_WINDOW > BUDGET {
+            break;
+        }
+        tokio::time::sleep(delay).await;
+        if let Some(fallback) = config
+            .esplora_url_fallback
+            .as_ref()
+            .filter(|url| **url != endpoint)
+        {
+            // Only switch away from the primary. Never re-probe and bounce back.
+            // Drop the old instance/store before rebuilding with the SAME
+            // builder entropy and directory; no reinitialization or new identity.
+            drop(node.take());
+            endpoint = fallback.clone();
+        }
+    }
+    Err(LightningError::ChainSourceUnavailable {
+        network: config.network.clone(),
+        service: startup_service(&endpoint),
+        attempts,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        cause,
+    })
+}
+
+fn startup_service(endpoint: &str) -> String {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "configured chain service".into())
+}
+
 /// blake3 KDF context for LDK Lightning entropy derivation.
 ///
 /// This context string provides domain separation from the BitSov identity
@@ -1490,7 +1623,7 @@ fn parse_network(network: &str) -> Result<bitcoin::Network, LightningError> {
         "testnet" | "testnet3" => Ok(bitcoin::Network::Testnet),
         "signet" => Ok(bitcoin::Network::Signet),
         "regtest" => Ok(bitcoin::Network::Regtest),
-        other => Err(LightningError::Backend(format!("unknown network: {other}"))),
+        other => Err(LightningError::InvalidStartupConfig(format!("unknown network: {other}"))),
     }
 }
 
