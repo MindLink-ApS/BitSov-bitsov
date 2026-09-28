@@ -351,3 +351,45 @@ async fn regression_consumed_confirmation_cannot_move_to_replacement_grant() {
     assert_eq!(s.fx.used(), 0);
     assert_eq!(s.spent().await, 0);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owner_socket_first_contact_checks_tuple_and_consumes_once() {
+    let fx = fixture().await;
+    let token = fx.grant(None, GrantTerms::new(10_000)).await;
+    let server = control::ControlServer::bind(fx.tmp.path(), Arc::new(fx.control())).unwrap();
+    let path = server.path().to_owned();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let body = json!({"op":"approve-first-contact", "client_id":fx.client_id,
+        "grant_op_id":fx.service.grant_view_for(&fx.client_id).unwrap().op_id,
+        "recipient":fx.peer.to_hex(), "max_total_msat":4000, "contact_budget_msat":8000});
+    for (field, wrong) in [("client_id", json!("wrong")), ("grant_op_id", json!("wrong")),
+        ("recipient", json!("invalid")), ("max_total_msat", json!(10001)),
+        ("contact_budget_msat", json!(0)), ("contact_budget_msat", json!(3999)),
+        ("contact_budget_msat", json!(10001))] {
+        let mut bad = body.clone();
+        bad[field] = wrong;
+        let req = serde_json::from_value(bad).unwrap();
+        assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Error { .. }));
+        assert!(fx.service.take_first_contact(&fx.client_id, 1, &fx.peer.to_hex()).is_none());
+    }
+    let req = serde_json::from_value(body.clone()).unwrap();
+    assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Ok { .. }));
+    let mut changed = body;
+    changed["contact_budget_msat"] = json!(7000);
+    let req = serde_json::from_value(changed).unwrap();
+    assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Error { .. }));
+    assert!(fx.service.take_first_contact(&fx.client_id, 1, &"ff".repeat(32)).is_none());
+    let approval = fx.service.take_first_contact(&fx.client_id, 1, &fx.peer.to_hex()).unwrap();
+    assert!(fx.service.take_first_contact(&fx.client_id, 1, &fx.peer.to_hex()).is_none(), "authorization cannot replay");
+    fx.service.reserve_first_contact(approval, Some(4001)).unwrap();
+    assert_eq!(fx.used(), 4000, "send cannot exceed approved cap");
+    let (status, _) = fx.call("POST", "/api/v1/pair/first-contact-grant", Some(json!({
+        "client_id":fx.client_id, "grant_op_id":fx.service.grant_view_for(&fx.client_id).unwrap().op_id,
+        "recipient":fx.peer.to_hex(), "max_total_msat":4000
+    })), Some(&token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}

@@ -1898,13 +1898,22 @@ impl PairingService {
                 });
             }
         }
+        if let Some(contact_budget) = contact_budget_msat {
+            if contact_budget < max_total_msat || contact_budget > budget.budget_msat
+                || budget.per_recipient_msat.get(&recipient).is_some_and(|cap| *cap != contact_budget)
+            {
+                return Err(BudgetRefusal::FirstContact(
+                    "contact budget must cover this approval, fit the grant total and match any existing recipient cap".into(),
+                ));
+            }
+        }
         let issued = FirstContactGrant {
             recipient,
             max_total_msat,
             expires_at: (now + FIRST_CONTACT_GRANT_TTL_SECS).min(grant.expires_at),
         };
         let budget_op_id = grant.op_id.clone();
-        if let Some(contact_budget) = contact_budget_msat.filter(|b| *b > 0) {
+        if let Some(contact_budget) = contact_budget_msat {
             let idx = inner
                 .file
                 .grants
@@ -1914,8 +1923,7 @@ impl PairingService {
             let before = inner.file.grants[idx].budget.clone();
             if let Some(budget) = inner.file.grants[idx].budget.as_mut() {
                 if !budget.per_recipient_msat.contains_key(&issued.recipient) {
-                    let cap = contact_budget.min(budget.budget_msat);
-                    budget.per_recipient_msat.insert(issued.recipient.clone(), cap);
+                    budget.per_recipient_msat.insert(issued.recipient.clone(), contact_budget);
                 }
             }
             if inner.file.grants[idx].budget != before {

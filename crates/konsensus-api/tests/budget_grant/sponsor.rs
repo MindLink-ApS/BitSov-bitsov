@@ -209,3 +209,36 @@ async fn paired_approval_is_refused_before_parsing_the_funding_intent() {
     assert_eq!(fx.wallet.money(), 0);
     assert_eq!(fx.used(), 0);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owner_socket_gift_checks_every_field_and_refuses_replay() {
+    let (fx, token, cand) = kit(50_000).await;
+    let server = control::ControlServer::bind(fx.tmp.path(), Arc::new(fx.control())).unwrap()
+        .with_approval_state(fx.state.clone());
+    let path = server.path().to_owned();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let mut body = approval(&cand);
+    body["op"] = json!("approve-gift");
+    for (field, wrong) in [("intro_id", json!("wrong")), ("newcomer", json!("ff".repeat(32))),
+        ("payment_hash", json!("ff".repeat(32))), ("gift_msat", json!(GIFT + 1)),
+        ("fee_max_msat", json!(FEE + 1)), ("code", json!("bad"))] {
+        let mut bad = body.clone();
+        bad[field] = wrong;
+        let req = serde_json::from_value(bad).unwrap();
+        assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Error { .. }));
+        assert_eq!(fx.wallet.money(), 0, "mismatch must not dispatch");
+        assert_eq!(kit_state(&fx, &token).await, (json!("candidate"), json!(0)));
+    }
+    let req = serde_json::from_value(body).unwrap();
+    assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Ok { .. }));
+    let paid = fx.wallet.money();
+    assert!(paid > 0);
+    assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Error { .. }));
+    assert_eq!(fx.wallet.money(), paid, "replay must not dispatch twice");
+    assert_eq!(fx.used(), 0, "owner gift uses sponsor purse, never paired budget");
+    assert_eq!(approve(&fx, &token, &cand).await.0, StatusCode::CONFLICT);
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}

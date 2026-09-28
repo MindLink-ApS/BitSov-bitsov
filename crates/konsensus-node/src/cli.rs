@@ -127,6 +127,12 @@ pub enum Command {
         passphrase: String,
     },
 
+    /// Approve a first contact or sponsor gift on the owner's local node.
+    Approve {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
+
     /// Static channel backup (SCB) operations.
     Scb {
         #[command(subcommand)]
@@ -364,3 +370,61 @@ pub enum WhitelistCommand {
 #[cfg(test)]
 #[path = "tests/cli.rs"]
 mod tests;
+
+/// Complete owner-reviewed tuples; no field is inferred from paired-app state.
+#[derive(Subcommand)]
+pub enum ApprovalCommand {
+    /// Authorize one first contact within a live paired client's budget grant.
+    FirstContact {
+        /// Paired client id whose budget may pay this first contact.
+        #[arg(long)]
+        client: String,
+        /// Exact current budget grant operation id.
+        #[arg(long)]
+        op: String,
+        /// Recipient node key (64 hex characters).
+        #[arg(long)]
+        to: String,
+        /// Maximum admission plus first-message cost, in millisatoshis.
+        #[arg(long)]
+        max_msat: u64,
+        /// Exact per-contact budget; must fit the grant and any existing cap.
+        #[arg(long)]
+        contact_budget_msat: Option<u64>,
+        /// Config location selects the adjacent owner control socket.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+    /// Pay the exact frozen sponsor candidate after comparing its six-digit code.
+    Gift {
+        /// Introduction id of the frozen sponsor candidate.
+        #[arg(long)]
+        intro: String,
+        /// Exact newcomer node key from that candidate.
+        #[arg(long)]
+        newcomer: String,
+        /// Exact invoice payment hash from that candidate.
+        #[arg(long)]
+        hash: String,
+        /// Exact gift amount from the candidate, in millisatoshis.
+        #[arg(long)]
+        gift_msat: u64,
+        /// Exact candidate fee ceiling, in millisatoshis.
+        #[arg(long)]
+        fee_max_msat: u64,
+        /// Six ASCII digits compared with the newcomer; preserve leading zeros.
+        #[arg(long, value_parser = approval_code)]
+        code: String,
+        /// Config location selects the adjacent owner control socket.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+}
+
+fn approval_code(value: &str) -> Result<String, String> {
+    if value.len() == 6 && value.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(value.to_owned())
+    } else {
+        Err("code must be exactly six ASCII digits".into())
+    }
+}

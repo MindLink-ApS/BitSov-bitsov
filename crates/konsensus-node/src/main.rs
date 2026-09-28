@@ -122,6 +122,9 @@ async fn main() -> Result<()> {
         Command::Start { config, password, admission_mode, owner_control } => {
             cmd_start(&config, password.as_deref(), admission_mode.as_deref(), owner_control).await?;
         }
+        Command::Approve { command } => {
+            owner_cmd::cmd_approve(command).await?;
+        }
         Command::PairStatus { config } => {
             owner_cmd::cmd_pair_status(&config).await?;
         }
@@ -1088,7 +1091,7 @@ async fn cmd_start(
                 socket = %server.path().display(),
                 "owner-run mode: elevation can be granted at this socket"
             );
-            tokio::spawn(server.serve(node.shutdown_rx()));
+            tokio::spawn(server.with_approval_state(Arc::clone(&api_state)).serve(node.shutdown_rx()));
         }
         #[cfg(not(unix))]
         {

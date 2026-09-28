@@ -348,3 +348,22 @@ fn parse_sign_challenge_missing_both_fails() {
     let result = Cli::try_parse_from(["konsensus", "sign-challenge"]);
     assert!(result.is_err());
 }
+
+#[test]
+fn owner_approval_commands_require_the_complete_tuple() {
+    let first = ["konsensus", "approve", "first-contact", "--client", "client-1", "--op", "grant-1", "--to", "recipient", "--max-msat", "4000"];
+    let gift = ["konsensus", "approve", "gift", "--intro", "intro-1", "--newcomer", "key", "--hash", "hash", "--gift-msat", "20000", "--fee-max-msat", "1000", "--code", "012345"];
+    for args in [&first[..], &gift[..]] {
+        assert!(Cli::try_parse_from(args).is_ok());
+        for index in (3..args.len()).step_by(2) {
+            let mut incomplete = args.to_vec();
+            incomplete.drain(index..index + 2);
+            assert!(Cli::try_parse_from(incomplete).is_err(), "missing {}", args[index]);
+        }
+    }
+    for invalid in ["12345", "1234567", "abcdef", "１２３４５６", " 123456"] {
+        let mut args = gift.to_vec();
+        *args.last_mut().unwrap() = invalid;
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+}

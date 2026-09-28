@@ -597,6 +597,18 @@ async fn approve(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<ApproveResponse>, ApiError> {
+    approve_owner(auth, state, body).await
+}
+
+/// Shared approval transaction, called only after owner HTTP or socket authority.
+pub(crate) async fn approve_owner(
+    auth: MeteredSpend,
+    state: Arc<AppState>,
+    body: ApproveRequest,
+) -> Result<Json<ApproveResponse>, ApiError> {
+    if auth.is_metered() {
+        return Err(ApiError::Conflict("sponsor_owner_approval_required".into()));
+    }
     let (candidate, fee_msat, deadline, debit, _active_dispatch) = {
         // One transaction validates the owner intent and consumes the kit
         // with its purse reservation. No await separates approval and claim.
@@ -633,7 +645,7 @@ async fn approve(
         if deadline <= now {
             return Err(ApiError::Conflict("sponsor_kit_expired: the request or invoice dispatch window has passed".into()));
         }
-        if body.code.trim() != candidate.code {
+        if body.code.len() != 6 || !body.code.bytes().all(|b| b.is_ascii_digit()) || body.code != candidate.code {
             return Err(ApiError::BadRequest("sponsor_code_mismatch: the code does not match this candidate; nothing was paid".into()));
         }
         let (gift_msat, payee) = super::payments::invoice_terms(&candidate.bolt11)?;

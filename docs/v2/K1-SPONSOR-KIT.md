@@ -58,3 +58,5 @@ Both records are compact binary behind base64url and use strict Ed25519 (weak an
 - On-chain reserve gifts (the 25,000-sat anchor reserve) and JIT/LSPS2 funding of the gift. The pilot pays an ordinary invoice.
 - A newcomer-side messaging grant scoped to the inviter. The newcomer's existing G1 budget and first-contact OK apply.
 - A transport frame for the request, and the anti-amplification challenge on a public door.
+
+Owner terminal commands for the app handoff: [Owner approvals](OWNER-APPROVALS.md).
