@@ -182,6 +182,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     break;
                 };
 
+                // Unprivileged frames refused here never reach the per-arm
+                // `!privileged` guards below; those stay as defense in depth.
                 if refuse_unpaid_control(&event, audit_log.membrane()) {
                     continue;
                 }
@@ -210,7 +212,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PrekeyOffer { peer_id, bundle, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP PrekeyOffer from unprivileged peer (P2: no free X3DH before payment)");
                             continue;
                         }
                         handle_prekey_offer(
@@ -221,7 +222,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::SessionInit { peer_id, init_data, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP SessionInit from unprivileged peer (P2: no free durable session before payment)");
                             continue;
                         }
                         handle_session_init(
@@ -232,7 +232,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::SessionAck { peer_id, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP SessionAck from unprivileged peer (P2: no free session-state before payment)");
                             continue;
                         }
                         handle_session_ack(
@@ -242,7 +241,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::RatchetInit { peer_id, payload, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP RatchetInit from unprivileged peer (P2: no free ratchet-state before payment)");
                             continue;
                         }
                         handle_ratchet_init(
@@ -252,7 +250,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::MessageAcked { peer_id, message_id, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP MessageAck from unprivileged peer (P2: no free trust-weight pump before payment)");
                             continue;
                         }
                         handle_message_acked(
@@ -263,7 +260,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP MessageReject from unprivileged peer (P2: no free trust-weight pump before payment)");
                             continue;
                         }
                         handle_message_rejected(
@@ -280,7 +276,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PriceQueryReceived { peer_id, kind, privileged } => {
                         if !privileged {
-                            debug!(peer = %peer_id, kind, "DROP PriceQuery from unprivileged peer (info-disclosure floor: strangers learn our price surface only via the admission path)");
                             continue;
                         }
                         handle_price_query(&peer_id, kind, &pricing, &chain, &transport).await;
@@ -316,7 +311,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PeerExchangeRequested { peer_id, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP PeerExchange request from unprivileged peer (P3: no mesh-topology / social-graph leak before payment)");
                             continue;
                         }
                         handle_peer_exchange_request(
@@ -327,7 +321,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PeerExchangeReceived { peer_id, peers, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP PeerExchange response from unprivileged peer (P2/P3: no unauthenticated registry write before payment)");
                             continue;
                         }
                         handle_peer_exchange_received(
@@ -338,7 +331,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::LightningInfoReceived { peer_id, ln_pubkey, ln_addr, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP LightningInfo from unprivileged peer (P2: no durable onboarding write or auto-channel open — spends sats — before payment)");
                             continue;
                         }
                         let valid = handle_lightning_info_received(
@@ -375,7 +367,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::GossipReceived { from_peer, envelope, privileged } => {
                         if !privileged {
-                            warn!(peer = %from_peer, "DROP Gossip from unprivileged peer (P2: no free relay/amplification before payment)");
                             continue;
                         }
                         handle_gossip_received(
