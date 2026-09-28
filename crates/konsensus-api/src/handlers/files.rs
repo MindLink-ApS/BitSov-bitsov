@@ -154,6 +154,8 @@ fn default_file_limit() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct SendFileRequest {
     #[serde(default)]
+    pub max_routing_fee_msat: Option<u64>,
+    #[serde(default)]
     pub max_total_msat: Option<u64>,
     /// Recipient node ID (hex).
     pub recipient: String,
@@ -162,6 +164,7 @@ pub struct SendFileRequest {
 /// Response after sending a file.
 #[derive(Serialize)]
 pub struct SendFileResponse {
+    pub max_routing_fee_msat: u64,
     /// The message ID of the UKM envelope.
     pub message_id: String,
     /// Whether the file was delivered to a connected peer.
@@ -403,13 +406,25 @@ async fn send_file(
     Path(file_id): Path<String>,
     Json(req): Json<SendFileRequest>,
 ) -> Result<Json<SendFileResponse>, ApiError> {
+    // Refuse before pricing, grant debits, staged-file claims, or ratchet changes.
+    crate::error::require_money_ready(&state).await?;
     let deadline = state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).deadline(&file_id);
-    tokio::time::timeout_at(deadline, send_file_inner(auth, state, file_id, req)).await
-        .map_err(|_| ApiError::PaymentUnresolved("file send deadline exceeded; payment may have dispatched; do not retry automatically".into()))?
+    // Keep authorized ceilings outside the cancelled future, including any
+    // separately approved re-admission recorded before its wallet dispatch.
+    let ceiling = std::sync::Mutex::new(None);
+    let readmission = super::messages::Readmission::for_cap(req.max_total_msat.is_some());
+    let result = tokio::time::timeout_at(deadline, send_file_inner(auth, state, file_id, req, &ceiling, &readmission)).await
+        .unwrap_or_else(|_| Err(ApiError::PaymentUnresolved("file send deadline exceeded; payment may have dispatched; do not retry automatically".into())));
+    let approved = *ceiling.lock().unwrap_or_else(|e| e.into_inner());
+    result.map_err(|error| match approved {
+        Some(fee) => error.with_routing_fee(fee.saturating_add(readmission.fee_ceiling_msat())),
+        None => error,
+    })
 }
 
 async fn send_file_inner(
     auth: MeteredSpend, state: Arc<AppState>, file_id: String, req: SendFileRequest,
+    ceiling: &std::sync::Mutex<Option<u64>>, readmission: &super::messages::Readmission,
 ) -> Result<Json<SendFileResponse>, ApiError> {
     // Parse recipient
     let peer_id = NodeId::from_hex(&req.recipient)
@@ -423,7 +438,8 @@ async fn send_file_inner(
         .await
         .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
 
-    super::messages::caps::check(super::messages::caps::payable(price_msat), req.max_total_msat)?;
+    let all_in = super::messages::caps::check_payment(&state, super::messages::caps::payable(price_msat), req.max_routing_fee_msat, req.max_total_msat)?;
+    *ceiling.lock().unwrap_or_else(|e| e.into_inner()) = Some(all_in - super::messages::caps::payable(price_msat));
 
     // Do not retain bytes across pricing awaits: deletion or expiry could
     // otherwise release their quota while this future still owns the blob.
@@ -446,9 +462,9 @@ async fn send_file_inner(
         &state,
         vec![Charge {
             recipient: peer_key.clone(),
-            amount_msat: super::messages::caps::payable(price_msat),
+            amount_msat: all_in,
         }],
-    )?;
+    ).map_err(|e| e.with_routing_fee(all_in - super::messages::caps::payable(price_msat)))?.with_fee_limit(req.max_routing_fee_msat);
 
     // Reserve this staged blob through every await. Cap refusals leave it
     // available; an attempted send consumes it even on error/cancellation.
@@ -472,9 +488,8 @@ async fn send_file_inner(
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
     // Create real payment proof — requests invoice from recipient (Principle 2).
-    let readmission = super::messages::Readmission::for_cap(req.max_total_msat.is_some());
     let mut admission = super::messages::FirstContactCharge::default();
-    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, &readmission, Some(KIND_FILE_REF), &mut admission).await.map_err(|error| admission.error(error));
+    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission, Some(KIND_FILE_REF), &mut admission).await.map_err(|error| admission.error(error));
     if matches!(&paid, Err(ApiError::PaymentUnresolved(_))) && admission.readmission_blocks_message {
         debit.settled(&peer_key, admission.settled_msat.saturating_sub(admission.readmission_msat));
     } else if let Err(ApiError::PaymentProofUnavailable { amount_msat, .. }) = &paid {
@@ -482,7 +497,7 @@ async fn send_file_inner(
     } else {
         debit.resolve_proof(&peer_key, &paid);
     }
-    let (payment_hash, preimage, amount_msat) = paid?;
+    let (payment_hash, preimage, amount_msat) = paid.map_err(|e| e.with_routing_fee(debit.fee_limit(&state, super::messages::caps::payable(price_msat)).saturating_add(readmission.fee_ceiling_msat())))?;
     let proof =
         konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
     let amount_msat = amount_msat.saturating_add(admission.settled_msat);
@@ -509,6 +524,10 @@ async fn send_file_inner(
     // We don't have an update_file method, but the association is recorded
     // in the audit log below.
 
+    state.storage.prepare_delivery(&envelope.id, &peer_id).await.map_err(|e| ApiError::PaymentProofUnavailable {
+        amount_msat,
+        reason: format!("file payment settled; saved envelope {} requires delivery reconciliation: {e}", envelope.id.to_hex()),
+    })?;
     // Deliver
     let delivered = if state.transport.is_connected(&peer_id).await {
         state
@@ -518,13 +537,6 @@ async fn send_file_inner(
             .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("file payment settled but delivery failed: {e}") })?;
         true
     } else {
-        if let Err(e) = state
-            .storage
-            .queue_pending_delivery(&envelope.id, &peer_id)
-            .await
-        {
-            tracing::warn!(error = %e, "failed to queue pending file delivery");
-        }
         false
     };
 
@@ -551,6 +563,7 @@ async fn send_file_inner(
     );
 
     Ok(Json(SendFileResponse {
+        max_routing_fee_msat: (all_in - super::messages::caps::payable(price_msat)).saturating_add(readmission.fee_ceiling_msat()),
         message_id: envelope.id.to_hex(),
         delivered,
         amount_msat,

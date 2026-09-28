@@ -3,8 +3,9 @@
 A connected stranger can call `POST /api/v1/messages/compose` with
 `max_total_msat`. Admission and message delivery are two separately settled,
 single-use acts. At a 2,000-msat admission price and 2,000-msat message price,
-the call needs a 4,000-msat cap. The response's `amount_msat` includes both
-principals. Routing fees remain outside the principal cap, as in #80.
+the call needs a 14,000-msat all-in cap under the default routing-fee policy.
+The response's `amount_msat` includes both principals; `max_routing_fee_msat`
+reports their combined fee ceiling. See [all-in fee caps](ALL-IN-FEE-CAPS.md).
 
 First contact is restricted to `KIND_CHAT` (`konsensus:admission:0`). The
 requester sends an amount hint that the target ignores. The target reads the
@@ -206,11 +207,14 @@ check is used for the successful admission/file flows.
 
 This does not prove LND/LDK routing, liquidity, fees, HTLC timing, a room with two
 remote recipients, or the live Tauri UI. A peer price table can remain unknown
-immediately after admission, and existing startup ratchet repair can delay
-readiness; the harness records both rather than claiming those are fixed.
+immediately after admission; the harness records that rather than claiming it is fixed.
+After #102, first-contact session setup is offered immediately on promotion/proof; do not
+treat the old self-heal-tick delay as expected.
 
 The first-contact approval endpoint requires the independent owner's credential,
 plus the target paired `client_id` and exact budget `grant_op_id`. Paired spend
 tokens can fetch quotes and send within approved terms, but cannot mint owner
 approval. Cached quotes remain chat-only and expire at the signed BOLT11 expiry,
 which may be earlier than the admission request deadline.
+
+Owner terminal commands for the app handoff: [Owner approvals](OWNER-APPROVALS.md).

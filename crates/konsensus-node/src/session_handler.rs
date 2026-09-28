@@ -28,6 +28,7 @@ use konsensus_message::{ControlEvent, Frame, NoiseTransport};
 use konsensus_pricing::PeerPriceCache;
 
 use konsensus_api::audit::AuditLog;
+use konsensus_api::membrane::{Membrane, PrePaymentReason};
 use konsensus_api::state::WsDeliveryStatus;
 use konsensus_api::InvoiceResponseData;
 use konsensus_api::state::{InvoiceRequestOutcome, InvoiceResponseError};
@@ -90,6 +91,41 @@ const ADMISSION_INVOICE_PURPOSE: &str = "konsensus:admission";
 /// chat floor — the minimum energy required to be admitted and promoted.
 const ADMISSION_INVOICE_KIND: u16 = konsensus_core::kind::KIND_CHAT;
 
+/// Refuse state-changing control frames before dispatch. This consumes no
+/// identity or payload into telemetry: only a fixed reason counter is updated.
+fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
+    use ControlEvent::*;
+    let (privileged, reason) = match event {
+        PrekeyOffer { privileged, .. }
+        | SessionInit { privileged, .. }
+        | SessionAck { privileged, .. }
+        | RatchetInit { privileged, .. } => (privileged, PrePaymentReason::SessionBeforePayment),
+        // These carry no admission authority: the handler requires a durable
+        // outbox match; only a bought reply may change routing weights.
+        MessageAcked { .. } | MessageRejected { .. } => return false,
+        PriceTableReceived { privileged, .. }
+        | PriceQueryReceived { privileged, .. }
+        | PriceResponseReceived { privileged, .. } => {
+            (privileged, PrePaymentReason::PriceBeforePayment)
+        }
+        PeerExchangeRequested { privileged, .. } | PeerExchangeReceived { privileged, .. } => {
+            (privileged, PrePaymentReason::PeerExchangeBeforePayment)
+        }
+        LightningInfoReceived { privileged, .. } => {
+            (privileged, PrePaymentReason::LightningInfoBeforePayment)
+        }
+        GossipReceived { privileged, .. } => (privileged, PrePaymentReason::GossipBeforePayment),
+        // Connecting is not a refused frame. Invoice requests and responses
+        // have binding/bootstrap exceptions and are counted at their decision.
+        _ => return false,
+    };
+    if *privileged {
+        return false;
+    }
+    membrane.pre_payment_refused(reason);
+    true
+}
+
 /// Runs the session/control event handler loop.
 pub(crate) async fn run(deps: SessionHandlerDeps) {
     let SessionHandlerDeps {
@@ -126,7 +162,12 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
+    let mut delivery_budget = DeliveryConfirmationBudget::default();
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
+    // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
+    // from the other two eager limiters on purpose; see `eager_offers` in the
+    // compose handler.
+    let mut eager_offers = konsensus_message::EagerOfferLimiter::new();
 
     // Periodic cleanup interval for the cooldown maps to prevent unbounded growth.
     let mut cooldown_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -135,6 +176,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     // Periodic E2EE self-heal. Transport supervision can reconnect peers after
     // restart/flap without a fresh application message; this loop makes the
     // session membrane repair itself without operator intervention.
+    let mut lightning_was_ready = lightning.money_ready().await;
     let mut session_self_heal_interval = tokio::time::interval(SESSION_SELF_HEAL_INTERVAL);
     session_self_heal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -145,6 +187,12 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     info!("control channel closed, session handler exiting");
                     break;
                 };
+
+                // Unprivileged frames refused here never reach the per-arm
+                // `!privileged` guards below; those stay as defense in depth.
+                if refuse_unpaid_control(&event, audit_log.membrane()) {
+                    continue;
+                }
 
                 match event {
                     // M1b: PeerConnected for an UNPRIVILEGED (PriceOpen stranger)
@@ -170,9 +218,11 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PrekeyOffer { peer_id, bundle, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP PrekeyOffer from unprivileged peer (P2: no free X3DH before payment)");
                             continue;
                         }
+                        reply_prekey_offer_to_paid_payee(
+                            &peer_id, our_node_id, &session_manager, &transport, &mut eager_offers,
+                        ).await;
                         handle_prekey_offer(
                             &peer_id, bundle, our_node_id, &session_manager, &storage,
                             &transport, &audit_log, &mut last_negotiation,
@@ -181,7 +231,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::SessionInit { peer_id, init_data, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP SessionInit from unprivileged peer (P2: no free durable session before payment)");
                             continue;
                         }
                         handle_session_init(
@@ -192,7 +241,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::SessionAck { peer_id, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP SessionAck from unprivileged peer (P2: no free session-state before payment)");
                             continue;
                         }
                         handle_session_ack(
@@ -202,7 +250,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::RatchetInit { peer_id, payload, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP RatchetInit from unprivileged peer (P2: no free ratchet-state before payment)");
                             continue;
                         }
                         handle_ratchet_init(
@@ -210,25 +257,13 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::MessageAcked { peer_id, message_id, privileged } => {
-                        if !privileged {
-                            warn!(peer = %peer_id, "DROP MessageAck from unprivileged peer (P2: no free trust-weight pump before payment)");
-                            continue;
-                        }
-                        handle_message_acked(
-                            &peer_id, &message_id, &send_timestamps, &storage,
-                            &routing, &ws_delivery_tx,
-                        ).await;
+                    ControlEvent::MessageAcked { peer_id, message_id, privileged, .. } => {
+                        handle_delivery_confirmation(&peer_id, &message_id, None, privileged,
+                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget).await;
                     }
-
                     ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
-                        if !privileged {
-                            warn!(peer = %peer_id, "DROP MessageReject from unprivileged peer (P2: no free trust-weight pump before payment)");
-                            continue;
-                        }
-                        handle_message_rejected(
-                            &peer_id, &message_id, &reason, &routing, &ws_delivery_tx,
-                        ).await;
+                        handle_delivery_confirmation(&peer_id, &message_id, Some(&reason), privileged,
+                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget).await;
                     }
 
                     ControlEvent::PriceTableReceived { peer_id, prices, block_height, valid_blocks, trust_discount, privileged } => {
@@ -240,10 +275,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PriceQueryReceived { peer_id, kind, privileged } => {
                         if !privileged {
-                            debug!(peer = %peer_id, kind, "DROP PriceQuery from unprivileged peer (info-disclosure floor: strangers learn our price surface only via the admission path)");
                             continue;
                         }
-                        handle_price_query(&peer_id, kind, &pricing, &chain, &transport).await;
+                        handle_price_query(&peer_id, kind, &pricing, &chain, &transport, storage.as_ref()).await;
                     }
 
                     ControlEvent::PriceResponseReceived { peer_id, kind, price_msat, block_height, privileged } => {
@@ -267,14 +301,15 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     }
 
                     ControlEvent::InvoiceErrorReceived { peer_id, request_id, reason, privileged } => {
-                        handle_invoice_error_received(
+                        if handle_invoice_error_received(
                             &peer_id, &request_id, &reason, privileged, &invoice_requests,
-                        ).await;
+                        ).await {
+                            audit_log.membrane().pre_payment_refused(PrePaymentReason::InvoiceErrorBeforePayment);
+                        }
                     }
 
                     ControlEvent::PeerExchangeRequested { peer_id, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP PeerExchange request from unprivileged peer (P3: no mesh-topology / social-graph leak before payment)");
                             continue;
                         }
                         handle_peer_exchange_request(
@@ -285,7 +320,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::PeerExchangeReceived { peer_id, peers, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP PeerExchange response from unprivileged peer (P2/P3: no unauthenticated registry write before payment)");
                             continue;
                         }
                         handle_peer_exchange_received(
@@ -296,7 +330,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::LightningInfoReceived { peer_id, ln_pubkey, ln_addr, privileged } => {
                         if !privileged {
-                            warn!(peer = %peer_id, "DROP LightningInfo from unprivileged peer (P2: no durable onboarding write or auto-channel open — spends sats — before payment)");
                             continue;
                         }
                         let valid = handle_lightning_info_received(
@@ -333,7 +366,6 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
                     ControlEvent::GossipReceived { from_peer, envelope, privileged } => {
                         if !privileged {
-                            warn!(peer = %from_peer, "DROP Gossip from unprivileged peer (P2: no free relay/amplification before payment)");
                             continue;
                         }
                         handle_gossip_received(
@@ -407,6 +439,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 }
             }
             _ = session_self_heal_interval.tick() => {
+                refresh_recovered_lightning(
+                    &mut lightning_was_ready, &transport, &lightning, &lightning_addr,
+                    &storage, &ws_delivery_tx, our_node_id,
+                ).await;
                 heal_connected_e2ee_sessions(&session_manager, &transport).await;
             }
             _ = shutdown_rx.changed() => {
@@ -415,6 +451,67 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
             }
         }
     }
+}
+
+/// Recovery reuses the existing session maintenance task, and only shares
+/// identity with already privileged connections. No reconnect or re-admission.
+async fn refresh_recovered_lightning(
+    was_ready: &mut bool,
+    transport: &Arc<NoiseTransport>,
+    lightning: &Arc<dyn LightningProvider>,
+    lightning_addr: &Option<String>,
+    storage: &Arc<dyn konsensus_storage::Storage>,
+    ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    our_node_id: NodeId,
+) {
+    let ready = lightning.money_ready().await;
+    if ready && !*was_ready {
+        for peer in transport.connected_privileged_peers().await {
+            send_lightning_info(&peer, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
+        }
+    }
+    *was_ready = ready;
+}
+
+async fn send_lightning_info(
+    peer_id: &NodeId,
+    transport: &Arc<NoiseTransport>,
+    lightning: &Arc<dyn LightningProvider>,
+    lightning_addr: &Option<String>,
+    storage: &Arc<dyn konsensus_storage::Storage>,
+    ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    our_node_id: NodeId,
+) {
+    // Send our Lightning pubkey if available (enables keysend payments from peer).
+    if let Some(ln_pubkey) = lightning.get_node_pubkey().await {
+        let ln_frame = Frame::LightningInfo {
+            ln_pubkey,
+            ln_addr: lightning_addr.clone(),
+        };
+        if let Err(e) = transport.send_frame(peer_id, &ln_frame).await {
+            warn!(peer = %peer_id, error = %e, "failed to send Lightning info");
+        } else {
+            if let Err(e) = funding_poll::emit_progress_step(
+                storage.as_ref(),
+                ws_delivery_tx,
+                peer_id,
+                "lightning_info_sent",
+                "Lightning details shared",
+            )
+            .await
+            {
+                warn!(error = %e, "failed to persist onboarding lightning_info_sent step");
+            }
+            funding_poll::ensure_poll_task(
+                our_node_id.to_hex(),
+                Arc::clone(storage),
+                Arc::clone(lightning),
+                ws_delivery_tx.clone(),
+            )
+            .await;
+        }
+    }
+
 }
 
 // ── Individual event handlers ─────────────────────────────────────────────
@@ -480,39 +577,11 @@ async fn handle_peer_connected(
         valid_blocks: meta.valid_blocks,
         trust_discount: peer_discount,
     };
-    if let Err(e) = transport.send_frame(peer_id, &price_frame).await {
+    if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage.as_ref(), peer_id, &price_frame, pricing.as_ref()).await {
         warn!(peer = %peer_id, error = %e, "failed to send price table");
     }
 
-    // Send our Lightning pubkey if available (enables keysend payments from peer).
-    if let Some(ln_pubkey) = lightning.get_node_pubkey().await {
-        let ln_frame = Frame::LightningInfo {
-            ln_pubkey,
-            ln_addr: lightning_addr.clone(),
-        };
-        if let Err(e) = transport.send_frame(peer_id, &ln_frame).await {
-            warn!(peer = %peer_id, error = %e, "failed to send Lightning info");
-        } else {
-            if let Err(e) = funding_poll::emit_progress_step(
-                storage.as_ref(),
-                ws_delivery_tx,
-                peer_id,
-                "lightning_info_sent",
-                "Lightning details shared",
-            )
-            .await
-            {
-                warn!(error = %e, "failed to persist onboarding lightning_info_sent step");
-            }
-            funding_poll::ensure_poll_task(
-                our_node_id.to_hex(),
-                Arc::clone(storage),
-                Arc::clone(lightning),
-                ws_delivery_tx.clone(),
-            )
-            .await;
-        }
-    }
+    send_lightning_info(peer_id, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
 
     // Request peer's known peers for mesh discovery.
     if let Err(e) = transport.send_frame(peer_id, &Frame::PeerExchangeRequest).await {
@@ -529,7 +598,7 @@ async fn handle_prekey_offer(
     bundle: serde_json::Value,
     our_node_id: NodeId,
     session_manager: &SessionManager,
-    storage: &Arc<dyn konsensus_storage::Storage>,
+    _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
@@ -559,9 +628,7 @@ async fn handle_prekey_offer(
     if session_manager.has_session(peer_id).await {
         warn!(peer = %peer_id, "peer sent PrekeyOffer but session exists — replacing stale session");
         session_manager.remove_session(peer_id).await;
-        if let Err(e) = storage.clear_pending_for_peer(peer_id).await {
-            warn!(peer = %peer_id, error = %e, "failed to clear stale pending deliveries");
-        }
+        // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
     }
 
     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
@@ -601,7 +668,7 @@ async fn handle_session_init(
     peer_id: &NodeId,
     init_data: serde_json::Value,
     session_manager: &SessionManager,
-    storage: &Arc<dyn konsensus_storage::Storage>,
+    _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
@@ -622,9 +689,7 @@ async fn handle_session_init(
     if session_manager.has_session(peer_id).await {
         warn!(peer = %peer_id, "peer sent SessionInit but session exists — replacing stale session");
         session_manager.remove_session(peer_id).await;
-        if let Err(e) = storage.clear_pending_for_peer(peer_id).await {
-            warn!(peer = %peer_id, error = %e, "failed to clear stale pending deliveries");
-        }
+        // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
     }
 
     let init: konsensus_crypto::SerializableSessionInit =
@@ -692,7 +757,7 @@ async fn handle_ratchet_init(
     peer_id: &NodeId,
     payload: &[u8],
     session_manager: &SessionManager,
-    storage: &Arc<dyn konsensus_storage::Storage>,
+    _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
 ) {
     match konsensus_crypto::ratchet_message_from_bytes(payload) {
@@ -707,9 +772,7 @@ async fn handle_ratchet_init(
                         "failed to decrypt ratchet init — removing broken session and re-negotiating"
                     );
                     session_manager.remove_session(peer_id).await;
-                    if let Err(clear_err) = storage.clear_pending_for_peer(peer_id).await {
-                        warn!(peer = %peer_id, error = %clear_err, "failed to clear pending after ratchet init failure");
-                    }
+                    // Preserve paid envelopes across ratchet recovery; acceptance ACKs do not require decryption.
                     // Send fresh PrekeyOffer to trigger re-negotiation
                     if let Err(send_err) = send_prekey_offer(session_manager, transport, peer_id).await {
                         warn!(peer = %peer_id, error = %send_err, "failed to send PrekeyOffer after ratchet init failure");
@@ -733,7 +796,13 @@ async fn heal_connected_e2ee_sessions(
     // This mirrors the `PeerConnected` withholding above (line ~166); without it,
     // the periodic self-heal would re-offer the prekey to every connected peer
     // regardless of privilege, leaking free X3DH to an unpaid peer.
-    let connected_peers = transport.connected_privileged_peers().await;
+    //
+    // BUG-PSI: this includes a payee whose admission WE settled on the live
+    // connection (`connected_session_peers`, never `connected_privileged_peers`,
+    // which stays strictly privileged for security callers). Offering it our
+    // prekey is part of the act we bought, and it is how the session forms when
+    // the payee is the X3DH initiator.
+    let connected_peers = transport.connected_session_peers().await;
     for peer_id in connected_peers {
         if !e2ee_needs_self_heal(session_manager, &peer_id).await {
             continue;
@@ -757,6 +826,52 @@ async fn heal_connected_e2ee_sessions(
     }
 }
 
+/// PSI-SPEED: the payee offers its prekey the moment our paid admission
+/// promotes us, but when the payee has the LOWER NodeId it is the X3DH
+/// initiator and needs OUR bundle, and the offer we sent right after our proof
+/// usually reached it before its promotion and was dropped. So when the node
+/// whose admission WE settled on this live connection offers, and we are not
+/// the initiator and have no sending chain, answer with our offer at once
+/// instead of on the next self-heal tick. Only a connection we paid on
+/// (`admission_paid`) qualifies, never a stranger, and replies are
+/// rate-limited; self-heal remains the fallback.
+async fn reply_prekey_offer_to_paid_payee(
+    peer_id: &NodeId,
+    our_node_id: NodeId,
+    session_manager: &SessionManager,
+    transport: &Arc<NoiseTransport>,
+    limiter: &mut konsensus_message::EagerOfferLimiter,
+) {
+    // The generation is captured once; the reply goes on that connection only,
+    // and only if it is still the one we paid on (checked under its lock by
+    // `send_raw_frame_on`), never on an unpaid replacement.
+    let Some(since) = transport.connected_since(peer_id).await else { return };
+    if our_node_id.as_bytes() < peer_id.as_bytes()
+        || !transport.admission_paid_on_connection(peer_id).await
+        || !e2ee_needs_self_heal(session_manager, peer_id).await
+    {
+        return;
+    }
+    if !limiter.allow(peer_id, std::time::Instant::now()) {
+        debug!(peer = %peer_id, "prekey reply to paid payee rate-limited; self-heal will offer");
+        return;
+    }
+    let sent = match serde_json::to_value(session_manager.prekey_bundle().await)
+        .map_err(|e| format!("serialize prekey bundle: {e}"))
+        .and_then(|bundle| Frame::PrekeyOffer { bundle }.to_bytes().map_err(|e| e.to_string()))
+    {
+        Ok(frame) => transport
+            .send_raw_frame_on(peer_id, since, konsensus_message::Standing::AdmissionPaid, &frame)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match sent {
+        Ok(()) => info!(peer = %peer_id, "answered the paid payee's PrekeyOffer with ours (PSI-SPEED)"),
+        Err(e) => warn!(peer = %peer_id, error = %e, "failed to answer the paid payee's PrekeyOffer"),
+    }
+}
+
 async fn e2ee_needs_self_heal(session_manager: &SessionManager, peer_id: &NodeId) -> bool {
     !session_manager.can_send(peer_id).await
 }
@@ -776,6 +891,89 @@ async fn send_prekey_offer(
         .map_err(|e| e.to_string())
 }
 
+/// Wire reasons are the gate's stable Display prefixes; unknown reasons stay
+/// retryable so older peers and temporary gate failures cannot burn delivery.
+fn terminal_paid_rejection(reason: &str) -> bool {
+    ["payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:"]
+        .iter().any(|prefix| reason.starts_with(prefix))
+}
+
+/// Bound storage work before looking up an unprivileged confirmation. A
+/// process-wide window caps identity churn; per-peer windows survive reconnects.
+/// Only budgeted frames allocate entries, so the map has at most 128 keys.
+#[derive(Default)]
+struct DeliveryConfirmationBudget {
+    window: Option<tokio::time::Instant>,
+    used: u32,
+    peers: std::collections::HashMap<NodeId, u32>,
+}
+
+impl DeliveryConfirmationBudget {
+    fn allow(&mut self, peer: &NodeId, privileged: bool, now: tokio::time::Instant) -> bool {
+        if privileged { return true; }
+        if self.window.is_none_or(|start| now.duration_since(start) >= std::time::Duration::from_secs(1)) {
+            self.window = Some(now);
+            self.used = 0;
+            self.peers.clear();
+        }
+        if self.used >= 128 { return false; }
+        let used = self.peers.entry(*peer).or_default();
+        if *used >= 32 { return false; }
+        *used += 1;
+        self.used += 1;
+        true
+    }
+}
+
+/// Delivery confirmations cannot grant admission or mutate unrelated deliveries.
+#[allow(clippy::too_many_arguments)]
+async fn handle_delivery_confirmation(
+    peer: &NodeId, id: &konsensus_core::MessageId, rejection: Option<&str>, privileged: bool,
+    own_id: &NodeId, storage: &Arc<dyn konsensus_storage::Storage>,
+    timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::MessageId, std::time::Instant>>,
+    routing: &konsensus_routing::RoutingTable, ws: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    audit: &konsensus_api::audit::AuditLog,
+    budget: &mut DeliveryConfirmationBudget,
+) {
+    if !budget.allow(peer, privileged, tokio::time::Instant::now()) {
+        audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
+        return;
+    }
+    let nonce_replay = rejection == Some("replay detected: nonce already used");
+    let hash_replay = rejection.and_then(|reason| reason.strip_prefix("payment proof already used: "))
+        .filter(|hash| hash.len() == 64)
+        .and_then(|hash| hex::decode(hash).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+    // The hash compatibility exception must consume the row atomically with
+    // the exact payment binding; unrelated PaymentReused remains terminal.
+    let hash_acked = if let Some(hash) = hash_replay {
+        match storage.acknowledge_pending_payment(id, peer, own_id, &hash).await {
+            Ok(acked) => acked,
+            Err(_) => return,
+        }
+    } else { false };
+    let legacy = nonce_replay || hash_acked;
+    if rejection.is_none() || legacy {
+        if !hash_acked && !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) {
+            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
+            return;
+        }
+        if legacy {
+            audit.record("acked_legacy", &peer.to_hex(), Some(serde_json::json!({"message_id": id.to_hex()})));
+        }
+        handle_message_acked(peer, id, timestamps, storage, routing, ws, privileged && !legacy).await;
+    } else {
+        let reason = rejection.unwrap_or_default();
+        let terminal = terminal_paid_rejection(reason);
+        if !matches!(storage.reject_pending(id, peer, own_id, reason, terminal).await, Ok(true)) {
+            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
+            return;
+        }
+        timestamps.lock().await.remove(id);
+        handle_message_rejected(peer, id, reason, routing, ws, privileged).await;
+    }
+}
+
 async fn handle_message_acked(
     peer_id: &NodeId,
     message_id: &konsensus_core::types::MessageId,
@@ -783,6 +981,7 @@ async fn handle_message_acked(
     storage: &Arc<dyn konsensus_storage::Storage>,
     routing: &konsensus_routing::RoutingTable,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    update_weights: bool,
 ) {
     // Compute STDP latency from send timestamp.
     let latency_ms = {
@@ -813,7 +1012,7 @@ async fn handle_message_acked(
     );
 
     // Hebbian learning: successful delivery strengthens routing weight.
-    routing.record_success(peer_id, latency_ms, payment_msat).await;
+    if update_weights { routing.record_success(peer_id, latency_ms, payment_msat).await; }
 
     // Broadcast delivery confirmation to WebSocket clients.
     if let Err(e) = ws_delivery_tx.send(Arc::new(
@@ -834,15 +1033,16 @@ async fn handle_message_rejected(
     reason: &str,
     routing: &konsensus_routing::RoutingTable,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    update_weights: bool,
 ) {
     warn!(peer = %peer_id, msg_id = %message_id, %reason, "message rejected by peer");
-    routing.record_failure(peer_id).await;
+    if update_weights { routing.record_failure(peer_id).await; }
 
     if let Err(e) = ws_delivery_tx.send(Arc::new(
         WsDeliveryStatus {
             event_type: "delivery_status",
             message_id: message_id.to_hex(),
-            status: "rejected".to_string(),
+            status: if terminal_paid_rejection(reason) { "failed_paid" } else { "rejected" }.to_string(),
             reason: Some(reason.to_string()),
         },
     )) {
@@ -856,6 +1056,7 @@ async fn handle_price_query(
     pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     chain: &Arc<dyn ChainProvider>,
     transport: &Arc<NoiseTransport>,
+    storage: &dyn konsensus_storage::Storage,
 ) {
     match pricing.get_price_msat(kind).await {
         Ok(price_msat) => {
@@ -867,7 +1068,7 @@ async fn handle_price_query(
                 }
             };
             let frame = Frame::PriceResponse { kind, price_msat, block_height };
-            if let Err(e) = transport.send_frame(peer_id, &frame).await {
+            if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage, peer_id, &frame, pricing.as_ref()).await {
                 warn!(peer = %peer_id, error = %e, "failed to send price response");
             }
         }
@@ -1036,9 +1237,9 @@ async fn handle_invoice_requested_gated(
         return;
     }
     if !privileged {
+        membrane.pre_payment_refused(PrePaymentReason::AdmissionRequired);
         let now = tokio::time::Instant::now();
         if last_admission_refusal.permit(source_ip, now) {
-            last_admission_refusal.event(peer_id, now, membrane);
             send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED).await;
         }
         return;
@@ -1128,19 +1329,19 @@ async fn send_invoice_refusal(
 /// that same peer (the binding in [`konsensus_api::invoice_refusal`]): it can
 /// only end our own request early, which it could do anyway by never answering.
 /// That is how a sender learns that a recipient now requires admission again.
+/// Returns true only for a pre-payment drop, for anonymous aggregate counting.
 async fn handle_invoice_error_received(
     peer_id: &NodeId,
     request_id: &str,
     reason: &str,
     privileged: bool,
     invoice_requests: &tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>,
-) {
+) -> bool {
     let bound_quote = request_id.starts_with(&format!("v1:{peer_id}:"))
         && reason == "stateless_quote_unsupported";
     let bound = konsensus_api::invoice_refusal::record(request_id, peer_id, reason);
     if !privileged && !bound_quote && !bound {
-        warn!(peer = %peer_id, "DROP InvoiceError from unprivileged peer (P2: no pending-invoice bookkeeping drive before payment)");
-        return;
+        return true;
     }
     warn!(
         peer = %peer_id, %request_id, %reason,
@@ -1150,11 +1351,12 @@ async fn handle_invoice_error_received(
     // First-contact IDs embed the intended recipient. A different connected
     // peer cannot cancel that request, even if it knows the correlation ID.
     if request_id.starts_with("v1:") && !request_id.starts_with(&format!("v1:{peer_id}:")) {
-        return;
+        return false;
     }
     if let Some(sender) = requests.remove(request_id) {
         let _ = sender.send(Err(InvoiceResponseError { recipient: *peer_id, reason: reason.into() }));
     }
+    false
 }
 
 async fn handle_invoice_response(
@@ -1568,3 +1770,7 @@ mod reconnect_two_node;
 #[cfg(test)]
 #[path = "tests/budgeted_reconnect_two_node.rs"]
 mod budgeted_reconnect_two_node;
+
+#[cfg(test)]
+#[path = "tests/paid_first_contact_two_node.rs"]
+mod paid_first_contact_two_node;

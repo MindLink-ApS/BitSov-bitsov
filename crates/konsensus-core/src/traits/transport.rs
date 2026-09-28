@@ -133,6 +133,47 @@ pub trait MessageTransport: Send + Sync {
     /// Mark settlement only if the connection generation still matches.
     async fn mark_admission_paid(&self, _peer: &NodeId, _since: std::time::Instant) {}
 
+    /// Send `envelope` on the connection generation `since` (as returned by
+    /// [`connected_since`](Self::connected_since)) and on no other: the peer is
+    /// looked up once, and if that connection is gone or was replaced, nothing
+    /// is written and `NotConnected` is returned. `NotConnected` therefore
+    /// means the envelope certainly did not go out; any other error means it
+    /// may have.
+    ///
+    /// Used for the admission proof, so the connection marked paid and the
+    /// connection the proof admits are the same one. The default, for
+    /// transports that track no generations, is a plain [`send`](Self::send).
+    async fn send_on_connection(
+        &self,
+        peer: &NodeId,
+        since: Option<std::time::Instant>,
+        envelope: &UkmEnvelope,
+    ) -> Result<(), TransportError> {
+        let _ = since;
+        self.send(peer, envelope).await
+    }
+
+    /// Write raw frame bytes on connection generation `since` only, and only
+    /// while that very connection is marked [`admission_paid`] — the one we
+    /// settled an admission on. The connection is looked up once; if it is
+    /// gone, replaced, closed or not marked paid, nothing is written and an
+    /// error is returned. Used for eager, best-effort session setup after a
+    /// paid admission, which must never reach an unpaid replacement.
+    ///
+    /// The default, for transports that track no generations, writes nothing:
+    /// callers fall back to the periodic self-heal.
+    ///
+    /// [`admission_paid`]: Self::admission_paid_on_connection
+    async fn send_raw_frame_on_paid_connection(
+        &self,
+        peer: &NodeId,
+        since: std::time::Instant,
+        frame_bytes: &[u8],
+    ) -> Result<(), TransportError> {
+        let _ = (peer, since, frame_bytes);
+        Err(TransportError::NotConnected("connection generations not tracked by this transport".into()))
+    }
+
     /// Add a peer to the transport whitelist (Principle 3: Closed Mesh).
     ///
     /// Called when a peer is added via invite redemption or manual peer add.

@@ -16,6 +16,44 @@ fn parse_network_variants() {
     assert!(parse_network("invalid").is_err());
 }
 
+/// REAL-LATENCY: settle/fail events of outgoing payments wake settlement polls
+/// by the hash `get_payment_status` is keyed on; inbound events do not.
+#[test]
+fn outgoing_update_hash_names_the_polled_payment() {
+    use ldk_node::lightning::ln::channelmanager::PaymentId;
+    use ldk_node::lightning_types::payment::PaymentHash;
+    let hash = PaymentHash([7; 32]);
+    let settled = ldk_node::Event::PaymentSuccessful {
+        payment_id: Some(PaymentId([7; 32])),
+        payment_hash: hash,
+        payment_preimage: None,
+        fee_paid_msat: Some(1000),
+    };
+    assert_eq!(outgoing_update_hash(&settled), Some("07".repeat(32)));
+    let failed = ldk_node::Event::PaymentFailed {
+        payment_id: Some(PaymentId([9; 32])),
+        payment_hash: Some(hash),
+        reason: None,
+    };
+    assert_eq!(outgoing_update_hash(&failed), Some("07".repeat(32)));
+    let failed_unknown_hash = ldk_node::Event::PaymentFailed {
+        payment_id: Some(PaymentId([9; 32])),
+        payment_hash: None,
+        reason: None,
+    };
+    assert_eq!(
+        outgoing_update_hash(&failed_unknown_hash),
+        Some("09".repeat(32))
+    );
+    let received = ldk_node::Event::PaymentReceived {
+        payment_id: None,
+        payment_hash: hash,
+        amount_msat: 1,
+        custom_records: vec![],
+    };
+    assert_eq!(outgoing_update_hash(&received), None);
+}
+
 #[test]
 fn convert_status_mapping() {
     assert_eq!(
@@ -780,5 +818,204 @@ fn jit_purpose_fee_and_net_survive_ldk_serialization_without_admission_proof() {
         let public = convert_payment_details(&restored);
         assert!(public.preimage.is_none());
         assert!(!is_admittable_inbound_payment(&public));
+    }
+}
+
+#[test]
+fn invoice_and_keysend_ldk_call_arguments_include_exact_fee_ceiling() {
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    let key = SecretKey::from_slice(&[42; 32]).unwrap();
+    let secp = Secp256k1::new();
+    let dest = key.public_key(&secp);
+    let invoice = InvoiceBuilder::new(Currency::Regtest)
+        .description("fee cap".into())
+        .payment_hash(sha256::Hash::hash(&[7; 32]))
+        .payment_secret(PaymentSecret([8; 32]))
+        .current_timestamp().min_final_cltv_expiry_delta(18)
+        .amount_milli_satoshis(1000)
+        .build_signed(|h| secp.sign_ecdsa_recoverable(h, &key)).unwrap();
+    for ceiling in [0, 7, 1000, 100_000] {
+        dispatch_invoice_with_fee_limit(&invoice, ceiling, |arg, route| {
+            assert_eq!(arg, &invoice);
+            assert_eq!(route.unwrap().max_total_routing_fee_msat, Some(ceiling));
+        });
+        dispatch_keysend_with_fee_limit(1000, dest, ceiling, |amount, recipient, route| {
+            assert_eq!(amount, 1000);
+            assert_eq!(recipient, dest);
+            assert_eq!(route.unwrap().max_total_routing_fee_msat, Some(ceiling));
+        });
+    }
+}
+
+#[test]
+fn dispatch_error_classification_retains_ambiguous_liabilities() {
+    use ldk_node::NodeError;
+    for error in [NodeError::PaymentSendingFailed, NodeError::InvalidInvoice,
+        NodeError::InvalidAmount, NodeError::InvalidCustomTlvs, NodeError::NotRunning] {
+        let capable = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(super::classify_dispatch_error(error, &capable), LightningError::PaymentNotDispatched(_)));
+        assert!(capable.load(std::sync::atomic::Ordering::Relaxed));
+    }
+    for error in [NodeError::PersistenceFailed, NodeError::DuplicatePayment] {
+        assert!(matches!(super::classify_dispatch_error(error, &std::sync::atomic::AtomicBool::new(true)), LightningError::PaymentFailed(_)));
+    }
+}
+
+const CHANNEL_PEER: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+#[test]
+fn channel_fee_explicit_rate_never_dispatches() {
+    for announce in [false, true] {
+        for rate in [5.0, 1.5, 0.0, -1.0, f32::NAN, f32::INFINITY, f32::MAX] {
+            let mut node = MockChannelOpener::new();
+            node.expect_open_channel().never();
+            node.expect_open_announced_channel().never();
+            let result = open_ldk_channel(
+                &node,
+                CHANNEL_PEER,
+                "127.0.0.1:9735",
+                50_000,
+                announce,
+                Some(rate),
+            );
+            assert!(
+                matches!(result, Err(LightningError::PaymentNotDispatched(_))),
+                "fee {rate}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn channel_fee_announcement_selects_ldk_method_and_preserves_args() {
+    for announce in [false, true] {
+        let mut node = MockChannelOpener::new();
+        let matches_args =
+            |peer: &bitcoin::secp256k1::PublicKey,
+             addr: &ldk_node::lightning::ln::msgs::SocketAddress,
+             amount: &u64,
+             push: &Option<u64>,
+             config: &Option<ldk_node::config::ChannelConfig>| {
+                peer.to_string() == CHANNEL_PEER
+                    && *addr
+                        == ldk_node::lightning::ln::msgs::SocketAddress::TcpIpV4 {
+                            addr: [127, 0, 0, 1],
+                            port: 9735,
+                        }
+                    && *amount == 50_000
+                    && push.is_none()
+                    && config.is_none()
+            };
+        if announce {
+            node.expect_has_node_alias().return_const(true);
+            node.expect_has_listening_addresses().return_const(true);
+            node.expect_open_channel().never();
+            node.expect_open_announced_channel()
+                .times(1)
+                .withf(matches_args)
+                .returning(|_, _, _, _, _| Ok(ldk_node::UserChannelId(42)));
+        } else {
+            node.expect_open_announced_channel().never();
+            node.expect_open_channel()
+                .times(1)
+                .withf(matches_args)
+                .returning(|_, _, _, _, _| Ok(ldk_node::UserChannelId(42)));
+        }
+        let id = open_ldk_channel(
+            &node,
+            CHANNEL_PEER,
+            "127.0.0.1:9735",
+            50_000,
+            announce,
+            None,
+        )
+        .unwrap();
+        assert_eq!(id, ldk_node::UserChannelId(42).to_string());
+    }
+}
+
+
+#[test]
+fn channel_fee_real_provider_refuses_announcement_without_alias() {
+    // Cover absent, empty, and nonempty listening addresses without an alias.
+    // Alias-without-addresses is rejected at build time; the mock preflight
+    // test below covers that combination.
+    for addresses in [None, Some(Vec::new()), Some(vec!["127.0.0.1:19735".parse().unwrap()])] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ldk_node::config::Config {
+            network: bitcoin::Network::Regtest,
+            storage_dir_path: dir.path().to_str().unwrap().to_owned(),
+            listening_addresses: addresses,
+            ..Default::default()
+        };
+        let mut builder = ldk_node::Builder::from_config(config);
+        builder.set_entropy_seed_bytes([42; 64]);
+        let node = Arc::new(builder.build().unwrap());
+        let provider = LdkProvider::from_node(node.clone());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(provider.open_channel(
+            CHANNEL_PEER, "127.0.0.1:19736", 50_000, true, None,
+        ));
+        assert!(
+            matches!(&result, Err(LightningError::PaymentNotDispatched(reason))
+                if reason.contains("announce_unavailable")),
+            "addresses={:?}: {result:?}", node.listening_addresses()
+        );
+        assert!(node.node_alias().is_none());
+        assert!(node.list_channels().is_empty());
+    }
+}
+
+#[test]
+fn channel_fee_creation_refusal_is_not_dispatched_but_persistence_is_ambiguous() {
+    // LDK can fail peer persistence after create_channel succeeds. Never mark
+    // that failure retry-safe alongside its pre-dispatch creation refusal.
+    for announce in [false, true] {
+        for creation_refused in [false, true] {
+            let mut node = MockChannelOpener::new();
+            let error = if creation_refused {
+                ldk_node::NodeError::ChannelCreationFailed
+            } else {
+                ldk_node::NodeError::PersistenceFailed
+            };
+            if announce {
+                node.expect_has_node_alias().return_const(true);
+                node.expect_has_listening_addresses().return_const(true);
+                node.expect_open_channel().never();
+                node.expect_open_announced_channel().times(1)
+                    .return_once(move |_, _, _, _, _| Err(error));
+            } else {
+                node.expect_open_announced_channel().never();
+                node.expect_open_channel().times(1)
+                    .return_once(move |_, _, _, _, _| Err(error));
+            }
+            let result = open_ldk_channel(
+                &node, CHANNEL_PEER, "127.0.0.1:9735", 50_000, announce, None,
+            );
+            if creation_refused {
+                assert!(matches!(result, Err(LightningError::PaymentNotDispatched(_))), "{result:?}");
+            } else {
+                assert!(matches!(result, Err(LightningError::Backend(_))), "{result:?}");
+            }
+        }
+    }
+}
+
+
+#[test]
+fn channel_fee_announcement_preflight_never_calls_ldk_when_unavailable() {
+    for (alias, addresses) in [(false, false), (false, true), (true, false)] {
+        let mut node = MockChannelOpener::new();
+        node.expect_has_node_alias().return_const(alias);
+        node.expect_has_listening_addresses().return_const(addresses);
+        node.expect_open_channel().never();
+        node.expect_open_announced_channel().never();
+        let result = open_ldk_channel(
+            &node, CHANNEL_PEER, "127.0.0.1:9735", 50_000, true, None,
+        );
+        assert!(matches!(result, Err(LightningError::PaymentNotDispatched(reason))
+            if reason.contains("announce_unavailable")));
     }
 }

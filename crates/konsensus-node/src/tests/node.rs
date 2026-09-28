@@ -18,6 +18,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
     )
     .unwrap();
     NodeConfig {
+        routing_fees: Default::default(),
         tier: NodeTier::Light,
         identity: IdentityConfig {
             mnemonic_file: mnemonic_path,
@@ -50,6 +51,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
 /// Helper: create a config struct for snapshot tests (no temp dir needed).
 fn snapshot_config(storage: StorageConfig) -> NodeConfig {
     NodeConfig {
+        routing_fees: Default::default(),
         tier: NodeTier::Light,
         identity: IdentityConfig {
             mnemonic_file: PathBuf::from("/tmp/m.txt"),
@@ -447,7 +449,31 @@ async fn from_config_lnbits_lightning_provider() {
         api_url: "http://localhost:5000".to_string(),
         admin_key: "test-key".to_string(),
     };
-    // Should succeed building the provider (no actual connection at build time)
-    let node = KonsensusNode::from_config(config, None).await.unwrap();
-    assert_eq!(node.node_id().to_hex().len(), 64);
+    let error = match KonsensusNode::from_config(config, None).await {
+        Ok(_) => panic!("LNbits must fail at startup, before any payment"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("not_supported") && error.contains("LNbits"));
+}
+
+// BOOT-2: exhaustion of the real fee barrier must preserve local services.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_fee_barrier_preserves_local_identity_and_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    let expected = *KonsensusNode::from_config(config.clone(), None).await.unwrap().node_id();
+    config.lightning = LightningConfig::Ldk {
+        liquidity: Default::default(), network: "bitcoin".into(),
+        esplora_url: "http://127.0.0.1:1".into(), esplora_url_fallback: None,
+        rgs_url: None, lsp_node_id: None, lsp_address: None, lsp_token: None,
+        listening_address: None, advertised_address: None,
+    };
+    let node = KonsensusNode::from_config(config, None).await
+        .expect("fee outage must leave local services available");
+    assert_eq!(*node.node_id(), expected);
+    assert!(!node.lightning().is_available().await);
+    assert_eq!(node.storage().count_pending_deliveries().await.unwrap(), 0);
+    let error = node.lightning().create_invoice(1000, "offline", 60).await.unwrap_err();
+    assert!(error.to_string().contains("not_ready"), "{error}");
+    node.lightning().shutdown().await.unwrap();
 }

@@ -597,6 +597,19 @@ async fn approve(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<ApproveResponse>, ApiError> {
+    approve_owner(auth, state, body).await
+}
+
+/// Shared approval transaction, called only after owner HTTP or socket authority.
+pub(crate) async fn approve_owner(
+    auth: MeteredSpend,
+    state: Arc<AppState>,
+    body: ApproveRequest,
+) -> Result<Json<ApproveResponse>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
+    if auth.is_metered() {
+        return Err(ApiError::Conflict("sponsor_owner_approval_required".into()));
+    }
     let (candidate, fee_msat, deadline, debit, _active_dispatch) = {
         // One transaction validates the owner intent and consumes the kit
         // with its purse reservation. No await separates approval and claim.
@@ -633,7 +646,7 @@ async fn approve(
         if deadline <= now {
             return Err(ApiError::Conflict("sponsor_kit_expired: the request or invoice dispatch window has passed".into()));
         }
-        if body.code.trim() != candidate.code {
+        if body.code.len() != 6 || !body.code.bytes().all(|b| b.is_ascii_digit()) || body.code != candidate.code {
             return Err(ApiError::BadRequest("sponsor_code_mismatch: the code does not match this candidate; nothing was paid".into()));
         }
         let (gift_msat, payee) = super::payments::invoice_terms(&candidate.bolt11)?;
@@ -641,7 +654,7 @@ async fn approve(
         pending.state = KitState::Paying;
         pending.approved_at = Some(now);
         pending.reserved_msat = kit.gift_msat.saturating_add(kit.fee_msat);
-        let debit = auth.debit_linked(&state, vec![Charge { recipient: payee, amount_msat: gift_msat }], |reservation| {
+        let debit = auth.debit_linked(&state, vec![Charge { recipient: payee, amount_msat: gift_msat.saturating_add(kit.fee_msat) }], |reservation| {
             ledger.kit_mut(&body.intro_id).map_err(|e| BudgetRefusal::Ledger(e.to_string()))?
                 .grant_reservation = reservation.cloned();
             save(&dir, &ledger).map_err(|e| BudgetRefusal::Ledger(e.to_string()))
@@ -695,7 +708,17 @@ async fn approve(
     }).await?;
     resolve_grant(&state, &outcome);
     if outcome.state == KitState::Failed {
-        return Err(ApiError::Lightning("the gift was definitively not paid".into()));
+        // Resolve this kit before exposing non-dispatch. A terminal payment
+        // failure proves nonpayment, but does not prove it was never dispatched.
+        return Err(match paid {
+            Err(error) => ApiError::from(error),
+            Ok(_) => ApiError::Lightning("the gift was definitively not paid".into()),
+        });
+    }
+    if outcome.state == KitState::Unknown {
+        if let Err(error) = paid {
+            return Err(ApiError::PaymentUnresolved(format!("sponsor payment outcome unknown: {error}")));
+        }
     }
     Ok(Json(ApproveResponse {
         intro_id: outcome.intro_id,
@@ -739,7 +762,7 @@ fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>
                 kit.state = KitState::Failed;
                 kit.reserved_msat = 0;
             }
-        Err(LightningError::PaymentNotDispatched(_)) if kit.state != KitState::Funded => {
+        Err(LightningError::PaymentNotDispatched(_) | LightningError::NotReady) if kit.state != KitState::Funded => {
             kit.state = KitState::Failed;
             kit.reserved_msat = 0;
         }
@@ -752,7 +775,7 @@ fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>
 /// and idempotent; retrying a terminal kit repairs a failed grant-store write.
 fn resolve_grant(state: &AppState, kit: &Kit) {
     let actual = match kit.state {
-        KitState::Funded => kit.paid_msat,
+        KitState::Funded if kit.reserved_msat == 0 => kit.paid_msat.saturating_add(kit.fee_paid_msat),
         KitState::Failed => 0,
         _ => return,
     };
@@ -890,6 +913,7 @@ async fn request_funding(
     State(state): State<Arc<AppState>>,
     Json(body): Json<FundingAsk>,
 ) -> Result<Json<FundingAskResponse>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     let now = now_unix()?;
     let net = network(&state)?;
     let (_, offer_text) = core::split_introduction_link(&body.link);
@@ -909,7 +933,7 @@ async fn request_funding(
         .lightning
         .create_invoice(offer.gift_msat, &description, expiry)
         .await
-        .map_err(|e| ApiError::Lightning(format!("could not create the funding invoice: {e}")))?;
+        .map_err(ApiError::from)?;
     let hash: [u8; 32] = hex::decode(&invoice.payment_hash).ok().and_then(|b| b.try_into().ok())
         .ok_or_else(|| ApiError::Internal("invoice hash".into()))?;
     // Funding-only BEFORE the invoice leaves this node: the gate's durable

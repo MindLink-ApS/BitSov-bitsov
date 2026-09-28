@@ -334,7 +334,7 @@ fn every_metered_handler_debits_before_it_pays() {
                 .unwrap_or("<unknown>")
                 .trim()
                 .to_string();
-            match body.find(".debit(") {
+            match [".debit(", ".debit_operation("].iter().filter_map(|call| body.find(call)).min() {
                 Some(debit) if debit < first_pay => {}
                 _ => bad.push(format!("{file}: {name}")),
             }

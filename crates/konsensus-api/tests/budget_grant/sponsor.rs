@@ -99,11 +99,14 @@ async fn regression_g1_alone_cannot_approve_a_sponsor_gift() {
 
 #[tokio::test]
 async fn an_unknown_outcome_stays_reserved_and_blocks_a_new_kit() {
-    let (fx, token, cand) = kit(50_000).await;
+    let (mut fx, token, cand) = kit(50_000).await;
     fx.wallet.set(UNKNOWN);
     let (s, body) = owner_approve(&fx, &cand).await;
-    assert_eq!(s, StatusCode::OK, "{body}");
-    assert_eq!(body["state"], "unknown");
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{body}");
+    assert_ne!(body["code"], "not_dispatched");
+    fx.restart();
+    assert_eq!(owner_approve(&fx, &cand).await.0, StatusCode::CONFLICT);
+    assert_eq!(fx.wallet.money(), 1, "an unknown gift cannot be retried");
     assert_eq!(kit_state(&fx, &token).await, (json!("unknown"), json!(GIFT + FEE)), "gift + fee ceiling stay held");
     let (s, body) = fx.call("POST", "/api/v1/sponsor/offer", None, Some(&token)).await;
     assert_eq!(s, StatusCode::CONFLICT);
@@ -115,7 +118,8 @@ async fn an_owner_payment_failure_closes_the_kit_without_debiting_a_grant() {
     let (fx, token, cand) = kit(50_000).await;
     fx.wallet.set(FAILED);
     let (s, body) = owner_approve(&fx, &cand).await;
-    assert_ne!(s, StatusCode::OK, "{body}");
+    assert_eq!(s, StatusCode::BAD_GATEWAY, "{body}");
+    assert_ne!(body["code"], "not_dispatched");
     assert_eq!(kit_state(&fx, &token).await, (json!("failed"), json!(0)));
     assert_eq!(fx.used(), 0, "owner approval never debits the paired grant");
     // Single use: a failed kit is not retried; the sponsor makes a new offer.
@@ -189,7 +193,7 @@ async fn cancelled_owner_dispatch_retains_its_purse_reservation_for_restart() {
 async fn reconciliation_needs_read_authority_but_never_a_new_spend_grant() {
     let (fx, _token, cand) = kit(50_000).await;
     fx.wallet.set(UNKNOWN);
-    assert_eq!(owner_approve(&fx, &cand).await.0, StatusCode::OK);
+    assert_eq!(owner_approve(&fx, &cand).await.0, StatusCode::BAD_GATEWAY);
     fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
     fx.wallet.set(FAILED);
     let read_token = fx.token().await;
@@ -208,4 +212,57 @@ async fn paired_approval_is_refused_before_parsing_the_funding_intent() {
     assert!(body.to_string().contains("sponsor_owner_approval_required"), "{body}");
     assert_eq!(fx.wallet.money(), 0);
     assert_eq!(fx.used(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owner_socket_gift_checks_every_field_and_refuses_replay() {
+    let (fx, token, cand) = kit(50_000).await;
+    let server = control::ControlServer::bind(fx.tmp.path(), Arc::new(fx.control())).unwrap()
+        .with_approval_state(fx.state.clone());
+    let path = server.path().to_owned();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let mut body = approval(&cand);
+    body["op"] = json!("approve-gift");
+    for (field, wrong) in [("intro_id", json!("wrong")), ("newcomer", json!("ff".repeat(32))),
+        ("payment_hash", json!("ff".repeat(32))), ("gift_msat", json!(GIFT + 1)),
+        ("fee_max_msat", json!(FEE + 1)), ("code", json!("bad"))] {
+        let mut bad = body.clone();
+        bad[field] = wrong;
+        let req = serde_json::from_value(bad).unwrap();
+        assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Error { .. }));
+        assert_eq!(fx.wallet.money(), 0, "mismatch must not dispatch");
+        assert_eq!(kit_state(&fx, &token).await, (json!("candidate"), json!(0)));
+    }
+    let req = serde_json::from_value(body).unwrap();
+    assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Ok { .. }));
+    let paid = fx.wallet.money();
+    assert!(paid > 0);
+    assert!(matches!(control::send(&path, &req).await.unwrap(), ControlResponse::Error { .. }));
+    assert_eq!(fx.wallet.money(), paid, "replay must not dispatch twice");
+    assert_eq!(fx.used(), 0, "owner gift uses sponsor purse, never paired budget");
+    assert_eq!(approve(&fx, &token, &cand).await.0, StatusCode::CONFLICT);
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn sponsor_non_dispatch_releases_only_the_approved_kit() {
+    for fee_refusal in [false, true] {
+        let (mut fx, token, cand) = kit(50_000).await;
+        if fee_refusal { fx.wallet.fee.store(FEE + 1, Ordering::SeqCst); }
+        else { fx.wallet.set(NOT_DISPATCHED); }
+        let (status, body) = owner_approve(&fx, &cand).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "not_dispatched");
+        assert_eq!(fx.wallet.left(), 0);
+        fx.restart();
+        assert_eq!(kit_state(&fx, &token).await, (json!("failed"), json!(0)));
+        assert_eq!(fx.used(), 0);
+        assert_eq!(owner_approve(&fx, &cand).await.0, StatusCode::CONFLICT);
+        // A failed kit remains single-use; its release cannot erase a later hold.
+        let (_, offer) = fx.call("POST", "/api/v1/sponsor/offer", None, Some(&token)).await;
+        assert!(offer["link"].is_string(), "{offer}");
+    }
 }

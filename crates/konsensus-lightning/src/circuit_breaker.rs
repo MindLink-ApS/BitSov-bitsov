@@ -19,7 +19,8 @@
 //!    circuit opens and subsequent calls fast-fail for `open_cooldown` (no
 //!    backend hit), capping the damage of a slow/unhealthy backend; after the
 //!    cooldown a single probe is allowed (half-open) and closes the circuit on
-//!    success.
+//!    success. Calls already admitted may finish, but their results cannot
+//!    change a newer open/probe cycle.
 //! 3. **Bounded verification concurrency** — a semaphore caps how many backend
 //!    verifications run at once, so verification work cannot grow without bound
 //!    under pressure.
@@ -36,10 +37,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Semaphore;
+// Share the timeout clock so tests can freeze/advance every breaker deadline.
+use tokio::time::Instant;
 
 use konsensus_core::traits::lightning::{
     Invoice, LightningError, LightningProvider, PaymentDetails, PaymentStatus, WalletSync,
@@ -81,6 +84,40 @@ struct BreakerState {
     consecutive_failures: u32,
     /// `Some(t)` while the circuit is open; fast-fail until `now >= t`.
     open_until: Option<Instant>,
+    /// Invalidate results from calls admitted before the latest transition.
+    generation: u64,
+    probe_in_flight: bool,
+}
+
+impl BreakerState {
+    fn check_available(&self, now: Instant) -> Result<u64, LightningError> {
+        if self.probe_in_flight || matches!(self.open_until, Some(until) if now < until) {
+            Err(LightningError::Backend(
+                "settlement-verification circuit open (backend unhealthy) — fail-closed".into(),
+            ))
+        } else {
+            Ok(self.generation)
+        }
+    }
+}
+
+/// Own a half-open probe reservation across the backend await. Cancellation
+/// releases it too, so a dropped caller cannot strand the circuit half-open.
+struct CallGuard<'a> {
+    breaker: &'a CircuitBreakerLightning,
+    generation: u64,
+    probe: bool,
+}
+
+impl Drop for CallGuard<'_> {
+    fn drop(&mut self) {
+        if self.probe {
+            let mut st = self.breaker.state.lock().unwrap_or_else(|p| p.into_inner());
+            if st.generation == self.generation {
+                st.probe_in_flight = false;
+            }
+        }
+    }
 }
 
 struct NegEntry {
@@ -111,6 +148,8 @@ impl CircuitBreakerLightning {
             state: Mutex::new(BreakerState {
                 consecutive_failures: 0,
                 open_until: None,
+                generation: 0,
+                probe_in_flight: false,
             }),
             neg_cache: Mutex::new(HashMap::new()),
         }
@@ -121,23 +160,48 @@ impl CircuitBreakerLightning {
         Self::new(inner, CircuitBreakerConfig::default())
     }
 
-    fn is_open(&self, now: Instant) -> bool {
+    fn available_generation(&self) -> Result<u64, LightningError> {
         let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        matches!(st.open_until, Some(until) if now < until)
+        st.check_available(Instant::now())
     }
 
-    fn record_failure(&self, now: Instant) {
+    fn admit_call(&self) -> Result<CallGuard<'_>, LightningError> {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = st.check_available(Instant::now())?;
+        let probe = st.open_until.is_some();
+        st.probe_in_flight = probe;
+        Ok(CallGuard {
+            breaker: self,
+            generation,
+            probe,
+        })
+    }
+
+    fn record_failure(&self, generation: u64, probe: bool) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        // Old in-flight calls and slot-acquisition timeouts cannot change an
+        // open circuit. Only the reserved probe may restart its cooldown.
+        if st.generation != generation || (st.open_until.is_some() && !probe) {
+            return;
+        }
         st.consecutive_failures = st.consecutive_failures.saturating_add(1);
         if st.consecutive_failures >= self.cfg.failure_threshold {
-            st.open_until = Some(now + self.cfg.open_cooldown);
+            st.open_until = Some(Instant::now() + self.cfg.open_cooldown);
+            st.generation = st.generation.wrapping_add(1);
+            st.probe_in_flight = false;
         }
     }
 
-    fn record_success(&self) {
+    fn record_success(&self, generation: u64) {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if st.generation != generation {
+            return;
+        }
         st.consecutive_failures = 0;
-        st.open_until = None;
+        if st.open_until.take().is_some() {
+            st.generation = st.generation.wrapping_add(1);
+        }
+        st.probe_in_flight = false;
     }
 
     fn neg_cache_get(&self, hash: &str, now: Instant) -> Option<PaymentDetails> {
@@ -178,6 +242,11 @@ impl CircuitBreakerLightning {
 
 #[async_trait]
 impl LightningProvider for CircuitBreakerLightning {
+    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy { self.inner.routing_fee_policy() }
+    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, cap: u64) -> Result<PaymentDetails, LightningError> {
+        self.inner.keysend_with_fee_limit(dest, amount, memo, cap).await
+    }
+
     fn liquidity_info(&self) -> konsensus_core::traits::liquidity::LiquidityInfo {
         self.inner.liquidity_info()
     }
@@ -202,14 +271,9 @@ impl LightningProvider for CircuitBreakerLightning {
         &self,
         payment_hash: &str,
     ) -> Result<PaymentDetails, LightningError> {
-        let now = Instant::now();
-
         // 1. Circuit open → fast-fail (fail-closed), no backend hit.
-        if self.is_open(now) {
-            return Err(LightningError::Backend(
-                "settlement-verification circuit open (backend unhealthy) — fail-closed".into(),
-            ));
-        }
+        let generation = self.available_generation()?;
+        let now = Instant::now();
 
         // 2. Recent non-settled result → return it without a backend hit. Gate
         //    sees a non-settled status and rejects (fail-closed). Never serves a
@@ -220,7 +284,7 @@ impl LightningProvider for CircuitBreakerLightning {
 
         // 3. Bounded concurrency: take a slot, but never wait longer than the
         //    call budget (at-capacity for too long is itself a fail-closed error).
-        let permit = match tokio::time::timeout(
+        let _permit = match tokio::time::timeout(
             self.cfg.call_timeout,
             Arc::clone(&self.sem).acquire_owned(),
         )
@@ -228,7 +292,7 @@ impl LightningProvider for CircuitBreakerLightning {
         {
             Ok(Ok(p)) => p,
             _ => {
-                self.record_failure(Instant::now());
+                self.record_failure(generation, false);
                 return Err(LightningError::Backend(
                     "settlement verification at capacity / timed out acquiring a slot — fail-closed"
                         .into(),
@@ -236,25 +300,29 @@ impl LightningProvider for CircuitBreakerLightning {
             }
         };
 
-        // 4. The actual backend call, bounded by the timeout.
+        // Recheck after waiting: a previous call may have opened the circuit.
+        // Admission and the single half-open probe reservation are atomic.
+        let call = self.admit_call()?;
+
+        // 4. The actual backend call, bounded by the timeout. Keep the slot until
+        // its outcome is recorded, before waking the next queued caller.
         let result =
             tokio::time::timeout(self.cfg.call_timeout, self.inner.get_payment_status(payment_hash))
                 .await;
-        drop(permit);
 
         match result {
             Err(_elapsed) => {
-                self.record_failure(Instant::now());
+                self.record_failure(call.generation, call.probe);
                 Err(LightningError::Backend(
                     "settlement verification timed out — fail-closed".into(),
                 ))
             }
             Ok(Err(e)) => {
-                self.record_failure(Instant::now());
+                self.record_failure(call.generation, call.probe);
                 Err(e)
             }
             Ok(Ok(details)) => {
-                self.record_success();
+                self.record_success(call.generation);
                 if details.status != PaymentStatus::Settled {
                     self.neg_cache_put(payment_hash, &details, Instant::now());
                 }
@@ -307,12 +375,15 @@ mod tests {
         Settled,
         Pending,
         Error,
+        BlockedError,
+        BlockedSettled,
         /// Sleep this long, then return `Settled` (simulates a slow backend).
         SlowSettled(Duration),
     }
 
     struct FakeProvider {
         behavior: Mutex<Behavior>,
+        release: tokio::sync::Notify,
         /// Total `get_payment_status` calls that reached the backend.
         calls: AtomicU32,
         /// Concurrently in-flight backend calls.
@@ -325,6 +396,7 @@ mod tests {
         fn new(behavior: Behavior) -> Arc<Self> {
             Arc::new(Self {
                 behavior: Mutex::new(behavior),
+                release: tokio::sync::Notify::new(),
                 calls: AtomicU32::new(0),
                 in_flight: AtomicU32::new(0),
                 max_in_flight: AtomicU32::new(0),
@@ -380,6 +452,14 @@ mod tests {
                 Behavior::Settled => Ok(settled_details()),
                 Behavior::Pending => Ok(pending_details()),
                 Behavior::Error => Err(LightningError::Backend("boom".into())),
+                Behavior::BlockedError => {
+                    self.release.notified().await;
+                    Err(LightningError::Backend("boom".into()))
+                }
+                Behavior::BlockedSettled => {
+                    self.release.notified().await;
+                    Ok(settled_details())
+                }
                 Behavior::SlowSettled(d) => {
                     tokio::time::sleep(d).await;
                     Ok(settled_details())
@@ -448,7 +528,7 @@ mod tests {
     }
 
     // 2 — a backend outage opens the circuit, then calls fast-fail without hitting it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn outage_opens_circuit_and_subsequent_calls_fast_fail() {
         let fake = FakeProvider::new(Behavior::Error);
         let cb = CircuitBreakerLightning::new(Arc::clone(&fake) as Arc<_>, fast_cfg());
@@ -457,6 +537,10 @@ mod tests {
             assert!(cb.get_payment_status("h").await.is_err());
         }
         let calls_after_open = fake.calls.load(Ordering::SeqCst);
+        assert_eq!(calls_after_open, 3);
+        // Stay just inside the cooldown, regardless of host scheduling delays.
+        tokio::time::advance(cb.cfg.open_cooldown - Duration::from_nanos(1)).await;
+        let before = Instant::now();
         // Further calls fast-fail WITHOUT reaching the backend.
         for _ in 0..10 {
             assert!(cb.get_payment_status("h").await.is_err());
@@ -466,22 +550,175 @@ mod tests {
             calls_after_open,
             "an open circuit must not hit the backend"
         );
+        assert_eq!(
+            Instant::now(),
+            before,
+            "fast-failing must not wait for a slot or timeout"
+        );
     }
 
     // 3 — after the cooldown the circuit recovers (half-open probe closes it).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn circuit_recovers_after_cooldown() {
         let fake = FakeProvider::new(Behavior::Error);
         let cb = CircuitBreakerLightning::new(Arc::clone(&fake) as Arc<_>, fast_cfg());
         for _ in 0..3 {
             let _ = cb.get_payment_status("h").await;
         }
-        // Backend heals; wait out the cooldown.
+        // Backend heals; advance exactly to the cooldown boundary.
         fake.set(Behavior::Settled);
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::advance(cb.cfg.open_cooldown).await;
         let r = cb.get_payment_status("h").await;
-        assert!(r.is_ok(), "after cooldown + healthy backend, verification must succeed");
+        assert!(
+            r.is_ok(),
+            "after cooldown + healthy backend, verification must succeed"
+        );
         assert_eq!(r.unwrap().status, PaymentStatus::Settled);
+    }
+
+    // Poll explicitly to establish ordering; no scheduler delays or sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn queued_call_rechecks_circuit_after_acquiring_slot() {
+        let fake = FakeProvider::new(Behavior::BlockedError);
+        let cb = CircuitBreakerLightning::new(
+            Arc::clone(&fake) as Arc<_>,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                max_concurrent: 1,
+                ..fast_cfg()
+            },
+        );
+        let mut first = Box::pin(cb.get_payment_status("first"));
+        assert!(futures::poll!(&mut first).is_pending());
+        let mut queued = Box::pin(cb.get_payment_status("queued"));
+        assert!(futures::poll!(&mut queued).is_pending());
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+
+        fake.set(Behavior::Error);
+        fake.release.notify_one();
+        assert!(first.await.is_err());
+        assert!(queued.await.is_err());
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            1,
+            "a queued call must not hit the backend after the circuit opens"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_success_does_not_close_newly_opened_circuit() {
+        let fake = FakeProvider::new(Behavior::BlockedSettled);
+        let cb = CircuitBreakerLightning::new(
+            Arc::clone(&fake) as Arc<_>,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..fast_cfg()
+            },
+        );
+        let mut old = Box::pin(cb.get_payment_status("old"));
+        assert!(futures::poll!(&mut old).is_pending());
+        fake.set(Behavior::Error);
+        assert!(cb.get_payment_status("failure").await.is_err());
+        fake.release.notify_one();
+        assert_eq!(old.await.unwrap().status, PaymentStatus::Settled);
+        assert!(cb.get_payment_status("after-open").await.is_err());
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            2,
+            "an older success must not reopen admission during the cooldown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooldown_allows_only_one_probe_and_cancellation_releases_it() {
+        let fake = FakeProvider::new(Behavior::Error);
+        let cb = CircuitBreakerLightning::new(
+            Arc::clone(&fake) as Arc<_>,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..fast_cfg()
+            },
+        );
+        assert!(cb.get_payment_status("failure").await.is_err());
+        tokio::time::advance(cb.cfg.open_cooldown).await;
+        fake.set(Behavior::BlockedSettled);
+        let mut probe = Box::pin(cb.get_payment_status("probe"));
+        assert!(futures::poll!(&mut probe).is_pending());
+        fake.set(Behavior::Settled);
+        assert!(cb.get_payment_status("other").await.is_err());
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+        drop(probe);
+        assert_eq!(
+            cb.get_payment_status("replacement").await.unwrap().status,
+            PaymentStatus::Settled
+        );
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn old_failure_does_not_extend_cooldown_and_failed_probe_restarts_it() {
+        let fake = FakeProvider::new(Behavior::BlockedError);
+        let cb = CircuitBreakerLightning::new(
+            Arc::clone(&fake) as Arc<_>,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..fast_cfg()
+            },
+        );
+        let mut old = Box::pin(cb.get_payment_status("old"));
+        assert!(futures::poll!(&mut old).is_pending());
+        fake.set(Behavior::Error);
+        assert!(cb.get_payment_status("failure").await.is_err());
+        tokio::time::advance(cb.cfg.open_cooldown / 2).await;
+        fake.release.notify_one();
+        assert!(old.await.is_err());
+        tokio::time::advance(cb.cfg.open_cooldown / 2).await;
+        assert!(cb.get_payment_status("failed-probe").await.is_err());
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            3,
+            "an older failure must not extend the original cooldown"
+        );
+        fake.set(Behavior::Settled);
+        tokio::time::advance(cb.cfg.open_cooldown - Duration::from_nanos(1)).await;
+        assert!(cb.get_payment_status("too-soon").await.is_err());
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 3);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert_eq!(
+            cb.get_payment_status("recovered").await.unwrap().status,
+            PaymentStatus::Settled
+        );
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_probe_restarts_cooldown() {
+        let fake = FakeProvider::new(Behavior::Error);
+        let cb = CircuitBreakerLightning::new(
+            Arc::clone(&fake) as Arc<_>,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..fast_cfg()
+            },
+        );
+        assert!(cb.get_payment_status("failure").await.is_err());
+        tokio::time::advance(cb.cfg.open_cooldown).await;
+        fake.set(Behavior::BlockedSettled);
+        let mut probe = Box::pin(cb.get_payment_status("probe"));
+        assert!(futures::poll!(&mut probe).is_pending());
+        tokio::time::advance(cb.cfg.call_timeout).await;
+        assert!(probe.await.is_err());
+        assert_eq!(fake.in_flight.load(Ordering::SeqCst), 0);
+        fake.set(Behavior::Settled);
+        tokio::time::advance(cb.cfg.open_cooldown - Duration::from_nanos(1)).await;
+        assert!(cb.get_payment_status("too-soon").await.is_err());
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert_eq!(
+            cb.get_payment_status("recovered").await.unwrap().status,
+            PaymentStatus::Settled
+        );
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 3);
     }
 
     // 4 — replay/admission safety: a Settled result is NEVER cached, so every

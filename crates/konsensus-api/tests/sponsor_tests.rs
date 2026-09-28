@@ -153,7 +153,7 @@ async fn the_gift_hash_is_funding_only_and_never_admits_a_message() {
         .check_and_store_paid(&Nonce::from_bytes([7; 24]), &hash, p.sponsor.identity.node_id(), &MessageId::from_bytes([9; 32]))
         .await
         .unwrap();
-    assert!(matches!(reuse, PaidReplay::PaymentReused { .. }), "{reuse:?}");
+    assert!(matches!(reuse, PaidReplay::PaymentReused), "{reuse:?}");
     // Control: an unrelated payment is still accepted by the same store.
     let fresh = adapter
         .check_and_store_paid(&Nonce::from_bytes([8; 24]), &[0x42; 32], p.sponsor.identity.node_id(), &MessageId::from_bytes([10; 32]))
@@ -516,9 +516,10 @@ async fn approval_refuses_an_invoice_with_an_existing_outgoing_attempt() {
     let (ask, candidate) = up_to_candidate(&p).await;
     let request = FundingRequest::parse(ask["request"].as_str().unwrap()).unwrap();
     p.sponsor_ln.pay_invoice(&request.bolt11).await.unwrap();
-    let (status, _) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve",
+    let (status, body) = call(&p.sponsor, "POST", "/api/v1/sponsor/approve",
         Some(approval(&candidate))).await;
-    assert_ne!(status, StatusCode::OK, "a prior attempt must not be claimed as this gift");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "not_dispatched");
     assert_eq!(call(&p.sponsor, "GET", "/api/v1/sponsor", None).await.1["purse_used_msat"], 0);
 }
 

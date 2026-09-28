@@ -9,10 +9,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod offer_limit;
 pub mod peer;
 pub mod transport;
 pub mod wire;
 
+pub use offer_limit::EagerOfferLimiter;
 pub use peer::{PeerConfig, PeerEntry, PeerRegistry};
-pub use transport::{CookieMode, ReachabilityMode, ControlEvent, NoiseTransport, TransportConfig};
+pub use transport::{CookieMode, ReachabilityMode, ControlEvent, NoiseTransport, Standing, TransportConfig};
 pub use wire::{Capability, Frame, PeerExchangeEntry, SovereigntyTier, WireError};

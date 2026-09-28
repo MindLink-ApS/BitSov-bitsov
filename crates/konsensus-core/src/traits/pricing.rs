@@ -48,6 +48,12 @@ pub trait PricingEngine: Send + Sync {
     /// Get the price for a kind category (bulk pricing lookup).
     async fn get_category_price_msat(&self, category: KindCategory) -> Result<u64, PricingError>;
 
+    /// Snapshot kinds with a distinct tariff at offer issuance. `Some` attests
+    /// that every other priceable kind uses its category price. Engines unable
+    /// to provide that guarantee must return `None` (no durable category offer).
+    /// This applicability is persisted with an offer, never recomputed at redemption.
+    fn category_price_overrides(&self) -> Option<Vec<u16>> { None }
+
     /// Downcast to concrete type for engine-specific operations.
     ///
     /// Used by the node runtime to access chain-aware features (EMA snapshot

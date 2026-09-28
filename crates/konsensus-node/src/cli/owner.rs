@@ -125,11 +125,11 @@ async fn send(config_path: &Path, req: ControlRequest) -> Result<ControlResponse
     let socket = socket_path(config_path);
     control::send(&socket, &req).await.with_context(|| {
         format!(
-            "could not reach the owner control socket at {}.\n\
+            "could not reach the owner control socket at {:?}.\n\
              The node must be running and must have been started with `--owner-control`.\n\
              A packaged sidecar node does not create this socket: in that deployment the app \
              is a read+receive client and elevation is unavailable by design.",
-            socket.display()
+            socket
         )
     })
 }
@@ -683,9 +683,7 @@ mod startup_tests {
         let config = NodeConfig::default_for_tier(NodeTier::Full, phrase, dir.path());
         let path = dir.path().join("konsensus.toml");
         config.save(&path).unwrap();
-        let err = prepare_start(&path)
-            .err()
-            .expect("markerless identity must refuse");
+        let err = prepare_start(&path).expect_err("markerless identity must refuse");
         assert!(err.to_string().contains("refusing to start"));
         assert!(!DataDirLayout::new(dir.path()).marker().exists());
     }
@@ -1055,5 +1053,57 @@ mod liquidity_authority_tests {
         assert!(!resolve_terms(&flags, Some(&proposal)).unwrap().allow_liquidity_fees);
         flags.allow_liquidity_fees = true;
         assert!(resolve_terms(&flags, Some(&proposal)).unwrap().allow_liquidity_fees);
+    }
+}
+
+/// Print the complete reviewed tuple, flush it, then act over the owner socket.
+/// The explicit flags are the owner's consent; no paired credential is accepted.
+pub async fn cmd_approve(command: crate::cli::ApprovalCommand) -> Result<()> {
+    use crate::cli::ApprovalCommand;
+    let (config, request, summary) = match command {
+        ApprovalCommand::FirstContact { client, op, to, max_msat, contact_budget_msat, config } => {
+            let summary = format!(
+                "Approve first contact: client {client:?}, grant {op:?}, recipient {to:?}, maximum {max_msat} msat, contact budget {}.",
+                contact_budget_msat.map(|n| format!("{n} msat")).unwrap_or_else(|| "unchanged".into())
+            );
+            (config, ControlRequest::ApproveFirstContact {
+                client_id: client, grant_op_id: op, recipient: to,
+                max_total_msat: max_msat, contact_budget_msat,
+            }, summary)
+        }
+        ApprovalCommand::Gift { intro, newcomer, hash, gift_msat, fee_max_msat, code, config } => {
+            let summary = format!(
+                "Approve gift: introduction {intro:?}, newcomer {newcomer:?}, payment hash {hash:?}, gift {gift_msat} msat, maximum fee {fee_max_msat} msat, code {code:?}."
+            );
+            (config, ControlRequest::ApproveGift {
+                intro_id: intro, newcomer, payment_hash: hash, gift_msat, fee_max_msat, code,
+            }, summary)
+        }
+    };
+    println!("{summary}");
+    std::io::stdout().flush()?;
+    report(send(&config, request).await?)
+}
+
+
+#[cfg(all(test, unix))]
+mod connection_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn socket_errors_escape_controls_even_without_approval_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        for control in ['\u{061c}', '\u{feff}', '\r', '\n', '\u{1b}'].into_iter()
+            .chain('\u{200b}'..='\u{200f}')
+            .chain('\u{202a}'..='\u{202e}')
+            .chain('\u{2066}'..='\u{2069}')
+        {
+            let config = dir.path().join(format!("missing{control}dir")).join("konsensus.toml");
+            let error = send(&config, ControlRequest::Status).await.unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("owner control socket"));
+            assert!(!diagnostic.contains(&format!("missing{control}dir")), "{diagnostic:?}");
+            assert!(diagnostic.contains(&control.escape_debug().to_string()), "{diagnostic:?}");
+        }
     }
 }

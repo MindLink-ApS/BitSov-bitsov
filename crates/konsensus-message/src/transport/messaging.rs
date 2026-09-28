@@ -20,6 +20,15 @@ use super::{
 };
 use super::NoiseTransport;
 
+/// What a connection must hold for [`NoiseTransport::send_raw_frame_on`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// We settled an admission on this connection (`admission_paid`).
+    AdmissionPaid,
+    /// The peer is privileged on this connection (whitelisted or promoted by its payment).
+    Privileged,
+}
+
 // ─── impl NoiseTransport — send_frame ────────────────────────────────────────
 
 impl NoiseTransport {
@@ -59,7 +68,125 @@ impl NoiseTransport {
             .await
             .map_err(|e| TransportError::Other(e.to_string()))?;
 
+        if let Frame::PriceTable { trust_discount, .. } = frame {
+            conn.advertised_trust_discount = Some(*trust_discount);
+        }
         Ok(())
+    }
+
+    /// Persist a price offer with the exact discount advertised on this connection,
+    /// then publish it. The send lock covers persistence and publication so a
+    /// concurrent table cannot change the discount between those operations.
+    /// On a new connection, publish `initial_table` before a kind response: the
+    /// remote cache may still retain a discount from an older connection.
+    /// `persist` receives the effective discount and whether that table is needed.
+    pub async fn send_price_frame_with<F, Fut>(
+        &self,
+        peer: &NodeId,
+        frame: &Frame,
+        initial_table: &Frame,
+        persist: F,
+    ) -> Result<(), TransportError>
+    where
+        F: FnOnce(f64, bool) -> Fut,
+        Fut: std::future::Future<Output = Result<(), TransportError>>,
+    {
+        let Frame::PriceTable {
+            trust_discount: initial_discount,
+            ..
+        } = initial_table
+        else {
+            return Err(TransportError::Other("expected initial price table".into()));
+        };
+        if !matches!(
+            frame,
+            Frame::PriceTable { .. } | Frame::PriceResponse { .. }
+        ) {
+            return Err(TransportError::Other("expected a price frame".into()));
+        }
+        let conn = {
+            let peers = self.peers.read().await;
+            Arc::clone(
+                peers
+                    .get(peer)
+                    .ok_or_else(|| TransportError::NotConnected(peer.to_hex()))?,
+            )
+        };
+        let mut conn = conn.lock().await;
+        let needs_table = matches!(frame, Frame::PriceResponse { .. })
+            && conn.advertised_trust_discount.is_none();
+        let discount = match frame {
+            Frame::PriceTable { trust_discount, .. } => *trust_discount,
+            _ => conn.advertised_trust_discount.unwrap_or(*initial_discount),
+        };
+        persist(discount, needs_table).await?;
+        // Retain this same connection for both frames, even if the peer reconnects.
+        for outgoing in needs_table
+            .then_some(initial_table)
+            .into_iter()
+            .chain(std::iter::once(frame))
+        {
+            let bytes = outgoing
+                .to_bytes()
+                .map_err(|e| TransportError::WireProtocol(e.to_string()))?;
+            let encrypted = conn
+                .noise
+                .encrypt(&bytes)
+                .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+            write_noise_message(&mut conn.writer, &encrypted)
+                .await
+                .map_err(|e| TransportError::Other(e.to_string()))?;
+            if let Frame::PriceTable { trust_discount, .. } = outgoing {
+                conn.advertised_trust_discount = Some(*trust_discount);
+            }
+        }
+        Ok(())
+    }
+
+    /// Send `frame_bytes` on connection generation `since` of `peer` only, and
+    /// only while that connection holds `standing`. The connection is looked
+    /// up once and everything is checked under its lock right before the
+    /// write: a replacement (a new generation), a closed connection or one
+    /// without the standing gets nothing. `NotConnected` means nothing was
+    /// written.
+    ///
+    /// For eager session setup after a paid admission (PSI-SPEED): the prekey
+    /// goes only to the exact connection that was paid for or promoted, never
+    /// through a fresh NodeId lookup that could land on an unpaid replacement.
+    pub async fn send_raw_frame_on(
+        &self,
+        peer: &NodeId,
+        since: Instant,
+        standing: Standing,
+        frame_bytes: &[u8],
+    ) -> Result<(), TransportError> {
+        let conn = {
+            let peers = self.peers.read().await;
+            peers
+                .get(peer)
+                .filter(|conn| conn.connected_at == since)
+                .map(Arc::clone)
+                .ok_or_else(|| TransportError::NotConnected(format!(
+                    "{}: connection generation replaced or gone", peer.to_hex()
+                )))?
+        };
+        let mut state = conn.lock().await;
+        let holds = match standing {
+            Standing::AdmissionPaid => conn.admission_paid.load(std::sync::atomic::Ordering::Acquire),
+            Standing::Privileged => state.privileged,
+        };
+        if conn.is_closed() || !holds {
+            return Err(TransportError::NotConnected(format!(
+                "{}: connection closed or not {standing:?}", peer.to_hex()
+            )));
+        }
+        let encrypted = state
+            .noise
+            .encrypt(frame_bytes)
+            .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+        write_noise_message(&mut state.writer, &encrypted)
+            .await
+            .map_err(|e| TransportError::Other(e.to_string()))
     }
 
     /// M1b promote-on-paid: flip a connection's `privileged` flag to `true`.
@@ -78,19 +205,23 @@ impl NoiseTransport {
     /// reconnect starts unprivileged, the node refuses its paid invoice requests
     /// with `admission_required`, and the sender pays admission again.
     pub async fn promote_to_privileged(&self, peer: &NodeId) -> bool {
+        self.promote_to_privileged_at(peer).await.is_some()
+    }
+
+    /// [`promote_to_privileged`](Self::promote_to_privileged), returning the
+    /// generation (`connected_at`) of the exact connection promoted, so a
+    /// follow-up send can be bound to it ([`send_raw_frame_on`](Self::send_raw_frame_on)).
+    pub async fn promote_to_privileged_at(&self, peer: &NodeId) -> Option<Instant> {
         let conn = {
             let peers = self.peers.read().await;
-            match peers.get(peer) {
-                Some(c) => Arc::clone(c),
-                None => return false,
-            }
+            Arc::clone(peers.get(peer)?)
         };
-        let mut conn = conn.lock().await;
-        if !conn.privileged {
-            conn.privileged = true;
+        let mut state = conn.lock().await;
+        if !state.privileged {
+            state.privileged = true;
             info!(peer = %peer, "promoted connection to privileged after settled payment (M1b)");
         }
-        true
+        Some(conn.connected_at)
     }
 
     /// Connected peers that are currently **privileged** — whitelisted in
@@ -105,7 +236,12 @@ impl NoiseTransport {
     /// to every connected peer regardless of privilege (P2: no free X3DH before
     /// payment — no prekey before settlement).
     ///
+    /// Strictly `conn.privileged`: security callers (the rejection/corrective
+    /// price-table gate in the message handler) rely on it. A peer whose
+    /// admission WE paid is NOT in this list; see [`connected_session_peers`].
+    ///
     /// [`promote_to_privileged`]: NoiseTransport::promote_to_privileged
+    /// [`connected_session_peers`]: NoiseTransport::connected_session_peers
     pub async fn connected_privileged_peers(&self) -> Vec<NodeId> {
         // Scoped-clone the Arcs first so the `peers` read guard is not held across
         // each `conn.lock().await` (same lock-ordering discipline as `send_frame`
@@ -121,6 +257,30 @@ impl NoiseTransport {
             }
         }
         privileged
+    }
+
+    /// Connected peers eligible for E2EE session setup: privileged ones, plus
+    /// a peer whose admission WE settled on this live connection
+    /// (`Connection::admission_paid`, BUG-PSI). Offering our prekey to the node
+    /// we paid is our own choice and completes the act we bought; it is how
+    /// the session forms when the payee is the X3DH initiator.
+    ///
+    /// Use this ONLY for self-heal / prekey offers. It confers no other
+    /// authority: anything gated on privilege uses
+    /// [`connected_privileged_peers`](NoiseTransport::connected_privileged_peers).
+    /// It never adds an unpaid stranger.
+    pub async fn connected_session_peers(&self) -> Vec<NodeId> {
+        let conns: Vec<(NodeId, Arc<Connection>)> = {
+            let peers = self.peers.read().await;
+            peers.iter().map(|(id, c)| (*id, Arc::clone(c))).collect()
+        };
+        let mut eligible = Vec::with_capacity(conns.len());
+        for (id, conn) in conns {
+            if conn.admission_paid.load(std::sync::atomic::Ordering::Acquire) || conn.lock().await.privileged {
+                eligible.push(id);
+            }
+        }
+        eligible
     }
 
     /// Send raw bytes to a peer (for testing frame validation budget).
@@ -282,10 +442,18 @@ pub(super) fn spawn_reader_task(
             // promote_to_privileged flips this flag; reading it per frame means a
             // promotion is honoured on the very next frame. In Whitelist mode this
             // is always `true`, so every stamped arm behaves byte-identically.
-            let (privileged, source_ip) = {
-                let mut conn = conn.lock().await;
-                conn.last_recv = Instant::now();
-                (conn.privileged, conn.source_ip)
+            //
+            // BUG-PSI: `bought` also admits the frames of a peer whose admission
+            // WE settled on this connection (`admission_paid`, set before our
+            // proof goes out): the replies that complete the act we paid for —
+            // its session handshake, acks/rejects of our messages and its prices.
+            // Every other frame (peer exchange, Lightning info, gossip, price
+            // queries, invoice requests) keeps plain `privileged`.
+            let (privileged, bought, source_ip) = {
+                let mut state = conn.lock().await;
+                state.last_recv = Instant::now();
+                let paid = conn.admission_paid.load(std::sync::atomic::Ordering::Acquire);
+                (state.privileged, state.privileged || paid, state.source_ip)
             };
 
             // Handle frame
@@ -321,13 +489,14 @@ pub(super) fn spawn_reader_task(
                     info!(peer = %peer_id, %reason, "peer disconnected gracefully");
                     break;
                 }
-                Frame::MessageAck { id } => {
+                Frame::MessageAck { id, duplicate } => {
                     debug!(peer = %peer_id, msg_id = %id, "received message ack");
                     if let Err(e) = control_tx
                         .send(ControlEvent::MessageAcked {
+                            duplicate,
                             peer_id,
                             message_id: id,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -341,7 +510,7 @@ pub(super) fn spawn_reader_task(
                             peer_id,
                             message_id: id,
                             reason,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -354,7 +523,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::PrekeyOffer {
                             peer_id,
                             bundle,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -367,7 +536,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::SessionInit {
                             peer_id,
                             init_data,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -377,7 +546,7 @@ pub(super) fn spawn_reader_task(
                 Frame::SessionAck => {
                     debug!(peer = %peer_id, "received session ack");
                     if let Err(e) = control_tx
-                        .send(ControlEvent::SessionAck { peer_id, privileged })
+                        .send(ControlEvent::SessionAck { peer_id, privileged: bought })
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send SessionAck control event");
@@ -389,7 +558,7 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::RatchetInit {
                             peer_id,
                             payload,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -489,7 +658,7 @@ pub(super) fn spawn_reader_task(
                             block_height,
                             valid_blocks,
                             trust_discount,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {
@@ -523,7 +692,7 @@ pub(super) fn spawn_reader_task(
                             kind,
                             price_msat,
                             block_height,
-                            privileged,
+                            privileged: bought,
                         })
                         .await
                     {

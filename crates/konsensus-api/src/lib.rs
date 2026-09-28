@@ -232,6 +232,20 @@ pub async fn serve(
             }
         }
     });
+    // Recovery only polls recorded payments and queues their encrypted envelopes.
+    let operation_state = state.clone();
+    let mut operation_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => if let Err(error) = handlers::messages::reconcile_operations(&operation_state).await {
+                    tracing::warn!(%error, "outbox operation reconciliation failed");
+                },
+                _ = operation_shutdown.changed() => break,
+            }
+        }
+    });
     let app = build_router(state).into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -19,7 +19,7 @@ One person funds another. The inviter's node pays a small, capped gift of its ow
 | 3 | newcomer | `POST /api/v1/sponsor/request {link}` | receive | Verifies the card and offer (same key, same `intro_id`, network, expiry, strict Ed25519). Creates one invoice of exactly the offered gift, registers its hash as funding-only (fails closed), and signs a `FundingRequest`. Returns `bitsov://sponsor-request#…` and a six-digit code. |
 | 4 | in person | — | — | The newcomer shows the request as a QR; both people compare the six digits. |
 | 5 | sponsor | `POST /api/v1/sponsor/candidate {request}` | spend (metered) | Verifies the signature, that the request is for this sponsor, and that the invoice currency matches the configured Bitcoin network and pays the bound Lightning key the exact amount with the exact hash. Freezes the request as the kit's only candidate; a different one is refused, not swapped in. |
-| 6 | sponsor | `POST /api/v1/sponsor/approve {intro_id, newcomer, payment_hash, gift_msat, fee_max_msat, code}` | independent owner spend | Requires the exact funding intent returned by `/candidate` and the compared code. Re-checks active-kit exclusivity, purse and daily count, then **atomically consumes the single-use intent with the gift + fee reservation before dispatch**. Paired/G1 approvals return `409 sponsor_owner_approval_required`. |
+| 6 | sponsor | App/owner handoff: `konsensus approve gift …` (#92/#94). HTTP `POST /api/v1/sponsor/approve {…}` remains owner-credential territory | independent owner spend | Requires the exact funding intent returned by `/candidate` and the compared code. Re-checks active-kit exclusivity, purse and daily count, then **atomically consumes the single-use intent with the gift + fee reservation before dispatch**. Paired/G1 approvals return `409 sponsor_owner_approval_required` (#91). |
 | 7 | newcomer | `GET /api/v1/sponsor/request/:hash` | read | `waiting` or `received`. |
 
 - **Outcomes of step 6:** settled → `funded`. Failed or not dispatched → `failed`: the kit closes and its purse reservation is released. Anything else → `unknown`: the reservation stays until `POST /api/v1/sponsor/kits/:id/reconcile` finds a definitive outgoing record.
@@ -58,3 +58,5 @@ Both records are compact binary behind base64url and use strict Ed25519 (weak an
 - On-chain reserve gifts (the 25,000-sat anchor reserve) and JIT/LSPS2 funding of the gift. The pilot pays an ordinary invoice.
 - A newcomer-side messaging grant scoped to the inviter. The newcomer's existing G1 budget and first-contact OK apply.
 - A transport frame for the request, and the anti-amplification challenge on a public door.
+
+Owner terminal commands for the app handoff: [Owner approvals](OWNER-APPROVALS.md).

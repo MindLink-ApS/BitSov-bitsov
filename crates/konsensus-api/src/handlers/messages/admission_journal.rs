@@ -19,6 +19,16 @@ pub(super) struct ReadmissionSettlement {
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Attempt {
+    /// False proves the operation-journal handshake has not reached dispatch.
+    /// Legacy journals remain conservatively dispatched.
+    #[serde(default = "legacy_proof_delivered")]
+    pub dispatch_started: bool,
+    #[serde(default)]
+    pub previous_attempt: Option<Box<Attempt>>,
+    #[serde(default)]
+    pub operation: Option<crate::spend_budget::OperationReservationLink>,
+    #[serde(default)]
+    pub max_routing_fee_msat: Option<u64>,
     pub payment_hash: String,
     pub amount_msat: u64,
     pub quote: Option<(u16, u64)>,
@@ -31,6 +41,14 @@ pub(super) struct Attempt {
     pub message_may_have_dispatched: bool,
     #[serde(default)]
     pub readmission: Option<ReadmissionSettlement>,
+    /// Whether the proof in `envelope` may have gone out. A journal written
+    /// before this field existed counts as delivered: its proof may have been
+    /// consumed, so it is never re-sent on a replacement connection.
+    #[serde(default = "legacy_proof_delivered")]
+    pub proof_delivered: bool,
+}
+fn legacy_proof_delivered() -> bool {
+    true
 }
 fn error(e: impl std::fmt::Display) -> ApiError {
     ApiError::Storage(format!("admission journal: {e}"))
@@ -106,4 +124,32 @@ pub(super) fn clear_failed(state: &AppState, peer: &NodeId) -> Result<(), ApiErr
         }
     }
     clear(state, peer)
+}
+
+
+/// Remove only the exact known-undispatched guard, restoring any earlier record.
+/// Persisted intent makes cancellation/process death during the async operation
+/// write recoverable too; a legacy or possibly-dispatched attempt is untouched.
+pub(super) fn undo_undispatched(state: &AppState, peer: &NodeId, hash: &str) -> Result<bool, ApiError> {
+    let Some(attempt) = load(state, peer)? else { return Ok(false); };
+    if attempt.payment_hash != hash || attempt.dispatch_started { return Ok(false); }
+    if let (Some(service), Some(original)) = (&state.pairing, &attempt.original_reservation) {
+        service.try_resolve_spend(original, &peer.to_hex(), 0).map_err(error)?;
+    }
+    match attempt.previous_attempt {
+        Some(previous) => save(state, peer, &previous)?,
+        None => clear(state, peer)?,
+    }
+    Ok(true)
+}
+
+/// Checkpoint positive non-dispatch before any cancellable operation-store await.
+pub(super) fn mark_undispatched(state: &AppState, peer: &NodeId, hash: &str) -> Result<(), ApiError> {
+    if let Some(mut attempt) = load(state, peer)? {
+        if attempt.payment_hash == hash {
+            attempt.dispatch_started = false;
+            save(state, peer, &attempt)?;
+        }
+    }
+    Ok(())
 }

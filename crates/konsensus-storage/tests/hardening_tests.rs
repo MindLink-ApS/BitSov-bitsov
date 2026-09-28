@@ -559,7 +559,7 @@ async fn clear_pending_for_peer_removes_all() {
 }
 
 #[tokio::test]
-async fn cleanup_stale_pending_removes_high_attempt_entries() {
+async fn cleanup_stale_pending_stalls_high_attempt_entries() {
     let db = setup().await;
     let env = make_envelope(0, 1, 2, 1_000);
     db.store_message(&env).await.unwrap();
@@ -572,10 +572,11 @@ async fn cleanup_stale_pending_removes_high_attempt_entries() {
         db.increment_pending_attempts(&env.id, &recipient).await.unwrap();
     }
 
-    // Cleanup with max_attempts=3 should remove this entry
+    // Cleanup with max_attempts=3 should stall this entry
     let removed = db.cleanup_stale_pending(3).await.unwrap();
     assert_eq!(removed, 1);
-    assert!(db.get_pending_for_peer(&recipient).await.unwrap().is_empty());
+    assert_eq!(db.get_pending_for_peer(&recipient).await.unwrap().len(), 1);
+    assert_eq!(db.cleanup_stale_pending(3).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -789,7 +790,7 @@ async fn delete_message_cascades_to_pending_deliveries() {
 }
 
 #[tokio::test]
-async fn delete_messages_older_than_cascades_to_pending_deliveries() {
+async fn retention_keeps_messages_with_pending_deliveries() {
     let db = setup().await;
 
     // Store 3 messages: two old (ts=1000, 2000) and one new (ts=100_000)
@@ -808,10 +809,10 @@ async fn delete_messages_older_than_cascades_to_pending_deliveries() {
     db.queue_pending_delivery(&new1.id, &peer4).await.unwrap();
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 3);
 
-    // Delete messages older than ts=50_000 — should remove old1, old2 and their deliveries
+    // Retention must not discard old paid messages awaiting acceptance.
     let deleted = db.delete_messages_older_than(50_000).await.unwrap();
-    assert_eq!(deleted, 2);
-    assert_eq!(db.count_pending_deliveries().await.unwrap(), 1);
+    assert_eq!(deleted, 0);
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 3);
 
     // The remaining delivery should be for the new message
     let remaining = db.get_pending_for_peer(&peer4).await.unwrap();

@@ -92,7 +92,8 @@ pub(crate) async fn whitelist_then_verify(
     trust_discount: f64,
     our_node_id: Option<&konsensus_core::types::NodeId>,
     admission_mode: konsensus_message::ReachabilityMode,
-) -> Result<(), konsensus_core::gate::GateRejection> {
+    commit_replay: bool,
+) -> Result<(bool, bool), konsensus_core::gate::GateRejection> {
     // Snapshot the whitelist UNCONDITIONALLY (preserves the HARD-11
     // lock-release-before-await seam even in PriceOpen, where the snapshot is
     // ignored). Only the cheap Arc clone is held across the gate await.
@@ -111,24 +112,20 @@ pub(crate) async fn whitelist_then_verify(
             konsensus_message::ReachabilityMode::Whitelist => Some(&whitelist),
             konsensus_message::ReachabilityMode::PriceOpen => None,
         };
-    let result = gate.verify(
-        envelope,
-        nonce_store,
-        pricing,
-        wl_arg,
-        lightning,
-        trust_discount,
-        our_node_id,
-    )
-    .await;
-    // Emit exactly once at the gate boundary, before relay dispatch, storage,
-    // decryption or ACK can take an early exit. Membership is the same snapshot
-    // used for this decision; never take another registry lock to classify it.
+    let result = if commit_replay {
+        gate.verify(envelope, nonce_store, pricing, wl_arg, lightning, trust_discount, our_node_id).await.map(|()| false)
+    } else {
+        gate.validate_received_paid_envelope(envelope, nonce_store, pricing, wl_arg, lightning, trust_discount, our_node_id).await
+    };
+    // Ordinary admission is observed only after the durable acceptance commit.
+    // Return the same whitelist snapshot classification across that boundary.
+    let first_contact = !whitelist.contains(&envelope.sender);
     match &result {
-        Ok(()) => { membrane.admitted(envelope, !whitelist.contains(&envelope.sender)); }
+        Ok(_) if commit_replay => { membrane.admitted(envelope, first_contact); }
         Err(rejection) => { membrane.refused(envelope, rejection); }
+        _ => {}
     }
-    result
+    result.map(|already_accepted| (first_contact, already_accepted))
 }
 
 /// Cooldown between corrective price-table resends to the same privileged peer.
@@ -156,6 +153,47 @@ fn corrective_price_table_rate_limited(
     }
     last_sent.insert(*peer, now);
     false
+}
+
+/// PSI-SPEED: offer our X3DH prekey to `peer` right after a settled payment
+/// promoted its connection (generation `promoted`), so the session forms now rather than on the next
+/// self-heal tick. Skipped when a sending chain already exists (an offer would
+/// make a lower-NodeId peer replace a working session) or when the limiter
+/// refuses; the periodic self-heal remains the fallback either way.
+async fn offer_prekey_after_promotion(
+    transport: &NoiseTransport,
+    sessions: &SessionManager,
+    peer: &konsensus_core::types::NodeId,
+    promoted: std::time::Instant,
+    limiter: &mut konsensus_message::EagerOfferLimiter,
+) {
+    if sessions.can_send(peer).await {
+        return;
+    }
+    if !limiter.allow(peer, std::time::Instant::now()) {
+        debug!(peer = %peer, "eager PrekeyOffer rate-limited; self-heal will offer");
+        return;
+    }
+    let bundle = match serde_json::to_value(sessions.prekey_bundle().await) {
+        Ok(bundle) => bundle,
+        Err(e) => {
+            warn!(peer = %peer, error = %e, "failed to serialize prekey bundle for eager offer");
+            return;
+        }
+    };
+    let frame = match (Frame::PrekeyOffer { bundle }).to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(peer = %peer, error = %e, "failed to encode eager PrekeyOffer");
+            return;
+        }
+    };
+    // Only on the exact connection this payment promoted, and only while it is
+    // still privileged: a replacement that reconnected meanwhile is unpaid.
+    match transport.send_raw_frame_on(peer, promoted, konsensus_message::Standing::Privileged, &frame).await {
+        Ok(()) => info!(peer = %peer, "sent PrekeyOffer to the payer just promoted (PSI-SPEED)"),
+        Err(e) => warn!(peer = %peer, error = %e, "failed to send eager PrekeyOffer after promotion"),
+    }
 }
 
 /// Runs the incoming message handler loop.
@@ -190,6 +228,11 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
         konsensus_core::types::NodeId,
         tokio::time::Instant,
     > = std::collections::HashMap::new();
+
+    // PSI-SPEED: bounds the prekey offers sent right after promote-on-paid.
+    // Separate from the other two eager limiters on purpose; see `eager_offers`
+    // in the compose handler.
+    let mut eager_offers = konsensus_message::EagerOfferLimiter::new();
 
     // Doorway hardening #3: wrap the settlement-verification provider in a
     // circuit-breaker (timeout + breaker + bounded concurrency + short negative
@@ -227,7 +270,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // `whitelist_then_verify` so the HARD-11
                         // lock-release-before-await contract is directly
                         // unit-testable (tests::whitelist_read_guard_released_*).
-                        let gate_result = whitelist_then_verify(
+                        let is_relay_control = relay_engine_for_recv.is_some()
+                            && konsensus_core::kind::KindCategory::from_kind(envelope.kind)
+                                == konsensus_core::kind::KindCategory::Storage;
+                        let mut gate_result = whitelist_then_verify(
                             &envelope,
                             audit_for_recv.membrane(),
                             peer_registry_for_recv.as_ref(),
@@ -242,8 +288,54 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             // M1a: Whitelist => Step-2 membership enforced;
                             // PriceOpen => membership skipped, payment still gates.
                             admission_mode_for_recv,
+                            is_relay_control,
                         )
                         .await;
+
+                        if matches!(gate_result, Ok((_, true))) {
+                            let ack = Frame::MessageAck { id: msg_id, duplicate: true };
+                            if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
+                                warn!(error = %e, "failed to send duplicate ACK");
+                            }
+                            continue;
+                        }
+
+                        if gate_result.is_ok() && !is_relay_control {
+                            use konsensus_storage::PaidAcceptance;
+                            match storage_for_recv.accept_paid_envelope(&envelope).await {
+                                Ok(PaidAcceptance::Accepted) => {
+                                    audit_for_recv.membrane().admitted(&envelope, gate_result.as_ref().expect("validated").0);
+                                }
+                                Ok(PaidAcceptance::AlreadyAccepted) => {
+                                    // No second promotion, decrypt, application side effect or write.
+                                    let ack = Frame::MessageAck { id: msg_id, duplicate: true };
+                                    if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
+                                        warn!(error = %e, "failed to send duplicate ACK");
+                                    }
+                                    continue;
+                                }
+                                Ok(PaidAcceptance::NonceReused) => {
+                                    let rejection = konsensus_core::gate::GateRejection::ReplayDetected;
+                                    audit_for_recv.membrane().refused(&envelope, &rejection);
+                                    gate_result = Err(rejection);
+                                }
+                                Ok(PaidAcceptance::PaymentReused) => {
+                                    let rejection = konsensus_core::gate::GateRejection::PaymentProofReused {
+                                        payment_hash: hex::encode(envelope.payment_proof.payment_hash),
+                                    };
+                                    audit_for_recv.membrane().refused(&envelope, &rejection);
+                                    gate_result = Err(rejection);
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "atomic paid acceptance failed; replay keys rolled back");
+                                    audit_for_recv.membrane().refused(&envelope,
+                                        &konsensus_core::gate::GateRejection::NonceCheckFailed(e.to_string()));
+                                    let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                            }
+                        }
 
                         if let Err(rejection) = gate_result {
                             // Increment the appropriate Prometheus counter based on
@@ -326,7 +418,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         // sender above — no second wallet weight lookup.
                                         trust_discount,
                                     };
-                                    if let Err(e) = transport_for_ack.send_frame(&sender, &price_frame).await {
+                                    if let Err(e) = crate::delivery_prices::send_price_frame(&transport_for_ack, storage_for_recv.as_ref(), &sender, &price_frame, pricing_for_recv.as_ref()).await {
                                         warn!(peer = %sender, error = %e, "failed to send corrective price table");
                                     } else {
                                         info!(peer = %sender, "sent corrective price table after payment mismatch");
@@ -347,12 +439,28 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // as `sender` is flipped (binding: envelope.sender ==
                         // connection.peer_id). In Whitelist mode the peer is already
                         // privileged, so this is a no-op (byte-identical).
+                        //
+                        // PSI-SPEED: offer our prekey on that connection now,
+                        // instead of on the next self-heal tick (up to 15 s).
+                        // Only the connection just promoted by this payment is
+                        // offered to, never an unpaid peer, and the offer is
+                        // rate-limited (`EagerOfferLimiter`).
                         if matches!(
                             admission_mode_for_recv,
                             konsensus_message::ReachabilityMode::PriceOpen
-                        ) && !transport_for_recv.promote_to_privileged(&sender).await
-                        {
-                            debug!(sender = %sender, "paid sender has no live connection to promote (relayed/offline proof)");
+                        ) {
+                            if let Some(promoted) = transport_for_recv.promote_to_privileged_at(&sender).await {
+                                offer_prekey_after_promotion(
+                                    &transport_for_ack,
+                                    &session_mgr_for_recv,
+                                    &sender,
+                                    promoted,
+                                    &mut eager_offers,
+                                )
+                                .await;
+                            } else {
+                                debug!(sender = %sender, "paid sender has no live connection to promote (relayed/offline proof)");
+                            }
                         }
 
                         // R3 SEAM-B (Route B) — relay-control intercept. Fires only
@@ -387,19 +495,6 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                         }
 
-                        // Gate passed — store the message (must succeed before ACK)
-                        if let Err(e) = storage_for_recv.store_message(&envelope).await {
-                            error!(error = %e, "failed to store incoming message — rejecting");
-                            let reject = Frame::MessageReject {
-                                id: msg_id,
-                                reason: "storage error".to_string(),
-                            };
-                            if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
-                                warn!(peer = %sender, error = %e, "failed to send MessageReject after storage failure");
-                            }
-                            continue;
-                        }
-
                         // Attempt to decrypt ciphertext via Double Ratchet session
                         let plaintext = decrypt_and_process(
                             &envelope,
@@ -426,7 +521,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         }
 
                         // Send MessageAck back to sender
-                        let ack = Frame::MessageAck { id: msg_id };
+                        let ack = Frame::MessageAck { id: msg_id, duplicate: false };
                         if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
                             warn!(peer = %sender, error = %e, "failed to send MessageAck");
                         }

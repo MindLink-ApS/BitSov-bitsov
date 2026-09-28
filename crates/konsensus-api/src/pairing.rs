@@ -509,6 +509,7 @@ struct ReservationAuthority<'a> {
     expected_op_id: Option<&'a str>,
     liquidity: bool,
     before_persist: Option<ReservationJournal<'a>>,
+    operation: Option<crate::spend_budget::OperationReservationLink>,
 }
 
 /// Consumed, single-use authorization. Its grant identity survives the handoff
@@ -1741,6 +1742,33 @@ impl PairingService {
             || chrono::Utc::now().timestamp())
     }
 
+    pub(crate) fn reserve_operation_spend(
+        &self, client_id: &str, epoch: u64, charges: Vec<Charge>,
+        operation: crate::spend_budget::OperationReservationLink,
+    ) -> Result<Reservation, BudgetRefusal> {
+        let mut inner = self.lock();
+        self.reserve_spend_locked(&mut inner, client_id, epoch, charges,
+            ReservationAuthority { operation: Some(operation), ..Default::default() },
+            || chrono::Utc::now().timestamp())
+    }
+
+    /// Discover even reservations whose async SQL attachment never ran.
+    pub(crate) fn pending_operation_reservations(&self) -> Vec<(crate::spend_budget::OperationReservationLink, Reservation)> {
+        let inner = self.lock();
+        let mut result = Vec::new();
+        for grant in &inner.file.grants {
+            let Some(budget) = &grant.budget else { continue; };
+            for (id, link) in &budget.operation_links {
+                let Some(pending) = budget.pending.get(id) else { continue; };
+                result.push((link.clone(), Reservation {
+                    id: id.clone(), client_id: grant.client_id.clone(), op_id: grant.op_id.clone(),
+                    charges: pending.iter().map(|(recipient, amount_msat)| Charge { recipient: recipient.clone(), amount_msat: *amount_msat }).collect(),
+                }));
+            }
+        }
+        result
+    }
+
     /// Persist an operation's reconciliation reference before its grant debit.
     /// The callback must not re-enter this service. A crash can leave the
     /// operation reserved without a debit, but never an orphaned grant debit.
@@ -1802,6 +1830,9 @@ impl PairingService {
         // An empty fanout moves no value and grants no dispatch authority.
         if !recipients.is_empty() {
             budget.pending.insert(id.clone(), recipients);
+            if let Some(link) = authority.operation {
+                budget.operation_links.insert(id.clone(), link);
+            }
         }
         let reservation = Reservation { id, client_id: client_id.to_string(), op_id: op_id.clone(), charges };
         if let Err(e) = authority.before_persist.map_or(Ok(()), |save| save(&reservation)) {
@@ -1898,13 +1929,22 @@ impl PairingService {
                 });
             }
         }
+        if let Some(contact_budget) = contact_budget_msat {
+            if contact_budget < max_total_msat || contact_budget > budget.budget_msat
+                || budget.per_recipient_msat.get(&recipient).is_some_and(|cap| *cap != contact_budget)
+            {
+                return Err(BudgetRefusal::FirstContact(
+                    "contact budget must cover this approval, fit the grant total and match any existing recipient cap".into(),
+                ));
+            }
+        }
         let issued = FirstContactGrant {
             recipient,
             max_total_msat,
             expires_at: (now + FIRST_CONTACT_GRANT_TTL_SECS).min(grant.expires_at),
         };
         let budget_op_id = grant.op_id.clone();
-        if let Some(contact_budget) = contact_budget_msat.filter(|b| *b > 0) {
+        if let Some(contact_budget) = contact_budget_msat {
             let idx = inner
                 .file
                 .grants
@@ -1914,8 +1954,7 @@ impl PairingService {
             let before = inner.file.grants[idx].budget.clone();
             if let Some(budget) = inner.file.grants[idx].budget.as_mut() {
                 if !budget.per_recipient_msat.contains_key(&issued.recipient) {
-                    let cap = contact_budget.min(budget.budget_msat);
-                    budget.per_recipient_msat.insert(issued.recipient.clone(), cap);
+                    budget.per_recipient_msat.insert(issued.recipient.clone(), contact_budget);
                 }
             }
             if inner.file.grants[idx].budget != before {
@@ -2003,11 +2042,18 @@ impl PairingService {
     /// and which bounds the amount. There is no durable admission object: the
     /// admission is re-proven by a new settled payment, debited like any other.
     pub fn reserve_readmission(
+        &self, parent: &Reservation, recipient: &str, amount_msat: u64, call_reserved_msat: u64,
+    ) -> Result<Reservation, BudgetRefusal> {
+        self.reserve_readmission_operation(parent, recipient, amount_msat, call_reserved_msat, None)
+    }
+
+    pub(crate) fn reserve_readmission_operation(
         &self,
         parent: &Reservation,
         recipient: &str,
         amount_msat: u64,
         call_reserved_msat: u64,
+        operation: Option<crate::spend_budget::OperationReservationLink>,
     ) -> Result<Reservation, BudgetRefusal> {
         let recipient = crate::spend_budget::canonical_recipient(recipient)
             .ok_or(BudgetRefusal::NoGrant)?;
@@ -2036,23 +2082,28 @@ impl PairingService {
         // Eligibility and reservation share the replacement/revocation mutex.
         self.reserve_spend_locked(&mut inner, &parent.client_id, epoch,
             vec![Charge { recipient, amount_msat }],
-            ReservationAuthority { expected_op_id: Some(&parent.op_id), ..Default::default() },
+            ReservationAuthority { expected_op_id: Some(&parent.op_id), operation, ..Default::default() },
             || chrono::Utc::now().timestamp())
     }
 
     /// Reserve a consumed approval against its exact original grant. The
     /// opaque value is not cloneable and cannot be deserialized from a request.
-    pub fn reserve_first_contact(
+    pub fn reserve_first_contact(&self, approval: FirstContactAuthorization, cap: Option<u64>) -> Result<Reservation, BudgetRefusal> {
+        self.reserve_first_contact_operation(approval, cap, None)
+    }
+
+    pub(crate) fn reserve_first_contact_operation(
         &self,
         approval: FirstContactAuthorization,
         cap: Option<u64>,
+        operation: Option<crate::spend_budget::OperationReservationLink>,
     ) -> Result<Reservation, BudgetRefusal> {
         let amount_msat = cap.unwrap_or(approval.max_total_msat).min(approval.max_total_msat);
         let mut inner = self.lock();
         if approval.expires_at <= chrono::Utc::now().timestamp() { return Err(BudgetRefusal::NoGrant); }
         self.reserve_spend_locked(&mut inner, &approval.client_id, approval.epoch,
             vec![Charge { recipient: approval.recipient, amount_msat }],
-            ReservationAuthority { expected_op_id: Some(&approval.budget_op_id), ..Default::default() },
+            ReservationAuthority { expected_op_id: Some(&approval.budget_op_id), operation, ..Default::default() },
             || chrono::Utc::now().timestamp())
     }
 
@@ -2134,22 +2185,32 @@ impl PairingService {
     /// that was revoked, replaced or has expired does nothing: there is no
     /// budget left to return the sats to.
     pub fn resolve_spend(&self, reservation: &Reservation, recipient: &str, actual_msat: u64) {
+        if let Err(e) = self.try_resolve_spend(reservation, recipient, actual_msat) {
+            tracing::warn!(error = %e, "spend ledger resolution not persisted; reservation retained");
+        }
+    }
+
+    pub(crate) fn try_resolve_spend(&self, reservation: &Reservation, recipient: &str, actual_msat: u64) -> Result<(), PairingError> {
         let mut inner = self.lock();
         let Some(grant) = inner.file.grants.iter_mut().find(|g|
             g.op_id == reservation.op_id && g.client_id == reservation.client_id
-        ) else { return; };
-        let Some(budget) = grant.budget.as_mut() else { return; };
+        ) else { return Ok(()); };
+        let Some(budget) = grant.budget.as_mut() else { return Ok(()); };
         let before = budget.clone();
-        let Some(recipients) = budget.pending.get_mut(&reservation.id) else { return; };
-        let Some(reserved) = recipients.remove(recipient) else { return; };
-        if recipients.is_empty() { budget.pending.remove(&reservation.id); }
+        let Some(recipients) = budget.pending.get_mut(&reservation.id) else { return Ok(()); };
+        let Some(reserved) = recipients.remove(recipient) else { return Ok(()); };
+        if recipients.is_empty() {
+            budget.pending.remove(&reservation.id);
+            budget.operation_links.remove(&reservation.id);
+        }
         budget.resolve(recipient, reserved, actual_msat);
         if let Err(e) = self.persist(&mut inner.file) {
             if let Some(grant) = inner.file.grants.iter_mut().find(|g| g.op_id == reservation.op_id) {
                 grant.budget = Some(before);
             }
-            tracing::warn!(error = %e, "spend ledger resolution not persisted; reservation retained");
+            return Err(e);
         }
+        Ok(())
     }
 
     /// Revoke spend grants now: one client's, or every client's. Returns how

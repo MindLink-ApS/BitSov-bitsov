@@ -9,6 +9,18 @@ use thiserror::Error;
 /// API errors — converted to appropriate HTTP status codes.
 #[derive(Debug, Error)]
 pub enum ApiError {
+    #[error("{source}")]
+    Operation { source: Box<ApiError>, operation_id: String, state: String, payment_hash: Option<String>, retry_allowed: bool },
+    #[error("{0}")]
+    OperationConflict(&'static str),
+    #[error("Lightning is offline or synchronizing; retry when money_ready is true")]
+    NotReady,
+
+    #[error("{source}")]
+    RoutingFee { source: Box<ApiError>, max_routing_fee_msat: u64 },
+    /// The backend positively refused the operation before any dispatch.
+    #[error("not dispatched: {0}")]
+    NotDispatched(String),
     #[error("recipient backend does not support stateless first-contact quotes")]
     StatelessQuoteUnsupported,
 
@@ -85,22 +97,50 @@ struct ErrorBody {
     code: u16,
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
+impl ApiError {
+    pub(crate) fn with_routing_fee(self, max_routing_fee_msat: u64) -> Self {
+        Self::RoutingFee { source: Box::new(self), max_routing_fee_msat }
+    }
+    fn response_parts(&self) -> (StatusCode, serde_json::Value) {
+        if let Self::Operation { source, operation_id, state, payment_hash, retry_allowed } = self {
+            let (status, mut body) = source.response_parts();
+            body["operation_id"] = operation_id.clone().into(); body["state"] = state.clone().into();
+            body["payment_hash"] = serde_json::json!(payment_hash);
+            body["accepted"] = false.into(); body["retry_allowed"] = (*retry_allowed).into();
+            return (status, body);
+        }
+        if let Self::OperationConflict(code) = self {
+            return (StatusCode::CONFLICT, serde_json::json!({"error": code, "code": code}));
+        }
+        if matches!(self, Self::NotReady) {
+            return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                "error": self.to_string(), "code": "not_ready", "money_ready": false
+            }));
+        }
+        if let Self::RoutingFee { source, max_routing_fee_msat } = self {
+            let (status, mut body) = source.response_parts();
+            body["max_routing_fee_msat"] = (*max_routing_fee_msat).into();
+            return (status, body);
+        }
+        if let Self::NotDispatched(reason) = self {
+            return (StatusCode::BAD_REQUEST, serde_json::json!({
+                "error": reason, "code": "not_dispatched"
+            }));
+        }
         if matches!(self, ApiError::StatelessQuoteUnsupported) {
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
                 "error": self.to_string(), "code": "stateless_quote_unsupported"
-            }))).into_response();
+            }));
         }
         if let ApiError::PriceCapExceeded(message) = &self {
-            return (StatusCode::CONFLICT, Json(serde_json::json!({
+            return (StatusCode::CONFLICT, serde_json::json!({
                 "error": message, "code": "price_cap_exceeded"
-            }))).into_response();
+            }));
         }
         if let ApiError::PaymentProofUnavailable { amount_msat, reason } = &self {
-            return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            return (StatusCode::BAD_GATEWAY, serde_json::json!({
                 "error": reason, "code": "payment_settled_send_incomplete", "amount_msat": amount_msat
-            }))).into_response();
+            }));
         }
         if let ApiError::BudgetExceeded(refusal) = &self {
             let remaining = match refusal {
@@ -110,15 +150,15 @@ impl IntoResponse for ApiError {
                 }
                 _ => None,
             };
-            return (StatusCode::CONFLICT, Json(serde_json::json!({
+            return (StatusCode::CONFLICT, serde_json::json!({
                 "error": refusal.to_string(),
                 "code": "budget_exceeded",
                 "reason": refusal.reason(),
                 "remaining_msat": remaining,
-            }))).into_response();
+            }));
         }
         let (status, message) = match &self {
-            ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
+            ApiError::Operation { .. } | ApiError::OperationConflict(_) | ApiError::NotReady | ApiError::RoutingFee { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
@@ -139,7 +179,32 @@ impl IntoResponse for ApiError {
             code: status.as_u16(),
         };
 
+        (status, serde_json::to_value(body).expect("error body serializes"))
+    }
+}
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, body) = self.response_parts();
         (status, Json(body)).into_response()
+    }
+}
+
+/// Check before parsing payment details, consuming grants, or issuing invoices.
+pub(crate) async fn require_money_ready(state: &crate::state::AppState) -> Result<(), ApiError> {
+    if state.lightning.money_ready().await { Ok(()) } else { Err(ApiError::NotReady) }
+}
+
+impl From<konsensus_core::traits::lightning::LightningError> for ApiError {
+    fn from(error: konsensus_core::traits::lightning::LightningError) -> Self {
+        match error {
+            konsensus_core::traits::lightning::LightningError::NotReady => Self::NotReady,
+            // Preserve positive non-dispatch evidence for every generic caller.
+            // Unclassified failures must remain ambiguous, regardless of their text.
+            konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(reason) => {
+                Self::NotDispatched(reason)
+            }
+            other => Self::Lightning(other.to_string()),
+        }
     }
 }
 
@@ -154,6 +219,43 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn lightning_conversion_preserves_only_proven_non_dispatch() {
+        use konsensus_core::traits::lightning::LightningError;
+        let (status, body) = error_body(ApiError::from(
+            LightningError::PaymentNotDispatched("fee ceiling exceeded".into()),
+        )).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "not_dispatched");
+        assert_eq!(body["error"], "fee ceiling exceeded");
+        assert!(body.get("max_routing_fee_msat").is_none());
+        for error in [
+            LightningError::Connection("response lost".into()),
+            LightningError::Backend("not dispatched (untrusted backend text)".into()),
+            LightningError::PaymentFailed("failed".into()),
+        ] {
+            let (status, body) = error_body(ApiError::from(error)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body["code"], 502);
+        }
+        let (status, body) = error_body(ApiError::from(LightningError::NotReady)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "not_ready");
+    }
+
+    #[tokio::test]
+    async fn not_dispatched_keeps_400_and_code_when_wrapped_with_routing_fee() {
+        for ceiling in [0, 5_000] {
+            let (status, body) = error_body(
+                ApiError::NotDispatched("announce_unavailable".into()).with_routing_fee(ceiling),
+            ).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "not_dispatched");
+            assert_eq!(body["error"], "announce_unavailable");
+            assert_eq!(body["max_routing_fee_msat"], ceiling);
+        }
     }
 
     #[tokio::test]

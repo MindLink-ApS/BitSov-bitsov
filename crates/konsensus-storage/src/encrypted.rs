@@ -348,9 +348,86 @@ impl<S: Storage> EncryptedStorage<S> {
 
 #[async_trait]
 impl<S: Storage> Storage for EncryptedStorage<S> {
+    async fn record_outbox_sent(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
+        self.inner.record_outbox_sent(id, peer).await
+    }
+
+    async fn commit_outbox_envelope(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        let mut encrypted = op.clone(); encrypted.recovery = self.encrypt(&op.recovery)?;
+        self.inner.commit_outbox_envelope(&encrypted, &self.encrypt_envelope(envelope)?).await
+    }
+
+    async fn insert_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+        let mut encrypted = op.clone();
+        encrypted.recovery = self.encrypt(&op.recovery)?;
+        self.inner.insert_outbox_operation(&encrypted).await
+    }
+    async fn update_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
+        let mut encrypted = op.clone();
+        encrypted.recovery = self.encrypt(&op.recovery)?;
+        self.inner.update_outbox_operation(&encrypted).await
+    }
+    async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
+        let mut op = self.inner.get_outbox_operation(id).await?;
+        if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        Ok(op)
+    }
+    async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        let mut ops = self.inner.list_recoverable_operations().await?;
+        for op in &mut ops { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        Ok(ops)
+    }
+
+    async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        let mut ops = self.inner.list_compactable_operations(before_ms, limit).await?;
+        for op in &mut ops { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        Ok(ops)
+    }
+
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
         let encrypted = self.encrypt_envelope(envelope)?;
         self.inner.store_message(&encrypted).await
+    }
+
+    async fn record_delivery_prices(&self, sender: &NodeId, prices: &[(String, u64)], excluded_kinds: &[u16], issued_at: u64, expires_at: u64) -> Result<(), StorageError> {
+        self.inner.record_delivery_prices(sender, prices, excluded_kinds, issued_at, expires_at).await
+    }
+
+    async fn delivery_price_floor(&self, envelope: &UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, StorageError> {
+        self.inner.delivery_price_floor(envelope, paid_at, now).await
+    }
+
+    async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        // Receipt matching uses immutable metadata, never randomized at-rest ciphertext.
+        self.inner.is_paid_envelope_accepted(envelope).await
+    }
+
+    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
+    }
+
+    async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
+        self.inner.update_message_wrapper(envelope).await
+    }
+
+    async fn mark_pending_sent(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
+        self.inner.mark_pending_sent(id, peer).await
+    }
+
+    async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        self.inner.is_pending_dispatched(id, peer, sender).await
+    }
+
+    async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {
+        self.inner.reject_pending(id, peer, sender, reason, terminal).await
+    }
+
+    async fn acknowledge_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        self.inner.acknowledge_pending(id, peer, sender).await
+    }
+
+    async fn acknowledge_pending_payment(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        self.inner.acknowledge_pending_payment(id, peer, sender, hash).await
     }
 
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {

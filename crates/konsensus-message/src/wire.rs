@@ -708,6 +708,9 @@ pub enum Frame {
     MessageAck {
         /// The ID of the acknowledged message.
         id: MessageId,
+        /// True when this paid envelope was durably accepted previously.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        duplicate: bool,
     },
 
     /// Message was rejected by the recipient's payment gate.
@@ -1224,15 +1227,29 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_ack_is_compatible_with_legacy_wire_shape() {
+        // a3d05c9's tagged enum has no duplicate field and accepts unknown fields.
+        #[derive(serde::Deserialize)]
+        enum LegacyFrame { MessageAck { id: MessageId } }
+        let id = MessageId::from_bytes([42; 32]);
+        let bytes = Frame::MessageAck { id, duplicate: true }.to_bytes().unwrap();
+        let LegacyFrame::MessageAck { id: old_id } = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old_id, id);
+        let old = Frame::MessageAck { id, duplicate: false }.to_bytes().unwrap();
+        assert!(!String::from_utf8_lossy(&old).contains("duplicate"));
+        assert!(matches!(Frame::from_bytes(&old).unwrap(), Frame::MessageAck { duplicate: false, .. }));
+    }
+
+    #[test]
     fn frame_message_ack_roundtrip() {
         let id = MessageId::compute(b"test", &Nonce::from_bytes([1u8; 24]));
-        let frame = Frame::MessageAck { id };
+        let frame = Frame::MessageAck { id, duplicate: false };
 
         let bytes = frame.to_bytes().unwrap();
         let decoded = Frame::from_bytes(&bytes).unwrap();
 
         match decoded {
-            Frame::MessageAck { id: decoded_id } => assert_eq!(decoded_id, id),
+            Frame::MessageAck { id: decoded_id, .. } => assert_eq!(decoded_id, id),
             _ => panic!("expected MessageAck frame"),
         }
     }

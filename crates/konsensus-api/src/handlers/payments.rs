@@ -96,6 +96,7 @@ async fn create_invoice(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateInvoiceRequest>,
 ) -> Result<Json<InvoiceResponse>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     if req.description.len() > MAX_INVOICE_DESCRIPTION_LEN {
         return Err(ApiError::BadRequest(format!(
             "description too long: {} bytes (max {MAX_INVOICE_DESCRIPTION_LEN})",
@@ -129,7 +130,7 @@ async fn create_invoice(
         .lightning
         .create_invoice(req.amount_msat, &req.description, req.expiry_secs)
         .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     Ok(Json(InvoiceResponse {
         bolt11: invoice.bolt11,
@@ -147,10 +148,10 @@ async fn payment_status(
         .lightning
         .get_payment_status(&hash)
         .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     let liquidity = state.lightning.liquidity_receipt(&hash).await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
     Ok(Json(PaymentStatusResponse {
         liquidity,
         payment_hash: details.payment_hash,
@@ -175,7 +176,7 @@ async fn get_balance(
         .lightning
         .get_balance_msat()
         .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     Ok((
         DataFreshness::from_wallet_sync(sync, read_at),
@@ -189,6 +190,8 @@ async fn get_balance(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PayInvoiceRequest {
+    #[serde(default)]
+    pub max_routing_fee_msat: Option<u64>,
     /// BOLT11 payment request string.
     pub bolt11: String,
 }
@@ -196,6 +199,7 @@ pub struct PayInvoiceRequest {
 /// Response after paying an invoice.
 #[derive(Serialize)]
 pub struct PayInvoiceResponse {
+    pub max_routing_fee_msat: u64,
     /// Payment hash (hex).
     pub payment_hash: String,
     /// Amount paid in millisatoshis.
@@ -213,6 +217,7 @@ async fn pay_invoice(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PayInvoiceRequest>,
 ) -> Result<Json<PayInvoiceResponse>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     if req.bolt11.is_empty() {
         return Err(ApiError::BadRequest("bolt11 invoice string is required".into()));
     }
@@ -223,6 +228,12 @@ async fn pay_invoice(
         )));
     }
 
+    let (principal, _) = invoice_terms(&req.bolt11).map_err(|error| {
+        if !auth.is_metered() && matches!(error, ApiError::BudgetExceeded(_)) {
+            ApiError::BadRequest("amountless invoices are not supported; request an invoice with an amount".into())
+        } else { error }
+    })?;
+    let max_routing_fee_msat = state.lightning.routing_fee_policy().ceiling(principal, req.max_routing_fee_msat);
     // G1: a metered caller's debit needs the amount and payee before paying.
     let debit = if auth.is_metered() {
         let (amount_msat, payee) = invoice_terms(&req.bolt11)?;
@@ -231,9 +242,9 @@ async fn pay_invoice(
                 &state,
                 vec![Charge {
                     recipient: payee.clone(),
-                    amount_msat,
+                    amount_msat: amount_msat.checked_add(max_routing_fee_msat).ok_or_else(|| ApiError::BadRequest("payment debit overflow".into()))?,
                 }],
-            )?,
+            ).map_err(|e| e.with_routing_fee(max_routing_fee_msat))?,
             payee,
         ))
     } else {
@@ -242,18 +253,22 @@ async fn pay_invoice(
 
     let unmetered = Debit::unmetered();
     let guard = debit.as_ref().map(|(debit, _)| debit).unwrap_or(&unmetered);
-    let paid = guard.dispatch(state.lightning.pay_invoice(&req.bolt11)).await?;
+    let paid = guard.dispatch(state.lightning.pay_invoice_with_fee_limit(&req.bolt11, max_routing_fee_msat)).await.map_err(|e| e.with_routing_fee(max_routing_fee_msat))?;
     if let Some((debit, payee)) = &debit {
         resolve_payment(debit, payee, &paid);
     }
-    let details = paid.map_err(|e| ApiError::Lightning(e.to_string()))?;
+    let details = paid.map_err(|e| ApiError::from(e).with_routing_fee(max_routing_fee_msat))?;
 
+    if matches!(details.status, konsensus_core::traits::lightning::PaymentStatus::Failed | konsensus_core::traits::lightning::PaymentStatus::Expired) {
+        return Err(ApiError::Lightning("invoice payment failed before settlement".into()).with_routing_fee(max_routing_fee_msat));
+    }
     let preimage = details.preimage.unwrap_or_else(|| {
         tracing::warn!(payment_hash = %details.payment_hash, "payment succeeded but no preimage returned");
         String::new()
     });
 
     Ok(Json(PayInvoiceResponse {
+        max_routing_fee_msat,
         payment_hash: details.payment_hash,
         amount_msat: details.amount_msat,
         preimage,
@@ -264,6 +279,8 @@ async fn pay_invoice(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeysendRequest {
+    #[serde(default)]
+    pub max_routing_fee_msat: Option<u64>,
     /// Destination Lightning node public key (hex, 66 chars).
     pub dest_pubkey: String,
     /// Amount in millisatoshis.
@@ -276,6 +293,7 @@ pub struct KeysendRequest {
 /// Response after a keysend payment.
 #[derive(Serialize)]
 pub struct KeysendResponse {
+    pub max_routing_fee_msat: u64,
     /// Payment hash (hex).
     pub payment_hash: String,
     /// Amount paid in millisatoshis.
@@ -305,6 +323,7 @@ async fn keysend(
     State(state): State<Arc<AppState>>,
     Json(req): Json<KeysendRequest>,
 ) -> Result<Json<KeysendResponse>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     if req.dest_pubkey.is_empty() {
         return Err(ApiError::BadRequest("dest_pubkey is required".into()));
     }
@@ -325,6 +344,7 @@ async fn keysend(
         )));
     }
 
+    let max_routing_fee_msat = state.lightning.routing_fee_policy().ceiling(req.amount_msat, req.max_routing_fee_msat);
     // G1: debit a metered caller before the keysend is dispatched.
     let dest = req.dest_pubkey.trim().to_ascii_lowercase();
     let debit = if auth.is_metered() {
@@ -335,9 +355,9 @@ async fn keysend(
             &state,
             vec![Charge {
                 recipient: key,
-                amount_msat: req.amount_msat,
+                amount_msat: req.amount_msat.checked_add(max_routing_fee_msat).ok_or_else(|| ApiError::BadRequest("payment debit overflow".into()))?,
             }],
-        )?)
+        ).map_err(|e| e.with_routing_fee(max_routing_fee_msat))?)
     } else {
         None
     };
@@ -346,16 +366,17 @@ async fn keysend(
     let guard = debit.as_ref().unwrap_or(&unmetered);
     let paid = guard.dispatch(state
         .lightning
-        .keysend(&req.dest_pubkey, req.amount_msat, req.memo.as_deref()))
-        .await?;
+        .keysend_with_fee_limit(&req.dest_pubkey, req.amount_msat, req.memo.as_deref(), max_routing_fee_msat))
+        .await.map_err(|e| e.with_routing_fee(max_routing_fee_msat))?;
     if let Some(debit) = &debit {
         resolve_payment(debit, &dest, &paid);
     }
-    let details = paid.map_err(|e| ApiError::Lightning(e.to_string()))?;
+    let details = paid.map_err(|e| ApiError::from(e).with_routing_fee(max_routing_fee_msat))?;
 
     let preimage = details.preimage.unwrap_or_default();
 
     Ok(Json(KeysendResponse {
+        max_routing_fee_msat,
         payment_hash: details.payment_hash,
         amount_msat: details.amount_msat,
         preimage,
@@ -398,12 +419,12 @@ pub(crate) fn resolve_payment(
 ) {
     use konsensus_core::traits::lightning::PaymentStatus;
     match paid {
-        Ok(d) if d.status == PaymentStatus::Settled => debit.settled(recipient, d.amount_msat),
+        Ok(d) if d.status == PaymentStatus::Settled => { debit.record_payment(recipient, d); debit.settled(recipient, d.amount_msat); },
         Ok(d) if matches!(d.status, PaymentStatus::Failed | PaymentStatus::Expired) => {
             debit.released(recipient)
         }
         Ok(_) => {}
-        Err(LightningError::PaymentNotDispatched(_)) => debit.released(recipient),
+        Err(LightningError::PaymentNotDispatched(_) | LightningError::NotReady) => debit.released(recipient),
         Err(_) => {}
     }
 }
@@ -443,7 +464,7 @@ async fn list_channels(
         .lightning
         .list_channels()
         .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     Ok((
         DataFreshness::from_wallet_sync(sync, read_at),
@@ -526,7 +547,7 @@ async fn list_payments(
         .lightning
         .list_payments(limit)
         .await
-        .map_err(|e| ApiError::Lightning(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
     Ok(Json(
         payments
@@ -592,7 +613,8 @@ pub struct OpenChannelRequest {
     pub announce: bool,
     /// Optional fee rate override in sat/vB for the channel funding transaction.
     /// If omitted, the backend selects a rate from its fee estimator.
-    /// Must be > 0 if provided.
+    /// Unsupported overrides are refused with `not_dispatched`, never ignored.
+    /// Must be finite and within 1–10,000 sat/vB if provided.
     #[serde(default)]
     pub fee_rate_sat_per_vb: Option<f32>,
 }
@@ -613,12 +635,13 @@ async fn open_channel(
     _user: ScopedAuth<Spend>,
     Json(req): Json<OpenChannelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     // L0a: shared validator rejects NaN/Inf and enforces 1.0–10_000.0 sat/vB.
     // The naive `<= 0.0` check accepts NaN (NaN compares false everywhere) and
     // ignores fractional floors that would silently produce a 0-rate tx.
     if let Some(rate) = req.fee_rate_sat_per_vb {
         validate_fee_rate_sat_per_vb(rate)
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            .map_err(|e| ApiError::NotDispatched(e.to_string()))?;
     }
     let channel_id = state
         .lightning
@@ -630,7 +653,7 @@ async fn open_channel(
             req.fee_rate_sat_per_vb,
         )
         .await
-        .map_err(|e| ApiError::BadRequest(format!("open_channel failed: {e}")))?;
+        .map_err(ApiError::from)?;
 
     Ok(Json(serde_json::json!({
         "channel_id": channel_id,
@@ -645,6 +668,7 @@ async fn close_channel(
     _user: ScopedAuth<Spend>,
     Json(req): Json<CloseChannelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     if req.channel_id.trim().is_empty() {
         return Err(ApiError::BadRequest("channel_id is required".into()));
     }
@@ -653,7 +677,7 @@ async fn close_channel(
         .lightning
         .close_channel(&req.channel_id, req.force)
         .await
-        .map_err(|e| ApiError::BadRequest(format!("close_channel failed: {e}")))?;
+        .map_err(ApiError::from)?;
 
     Ok(Json(serde_json::json!({
         "channel_id": req.channel_id,
@@ -681,10 +705,11 @@ async fn send_onchain(
     _user: ScopedAuth<Spend>,
     Json(req): Json<SendOnchainRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    crate::error::require_money_ready(&state).await?;
     // L0a: see open_channel above for the same validation rationale.
     if let Some(rate) = req.fee_rate_sat_per_vb {
         validate_fee_rate_sat_per_vb(rate)
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            .map_err(|e| ApiError::NotDispatched(e.to_string()))?;
     }
     // L0f: distinguish between "broadcast confirmed visible" (HTTP 200) and
     // "broadcast initiated, but the chain provider couldn't confirm
@@ -718,7 +743,7 @@ async fn send_onchain(
                 })),
             ))
         }
-        Err(e) => Err(ApiError::BadRequest(format!("send_onchain failed: {e}"))),
+        Err(e) => Err(ApiError::from(e)),
     }
 }
 
@@ -730,6 +755,7 @@ async fn get_funding_address(
     State(state): State<Arc<AppState>>,
     _user: ScopedAuth<Receive>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     match state.lightning.get_funding_address().await {
         Some(address) => Ok(Json(serde_json::json!({
             "address": address,

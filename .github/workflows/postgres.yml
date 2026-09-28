@@ -1,0 +1,97 @@
+name: PostgreSQL Tests
+
+# Runs the `#[ignore]`d PostgreSQL storage tests against a real server.
+#
+# NON-BLOCKING: this is a separate workflow and is NOT a required status check
+# on main, so a red run here is visible but never blocks a merge. Promote it to
+# a required check (or fold it into ci.yml) once it has been green for a while.
+#
+# Test selection is by name, not by list: every ignored konsensus-storage test
+# whose path contains `postgres` runs (e.g. everything in src/postgres.rs,
+# including `postgres::migration_recovery_tests::*`). New ignored PostgreSQL
+# tests are picked up without editing this file as long as they live in
+# src/postgres.rs or carry `postgres` in their test name.
+#
+# Tests read BITSOV_TEST_POSTGRES_URL and may CREATE/DROP their own databases,
+# so the URL must point at a disposable server with a superuser role.
+#
+# Local equivalent:
+#   docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
+#   BITSOV_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/postgres \
+#     cargo test -p konsensus-storage --locked -- --ignored postgres
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/konsensus-storage/**'
+      - 'crates/konsensus-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/postgres.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/konsensus-storage/**'
+      - 'crates/konsensus-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/postgres.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: postgres-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  postgres:
+    name: PostgreSQL ignored tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BITSOV_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-postgres-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-postgres-
+
+      - name: cargo test (ignored PostgreSQL tests)
+        run: |
+          set -o pipefail
+          cargo test -p konsensus-storage --locked -- --ignored postgres 2>&1 | tee test.log
+          passed=$(grep -cE '^test .+ \.\.\. ok$' test.log || true)
+          echo "PostgreSQL tests passed: ${passed}"
+          if [ "${passed}" -eq 0 ]; then
+            echo "::warning title=No PostgreSQL tests ran::no ignored konsensus-storage test matched 'postgres'"
+          fi
