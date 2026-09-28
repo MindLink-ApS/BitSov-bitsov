@@ -3365,6 +3365,137 @@ mod settlement_tests {
         );
     }
 
+    // Match node.rs -> AppState.lightning: RecoveringLightning wraps the backend;
+    // CircuitBreakerLightning is only on the separate inbound gate verifier.
+    async fn recovered_lightning(
+        mock: Arc<MockLightningProvider>,
+        initially_offline: bool,
+    ) -> Arc<dyn LightningProvider> {
+        let mut offline = initially_offline;
+        let lightning = Arc::new(
+            konsensus_lightning::RecoveringLightning::new(
+                move || {
+                    let unavailable = std::mem::take(&mut offline);
+                    let backend = mock.clone();
+                    async move {
+                        if unavailable {
+                            Err(LightningError::ChainSourceUnavailable {
+                                network: "bitcoin".into(),
+                                service: "localhost".into(),
+                                attempts: 1,
+                                elapsed_ms: 0,
+                                cause: "unavailable".into(),
+                            })
+                        } else {
+                            Ok(backend as Arc<dyn LightningProvider>)
+                        }
+                    }
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(lightning.outgoing_payment_updates().is_none());
+        let_run().await;
+        if initially_offline {
+            assert!(!lightning.money_ready().await);
+            assert!(lightning.outgoing_payment_updates().is_none());
+            tokio::time::advance(Duration::from_secs(5)).await;
+            let_run().await;
+        }
+        assert!(lightning.money_ready().await);
+        lightning
+    }
+
+    /// Missing wrapper delegation or lazy subscription loses the dispatch hint.
+    /// Also exercise subscription to the live backend after offline recovery.
+    #[tokio::test(start_paused = true)]
+    async fn production_wrapper_dispatch_hint_wakes_settlement() {
+        for initially_offline in [false, true] {
+            let mock = Arc::new(MockLightningProvider::new());
+            let lightning = recovered_lightning(mock.clone(), initially_offline).await;
+            let updates = SettlementUpdates::subscribe(lightning.as_ref());
+            mock.defer_next_keysend_settlement(0).await;
+            mock.hint_during_next_deferred_keysend();
+            let initial = lightning
+                .keysend(&format!("02{}", "aa".repeat(32)), 5_000, None)
+                .await
+                .unwrap();
+            assert_eq!(initial.status, PaymentStatus::InFlight);
+            let started = tokio::time::Instant::now();
+            let settled = await_settlement(&lightning, updates, initial, "keysend")
+                .await
+                .unwrap();
+            assert_eq!(settled.status, PaymentStatus::Settled);
+            assert_eq!(started.elapsed(), Duration::ZERO, "hint must bypass timer");
+            lightning.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn production_wrapper_hint_is_not_proof_or_a_timeout_extension() {
+        let mock = Arc::new(MockLightningProvider::new());
+        let lightning = recovered_lightning(mock.clone(), false).await;
+        for polls in [1, u32::MAX] {
+            let updates = SettlementUpdates::subscribe(lightning.as_ref());
+            mock.defer_next_keysend_settlement(polls).await;
+            mock.hint_during_next_deferred_keysend();
+            let initial = lightning
+                .keysend(&format!("02{}", "aa".repeat(32)), 5_000, None)
+                .await
+                .unwrap();
+            let started = tokio::time::Instant::now();
+            let result = await_settlement(&lightning, updates, initial, "keysend").await;
+            if polls == 1 {
+                assert_eq!(result.unwrap().status, PaymentStatus::Settled);
+                assert_eq!(started.elapsed(), Duration::from_millis(100));
+            } else {
+                assert!(matches!(result, Err(ApiError::PaymentUnresolved(_))));
+                assert!(started.elapsed() >= PAYMENT_SETTLE_TIMEOUT);
+                assert!(started.elapsed() < PAYMENT_SETTLE_TIMEOUT + PAYMENT_POLL_INTERVAL);
+            }
+        }
+        lightning.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn production_wrapper_retired_backend_stream_closes_and_poll_uses_timer() {
+        use futures::{FutureExt, StreamExt};
+
+        let old_backend = Arc::new(MockLightningProvider::new());
+        let old_lightning = recovered_lightning(old_backend.clone(), false).await;
+        let updates = SettlementUpdates::subscribe(old_lightning.as_ref());
+        let mut closure_probe = old_lightning
+            .outgoing_payment_updates()
+            .expect("ready wrapper must forward hints");
+        old_lightning.shutdown().await.unwrap();
+        assert!(old_lightning.outgoing_payment_updates().is_none());
+        drop(old_backend);
+        assert_eq!(
+            closure_probe.next().now_or_never(),
+            Some(None),
+            "subscription must not keep the retired backend alive"
+        );
+
+        // Recovery never rebuilds an initialized backend. Simulate a node restart
+        // with a new wrapper; an old subscription must not prevent timer polling.
+        let mock = Arc::new(MockLightningProvider::new());
+        let lightning = recovered_lightning(mock.clone(), true).await;
+        mock.defer_next_keysend_settlement(2).await;
+        let initial = lightning
+            .keysend(&format!("02{}", "aa".repeat(32)), 5_000, None)
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let settled = await_settlement(&lightning, updates, initial, "keysend")
+            .await
+            .unwrap();
+        assert_eq!(settled.status, PaymentStatus::Settled);
+        assert_eq!(started.elapsed(), Duration::from_millis(350));
+        lightning.shutdown().await.unwrap();
+    }
+
     /// #108 review: a backend may settle and emit its terminal hint while the
     /// dispatch call is still returning its earlier `InFlight` snapshot. The
     /// subscription is taken before dispatch, so that hint is buffered and the
