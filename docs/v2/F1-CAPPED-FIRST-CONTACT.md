@@ -3,7 +3,7 @@
 A connected stranger can call `POST /api/v1/messages/compose` with
 `max_total_msat`. Admission and message delivery are two separately settled,
 single-use acts. At a 2,000-msat admission price and 2,000-msat message price,
-the call needs a 6,000-msat all-in cap under the default routing-fee policy.
+the call needs a 14,000-msat all-in cap under the default routing-fee policy.
 The response's `amount_msat` includes both principals; `max_routing_fee_msat`
 reports their combined fee ceiling. See [all-in fee caps](ALL-IN-FEE-CAPS.md).
 

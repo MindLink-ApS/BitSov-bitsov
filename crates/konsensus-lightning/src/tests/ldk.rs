@@ -810,3 +810,17 @@ fn invoice_and_keysend_ldk_call_arguments_include_exact_fee_ceiling() {
         });
     }
 }
+
+#[test]
+fn dispatch_error_classification_retains_ambiguous_liabilities() {
+    use ldk_node::NodeError;
+    for error in [NodeError::PaymentSendingFailed, NodeError::InvalidInvoice,
+        NodeError::InvalidAmount, NodeError::InvalidCustomTlvs, NodeError::NotRunning] {
+        let capable = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(super::classify_dispatch_error(error, &capable), LightningError::PaymentNotDispatched(_)));
+        assert!(capable.load(std::sync::atomic::Ordering::Relaxed));
+    }
+    for error in [NodeError::PersistenceFailed, NodeError::DuplicatePayment] {
+        assert!(matches!(super::classify_dispatch_error(error, &std::sync::atomic::AtomicBool::new(true)), LightningError::PaymentFailed(_)));
+    }
+}

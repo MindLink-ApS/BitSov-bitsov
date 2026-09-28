@@ -272,9 +272,18 @@ pub async fn create_payment_proof(
     price_msat: u64,
     peer_id: &NodeId,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
+    create_payment_proof_with_fee_report(state, price_msat, peer_id).await.map(|(proof, _)| proof)
+}
+
+pub(crate) async fn create_payment_proof_with_fee_report(
+    state: &AppState, price_msat: u64, peer_id: &NodeId,
+) -> Result<(([u8; 32], [u8; 32], u64), u64), ApiError> {
     let mut charge = FirstContactCharge::default();
-    create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), &Readmission::for_cap(false), None, &mut charge)
-        .await.map_err(|error| charge.error(error))
+    let readmission = Readmission::for_cap(false);
+    let fee = state.lightning.routing_fee_policy().ceiling(super::caps::payable(price_msat), None);
+    let result = create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), &readmission, None, &mut charge).await;
+    let ceiling = fee.saturating_add(readmission.fee_ceiling_msat());
+    result.map(|proof| (proof, ceiling)).map_err(|error| charge.error(error).with_routing_fee(ceiling))
 }
 
 /// How a paid send may pay admission again when the recipient refuses it with
@@ -424,12 +433,10 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
 /// admission invoice and its signed proof), then ask for the message invoice
 /// again. The E2EE session is untouched; both sides still hold it.
 ///
-/// A confirmed price cap covers the message only, so a capped caller gets an
-/// explicit refusal. A budget grant pays it (CoS decision, 2026-09-27) only for
-/// a contact the owner already budgeted, or with the owner's one-time
-/// confirmation for exactly this contact: the recipient's signed quote is
-/// reserved against the grant (per-contact cap, per-call maximum, what is left)
-/// before anything is paid, and the payment is an N2 membrane event.
+/// Any confirmed total/recipient cap refuses an additional unquoted admission,
+/// including a paired caller whose grant otherwise budgets the contact. An
+/// uncapped request may use existing admission authority; G1 reserves admission
+/// principal plus the approved fee against the same contact/call/grant limits.
 async fn readmit_then_pay(
     state: &AppState,
     amount_msat: u64,
@@ -468,7 +475,7 @@ async fn readmit_then_pay(
             lock_admission_ledger().quotes.remove(peer_id);
         }
         let mut attempt = FirstContactCharge::default();
-        let mut readmit = Readmit { parent: debit, reserved: None };
+        let mut readmit = Readmit { parent: debit, reserved: None, fee_ceiling: &readmission.fee_ceiling_msat };
         charge.readmission_blocks_message = true;
         let result = first_contact_admission(
             state, peer_id, konsensus_core::kind::KIND_CHAT, None, &mut attempt,
@@ -487,7 +494,6 @@ async fn readmit_then_pay(
         if attempt.settled_msat > 0 {
             readmission.paid_msat.fetch_add(attempt.settled_msat, std::sync::atomic::Ordering::Relaxed);
         }
-        readmission.fee_ceiling_msat.fetch_add(attempt.fee_ceiling_msat, std::sync::atomic::Ordering::Relaxed);
         charge.readmission_msat = charge.readmission_msat.saturating_add(attempt.settled_msat);
         charge.include_attempt(attempt);
         result?;
@@ -887,6 +893,7 @@ struct Readmit<'a> {
     parent: &'a Debit,
     /// The re-admission's own reservation, once the signed quote is known.
     reserved: Option<Debit>,
+    fee_ceiling: &'a std::sync::atomic::AtomicU64,
 }
 
 /// Record of one admission attempt to one peer.
@@ -1727,7 +1734,7 @@ pub struct FirstContactQuoteResponse {
     pub admission_msat: u64,
     /// The target's price for this first message, msat (signed in the quote).
     pub message_msat: u64,
-    /// Admission plus the first message: the cap to confirm, msat.
+    /// Admission plus first message plus both routing ceilings: cap to confirm, msat.
     pub total_msat: u64,
     /// The quote is payable until this unix time (≤ 60 s).
     pub expires_at: u64,
@@ -2115,11 +2122,15 @@ async fn first_contact_admission(
     let readmission_event = readmit.as_ref().map(|r| super::admission_journal::ReadmissionSettlement {
         budget_msat: r.parent.contact_budget(&peer_id.to_hex()), reported: false,
     });
+    let readmission_fee_counter = readmit.as_ref().map(|r| r.fee_ceiling);
     let debit: &Debit = match readmit {
         Some(r) => r.reserved.insert(r.parent.readmission(&peer_id.to_hex(), admission_msat.checked_add(r.parent.fee_limit(state, admission_msat)).ok_or_else(|| ApiError::PriceCapExceeded("admission debit overflow".into()))?)?),
         None => debit,
     };
 
+    if let Some(counter) = readmission_fee_counter {
+        counter.fetch_add(charge.fee_ceiling_msat, std::sync::atomic::Ordering::Relaxed);
+    }
     // 4. Record a DispatchUnknown guard from the BOLT11 payment hash BEFORE
     //    dispatching, then pay. This closes the ambiguous-dispatch window (review
     //    finding #4) WITHOUT the permanent-brick hazard (review finding #1,

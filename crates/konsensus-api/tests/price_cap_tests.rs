@@ -16,7 +16,12 @@ async fn fixture() -> (Arc<AppState>, NodeId, Arc<CountingLightning>) {
     state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
     (state, peer, lightning)
 }
-async fn post(state: &Arc<AppState>, path: &str, body: Value) -> (StatusCode, Value) {
+async fn post(state: &Arc<AppState>, path: &str, mut body: Value) -> (StatusCode, Value) {
+    // Exercise caller tightening independently of the node's default floor.
+    if (path == "/api/v1/messages/compose" || (path.starts_with("/api/v1/files/") && path.ends_with("/send")))
+        && body.get("max_routing_fee_msat").is_none() {
+        body["max_routing_fee_msat"] = json!(1000);
+    }
     let response = test_router(state.clone()).oneshot(Request::builder().method("POST").uri(path)
         .header("authorization", auth_header(state)).header("content-type","application/json")
         .body(Body::from(body.to_string())).unwrap()).await.unwrap();

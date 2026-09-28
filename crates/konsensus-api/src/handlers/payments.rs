@@ -226,7 +226,11 @@ async fn pay_invoice(
         )));
     }
 
-    let (principal, _) = invoice_terms(&req.bolt11)?;
+    let (principal, _) = invoice_terms(&req.bolt11).map_err(|error| {
+        if !auth.is_metered() && matches!(error, ApiError::BudgetExceeded(_)) {
+            ApiError::BadRequest("amountless invoices are not supported; request an invoice with an amount".into())
+        } else { error }
+    })?;
     let max_routing_fee_msat = state.lightning.routing_fee_policy().ceiling(principal, req.max_routing_fee_msat);
     // G1: a metered caller's debit needs the amount and payee before paying.
     let debit = if auth.is_metered() {
@@ -253,6 +257,9 @@ async fn pay_invoice(
     }
     let details = paid.map_err(|e| ApiError::Lightning(e.to_string()).with_routing_fee(max_routing_fee_msat))?;
 
+    if matches!(details.status, konsensus_core::traits::lightning::PaymentStatus::Failed | konsensus_core::traits::lightning::PaymentStatus::Expired) {
+        return Err(ApiError::Lightning("invoice payment failed before settlement".into()).with_routing_fee(max_routing_fee_msat));
+    }
     let preimage = details.preimage.unwrap_or_else(|| {
         tracing::warn!(payment_hash = %details.payment_hash, "payment succeeded but no preimage returned");
         String::new()

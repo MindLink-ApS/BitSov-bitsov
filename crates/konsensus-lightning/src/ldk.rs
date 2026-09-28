@@ -319,12 +319,7 @@ impl LdkProvider {
         }
         let payment_id = dispatch_invoice_with_fee_limit(&invoice, max_fee_msat,
             |invoice, route| self.node.bolt11_payment().send(invoice, route))
-            .map_err(|e| {
-                // Mark as payment-incapable on channel/funding errors
-                self.payment_capable.store(false, Ordering::Relaxed);
-                warn!(error = %e, "LDK payment failed — marking as payment-incapable");
-                LightningError::PaymentFailed(format!("{e}"))
-            })?;
+            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         // Successful send — ensure the capability flag is set
         self.payment_capable.store(true, Ordering::Relaxed);
@@ -1162,11 +1157,7 @@ impl LightningProvider for LdkProvider {
 
         let payment_id = dispatch_keysend_with_fee_limit(amount_msat, pubkey, max_fee_msat,
             |amount, dest, route| self.node.spontaneous_payment().send(amount, dest, route))
-            .map_err(|e| {
-                self.payment_capable.store(false, Ordering::Relaxed);
-                warn!(error = %e, "LDK keysend failed — marking as payment-incapable");
-                LightningError::PaymentFailed(format!("keysend failed: {e}"))
-            })?;
+            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         // Successful send — ensure the capability flag is set
         self.payment_capable.store(true, Ordering::Relaxed);
@@ -1220,11 +1211,7 @@ impl LightningProvider for LdkProvider {
 
         let payment_id = dispatch_keysend_with_fee_limit(amount_msat, pubkey, self.routing_fee_policy.ceiling(amount_msat, None),
             |amount, dest, route| self.node.spontaneous_payment().send_with_custom_tlvs(amount, dest, route, custom_tlvs))
-            .map_err(|e| {
-                self.payment_capable.store(false, Ordering::Relaxed);
-                warn!(error = %e, "LDK keysend_with_binding failed — marking as payment-incapable");
-                LightningError::PaymentFailed(format!("keysend_with_binding failed: {e}"))
-            })?;
+            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1832,4 +1819,22 @@ fn dispatch_keysend_with_fee_limit<T>(
     send: impl FnOnce(u64, bitcoin::secp256k1::PublicKey, Option<ldk_node::lightning::routing::router::RouteParametersConfig>) -> T,
 ) -> T {
     send(amount, dest, Some(routing_fee_parameters(max_fee_msat)))
+}
+
+/// Pinned ldk-node bolt11/spontaneous send paths return PaymentSendingFailed
+/// only for RetryableSendFailure BEFORE any HTLC dispatch (including RouteNotFound).
+/// PersistenceFailed can occur after dispatch; DuplicatePayment can refer to an
+/// earlier live attempt. Neither proves that the liability is absent.
+fn classify_dispatch_error(error: ldk_node::NodeError, payment_capable: &AtomicBool) -> LightningError {
+    use ldk_node::NodeError::*;
+    match error {
+        PaymentSendingFailed | InvalidInvoice | InvalidAmount | InvalidCustomTlvs | NotRunning => {
+            LightningError::PaymentNotDispatched(error.to_string())
+        }
+        DuplicatePayment => LightningError::PaymentFailed(error.to_string()),
+        _ => {
+            payment_capable.store(false, Ordering::Relaxed);
+            LightningError::PaymentFailed(error.to_string())
+        }
+    }
 }

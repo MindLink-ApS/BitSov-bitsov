@@ -646,7 +646,7 @@ async fn a_contact_without_a_budget_needs_the_one_time_confirmation_once() {
         .post("/api/v1/messages/first-contact/quote", serde_json::json!({ "recipient": bob.to_hex() }))
         .await;
     assert_eq!(status, StatusCode::OK, "{quote}");
-    assert_eq!(quote["total_msat"], 6_000, "{quote}");
+    assert_eq!(quote["total_msat"], 14_000, "{quote}");
     let (status, grant) = net
         .sender
         .owner_confirm(

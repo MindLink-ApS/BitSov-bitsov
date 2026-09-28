@@ -407,12 +407,22 @@ async fn send_file(
     Json(req): Json<SendFileRequest>,
 ) -> Result<Json<SendFileResponse>, ApiError> {
     let deadline = state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).deadline(&file_id);
-    tokio::time::timeout_at(deadline, send_file_inner(auth, state, file_id, req)).await
-        .map_err(|_| ApiError::PaymentUnresolved("file send deadline exceeded; payment may have dispatched; do not retry automatically".into()))?
+    // Keep authorized ceilings outside the cancelled future, including any
+    // separately approved re-admission recorded before its wallet dispatch.
+    let ceiling = std::sync::Mutex::new(None);
+    let readmission = super::messages::Readmission::for_cap(req.max_total_msat.is_some());
+    let result = tokio::time::timeout_at(deadline, send_file_inner(auth, state, file_id, req, &ceiling, &readmission)).await
+        .unwrap_or_else(|_| Err(ApiError::PaymentUnresolved("file send deadline exceeded; payment may have dispatched; do not retry automatically".into())));
+    let approved = *ceiling.lock().unwrap_or_else(|e| e.into_inner());
+    result.map_err(|error| match approved {
+        Some(fee) => error.with_routing_fee(fee.saturating_add(readmission.fee_ceiling_msat())),
+        None => error,
+    })
 }
 
 async fn send_file_inner(
     auth: MeteredSpend, state: Arc<AppState>, file_id: String, req: SendFileRequest,
+    ceiling: &std::sync::Mutex<Option<u64>>, readmission: &super::messages::Readmission,
 ) -> Result<Json<SendFileResponse>, ApiError> {
     // Parse recipient
     let peer_id = NodeId::from_hex(&req.recipient)
@@ -427,6 +437,7 @@ async fn send_file_inner(
         .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
 
     let all_in = super::messages::caps::check_payment(&state, super::messages::caps::payable(price_msat), req.max_routing_fee_msat, req.max_total_msat)?;
+    *ceiling.lock().unwrap_or_else(|e| e.into_inner()) = Some(all_in - super::messages::caps::payable(price_msat));
 
     // Do not retain bytes across pricing awaits: deletion or expiry could
     // otherwise release their quota while this future still owns the blob.
@@ -475,9 +486,8 @@ async fn send_file_inner(
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
     // Create real payment proof — requests invoice from recipient (Principle 2).
-    let readmission = super::messages::Readmission::for_cap(req.max_total_msat.is_some());
     let mut admission = super::messages::FirstContactCharge::default();
-    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, &readmission, Some(KIND_FILE_REF), &mut admission).await.map_err(|error| admission.error(error));
+    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission, Some(KIND_FILE_REF), &mut admission).await.map_err(|error| admission.error(error));
     if matches!(&paid, Err(ApiError::PaymentUnresolved(_))) && admission.readmission_blocks_message {
         debit.settled(&peer_key, admission.settled_msat.saturating_sub(admission.readmission_msat));
     } else if let Err(ApiError::PaymentProofUnavailable { amount_msat, .. }) = &paid {

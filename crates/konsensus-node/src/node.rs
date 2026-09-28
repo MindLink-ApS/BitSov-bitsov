@@ -18,7 +18,7 @@ use konsensus_core::traits::lightning::LightningProvider;
 use konsensus_core::traits::pricing::PricingEngine;
 use konsensus_core::types::NodeId;
 use konsensus_lightning::{
-    LdkConfig, LdkProvider, LnbitsProvider, LndConfig, LndProvider, MockLightningConfig,
+    LdkConfig, LdkProvider, LndConfig, LndProvider, MockLightningConfig,
     MockLightningProvider,
 };
 use konsensus_message::wire::Capability;
@@ -75,6 +75,7 @@ impl KonsensusNode {
     /// This wires all components together based on the config file's
     /// backend selections. The node is not started yet — call [`Self::start`] next.
     pub async fn from_config(config: NodeConfig, mnemonic_password: Option<&str>) -> Result<Self> {
+        config.validate_routing_fee_backend()?;
         // ── 1. Load identity ────────────────────────────────────────────
         let mnemonic = crate::mnemonic_crypto::read_mnemonic(
             &config.identity.mnemonic_file,
@@ -131,17 +132,7 @@ impl KonsensusNode {
 
         // ── 3. Initialize Lightning provider ────────────────────────────
         let lightning: Arc<dyn LightningProvider> = match &config.lightning {
-            LightningConfig::Lnbits { api_url, admin_key } => {
-                let lnbits_config = konsensus_lightning::LnbitsConfig {
-                    api_url: api_url.clone(),
-                    admin_key: admin_key.clone(),
-                };
-                info!(backend = "lnbits", api_url = %api_url, "lightning provider");
-                let provider = LnbitsProvider::new(lnbits_config)
-                    .map_err(|e| anyhow::anyhow!("lnbits provider: {e}"))?;
-                provider.probe_payment_capability().await;
-                Arc::new(provider)
-            }
+            LightningConfig::Lnbits { .. } => anyhow::bail!("not_supported: LNbits routing fee ceilings"),
             LightningConfig::Lnd {
                 api_url,
                 macaroon_hex,
@@ -154,7 +145,8 @@ impl KonsensusNode {
                 };
                 info!(backend = "lnd", api_url = %api_url, "lightning provider (direct LND REST)");
                 let provider = LndProvider::new(lnd_config)
-                    .map_err(|e| anyhow::anyhow!("lnd provider: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("lnd provider: {e}"))?
+                    .with_routing_fee_policy(config.routing_fees);
                 provider.probe_payment_capability().await;
                 Arc::new(provider)
             }

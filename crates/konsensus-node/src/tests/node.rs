@@ -449,7 +449,9 @@ async fn from_config_lnbits_lightning_provider() {
         api_url: "http://localhost:5000".to_string(),
         admin_key: "test-key".to_string(),
     };
-    // Should succeed building the provider (no actual connection at build time)
-    let node = KonsensusNode::from_config(config, None).await.unwrap();
-    assert_eq!(node.node_id().to_hex().len(), 64);
+    let error = match KonsensusNode::from_config(config, None).await {
+        Ok(_) => panic!("LNbits must fail at startup, before any payment"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("not_supported") && error.contains("LNbits"));
 }

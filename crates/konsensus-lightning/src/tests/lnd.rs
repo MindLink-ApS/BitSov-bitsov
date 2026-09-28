@@ -643,7 +643,8 @@ async fn start_mock_lnd_payment() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         .route("/v2/router/send", post(pay_streaming_success))
         .route("/pay_fail/v2/router/send", post(pay_failed))
         .route("/pay_empty/v2/router/send", post(pay_empty))
-        .route("/pay_mixed/v2/router/send", post(pay_mixed));
+        .route("/pay_mixed/v2/router/send", post(pay_mixed))
+        .fallback(|| async { (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"code":5}))) });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -658,7 +659,7 @@ async fn pay_invoice_streaming_uses_final_result() {
     let (addr, _handle) = start_mock_lnd_payment().await;
     let provider = test_provider(addr);
 
-    let result = provider.pay_invoice("lnbc10n1test").await.unwrap();
+    let result = provider.pay_invoice_with_fee_limit(&crate::MockLightningProvider::new().create_invoice(10000, "test", 3600).await.unwrap().bolt11, 5000).await.unwrap();
     // Should use the SUCCEEDED result, not the IN_FLIGHT one
     assert_eq!(result.status, PaymentStatus::Settled);
     assert_eq!(result.payment_hash, "abc123");
@@ -680,7 +681,7 @@ async fn pay_invoice_error_response_returns_payment_failed() {
     };
     let provider = LndProvider::with_client(config, Client::new());
 
-    let err = provider.pay_invoice("lnbc10n1test").await.unwrap_err();
+    let err = provider.pay_invoice_with_fee_limit(&crate::MockLightningProvider::new().create_invoice(10000, "test", 3600).await.unwrap().bolt11, 5000).await.unwrap_err();
     match err {
         LightningError::PaymentFailed(msg) => {
             assert!(msg.contains("no route found"), "got: {msg}");
@@ -702,7 +703,7 @@ async fn pay_invoice_empty_body_returns_error() {
     };
     let provider = LndProvider::with_client(config, Client::new());
 
-    let err = provider.pay_invoice("lnbc10n1test").await.unwrap_err();
+    let err = provider.pay_invoice_with_fee_limit(&crate::MockLightningProvider::new().create_invoice(10000, "test", 3600).await.unwrap().bolt11, 5000).await.unwrap_err();
     match err {
         LightningError::PaymentFailed(msg) => {
             assert!(msg.contains("no payment result"), "got: {msg}");
@@ -722,7 +723,7 @@ async fn pay_invoice_mixed_garbage_finds_valid_line() {
     };
     let provider = LndProvider::with_client(config, Client::new());
 
-    let result = provider.pay_invoice("lnbc10n1test").await.unwrap();
+    let result = provider.pay_invoice_with_fee_limit(&crate::MockLightningProvider::new().create_invoice(10000, "test", 3600).await.unwrap().bolt11, 5000).await.unwrap();
     assert_eq!(result.status, PaymentStatus::Settled);
     assert_eq!(result.payment_hash, "good");
     assert_eq!(result.amount_msat, 5_000);

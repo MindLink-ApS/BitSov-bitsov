@@ -43,11 +43,11 @@ payment already handed to the Lightning backend.
 
 | Route | Recipient key | Amount reserved |
 |---|---|---|
-| `POST /messages/compose` (peer) | node id | quoted price (1-sat minimum) |
-| `POST /messages/compose` (room) | each member's node id | every member's quoted price, as **one** call |
-| `POST /files/:id/send` | node id | file price (1-sat minimum) |
-| `POST /payments/pay` | invoice payee pubkey | invoice amount |
-| `POST /payments/keysend` | `dest_pubkey` | `amount_msat` |
+| `POST /messages/compose` (peer) | node id | quoted principal (1-sat minimum) + fee ceiling |
+| `POST /messages/compose` (room) | each member's node id | sum of each member's principal + fee ceiling, as **one** call |
+| `POST /files/:id/send` | node id | file principal (1-sat minimum) + fee ceiling |
+| `POST /payments/pay` | invoice payee pubkey | invoice principal + fee ceiling |
+| `POST /payments/keysend` | `dest_pubkey` | `amount_msat` + fee ceiling |
 
 The debit happens under the pairing store's mutex and is persisted **before**
 any ratchet is advanced, invoice is requested or payment is dispatched. The
@@ -72,12 +72,14 @@ before dispatch releases the reservation. A budget refusal is HTTP 409:
 that contact; see below) or `ledger` (the ledger could not be written). Nothing
 was reserved and nothing was paid.
 
-Outcomes follow the #80 rules. A settled payment is charged the amount the
-provider reported. A refusal before dispatch or a confirmed failure is
+Outcomes follow the #80 all-in debit rules. Reserve principal plus approved
+maximum routing fee before dispatch; a settled payment charges actual principal
+plus the actual reported fee. A refusal before dispatch or a confirmed failure is
 released. An unknown outcome (transport loss, still in flight, a crash in
 between) stays reserved. For rooms, `settled` / `refused` / `unknown` members
-resolve the same way. The tally can over-count, never under-count. Routing
-fees are provider-controlled and, as with the #80 caps, are not principal.
+resolve the same way. Missing actual fees or absent fee records retain the
+reservation. The tally can over-count, never under-count. Routing fee ceilings
+are enforced by the provider and included in both #80 caps and G1 limits.
 
 `POST /messages` (a pre-encrypted message carrying a proof the caller already
 paid) accepts a budget grant but debits nothing: it requests no invoice and
@@ -148,7 +150,7 @@ backs that one answer with a short, single-use **first-contact grant**.
    connected stranger for its signed admission quote. This is F1's bounded
    payment preparation (`docs/v2/F1-CAPPED-FIRST-CONTACT.md`). The node
    validates the quote as a send would and returns `admission_msat`,
-   `message_msat`, `total_msat` and `expires_at` (≤ 60 s). It pays and
+   `message_msat`, `max_routing_fee_msat`, `total_msat` and `expires_at` (≤ 60 s). It pays and
    reserves nothing, and needs a live budget grant. The node keeps the quote for
    its validity, so the send pays exactly this invoice and the stranger is never
    asked for a second one. For a stranger, it returns 409 if a first contact is
@@ -176,8 +178,10 @@ backs that one answer with a short, single-use **first-contact grant**.
    - It is held in memory only: never written down, and dropped on restart,
      revocation, rotation or replacement of the budget grant.
 3. **Send.** `POST /api/v1/messages/compose` to that stranger consumes the grant.
-   - The grant's amount caps the whole first contact: admission plus first
-     message, together with any `max_total_msat`.
+   - The grant's amount caps the whole first contact: admission principal, first
+     message principal, and both approved routing ceilings, together with any
+     `max_total_msat`. Confirm `quote.total_msat` (already all-in); display
+     `quote.max_routing_fee_msat` without adding it to the total a second time.
    - Consumption carries the original grant identity into reservation. Grant
      replacement or expiry during that handoff refuses the send.
    - The node reserves that cap **once** against the budget grant before
@@ -210,7 +214,7 @@ the owner already budgeted**, without a prompt.
   the owner granted the budget, or by `contact_budget_msat` on the contact's
   first-contact confirmation.
 - The node first asks for the recipient's signed quote, then reserves exactly
-  the quoted admission against the grant before paying anything. The
+  the quoted admission plus its routing ceiling against the grant before paying anything. The
   reservation must fit the contact's cap and what is left. The message and
   every re-admission in the same API call share one per-call maximum, including
   all members of a room fan-out. Separate reservations track their financial
@@ -227,13 +231,18 @@ the owner already budgeted**, without a prompt.
   one-time confirmation for exactly that contact (steps 1 and 2 above) then
   covers the re-admission, is consumed by it, and bounds its amount. Never for a
   stranger without it.
-- A confirmed `max_total_msat` covers the message only. The compose reply's
-  `amount_msat` stays the message principal, and the re-admission is reported
-  apart as `readmission_msat`. For a paired client the grant bounds it; the
-  owner's own key has no such bound, so a capped owner send is refused
-  (`price_cap_exceeded`) and an uncapped one pays.
+- Any confirmed total/recipient cap refuses an additional unquoted reconnect
+  admission (`price_cap_exceeded`), for owner and paired callers alike. Without
+  that request cap, existing admission authority may pay it under G1 all-in
+  limits. The reply's `amount_msat` remains message principal; `readmission_msat`
+  reports admission principal and `max_routing_fee_msat` sums authorized fees.
 
 The node enforces independent owner authority for confirmation, exact client
 and grant binding, exact recipient, bounded amount, single use, short life, and
 reservation inside that same budget. A delegated paired program cannot issue
 its own first-contact approval.
+
+Routing policy defaults to `min(max(5000, floor(P / 100)), 10000)` msat per
+payment, with caller tightening. A 1,000-msat principal therefore needs a
+6,000-msat all-in allowance by default. See [fee caps](v2/ALL-IN-FEE-CAPS.md)
+for backend support, single-use invoice hashes, and the app migration.

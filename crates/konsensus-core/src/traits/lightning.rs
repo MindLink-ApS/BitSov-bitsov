@@ -21,7 +21,7 @@ pub struct RoutingFeePolicy {
 }
 impl Default for RoutingFeePolicy {
     fn default() -> Self {
-        Self { minimum_msat: 1_000, proportional_millionths: 10_000, maximum_msat: 10_000 }
+        Self { minimum_msat: 5_000, proportional_millionths: 10_000, maximum_msat: 10_000 }
     }
 }
 impl RoutingFeePolicy {
@@ -706,7 +706,7 @@ mod routing_fee_policy_tests {
     #[test]
     fn default_policy_bounds_small_large_and_overflowing_inputs() {
         let p = RoutingFeePolicy::default();
-        for (amount, expected) in [(0,0), (1,1000), (1000,1000), (100_000,1000), (500_000,5000), (1_000_000,10000), (u64::MAX,10000)] {
+        for (amount, expected) in [(0,0), (1,5000), (1000,5000), (100_000,5000), (500_000,5000), (1_000_000,10000), (u64::MAX,10000)] {
             assert_eq!(p.ceiling(amount, None), expected);
             assert_eq!(p.ceiling(amount, Some(0)), 0);
             assert_eq!(p.ceiling(amount, Some(u64::MAX)), expected);

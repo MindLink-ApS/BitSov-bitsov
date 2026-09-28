@@ -337,8 +337,7 @@ impl Debit {
     pub fn settled(&self, recipient: &str, amount_msat: u64) {
         if let Some((service, reservation)) = &self.held {
             let fees = self.fees.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(total) = fees.get(recipient).copied().unwrap_or(Some(0))
-                .and_then(|fee| amount_msat.checked_add(fee)) {
+            if let Some(total) = settled_total(amount_msat, fees.get(recipient).copied()) {
                 service.resolve_spend(reservation, recipient, total);
             }
         }
@@ -347,7 +346,9 @@ impl Debit {
     /// Nothing was paid to `recipient`: refused before dispatch, or the
     /// payment was confirmed failed.
     pub fn released(&self, recipient: &str) {
-        self.settled(recipient, 0);
+        if let Some((service, reservation)) = &self.held {
+            service.resolve_spend(reservation, recipient, 0);
+        }
     }
 
     /// Resolve from the result of `create_payment_proof`, using the #80
@@ -363,5 +364,25 @@ impl Debit {
             }
             Err(_) => self.released(recipient),
         }
+    }
+}
+
+/// No record is safe only when no principal was paid. An explicit unknown fee
+/// always retains liability; absence never invents a zero fee for paid value.
+fn settled_total(principal: u64, recorded_fee: Option<Option<u64>>) -> Option<u64> {
+    recorded_fee.unwrap_or_else(|| (principal == 0).then_some(0))
+        .and_then(|fee| principal.checked_add(fee))
+}
+
+#[cfg(test)]
+mod fee_evidence_tests {
+    #[test]
+    fn missing_fee_evidence_holds_positive_debit_but_known_nonpayment_releases() {
+        assert_eq!(super::settled_total(1000, None), None);
+        assert_eq!(super::settled_total(0, None), Some(0));
+        assert_eq!(super::settled_total(0, Some(None)), None);
+        assert_eq!(super::settled_total(1000, Some(None)), None);
+        assert_eq!(super::settled_total(1000, Some(Some(400))), Some(1400));
+        assert_eq!(super::settled_total(u64::MAX, Some(Some(1))), None);
     }
 }
