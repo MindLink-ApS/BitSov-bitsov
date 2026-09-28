@@ -53,6 +53,8 @@ pub struct PrePaymentRefusals {
     pub bucket_ms: u64,
     /// Maximum retained hours, including the current hour.
     pub capacity: usize,
+    /// Effective current UTC hour after rollback clamping, including quiet reads.
+    pub effective_hour_start_ms: u64,
     /// Nonempty buckets, oldest first. Volatile; resets on restart.
     pub buckets: Vec<PrePaymentBucket>,
 }
@@ -102,7 +104,7 @@ impl PrePaymentCounters {
     }
 
     pub(super) fn snapshot(&mut self, now_ms: u64) -> PrePaymentRefusals {
-        self.advance(now_ms);
+        let effective_hour_start_ms = self.advance(now_ms);
         let mut buckets: Vec<_> = self
             .buckets
             .iter()
@@ -123,6 +125,7 @@ impl PrePaymentCounters {
         PrePaymentRefusals {
             bucket_ms: BUCKET_MS,
             capacity: CAPACITY,
+            effective_hour_start_ms,
             buckets,
         }
     }
@@ -131,6 +134,28 @@ impl PrePaymentCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_exposes_effective_hour_after_quiet_read_and_rollback() {
+        let mut counters = PrePaymentCounters::default();
+        counters.record(PrePaymentReason::SessionBeforePayment, 100 * BUCKET_MS);
+        let quiet = serde_json::to_value(counters.snapshot(101 * BUCKET_MS)).unwrap();
+        assert_eq!(quiet["effective_hour_start_ms"], 101 * BUCKET_MS);
+        assert_eq!(quiet["buckets"].as_array().unwrap().len(), 1);
+        assert_eq!(quiet["buckets"][0]["start_ms"], 100 * BUCKET_MS);
+
+        let rollback = serde_json::to_value(counters.snapshot(99 * BUCKET_MS)).unwrap();
+        assert_eq!(rollback, quiet);
+        counters.record(PrePaymentReason::AdmissionRequired, 99 * BUCKET_MS);
+        let recorded = serde_json::to_value(counters.snapshot(99 * BUCKET_MS)).unwrap();
+        assert_eq!(recorded["effective_hour_start_ms"], 101 * BUCKET_MS);
+        assert_eq!(recorded["buckets"][1]["start_ms"], 101 * BUCKET_MS);
+        assert_eq!(recorded["buckets"][1]["counts"]["admission_required"], 1);
+
+        let expired = serde_json::to_value(counters.snapshot(125 * BUCKET_MS)).unwrap();
+        assert_eq!(expired["effective_hour_start_ms"], 125 * BUCKET_MS);
+        assert_eq!(expired["buckets"], serde_json::json!([]));
+    }
 
     #[test]
     fn counter_saturates_without_wrapping_or_panicking() {
