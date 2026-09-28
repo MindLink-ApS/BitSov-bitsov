@@ -35,6 +35,7 @@ can read that code by construction. If anyone describes the code comparison as
 |---|---|
 | `read` + `receive` | the pairing default — first run works unattended, and a paired client is no more capable than the old loopback token |
 | `spend` | explicit **per-pairing** grant by the owner at the control socket. Not a per-message confirmation: under "payment IS the connection" every message send is a spend, so per-operation prompts would fire on every message |
+| `admin` | never grantable to a pairing (#104) |
 | `identity` | only on an identity-free node during first-run bootstrap, and stripped from the pairing as part of the transition commit |
 | `credential` | never grantable to a pairing |
 
