@@ -1065,7 +1065,7 @@ pub async fn cmd_approve(command: crate::cli::ApprovalCommand) -> Result<()> {
     let (config, request, summary) = match command {
         ApprovalCommand::FirstContact { client, op, to, max_msat, contact_budget_msat, config } => {
             let summary = format!(
-                "Approve first contact: client {client}, grant {op}, recipient {to}, maximum {max_msat} msat, contact budget {}.",
+                "Approve first contact: client {client:?}, grant {op:?}, recipient {to:?}, maximum {max_msat} msat, contact budget {}.",
                 contact_budget_msat.map(|n| format!("{n} msat")).unwrap_or_else(|| "unchanged".into())
             );
             (config, ControlRequest::ApproveFirstContact {
@@ -1075,7 +1075,7 @@ pub async fn cmd_approve(command: crate::cli::ApprovalCommand) -> Result<()> {
         }
         ApprovalCommand::Gift { intro, newcomer, hash, gift_msat, fee_max_msat, code, config } => {
             let summary = format!(
-                "Approve gift: introduction {intro}, newcomer {newcomer}, payment hash {hash}, gift {gift_msat} msat, maximum fee {fee_max_msat} msat, code {code}."
+                "Approve gift: introduction {intro:?}, newcomer {newcomer:?}, payment hash {hash:?}, gift {gift_msat} msat, maximum fee {fee_max_msat} msat, code {code:?}."
             );
             (config, ControlRequest::ApproveGift {
                 intro_id: intro, newcomer, payment_hash: hash, gift_msat, fee_max_msat, code,

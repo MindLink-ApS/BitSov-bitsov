@@ -367,3 +367,161 @@ fn owner_approval_commands_require_the_complete_tuple() {
         assert!(Cli::try_parse_from(args).is_err());
     }
 }
+
+#[test]
+fn owner_approval_strings_reject_controls_and_surrounding_whitespace() {
+    let recipient = "AB".repeat(32);
+    let commands = [
+        vec![
+            "konsensus",
+            "approve",
+            "first-contact",
+            "--client",
+            "client-1",
+            "--op",
+            "grant-1",
+            "--to",
+            &recipient,
+            "--max-msat",
+            "4000",
+            "--config",
+            "konsensus.toml",
+        ],
+        vec![
+            "konsensus",
+            "approve",
+            "gift",
+            "--intro",
+            "intro-1",
+            "--newcomer",
+            "key",
+            "--hash",
+            "hash",
+            "--gift-msat",
+            "20000",
+            "--fee-max-msat",
+            "1000",
+            "--code",
+            "012345",
+            "--config",
+            "konsensus.toml",
+        ],
+    ];
+    let controls = ('\u{0}'..='\u{1f}').chain('\u{7f}'..='\u{9f}');
+    let characters: Vec<char> = controls
+        .chain([' ', '\u{a0}', '\u{2003}', '\u{2028}', '\u{2029}'])
+        .collect();
+    let mut accepted = Vec::new();
+    for command in commands {
+        for index in (4..command.len()).step_by(2) {
+            let flag = command[index - 1];
+            if matches!(flag, "--max-msat" | "--gift-msat" | "--fee-max-msat") {
+                continue;
+            }
+            for &character in &characters {
+                let original = command[index];
+                let mut values = vec![
+                    format!("{character}{original}"),
+                    format!("{original}{character}"),
+                ];
+                if character.is_control() {
+                    values.push(format!("{}{character}{}", &original[..1], &original[1..]));
+                }
+                for value in values {
+                    let mut args = command.clone();
+                    args[index] = &value;
+                    match Cli::try_parse_from(args) {
+                        Ok(_) => accepted.push(format!("{} {flag} {value:?}", command[2])),
+                        Err(error) if character.is_control() => assert!(
+                            !error.to_string().contains(&value),
+                            "diagnostic echoed {} {flag} {value:?}",
+                            command[2]
+                        ),
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "unsafe arguments accepted: {accepted:#?}"
+    );
+}
+
+#[test]
+fn owner_approval_strings_preserve_valid_values() {
+    let recipient = "AB".repeat(32);
+    let cli = Cli::try_parse_from([
+        "konsensus",
+        "approve",
+        "first-contact",
+        "--client",
+        "client with spaces",
+        "--op",
+        "grant\\\"id",
+        "--to",
+        &recipient,
+        "--max-msat",
+        "4000",
+        "--config",
+        "node data/konsensus.toml",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Approve {
+            command:
+                ApprovalCommand::FirstContact {
+                    client,
+                    op,
+                    to,
+                    config,
+                    ..
+                },
+        } => {
+            assert_eq!(client, "client with spaces");
+            assert_eq!(op, "grant\\\"id");
+            assert_eq!(to, recipient);
+            assert_eq!(config, PathBuf::from("node data/konsensus.toml"));
+        }
+        _ => panic!("expected first-contact approval"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_approval_config_preserves_non_utf8_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let config = OsString::from_vec(b"node-\xff/konsensus.toml".to_vec());
+    let mut args: Vec<OsString> = [
+        "konsensus",
+        "approve",
+        "first-contact",
+        "--client",
+        "client-1",
+        "--op",
+        "grant-1",
+        "--to",
+        "recipient",
+        "--max-msat",
+        "4000",
+        "--config",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    args.push(config.clone());
+    let cli = Cli::try_parse_from(args.clone()).unwrap();
+    match cli.command {
+        Command::Approve {
+            command: ApprovalCommand::FirstContact { config: parsed, .. },
+        } => {
+            assert_eq!(parsed.as_os_str(), config);
+        }
+        _ => panic!("expected first-contact approval"),
+    }
+    *args.last_mut().unwrap() = OsString::from_vec(b"node-\xff\r/konsensus.toml".to_vec());
+    assert!(Cli::try_parse_from(args).is_err());
+}
