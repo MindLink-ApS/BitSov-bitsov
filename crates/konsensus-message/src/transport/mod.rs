@@ -608,6 +608,8 @@ struct PeerConnection {
     /// and `NoiseTransport::promote_to_privileged` flips it to `true` once the
     /// message-plane PaymentGate accepts a settled payment from this peer.
     privileged: bool,
+    /// Last price-table discount successfully published on this connection.
+    advertised_trust_discount: Option<f64>,
     /// The Noise session for encrypt/decrypt.
     noise: NoiseSession,
     /// TCP write half — protected by mutex for send serialization.

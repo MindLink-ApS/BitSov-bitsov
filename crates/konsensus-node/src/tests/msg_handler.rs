@@ -1370,3 +1370,449 @@ async fn category_offer_kind_transition(old_longform: u64, new_chat: u64, new_lo
     payer.shutdown(); payee.shutdown();
     assert_eq!(result.is_ok(), allowed, "the original offer's kind eligibility is immutable: {result:?}");
 }
+
+#[tokio::test]
+async fn discounted_kind_offer_survives_price_rise() {
+    for (raw_price, discount, expected) in [(2000, 0.5, 1000), (2001, 0.25, 1501)] {
+        discounted_kind_offer_case(raw_price, discount, expected).await;
+    }
+}
+
+async fn discounted_kind_offer_case(raw_price: u64, discount: f64, expected: u64) {
+    use konsensus_core::gate::GateConfig;
+    use konsensus_core::kind::KIND_LONGFORM;
+    use konsensus_core::traits::pricing::PricingEngine;
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recipient.sqlite");
+    let db = Arc::new(
+        konsensus_storage::SqliteStorage::open(path.to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    assert!(matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ));
+    assert!(matches!(
+        target.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ));
+    // Simulate the same generation-bound bought connection used by the
+    // production admission completion path; price events must pass its gate.
+    let since = source.connected_since(bob.node_id()).await.unwrap();
+    source.mark_admission_paid(bob.node_id(), since).await;
+    assert!(source.admission_paid_on_connection(bob.node_id()).await);
+
+    let old = konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
+        chat_msat: 1000,
+        longform_msat: raw_price,
+        ..Default::default()
+    });
+    let prices = konsensus_pricing::peer_prices::build_price_table(&old).await;
+    let cache = konsensus_pricing::PeerPriceCache::new();
+    crate::delivery_prices::send_price_frame(
+        &target,
+        db.as_ref(),
+        alice.node_id(),
+        &Frame::PriceTable {
+            prices,
+            block_height: 1,
+            valid_blocks: 10,
+            trust_discount: discount,
+        },
+        &old,
+    )
+    .await
+    .unwrap();
+    // Cache frames exactly as production handle_price_table_received and
+    // handle_price_response_received do for an authenticated bought peer.
+    match source.recv_control().await.unwrap() {
+        ControlEvent::PriceTableReceived {
+            peer_id,
+            prices,
+            block_height,
+            valid_blocks,
+            trust_discount,
+            privileged,
+        } => {
+            assert!(
+                privileged,
+                "production session handler must accept this price table"
+            );
+            cache
+                .update(peer_id, prices, block_height, valid_blocks, trust_discount)
+                .await;
+        }
+        event => panic!("unexpected event: {event:?}"),
+    }
+    let raw_kind_price = old.get_price_msat(KIND_LONGFORM).await.unwrap();
+    crate::delivery_prices::send_price_frame(
+        &target,
+        db.as_ref(),
+        alice.node_id(),
+        &Frame::PriceResponse {
+            kind: KIND_LONGFORM,
+            price_msat: raw_kind_price,
+            block_height: 1,
+        },
+        &old,
+    )
+    .await
+    .unwrap();
+    match source.recv_control().await.unwrap() {
+        ControlEvent::PriceResponseReceived {
+            peer_id,
+            kind,
+            price_msat,
+            block_height,
+            privileged,
+        } => {
+            assert!(
+                privileged,
+                "production session handler must accept this price response"
+            );
+            assert_eq!(price_msat, raw_price, "wire price stays undiscounted");
+            cache
+                .update_kind_price(peer_id, kind, price_msat, block_height)
+                .await;
+        }
+        event => panic!("unexpected event: {event:?}"),
+    }
+    let offered = cache
+        .get_fresh_discounted_peer_price(
+            bob.node_id(),
+            KIND_LONGFORM,
+            1,
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        offered, expected,
+        "production sender applies the retained table discount once"
+    );
+
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let hash = wallet.inject_inbound_keysend(offered, None).await;
+    let settled = wallet.get_payment_status(&hash).await.unwrap();
+    let proof = PaymentProof::new(
+        hex::decode(hash).unwrap().try_into().unwrap(),
+        hex::decode(settled.preimage.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        offered,
+    );
+    let mut env = UkmEnvelopeBuilder::new(
+        KIND_LONGFORM,
+        *alice.node_id(),
+        Recipient::Node(*bob.node_id()),
+        vec![1],
+        proof,
+    )
+    .build();
+    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+    let nonce = konsensus_storage::StorageNonceAdapter::new(db.clone());
+    let gate = PaymentGate::with_config(GateConfig {
+        verify_lightning_settlement: true,
+        ..Default::default()
+    });
+    assert!(
+        !gate
+            .validate_received_paid_envelope(
+                &env,
+                &nonce,
+                &old,
+                None,
+                Some(&wallet),
+                discount,
+                Some(bob.node_id()),
+            )
+            .await
+            .unwrap(),
+        "payment covers the issue-time discounted tariff"
+    );
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+
+    // Reopen the recipient store before first acceptance: only the durable
+    // effective offer survives, not the transport's advertised discount.
+    db.pool().close().await;
+    let db = Arc::new(
+        konsensus_storage::SqliteStorage::open(path.to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let nonce = konsensus_storage::StorageNonceAdapter::new(db.clone());
+    let new = konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
+        chat_msat: 1000,
+        longform_msat: 4000,
+        ..Default::default()
+    });
+    let recorded = db
+        .delivery_price_floor(&env, settled.timestamp, settled.timestamp)
+        .await
+        .unwrap();
+    let result = gate
+        .validate_received_paid_envelope(
+            &env,
+            &nonce,
+            &new,
+            None,
+            Some(&wallet),
+            0.0,
+            Some(bob.node_id()),
+        )
+        .await;
+    source.shutdown();
+    target.shutdown();
+    assert_eq!(
+        recorded,
+        Some(offered),
+        "persist the exact discounted sender price"
+    );
+    assert!(
+        matches!(result, Ok(false)),
+        "recipient-issued discounted kind price must survive repricing: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn kind_offer_establishes_discount_on_new_connection() {
+    use konsensus_core::kind::KIND_LONGFORM;
+    use konsensus_message::{ControlEvent, TransportConfig};
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let source = NoiseTransport::new(
+        alice.clone(),
+        TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![*bob.node_id()],
+            ..Default::default()
+        },
+    );
+    let target = NoiseTransport::new(
+        bob.clone(),
+        TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![*alice.node_id()],
+            ..Default::default()
+        },
+    );
+    target.start_listener().await.unwrap();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    source.recv_control().await.unwrap();
+    target.recv_control().await.unwrap();
+    let pricing =
+        konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
+            chat_msat: 1000,
+            longform_msat: 2001,
+            ..Default::default()
+        });
+    let db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let cache = konsensus_pricing::PeerPriceCache::new();
+    // The sender cache outlives a transport reconnect; its old discount must
+    // be explicitly replaced before publishing a new undiscounted kind offer.
+    cache
+        .update(
+            *bob.node_id(),
+            HashMap::from([("messaging".into(), 2001)]),
+            1,
+            10,
+            0.5,
+        )
+        .await;
+    crate::delivery_prices::send_price_frame(
+        &target,
+        &db,
+        alice.node_id(),
+        &Frame::PriceResponse {
+            kind: KIND_LONGFORM,
+            price_msat: 2001,
+            block_height: 1,
+        },
+        &pricing,
+    )
+    .await
+    .unwrap();
+    match source.recv_control().await.unwrap() {
+        ControlEvent::PriceTableReceived {
+            peer_id,
+            prices,
+            block_height,
+            valid_blocks,
+            trust_discount,
+            ..
+        } => {
+            assert_eq!(trust_discount, 0.0);
+            cache
+                .update(peer_id, prices, block_height, valid_blocks, trust_discount)
+                .await;
+        }
+        event => panic!("table must establish the discount first: {event:?}"),
+    }
+    match source.recv_control().await.unwrap() {
+        ControlEvent::PriceResponseReceived {
+            peer_id,
+            kind,
+            price_msat,
+            block_height,
+            ..
+        } => {
+            assert_eq!(price_msat, 2001);
+            cache
+                .update_kind_price(peer_id, kind, price_msat, block_height)
+                .await;
+        }
+        event => panic!("expected raw kind response: {event:?}"),
+    }
+    let price = cache
+        .get_discounted_peer_price(bob.node_id(), KIND_LONGFORM)
+        .await
+        .unwrap();
+    assert_eq!(price, 2001);
+    let persisted: i64 =
+        sqlx::query_scalar("SELECT amount_msat FROM delivery_price_quotes WHERE scope = ?")
+            .bind(format!("kind:{KIND_LONGFORM}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(persisted as u64, price);
+    source.shutdown();
+    target.shutdown();
+}
+
+#[tokio::test]
+async fn kind_offer_publication_serializes_discount_and_fails_closed() {
+    use konsensus_message::{ControlEvent, TransportConfig};
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let source = Arc::new(NoiseTransport::new(
+        alice.clone(),
+        TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![*bob.node_id()],
+            ..Default::default()
+        },
+    ));
+    let target = Arc::new(NoiseTransport::new(
+        bob.clone(),
+        TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![*alice.node_id()],
+            ..Default::default()
+        },
+    ));
+    target.start_listener().await.unwrap();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    source.recv_control().await.unwrap();
+    target.recv_control().await.unwrap();
+    let table = Frame::PriceTable {
+        prices: HashMap::new(),
+        block_height: 1,
+        valid_blocks: 10,
+        trust_discount: 0.5,
+    };
+    target.send_frame(alice.node_id(), &table).await.unwrap();
+    assert!(matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PriceTableReceived { .. }
+    ));
+    let response = Frame::PriceResponse {
+        kind: 1,
+        price_msat: 2000,
+        block_height: 1,
+    };
+    let newer = Frame::PriceTable {
+        trust_discount: 0.0,
+        prices: HashMap::new(),
+        block_height: 1,
+        valid_blocks: 10,
+    };
+    assert!(target
+        .send_price_frame_with(alice.node_id(), &newer, &newer, |_, _| async {
+            Err(konsensus_core::traits::transport::TransportError::Other(
+                "disk fault".into(),
+            ))
+        })
+        .await
+        .is_err());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let writer = target.clone();
+    let peer = *alice.node_id();
+    let pending = tokio::spawn(async move {
+        writer
+            .send_price_frame_with(
+                &peer,
+                &response,
+                &table,
+                |discount, needs_table| async move {
+                    assert_eq!(
+                        discount, 0.5,
+                        "failed persistence must not change the advertised discount"
+                    );
+                    assert!(!needs_table);
+                    entered_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+    });
+    entered_rx.await.unwrap();
+    let refresh = target.send_frame(alice.node_id(), &newer);
+    tokio::pin!(refresh);
+    tokio::select! {
+        result = &mut refresh => panic!("table overtook persistence: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+    }
+    release_tx.send(()).unwrap();
+    pending.await.unwrap();
+    refresh.await.unwrap();
+    // No frame from failed persistence; the response using the old discount
+    // precedes the new table, even though the latter tried to send concurrently.
+    assert!(matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PriceResponseReceived {
+            price_msat: 2000,
+            ..
+        }
+    ));
+    assert!(matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PriceTableReceived {
+            trust_discount: 0.0,
+            ..
+        }
+    ));
+    source.shutdown();
+    target.shutdown();
+}

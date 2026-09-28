@@ -59,6 +59,78 @@ impl NoiseTransport {
             .await
             .map_err(|e| TransportError::Other(e.to_string()))?;
 
+        if let Frame::PriceTable { trust_discount, .. } = frame {
+            conn.advertised_trust_discount = Some(*trust_discount);
+        }
+        Ok(())
+    }
+
+    /// Persist a price offer with the exact discount advertised on this connection,
+    /// then publish it. The send lock covers persistence and publication so a
+    /// concurrent table cannot change the discount between those operations.
+    /// On a new connection, publish `initial_table` before a kind response: the
+    /// remote cache may still retain a discount from an older connection.
+    /// `persist` receives the effective discount and whether that table is needed.
+    pub async fn send_price_frame_with<F, Fut>(
+        &self,
+        peer: &NodeId,
+        frame: &Frame,
+        initial_table: &Frame,
+        persist: F,
+    ) -> Result<(), TransportError>
+    where
+        F: FnOnce(f64, bool) -> Fut,
+        Fut: std::future::Future<Output = Result<(), TransportError>>,
+    {
+        let Frame::PriceTable {
+            trust_discount: initial_discount,
+            ..
+        } = initial_table
+        else {
+            return Err(TransportError::Other("expected initial price table".into()));
+        };
+        if !matches!(
+            frame,
+            Frame::PriceTable { .. } | Frame::PriceResponse { .. }
+        ) {
+            return Err(TransportError::Other("expected a price frame".into()));
+        }
+        let conn = {
+            let peers = self.peers.read().await;
+            Arc::clone(
+                peers
+                    .get(peer)
+                    .ok_or_else(|| TransportError::NotConnected(peer.to_hex()))?,
+            )
+        };
+        let mut conn = conn.lock().await;
+        let needs_table = matches!(frame, Frame::PriceResponse { .. })
+            && conn.advertised_trust_discount.is_none();
+        let discount = match frame {
+            Frame::PriceTable { trust_discount, .. } => *trust_discount,
+            _ => conn.advertised_trust_discount.unwrap_or(*initial_discount),
+        };
+        persist(discount, needs_table).await?;
+        // Retain this same connection for both frames, even if the peer reconnects.
+        for outgoing in needs_table
+            .then_some(initial_table)
+            .into_iter()
+            .chain(std::iter::once(frame))
+        {
+            let bytes = outgoing
+                .to_bytes()
+                .map_err(|e| TransportError::WireProtocol(e.to_string()))?;
+            let encrypted = conn
+                .noise
+                .encrypt(&bytes)
+                .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+            write_noise_message(&mut conn.writer, &encrypted)
+                .await
+                .map_err(|e| TransportError::Other(e.to_string()))?;
+            if let Frame::PriceTable { trust_discount, .. } = outgoing {
+                conn.advertised_trust_discount = Some(*trust_discount);
+            }
+        }
         Ok(())
     }
 
