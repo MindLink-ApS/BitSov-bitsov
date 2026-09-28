@@ -73,6 +73,10 @@ fn recovery(op: &OutboxOperation) -> Result<Recovery, ApiError> {
     serde_json::from_slice(&op.recovery).map_err(storage)
 }
 fn encode(op: &mut OutboxOperation, data: &Recovery) -> Result<(), ApiError> {
+    op.accounting_pending = data.reservation.is_some()
+        || data.admission_reservation.is_some()
+        || data.admission_pending
+        || !data.budget_resolutions.is_empty();
     op.recovery = serde_json::to_vec(data).map_err(storage)?;
     Ok(())
 }
@@ -939,15 +943,129 @@ async fn drain_resolutions(state: &AppState, op: &mut OutboxOperation) -> Result
     Ok(())
 }
 
+type LinkedReservation = (crate::spend_budget::OperationReservationLink, Reservation);
+
 /// Run at startup and periodically. It only queries payment status and repairs
 /// delivery state; neither grants nor invoice/keysend dispatch are recreated.
 pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError> {
-    for candidate in state
+    // One ledger lock per sweep, proportional to unresolved links rather than
+    // all-time SQL history. Union the IDs: a late debit from an execution fenced
+    // by another process can appear after its operation left the SQL predicate.
+    let mut links: HashMap<String, Vec<LinkedReservation>> = HashMap::new();
+    if let Some(service) = &state.pairing {
+        for (link, reservation) in service.pending_operation_reservations() {
+            links
+                .entry(link.operation_id.clone())
+                .or_default()
+                .push((link, reservation));
+        }
+    }
+    let mut ids: std::collections::BTreeSet<String> = state
         .storage
         .list_recoverable_operations()
         .await
         .map_err(storage)?
+        .into_iter()
+        .map(|op| op.operation_id)
+        .collect();
+    ids.extend(links.keys().cloned());
+    for id in ids {
+        let Ok(_guard) = operation_lock(state, &id)?.try_lock_owned() else {
+            continue;
+        };
+        let result = async {
+            let Some(mut op) = state
+                .storage
+                .get_outbox_operation(&id)
+                .await
+                .map_err(storage)?
+            else {
+                return Ok::<(), ApiError>(());
+            };
+            if let Some(linked) = links.get(&id) {
+                attach_recovered_reservations(state, &mut op, linked).await?;
+            }
+            if matches!(op.state.as_str(), "paying" | "payment_unknown") {
+                reconcile(state, &mut op).await?;
+            }
+            recover_budget(state, &mut op).await?;
+            if op.state == "paid" {
+                recover_paid(state, &mut op).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(operation_id = %id, %error, "operation recovery deferred");
+        }
+    }
+    compact_terminal_operations(state, &links).await
+}
+
+async fn attach_recovered_reservations(
+    state: &AppState,
+    op: &mut OutboxOperation,
+    linked: &[LinkedReservation],
+) -> Result<(), ApiError> {
+    let mut data = recovery(op)?;
+    let before = op.recovery.clone();
+    let was_pending = op.accounting_pending;
+    for (link, reservation) in linked {
+        if data
+            .budget_resolutions
+            .iter()
+            .any(|r| r.reservation.id == reservation.id && r.reservation.op_id == reservation.op_id)
+        {
+            continue;
+        }
+        if op.recovery_compacted {
+            // Compaction required empty accounting and no linked liabilities.
+            // A link appearing afterwards is a late, unattached debit from a
+            // fenced worker; do not infer its fee from the compacted receipt.
+            queue_resolution(&mut data, reservation.clone(), Some(0));
+        } else if data.execution_id.as_deref() != Some(&link.execution_id)
+            && data.execution_id.is_some()
+        {
+            // A superseded execution cannot dispatch: attach_debit/load checks
+            // execution identity before admission or message wallet calls.
+            queue_resolution(&mut data, reservation.clone(), Some(0));
+        } else if link.readmission {
+            if data
+                .admission_reservation
+                .as_ref()
+                .is_none_or(|r| r.id != reservation.id)
+            {
+                queue_resolution(&mut data, reservation.clone(), Some(0));
+            }
+        } else if data.reservation.is_none() {
+            data.reservation = Some(reservation.clone());
+        }
+    }
+    encode(op, &data)?;
+    if op.recovery != before || op.accounting_pending != was_pending {
+        save(state, op).await?;
+    }
+    Ok(())
+}
+
+// Retain full recovery evidence for 30 days after the last terminal/accounting
+// change, then compact at most 100 rows per sweep. Never expire operation IDs:
+// deleting the tombstone would authorize another payment on duplicate POST.
+const TERMINAL_RECOVERY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+async fn compact_terminal_operations(
+    state: &AppState,
+    links: &HashMap<String, Vec<LinkedReservation>>,
+) -> Result<(), ApiError> {
+    let cutoff = chrono::Utc::now().timestamp_millis() - TERMINAL_RECOVERY_RETENTION_MS;
+    for candidate in state
+        .storage
+        .list_compactable_operations(cutoff, 100)
+        .await
+        .map_err(storage)?
     {
+        if links.contains_key(&candidate.operation_id) {
+            continue;
+        }
         let Ok(_guard) = operation_lock(state, &candidate.operation_id)?.try_lock_owned() else {
             continue;
         };
@@ -960,18 +1078,33 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             else {
                 return Ok::<(), ApiError>(());
             };
-            if matches!(op.state.as_str(), "paying" | "payment_unknown") {
-                reconcile(state, &mut op).await?;
+            if op.accounting_pending
+                || op.recovery_compacted
+                || op.updated_at >= cutoff
+                || !matches!(op.state.as_str(), "acked" | "failed_paid")
+            {
+                return Ok(());
             }
-            recover_budget(state, &mut op).await?;
-            if op.state == "paid" {
-                recover_paid(state, &mut op).await?;
+            let data = recovery(&op)?;
+            // Defense in depth: retain any liabilities even if metadata came
+            // from an older/inconsistent writer. CAS protects concurrent ACKs.
+            encode(&mut op, &data)?;
+            if op.accounting_pending {
+                return save(state, &mut op).await;
             }
-            Ok(())
+            let receipt = Recovery {
+                caller: data.caller,
+                fee_ceiling_msat: data.fee_ceiling_msat,
+                admission_msat: data.admission_msat,
+                ..Default::default()
+            };
+            encode(&mut op, &receipt)?;
+            op.recovery_compacted = true;
+            save(state, &mut op).await
         }
         .await;
         if let Err(error) = result {
-            tracing::warn!(operation_id = %candidate.operation_id, %error, "operation recovery deferred");
+            tracing::warn!(operation_id = %candidate.operation_id, %error, "operation retention deferred");
         }
     }
     Ok(())
@@ -986,22 +1119,10 @@ fn settlement_matches(op: &OutboxOperation, data: &Recovery, details: &PaymentDe
 }
 
 async fn recover_budget(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    if !op.accounting_pending { return Ok(()); }
     let mut data = recovery(op)?;
     let before = op.recovery.clone();
-    if let Some(service) = &state.pairing {
-        for (link, reservation) in service.operation_reservations(&op.operation_id) {
-            if data.budget_resolutions.iter().any(|r| r.reservation.id == reservation.id && r.reservation.op_id == reservation.op_id) { continue; }
-            if data.execution_id.as_deref() != Some(&link.execution_id) && data.execution_id.is_some() { continue; }
-            if link.readmission {
-                if data.admission_reservation.as_ref().is_none_or(|r| r.id != reservation.id) {
-                    // Admission cannot dispatch until this exact child is attached.
-                    queue_resolution(&mut data, reservation, Some(0));
-                }
-            } else if data.reservation.is_none() {
-                data.reservation = Some(reservation);
-            }
-        }
-    }
+    let was_pending = op.accounting_pending;
     if let Some(details) = data.settlement.clone().filter(|d| settlement_matches(op, &data, d)) {
         queue_message_resolution(&mut data, details.amount_msat, details.fee_msat);
     } else if op.state == "released"
@@ -1012,7 +1133,7 @@ async fn recover_budget(state: &AppState, op: &mut OutboxOperation) -> Result<()
         queue_message_resolution(&mut data, 0, Some(0));
     }
     encode(op, &data)?;
-    if op.recovery != before { save(state, op).await?; }
+    if op.recovery != before || op.accounting_pending != was_pending { save(state, op).await?; }
     drain_resolutions(state, op).await
 }
 

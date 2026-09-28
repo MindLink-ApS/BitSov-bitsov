@@ -19,6 +19,10 @@ pub struct OutboxOperation {
     pub last_error: Option<String>,
     pub version: i64,
     pub recovery: Vec<u8>,
+    /// Unresolved accounting references/intents, including conservative legacy backfill.
+    pub accounting_pending: bool,
+    /// Terminal recovery payload has been compacted to a permanent replay tombstone.
+    pub recovery_compacted: bool,
 }
 impl OutboxOperation {
     pub fn prepared(
@@ -46,6 +50,8 @@ impl OutboxOperation {
             last_error: None,
             version: 0,
             recovery: Vec::new(),
+            accounting_pending: true,
+            recovery_compacted: false,
         }
     }
 }
@@ -73,6 +79,8 @@ macro_rules! outbox_from_row {
                     last_error: row.try_get("last_error")?,
                     version: row.try_get("version")?,
                     recovery: row.try_get("recovery")?,
+                    accounting_pending: row.try_get("accounting_pending")?,
+                    recovery_compacted: row.try_get("recovery_compacted")?,
                 })
             }
         }

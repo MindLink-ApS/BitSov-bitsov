@@ -780,3 +780,89 @@ fn compose_schema_accepts_old_clients_and_rejects_unknown_fields() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn recovered_terminal_history_leaves_the_recovery_scan() {
+    let f = Fixture::new().await;
+    assert_eq!(f.post().await.0, StatusCode::OK);
+    let original = f.op().await;
+    let message =
+        konsensus_core::MessageId::from_hex(original.message_id.as_ref().unwrap()).unwrap();
+    assert!(f
+        .db
+        .acknowledge_pending(&message, &f.peer, f.state.identity.node_id())
+        .await
+        .unwrap());
+    for i in 0..1000 {
+        let mut op = original.clone();
+        op.operation_id = format!("history-{i}");
+        op.state = if i % 2 == 0 { "acked" } else { "failed_paid" }.into();
+        assert!(f.db.insert_outbox_operation(&op).await.unwrap());
+    }
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    assert!(
+        f.db.list_recoverable_operations().await.unwrap().is_empty(),
+        "resolved history must not be decoded on every recovery sweep"
+    );
+    assert_eq!(f.post().await.0, StatusCode::OK);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn terminal_retention_keeps_duplicate_post_and_receipt_binding() {
+    let mut f = Fixture::new().await;
+    assert_eq!(f.post().await.0, StatusCode::OK);
+    let op = f.op().await;
+    let id = konsensus_core::MessageId::from_hex(op.message_id.as_ref().unwrap()).unwrap();
+    let env = f.db.get_message(&id).await.unwrap().unwrap();
+    // A receipt represents the independent #103 acceptance authority. Its
+    // binding must remain usable after sender recovery material is compacted.
+    assert!(f
+        .db
+        .acknowledge_pending(&id, &f.peer, f.state.identity.node_id())
+        .await
+        .unwrap());
+    f.db.delete_message(&id).await.unwrap();
+    assert_eq!(
+        f.db.accept_paid_envelope(&env).await.unwrap(),
+        konsensus_storage::PaidAcceptance::Accepted
+    );
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    let before = f.post().await;
+    sqlx::query("UPDATE outbox_operations SET updated_at = 0")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&f.op().await.recovery).unwrap();
+    assert!(
+        data["draft"].is_null(),
+        "old terminal drafts must be compacted"
+    );
+    assert!(data["settlement"].is_null());
+    f.db.delete_message(&id).await.unwrap();
+    f.restart().await;
+    assert_eq!(
+        f.post().await,
+        before,
+        "permanent tombstone preserves the receipt response"
+    );
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.db.accept_paid_envelope(&env).await.unwrap(),
+        konsensus_storage::PaidAcceptance::AlreadyAccepted
+    );
+    let mut changed = env.clone();
+    changed.kind += 1;
+    assert_eq!(
+        f.db.accept_paid_envelope(&changed).await.unwrap(),
+        konsensus_storage::PaidAcceptance::PaymentReused
+    );
+    assert!(f.db.get_message(&id).await.unwrap().is_none());
+}

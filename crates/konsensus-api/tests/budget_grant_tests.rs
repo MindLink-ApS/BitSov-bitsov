@@ -1777,3 +1777,90 @@ async fn direct_send_onchain_and_channel_refusals_preserve_not_dispatched() {
         assert!(body.get("max_routing_fee_msat").is_none());
     }
 }
+
+#[tokio::test]
+async fn late_unattached_ledger_debits_recover_outside_sql_scan_even_after_retention() {
+    use konsensus_storage::{OutboxOperation, SqliteStorage, Storage};
+    for phase in ["fenced", "superseded", "compacted"] {
+        let mut fx = fixture().await;
+        fx.grant(None, GrantTerms::new(5000)).await;
+        let epoch = fx
+            .service
+            .snapshot()
+            .clients
+            .iter()
+            .find(|c| c.client_id == fx.client_id)
+            .unwrap()
+            .epoch;
+        let reservation = fx
+            .service
+            .reserve_spend(
+                &fx.client_id,
+                epoch,
+                vec![Charge {
+                    recipient: fx.peer.to_hex(),
+                    amount_msat: 1500,
+                }],
+            )
+            .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        // Durable crash image of reserve_operation_spend, before SQL attachment.
+        // The SQL execution was fenced by another process while this debit was
+        // waiting to run, so its row already left the accounting index.
+        let mut ledger = serde_json::to_value(fx.service.snapshot()).unwrap();
+        ledger["grants"][0]["budget"]["operation_links"][&reservation.id] = json!({
+            "operation_id":id, "execution_id":"old-execution", "readmission":false,
+        });
+        std::fs::write(
+            fx.tmp.path().join("pairing/clients.json"),
+            serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+        fx.restart();
+        let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        let mut op = OutboxOperation::prepared(id.clone(), fx.peer.to_hex(), 1, "digest".into());
+        op.state = if phase == "fenced" {
+            "prepared"
+        } else {
+            "acked"
+        }
+        .into();
+        op.accounting_pending = false;
+        op.recovery_compacted = phase == "compacted";
+        op.recovery = serde_json::to_vec(&json!({
+            "caller":null, "draft":null, "dispatched":phase == "superseded", "expected_msat":0,
+            "settlement":null, "reservation":null, "fee_ceiling_msat":0,
+            "admission_msat":0, "admission_fee_msat":if phase == "compacted" { Value::Null } else { json!(0) },
+            "execution_id":if phase == "superseded" { json!("new-execution") } else { Value::Null },
+        })).unwrap();
+        db.insert_outbox_operation(&op).await.unwrap();
+        assert!(db.list_recoverable_operations().await.unwrap().is_empty());
+        fx.state = Arc::new(AppState {
+            storage: db.clone(),
+            ..(*fx.state).clone()
+        });
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state)
+            .await
+            .unwrap();
+        assert_eq!(
+            fx.used(),
+            0,
+            "{phase}: late fenced execution never dispatched"
+        );
+        let budget = fx.service.reload_from_disk().unwrap().grants[0]
+            .budget
+            .clone()
+            .unwrap();
+        assert!(budget.pending.is_empty(), "{phase}");
+        assert!(budget.operation_links.is_empty(), "{phase}");
+        assert!(
+            db.list_recoverable_operations().await.unwrap().is_empty(),
+            "{phase}"
+        );
+        assert_eq!(
+            db.get_outbox_operation(&id).await.unwrap().unwrap().state,
+            op.state
+        );
+        assert_eq!(fx.wallet.money(), 0);
+    }
+}
