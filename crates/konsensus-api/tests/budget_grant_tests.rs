@@ -203,6 +203,9 @@ impl LightningProvider for Wallet {
         _amount_sats: u64,
         _fee: Option<f32>,
     ) -> Result<String, LightningError> {
+        if self.mode.load(Ordering::SeqCst) == NOT_DISPATCHED {
+            return Err(LightningError::PaymentNotDispatched("local refusal".into()));
+        }
         self.money.fetch_add(1, Ordering::SeqCst);
         Ok("deadbeef".repeat(8))
     }
@@ -214,8 +217,14 @@ impl LightningProvider for Wallet {
         _announce: bool,
         _fee: Option<f32>,
     ) -> Result<String, LightningError> {
+        if self.mode.load(Ordering::SeqCst) == NOT_DISPATCHED {
+            return Err(LightningError::PaymentNotDispatched("local refusal".into()));
+        }
         self.money.fetch_add(1, Ordering::SeqCst);
         Ok("chan".into())
+    }
+    async fn close_channel(&self, _id: &str, _force: bool) -> Result<Option<String>, LightningError> {
+        Err(LightningError::PaymentNotDispatched("local refusal".into()))
     }
 }
 
@@ -1368,4 +1377,83 @@ async fn invoice_fee_refusal_releases_message_reservation() {
     assert_eq!(receipt["max_routing_fee_msat"], 0);
     assert_eq!(fx.wallet.money(), 0);
     assert_eq!(fx.used(), 0, "positive non-dispatch releases all authority");
+}
+
+// These HTTP contract tests catch loss of the typed pre-dispatch refusal while
+// exercising the real grant ledger and fee wrapper, for both caller classes.
+#[tokio::test]
+async fn direct_send_fee_refusal_is_not_dispatched_and_releases_budget() {
+    for metered in [false, true] {
+        for cap in [0, 1000] {
+            for route in ["pay", "keysend"] {
+                let mut fx = fixture().await;
+                let token = if metered {
+                    fx.grant(None, GrantTerms::new(2000)).await
+                } else {
+                    konsensus_api::auth::create_token(
+                        &fx.state.identity.node_id().to_hex(), &fx.state.jwt_secret, Scope::all(),
+                    ).unwrap()
+                };
+                let request = if route == "pay" {
+                    json!({"bolt11": create_test_bolt11(1000), "max_routing_fee_msat": cap})
+                } else {
+                    json!({"dest_pubkey": PEER_LN, "amount_msat": 1000, "max_routing_fee_msat": cap})
+                };
+                let path = format!("/api/v1/payments/{route}");
+                fx.wallet.fee.store(cap + 1, Ordering::SeqCst);
+                let (status, body) = fx.call("POST", &path, Some(request.clone()), Some(&token)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{path} metered={metered}: {body}");
+                assert_eq!(body["code"], "not_dispatched");
+                assert_eq!(body["error"], "route exceeds fee ceiling");
+                assert_eq!(body["max_routing_fee_msat"], cap);
+                fx.restart();
+                assert_eq!(fx.used(), 0, "refusal must durably release principal plus fee");
+
+                // A route at the cap can spend immediately; refusal consumed no authority.
+                fx.wallet.fee.store(cap, Ordering::SeqCst);
+                let (status, body) = fx.call("POST", &path, Some(request), Some(&token)).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(fx.used(), if metered { 1000 + cap } else { 0 });
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn direct_send_unknown_keeps_502_and_full_reservation() {
+    for route in ["pay", "keysend"] {
+        let fx = fixture().await;
+        let token = fx.grant(None, GrantTerms::new(2000)).await;
+        fx.wallet.set(UNKNOWN);
+        let request = if route == "pay" {
+            json!({"bolt11": create_test_bolt11(1000), "max_routing_fee_msat": 1000})
+        } else {
+            json!({"dest_pubkey": PEER_LN, "amount_msat": 1000, "max_routing_fee_msat": 1000})
+        };
+        let (status, body) = fx.call("POST", &format!("/api/v1/payments/{route}"), Some(request), Some(&token)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["code"], 502);
+        assert_eq!(body["max_routing_fee_msat"], 1000);
+        assert_eq!(fx.used(), 2000, "ambiguous dispatch must keep principal plus fee reserved");
+    }
+}
+
+#[tokio::test]
+async fn direct_send_onchain_and_channel_refusals_preserve_not_dispatched() {
+    for (route, request) in [
+        ("send-onchain", json!({"address": "bcrt1-test", "amount_sats": 1000})),
+        ("open-channel", json!({"peer_pubkey": PEER_LN, "peer_addr": "127.0.0.1:9735", "amount_sats": 1000})),
+        ("close-channel", json!({"channel_id": "test-channel"})),
+    ] {
+        let fx = fixture().await;
+        fx.wallet.set(NOT_DISPATCHED);
+        let token = konsensus_api::auth::create_token(
+            &fx.state.identity.node_id().to_hex(), &fx.state.jwt_secret, Scope::all(),
+        ).unwrap();
+        let (status, body) = fx.call("POST", &format!("/api/v1/payments/{route}"), Some(request), Some(&token)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {body}");
+        assert_eq!(body["code"], "not_dispatched", "{route}: {body}");
+        assert_eq!(body["error"], "local refusal");
+        assert!(body.get("max_routing_fee_msat").is_none());
+    }
 }

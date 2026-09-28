@@ -184,6 +184,11 @@ impl From<konsensus_core::traits::lightning::LightningError> for ApiError {
     fn from(error: konsensus_core::traits::lightning::LightningError) -> Self {
         match error {
             konsensus_core::traits::lightning::LightningError::NotReady => Self::NotReady,
+            // Preserve positive non-dispatch evidence for every generic caller.
+            // Unclassified failures must remain ambiguous, regardless of their text.
+            konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(reason) => {
+                Self::NotDispatched(reason)
+            }
             other => Self::Lightning(other.to_string()),
         }
     }
@@ -200,6 +205,30 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn lightning_conversion_preserves_only_proven_non_dispatch() {
+        use konsensus_core::traits::lightning::LightningError;
+        let (status, body) = error_body(ApiError::from(
+            LightningError::PaymentNotDispatched("fee ceiling exceeded".into()),
+        )).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "not_dispatched");
+        assert_eq!(body["error"], "fee ceiling exceeded");
+        assert!(body.get("max_routing_fee_msat").is_none());
+        for error in [
+            LightningError::Connection("response lost".into()),
+            LightningError::Backend("not dispatched (untrusted backend text)".into()),
+            LightningError::PaymentFailed("failed".into()),
+        ] {
+            let (status, body) = error_body(ApiError::from(error)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body["code"], 502);
+        }
+        let (status, body) = error_body(ApiError::from(LightningError::NotReady)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "not_ready");
     }
 
     #[tokio::test]
