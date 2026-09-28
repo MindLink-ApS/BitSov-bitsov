@@ -2320,3 +2320,18 @@ fn sponsor_is_off_by_default_and_clamped_to_the_spec() {
     }
     assert!(toml::from_str::<SponsorConfig>("enabled = true\nfree_lane = true").is_err(), "unknown keys refused");
 }
+
+#[test]
+fn channel_fee_subsidy_defaults_to_zero_ceiling() {
+    let default = serde_json::to_value(crate::config::SubsidyConfig::default()).unwrap();
+    assert_eq!(default["max_funding_fee_rate_sat_per_vb"], 0);
+    let old_config: crate::config::SubsidyConfig = serde_json::from_value(serde_json::json!({
+        "enabled": true, "max_channel_sats": 50_000, "max_total_budget_sats": 100_000,
+        "allowlist": ["01".repeat(32)]
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(old_config).unwrap()["max_funding_fee_rate_sat_per_vb"],
+        0
+    );
+}

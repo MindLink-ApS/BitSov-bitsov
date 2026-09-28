@@ -610,7 +610,8 @@ pub struct OpenChannelRequest {
     pub announce: bool,
     /// Optional fee rate override in sat/vB for the channel funding transaction.
     /// If omitted, the backend selects a rate from its fee estimator.
-    /// Must be > 0 if provided.
+    /// Unsupported overrides are refused with `not_dispatched`, never ignored.
+    /// Must be finite and within 1–10,000 sat/vB if provided.
     #[serde(default)]
     pub fee_rate_sat_per_vb: Option<f32>,
 }
@@ -648,7 +649,10 @@ async fn open_channel(
             req.fee_rate_sat_per_vb,
         )
         .await
-        .map_err(|e| ApiError::BadRequest(format!("open_channel failed: {e}")))?;
+        .map_err(|e| match e {
+            LightningError::PaymentNotDispatched(reason) => ApiError::NotDispatched(reason),
+            other => ApiError::BadRequest(format!("open_channel failed: {other}")),
+        })?;
 
     Ok(Json(serde_json::json!({
         "channel_id": channel_id,

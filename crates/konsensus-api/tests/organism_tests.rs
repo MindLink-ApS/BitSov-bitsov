@@ -555,10 +555,15 @@ async fn membrane_exposes_empty_pre_payment_aggregate_on_restart() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let anchor = body["pre_payment_refusals"]["effective_hour_start_ms"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(anchor % 3_600_000, 0);
     assert_eq!(
         body["pre_payment_refusals"],
         json!({
-            "bucket_ms": 3600000, "capacity": 24, "buckets": []
+            "bucket_ms": 3600000, "capacity": 24,
+            "effective_hour_start_ms": anchor, "buckets": []
         })
     );
 }

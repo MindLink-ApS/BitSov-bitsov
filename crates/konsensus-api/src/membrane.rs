@@ -725,6 +725,7 @@ mod pre_payment_tests {
             value,
             serde_json::json!({
                 "bucket_ms": 3600000, "capacity": 24,
+                "effective_hour_start_ms": 7200000,
                 "buckets": [
                     {"start_ms": 3600000, "counts": {"session_before_payment": 2}},
                     {"start_ms": 7200000, "counts": {"price_before_payment": 1}}

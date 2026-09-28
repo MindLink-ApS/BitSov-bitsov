@@ -11,6 +11,9 @@ use thiserror::Error;
 pub enum ApiError {
     #[error("{source}")]
     RoutingFee { source: Box<ApiError>, max_routing_fee_msat: u64 },
+    /// The backend positively refused the operation before any dispatch.
+    #[error("not dispatched: {0}")]
+    NotDispatched(String),
     #[error("recipient backend does not support stateless first-contact quotes")]
     StatelessQuoteUnsupported,
 
@@ -97,6 +100,11 @@ impl ApiError {
             body["max_routing_fee_msat"] = (*max_routing_fee_msat).into();
             return (status, body);
         }
+        if let Self::NotDispatched(reason) = self {
+            return (StatusCode::BAD_REQUEST, serde_json::json!({
+                "error": reason, "code": "not_dispatched"
+            }));
+        }
         if matches!(self, ApiError::StatelessQuoteUnsupported) {
             return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
                 "error": self.to_string(), "code": "stateless_quote_unsupported"
@@ -128,7 +136,7 @@ impl ApiError {
             }));
         }
         let (status, message) = match &self {
-            ApiError::RoutingFee { .. } | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
+            ApiError::RoutingFee { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
@@ -170,6 +178,19 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn not_dispatched_keeps_400_and_code_when_wrapped_with_routing_fee() {
+        for ceiling in [0, 5_000] {
+            let (status, body) = error_body(
+                ApiError::NotDispatched("announce_unavailable".into()).with_routing_fee(ceiling),
+            ).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "not_dispatched");
+            assert_eq!(body["error"], "announce_unavailable");
+            assert_eq!(body["max_routing_fee_msat"], ceiling);
+        }
     }
 
     #[tokio::test]

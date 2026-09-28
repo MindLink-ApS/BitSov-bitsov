@@ -147,11 +147,26 @@ pub struct InboundPayment {
 /// Errors from Lightning operations.
 #[derive(Debug, Error)]
 pub enum LightningError {
+    /// The bounded startup fee barrier could not obtain usable chain data.
+    #[error("BOOT_CHAIN_SOURCE_UNAVAILABLE: BitSov could not obtain usable fees from a Bitcoin chain service. Your local identity is saved. Check your connection and try again. (network={network}, service={service}, attempts={attempts}, elapsed_ms={elapsed_ms}, cause={cause})")]
+    ChainSourceUnavailable {
+        network: String,
+        /// Host only; never an authenticated URL or response body.
+        service: String,
+        attempts: usize,
+        elapsed_ms: u64,
+        cause: String,
+    },
+
+    /// A local startup setting is invalid; retrying the network cannot fix it.
+    #[error("BOOT_INVALID_CONFIG: Invalid Lightning configuration: {0}. Check konsensus.toml and try again.")]
+    InvalidStartupConfig(String),
+
     /// This backend cannot issue a quote without retaining unpaid state.
     #[error("stateless_quote_unsupported")]
     StatelessQuoteUnsupported,
 
-    /// Positively proven to have failed BEFORE payment dispatch. Only this
+    /// Positively proven to have failed BEFORE payment or channel-open dispatch. Only this
     /// variant permits a caller to try another payment path. Never use it for
     /// a response error, timeout, or an unclassified backend/connection error.
     #[error("payment not dispatched: {0}")]
@@ -598,8 +613,9 @@ pub trait LightningProvider: Send + Sync {
     /// * `announce` — Whether to announce the channel publicly.
     /// * `fee_rate_sat_per_vb` — Optional fee rate override in sat/vB for the
     ///   funding transaction. If `None`, the backend selects a rate from its
-    ///   fee estimator. Must be > 0 if provided. Not all backends support this;
-    ///   unsupported backends silently ignore it.
+    ///   fee estimator. A supplied rate and the announce flag must be honored.
+    ///   If either cannot be enforced, return `PaymentNotDispatched` before
+    ///   initiating the channel; never silently fall back to backend defaults.
     ///
     /// Returns the temporary channel ID on success.
     async fn open_channel(
@@ -610,7 +626,7 @@ pub trait LightningProvider: Send + Sync {
         _announce: bool,
         _fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        Err(LightningError::Backend(
+        Err(LightningError::PaymentNotDispatched(
             "open_channel not supported by this provider".into(),
         ))
     }

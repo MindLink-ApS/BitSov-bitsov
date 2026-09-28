@@ -709,10 +709,16 @@ impl LightningProvider for StubLightning {
         _peer_pubkey: &str,
         _peer_addr: &str,
         _amount_sats: u64,
-        _announce: bool,
-        _fee_rate_sat_per_vb: Option<f32>,
+        announce: bool,
+        fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        Ok("stub-channel-id".into())
+        // Model LDK's unsupported fee override rather than false success.
+        if fee_rate_sat_per_vb.is_some() {
+            return Err(LightningError::PaymentNotDispatched(
+                "stub cannot enforce a per-channel funding fee rate".into(),
+            ));
+        }
+        Ok(if announce { "stub-announced-channel-id" } else { "stub-channel-id" }.into())
     }
 
     async fn close_channel(
