@@ -280,6 +280,8 @@ fn read_confirmation(phrase: &str) -> Result<String> {
 /// The owner's flags for `konsensus grant`.
 #[derive(Debug, Default)]
 pub struct GrantFlags {
+    /// Explicit opt-in; never inherited from an app proposal.
+    pub allow_liquidity_fees: bool,
     /// `--budget <sats>`.
     pub budget_sats: Option<u64>,
     /// `--for <duration>`.
@@ -336,6 +338,7 @@ pub fn resolve_terms(flags: &GrantFlags, proposal: Option<&GrantTerms>) -> Resul
         map
     };
     GrantTerms {
+        allow_liquidity_fees: flags.allow_liquidity_fees,
         budget_msat,
         per_call_max_msat,
         per_recipient_msat,
@@ -1038,5 +1041,19 @@ mod startup_tests {
         assert_eq!(t.per_recipient_msat[&"ab".repeat(32)], 5_000);
         f.per_call_sats = Some(101);
         assert!(resolve_terms(&f, None).is_err(), "per-call above the budget");
+    }
+}
+
+#[cfg(test)]
+mod liquidity_authority_tests {
+    use super::*;
+    #[test]
+    fn app_proposal_cannot_silently_enable_liquidity_fees() {
+        let mut proposal = GrantTerms::new(10_000);
+        proposal.allow_liquidity_fees = true;
+        let mut flags = GrantFlags::default();
+        assert!(!resolve_terms(&flags, Some(&proposal)).unwrap().allow_liquidity_fees);
+        flags.allow_liquidity_fees = true;
+        assert!(resolve_terms(&flags, Some(&proposal)).unwrap().allow_liquidity_fees);
     }
 }

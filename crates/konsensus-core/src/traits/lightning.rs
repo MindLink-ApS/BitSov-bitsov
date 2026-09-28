@@ -197,6 +197,34 @@ pub enum WalletSync {
 /// Every message must have its payment verified through this interface.
 #[async_trait]
 pub trait LightningProvider: Send + Sync {
+    /// Whether LSPS2 funding is explicitly enabled on this backend.
+    fn liquidity_info(&self) -> super::liquidity::LiquidityInfo { Default::default() }
+
+    /// Negotiate a private funding invoice, bounded by the caller's fee ceiling.
+    async fn quote_liquidity(&self, _owner: &str, _gross_msat: u64, _max_fee_msat: u64)
+        -> Result<super::liquidity::LiquidityQuote, LightningError> {
+        Err(LightningError::Backend("LSPS2 liquidity disabled".into()))
+    }
+
+    /// Read immutable terms before reserving fee authority.
+    fn liquidity_quote(&self, _owner: &str, _id: &str)
+        -> Result<super::liquidity::LiquidityQuote, LightningError> {
+        Err(LightningError::Backend("liquidity quote unavailable".into()))
+    }
+
+    /// Consume exactly once and publish the prepared invoice. Implementations
+    /// must not spawn work that publishes after this future is dropped.
+    async fn accept_liquidity(&self, _owner: &str, _id: &str) -> Result<Invoice, LightningError> {
+        Err(LightningError::PaymentNotDispatched("liquidity quote unavailable".into()))
+    }
+
+    /// Durable funding-purpose exclusion, checked on EVERY admission attempt.
+    async fn is_funding_payment(&self, _hash: &str) -> Result<bool, LightningError> { Ok(false) }
+
+    /// Actual settled JIT net and fee, read from the backend's durable payment store.
+    async fn liquidity_receipt(&self, _hash: &str)
+        -> Result<Option<super::liquidity::LiquidityReceipt>, LightningError> { Ok(None) }
+
     /// Create an invoice for receiving a payment.
     ///
     /// # Arguments

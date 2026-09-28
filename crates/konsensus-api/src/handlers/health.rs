@@ -186,6 +186,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
             crate::membrane::CAPABILITY,
             crate::spend_budget::CAPABILITY,
             super::introduction::CAPABILITY,
+            super::liquidity::CAPABILITY,
             super::sponsor::CAPABILITY,
         ],
         status: "ok",

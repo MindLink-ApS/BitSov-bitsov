@@ -61,6 +61,8 @@ pub struct PaymentStatusResponse {
     pub amount_msat: u64,
     /// Direction: "incoming" or "outgoing".
     pub direction: String,
+    /// Actual JIT funding fee/net only after settlement; never a message proof.
+    pub liquidity: Option<konsensus_core::traits::liquidity::LiquidityReceipt>,
 }
 
 /// Balance response.
@@ -147,7 +149,10 @@ async fn payment_status(
         .await
         .map_err(|e| ApiError::Lightning(e.to_string()))?;
 
+    let liquidity = state.lightning.liquidity_receipt(&hash).await
+        .map_err(|e| ApiError::Lightning(e.to_string()))?;
     Ok(Json(PaymentStatusResponse {
+        liquidity,
         payment_hash: details.payment_hash,
         status: format!("{:?}", details.status),
         amount_msat: details.amount_msat,
@@ -739,6 +744,7 @@ async fn get_funding_address(
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(super::liquidity::routes())
         .route("/api/v1/payments", get(list_payments))
         .route("/api/v1/payments/invoice", post(create_invoice))
         .route("/api/v1/payments/pay", post(pay_invoice_observed))
