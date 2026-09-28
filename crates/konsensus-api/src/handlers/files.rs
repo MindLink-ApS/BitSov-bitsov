@@ -406,6 +406,8 @@ async fn send_file(
     Path(file_id): Path<String>,
     Json(req): Json<SendFileRequest>,
 ) -> Result<Json<SendFileResponse>, ApiError> {
+    // Refuse before pricing, grant debits, staged-file claims, or ratchet changes.
+    crate::error::require_money_ready(&state).await?;
     let deadline = state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).deadline(&file_id);
     // Keep authorized ceilings outside the cancelled future, including any
     // separately approved re-admission recorded before its wallet dispatch.

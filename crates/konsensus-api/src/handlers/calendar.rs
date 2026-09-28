@@ -465,6 +465,9 @@ async fn create_event(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateEventRequest>,
 ) -> Result<Json<EventActionResponse>, ApiError> {
+    // Even attendees without a session must not leave a locally saved invitation
+    // when the money route is unavailable. Check before storage and pricing.
+    crate::error::require_money_ready(&state).await?;
     // Validate
     if req.title.is_empty() {
         return Err(ApiError::BadRequest("title cannot be empty".into()));
@@ -663,6 +666,8 @@ async fn update_event(
     Path(event_id): Path<String>,
     Json(req): Json<UpdateEventRequest>,
 ) -> Result<Json<EventActionResponse>, ApiError> {
+    // Refuse before persisting an unsent update or advancing attendee ratchets.
+    crate::error::require_money_ready(&state).await?;
     let existing = state
         .storage
         .get_calendar_event(&event_id)
@@ -868,6 +873,8 @@ async fn create_rsvp(
     Path(event_id): Path<String>,
     Json(req): Json<CreateRsvpRequest>,
 ) -> Result<Json<RsvpActionResponse>, ApiError> {
+    // Encryption advances the ratchet, so readiness must precede it and pricing.
+    crate::error::require_money_ready(&state).await?;
     // Validate response string
     let response_str = req.response.to_lowercase();
     if !["accepted", "declined", "tentative"].contains(&response_str.as_str()) {

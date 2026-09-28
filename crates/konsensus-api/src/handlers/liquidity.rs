@@ -45,6 +45,7 @@ async fn quote(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QuoteRequest>,
 ) -> Result<Json<LiquidityQuote>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     if req.gross_msat == 0
         || req.gross_msat > 100_000_000_000
         || req.max_lsp_fee_msat >= req.gross_msat
@@ -58,7 +59,7 @@ async fn quote(
         .quote_liquidity(&owner(&auth.user), req.gross_msat, req.max_lsp_fee_msat)
         .await
         .map(Json)
-        .map_err(|e| ApiError::Lightning(e.to_string()))
+        .map_err(ApiError::from)
 }
 
 #[derive(Deserialize)]
@@ -76,6 +77,7 @@ async fn accept_liquidity(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AcceptRequest>,
 ) -> Result<Json<Invoice>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     let owner = owner(&auth.user);
     let q = state
         .lightning
@@ -97,7 +99,7 @@ async fn accept_liquidity(
     let result = debit
         .dispatch(state.lightning.accept_liquidity(&owner, &req.quote_id))
         .await?;
-    if matches!(&result, Err(LightningError::PaymentNotDispatched(_))) {
+    if matches!(&result, Err(LightningError::PaymentNotDispatched(_) | LightningError::NotReady)) {
         debit.released(&q.provider);
     }
     // Publication commits bounded future deductions. Keep the durable debit on
@@ -105,7 +107,7 @@ async fn accept_liquidity(
     // Expiry alone cannot prove no HTLC is in flight. Never retry automatically.
     result
         .map(Json)
-        .map_err(|e| ApiError::Lightning(e.to_string()))
+        .map_err(ApiError::from)
 }
 
 pub fn routes() -> Router<Arc<AppState>> {

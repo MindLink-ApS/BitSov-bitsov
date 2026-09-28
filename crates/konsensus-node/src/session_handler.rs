@@ -176,6 +176,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     // Periodic E2EE self-heal. Transport supervision can reconnect peers after
     // restart/flap without a fresh application message; this loop makes the
     // session membrane repair itself without operator intervention.
+    let mut lightning_was_ready = lightning.money_ready().await;
     let mut session_self_heal_interval = tokio::time::interval(SESSION_SELF_HEAL_INTERVAL);
     session_self_heal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -438,6 +439,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                 }
             }
             _ = session_self_heal_interval.tick() => {
+                refresh_recovered_lightning(
+                    &mut lightning_was_ready, &transport, &lightning, &lightning_addr,
+                    &storage, &ws_delivery_tx, our_node_id,
+                ).await;
                 heal_connected_e2ee_sessions(&session_manager, &transport).await;
             }
             _ = shutdown_rx.changed() => {
@@ -446,6 +451,67 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
             }
         }
     }
+}
+
+/// Recovery reuses the existing session maintenance task, and only shares
+/// identity with already privileged connections. No reconnect or re-admission.
+async fn refresh_recovered_lightning(
+    was_ready: &mut bool,
+    transport: &Arc<NoiseTransport>,
+    lightning: &Arc<dyn LightningProvider>,
+    lightning_addr: &Option<String>,
+    storage: &Arc<dyn konsensus_storage::Storage>,
+    ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    our_node_id: NodeId,
+) {
+    let ready = lightning.money_ready().await;
+    if ready && !*was_ready {
+        for peer in transport.connected_privileged_peers().await {
+            send_lightning_info(&peer, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
+        }
+    }
+    *was_ready = ready;
+}
+
+async fn send_lightning_info(
+    peer_id: &NodeId,
+    transport: &Arc<NoiseTransport>,
+    lightning: &Arc<dyn LightningProvider>,
+    lightning_addr: &Option<String>,
+    storage: &Arc<dyn konsensus_storage::Storage>,
+    ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    our_node_id: NodeId,
+) {
+    // Send our Lightning pubkey if available (enables keysend payments from peer).
+    if let Some(ln_pubkey) = lightning.get_node_pubkey().await {
+        let ln_frame = Frame::LightningInfo {
+            ln_pubkey,
+            ln_addr: lightning_addr.clone(),
+        };
+        if let Err(e) = transport.send_frame(peer_id, &ln_frame).await {
+            warn!(peer = %peer_id, error = %e, "failed to send Lightning info");
+        } else {
+            if let Err(e) = funding_poll::emit_progress_step(
+                storage.as_ref(),
+                ws_delivery_tx,
+                peer_id,
+                "lightning_info_sent",
+                "Lightning details shared",
+            )
+            .await
+            {
+                warn!(error = %e, "failed to persist onboarding lightning_info_sent step");
+            }
+            funding_poll::ensure_poll_task(
+                our_node_id.to_hex(),
+                Arc::clone(storage),
+                Arc::clone(lightning),
+                ws_delivery_tx.clone(),
+            )
+            .await;
+        }
+    }
+
 }
 
 // ── Individual event handlers ─────────────────────────────────────────────
@@ -515,35 +581,7 @@ async fn handle_peer_connected(
         warn!(peer = %peer_id, error = %e, "failed to send price table");
     }
 
-    // Send our Lightning pubkey if available (enables keysend payments from peer).
-    if let Some(ln_pubkey) = lightning.get_node_pubkey().await {
-        let ln_frame = Frame::LightningInfo {
-            ln_pubkey,
-            ln_addr: lightning_addr.clone(),
-        };
-        if let Err(e) = transport.send_frame(peer_id, &ln_frame).await {
-            warn!(peer = %peer_id, error = %e, "failed to send Lightning info");
-        } else {
-            if let Err(e) = funding_poll::emit_progress_step(
-                storage.as_ref(),
-                ws_delivery_tx,
-                peer_id,
-                "lightning_info_sent",
-                "Lightning details shared",
-            )
-            .await
-            {
-                warn!(error = %e, "failed to persist onboarding lightning_info_sent step");
-            }
-            funding_poll::ensure_poll_task(
-                our_node_id.to_hex(),
-                Arc::clone(storage),
-                Arc::clone(lightning),
-                ws_delivery_tx.clone(),
-            )
-            .await;
-        }
-    }
+    send_lightning_info(peer_id, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
 
     // Request peer's known peers for mesh discovery.
     if let Err(e) = transport.send_frame(peer_id, &Frame::PeerExchangeRequest).await {

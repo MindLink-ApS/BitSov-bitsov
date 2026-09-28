@@ -2147,3 +2147,45 @@ async fn accepted_chain_price_rise_and_delayed_ack_never_fail_paid() {
     assert!(updates.try_recv().is_err());
     assert_eq!(sender.count_pending_deliveries().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn recovery_announces_lightning_once_only_to_privileged_connected_peers() {
+    use konsensus_message::{ReachabilityMode, TransportConfig};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, a) = NodeIdentity::generate().unwrap();
+    let (_, b) = NodeIdentity::generate().unwrap();
+    let (_, c) = NodeIdentity::generate().unwrap();
+    let a = Arc::new(a);
+    let b = Arc::new(b);
+    let c = Arc::new(c);
+    let build = |id: Arc<NodeIdentity>, whitelist| Arc::new(NoiseTransport::new(id, TransportConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(), admission_mode: ReachabilityMode::PriceOpen,
+        whitelist, ..Default::default()
+    }));
+    let source = build(a.clone(), vec![*b.node_id()]);
+    let stranger = build(c, vec![*b.node_id()]);
+    let target = build(b.clone(), vec![*a.node_id()]);
+    target.start_listener().await.unwrap();
+    let addr = target.listen_addr().unwrap().to_string();
+    source.connect(b.node_id(), &addr).await.unwrap();
+    stranger.connect(b.node_id(), &addr).await.unwrap();
+    // Drain connection events; no session handler has sent LightningInfo yet.
+    assert!(matches!(source.recv_control().await, Some(ControlEvent::PeerConnected { .. })));
+    assert!(matches!(stranger.recv_control().await, Some(ControlEvent::PeerConnected { .. })));
+    let lightning: Arc<dyn LightningProvider> = Arc::new(konsensus_lightning::shared_mock::SharedMockProvider::new(
+        &dir.path().join("ledger.sqlite"), "recovered", 0).unwrap());
+    let expected = lightning.get_node_pubkey().await.unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let (ws, _) = broadcast::channel(8);
+    let mut was_ready = false;
+    refresh_recovered_lightning(&mut was_ready, &target, &lightning, &None, &storage, &ws, *b.node_id()).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await.unwrap().unwrap();
+    assert!(matches!(event, ControlEvent::LightningInfoReceived { ln_pubkey, .. } if ln_pubkey == expected));
+    refresh_recovered_lightning(&mut was_ready, &target, &lightning, &None, &storage, &ws, *b.node_id()).await;
+    assert!(tokio::time::timeout(Duration::from_millis(50), source.recv_control()).await.is_err(), "duplicate announcement");
+    assert!(tokio::time::timeout(Duration::from_millis(50), stranger.recv_control()).await.is_err(), "unpaid stranger received identity");
+    source.shutdown();
+    stranger.shutdown();
+    target.shutdown();
+}

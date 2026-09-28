@@ -212,12 +212,21 @@ impl KonsensusNode {
                     esplora_fallback = esplora_url_fallback.as_deref().unwrap_or("none"),
                     "lightning provider (embedded)"
                 );
-                Arc::new(
-                    LdkProvider::new(ldk_config)
-                        .await
-                        .map(|provider| provider.with_routing_fee_policy(config.routing_fees))
-                        .map_err(|e| anyhow::anyhow!("ldk provider: {e}"))?,
-                )
+                // Keep the retry seed scrubbed on drop; each attempt uses the same
+                // entropy, directory and configuration, never onboarding/init.
+                let mut ldk_config = ldk_config;
+                let mnemonic = zeroize::Zeroizing::new(std::mem::take(&mut ldk_config.mnemonic));
+                let passphrase = zeroize::Zeroizing::new(ldk_config.passphrase.take().unwrap_or_default());
+                let policy = config.routing_fees;
+                Arc::new(konsensus_lightning::RecoveringLightning::new(move || {
+                    let mut attempt = ldk_config.clone();
+                    attempt.mnemonic = mnemonic.to_string();
+                    attempt.passphrase = Some(passphrase.to_string());
+                    async move {
+                        LdkProvider::new(attempt).await.map(|provider|
+                            Arc::new(provider.with_routing_fee_policy(policy)) as Arc<dyn LightningProvider>)
+                    }
+                }, policy).await.map_err(|e| anyhow::anyhow!("ldk provider: {e}"))?)
             }
         };
 
