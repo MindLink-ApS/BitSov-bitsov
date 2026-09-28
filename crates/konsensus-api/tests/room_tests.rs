@@ -1,36 +1,20 @@
 mod common;
-use common::*;
-
-use std::collections::HashMap;
-use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use base64::Engine;
-use tower::ServiceExt;
-
-use konsensus_core::identity::NodeIdentity;
-use konsensus_core::gate::PaymentGate;
-use konsensus_core::traits::chain::{BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel};
-use konsensus_core::traits::lightning::{
-    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection,
-    PaymentStatus,
-};
-use konsensus_core::traits::pricing::{PricingEngine, PricingError};
-use konsensus_core::traits::transport::{MessageTransport, TransportError};
-use konsensus_core::types::{MessageId, NodeId, Nonce, Recipient, RoomId};
-use konsensus_core::UkmEnvelope;
-use konsensus_message::PeerRegistry;
-use konsensus_storage::error::StorageError;
-use konsensus_storage::models::{Peer, Room};
-use konsensus_storage::Storage;
-use async_trait::async_trait;
-
+use common::test_router as build_router;
+use common::*;
 use konsensus_api::audit::AuditLog;
-use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use common::test_router as build_router;
-
+use konsensus_core::gate::PaymentGate;
+use konsensus_core::traits::transport::MessageTransport;
+use konsensus_core::types::NodeId;
+use konsensus_message::PeerRegistry;
+use konsensus_storage::models::Room;
+use konsensus_storage::Storage;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn rooms_crud() {
@@ -285,7 +269,7 @@ async fn delete_room() {
     let app = build_router(Arc::clone(&state));
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/rooms/{room_id}"))
+        .uri(format!("/api/v1/rooms/{room_id}"))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();
@@ -298,7 +282,7 @@ async fn delete_room() {
     // Verify room is gone
     let app = build_router(Arc::clone(&state));
     let req = Request::builder()
-        .uri(&format!("/api/v1/rooms/{room_id}"))
+        .uri(format!("/api/v1/rooms/{room_id}"))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();
@@ -347,7 +331,7 @@ async fn room_member_remove() {
     let app = build_router(Arc::clone(&state));
     let req = Request::builder()
         .method("POST")
-        .uri(&format!("/api/v1/rooms/{room_id}/members"))
+        .uri(format!("/api/v1/rooms/{room_id}/members"))
         .header("authorization", &auth)
         .header("content-type", "application/json")
         .body(Body::from(
@@ -361,7 +345,7 @@ async fn room_member_remove() {
     let app = build_router(Arc::clone(&state));
     let req = Request::builder()
         .method("DELETE")
-        .uri(&format!("/api/v1/rooms/{room_id}/members/{member_hex}"))
+        .uri(format!("/api/v1/rooms/{room_id}/members/{member_hex}"))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();
@@ -374,7 +358,7 @@ async fn room_member_remove() {
     // Verify member list is empty
     let app = build_router(Arc::clone(&state));
     let req = Request::builder()
-        .uri(&format!("/api/v1/rooms/{room_id}/members"))
+        .uri(format!("/api/v1/rooms/{room_id}/members"))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();

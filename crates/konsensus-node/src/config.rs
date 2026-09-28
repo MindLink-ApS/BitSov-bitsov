@@ -264,13 +264,12 @@ impl Default for NetworkConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "backend", deny_unknown_fields)]
 pub enum LightningConfig {
-    /// LNbits HTTP REST API (simplest, works for T1-T2).
+    /// Legacy LNbits HTTP REST API. Fee-limited payments fail closed because
+    /// LNbits cannot enforce per-payment routing-fee ceilings. Selecting this
+    /// backend is rejected at configuration/startup; use LDK or LND instead.
     #[serde(rename = "lnbits")]
     Lnbits {
         /// Base URL of the LNbits instance.
-        ///
-        /// For Light tier, point this to a user-selected LNbits instance.
-        /// For Full tier, prefer embedded LDK or point this to your own LNbits.
         api_url: String,
         /// Admin API key for the wallet.
         admin_key: String,
