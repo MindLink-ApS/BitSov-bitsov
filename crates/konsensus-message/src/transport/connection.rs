@@ -454,6 +454,7 @@ pub(super) async fn handle_incoming(
     // Register connection
     let now = Instant::now();
     let conn = super::Connection::new(PeerConnection {
+        advertised_trust_discount: None,
         source_ip: addr.ip(),
         privileged,
         noise,

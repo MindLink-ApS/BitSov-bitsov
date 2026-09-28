@@ -358,10 +358,11 @@ impl MessageTransport for Hooked {
 struct Node {
     id: NodeId,
     pause: Arc<PauseAfterMark>,
-    audit: Arc<konsensus_api::audit::AuditLog>,
     identity: Arc<NodeIdentity>,
     transport: Arc<NoiseTransport>,
     sessions: Arc<SessionManager>,
+    storage: Arc<dyn konsensus_storage::Storage>,
+    audit: Arc<konsensus_api::audit::AuditLog>,
     wallet: Arc<SharedMockProvider>,
     routing: Arc<konsensus_routing::RoutingTable>,
     peer_prices: Arc<konsensus_pricing::PeerPriceCache>,
@@ -561,10 +562,11 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
     Node {
         id,
         pause,
-        audit,
         identity,
         transport,
         sessions,
+        storage,
+        audit,
         wallet,
         routing,
         peer_prices,
@@ -1121,7 +1123,7 @@ async fn m9_m10_reconnect_needs_readmission_then_acks_count() {
     net.payee.transport.send_frame(&payer, &Frame::PrekeyOffer { bundle }).await.unwrap();
     net.payee
         .transport
-        .send_frame(&payer, &Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([3u8; 32]) })
+        .send_frame(&payer, &Frame::MessageAck { id: konsensus_core::types::MessageId::from_bytes([3u8; 32]), duplicate: false })
         .await
         .unwrap();
     wait_until("the payer dropped both", Duration::from_secs(5), || async {
@@ -1305,6 +1307,63 @@ async fn p2_paid_payee_gets_no_rejection_or_prices_for_an_unpaid_envelope() {
     .await;
     assert_eq!(rejects(&unpaid.id), 0, "the unpaid envelope from the paid-for payee got a MessageReject");
     net.stop();
+}
+
+
+/// Simulate durable state at reconnect after sixteen minutes, including the
+/// generic outbox row written by the old #103. Run the real flusher alongside
+/// compose, Noise, settlement gate and recipient storage: only the new
+/// generation's admission may arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sixteen_minute_flap_with_legacy_outbox_accepts_only_one_new_admission() {
+    use konsensus_core::{PaymentProof, Recipient, Signature, UkmEnvelopeBuilder};
+    let mut net = pair(Shape::CardOnly, Order::PayerLower, Wallet::Plain, Wallet::Plain).await;
+    let payee = net.payee.id;
+    let invoice = net.payee.wallet.create_invoice(CHAT_MSAT, "konsensus:admission", 3600).await.unwrap();
+    let paid = net.payer.wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let mut old = UkmEnvelopeBuilder::new(konsensus_core::kind::KIND_CHAT, net.payer.id,
+        Recipient::Node(payee), b"konsensus:admission:v1".to_vec(),
+        PaymentProof::new(hex::decode(&paid.payment_hash).unwrap().try_into().unwrap(),
+            hex::decode(paid.preimage.unwrap()).unwrap().try_into().unwrap(), CHAT_MSAT))
+        .timestamp(now.as_millis() as u64 - 960_000).build();
+    old.signature = Signature::from_ed25519(&net.payer.identity.sign(&old.signable_bytes()));
+    let journal = net.payer.data_dir.join("admission-attempts");
+    std::fs::create_dir_all(&journal).unwrap();
+    std::fs::write(journal.join(payee.to_hex()), serde_json::to_vec(&serde_json::json!({
+        "payment_hash": paid.payment_hash, "amount_msat": CHAT_MSAT, "quote": [0, CHAT_MSAT],
+        "envelope": old, "settled_at_unix": now.as_secs() - 960, "proof_delivered": true,
+        "original_reservation": null, "message_may_have_dispatched": false
+    })).unwrap()).unwrap();
+    // Model the write failing or recipient crashing before its commit.
+    net.payer.storage.store_message(&old).await.unwrap();
+    net.payer.storage.prepare_delivery(&old.id, &payee).await.unwrap();
+    net.flap().await;
+    let (pending_tx, pending_rx) = mpsc::channel(4);
+    let (stop, shutdown_rx) = watch::channel(false);
+    let flusher = tokio::spawn(crate::pending_handler::run(crate::pending_handler::PendingHandlerDeps {
+        identity: net.payer.identity.clone(), storage: net.payer.storage.clone(),
+        transport: net.payer.transport.clone(),
+        audit_log: Arc::new(konsensus_api::audit::AuditLog::open(net.payer.data_dir.join("flusher.log")).unwrap()),
+        send_timestamps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        pending_rx, shutdown_rx,
+    }));
+    pending_tx.send(payee).await.unwrap();
+    let (status, body) = net.payer.compose(&payee, "after sixteen minute flap").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    net.payee.delivered_once("after sixteen minute flap").await;
+    wait_until("legacy admission is removed", Duration::from_secs(5), || async {
+        net.payer.storage.get_message(&old.id).await.unwrap().is_none()
+    }).await;
+    assert!(net.payee.storage.get_message(&old.id).await.unwrap().is_none(), "old proof never reached recipient acceptance");
+    let received = net.payee.storage.get_messages_for_recipient(&Recipient::Node(payee), 100, None).await.unwrap();
+    assert_eq!(received.iter().filter(|e| e.ciphertext == b"konsensus:admission:v1").count(), 1,
+        "exactly one admission accepted on the replacement generation");
+    let outgoing = net.payer.storage.get_messages_for_recipient(&Recipient::Node(payee), 100, None).await.unwrap();
+    assert!(outgoing.iter().all(|e| e.ciphertext != b"konsensus:admission:v1"), "no outgoing marker chats");
+    assert!(net.payer.paid_on_connection(&payee).await);
+    assert_eq!(net.payer.paid_out().await, vec![CHAT_MSAT; 3], "old settlement, new admission, message");
+    stop.send(true).unwrap(); flusher.await.unwrap(); net.stop();
 }
 
 // ── PSI-SPEED: first contact without waiting for a self-heal tick ────────

@@ -100,9 +100,9 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
         | SessionInit { privileged, .. }
         | SessionAck { privileged, .. }
         | RatchetInit { privileged, .. } => (privileged, PrePaymentReason::SessionBeforePayment),
-        MessageAcked { privileged, .. } | MessageRejected { privileged, .. } => {
-            (privileged, PrePaymentReason::DeliveryBeforePayment)
-        }
+        // These carry no admission authority: the handler requires a durable
+        // outbox match; only a bought reply may change routing weights.
+        MessageAcked { .. } | MessageRejected { .. } => return false,
         PriceTableReceived { privileged, .. }
         | PriceQueryReceived { privileged, .. }
         | PriceResponseReceived { privileged, .. } => {
@@ -162,6 +162,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut last_peer_exchange: std::collections::HashMap<NodeId, tokio::time::Instant> =
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
+    let mut delivery_budget = DeliveryConfirmationBudget::default();
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
     // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
     // from the other two eager limiters on purpose; see `eager_offers` in the
@@ -256,23 +257,13 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         ).await;
                     }
 
-                    ControlEvent::MessageAcked { peer_id, message_id, privileged } => {
-                        if !privileged {
-                            continue;
-                        }
-                        handle_message_acked(
-                            &peer_id, &message_id, &send_timestamps, &storage,
-                            &routing, &ws_delivery_tx,
-                        ).await;
+                    ControlEvent::MessageAcked { peer_id, message_id, privileged, .. } => {
+                        handle_delivery_confirmation(&peer_id, &message_id, None, privileged,
+                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget).await;
                     }
-
                     ControlEvent::MessageRejected { peer_id, message_id, reason, privileged } => {
-                        if !privileged {
-                            continue;
-                        }
-                        handle_message_rejected(
-                            &peer_id, &message_id, &reason, &routing, &ws_delivery_tx,
-                        ).await;
+                        handle_delivery_confirmation(&peer_id, &message_id, Some(&reason), privileged,
+                            identity.node_id(), &storage, &send_timestamps, &routing, &ws_delivery_tx, &audit_log, &mut delivery_budget).await;
                     }
 
                     ControlEvent::PriceTableReceived { peer_id, prices, block_height, valid_blocks, trust_discount, privileged } => {
@@ -286,7 +277,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         if !privileged {
                             continue;
                         }
-                        handle_price_query(&peer_id, kind, &pricing, &chain, &transport).await;
+                        handle_price_query(&peer_id, kind, &pricing, &chain, &transport, storage.as_ref()).await;
                     }
 
                     ControlEvent::PriceResponseReceived { peer_id, kind, price_msat, block_height, privileged } => {
@@ -586,7 +577,7 @@ async fn handle_peer_connected(
         valid_blocks: meta.valid_blocks,
         trust_discount: peer_discount,
     };
-    if let Err(e) = transport.send_frame(peer_id, &price_frame).await {
+    if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage.as_ref(), peer_id, &price_frame, pricing.as_ref()).await {
         warn!(peer = %peer_id, error = %e, "failed to send price table");
     }
 
@@ -607,7 +598,7 @@ async fn handle_prekey_offer(
     bundle: serde_json::Value,
     our_node_id: NodeId,
     session_manager: &SessionManager,
-    storage: &Arc<dyn konsensus_storage::Storage>,
+    _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
@@ -637,9 +628,7 @@ async fn handle_prekey_offer(
     if session_manager.has_session(peer_id).await {
         warn!(peer = %peer_id, "peer sent PrekeyOffer but session exists — replacing stale session");
         session_manager.remove_session(peer_id).await;
-        if let Err(e) = storage.clear_pending_for_peer(peer_id).await {
-            warn!(peer = %peer_id, error = %e, "failed to clear stale pending deliveries");
-        }
+        // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
     }
 
     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
@@ -679,7 +668,7 @@ async fn handle_session_init(
     peer_id: &NodeId,
     init_data: serde_json::Value,
     session_manager: &SessionManager,
-    storage: &Arc<dyn konsensus_storage::Storage>,
+    _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
     last_negotiation: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
@@ -700,9 +689,7 @@ async fn handle_session_init(
     if session_manager.has_session(peer_id).await {
         warn!(peer = %peer_id, "peer sent SessionInit but session exists — replacing stale session");
         session_manager.remove_session(peer_id).await;
-        if let Err(e) = storage.clear_pending_for_peer(peer_id).await {
-            warn!(peer = %peer_id, error = %e, "failed to clear stale pending deliveries");
-        }
+        // Paid ciphertext remains queued until its recipient ACKs, even after a session reset.
     }
 
     let init: konsensus_crypto::SerializableSessionInit =
@@ -770,7 +757,7 @@ async fn handle_ratchet_init(
     peer_id: &NodeId,
     payload: &[u8],
     session_manager: &SessionManager,
-    storage: &Arc<dyn konsensus_storage::Storage>,
+    _storage: &Arc<dyn konsensus_storage::Storage>,
     transport: &Arc<NoiseTransport>,
 ) {
     match konsensus_crypto::ratchet_message_from_bytes(payload) {
@@ -785,9 +772,7 @@ async fn handle_ratchet_init(
                         "failed to decrypt ratchet init — removing broken session and re-negotiating"
                     );
                     session_manager.remove_session(peer_id).await;
-                    if let Err(clear_err) = storage.clear_pending_for_peer(peer_id).await {
-                        warn!(peer = %peer_id, error = %clear_err, "failed to clear pending after ratchet init failure");
-                    }
+                    // Preserve paid envelopes across ratchet recovery; acceptance ACKs do not require decryption.
                     // Send fresh PrekeyOffer to trigger re-negotiation
                     if let Err(send_err) = send_prekey_offer(session_manager, transport, peer_id).await {
                         warn!(peer = %peer_id, error = %send_err, "failed to send PrekeyOffer after ratchet init failure");
@@ -906,6 +891,89 @@ async fn send_prekey_offer(
         .map_err(|e| e.to_string())
 }
 
+/// Wire reasons are the gate's stable Display prefixes; unknown reasons stay
+/// retryable so older peers and temporary gate failures cannot burn delivery.
+fn terminal_paid_rejection(reason: &str) -> bool {
+    ["payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:"]
+        .iter().any(|prefix| reason.starts_with(prefix))
+}
+
+/// Bound storage work before looking up an unprivileged confirmation. A
+/// process-wide window caps identity churn; per-peer windows survive reconnects.
+/// Only budgeted frames allocate entries, so the map has at most 128 keys.
+#[derive(Default)]
+struct DeliveryConfirmationBudget {
+    window: Option<tokio::time::Instant>,
+    used: u32,
+    peers: std::collections::HashMap<NodeId, u32>,
+}
+
+impl DeliveryConfirmationBudget {
+    fn allow(&mut self, peer: &NodeId, privileged: bool, now: tokio::time::Instant) -> bool {
+        if privileged { return true; }
+        if self.window.is_none_or(|start| now.duration_since(start) >= std::time::Duration::from_secs(1)) {
+            self.window = Some(now);
+            self.used = 0;
+            self.peers.clear();
+        }
+        if self.used >= 128 { return false; }
+        let used = self.peers.entry(*peer).or_default();
+        if *used >= 32 { return false; }
+        *used += 1;
+        self.used += 1;
+        true
+    }
+}
+
+/// Delivery confirmations cannot grant admission or mutate unrelated deliveries.
+#[allow(clippy::too_many_arguments)]
+async fn handle_delivery_confirmation(
+    peer: &NodeId, id: &konsensus_core::MessageId, rejection: Option<&str>, privileged: bool,
+    own_id: &NodeId, storage: &Arc<dyn konsensus_storage::Storage>,
+    timestamps: &tokio::sync::Mutex<std::collections::HashMap<konsensus_core::MessageId, std::time::Instant>>,
+    routing: &konsensus_routing::RoutingTable, ws: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    audit: &konsensus_api::audit::AuditLog,
+    budget: &mut DeliveryConfirmationBudget,
+) {
+    if !budget.allow(peer, privileged, tokio::time::Instant::now()) {
+        audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
+        return;
+    }
+    let nonce_replay = rejection == Some("replay detected: nonce already used");
+    let hash_replay = rejection.and_then(|reason| reason.strip_prefix("payment proof already used: "))
+        .filter(|hash| hash.len() == 64)
+        .and_then(|hash| hex::decode(hash).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+    // The hash compatibility exception must consume the row atomically with
+    // the exact payment binding; unrelated PaymentReused remains terminal.
+    let hash_acked = if let Some(hash) = hash_replay {
+        match storage.acknowledge_pending_payment(id, peer, own_id, &hash).await {
+            Ok(acked) => acked,
+            Err(_) => return,
+        }
+    } else { false };
+    let legacy = nonce_replay || hash_acked;
+    if rejection.is_none() || legacy {
+        if !hash_acked && !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) {
+            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
+            return;
+        }
+        if legacy {
+            audit.record("acked_legacy", &peer.to_hex(), Some(serde_json::json!({"message_id": id.to_hex()})));
+        }
+        handle_message_acked(peer, id, timestamps, storage, routing, ws, privileged && !legacy).await;
+    } else {
+        let reason = rejection.unwrap_or_default();
+        let terminal = terminal_paid_rejection(reason);
+        if !matches!(storage.reject_pending(id, peer, own_id, reason, terminal).await, Ok(true)) {
+            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
+            return;
+        }
+        timestamps.lock().await.remove(id);
+        handle_message_rejected(peer, id, reason, routing, ws, privileged).await;
+    }
+}
+
 async fn handle_message_acked(
     peer_id: &NodeId,
     message_id: &konsensus_core::types::MessageId,
@@ -913,6 +981,7 @@ async fn handle_message_acked(
     storage: &Arc<dyn konsensus_storage::Storage>,
     routing: &konsensus_routing::RoutingTable,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    update_weights: bool,
 ) {
     // Compute STDP latency from send timestamp.
     let latency_ms = {
@@ -943,7 +1012,7 @@ async fn handle_message_acked(
     );
 
     // Hebbian learning: successful delivery strengthens routing weight.
-    routing.record_success(peer_id, latency_ms, payment_msat).await;
+    if update_weights { routing.record_success(peer_id, latency_ms, payment_msat).await; }
 
     // Broadcast delivery confirmation to WebSocket clients.
     if let Err(e) = ws_delivery_tx.send(Arc::new(
@@ -964,15 +1033,16 @@ async fn handle_message_rejected(
     reason: &str,
     routing: &konsensus_routing::RoutingTable,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
+    update_weights: bool,
 ) {
     warn!(peer = %peer_id, msg_id = %message_id, %reason, "message rejected by peer");
-    routing.record_failure(peer_id).await;
+    if update_weights { routing.record_failure(peer_id).await; }
 
     if let Err(e) = ws_delivery_tx.send(Arc::new(
         WsDeliveryStatus {
             event_type: "delivery_status",
             message_id: message_id.to_hex(),
-            status: "rejected".to_string(),
+            status: if terminal_paid_rejection(reason) { "failed_paid" } else { "rejected" }.to_string(),
             reason: Some(reason.to_string()),
         },
     )) {
@@ -986,6 +1056,7 @@ async fn handle_price_query(
     pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     chain: &Arc<dyn ChainProvider>,
     transport: &Arc<NoiseTransport>,
+    storage: &dyn konsensus_storage::Storage,
 ) {
     match pricing.get_price_msat(kind).await {
         Ok(price_msat) => {
@@ -997,7 +1068,7 @@ async fn handle_price_query(
                 }
             };
             let frame = Frame::PriceResponse { kind, price_msat, block_height };
-            if let Err(e) = transport.send_frame(peer_id, &frame).await {
+            if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage, peer_id, &frame, pricing.as_ref()).await {
                 warn!(peer = %peer_id, error = %e, "failed to send price response");
             }
         }

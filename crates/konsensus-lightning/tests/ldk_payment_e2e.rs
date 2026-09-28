@@ -482,6 +482,14 @@ async fn ldk_two_node_channel_payment_and_gate_verification() {
         "B's local balance should increase after receiving"
     );
 
+    // Slice 1: inject post-gate storage failures, then lose the acceptance ACK.
+    // All retries validate against this same real settled Lightning payment.
+    paid_delivery_retries(&provider_b, &status_b).await;
+    assert_eq!(provider_a.list_payments(100).await.unwrap().iter()
+        .filter(|p| p.payment_hash == invoice.payment_hash).count(), 1);
+    assert_eq!(provider_b.list_payments(100).await.unwrap().iter()
+        .filter(|p| p.payment_hash == invoice.payment_hash).count(), 1);
+
     println!(
         "\n=== B8 LDK Payment Gate E2E Test PASSED ===\n\
          Nodes: {pubkey_a} <-> {pubkey_b}\n\
@@ -763,4 +771,51 @@ async fn ldk_keysend_with_binding_delivers_adr037_tlv_on_wire() {
         "=== R2 seam-3c PASSED: ADR-037 binding TLV ({} bytes) delivered on-wire ===",
         binding.len()
     );
+}
+
+/// Real-settlement counterpart of the receive-loop and process-crash tests.
+async fn paid_delivery_retries(provider: &LdkProvider, payment: &konsensus_core::traits::lightning::PaymentDetails) {
+    use konsensus_core::{NodeIdentity, PaymentProof, Recipient, Signature, UkmEnvelopeBuilder};
+    use konsensus_core::gate::{GateConfig, PaymentGate};
+    use konsensus_storage::{PaidAcceptance, SqliteStorage, Storage};
+    struct Price;
+    #[async_trait::async_trait]
+    impl konsensus_core::traits::pricing::PricingEngine for Price {
+        fn as_any(&self) -> &dyn std::any::Any { self }
+        async fn get_price_msat(&self, _: u16) -> Result<u64, konsensus_core::traits::pricing::PricingError> { Ok(1) }
+        async fn get_category_price_msat(&self, _: konsensus_core::kind::KindCategory) -> Result<u64, konsensus_core::traits::pricing::PricingError> { Ok(1) }
+    }
+    let (_, alice) = NodeIdentity::generate().unwrap(); let alice = Arc::new(alice);
+    let (_, bob) = NodeIdentity::generate().unwrap(); let bob = Arc::new(bob);
+    let sender_session = konsensus_crypto::SessionManager::new(alice.clone());
+    let recipient_session = konsensus_crypto::SessionManager::new(bob.clone());
+    let init = sender_session.initiate_session(bob.node_id(), &recipient_session.prekey_bundle().await).await.unwrap();
+    recipient_session.accept_session(alice.node_id(), &init).await.unwrap();
+    let payload = sender_session.encrypt(bob.node_id(), b"one real Lightning payment").await.unwrap();
+    let proof = PaymentProof::new(hex::decode(&payment.payment_hash).unwrap().try_into().unwrap(),
+        hex::decode(payment.preimage.as_ref().unwrap()).unwrap().try_into().unwrap(), payment.amount_msat);
+    let mut env = UkmEnvelopeBuilder::new(0, *alice.node_id(), Recipient::Node(*bob.node_id()),
+        konsensus_crypto::ratchet_message_to_bytes(&payload), proof).build();
+    env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+    let gate = PaymentGate::with_config(GateConfig { verify_lightning_settlement: true, ..Default::default() });
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let balance = provider.get_balance_msat().await.unwrap();
+    for failure in ["ABORT", "ROLLBACK"] {
+        sqlx::query(&format!("CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE({failure}, 'injected post-gate failure'); END"))
+            .execute(db.pool()).await.unwrap();
+        gate.validate_paid_envelope(&env, &Price, None, Some(provider), 0.0, Some(bob.node_id())).await.unwrap();
+        assert!(db.accept_paid_envelope(&env).await.is_err());
+        assert!(!db.has_nonce(&env.nonce).await.unwrap());
+        sqlx::query("DROP TRIGGER fail_message").execute(db.pool()).await.unwrap();
+    }
+    gate.validate_paid_envelope(&env, &Price, None, Some(provider), 0.0, Some(bob.node_id())).await.unwrap();
+    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), PaidAcceptance::Accepted);
+    let readable = recipient_session.decrypt(alice.node_id(), &konsensus_crypto::ratchet_message_from_bytes(&env.ciphertext).unwrap()).await.unwrap();
+    assert_eq!(readable, b"one real Lightning payment");
+    // Lost ACK: a full gate pass still yields a receipt, never a second insert/decrypt.
+    gate.validate_paid_envelope(&env, &Price, None, Some(provider), 0.0, Some(bob.node_id())).await.unwrap();
+    assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), PaidAcceptance::AlreadyAccepted);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages").fetch_one(db.pool()).await.unwrap(), 1);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payment_receipts").fetch_one(db.pool()).await.unwrap(), 1);
+    assert_eq!(provider.get_balance_msat().await.unwrap(), balance);
 }

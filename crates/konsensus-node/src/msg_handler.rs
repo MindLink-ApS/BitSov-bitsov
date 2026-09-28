@@ -92,7 +92,8 @@ pub(crate) async fn whitelist_then_verify(
     trust_discount: f64,
     our_node_id: Option<&konsensus_core::types::NodeId>,
     admission_mode: konsensus_message::ReachabilityMode,
-) -> Result<(), konsensus_core::gate::GateRejection> {
+    commit_replay: bool,
+) -> Result<(bool, bool), konsensus_core::gate::GateRejection> {
     // Snapshot the whitelist UNCONDITIONALLY (preserves the HARD-11
     // lock-release-before-await seam even in PriceOpen, where the snapshot is
     // ignored). Only the cheap Arc clone is held across the gate await.
@@ -111,24 +112,20 @@ pub(crate) async fn whitelist_then_verify(
             konsensus_message::ReachabilityMode::Whitelist => Some(&whitelist),
             konsensus_message::ReachabilityMode::PriceOpen => None,
         };
-    let result = gate.verify(
-        envelope,
-        nonce_store,
-        pricing,
-        wl_arg,
-        lightning,
-        trust_discount,
-        our_node_id,
-    )
-    .await;
-    // Emit exactly once at the gate boundary, before relay dispatch, storage,
-    // decryption or ACK can take an early exit. Membership is the same snapshot
-    // used for this decision; never take another registry lock to classify it.
+    let result = if commit_replay {
+        gate.verify(envelope, nonce_store, pricing, wl_arg, lightning, trust_discount, our_node_id).await.map(|()| false)
+    } else {
+        gate.validate_received_paid_envelope(envelope, nonce_store, pricing, wl_arg, lightning, trust_discount, our_node_id).await
+    };
+    // Ordinary admission is observed only after the durable acceptance commit.
+    // Return the same whitelist snapshot classification across that boundary.
+    let first_contact = !whitelist.contains(&envelope.sender);
     match &result {
-        Ok(()) => { membrane.admitted(envelope, !whitelist.contains(&envelope.sender)); }
+        Ok(_) if commit_replay => { membrane.admitted(envelope, first_contact); }
         Err(rejection) => { membrane.refused(envelope, rejection); }
+        _ => {}
     }
-    result
+    result.map(|already_accepted| (first_contact, already_accepted))
 }
 
 /// Cooldown between corrective price-table resends to the same privileged peer.
@@ -273,7 +270,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // `whitelist_then_verify` so the HARD-11
                         // lock-release-before-await contract is directly
                         // unit-testable (tests::whitelist_read_guard_released_*).
-                        let gate_result = whitelist_then_verify(
+                        let is_relay_control = relay_engine_for_recv.is_some()
+                            && konsensus_core::kind::KindCategory::from_kind(envelope.kind)
+                                == konsensus_core::kind::KindCategory::Storage;
+                        let mut gate_result = whitelist_then_verify(
                             &envelope,
                             audit_for_recv.membrane(),
                             peer_registry_for_recv.as_ref(),
@@ -288,8 +288,54 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             // M1a: Whitelist => Step-2 membership enforced;
                             // PriceOpen => membership skipped, payment still gates.
                             admission_mode_for_recv,
+                            is_relay_control,
                         )
                         .await;
+
+                        if matches!(gate_result, Ok((_, true))) {
+                            let ack = Frame::MessageAck { id: msg_id, duplicate: true };
+                            if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
+                                warn!(error = %e, "failed to send duplicate ACK");
+                            }
+                            continue;
+                        }
+
+                        if gate_result.is_ok() && !is_relay_control {
+                            use konsensus_storage::PaidAcceptance;
+                            match storage_for_recv.accept_paid_envelope(&envelope).await {
+                                Ok(PaidAcceptance::Accepted) => {
+                                    audit_for_recv.membrane().admitted(&envelope, gate_result.as_ref().expect("validated").0);
+                                }
+                                Ok(PaidAcceptance::AlreadyAccepted) => {
+                                    // No second promotion, decrypt, application side effect or write.
+                                    let ack = Frame::MessageAck { id: msg_id, duplicate: true };
+                                    if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
+                                        warn!(error = %e, "failed to send duplicate ACK");
+                                    }
+                                    continue;
+                                }
+                                Ok(PaidAcceptance::NonceReused) => {
+                                    let rejection = konsensus_core::gate::GateRejection::ReplayDetected;
+                                    audit_for_recv.membrane().refused(&envelope, &rejection);
+                                    gate_result = Err(rejection);
+                                }
+                                Ok(PaidAcceptance::PaymentReused) => {
+                                    let rejection = konsensus_core::gate::GateRejection::PaymentProofReused {
+                                        payment_hash: hex::encode(envelope.payment_proof.payment_hash),
+                                    };
+                                    audit_for_recv.membrane().refused(&envelope, &rejection);
+                                    gate_result = Err(rejection);
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "atomic paid acceptance failed; replay keys rolled back");
+                                    audit_for_recv.membrane().refused(&envelope,
+                                        &konsensus_core::gate::GateRejection::NonceCheckFailed(e.to_string()));
+                                    let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                            }
+                        }
 
                         if let Err(rejection) = gate_result {
                             // Increment the appropriate Prometheus counter based on
@@ -372,7 +418,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         // sender above — no second wallet weight lookup.
                                         trust_discount,
                                     };
-                                    if let Err(e) = transport_for_ack.send_frame(&sender, &price_frame).await {
+                                    if let Err(e) = crate::delivery_prices::send_price_frame(&transport_for_ack, storage_for_recv.as_ref(), &sender, &price_frame, pricing_for_recv.as_ref()).await {
                                         warn!(peer = %sender, error = %e, "failed to send corrective price table");
                                     } else {
                                         info!(peer = %sender, "sent corrective price table after payment mismatch");
@@ -449,19 +495,6 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                         }
 
-                        // Gate passed — store the message (must succeed before ACK)
-                        if let Err(e) = storage_for_recv.store_message(&envelope).await {
-                            error!(error = %e, "failed to store incoming message — rejecting");
-                            let reject = Frame::MessageReject {
-                                id: msg_id,
-                                reason: "storage error".to_string(),
-                            };
-                            if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
-                                warn!(peer = %sender, error = %e, "failed to send MessageReject after storage failure");
-                            }
-                            continue;
-                        }
-
                         // Attempt to decrypt ciphertext via Double Ratchet session
                         let plaintext = decrypt_and_process(
                             &envelope,
@@ -488,7 +521,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         }
 
                         // Send MessageAck back to sender
-                        let ack = Frame::MessageAck { id: msg_id };
+                        let ack = Frame::MessageAck { id: msg_id, duplicate: false };
                         if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
                             warn!(peer = %sender, error = %e, "failed to send MessageAck");
                         }

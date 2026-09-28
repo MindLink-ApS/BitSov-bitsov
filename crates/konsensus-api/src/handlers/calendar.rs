@@ -582,12 +582,12 @@ async fn create_event(
 
         let paid = create_payment_proof_with_fee_report(&state, price_msat, peer_id).await;
         let fee_ceiling = match &paid {
-            Ok((_, fee)) => *fee,
+            Ok((_, fee, _)) => *fee,
             Err(ApiError::RoutingFee { max_routing_fee_msat, .. }) => *max_routing_fee_msat,
             Err(_) => 0,
         };
         max_routing_fee_msat = max_routing_fee_msat.saturating_add(fee_ceiling);
-        let ((payment_hash, preimage, amount_msat), _) = paid?;
+        let ((payment_hash, preimage, amount_msat), _, settled_msat) = paid?;
         let proof = konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
 
         let sender = *state.identity.node_id();
@@ -611,20 +611,22 @@ async fn create_event(
 
         let msg_id_hex = envelope.id.to_hex();
 
+        state.storage.prepare_delivery(&envelope.id, peer_id).await.map_err(|e| ApiError::PaymentProofUnavailable {
+            amount_msat: total_msat.saturating_add(settled_msat),
+            reason: format!("calendar payment settled; saved envelope {} requires delivery reconciliation: {e}", envelope.id.to_hex()),
+        })?;
         if state.transport.is_connected(peer_id).await {
             if let Err(e) = state.transport.send(peer_id, &envelope).await {
                 tracing::warn!(peer = %peer_id, error = %e, "calendar event delivery failed, queuing");
-                let _ = state.storage.queue_pending_delivery(&envelope.id, peer_id).await;
                 queued_for.push(peer_id.to_hex());
             } else {
                 delivered_to.push(peer_id.to_hex());
             }
         } else {
-            let _ = state.storage.queue_pending_delivery(&envelope.id, peer_id).await;
             queued_for.push(peer_id.to_hex());
         }
 
-        total_msat = total_msat.saturating_add(amount_msat);
+        total_msat = total_msat.saturating_add(settled_msat);
         last_message_id = Some(msg_id_hex);
     }
 
@@ -774,12 +776,12 @@ async fn update_event(
             .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
         let paid = create_payment_proof_with_fee_report(&state, price_msat, peer_id).await;
         let fee_ceiling = match &paid {
-            Ok((_, fee)) => *fee,
+            Ok((_, fee, _)) => *fee,
             Err(ApiError::RoutingFee { max_routing_fee_msat, .. }) => *max_routing_fee_msat,
             Err(_) => 0,
         };
         max_routing_fee_msat = max_routing_fee_msat.saturating_add(fee_ceiling);
-        let ((payment_hash, preimage, amount_msat), _) = paid?;
+        let ((payment_hash, preimage, amount_msat), _, settled_msat) = paid?;
         let proof = konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
 
         let sender = *state.identity.node_id();
@@ -803,20 +805,22 @@ async fn update_event(
 
         let msg_id_hex = envelope.id.to_hex();
 
+        state.storage.prepare_delivery(&envelope.id, peer_id).await.map_err(|e| ApiError::PaymentProofUnavailable {
+            amount_msat: total_msat.saturating_add(settled_msat),
+            reason: format!("calendar payment settled; saved envelope {} requires delivery reconciliation: {e}", envelope.id.to_hex()),
+        })?;
         if state.transport.is_connected(peer_id).await {
             if let Err(e) = state.transport.send(peer_id, &envelope).await {
                 tracing::warn!(peer = %peer_id, error = %e, "update delivery failed, queuing");
-                let _ = state.storage.queue_pending_delivery(&envelope.id, peer_id).await;
                 queued_for.push(peer_id.to_hex());
             } else {
                 delivered_to.push(peer_id.to_hex());
             }
         } else {
-            let _ = state.storage.queue_pending_delivery(&envelope.id, peer_id).await;
             queued_for.push(peer_id.to_hex());
         }
 
-        total_msat = total_msat.saturating_add(amount_msat);
+        total_msat = total_msat.saturating_add(settled_msat);
         last_message_id = Some(msg_id_hex);
     }
 
@@ -913,7 +917,7 @@ async fn create_rsvp(
         .get_price_msat(KIND_RSVP)
         .await
         .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
-    let ((payment_hash, preimage, amount_msat), max_routing_fee_msat) =
+    let ((payment_hash, preimage, amount_msat), max_routing_fee_msat, settled_msat) =
         create_payment_proof_with_fee_report(&state, price_msat, &organizer_id).await?;
     let result = async {
     let proof = konsensus_core::PaymentProof::new(payment_hash, preimage, amount_msat);
@@ -951,23 +955,19 @@ async fn create_rsvp(
     // Best effort — the event may not be stored locally if this node is an attendee
     let _ = state.storage.store_rsvp(&rsvp_record).await;
 
+    state.storage.prepare_delivery(&envelope.id, &organizer_id).await.map_err(|e| ApiError::PaymentProofUnavailable {
+            amount_msat: settled_msat,
+            reason: format!("calendar payment settled; saved envelope {} requires delivery reconciliation: {e}", envelope.id.to_hex()),
+        })?;
     let delivered = if state.transport.is_connected(&organizer_id).await {
         match state.transport.send(&organizer_id, &envelope).await {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(peer = %organizer_id, error = %e, "RSVP delivery failed, queuing");
-                let _ = state
-                    .storage
-                    .queue_pending_delivery(&envelope.id, &organizer_id)
-                    .await;
                 false
             }
         }
     } else {
-        let _ = state
-            .storage
-            .queue_pending_delivery(&envelope.id, &organizer_id)
-            .await;
         false
     };
 
@@ -980,7 +980,7 @@ async fn create_rsvp(
             "response": response_str,
             "organizer": req.organizer,
             "delivered": delivered,
-            "amount_msat": amount_msat,
+            "amount_msat": settled_msat,
         })),
     );
 
@@ -990,7 +990,7 @@ async fn create_rsvp(
         response: response_str,
         message_id: msg_id_hex,
         delivered,
-        amount_msat,
+        amount_msat: settled_msat,
     }))
     }.await;
     result.map_err(|error: ApiError| error.with_routing_fee(max_routing_fee_msat))

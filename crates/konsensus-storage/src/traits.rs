@@ -15,6 +15,10 @@ use crate::invites::{
 use crate::models::{EnergyRow, FileMetadata, FileRecord, OnboardingStateRecord, Peer, Room};
 use crate::reactions::ReactionRecord;
 
+/// Outcome of the durable recipient acceptance transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused }
+
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -22,6 +26,66 @@ pub trait Storage: Send + Sync {
 
     /// Store a UKM envelope.
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError>;
+
+    /// Commit replay keys and the validated envelope together, or write nothing.
+    /// Call only after full payment-gate validation. At-rest wrappers may encrypt
+    /// ciphertext; backends compare the validated ID and immutable metadata.
+    async fn accept_paid_envelope(&self, _envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
+        Err(StorageError::Unsupported("accept_paid_envelope".into()))
+    }
+
+    /// Match immutable acceptance without reserving replay keys or writing messages.
+    /// Legacy full-message evidence is backfilled into the receipt before returning.
+    async fn is_paid_envelope_accepted(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Persist recipient-issued kind/category offers before publication, for at most one hour.
+    async fn record_delivery_prices(&self, _sender: &NodeId, _prices: &[(String, u64)], _excluded_kinds: &[u16], _issued_at: u64, _expires_at: u64) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("record_delivery_prices".into()))
+    }
+
+    /// Find an unexpired offer issued to this sender before its inbound settlement.
+    async fn delivery_price_floor(&self, _envelope: &UkmEnvelope, _paid_at: u64, _now: u64) -> Result<Option<u64>, StorageError> {
+        Ok(None)
+    }
+
+    /// Persist only a renewed timestamp/signature, preserving the paid identity.
+    async fn update_message_wrapper(&self, _envelope: &UkmEnvelope) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("update_message_wrapper".into()))
+    }
+
+    /// Persist a dispatch intent BEFORE transport can return an immediate ACK.
+    async fn mark_pending_sent(&self, _id: &MessageId, _peer: &NodeId) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("mark_pending_sent".into()))
+    }
+
+    /// Match a non-destructive rejection to an already dispatched outbox entry.
+    async fn is_pending_dispatched(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("is_pending_dispatched".into()))
+    }
+
+    /// Record one rejection per dispatch, retaining the paid envelope. Terminal
+    /// failures never retry; transient failures back off durably (60s to 1h).
+    async fn reject_pending(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId, _reason: &str, _terminal: bool) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("reject_pending".into()))
+    }
+
+    /// Atomically consume a dispatched outbox entry bound to our identity and peer.
+    async fn acknowledge_pending(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("acknowledge_pending".into()))
+    }
+
+    /// Legacy hash-reuse completion additionally binds the exact stored payment.
+    async fn acknowledge_pending_payment(&self, _id: &MessageId, _peer: &NodeId, _sender: &NodeId, _hash: &[u8; 32]) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("acknowledge_pending_payment".into()))
+    }
+
+    /// Queue before every first dispatch; retries retain the same row until ACK.
+    async fn prepare_delivery(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
+        self.queue_pending_delivery(id, peer).await?;
+        self.mark_pending_sent(id, peer).await
+    }
 
     /// Retrieve a message by its ID.
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError>;
@@ -274,15 +338,11 @@ pub trait Storage: Send + Sync {
 
     /// Remove all pending deliveries for a specific peer.
     ///
-    /// Called when an E2EE session is re-negotiated — pending messages encrypted
-    /// with the old session keys become undeliverable and must be cleared.
+    /// Explicit administrative removal only. Session resets must retain paid rows.
     async fn clear_pending_for_peer(&self, recipient: &NodeId) -> Result<u64, StorageError>;
 
-    /// Remove pending deliveries that have exceeded the maximum retry attempts.
-    ///
-    /// Returns the number of entries removed. This prevents unbounded table
-    /// growth when a peer is permanently unreachable or messages are encrypted
-    /// with stale keys that will never decrypt.
+    /// Mark deliveries past the retry threshold stalled, retaining paid envelopes.
+    /// Returns newly stalled rows; the periodic scan continues retrying them.
     async fn cleanup_stale_pending(&self, max_attempts: u32) -> Result<u64, StorageError>;
 
     // ── Files ──────────────────────────────────────────────────────────

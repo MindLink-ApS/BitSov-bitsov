@@ -466,3 +466,64 @@ async fn promotion_deadline_does_not_cancel_a_dispatched_payment() {
     assert!(state.invoice_requests.lock().await.is_empty());
     assert_eq!(transport.admission_requests.load(Ordering::SeqCst), 0);
 }
+
+/// The actual first-contact resend branch must renew the durable admission
+/// wrapper inside its 15-minute paid-proof TTL, without paying another invoice.
+#[tokio::test]
+async fn fourteen_minute_admission_resend_renews_same_paid_envelope() {
+    use konsensus_core::traits::lightning::LightningProvider;
+    use konsensus_storage::{SqliteStorage, Storage, PaidAcceptance};
+    let dir = tempfile::tempdir().unwrap();
+    let sender_wallet = Arc::new(common::CountingLightning::default());
+    let recipient_wallet = konsensus_lightning::MockLightningProvider::new();
+    let (_, recipient) = NodeIdentity::generate().unwrap();
+    let peer = *recipient.node_id();
+    let hash = recipient_wallet.inject_inbound_keysend(2000, None).await;
+    let details = recipient_wallet.get_payment_status(&hash).await.unwrap();
+    let mut state = (*common::test_state_with_lightning(sender_wallet.clone())).clone();
+    state.data_dir = Some(dir.path().to_path_buf());
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    state.storage = db.clone();
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    state.transport = transport.clone();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let mut old = UkmEnvelopeBuilder::new(konsensus_core::kind::KIND_CHAT,
+        *state.identity.node_id(), Recipient::Node(peer), b"konsensus:admission:v1".to_vec(),
+        PaymentProof::new(hex::decode(&hash).unwrap().try_into().unwrap(),
+            hex::decode(details.preimage.unwrap()).unwrap().try_into().unwrap(), 2000))
+        .timestamp(now.as_millis() as u64 - 840_000).build();
+    old.signature = Signature::from_ed25519(&state.identity.sign(&old.signable_bytes()));
+    let journal = dir.path().join("admission-attempts"); std::fs::create_dir(&journal).unwrap();
+    std::fs::write(journal.join(peer.to_hex()), serde_json::to_vec(&serde_json::json!({
+        "payment_hash": hash, "amount_msat": 2000, "quote": [0, 2000], "envelope": old,
+        "settled_at_unix": now.as_secs() - 840, "original_reservation": null,
+        "message_may_have_dispatched": false
+    })).unwrap()).unwrap();
+    let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
+    let app = common::test_router(Arc::new(state));
+    let response = app.oneshot(Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"after admission"}).to_string())).unwrap()).await.unwrap();
+    // No X3DH peer is running, so compose eventually times out after resending.
+    assert!(response.status().is_server_error());
+    assert_eq!(sender_wallet.money(), 0);
+    let sent = transport.sent_envelopes.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let renewed = sent[0].1.clone(); drop(sent);
+    assert!(renewed.timestamp > old.timestamp);
+    let mut expected = old.clone(); expected.timestamp = renewed.timestamp; expected.signature = renewed.signature;
+    assert_eq!(renewed, expected);
+    assert!(db.get_message(&old.id).await.unwrap().is_none(), "admission must not appear as outgoing chat");
+    assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(journal.join(peer.to_hex())).unwrap()).unwrap();
+    assert_eq!(serde_json::from_value::<UkmEnvelope>(saved["envelope"].clone()).unwrap(), renewed);
+    let recipient_db = SqliteStorage::in_memory().await.unwrap();
+    let gate = konsensus_core::gate::PaymentGate::with_config(konsensus_core::gate::GateConfig {
+        verify_lightning_settlement: true, ..Default::default()
+    });
+    let pricing = konsensus_pricing::StaticPricingEngine::new(Default::default());
+    gate.validate_paid_envelope(&renewed, &pricing, None, Some(&recipient_wallet), 0.0, Some(&peer)).await.unwrap();
+    assert_eq!(recipient_db.accept_paid_envelope(&renewed).await.unwrap(), PaidAcceptance::Accepted);
+    assert_eq!(recipient_db.accept_paid_envelope(&renewed).await.unwrap(), PaidAcceptance::AlreadyAccepted);
+}

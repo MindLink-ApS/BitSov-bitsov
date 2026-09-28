@@ -516,6 +516,7 @@ pub(super) async fn connect_to_peer(
 
     let now = Instant::now();
     let conn = super::Connection::new(PeerConnection {
+        advertised_trust_discount: None,
         source_ip: addr.ip(),
         privileged,
         noise,
