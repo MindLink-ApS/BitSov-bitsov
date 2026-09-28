@@ -26,6 +26,9 @@ use crate::traits::lightning::{LightningProvider, PaymentDirection, PaymentStatu
 use crate::traits::pricing::{PricingEngine, PricingError};
 use crate::types::{MessageId, NodeId, Nonce, Recipient};
 
+/// Maximum lifetime of a recipient-issued delivery price offer.
+pub const DELIVERY_PRICE_WINDOW_SECS: u64 = 3600;
+
 /// Why the gate rejected a message.
 ///
 /// Every variant is a hard rejection — the message MUST NOT be accepted.
@@ -124,6 +127,15 @@ pub enum GateRejection {
 /// without depending on konsensus-storage.
 #[async_trait::async_trait]
 pub trait NonceStore: Send + Sync {
+    /// Recipient-issued price floor valid at this inbound proof's settlement time.
+    async fn delivery_price_floor(&self, _envelope: &UkmEnvelope, _paid_at: u64, _now: u64)
+        -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+
+    /// Exact immutable binding to a previously accepted message. Storage may
+    /// backfill a legacy receipt, but must never insert or replay a message.
+    async fn is_paid_envelope_accepted(&self, _envelope: &UkmEnvelope)
+        -> Result<bool, Box<dyn std::error::Error + Send + Sync>> { Ok(false) }
+
     /// Atomically consume both replay keys, or write neither on a duplicate.
     /// Backends without a transaction fail closed.
     async fn check_and_store_paid(
@@ -267,11 +279,6 @@ impl PaymentGate {
     /// * `trust_discount` — Plasticity pricing discount for this sender (0.0 to 0.5).
     ///   Based on the sender's synaptic weight in our routing table. Higher weight
     ///   = more reliable peer = lower required payment. Default 0.0 (no discount).
-    #[instrument(skip_all, fields(
-        sender = %envelope.sender,
-        kind = envelope.kind,
-        amount_msat = envelope.payment_proof.amount_msat,
-    ))]
     #[allow(clippy::too_many_arguments)]
     pub async fn verify(
         &self,
@@ -307,8 +314,7 @@ impl PaymentGate {
         Ok(())
     }
 
-    /// Validate all signed fields, pricing and settlement without consuming replay
-    /// keys. The recipient MUST follow this with atomic durable acceptance.
+    /// Validate signed fields, pricing and settlement without consuming replay keys.
     #[allow(clippy::too_many_arguments)]
     pub async fn validate_paid_envelope(
         &self,
@@ -323,6 +329,44 @@ impl PaymentGate {
         // envelope is legitimately addressed to a peer.
         our_node_id: Option<&NodeId>,
     ) -> Result<(), GateRejection> {
+        self.validate_paid_envelope_inner(envelope, pricing, whitelist, lightning, trust_discount, our_node_id, None).await.map(|_| ())
+    }
+
+    /// Authenticate before consulting immutable receipts; duplicates need no new price or payment.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn validate_received_paid_envelope(
+        &self,
+        envelope: &UkmEnvelope,
+        receipts: &dyn NonceStore,
+        pricing: &dyn PricingEngine,
+        whitelist: Option<&HashSet<NodeId>>,
+        lightning: Option<&dyn LightningProvider>,
+        trust_discount: f64,
+        // This node's own NodeId. Threaded into settlement to bind the signed
+        // `envelope.recipient` to THIS node so a settlement proof for another
+        // node is non-transferable. Pass `None` only on the send path, where the
+        // envelope is legitimately addressed to a peer.
+        our_node_id: Option<&NodeId>,
+    ) -> Result<bool, GateRejection> {
+        self.validate_paid_envelope_inner(envelope, pricing, whitelist, lightning, trust_discount, our_node_id, Some(receipts)).await
+    }
+
+    #[instrument(skip_all, fields(sender = %envelope.sender, kind = envelope.kind, amount_msat = envelope.payment_proof.amount_msat))]
+    #[allow(clippy::too_many_arguments)]
+    async fn validate_paid_envelope_inner(
+        &self,
+        envelope: &UkmEnvelope,
+        pricing: &dyn PricingEngine,
+        whitelist: Option<&HashSet<NodeId>>,
+        lightning: Option<&dyn LightningProvider>,
+        trust_discount: f64,
+        // This node's own NodeId. Threaded into settlement to bind the signed
+        // `envelope.recipient` to THIS node so a settlement proof for another
+        // node is non-transferable. Pass `None` only on the send path, where the
+        // envelope is legitimately addressed to a peer.
+        our_node_id: Option<&NodeId>,
+        receipts: Option<&dyn NonceStore>,
+    ) -> Result<bool, GateRejection> {
         // ── Step 1: Envelope integrity ─────────────────────────────────
         // Validates: ID matches blake3(ciphertext||nonce), ciphertext non-empty,
         // preimage matches payment_hash via SHA-256.
@@ -391,13 +435,42 @@ impl PaymentGate {
 
         debug!("signature verification: OK");
 
+        if let (Recipient::Node(claimed), Some(ours)) = (&envelope.recipient, our_node_id) {
+            if claimed != ours {
+                return Err(GateRejection::RecipientMismatch { claimed: *claimed, ours: *ours });
+            }
+        }
+        if let Some(receipts) = receipts {
+            if receipts.is_paid_envelope_accepted(envelope).await
+                .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))? {
+                return Ok(true);
+            }
+        }
+
         // ── Step 5: Price verification ─────────────────────────────────
         // Determine the required price for this message kind and verify
         // the payment amount meets or exceeds it. Plasticity pricing
         // applies a trust discount for reliable peers (v2.1). The resolved
         // `required_msat` (after discount) is threaded into settlement so the
         // price floor is re-enforced there too (Council #218).
-        let required_msat = self.verify_price(envelope, pricing, trust_discount).await?;
+        let mut settlement_checked = false;
+        let required_msat = match self.verify_price(envelope, pricing, trust_discount).await {
+            Ok(required) => required,
+            Err(rejection @ GateRejection::InsufficientPayment { .. }) => {
+                if envelope.payment_proof.amount_msat == 0 { return Err(rejection); }
+                let (Some(receipts), Some(ln), true) = (receipts, lightning, self.config.verify_lightning_settlement) else { return Err(rejection); };
+                // A proof's self-asserted amount/time cannot buy a stale price:
+                // authenticate the full inbound settlement before consulting offers.
+                let settled = self.verify_settlement(envelope, ln, 1, our_node_id).await?;
+                let quoted = receipts.delivery_price_floor(envelope, settled.timestamp, now_ms / 1000).await
+                    .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
+                let Some(required) = quoted.map(|price| price.max(1).max(self.config.min_admission_cost_msat)) else { return Err(rejection); };
+                if envelope.payment_proof.amount_msat < required || settled.amount_msat < required { return Err(rejection); }
+                settlement_checked = true;
+                required
+            }
+            Err(rejection) => return Err(rejection),
+        };
 
         debug!("price verification: OK");
 
@@ -407,7 +480,7 @@ impl PaymentGate {
         // (step 1) is already cryptographically sufficient. Settlement also
         // independently enforces `required_msat`, so it fail-closes on the
         // price floor even if step 5 were ever bypassed or reordered.
-        if self.config.verify_lightning_settlement {
+        if self.config.verify_lightning_settlement && !settlement_checked {
             if let Some(ln) = lightning {
                 self.verify_settlement(envelope, ln, required_msat, our_node_id)
                     .await?;
@@ -420,7 +493,7 @@ impl PaymentGate {
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Verify the Ed25519 signature over the envelope's signable fields.
@@ -553,7 +626,7 @@ impl PaymentGate {
         lightning: &dyn LightningProvider,
         required_msat: u64,
         our_node_id: Option<&NodeId>,
-    ) -> Result<(), GateRejection> {
+    ) -> Result<crate::traits::lightning::PaymentDetails, GateRejection> {
         let payment_hash = hex::encode(envelope.payment_proof.payment_hash);
 
         if lightning.is_funding_payment(&payment_hash).await
@@ -666,7 +739,7 @@ impl PaymentGate {
             ));
         }
 
-        Ok(())
+        Ok(details)
     }
 }
 

@@ -288,10 +288,49 @@ async fn retained_receipt_matches_all_immutable_fields_after_content_deletion() 
             6 => other.payment_proof.amount_msat += 1,
             _ => other.payment_proof.preimage = [9; 32],
         }
+        assert!(!db.is_paid_envelope_accepted(&other).await.unwrap(), "read-only binding variant {variant}");
         assert_eq!(db.accept_paid_envelope(&other).await.unwrap(), konsensus_storage::PaidAcceptance::PaymentReused, "variant {variant}");
     }
     let mut renewed = env.clone(); renewed.timestamp += 7 * 86400_000;
     renewed.signature = Signature::from_bytes([8; 64]);
     assert_eq!(db.accept_paid_envelope(&renewed).await.unwrap(), konsensus_storage::PaidAcceptance::AlreadyAccepted);
     assert!(db.get_message(&env.id).await.unwrap().is_none());
+    assert!(db.is_paid_envelope_accepted(&renewed).await.unwrap());
+}
+
+
+#[tokio::test]
+async fn delivery_quotes_survive_restart_and_cannot_be_extended_by_the_wrapper() {
+    use konsensus_storage::EncryptedStorage;
+    let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("quotes.sqlite");
+    let mut env = envelope(); env.kind = 0;
+    {
+        let db = EncryptedStorage::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap(), &[7; 32]);
+        db.record_delivery_prices(&env.sender, &[("category:communication".into(), 1000)], &[1], 1000, 4600).await.unwrap();
+        assert!(db.record_delivery_prices(&env.sender, &[("kind:0".into(), 1)], &[1], 1000, 4601).await.is_err());
+    }
+    let db = EncryptedStorage::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap(), &[7; 32]);
+    assert_eq!(db.delivery_price_floor(&env, 2000, 5600).await.unwrap(), Some(1000));
+    env.timestamp = u64::MAX;
+    assert_eq!(db.delivery_price_floor(&env, 2000, 5601).await.unwrap(), None, "the payment's one-hour window expired");
+    assert_eq!(db.delivery_price_floor(&env, 999, 1100).await.unwrap(), None, "payment predates this offer");
+    assert_eq!(db.delivery_price_floor(&env, 4601, 4700).await.unwrap(), None, "offer expired before payment");
+    assert_eq!(db.delivery_price_floor(&env, 2000, 1999).await.unwrap(), None, "future payment fails closed");
+    env.kind = 1;
+    assert_eq!(db.delivery_price_floor(&env, 2000, 2100).await.unwrap(), None, "category price cannot replace a distinct per-kind tariff");
+    env.kind = 0;
+    env.sender = NodeId::from_bytes([8; 32]);
+    assert_eq!(db.delivery_price_floor(&env, 2000, 2100).await.unwrap(), None);
+    env.sender = envelope().sender; env.kind = 200;
+    assert_eq!(db.delivery_price_floor(&env, 2000, 2100).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn legacy_duplicate_receipt_lookup_preserves_binding_before_retention() {
+    let db = SqliteStorage::in_memory().await.unwrap(); let env = envelope();
+    db.store_message(&env).await.unwrap();
+    db.store_payment_receipt(&env.payment_proof.payment_hash, &env.sender, &env.id).await.unwrap();
+    assert!(db.is_paid_envelope_accepted(&env).await.unwrap());
+    db.delete_messages_older_than(10).await.unwrap();
+    assert!(db.is_paid_envelope_accepted(&env).await.unwrap(), "a lost duplicate ACK must remain recoverable after retention");
 }

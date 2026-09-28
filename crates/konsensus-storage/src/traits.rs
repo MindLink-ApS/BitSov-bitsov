@@ -34,6 +34,22 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("accept_paid_envelope".into()))
     }
 
+    /// Match immutable acceptance without reserving replay keys or writing messages.
+    /// Legacy full-message evidence is backfilled into the receipt before returning.
+    async fn is_paid_envelope_accepted(&self, _envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Persist recipient-issued kind/category offers before publication, for at most one hour.
+    async fn record_delivery_prices(&self, _sender: &NodeId, _prices: &[(String, u64)], _excluded_kinds: &[u16], _issued_at: u64, _expires_at: u64) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("record_delivery_prices".into()))
+    }
+
+    /// Find an unexpired offer issued to this sender before its inbound settlement.
+    async fn delivery_price_floor(&self, _envelope: &UkmEnvelope, _paid_at: u64, _now: u64) -> Result<Option<u64>, StorageError> {
+        Ok(None)
+    }
+
     /// Persist only a renewed timestamp/signature, preserving the paid identity.
     async fn update_message_wrapper(&self, _envelope: &UkmEnvelope) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("update_message_wrapper".into()))

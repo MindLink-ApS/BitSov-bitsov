@@ -101,7 +101,7 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
         | SessionAck { privileged, .. }
         | RatchetInit { privileged, .. } => (privileged, PrePaymentReason::SessionBeforePayment),
         // These carry no admission authority: the handler requires a durable
-        // outbox match and unprivileged delivery events never change weights.
+        // outbox match; only a bought reply may change routing weights.
         MessageAcked { .. } | MessageRejected { .. } => return false,
         PriceTableReceived { privileged, .. }
         | PriceQueryReceived { privileged, .. }
@@ -272,7 +272,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             debug!(peer = %peer_id, kind, "DROP PriceQuery from unprivileged peer (info-disclosure floor: strangers learn our price surface only via the admission path)");
                             continue;
                         }
-                        handle_price_query(&peer_id, kind, &pricing, &chain, &transport).await;
+                        handle_price_query(&peer_id, kind, &pricing, &chain, &transport, storage.as_ref()).await;
                     }
 
                     ControlEvent::PriceResponseReceived { peer_id, kind, price_msat, block_height, privileged } => {
@@ -511,7 +511,7 @@ async fn handle_peer_connected(
         valid_blocks: meta.valid_blocks,
         trust_discount: peer_discount,
     };
-    if let Err(e) = transport.send_frame(peer_id, &price_frame).await {
+    if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage.as_ref(), peer_id, &price_frame, pricing.as_ref()).await {
         warn!(peer = %peer_id, error = %e, "failed to send price table");
     }
 
@@ -870,7 +870,10 @@ async fn handle_delivery_confirmation(
     } else { false };
     let legacy = nonce_replay || hash_acked;
     if rejection.is_none() || legacy {
-        if !hash_acked && !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) { return; }
+        if !hash_acked && !matches!(storage.acknowledge_pending(id, peer, own_id).await, Ok(true)) {
+            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
+            return;
+        }
         if legacy {
             audit.record("acked_legacy", &peer.to_hex(), Some(serde_json::json!({"message_id": id.to_hex()})));
         }
@@ -878,7 +881,10 @@ async fn handle_delivery_confirmation(
     } else {
         let reason = rejection.unwrap_or_default();
         let terminal = terminal_paid_rejection(reason);
-        if !matches!(storage.reject_pending(id, peer, own_id, reason, terminal).await, Ok(true)) { return; }
+        if !matches!(storage.reject_pending(id, peer, own_id, reason, terminal).await, Ok(true)) {
+            if !privileged { audit.membrane().pre_payment_refused(PrePaymentReason::DeliveryBeforePayment); }
+            return;
+        }
         timestamps.lock().await.remove(id);
         handle_message_rejected(peer, id, reason, routing, ws, privileged).await;
     }
@@ -966,6 +972,7 @@ async fn handle_price_query(
     pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     chain: &Arc<dyn ChainProvider>,
     transport: &Arc<NoiseTransport>,
+    storage: &dyn konsensus_storage::Storage,
 ) {
     match pricing.get_price_msat(kind).await {
         Ok(price_msat) => {
@@ -977,7 +984,7 @@ async fn handle_price_query(
                 }
             };
             let frame = Frame::PriceResponse { kind, price_msat, block_height };
-            if let Err(e) = transport.send_frame(peer_id, &frame).await {
+            if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage, peer_id, &frame, pricing.as_ref()).await {
                 warn!(peer = %peer_id, error = %e, "failed to send price response");
             }
         }

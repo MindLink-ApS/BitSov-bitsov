@@ -119,7 +119,7 @@ async fn file_and_calendar_queue_failures_report_settlement_and_preserve_reconci
                 (
                     "POST",
                     format!("/api/v1/files/{}/send", value["file_id"].as_str().unwrap()),
-                    serde_json::json!({"recipient":peer.to_hex(),"max_total_msat":1000}),
+                    serde_json::json!({"recipient":peer.to_hex(),"max_total_msat":6000,"max_routing_fee_msat":5000}),
                 )
             } else {
                 db.store_calendar_event(&konsensus_storage::CalendarEventRecord {
@@ -179,6 +179,7 @@ async fn file_and_calendar_queue_failures_report_settlement_and_preserve_reconci
             );
             assert_eq!(json["code"], "payment_settled_send_incomplete");
             assert_eq!(json["amount_msat"], spent);
+            assert_eq!(json["max_routing_fee_msat"], if fanout { 10000 } else { 5000 });
             assert_eq!(
                 transport.sent_envelopes.lock().unwrap().len(),
                 usize::from(fanout)

@@ -353,6 +353,19 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.store_message(&encrypted).await
     }
 
+    async fn record_delivery_prices(&self, sender: &NodeId, prices: &[(String, u64)], excluded_kinds: &[u16], issued_at: u64, expires_at: u64) -> Result<(), StorageError> {
+        self.inner.record_delivery_prices(sender, prices, excluded_kinds, issued_at, expires_at).await
+    }
+
+    async fn delivery_price_floor(&self, envelope: &UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, StorageError> {
+        self.inner.delivery_price_floor(envelope, paid_at, now).await
+    }
+
+    async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        // Receipt matching uses immutable metadata, never randomized at-rest ciphertext.
+        self.inner.is_paid_envelope_accepted(envelope).await
+    }
+
     async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
         self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
     }

@@ -161,6 +161,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (20, "pending delivery state", include_str!("../migrations/020_pending_delivery_state.sql")),
     (21, "paid delivery rejections", include_str!("../migrations/021_paid_delivery_rejections.sql")),
     (22, "receipt bindings", include_str!("../migrations/022_receipt_bindings.sql")),
+    (23, "delivery price quotes", include_str!("../migrations/023_delivery_price_quotes.sql")),
 ];
 
 impl EmbeddedMigrations {
@@ -560,6 +561,74 @@ impl Storage for SqliteStorage {
         .await?;
 
         Ok(())
+    }
+
+    async fn record_delivery_prices(&self, sender: &NodeId, prices: &[(String, u64)], excluded_kinds: &[u16], issued_at: u64, expires_at: u64) -> Result<(), StorageError> {
+        if expires_at <= issued_at || expires_at - issued_at > konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS {
+            return Err(StorageError::Conversion("invalid delivery price window".into()));
+        }
+        let issued = i64::try_from(issued_at).map_err(|_| StorageError::Conversion("quote time overflow".into()))?;
+        let expires = i64::try_from(expires_at).map_err(|_| StorageError::Conversion("quote expiry overflow".into()))?;
+        let exclusions = format!(",{},", excluded_kinds.iter().map(u16::to_string).collect::<Vec<_>>().join(","));
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM delivery_price_quotes WHERE expires_at < ?").bind(issued.saturating_sub(konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS as i64)).execute(&mut *tx).await?;
+        for (scope, amount) in prices {
+            let amount = i64::try_from(*amount).map_err(|_| StorageError::Conversion("quote amount overflow".into()))?;
+            sqlx::query("INSERT INTO delivery_price_quotes (sender, scope, amount_msat, issued_at, expires_at, excluded_kinds) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING")
+                .bind(sender.to_hex()).bind(scope).bind(amount).bind(issued).bind(expires).bind(&exclusions).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delivery_price_floor(&self, envelope: &UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, StorageError> {
+        // Paid-at comes from our Lightning backend, never the signed wrapper.
+        if paid_at > now || now.saturating_sub(paid_at) > konsensus_core::gate::DELIVERY_PRICE_WINDOW_SECS { return Ok(None); }
+        let paid = i64::try_from(paid_at).map_err(|_| StorageError::Conversion("payment time overflow".into()))?;
+        let category = format!("category:{}", konsensus_core::kind::KindCategory::from_kind(envelope.kind).price_table_key());
+        let amount: Option<i64> = sqlx::query_scalar("SELECT MIN(amount_msat) FROM delivery_price_quotes WHERE sender = ? AND (scope = ? OR (scope = ? AND excluded_kinds NOT LIKE ?)) AND issued_at <= ? AND expires_at >= ?")
+            .bind(envelope.sender.to_hex()).bind(format!("kind:{}", envelope.kind)).bind(category).bind(format!("%,{},%", envelope.kind)).bind(paid).bind(paid)
+            .fetch_one(&self.pool).await?;
+        amount.map(|n| u64::try_from(n).map_err(|_| StorageError::Conversion("negative quoted price".into()))).transpose()
+    }
+
+    async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = 1 AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
+            .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+            .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .fetch_one(&self.pool).await?;
+        if durable == 1 { return Ok(true); }
+        let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
+            .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+            .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .fetch_one(&self.pool).await?;
+        if matched != 1 { return Ok(false); }
+        // A legacy full-message match is already accepted. Preserve its binding
+        // before ACK so subsequent content retention cannot erase that evidence.
+        // The guarded UPDATE never inserts a message or consumes a fresh proof.
+        let upgraded = sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ? AND message_id = ? AND sender = ? AND EXISTS (SELECT 1 FROM messages m WHERE m.id = payment_receipts.message_id AND m.sender = payment_receipts.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = payment_receipts.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?)")
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .bind(&ph).bind(&id).bind(&sender)
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .execute(&self.pool).await?.rows_affected();
+        if upgraded != 1 {
+            // A retention race is retryable, never a current-price rejection.
+            return Err(StorageError::Conversion("legacy acceptance binding changed during lookup".into()));
+        }
+        Ok(true)
     }
 
     async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {

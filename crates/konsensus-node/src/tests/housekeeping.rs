@@ -493,6 +493,7 @@ async fn price_refresh_shuts_down_on_signal() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let handle = tokio::spawn(run_price_refresh(
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap()),
         transport, pricing, chain, routing, config, shutdown_rx,
     ));
     shutdown_tx.send(true).unwrap();

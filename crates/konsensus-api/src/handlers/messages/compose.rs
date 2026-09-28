@@ -272,18 +272,23 @@ pub async fn create_payment_proof(
     price_msat: u64,
     peer_id: &NodeId,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
-    create_payment_proof_with_fee_report(state, price_msat, peer_id).await.map(|(proof, _)| proof)
+    create_payment_proof_with_fee_report(state, price_msat, peer_id).await.map(|(proof, _, _)| proof)
 }
 
+/// Return message proof, combined routing-fee ceiling, and all principal settled
+/// by this call (including re-admission). Admission never inflates the proof.
 pub(crate) async fn create_payment_proof_with_fee_report(
     state: &AppState, price_msat: u64, peer_id: &NodeId,
-) -> Result<(([u8; 32], [u8; 32], u64), u64), ApiError> {
+) -> Result<(([u8; 32], [u8; 32], u64), u64, u64), ApiError> {
     let mut charge = FirstContactCharge::default();
     let readmission = Readmission::for_cap(false);
     let fee = state.lightning.routing_fee_policy().ceiling(super::caps::payable(price_msat), None);
     let result = create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), &readmission, None, &mut charge).await;
     let ceiling = fee.saturating_add(readmission.fee_ceiling_msat());
-    result.map(|proof| (proof, ceiling)).map_err(|error| charge.error(error).with_routing_fee(ceiling))
+    result.map(|proof| {
+        let settled_msat = proof.2.saturating_add(charge.settled_msat);
+        (proof, ceiling, settled_msat)
+    }).map_err(|error| charge.error(error).with_routing_fee(ceiling))
 }
 
 /// How a paid send may pay admission again when the recipient refuses it with

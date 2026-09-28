@@ -9,6 +9,7 @@ mod content_server;
 mod housekeeping;
 mod mnemonic_crypto;
 mod msg_handler;
+mod delivery_prices;
 mod node;
 mod onboarding;
 mod pending_handler;
@@ -1178,6 +1179,7 @@ async fn cmd_start(
     ));
 
     let price_refresh_handle = tokio::spawn(housekeeping::run_price_refresh(
+        Arc::clone(node.storage()),
         Arc::clone(node.transport()),
         Arc::clone(node.pricing()),
         Arc::clone(node.chain()),

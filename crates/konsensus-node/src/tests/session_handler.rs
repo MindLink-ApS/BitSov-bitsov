@@ -1350,7 +1350,7 @@ async fn price_query_responds_with_price() {
     );
 
     // Should not panic — sends PriceResponse (fails silently since no peer connected)
-    handle_price_query(&peer_id, 100, &pricing, &chain, &transport).await;
+    handle_price_query(&peer_id, 100, &pricing, &chain, &transport, &konsensus_storage::SqliteStorage::in_memory().await.unwrap()).await;
     // No panic = success
 }
 
@@ -1387,7 +1387,7 @@ async fn price_query_skips_response_when_chain_unavailable() {
     let chain: Arc<dyn ChainProvider> = Arc::new(FailingChain);
 
     // Should not panic — skips response due to chain failure
-    handle_price_query(&peer_id, 100, &pricing, &chain, &transport).await;
+    handle_price_query(&peer_id, 100, &pricing, &chain, &transport, &konsensus_storage::SqliteStorage::in_memory().await.unwrap()).await;
     // No panic = success (handler returns early with warning)
 }
 
@@ -2048,4 +2048,102 @@ async fn legacy_lost_ack_recovers_after_nonce_expiry_and_sender_restart() {
         }
         assert!(routing.get_peer_weight(&peer).await.is_none());
     }
+}
+
+
+#[tokio::test]
+async fn accepted_chain_price_rise_and_delayed_ack_never_fail_paid() {
+    use konsensus_core::gate::{GateConfig, PaymentGate};
+    use konsensus_core::kind::KIND_CHAT;
+    use konsensus_core::traits::chain::{BlockHeader, ChainError, FeeEstimate, TrustLevel};
+    use konsensus_core::traits::pricing::PricingEngine;
+    use konsensus_core::{PaymentProof, Recipient, Signature, UkmEnvelopeBuilder};
+    use konsensus_storage::PaidAcceptance;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Exercise the production chain-aware pricing engine, default EMA and cap.
+    // Only the external fee data changes; zero cache TTL compresses the normal
+    // one-minute refresh interval so this bounded probe needs no wall-clock wait.
+    struct FeeSpikeChain {
+        inner: konsensus_chain::MockChainProvider,
+        sat_per_vb: AtomicU64,
+    }
+    #[async_trait::async_trait]
+    impl ChainProvider for FeeSpikeChain {
+        fn trust_level(&self) -> TrustLevel { self.inner.trust_level() }
+        async fn get_block_height(&self) -> Result<u64, ChainError> { self.inner.get_block_height().await }
+        async fn get_block_header(&self, height: u64) -> Result<BlockHeader, ChainError> { self.inner.get_block_header(height).await }
+        async fn estimate_fee(&self, target_blocks: u32) -> Result<FeeEstimate, ChainError> {
+            Ok(FeeEstimate { target_blocks, sat_per_vbyte: self.sat_per_vb.load(Ordering::SeqCst) as f64 })
+        }
+        async fn is_tx_confirmed(&self, txid: &str, confirmations: u32) -> Result<bool, ChainError> {
+            self.inner.is_tx_confirmed(txid, confirmations).await
+        }
+        async fn is_synced(&self) -> bool { self.inner.is_synced().await }
+    }
+    let chain = Arc::new(FeeSpikeChain {
+        inner: konsensus_chain::MockChainProvider::new(), sat_per_vb: AtomicU64::new(1),
+    });
+    let pricing = konsensus_pricing::ChainAwarePricingEngine::new(
+        konsensus_pricing::ChainAwarePricingConfig {
+            cache_ttl: std::time::Duration::ZERO, ..Default::default()
+        }, chain.clone());
+    let paid_msat = pricing.get_price_msat(KIND_CHAT).await.unwrap();
+    assert_eq!(paid_msat, 11);
+
+    let alice = identity_from_mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+    let bob = identity_from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
+    let own = *alice.node_id();
+    let peer = *bob.node_id();
+    let whitelist = std::collections::HashSet::from([own]);
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let hash = wallet.inject_inbound_keysend(paid_msat, None).await;
+    let settled = wallet.get_payment_status(&hash).await.unwrap();
+    let proof = PaymentProof::new(hex::decode(&hash).unwrap().try_into().unwrap(),
+        hex::decode(settled.preimage.unwrap()).unwrap().try_into().unwrap(), paid_msat);
+    let mut envelope = UkmEnvelopeBuilder::new(KIND_CHAT, own, Recipient::Node(peer), vec![1, 2, 3], proof).build();
+    envelope.signature = Signature::from_ed25519(&alice.sign(&envelope.signable_bytes()));
+    let gate = PaymentGate::with_config(GateConfig {
+        verify_lightning_settlement: true, ..Default::default()
+    });
+    let recipient = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+
+    // Production receive ordering: validate first, then atomic acceptance.
+    gate.validate_paid_envelope(&envelope, &pricing, Some(&whitelist), Some(&wallet), 0.0, Some(&peer)).await.unwrap();
+    assert_eq!(recipient.accept_paid_envelope(&envelope).await.unwrap(), PaidAcceptance::Accepted);
+    // Lose the ACK. While the price remains unchanged, the same validated
+    // signed envelope correctly reaches AlreadyAccepted (duplicate ACK).
+    gate.validate_paid_envelope(&envelope, &pricing, Some(&whitelist), Some(&wallet), 0.0, Some(&peer)).await.unwrap();
+    assert_eq!(recipient.accept_paid_envelope(&envelope).await.unwrap(), PaidAcceptance::AlreadyAccepted);
+
+    // Price refresh after congestion. Even granting the maximum 50% routing
+    // discount cannot save this already-accepted proof from re-pricing.
+    chain.sat_per_vb.store(1000, Ordering::SeqCst);
+    let new_price = pricing.get_price_msat(KIND_CHAT).await.unwrap();
+    assert_eq!(new_price, 50, "production default 5x cap remains enforced");
+    let receipts = konsensus_storage::StorageNonceAdapter::new(recipient.clone());
+    assert!(gate.validate_received_paid_envelope(&envelope, &receipts, &pricing, Some(&whitelist), Some(&wallet), 0.5, Some(&peer)).await.unwrap(), "already-accepted evidence precedes current pricing");
+    assert!(recipient.get_message(&envelope.id).await.unwrap().is_some());
+
+    let sender = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    sender.store_message(&envelope).await.unwrap();
+    sender.prepare_delivery(&envelope.id, &peer).await.unwrap();
+    let storage: Arc<dyn Storage> = sender.clone();
+    let routing = konsensus_routing::RoutingTable::new(Default::default());
+    let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+    let (ws, mut updates) = broadcast::channel(16);
+    let dir = tempfile::tempdir().unwrap();
+    let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+    let mut budget = DeliveryConfirmationBudget::default();
+    // Model an authenticated, whitelisted/privileged counterparty: the
+    // PriceOpen unpaid-stranger suppression does not apply to this case.
+    handle_delivery_confirmation(&peer, &envelope.id, None, true, &own,
+        &storage, &timestamps, &routing, &ws, &audit, &mut budget).await;
+    assert_eq!(updates.try_recv().unwrap().status, "delivered");
+    assert_eq!(sender.count_pending_deliveries().await.unwrap(), 0);
+    // A delayed original ACK is harmless after duplicate-ACK completion.
+    handle_delivery_confirmation(&peer, &envelope.id, None, true, &own,
+        &storage, &timestamps, &routing, &ws, &audit, &mut budget).await;
+    assert!(updates.try_recv().is_err());
+    assert_eq!(sender.count_pending_deliveries().await.unwrap(), 0);
 }

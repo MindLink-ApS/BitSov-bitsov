@@ -93,7 +93,7 @@ pub(crate) async fn whitelist_then_verify(
     our_node_id: Option<&konsensus_core::types::NodeId>,
     admission_mode: konsensus_message::ReachabilityMode,
     commit_replay: bool,
-) -> Result<bool, konsensus_core::gate::GateRejection> {
+) -> Result<(bool, bool), konsensus_core::gate::GateRejection> {
     // Snapshot the whitelist UNCONDITIONALLY (preserves the HARD-11
     // lock-release-before-await seam even in PriceOpen, where the snapshot is
     // ignored). Only the cheap Arc clone is held across the gate await.
@@ -113,19 +113,19 @@ pub(crate) async fn whitelist_then_verify(
             konsensus_message::ReachabilityMode::PriceOpen => None,
         };
     let result = if commit_replay {
-        gate.verify(envelope, nonce_store, pricing, wl_arg, lightning, trust_discount, our_node_id).await
+        gate.verify(envelope, nonce_store, pricing, wl_arg, lightning, trust_discount, our_node_id).await.map(|()| false)
     } else {
-        gate.validate_paid_envelope(envelope, pricing, wl_arg, lightning, trust_discount, our_node_id).await
+        gate.validate_received_paid_envelope(envelope, nonce_store, pricing, wl_arg, lightning, trust_discount, our_node_id).await
     };
     // Ordinary admission is observed only after the durable acceptance commit.
     // Return the same whitelist snapshot classification across that boundary.
     let first_contact = !whitelist.contains(&envelope.sender);
     match &result {
-        Ok(()) if commit_replay => { membrane.admitted(envelope, first_contact); }
+        Ok(_) if commit_replay => { membrane.admitted(envelope, first_contact); }
         Err(rejection) => { membrane.refused(envelope, rejection); }
         _ => {}
     }
-    result.map(|()| first_contact)
+    result.map(|already_accepted| (first_contact, already_accepted))
 }
 
 /// Cooldown between corrective price-table resends to the same privileged peer.
@@ -246,11 +246,19 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         )
                         .await;
 
+                        if matches!(gate_result, Ok((_, true))) {
+                            let ack = Frame::MessageAck { id: msg_id, duplicate: true };
+                            if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
+                                warn!(error = %e, "failed to send duplicate ACK");
+                            }
+                            continue;
+                        }
+
                         if gate_result.is_ok() && !is_relay_control {
                             use konsensus_storage::PaidAcceptance;
                             match storage_for_recv.accept_paid_envelope(&envelope).await {
                                 Ok(PaidAcceptance::Accepted) => {
-                                    audit_for_recv.membrane().admitted(&envelope, *gate_result.as_ref().expect("validated"));
+                                    audit_for_recv.membrane().admitted(&envelope, gate_result.as_ref().expect("validated").0);
                                 }
                                 Ok(PaidAcceptance::AlreadyAccepted) => {
                                     // No second promotion, decrypt, application side effect or write.
@@ -364,7 +372,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         // sender above — no second wallet weight lookup.
                                         trust_discount,
                                     };
-                                    if let Err(e) = transport_for_ack.send_frame(&sender, &price_frame).await {
+                                    if let Err(e) = crate::delivery_prices::send_price_frame(&transport_for_ack, storage_for_recv.as_ref(), &sender, &price_frame, pricing_for_recv.as_ref()).await {
                                         warn!(peer = %sender, error = %e, "failed to send corrective price table");
                                     } else {
                                         info!(peer = %sender, "sent corrective price table after payment mismatch");

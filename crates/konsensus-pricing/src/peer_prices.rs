@@ -312,18 +312,7 @@ impl Default for PeerPriceCache {
 
 /// Convert a `KindCategory` to its canonical string name for price table keys.
 pub fn category_to_string(category: KindCategory) -> String {
-    match category {
-        KindCategory::Communication => "communication".to_string(),
-        KindCategory::StructuredData => "structured_data".to_string(),
-        KindCategory::FilesMedia => "files_media".to_string(),
-        KindCategory::Collaboration => "collaboration".to_string(),
-        KindCategory::RealTimeSignaling => "realtime_signaling".to_string(),
-        KindCategory::WebContent => "web_content".to_string(),
-        KindCategory::Storage => "relay_storage".to_string(),
-        KindCategory::Control => "control".to_string(),
-        KindCategory::AppExtension => "app_extension".to_string(),
-        KindCategory::Unknown => "unknown".to_string(),
-    }
+    category.price_table_key().to_string()
 }
 
 /// The hard floor for a discounted price, given a base price.

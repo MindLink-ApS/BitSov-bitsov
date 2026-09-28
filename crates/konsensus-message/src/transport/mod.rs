@@ -124,10 +124,9 @@ pub enum ControlEvent {
         peer_id: NodeId,
         /// The acknowledged message ID.
         message_id: konsensus_core::types::MessageId,
-        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
-        /// `false` => the session handler DROPS this ack so an unprivileged
-        /// stranger cannot pump their own Hebbian routing/trust weight (which
-        /// lowers their gate `required_msat`) before paying — a P2 bypass.
+        /// Bought on this receiving connection: `privileged || admission_paid`.
+        /// Completion requires a matching dispatched outbox entry. Only bought
+        /// replies may update routing weight; unmatched unbought replies are refused.
         privileged: bool,
     },
 
@@ -139,9 +138,9 @@ pub enum ControlEvent {
         message_id: konsensus_core::types::MessageId,
         /// Reason for rejection.
         reason: String,
-        /// M1b: privileged tag stamped from `conn.privileged` by the reader.
-        /// `false` => the session handler DROPS this so an unprivileged stranger
-        /// cannot drive our routing-weight bookkeeping before paying (P2).
+        /// Bought on this receiving connection: `privileged || admission_paid`.
+        /// Completion requires a matching dispatched outbox entry. Only bought
+        /// replies may update routing weight; unmatched unbought replies are refused.
         privileged: bool,
     },
 

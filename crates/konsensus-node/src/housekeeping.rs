@@ -281,6 +281,7 @@ pub(crate) async fn run_gossip_eviction(
 /// rejections. Re-announces every 10 minutes. Only sends if prices have
 /// actually changed since last announcement.
 pub(crate) async fn run_price_refresh(
+    storage: Arc<dyn konsensus_storage::Storage>,
     transport: Arc<NoiseTransport>,
     pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     chain: Arc<dyn ChainProvider>,
@@ -344,7 +345,7 @@ pub(crate) async fn run_price_refresh(
                         valid_blocks: meta.valid_blocks,
                         trust_discount: peer_discount,
                     };
-                    if let Err(e) = transport.send_frame(peer_id, &frame).await {
+                    if let Err(e) = crate::delivery_prices::send_price_frame(&transport, storage.as_ref(), peer_id, &frame, pricing.as_ref()).await {
                         warn!(peer = %peer_id, error = %e, "failed to send updated price table");
                     }
                 }
