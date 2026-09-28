@@ -1,36 +1,15 @@
 mod common;
-use common::*;
-
-use std::collections::HashMap;
-use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::Engine;
-use tower::ServiceExt;
-
-use konsensus_core::identity::NodeIdentity;
-use konsensus_core::gate::PaymentGate;
-use konsensus_core::traits::chain::{BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel};
-use konsensus_core::traits::lightning::{
-    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection,
-    PaymentStatus,
-};
-use konsensus_core::traits::pricing::{PricingEngine, PricingError};
-use konsensus_core::traits::transport::{MessageTransport, TransportError};
-use konsensus_core::types::{MessageId, NodeId, Nonce, Recipient, RoomId};
-use konsensus_core::UkmEnvelope;
-use konsensus_message::PeerRegistry;
-use konsensus_storage::error::StorageError;
-use konsensus_storage::models::{Peer, Room};
-use konsensus_storage::Storage;
-use async_trait::async_trait;
-
+use common::test_router as build_router;
+use common::*;
 use konsensus_api::audit::AuditLog;
-use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use common::test_router as build_router;
+use std::sync::Arc;
+use tower::ServiceExt;
 
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -538,7 +517,7 @@ async fn session_status_no_session() {
 
     let app = build_router(Arc::clone(&state));
     let req = Request::builder()
-        .uri(&format!("/api/v1/sessions/{fake_peer}"))
+        .uri(format!("/api/v1/sessions/{fake_peer}"))
         .header("authorization", &auth)
         .body(Body::empty())
         .unwrap();
@@ -1059,7 +1038,7 @@ async fn verify_mnemonic_rejects_100_word_input() {
     let app = build_router(Arc::clone(&state));
 
     // 100 words — resource exhaustion attempt
-    let words = std::iter::repeat("abandon").take(100).collect::<Vec<_>>().join(" ");
+    let words = ["abandon"; 100].join(" ");
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/identity/verify-mnemonic")

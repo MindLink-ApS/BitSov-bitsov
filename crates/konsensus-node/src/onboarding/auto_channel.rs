@@ -568,11 +568,13 @@ mod tests {
         }
     }
 
+    type ChannelOpen = (String, String, u64, Option<f32>, bool);
+
     #[derive(Default)]
     struct TestLightning {
         balance_msat: u64,
         channels: Mutex<Vec<ChannelInfo>>,
-        opens: Mutex<Vec<(String, String, u64, Option<f32>, bool)>>,
+        opens: Mutex<Vec<ChannelOpen>>,
         reject_fee_requests: bool,
         open_started: Option<Arc<Notify>>,
         release_open: Option<Arc<Notify>>,
@@ -699,17 +701,19 @@ mod tests {
         storage
     }
 
+    type TestDeps = (
+        Arc<dyn Storage>,
+        Arc<dyn LightningProvider>,
+        Arc<dyn ChainProvider>,
+        Arc<dyn NotificationSink>,
+    );
+
     fn deps(
         storage: Arc<dyn Storage>,
         lightning: Arc<TestLightning>,
         fee_rate: f64,
         notifier: Arc<RecordingNotifier>,
-    ) -> (
-        Arc<dyn Storage>,
-        Arc<dyn LightningProvider>,
-        Arc<dyn ChainProvider>,
-        Arc<dyn NotificationSink>,
-    ) {
+    ) -> TestDeps {
         (
             storage,
             lightning,

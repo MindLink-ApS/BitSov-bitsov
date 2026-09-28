@@ -1,35 +1,26 @@
 mod common;
-use common::*;
-
-use std::collections::HashMap;
-use std::sync::Arc;
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use base64::Engine;
-use tower::ServiceExt;
-
-use konsensus_core::identity::NodeIdentity;
-use konsensus_core::gate::PaymentGate;
-use konsensus_core::traits::chain::{BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel};
-use konsensus_core::traits::lightning::{
-    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection,
-    PaymentStatus,
-};
-use konsensus_core::traits::pricing::{PricingEngine, PricingError};
-use konsensus_core::traits::transport::{MessageTransport, TransportError};
-use konsensus_core::types::{MessageId, NodeId, Nonce, Recipient, RoomId};
-use konsensus_core::UkmEnvelope;
-use konsensus_message::PeerRegistry;
-use konsensus_storage::error::StorageError;
-use konsensus_storage::models::{Peer, Room};
-use konsensus_storage::Storage;
-use async_trait::async_trait;
-
+use common::test_router as build_router;
+use common::*;
 use konsensus_api::audit::AuditLog;
-use konsensus_api::auth;
 use konsensus_api::rate_limit::RateLimiter;
 use konsensus_api::state::AppState;
-use common::test_router as build_router;
+use konsensus_core::gate::PaymentGate;
+use konsensus_core::identity::NodeIdentity;
+use konsensus_core::traits::lightning::{
+    Invoice, LightningError, LightningProvider, PaymentDetails,
+};
+use konsensus_core::traits::transport::{MessageTransport, TransportError};
+use konsensus_core::types::NodeId;
+use konsensus_core::UkmEnvelope;
+use konsensus_message::PeerRegistry;
+use konsensus_storage::models::Room;
+use konsensus_storage::Storage;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tower::ServiceExt;
 
 
 #[tokio::test]
@@ -1140,7 +1131,7 @@ async fn content_manifest_with_pages() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["pages"].as_array().unwrap().len() >= 1);
+    assert!(!json["pages"].as_array().unwrap().is_empty());
     assert_eq!(json["default_price_msat"], 50);
     assert_eq!(json["block_height"], 850_000);
 }
@@ -1510,7 +1501,7 @@ async fn get_message_plaintext_requires_auth() {
     let app = build_router(Arc::clone(&state));
 
     let req = Request::builder()
-        .uri(&format!("/api/v1/messages/{}/plaintext", "aa".repeat(32)))
+        .uri(format!("/api/v1/messages/{}/plaintext", "aa".repeat(32)))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1862,14 +1853,13 @@ async fn compose_happy_path_keysend() {
     // Full pipeline: encrypt → price → keysend → build envelope → sign → store → deliver.
     // This is the primary compose path when the peer's Lightning pubkey is known.
     let invoice_requests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let peer_id_for_transport;
 
     // Step 1: Set up E2EE session.
     let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
         Arc::new(test_identity()),
     ));
     let peer_id = setup_e2ee_session(&session_manager).await;
-    peer_id_for_transport = peer_id;
+    let peer_id_for_transport = peer_id;
 
     // Step 2: Build state with connected transport.
     let transport = Arc::new(ConnectedStubTransport::new(
@@ -1957,19 +1947,22 @@ async fn compose_happy_path_keysend() {
     assert!(json["amount_msat"].as_u64().unwrap() > 0, "should have paid");
 
     // Verify envelope was delivered through transport.
-    let sent = transport.sent_envelopes.lock().unwrap();
-    assert_eq!(sent.len(), 1, "exactly one envelope should be sent");
-    assert_eq!(sent[0].0, peer_id, "sent to correct peer");
+    let message_id = {
+        let sent = transport.sent_envelopes.lock().unwrap();
+        assert_eq!(sent.len(), 1, "exactly one envelope should be sent");
+        assert_eq!(sent[0].0, peer_id, "sent to correct peer");
 
-    // Verify the envelope has valid structure.
-    let envelope = &sent[0].1;
-    assert_eq!(envelope.kind, 100, "correct message kind");
-    assert_eq!(envelope.sender, *identity.node_id(), "sender is us");
-    assert!(!envelope.ciphertext.is_empty(), "ciphertext should not be empty");
-    assert!(envelope.payment_proof.amount_msat > 0, "payment proof should have amount");
+        // Verify the envelope has valid structure.
+        let envelope = &sent[0].1;
+        assert_eq!(envelope.kind, 100, "correct message kind");
+        assert_eq!(envelope.sender, *identity.node_id(), "sender is us");
+        assert!(!envelope.ciphertext.is_empty(), "ciphertext should not be empty");
+        assert!(envelope.payment_proof.amount_msat > 0, "payment proof should have amount");
+        envelope.id
+    };
 
     // Verify the message was stored.
-    let stored = state.storage.get_message(&envelope.id).await.unwrap();
+    let stored = state.storage.get_message(&message_id).await.unwrap();
     assert!(stored.is_some(), "message should be stored in database");
 }
 
@@ -2075,8 +2068,7 @@ async fn compose_happy_path_invoice_flow() {
     assert!(json["amount_msat"].as_u64().unwrap() > 0);
 
     // Verify envelope was sent.
-    let sent = transport.sent_envelopes.lock().unwrap();
-    assert_eq!(sent.len(), 1);
+    assert_eq!(transport.sent_envelopes.lock().unwrap().len(), 1);
 
     // Verify no pending invoice requests remain (all cleaned up).
     assert!(
