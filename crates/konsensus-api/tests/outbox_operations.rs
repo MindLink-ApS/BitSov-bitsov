@@ -568,6 +568,183 @@ async fn recovery_missing_draft_stays_unknown_until_draft_restored() {
     }
 }
 
+/// Settled backend status without a usable preimage must fail closed: never
+/// repay, never terminalize as failed_paid, and remain payment_unknown across
+/// restart while the proof is still missing.
+#[tokio::test]
+async fn recovery_settled_without_preimage_stays_payment_unknown_across_restart() {
+    let mut f = Fixture::new().await;
+    f.wallet.mode.store(1, Ordering::SeqCst);
+    f.wallet.pause_next_status_poll.store(true, Ordering::SeqCst);
+    let app = common::test_router(f.state.clone());
+    let request = f.request();
+    let job = tokio::spawn(async move { app.oneshot(request).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.wallet.status_poll_started.notified(),
+    )
+    .await
+    .expect("compose must reach the post-checkpoint payment status poll");
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+
+    f.restart().await;
+    f.wallet.mode.store(7, Ordering::SeqCst); // Settled, preimage absent
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    assert_eq!(f.op().await.state, "payment_unknown");
+    assert_eq!(
+        f.op().await.last_error.as_deref(),
+        Some("settled payment has no valid proof")
+    );
+    assert_ne!(f.op().await.state, "failed_paid");
+    assert_eq!(f.post().await.0, StatusCode::CONFLICT);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+
+    f.restart().await;
+    f.wallet.mode.store(7, Ordering::SeqCst);
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    assert_eq!(f.op().await.state, "payment_unknown");
+    assert_eq!(f.post().await.0, StatusCode::CONFLICT);
+    assert_eq!(
+        f.wallet.calls.load(Ordering::SeqCst),
+        1,
+        "restart must never dispatch another payment"
+    );
+}
+
+/// Missing encrypted draft after settlement must fail closed the same way.
+#[tokio::test]
+async fn recovery_missing_draft_stays_payment_unknown_across_restart() {
+    let mut f = Fixture::new().await;
+    sqlx::raw_sql("CREATE TRIGGER crash BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'before paid commit'); END")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let _ = f.post().await;
+    sqlx::raw_sql("DROP TRIGGER crash")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+
+    let mut op = f.op().await;
+    let mut data: serde_json::Value = serde_json::from_slice(&op.recovery).unwrap();
+    data["draft"] = serde_json::Value::Null;
+    data["envelope_ready"] = false.into();
+    op.recovery = serde_json::to_vec(&data).unwrap();
+    op.state = "paying".into();
+    assert!(f.db.update_outbox_operation(&op).await.unwrap());
+
+    f.restart().await;
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    assert_eq!(f.op().await.state, "payment_unknown");
+    assert_eq!(
+        f.op().await.last_error.as_deref(),
+        Some("settled payment missing encrypted draft")
+    );
+    assert_ne!(f.op().await.state, "failed_paid");
+    assert_eq!(f.post().await.0, StatusCode::CONFLICT);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+
+    f.restart().await;
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    assert_eq!(f.op().await.state, "payment_unknown");
+    assert_eq!(f.post().await.0, StatusCode::CONFLICT);
+    assert_eq!(
+        f.wallet.calls.load(Ordering::SeqCst),
+        1,
+        "restart must never dispatch another payment"
+    );
+}
+
+/// A paid row whose envelope was lost cannot be resent and must fail closed
+/// without authorizing another payment.
+#[tokio::test]
+async fn recover_paid_missing_envelope_moves_to_payment_unknown() {
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    let mut f = Fixture::new().await;
+    let env = UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CHAT,
+        *f.state.identity.node_id(),
+        Recipient::Node(f.peer),
+        b"ciphertext".to_vec(),
+        PaymentProof::new([1; 32], [2; 32], 1000),
+    )
+    .build();
+    let mut op = konsensus_storage::OutboxOperation::prepared(
+        f.id.clone(),
+        f.peer.to_hex(),
+        env.kind,
+        "request-hash".into(),
+    );
+    op.state = "paid".into();
+    op.message_id = Some(env.id.to_hex());
+    op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
+    op.settled_msat = 1000;
+    op.accounting_pending = false;
+    op.recovery = serde_json::to_vec(&serde_json::json!({
+        "dispatched": true,
+        "envelope_ready": true,
+        "expected_msat": 1000,
+        "fee_ceiling_msat": 0,
+        "admission_msat": 0,
+    }))
+    .unwrap();
+    assert!(f.db.insert_outbox_operation(&op).await.unwrap());
+    // Deliberately do not store the envelope.
+    f.restart().await;
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    assert_eq!(f.op().await.state, "payment_unknown");
+    assert_eq!(
+        f.op().await.last_error.as_deref(),
+        Some("paid envelope missing")
+    );
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+}
+
+/// Pre-fix rows that terminalized incomplete settlement as failed_paid must
+/// reopen to payment_unknown (still no repay) when the client retries.
+#[tokio::test]
+async fn mistagged_failed_paid_incomplete_settlement_reopens_to_payment_unknown() {
+    let mut f = Fixture::new().await;
+    sqlx::raw_sql("CREATE TRIGGER crash BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'before paid commit'); END")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let _ = f.post().await;
+    sqlx::raw_sql("DROP TRIGGER crash")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let mut op = f.op().await;
+    let mut data: serde_json::Value = serde_json::from_slice(&op.recovery).unwrap();
+    data["settlement"]["preimage"] = serde_json::Value::Null;
+    data["envelope_ready"] = false.into();
+    op.recovery = serde_json::to_vec(&data).unwrap();
+    op.state = "failed_paid".into();
+    op.last_error = Some("settled payment has no valid proof".into());
+    assert!(f.db.update_outbox_operation(&op).await.unwrap());
+
+    f.restart().await;
+    f.wallet.mode.store(7, Ordering::SeqCst);
+    let (status, body) = f.post().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "payment_unresolved");
+    assert_eq!(f.op().await.state, "payment_unknown");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn recovery_offline_backoff_is_exponential_capped_and_survives_restart() {
     let mut f = Fixture::new().await;

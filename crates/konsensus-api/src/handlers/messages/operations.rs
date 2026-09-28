@@ -493,6 +493,12 @@ pub(super) async fn compose(
             ));
         }
         recover_budget(&state, &mut op).await?;
+        // Pre-fix rows may have terminalized incomplete settlement as failed_paid.
+        // Reopen those only; genuine terminal rejects stay failed_paid.
+        if op.state == "failed_paid" && incomplete_settled_recovery(&op) {
+            op.state = "payment_unknown".into();
+            save(&state, &mut op).await?;
+        }
         if matches!(op.state.as_str(), "paying" | "payment_unknown") {
             reconcile(&state, &mut op).await?;
         }
@@ -985,6 +991,12 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             if let Some(linked) = links.get(&id) {
                 attach_recovered_reservations(state, &mut op, linked).await?;
             }
+            // Mistagged incomplete settlement must not stay terminal failed_paid:
+            // that blocks later proof recovery while still forbidding repayment.
+            if op.state == "failed_paid" && incomplete_settled_recovery(&op) {
+                op.state = "payment_unknown".into();
+                save(state, &mut op).await?;
+            }
             if matches!(op.state.as_str(), "paying" | "payment_unknown") {
                 reconcile(state, &mut op).await?;
             }
@@ -1138,6 +1150,29 @@ async fn recover_budget(state: &AppState, op: &mut OutboxOperation) -> Result<()
 }
 
 async fn recover_paid(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    // Paid without a durable envelope cannot be resent and must never re-pay.
+    // Check before offline backoff so a missing envelope cannot linger as paid.
+    let message_id = match op.message_id.as_deref() {
+        Some(hex) => MessageId::from_hex(hex).map_err(storage)?,
+        None => {
+            op.state = "payment_unknown".into();
+            op.last_error = Some("paid operation missing message id".into());
+            save(state, op).await?;
+            return Ok(());
+        }
+    };
+    if state
+        .storage
+        .get_message(&message_id)
+        .await
+        .map_err(storage)?
+        .is_none()
+    {
+        op.state = "payment_unknown".into();
+        op.last_error = Some("paid envelope missing".into());
+        save(state, op).await?;
+        return Ok(());
+    }
     let mut data = recovery(op)?;
     let now = chrono::Utc::now().timestamp_millis();
     if now < data.resend_after_ms {
@@ -1159,4 +1194,15 @@ async fn recover_paid(state: &AppState, op: &mut OutboxOperation) -> Result<(), 
     }
     resend(state, op).await?;
     Ok(())
+}
+
+/// Early #113 builds terminalized settled-without-proof / missing-draft as
+/// `failed_paid`. Those must reopen to `payment_unknown` so later backend proof
+/// can still complete delivery — without authorizing another payment.
+fn incomplete_settled_recovery(op: &OutboxOperation) -> bool {
+    matches!(
+        op.last_error.as_deref(),
+        Some("settled payment has no valid proof")
+            | Some("settled payment missing encrypted draft")
+    )
 }
