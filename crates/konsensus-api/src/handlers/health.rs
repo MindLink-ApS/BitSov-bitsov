@@ -22,6 +22,8 @@ use crate::state::AppState;
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
+    pub money_ready: bool,
+    pub readiness: konsensus_core::traits::lightning::LightningReadiness,
     pub api_capabilities: Vec<&'static str>,
     /// Always "ok" if the node is running.
     pub status: &'static str,
@@ -103,6 +105,7 @@ pub struct PublicHealthResponse {
 /// `BitSov-Data-As-Of` is the time `block_height` was read from the chain
 /// backend (a live query per request); omitted when `block_height` is null.
 async fn health(State(state): State<Arc<AppState>>) -> (DataFreshness, Json<PublicHealthResponse>) {
+    let readiness = state.lightning.readiness().await;
     let connected = state.transport.connected_peers().await;
     let ln_available = state.lightning.is_available().await;
     let ln_payment_capable = state.lightning.is_payment_capable().await;
@@ -115,13 +118,14 @@ async fn health(State(state): State<Arc<AppState>>) -> (DataFreshness, Json<Publ
         }
     };
     let chain_read = DataFreshness::now();
-    let (block_height, freshness) = match state.chain.get_block_height().await {
-        Ok(h) => (Some(h), chain_read),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to query block height for health check");
+    let (block_height, freshness) = if !readiness.money_ready {
+        (None, DataFreshness::unknown())
+    } else { match tokio::time::timeout(std::time::Duration::from_secs(1), state.chain.get_block_height()).await {
+        Ok(Ok(h)) => (Some(h), chain_read),
+        _ => {
             (None, DataFreshness::unknown())
         }
-    };
+    }};
 
     (
         freshness,
@@ -146,6 +150,7 @@ async fn health(State(state): State<Arc<AppState>>) -> (DataFreshness, Json<Publ
 /// Includes identity, connected peer IDs, wallet balance, and LN pubkey — the
 /// fields redacted from the public `/health` endpoint.
 async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let readiness = state.lightning.readiness().await;
     let connected = state.transport.connected_peers().await;
     let ln_available = state.lightning.is_available().await;
     let ln_payment_capable = state.lightning.is_payment_capable().await;
@@ -170,16 +175,15 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
     };
     let uptime = state.started_at.elapsed().as_secs();
 
-    let block_height = match state.chain.get_block_height().await {
-        Ok(h) => Some(h),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to query block height for status");
-            None
-        }
-    };
+    let block_height = if readiness.money_ready {
+        tokio::time::timeout(std::time::Duration::from_secs(1), state.chain.get_block_height()).await.ok().and_then(Result::ok)
+    } else { None };
 
     Json(HealthResponse {
+        money_ready: readiness.money_ready,
+        readiness,
         api_capabilities: vec![
+            "offline_readiness_v1",
             super::messages::caps::CAPABILITY,
             super::messages::caps::ROOM_CAPABILITY,
             super::organism::ENERGY_CAPABILITY,

@@ -606,6 +606,7 @@ pub(crate) async fn approve_owner(
     state: Arc<AppState>,
     body: ApproveRequest,
 ) -> Result<Json<ApproveResponse>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     if auth.is_metered() {
         return Err(ApiError::Conflict("sponsor_owner_approval_required".into()));
     }
@@ -751,7 +752,7 @@ fn record_outcome(kit: &mut Kit, result: &Result<PaymentDetails, LightningError>
                 kit.state = KitState::Failed;
                 kit.reserved_msat = 0;
             }
-        Err(LightningError::PaymentNotDispatched(_)) if kit.state != KitState::Funded => {
+        Err(LightningError::PaymentNotDispatched(_) | LightningError::NotReady) if kit.state != KitState::Funded => {
             kit.state = KitState::Failed;
             kit.reserved_msat = 0;
         }
@@ -902,6 +903,7 @@ async fn request_funding(
     State(state): State<Arc<AppState>>,
     Json(body): Json<FundingAsk>,
 ) -> Result<Json<FundingAskResponse>, ApiError> {
+    crate::error::require_money_ready(&state).await?;
     let now = now_unix()?;
     let net = network(&state)?;
     let (_, offer_text) = core::split_introduction_link(&body.link);
@@ -921,7 +923,7 @@ async fn request_funding(
         .lightning
         .create_invoice(offer.gift_msat, &description, expiry)
         .await
-        .map_err(|e| ApiError::Lightning(format!("could not create the funding invoice: {e}")))?;
+        .map_err(ApiError::from)?;
     let hash: [u8; 32] = hex::decode(&invoice.payment_hash).ok().and_then(|b| b.try_into().ok())
         .ok_or_else(|| ApiError::Internal("invoice hash".into()))?;
     // Funding-only BEFORE the invoice leaves this node: the gate's durable
