@@ -33,6 +33,14 @@ pub(super) struct Attempt {
     pub message_may_have_dispatched: bool,
     #[serde(default)]
     pub readmission: Option<ReadmissionSettlement>,
+    /// Whether the proof in `envelope` may have gone out. A journal written
+    /// before this field existed counts as delivered: its proof may have been
+    /// consumed, so it is never re-sent on a replacement connection.
+    #[serde(default = "legacy_proof_delivered")]
+    pub proof_delivered: bool,
+}
+fn legacy_proof_delivered() -> bool {
+    true
 }
 fn error(e: impl std::fmt::Display) -> ApiError {
     ApiError::Storage(format!("admission journal: {e}"))
