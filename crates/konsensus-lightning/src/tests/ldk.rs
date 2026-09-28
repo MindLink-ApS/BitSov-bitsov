@@ -16,6 +16,44 @@ fn parse_network_variants() {
     assert!(parse_network("invalid").is_err());
 }
 
+/// REAL-LATENCY: settle/fail events of outgoing payments wake settlement polls
+/// by the hash `get_payment_status` is keyed on; inbound events do not.
+#[test]
+fn outgoing_update_hash_names_the_polled_payment() {
+    use ldk_node::lightning::ln::channelmanager::PaymentId;
+    use ldk_node::lightning_types::payment::PaymentHash;
+    let hash = PaymentHash([7; 32]);
+    let settled = ldk_node::Event::PaymentSuccessful {
+        payment_id: Some(PaymentId([7; 32])),
+        payment_hash: hash,
+        payment_preimage: None,
+        fee_paid_msat: Some(1000),
+    };
+    assert_eq!(outgoing_update_hash(&settled), Some("07".repeat(32)));
+    let failed = ldk_node::Event::PaymentFailed {
+        payment_id: Some(PaymentId([9; 32])),
+        payment_hash: Some(hash),
+        reason: None,
+    };
+    assert_eq!(outgoing_update_hash(&failed), Some("07".repeat(32)));
+    let failed_unknown_hash = ldk_node::Event::PaymentFailed {
+        payment_id: Some(PaymentId([9; 32])),
+        payment_hash: None,
+        reason: None,
+    };
+    assert_eq!(
+        outgoing_update_hash(&failed_unknown_hash),
+        Some("09".repeat(32))
+    );
+    let received = ldk_node::Event::PaymentReceived {
+        payment_id: None,
+        payment_hash: hash,
+        amount_msat: 1,
+        custom_records: vec![],
+    };
+    assert_eq!(outgoing_update_hash(&received), None);
+}
+
 #[test]
 fn convert_status_mapping() {
     assert_eq!(
