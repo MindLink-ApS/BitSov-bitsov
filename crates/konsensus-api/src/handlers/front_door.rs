@@ -19,9 +19,7 @@ use konsensus_core::front_door::{
     Avatar, FrontDoorCard, FrontDoorCv, FrontDoorError, FrontDoorFields, FrontDoorLink,
     FrontDoorMedia, FrontDoorPrices, FrontDoorProfile, FrontDoorSite, ProfileKind,
 };
-use konsensus_core::introduction::{
-    dial_allowed, first_contact_prices, split_endpoint, Reach,
-};
+use konsensus_core::introduction::{dial_allowed, first_contact_prices, split_endpoint, Reach};
 use konsensus_core::traits::transport::TransportError;
 
 use crate::auth::scoped::{Admin, Read, ScopedAuth};
@@ -32,6 +30,11 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const CARD_FILE: &str = "front-door.json";
 const SEQ_FILE: &str = "front-door.seq";
+/// Max gap between own published card seq and an adopted floor from
+/// `front-door.seq` or a salvaged corrupt-card seq. A hand-edited
+/// `u64::MAX` floor would otherwise lock publish forever via
+/// `saturating_add(1)` → `SeqNotMonotonic`.
+const SEQ_FLOOR_ADOPT_BOUND: u64 = 1_000_000;
 
 /// Advertised on `/api/v1/status`.
 pub const CAPABILITY: &str = "front_door_v1";
@@ -66,41 +69,56 @@ impl FrontDoorStore {
     ///
     /// `own_node_id` is this node's hex Ed25519 id. Foreign cards are ignored
     /// (R2). Corrupt/tampered cards do not load, but their seq (and any
-    /// `front-door.seq` floor) still raises the monotonic floor (R1).
+    /// `front-door.seq` floor) still raises the monotonic floor (R1), capped
+    /// so a hand-edited absurd floor cannot lock publishing.
     pub fn load(content_dir: Option<&Path>, data_dir: Option<&Path>, own_node_id: &str) -> Self {
         let persist = Self::persist_path(content_dir, data_dir);
-        let mut floor = persist
+        let raw_file_floor = persist
             .as_ref()
             .map(|p| read_seq_floor(&Self::seq_path(p)))
             .unwrap_or(0);
-        let card = persist.as_ref().and_then(|p| match load_card(p, own_node_id) {
-            LoadOutcome::Ours(c) => {
-                floor = floor.max(c.seq);
-                Some(*c)
-            }
-            LoadOutcome::Foreign { seq } => {
-                tracing::warn!(
-                    path = %p.display(),
-                    seq,
-                    "ignoring foreign front-door card (not our node_id)"
-                );
-                // Do not adopt a stranger's seq as ours — only our seq file counts.
-                None
-            }
-            LoadOutcome::Missing => None,
-            LoadOutcome::Corrupt { salvaged_seq, error } => {
-                tracing::warn!(
-                    path = %p.display(),
-                    error = %error,
-                    salvaged_seq,
-                    "front-door card load failed; keeping seq floor"
-                );
-                if let Some(s) = salvaged_seq {
-                    floor = floor.max(s);
+        let mut own_card_seq = 0u64;
+        let mut salvaged_for_floor: Option<u64> = None;
+        let card = persist
+            .as_ref()
+            .and_then(|p| match load_card(p, own_node_id) {
+                LoadOutcome::Ours(c) => {
+                    own_card_seq = c.seq;
+                    Some(*c)
                 }
-                None
-            }
-        });
+                LoadOutcome::Foreign { seq } => {
+                    tracing::warn!(
+                        path = %p.display(),
+                        seq,
+                        "ignoring foreign front-door card (not our node_id)"
+                    );
+                    // Do not adopt a stranger's seq as ours — only our seq file counts.
+                    None
+                }
+                LoadOutcome::Missing => None,
+                LoadOutcome::Corrupt {
+                    salvaged_seq,
+                    error,
+                } => {
+                    tracing::warn!(
+                        path = %p.display(),
+                        error = %error,
+                        salvaged_seq,
+                        "front-door card load failed; keeping seq floor"
+                    );
+                    salvaged_for_floor = salvaged_seq;
+                    None
+                }
+            });
+        let mut floor = own_card_seq;
+        floor = floor.max(cap_adopted_seq_floor(
+            raw_file_floor,
+            own_card_seq,
+            "front-door.seq",
+        ));
+        if let Some(s) = salvaged_for_floor {
+            floor = floor.max(cap_adopted_seq_floor(s, own_card_seq, "salvaged_card_seq"));
+        }
         if floor > 0 {
             if let Some(path) = persist.as_ref() {
                 let _ = write_seq_floor(&Self::seq_path(path), floor);
@@ -119,7 +137,10 @@ impl FrontDoorStore {
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                ApiError::Internal(format!("front_door persist mkdir {}: {e}", parent.display()))
+                ApiError::Internal(format!(
+                    "front_door persist mkdir {}: {e}",
+                    parent.display()
+                ))
             })?;
         }
         let bytes = serde_json::to_vec_pretty(card)
@@ -138,7 +159,9 @@ impl FrontDoorStore {
 
 enum LoadOutcome {
     Ours(Box<FrontDoorCard>),
-    Foreign { seq: u64 },
+    Foreign {
+        seq: u64,
+    },
     Missing,
     Corrupt {
         salvaged_seq: Option<u64>,
@@ -193,6 +216,24 @@ fn read_seq_floor(path: &Path) -> u64 {
     text.trim().parse::<u64>().unwrap_or(0)
 }
 
+/// Refuse a candidate floor above `own_card_seq + SEQ_FLOOR_ADOPT_BOUND`.
+/// Returns `own_card_seq` (safe published floor) when the candidate is absurd.
+fn cap_adopted_seq_floor(candidate: u64, own_card_seq: u64, source: &str) -> u64 {
+    let max_ok = own_card_seq.saturating_add(SEQ_FLOOR_ADOPT_BOUND);
+    if candidate > max_ok {
+        tracing::warn!(
+            candidate,
+            own_card_seq,
+            max_ok,
+            bound = SEQ_FLOOR_ADOPT_BOUND,
+            source,
+            "refusing front-door seq floor above own card seq + adopt bound"
+        );
+        return own_card_seq;
+    }
+    candidate
+}
+
 fn write_seq_floor(path: &Path, seq: u64) -> Result<(), ApiError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -200,9 +241,8 @@ fn write_seq_floor(path: &Path, seq: u64) -> Result<(), ApiError> {
         })?;
     }
     let tmp = path.with_extension("seq.tmp");
-    std::fs::write(&tmp, format!("{seq}\n")).map_err(|e| {
-        ApiError::Internal(format!("front_door seq write {}: {e}", tmp.display()))
-    })?;
+    std::fs::write(&tmp, format!("{seq}\n"))
+        .map_err(|e| ApiError::Internal(format!("front_door seq write {}: {e}", tmp.display())))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         ApiError::Internal(format!("front_door seq rename {}: {e}", path.display()))
     })?;
@@ -285,7 +325,11 @@ fn map_err(e: FrontDoorError) -> ApiError {
     ApiError::BadRequest(format!("front_door_invalid: {e}"))
 }
 
-fn response_for(card: FrontDoorCard, network: Option<&str>, now: u64) -> Result<FrontDoorResponse, ApiError> {
+fn response_for(
+    card: FrontDoorCard,
+    network: Option<&str>,
+    now: u64,
+) -> Result<FrontDoorResponse, ApiError> {
     let link = card.to_link().map_err(map_err)?;
     let fresh = match network {
         Some(net) => card.verify(now, net).is_ok(),
@@ -326,7 +370,8 @@ async fn put_front_door(
     })?;
     let endpoint = state.introduction.endpoint.clone().ok_or_else(|| {
         ApiError::Conflict(
-            "front_door_unavailable: no dialable peer endpoint; set [network] advertised_addr".into(),
+            "front_door_unavailable: no dialable peer endpoint; set [network] advertised_addr"
+                .into(),
         )
     })?;
     let chat = state
@@ -436,16 +481,14 @@ fn verified_for_open(state: &AppState, text: &str) -> Result<FrontDoorCard, ApiE
 async fn pin_endpoint(card: &FrontDoorCard) -> Result<SocketAddr, ApiError> {
     let (host, port) = split_endpoint(&card.endpoint)
         .map_err(|e| ApiError::BadRequest(format!("front_door_invalid: {e}")))?;
-    let addrs: Vec<SocketAddr> = match tokio::time::timeout(
-        DNS_TIMEOUT,
-        tokio::net::lookup_host((host.as_str(), port)),
-    )
-    .await
-    {
-        Ok(Ok(addrs)) => addrs.collect(),
-        Ok(Err(e)) => return Err(ApiError::Transport(format!("cannot resolve {host}: {e}"))),
-        Err(_) => return Err(ApiError::Transport(format!("resolving {host} timed out"))),
-    };
+    let addrs: Vec<SocketAddr> =
+        match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((host.as_str(), port)))
+            .await
+        {
+            Ok(Ok(addrs)) => addrs.collect(),
+            Ok(Err(e)) => return Err(ApiError::Transport(format!("cannot resolve {host}: {e}"))),
+            Err(_) => return Err(ApiError::Transport(format!("resolving {host} timed out"))),
+        };
     if addrs.is_empty() {
         return Err(ApiError::Transport(format!("{host} has no address")));
     }
@@ -504,7 +547,10 @@ async fn open_front_door(
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/v1/front-door", get(get_front_door).put(put_front_door))
+        .route(
+            "/api/v1/front-door",
+            get(get_front_door).put(put_front_door),
+        )
         .route("/api/v1/front-door/verify", post(verify_front_door))
         .route("/api/v1/front-door/open", post(open_front_door))
 }
