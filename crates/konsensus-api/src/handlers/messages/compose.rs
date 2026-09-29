@@ -3458,6 +3458,29 @@ pub(super) async fn compose_peer(
 
         let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
 
+        if let Some(expected) = konsensus_core::expected_reply_kind(req.kind) {
+            let Recipient::Node(peer) = envelope.recipient else {
+                return Err(ApiError::BadRequest("web request recipient must be a node".into()));
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            state
+                .storage
+                .record_outgoing_web_request(
+                    &envelope.payment_proof.payment_hash,
+                    konsensus_core::OutstandingWebRequest {
+                        request_id: envelope.id,
+                        peer,
+                        expected_reply_kind: expected,
+                        expires_at_ms: now_ms.saturating_add(konsensus_core::OUTSTANDING_TTL_MS),
+                    },
+                )
+                .await
+                .map_err(|e| ApiError::Internal(format!("record web request: {e}")))?;
+        }
+
         // Cache plaintext (encrypted at rest) for API retrieval
         if let Some(ref cipher) = state.plaintext_cipher {
             match cipher.encrypt(req.plaintext.as_bytes()) {

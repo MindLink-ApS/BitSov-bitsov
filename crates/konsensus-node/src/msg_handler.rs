@@ -620,6 +620,24 @@ async fn decrypt_and_process(
         process_calendar_event(&bytes, sender, envelope, storage).await
     } else if envelope.kind == konsensus_core::kind::KIND_RSVP {
         process_rsvp(&bytes, sender, envelope, storage).await
+    } else if konsensus_core::is_web_service_reply(envelope) {
+        // 510/501 reply bound to our paid request: deliver plaintext to the
+        // frontend, never treat it as a fresh manifest/page request (F3).
+        match String::from_utf8(bytes) {
+            Ok(text) => {
+                info!(
+                    sender = %sender,
+                    kind = envelope.kind,
+                    msg_id = %envelope.id,
+                    "received web service reply — forwarding to frontend"
+                );
+                Some(text)
+            }
+            Err(_) => {
+                debug!(sender = %sender, kind = envelope.kind, "web service reply payload is not UTF-8");
+                None
+            }
+        }
     } else if envelope.kind == konsensus_core::kind::KIND_WEB_MANIFEST {
         process_web_manifest(
             sender,

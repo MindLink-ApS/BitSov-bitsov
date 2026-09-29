@@ -26,6 +26,9 @@ use crate::traits::Storage;
 /// SQLite-backed storage for T1 Light and development.
 pub struct SqliteStorage {
     pool: SqlitePool,
+    outstanding_web: std::sync::Mutex<
+        std::collections::HashMap<[u8; 32], konsensus_core::web_reply::OutstandingWebRequest>,
+    >,
 }
 
 /// The on-disk file a SQLite connection string names, resolved with the same
@@ -90,7 +93,7 @@ impl SqliteStorage {
             .connect_with(options)
             .await?;
 
-        let storage = Self { pool };
+        let storage = Self { pool, outstanding_web: std::sync::Mutex::new(std::collections::HashMap::new()) };
         storage.run_migrations(migrations_dir).await?;
         Ok(storage)
     }
@@ -107,7 +110,7 @@ impl SqliteStorage {
             .connect_with(options)
             .await?;
 
-        let storage = Self { pool };
+        let storage = Self { pool, outstanding_web: std::sync::Mutex::new(std::collections::HashMap::new()) };
         let dir = std::env::var_os("KONSENSUS_SQLITE_MIGRATIONS_DIR").map(std::path::PathBuf::from);
         storage.run_migrations(dir.as_deref()).await?;
         Ok(storage)
@@ -1506,6 +1509,29 @@ impl Storage for SqliteStorage {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn record_outgoing_web_request(
+        &self,
+        payment_hash: &[u8; 32],
+        request: konsensus_core::web_reply::OutstandingWebRequest,
+    ) -> Result<(), StorageError> {
+        self.outstanding_web
+            .lock()
+            .map_err(|e| StorageError::Serialization(format!("outstanding_web lock: {e}")))?
+            .insert(*payment_hash, request);
+        Ok(())
+    }
+
+    async fn take_outstanding_web_request(
+        &self,
+        payment_hash: &[u8; 32],
+    ) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, StorageError> {
+        Ok(self
+            .outstanding_web
+            .lock()
+            .map_err(|e| StorageError::Serialization(format!("outstanding_web lock: {e}")))?
+            .remove(payment_hash))
     }
 
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {

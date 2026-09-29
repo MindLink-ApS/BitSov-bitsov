@@ -38,7 +38,10 @@ pub use types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, RoomId, Signa
 // Re-export core traits.
 pub use gate::{GateConfig, GateRejection, NonceStore, PaymentGate};
 pub use invite::{BitSovInvite, InviteError, InviteToken};
-pub use web_reply::{is_web_service_reply, reply_bound_proof};
+pub use web_reply::{
+    expected_reply_kind, is_web_service_reply, reply_bound_proof, reply_matches_outstanding,
+    OutstandingWebRequest, OUTSTANDING_TTL_MS,
+};
 pub use traits::{
     BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel,
     Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection, PaymentStatus,

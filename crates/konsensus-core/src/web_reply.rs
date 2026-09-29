@@ -6,10 +6,36 @@
 //! - `references` contains the request's [`MessageId`]
 //! - kinds: [`KIND_PAGE_RESPONSE`] or [`KIND_WEB_MANIFEST`] (manifest is request
 //!   when paid and unreplied; reply when amount is 0 and references are set)
+//!
+//! The requester records each paid 500/510 send as an outstanding entry keyed by
+//! payment hash. Step 4.5 of the gate accepts a reply only against that entry
+//! (peer, expected reply kind, request id, expiry), then consumes it.
 
 use crate::envelope::UkmEnvelope;
-use crate::kind::{KIND_PAGE_RESPONSE, KIND_WEB_MANIFEST};
-use crate::types::PaymentProof;
+use crate::kind::{KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE, KIND_WEB_MANIFEST};
+use crate::types::{MessageId, NodeId, PaymentProof};
+
+/// How long a paid web request may be answered (matches gate max age window).
+pub const OUTSTANDING_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// A paid outbound page/manifest request awaiting its bound reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutstandingWebRequest {
+    pub request_id: MessageId,
+    pub peer: NodeId,
+    /// [`KIND_PAGE_RESPONSE`] or [`KIND_WEB_MANIFEST`].
+    pub expected_reply_kind: u16,
+    pub expires_at_ms: u64,
+}
+
+/// Expected reply kind for an outbound paid web request, if any.
+pub fn expected_reply_kind(request_kind: u16) -> Option<u16> {
+    match request_kind {
+        KIND_PAGE_REQUEST => Some(KIND_PAGE_RESPONSE),
+        KIND_WEB_MANIFEST => Some(KIND_WEB_MANIFEST),
+        _ => None,
+    }
+}
 
 /// Build the payment proof for a web service reply bound to `request_proof`.
 ///
@@ -23,7 +49,7 @@ pub fn reply_bound_proof(request_proof: &PaymentProof) -> PaymentProof {
     )
 }
 
-/// True when this envelope is a web service reply bound to a paid request.
+/// True when this envelope is shaped as a web service reply bound to a paid request.
 pub fn is_web_service_reply(envelope: &UkmEnvelope) -> bool {
     matches!(
         envelope.kind,
@@ -32,14 +58,31 @@ pub fn is_web_service_reply(envelope: &UkmEnvelope) -> bool {
         && !envelope.references.is_empty()
 }
 
+/// Whether `envelope` matches an outstanding paid request entry.
+pub fn reply_matches_outstanding(
+    envelope: &UkmEnvelope,
+    outstanding: &OutstandingWebRequest,
+    now_ms: u64,
+) -> bool {
+    if now_ms > outstanding.expires_at_ms {
+        return false;
+    }
+    if envelope.sender != outstanding.peer {
+        return false;
+    }
+    if envelope.kind != outstanding.expected_reply_kind {
+        return false;
+    }
+    envelope.references.contains(&outstanding.request_id)
+}
+
 #[cfg(test)]
 mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
     use crate::envelope::UkmEnvelopeBuilder;
-    use crate::kind::KIND_PAGE_REQUEST;
-    use crate::types::{NodeId, Recipient};
+    use crate::types::Recipient;
 
     fn proof(amount: u64) -> PaymentProof {
         let preimage = [7u8; 32];
@@ -87,5 +130,32 @@ mod tests {
         reply.references.push(request.id);
         reply.payment_proof.amount_msat = 50;
         assert!(!is_web_service_reply(&reply));
+    }
+
+    #[test]
+    fn reply_matches_outstanding_requires_peer_kind_id_and_window() {
+        let peer = NodeId::from_bytes([2u8; 32]);
+        let other = NodeId::from_bytes([3u8; 32]);
+        let request_id = MessageId::from_bytes([9u8; 32]);
+        let outstanding = OutstandingWebRequest {
+            request_id,
+            peer,
+            expected_reply_kind: KIND_PAGE_RESPONSE,
+            expires_at_ms: 1_000,
+        };
+        let reply = UkmEnvelopeBuilder::new(
+            KIND_PAGE_RESPONSE,
+            peer,
+            Recipient::Node(NodeId::from_bytes([1u8; 32])),
+            b"page".to_vec(),
+            reply_bound_proof(&proof(50)),
+        )
+        .references(vec![request_id])
+        .build();
+        assert!(reply_matches_outstanding(&reply, &outstanding, 500));
+        assert!(!reply_matches_outstanding(&reply, &outstanding, 1_001));
+        let mut wrong_peer = reply.clone();
+        wrong_peer.sender = other;
+        assert!(!reply_matches_outstanding(&wrong_peer, &outstanding, 500));
     }
 }

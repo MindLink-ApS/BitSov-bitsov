@@ -187,6 +187,29 @@ pub trait NonceStore: Send + Sync {
              with a durable payment-hash store"
             .into())
     }
+
+    /// Record a paid outbound page/manifest request so its reply can be bound.
+    ///
+    /// Default is a no-op: without an override, Step 4.5 finds no outstanding
+    /// entry and falls through to the price floor (fail-closed for unpaid acts).
+    async fn record_outgoing_web_request(
+        &self,
+        _payment_hash: &[u8; 32],
+        _request: crate::web_reply::OutstandingWebRequest,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    /// Atomically take the outstanding web request for this payment hash, if any.
+    ///
+    /// Default returns `None` (no binding). Production stores must override.
+    async fn take_outstanding_web_request(
+        &self,
+        _payment_hash: &[u8; 32],
+    ) -> Result<Option<crate::web_reply::OutstandingWebRequest>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Ok(None)
+    }
 }
 
 /// Outcome of the atomic paid-envelope replay transaction.
@@ -299,7 +322,17 @@ impl PaymentGate {
         // envelope is legitimately addressed to a peer.
         our_node_id: Option<&NodeId>,
     ) -> Result<(), GateRejection> {
-        self.validate_paid_envelope(envelope, pricing, whitelist, lightning, trust_discount, our_node_id).await?;
+        self.validate_paid_envelope_inner(
+            envelope,
+            pricing,
+            whitelist,
+            lightning,
+            trust_discount,
+            our_node_id,
+            Some(nonce_store),
+        )
+        .await
+        .map(|_| ())?;
         // Persist replay guards only after price and settlement validation.
         // A signed, self-generated hash/preimage is not payment: recording it
         // earlier gives unpaid strangers a durable storage primitive.
@@ -453,13 +486,22 @@ impl PaymentGate {
         }
 
         // ── Step 4.5: Web service replies (page / manifest) ────────────
-        // Bound to the requester's paid request: amount 0, references the
-        // request MessageId, reuses that request's hash/preimage. Not a new
-        // Lightning payment — never self-minted via generate_valid_proof.
+        // Bound to an outstanding paid 500/510 request THIS node sent to the
+        // sender: amount 0, references the request MessageId, reuses that
+        // request's hash/preimage. Never a new Lightning payment. Without a
+        // matching outstanding entry we fall through to the price floor so
+        // unbound zero-amount 501/510 stay rejected on Mock (and everywhere).
         if crate::web_reply::is_web_service_reply(envelope) {
-            self.verify_web_service_reply(envelope, lightning).await?;
-            debug!("web service reply: bound to paid request, skipping price/settlement");
-            return Ok(false);
+            if let Some(store) = receipts {
+                if self
+                    .try_accept_web_service_reply(envelope, store, lightning, now_ms)
+                    .await?
+                {
+                    debug!("web service reply: bound to outstanding paid request, skipping price/settlement");
+                    return Ok(false);
+                }
+            }
+            debug!("web service reply: no outstanding request — applying price floor");
         }
 
         // ── Step 5: Price verification ─────────────────────────────────
@@ -528,16 +570,38 @@ impl PaymentGate {
             })
     }
 
-    /// Accept a web service reply only when it reuses a payment this node made
-    /// (outgoing, settled). When Lightning settlement checks are off (tests /
-    /// Mock), the structural reply-bound shape is enough.
-    async fn verify_web_service_reply(
+    /// Accept a web service reply only when it matches and consumes an
+    /// outstanding paid 500/510 request to this sender. When settlement checks
+    /// are on, also require the proof to be our outgoing settled payment.
+    /// Returns `Ok(true)` when bound and accepted; `Ok(false)` when there is no
+    /// outstanding entry (caller applies the price floor).
+    async fn try_accept_web_service_reply(
         &self,
         envelope: &UkmEnvelope,
+        nonce_store: &dyn NonceStore,
         lightning: Option<&dyn LightningProvider>,
-    ) -> Result<(), GateRejection> {
+        now_ms: u64,
+    ) -> Result<bool, GateRejection> {
+        let outstanding = nonce_store
+            .take_outstanding_web_request(&envelope.payment_proof.payment_hash)
+            .await
+            .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
+        let Some(outstanding) = outstanding else {
+            return Ok(false);
+        };
+        if !crate::web_reply::reply_matches_outstanding(envelope, &outstanding, now_ms) {
+            // Put it back? No — a mismatched claim against this hash must not
+            // leave the slot open for a later forge. The honest reply can only
+            // arrive once; consuming a mismatched attempt is fail-closed.
+            warn!(
+                peer = %envelope.sender,
+                kind = envelope.kind,
+                "rejected: web reply does not match outstanding paid request"
+            );
+            return Err(GateRejection::WebReplyUnbound);
+        }
         if !self.config.verify_lightning_settlement {
-            return Ok(());
+            return Ok(true);
         }
         let Some(ln) = lightning else {
             return Err(GateRejection::LightningUnavailable(
@@ -571,7 +635,7 @@ impl PaymentGate {
                 "web reply preimage does not match our outgoing payment".into(),
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Verify the payment amount meets the required price.
@@ -840,6 +904,7 @@ mod tests {
     struct MockNonceStore {
         seen: Mutex<HashSet<[u8; 24]>>,
         seen_payment_hashes: Mutex<HashSet<[u8; 32]>>,
+        outstanding_web: Mutex<std::collections::HashMap<[u8; 32], crate::web_reply::OutstandingWebRequest>>,
     }
 
     impl MockNonceStore {
@@ -847,6 +912,7 @@ mod tests {
             Self {
                 seen: Mutex::new(HashSet::new()),
                 seen_payment_hashes: Mutex::new(HashSet::new()),
+                outstanding_web: Mutex::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -884,6 +950,22 @@ mod tests {
         ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
             let mut seen = self.seen_payment_hashes.lock().unwrap();
             Ok(seen.insert(*payment_hash))
+        }
+
+        async fn record_outgoing_web_request(
+            &self,
+            payment_hash: &[u8; 32],
+            request: crate::web_reply::OutstandingWebRequest,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.outstanding_web.lock().unwrap().insert(*payment_hash, request);
+            Ok(())
+        }
+
+        async fn take_outstanding_web_request(
+            &self,
+            payment_hash: &[u8; 32],
+        ) -> Result<Option<crate::web_reply::OutstandingWebRequest>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.outstanding_web.lock().unwrap().remove(payment_hash))
         }
     }
 
@@ -1797,6 +1879,18 @@ mod tests {
 
         let gate = PaymentGate::new(); // settlement verification off
         let nonce_store = MockNonceStore::new();
+        nonce_store
+            .record_outgoing_web_request(
+                &request.payment_proof.payment_hash,
+                crate::web_reply::OutstandingWebRequest {
+                    request_id: request.id,
+                    peer: *server.node_id(),
+                    expected_reply_kind: KIND_PAGE_RESPONSE,
+                    expires_at_ms: now_ms() + crate::web_reply::OUTSTANDING_TTL_MS,
+                },
+            )
+            .await
+            .unwrap();
         let pricing = MockPricing { price_msat: 50 }; // reply kind is priced, but reply-bound skips it
         let result = gate
             .verify(
@@ -1851,6 +1945,18 @@ mod tests {
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
+        nonce_store
+            .record_outgoing_web_request(
+                &request.payment_proof.payment_hash,
+                crate::web_reply::OutstandingWebRequest {
+                    request_id: request.id,
+                    peer: *server.node_id(),
+                    expected_reply_kind: KIND_PAGE_RESPONSE,
+                    expires_at_ms: now_ms() + crate::web_reply::OUTSTANDING_TTL_MS,
+                },
+            )
+            .await
+            .unwrap();
         let pricing = MockPricing { price_msat: 50 };
         // Incoming settled ≠ our outgoing payment
         let lightning = MockLightning {
@@ -1877,6 +1983,109 @@ mod tests {
             "expected WebReplyUnbound, got {result:?}"
         );
     }
+
+    /// Reviewer F1: a prior chat payment hash must not buy a free 510 act.
+    #[tokio::test]
+    async fn probe_prior_outgoing_payment_hash_buys_free_manifest_request_on_real_backend() {
+        let requester = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let peer = NodeIdentity::from_mnemonic(
+            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+            "",
+        )
+        .unwrap();
+        // Simulate a settled outgoing CHAT payment to peer (no outstanding web request).
+        let chat_proof = make_proof(1000);
+        let ln = MockLightning {
+            funding_only: false,
+            settled: true,
+            amount_msat: 1000,
+            direction: PaymentDirection::Outgoing,
+            preimage: Some(chat_proof.preimage),
+            payment_hash_override: Some(hex::encode(chat_proof.payment_hash)),
+        };
+        let mut forged = UkmEnvelopeBuilder::new(
+            crate::kind::KIND_WEB_MANIFEST,
+            *peer.node_id(),
+            Recipient::Node(*requester.node_id()),
+            b"free-manifest".to_vec(),
+            reply_bound_proof(&chat_proof),
+        )
+        .references(vec![crate::types::MessageId::from_bytes([0xAB; 32])])
+        .timestamp(now_ms())
+        .build();
+        forged.signature =
+            crate::types::Signature::from_ed25519(&peer.sign(&forged.signable_bytes()));
+
+        let config = GateConfig { verify_lightning_settlement: true, ..Default::default() };
+        let gate = PaymentGate::with_config(config);
+        let nonce_store = MockNonceStore::new();
+        let pricing = MockPricing { price_msat: 50 };
+        let result = gate
+            .verify(
+                &forged,
+                &nonce_store,
+                &pricing,
+                None,
+                Some(&ln),
+                0.0,
+                Some(requester.node_id()),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GateRejection::InsufficientPayment { .. })),
+            "prior chat hash must hit the price floor, got {result:?}"
+        );
+    }
+
+    /// Reviewer F2: on Mock (settlement off), unbound zero-amount 510 still pays the floor.
+    #[tokio::test]
+    async fn probe_zero_amount_manifest_request_passes_on_mock() {
+        let requester = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let peer = NodeIdentity::from_mnemonic(
+            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+            "",
+        )
+        .unwrap();
+        let proof = make_proof(50);
+        let mut forged = UkmEnvelopeBuilder::new(
+            crate::kind::KIND_WEB_MANIFEST,
+            *peer.node_id(),
+            Recipient::Node(*requester.node_id()),
+            b"unbound".to_vec(),
+            reply_bound_proof(&proof),
+        )
+        .references(vec![crate::types::MessageId::from_bytes([0xCD; 32])])
+        .timestamp(now_ms())
+        .build();
+        forged.signature =
+            crate::types::Signature::from_ed25519(&peer.sign(&forged.signable_bytes()));
+
+        let gate = PaymentGate::new(); // settlement off
+        let nonce_store = MockNonceStore::new(); // no outstanding
+        let pricing = MockPricing { price_msat: 50 };
+        let result = gate
+            .verify(
+                &forged,
+                &nonce_store,
+                &pricing,
+                None,
+                None,
+                0.0,
+                Some(requester.node_id()),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(GateRejection::InsufficientPayment {
+                    required_msat: 50,
+                    paid_msat: 0
+                })
+            ),
+            "unbound zero-amount must hit Mock price floor, got {result:?}"
+        );
+    }
+
 
     #[tokio::test]
     async fn reject_zero_payment_nonzero_price() {
