@@ -57,8 +57,11 @@ Otherwise the send is refused (409 `readmission_required`, or the grant's
 `unpriced` refusal) with nothing more paid. A peer with no live connection
 generation is never quoted. Each connection generation pays admission at most once; a retry of a settled
 operation pays nothing. The response's `max_routing_fee_msat` (and the error's)
-is the sum of the ceilings actually given to the wallet, including a message
-repriced by the fresh quote.
+is the sum of the ceilings actually given to the wallet. An admission fee
+ceiling is recorded only at wallet dispatch, so a 409/400 refusal that never
+pays (cap, grant reservation, or connection-generation change) reports no
+admission ceiling. A message repriced by a fresh quote contributes its ceiling
+once that message is dispatched.
 
 Room compose returns `member_outcomes` for every non-self recipient, including
 when no message could be stored. Each row has `recipient`, `status`,

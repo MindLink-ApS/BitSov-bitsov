@@ -44,6 +44,9 @@ struct ReconnectingContact {
     quotes: AtomicUsize,
     /// The transport reports no live connection generation.
     no_generation: AtomicBool,
+    /// After this many `connected_since` observations, reconnect once (0 = never).
+    reconnect_after_connected_since: AtomicUsize,
+    connected_since_calls: AtomicUsize,
 }
 
 impl ReconnectingContact {
@@ -89,7 +92,16 @@ impl MessageTransport for ReconnectingContact {
         vec![self.peer]
     }
     async fn connected_since(&self, _: &NodeId) -> Option<Instant> {
-        (!self.no_generation.load(Ordering::SeqCst)).then(|| *self.generation.lock().unwrap())
+        if self.no_generation.load(Ordering::SeqCst) {
+            return None;
+        }
+        let n = self.connected_since_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let after = self.reconnect_after_connected_since.load(Ordering::SeqCst);
+        if after > 0 && n == after {
+            self.reconnect();
+            self.reconnect_after_connected_since.store(0, Ordering::SeqCst);
+        }
+        Some(*self.generation.lock().unwrap())
     }
     async fn admission_paid_on_connection(&self, _: &NodeId) -> bool {
         self.paid.load(Ordering::SeqCst)
@@ -167,6 +179,8 @@ async fn net() -> Net {
         flap_on_quote: AtomicBool::new(false),
         quotes: AtomicUsize::new(0),
         no_generation: AtomicBool::new(false),
+        reconnect_after_connected_since: AtomicUsize::new(0),
+        connected_since_calls: AtomicUsize::new(0),
     });
     Arc::get_mut(&mut state).unwrap().transport = contact.clone();
     let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
@@ -193,9 +207,13 @@ impl Net {
     }
 
     async fn compose(&self, operation_id: &str, cap: u64) -> (u16, serde_json::Value) {
+        self.compose_with_fee(operation_id, cap, 0).await
+    }
+
+    async fn compose_with_fee(&self, operation_id: &str, cap: u64, fee: u64) -> (u16, serde_json::Value) {
         self.post("/api/v1/messages/compose", serde_json::json!({
             "recipient": self.contact.peer.to_hex(), "kind": 0, "plaintext": "after the reconnect",
-            "max_total_msat": cap, "max_routing_fee_msat": 0, "operation_id": operation_id,
+            "max_total_msat": cap, "max_routing_fee_msat": fee, "operation_id": operation_id,
         })).await
     }
 
@@ -285,4 +303,74 @@ async fn no_connection_generation_never_binds_or_pays_a_quote() {
     assert_eq!((status, body["code"].as_str()), (400, Some("not_dispatched")), "{body}");
     assert_eq!(net.spent().await, 0);
     assert_eq!(net.contact.quotes.load(Ordering::SeqCst), 0, "no quote was asked for");
+}
+
+/// #127 follow-up: refusals that never reach wallet dispatch must not report an
+/// admission fee ceiling in `max_routing_fee_msat`.
+const FEE: u64 = 100;
+
+fn assert_message_fee_only(body: &serde_json::Value) {
+    assert_eq!(
+        body["max_routing_fee_msat"].as_u64(),
+        Some(FEE),
+        "refusal before admission dispatch reports the message fee only: {body}"
+    );
+}
+
+#[tokio::test]
+async fn cap_refusal_reports_no_admission_fee_ceiling() {
+    let net = net().await;
+    let (status, body) = net.compose_with_fee(&uuid::Uuid::new_v4().to_string(), 3_000, FEE).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(
+        (body["code"].as_str(), body["reason"].as_str()),
+        (Some("price_cap_exceeded"), Some("readmission_required")),
+        "{body}"
+    );
+    assert_eq!(net.spent().await, 0);
+    assert_message_fee_only(&body);
+}
+
+/// Cache a fitting quote, then reconnect on the Nth `connected_since` of the
+/// next compose. On the cached-quote re-admission path the observations are:
+/// readmit coverage, first_contact coverage, live take, then the three
+/// post-quote generation checks (before reserve / after reserve / before pay).
+async fn refuse_cached_quote_on_connected_since(n: usize) -> (u16, serde_json::Value, u64) {
+    let net = net().await;
+    let (status, body) = net.compose_with_fee(&uuid::Uuid::new_v4().to_string(), 3_000, FEE).await;
+    assert_eq!(status, 409, "seed the cache under a too-small cap: {body}");
+    assert_eq!(net.spent().await, 0);
+    net.contact.connected_since_calls.store(0, Ordering::SeqCst);
+    net.contact
+        .reconnect_after_connected_since
+        .store(n, Ordering::SeqCst);
+    let (status, body) = net
+        .compose_with_fee(&uuid::Uuid::new_v4().to_string(), 4_200, FEE)
+        .await;
+    let spent = net.spent().await;
+    (status, body, spent)
+}
+
+#[tokio::test]
+async fn generation_change_before_reservation_reports_no_admission_fee_ceiling() {
+    let (status, body, spent) = refuse_cached_quote_on_connected_since(4).await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("not_dispatched")), "{body}");
+    assert_eq!(spent, 0);
+    assert_message_fee_only(&body);
+}
+
+#[tokio::test]
+async fn generation_change_after_reservation_reports_no_admission_fee_ceiling() {
+    let (status, body, spent) = refuse_cached_quote_on_connected_since(5).await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("not_dispatched")), "{body}");
+    assert_eq!(spent, 0);
+    assert_message_fee_only(&body);
+}
+
+#[tokio::test]
+async fn generation_change_before_dispatch_reports_no_admission_fee_ceiling() {
+    let (status, body, spent) = refuse_cached_quote_on_connected_since(6).await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("not_dispatched")), "{body}");
+    assert_eq!(spent, 0);
+    assert_message_fee_only(&body);
 }

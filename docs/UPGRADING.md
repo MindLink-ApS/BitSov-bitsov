@@ -3,6 +3,14 @@
 This note covers two common failure modes when replacing the `konsensus` binary on a
 production data directory without re-running `konsensus init`.
 
+## MSRV (Rust 1.88+)
+
+Workspace `rust-version` is **1.88** (raised from 1.75). The tree uses
+`Option::is_none_or` (stabilized in 1.82), and the locked dependency set
+requires Rust 1.88 (`home` 0.5.12 and related crates). Build with Rust 1.88 or
+newer; CI continues to use stable. Verified with `rustup run 1.88.0 cargo check
+--workspace --locked`.
+
 ## Missing `NODE_INITIALIZED` after upgrade (pre-#76/#77 nodes)
 
 Nodes deployed before bootstrap (#76/#77) never wrote a `NODE_INITIALIZED` marker. After
