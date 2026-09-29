@@ -2700,9 +2700,11 @@ async fn first_contact_admission_at(
             admission_all_in.saturating_add(message_all_in), cap.unwrap_or(ADMISSION_MAX_MSAT),
         )).with_reason(READMISSION_REQUIRED));
     }
-    // Only a quote that fits gives the wallet an admission fee ceiling.
-    charge.fee_ceiling_msat = debit.fee_limit(state, admission_msat);
+    // The admission fee ceiling is recorded only at the wallet dispatch boundary
+    // below (#127 follow-up): generation checks and grant reservation can still
+    // refuse with nothing given to the wallet, so they must not report it.
     charge.message_price = Some(message_price);
+    let admission_fee_ceiling = debit.fee_limit(state, admission_msat);
     // Generation must still match before we reserve or pay.
     if state.transport.connected_since(peer_id).await != quote_generation {
         return Err(quote_generation_changed(peer_id));
@@ -2730,9 +2732,6 @@ async fn first_contact_admission_at(
         None => debit,
     };
 
-    if let Some(counter) = readmission_fee_counter {
-        counter.fetch_add(charge.fee_ceiling_msat, std::sync::atomic::Ordering::Relaxed);
-    }
     // Re-check after the reservation (the grant lock may have waited).
     if state.transport.connected_since(peer_id).await != quote_generation {
         if let Some(r) = readmit.as_ref().and_then(|r| r.reserved.as_ref()) {
@@ -2751,7 +2750,7 @@ async fn first_contact_admission_at(
             dispatch_started: false,
             previous_attempt: super::admission_journal::load(state, peer_id)?.map(Box::new),
             operation: charge.operation.as_ref().map(|op| op.reservation_link(readmission_event.is_some())),
-            max_routing_fee_msat: Some(debit.fee_limit(state, admission_msat)),
+            max_routing_fee_msat: Some(admission_fee_ceiling),
             payment_hash: bolt11_payment_hash.clone(),
             amount_msat: admission_msat,
             quote: Some((kind, message_price)),
@@ -2804,8 +2803,14 @@ async fn first_contact_admission_at(
 
     // Only positively proven non-dispatch releases the durable reservation.
     charge.current_dispatch = true;
+    // Dispatch boundary: this ceiling is the one given to the wallet. Report it
+    // on errors from here on; earlier refusals leave charge.fee_ceiling_msat at 0.
+    charge.fee_ceiling_msat = admission_fee_ceiling;
+    if let Some(counter) = readmission_fee_counter {
+        counter.fetch_add(admission_fee_ceiling, std::sync::atomic::Ordering::Relaxed);
+    }
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
-    let dispatched = match debit.dispatch(state.lightning.pay_invoice_with_fee_limit(&response.bolt11, debit.fee_limit(state, admission_msat))).await {
+    let dispatched = match debit.dispatch(state.lightning.pay_invoice_with_fee_limit(&response.bolt11, admission_fee_ceiling)).await {
         Ok(result) => result,
         Err(error @ ApiError::BudgetExceeded(_)) => {
             super::admission_journal::mark_undispatched(state, peer_id, &bolt11_payment_hash)?;

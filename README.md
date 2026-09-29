@@ -21,7 +21,7 @@ Node IDs and public keys are the protocol identity layer. IP addresses and DNS n
 The public protocol/core repository is source-first until the signed release is published. Signed binaries and desktop app packages are release artifacts; they are published only after the final launch go/no-go.
 
 ```bash
-# Prerequisite: Rust 1.75+
+# Prerequisite: Rust 1.88+
 git clone https://github.com/MindLink-ApS/BitSov-bitsov.git
 cd BitSov-bitsov
 cargo build --release -p konsensus-node

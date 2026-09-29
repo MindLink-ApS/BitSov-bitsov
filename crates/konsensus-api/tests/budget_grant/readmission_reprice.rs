@@ -143,6 +143,15 @@ struct Probe {
 
 impl Probe {
     async fn new(paired: bool) -> Self {
+        Self::with_terms(if paired {
+            Some(GrantTerms::new(100_000))
+        } else {
+            None
+        })
+        .await
+    }
+
+    async fn with_terms(grant: Option<GrantTerms>) -> Self {
         let mut fx = fixture().await;
         let path = fx.tmp.path().join("readmit-lightning.db");
         let payer = Arc::new(SharedMockProvider::new(&path, "payer", START_MSAT).unwrap());
@@ -164,8 +173,13 @@ impl Probe {
         let wallet = Arc::new(LosingWallet { inner: payer.clone(), lose_next: AtomicBool::new(false) });
         fx.state = Arc::new(AppState { transport: contact.clone(), lightning: wallet.clone(), ..(*fx.state).clone() });
         fx.peer = peer;
-        let token = if paired {
-            fx.grant(None, GrantTerms::new(100_000).recipient(&peer.to_hex(), 50_000)).await
+        let token = if let Some(terms) = grant {
+            let terms = if terms.per_recipient_msat.is_empty() {
+                terms.recipient(&peer.to_hex(), 50_000)
+            } else {
+                terms
+            };
+            fx.grant(None, terms).await
         } else {
             konsensus_api::auth::create_token(&fx.state.identity.node_id().to_hex(), &fx.state.jwt_secret, Scope::all()).unwrap()
         };
@@ -173,10 +187,18 @@ impl Probe {
     }
 
     async fn compose(&self, text: &str, cap: u64) -> (StatusCode, Value) {
-        self.fx.call("POST", "/api/v1/messages/compose", Some(json!({
+        self.compose_with_fee(text, cap, None).await
+    }
+
+    async fn compose_with_fee(&self, text: &str, cap: u64, fee: Option<u64>) -> (StatusCode, Value) {
+        let mut body = json!({
             "recipient": self.contact.peer.to_hex(), "kind": 0, "plaintext": text,
             "max_total_msat": cap, "operation_id": uuid::Uuid::new_v4().to_string(),
-        })), Some(&self.token)).await
+        });
+        if let Some(fee) = fee {
+            body["max_routing_fee_msat"] = json!(fee);
+        }
+        self.fx.call("POST", "/api/v1/messages/compose", Some(body), Some(&self.token)).await
     }
 
     async fn spent(&self) -> u64 {
@@ -232,4 +254,20 @@ async fn resumed_in_flight_admission_never_pays_the_quoted_message_above_the_cap
     let (status, body) = p.compose("resumed admission", 1_500).await;
     assert!(status.is_client_error(), "refused before the message: {status} {body}");
     assert_eq!(p.spent().await, 2_000, "nothing more paid under a 1500 cap");
+}
+
+#[tokio::test]
+async fn grant_reservation_refusal_reports_no_admission_fee_ceiling() {
+    // Cap fits (admission+message+fees), but the grant's per-call max does not.
+    // Nothing is dispatched, so the error must not include the admission ceiling.
+    const FEE: u64 = 100;
+    let p = Probe::with_terms(Some(GrantTerms::new(100_000).per_call(3_000))).await;
+    let (status, body) = p.compose_with_fee("grant cannot reserve", 10_000, Some(FEE)).await;
+    assert_budget_exceeded(status, &body, "per_call");
+    assert_eq!(p.spent().await, 0, "grant refusal pays nothing: {body}");
+    assert_eq!(
+        body["max_routing_fee_msat"].as_u64(),
+        Some(FEE),
+        "admission ceiling was never given to the wallet: {body}"
+    );
 }
