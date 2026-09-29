@@ -28,9 +28,37 @@ Omitting total/recipient caps leaves principal uncapped; the routing policy stil
 First-contact compose checks the aggregate admission/message principal and
 both fee ceilings against the confirmed cap. The app confirms `quote.total_msat`
 and displays `quote.max_routing_fee_msat` separately (already included in total).
-A later reconnect admission is unquoted: any capped request refuses it before
-payment, even when a G1 contact grant could otherwise pay. An uncapped authorized
-request may reserve and pay that additional all-in admission.
+A capped reconnect re-admission is allowed for **single-recipient chat** only,
+and only when the payee returns a fresh signed quote whose admission, message,
+and both fee ceilings fit that same caller cap (and any grant); the all-in
+amount is reserved before dispatch. Rooms, files, and other non-chat kinds keep
+refusing a capped reconnect before any quote (`caller_cap = Some(0)`). A chat
+call with `Some(0)` or a cap below the message all-in also refuses before
+asking. No quote, or a quote that does not fit, is refused before payment. An
+uncapped authorized request may reserve and pay that additional all-in
+admission under existing G1 admission authority.
+
+The node advertises this as `quoted_readmission_v1`. The quote is bound to the
+connection generation that asked for it: captured before the request, required
+unchanged when the response arrives and again before dispatch, never recaptured.
+A reconnect at any of those points refuses with 400 `not_dispatched` (nothing
+was paid). A capped refusal is 409 `price_cap_exceeded` with
+`reason: readmission_required`. When the node fetched a quote for it, that
+quote stays cached for the same connection, and
+`POST /messages/first-contact/quote` returns it (admission, message, both fee
+ceilings, `total_msat`). The client shows it and sends the same `operation_id`
+again with `max_total_msat` = that total; the node pays exactly that invoice.
+Whatever branch the re-admission took (a fresh quote, or resuming an admission
+an earlier call paid or left in flight, or a connection already admitted), the
+message price it carries is checked again before the message is paid: its
+all-in must fit what is left of the cap after admission, and a paired caller
+pays a price above its reservation only when this call reserved the increase.
+Otherwise the send is refused (409 `readmission_required`, or the grant's
+`unpriced` refusal) with nothing more paid. A peer with no live connection
+generation is never quoted. Each connection generation pays admission at most once; a retry of a settled
+operation pays nothing. The response's `max_routing_fee_msat` (and the error's)
+is the sum of the ceilings actually given to the wallet, including a message
+repriced by the fresh quote.
 
 Room compose returns `member_outcomes` for every non-self recipient, including
 when no message could be stored. Each row has `recipient`, `status`,

@@ -2055,35 +2055,82 @@ impl PairingService {
         call_reserved_msat: u64,
         operation: Option<crate::spend_budget::OperationReservationLink>,
     ) -> Result<Reservation, BudgetRefusal> {
+        self.reserve_quoted_readmission(parent, recipient, 0, amount_msat, call_reserved_msat, operation)
+            .map(|(_, admission)| admission)
+    }
+
+    /// Before paying a signed re-admission quote: raise the parent's message
+    /// reservation to `quoted_message_all_in` (no-op when already covered) and
+    /// reserve `admission_all_in` as its own operation-linked debit. Both share
+    /// one grant check and one persist, so a quote whose all-in cannot fit is
+    /// refused before any payment and a crash never keeps half of it.
+    ///
+    /// Returns the new call-reserved total and the admission reservation.
+    pub(crate) fn reserve_quoted_readmission(
+        &self,
+        parent: &Reservation,
+        recipient: &str,
+        quoted_message_all_in: u64,
+        admission_all_in: u64,
+        call_reserved_msat: u64,
+        operation: Option<crate::spend_budget::OperationReservationLink>,
+    ) -> Result<(u64, Reservation), BudgetRefusal> {
         let recipient = crate::spend_budget::canonical_recipient(recipient)
             .ok_or(BudgetRefusal::NoGrant)?;
         let mut inner = self.lock();
         let (epoch, confirmed) =
             Self::readmission_basis(&inner, parent, &recipient, chrono::Utc::now().timestamp())?;
-        let budget = inner.file.grants.iter().find(|g| g.op_id == parent.op_id)
-            .and_then(|g| g.budget.as_ref()).ok_or(BudgetRefusal::NoGrant)?;
+        let grant_idx = inner.file.grants.iter().position(|g| g.op_id == parent.op_id)
+            .ok_or(BudgetRefusal::NoGrant)?;
+        let budget = inner.file.grants[grant_idx].budget.as_ref().ok_or(BudgetRefusal::NoGrant)?;
         // A resolved parent cannot start more payments. This also binds the
         // admission to a recipient in the original API call.
-        if !budget.pending.get(&parent.id).is_some_and(|p| p.contains_key(&recipient)) {
+        let Some(old_message) = budget.pending.get(&parent.id).and_then(|p| p.get(&recipient)).copied() else {
             return Err(BudgetRefusal::NoGrant);
-        }
+        };
+        let message_top_up = quoted_message_all_in.saturating_sub(old_message);
         let max_msat = budget.per_call_max_msat;
-        let total = call_reserved_msat.checked_add(amount_msat)
+        let need = message_top_up.checked_add(admission_all_in)
+            .ok_or(BudgetRefusal::PerCall { max_msat })?;
+        let total = call_reserved_msat.checked_add(need)
             .ok_or(BudgetRefusal::PerCall { max_msat })?;
         if total > max_msat { return Err(BudgetRefusal::PerCall { max_msat }); }
         if let Some(max_msat) = confirmed {
             inner.first_contact.remove(&parent.client_id);
-            if amount_msat > max_msat {
+            if need > max_msat {
                 return Err(BudgetRefusal::FirstContact(format!(
-                    "the recipient asks {amount_msat} msat to admit you again, more than the {max_msat} msat you confirmed — nothing was paid"
+                    "the recipient asks {need} msat to admit you again, more than the {max_msat} msat you confirmed — nothing was paid"
                 )));
             }
         }
+        // The top-up joins the parent's own pending entry (resolved with the
+        // message), checked against every grant limit together with the
+        // admission below; on any refusal the whole budget is restored.
+        let before = inner.file.grants[grant_idx].budget.clone();
+        if message_top_up > 0 {
+            let budget = inner.file.grants[grant_idx].budget.as_mut().ok_or(BudgetRefusal::NoGrant)?;
+            if let Err(e) = budget.reserve(&[Charge { recipient: recipient.clone(), amount_msat: message_top_up }]) {
+                inner.file.grants[grant_idx].budget = before;
+                return Err(e);
+            }
+            if let Some(amount) = budget.pending.get_mut(&parent.id).and_then(|p| p.get_mut(&recipient)) {
+                *amount += message_top_up;
+            }
+        }
         // Eligibility and reservation share the replacement/revocation mutex.
-        self.reserve_spend_locked(&mut inner, &parent.client_id, epoch,
-            vec![Charge { recipient, amount_msat }],
+        let admission = self.reserve_spend_locked(&mut inner, &parent.client_id, epoch,
+            vec![Charge { recipient, amount_msat: admission_all_in }],
             ReservationAuthority { expected_op_id: Some(&parent.op_id), operation, ..Default::default() },
-            || chrono::Utc::now().timestamp())
+            || chrono::Utc::now().timestamp());
+        match admission {
+            Ok(admission) => Ok((total, admission)),
+            Err(e) => {
+                if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == parent.op_id) {
+                    g.budget = before;
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Reserve a consumed approval against its exact original grant. The

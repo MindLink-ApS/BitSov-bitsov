@@ -1874,3 +1874,6 @@ async fn late_unattached_ledger_debits_recover_outside_sql_scan_even_after_reten
 
 #[path = "budget_grant/not_dispatched.rs"]
 mod not_dispatched;
+
+#[path = "budget_grant/readmission_reprice.rs"]
+mod readmission_reprice;

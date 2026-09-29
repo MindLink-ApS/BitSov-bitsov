@@ -484,7 +484,10 @@ async fn fourteen_minute_admission_resend_renews_same_paid_envelope() {
     state.data_dir = Some(dir.path().to_path_buf());
     let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
     state.storage = db.clone();
-    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    // The journaled proof is re-sent on the connection it was never sent on:
+    // this stub reports no connection generation, so it is not classified as
+    // consumed by an earlier connection.
+    let transport = Arc::new(common::ConnectedStubTransport { since: None, ..common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()) });
     state.transport = transport.clone();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let mut old = UkmEnvelopeBuilder::new(konsensus_core::kind::KIND_CHAT,
@@ -528,4 +531,245 @@ async fn fourteen_minute_admission_resend_renews_same_paid_envelope() {
     gate.validate_paid_envelope(&renewed, &pricing, None, Some(&recipient_wallet), 0.0, Some(&peer)).await.unwrap();
     assert_eq!(recipient_db.accept_paid_envelope(&renewed).await.unwrap(), PaidAcceptance::Accepted);
     assert_eq!(recipient_db.accept_paid_envelope(&renewed).await.unwrap(), PaidAcceptance::AlreadyAccepted);
+}
+
+/// Peers that always refuse the message invoice with `admission_required`
+/// (reconnect starts unpaid). Admission quote requests are counted so capped
+/// room/file paths can prove they refuse before asking.
+struct AdmissionRequiredPeers {
+    peers: Vec<NodeId>,
+    requests: Requests,
+    connected_at: Instant,
+    message_requests: AtomicUsize,
+    admission_requests: AtomicUsize,
+}
+
+#[async_trait]
+impl MessageTransport for AdmissionRequiredPeers {
+    async fn send(&self, _: &NodeId, _: &UkmEnvelope) -> Result<(), TransportError> {
+        Ok(())
+    }
+    async fn recv(&self) -> Result<UkmEnvelope, TransportError> {
+        Err(TransportError::Other("no input".into()))
+    }
+    async fn connect(&self, _: &NodeId, _: &str) -> Result<(), TransportError> {
+        Ok(())
+    }
+    async fn disconnect(&self, _: &NodeId) -> Result<(), TransportError> {
+        Ok(())
+    }
+    async fn is_connected(&self, peer: &NodeId) -> bool {
+        self.peers.contains(peer)
+    }
+    async fn connected_peers(&self) -> Vec<NodeId> {
+        self.peers.clone()
+    }
+    async fn connected_since(&self, _: &NodeId) -> Option<Instant> {
+        Some(self.connected_at)
+    }
+    async fn admission_paid_on_connection(&self, _: &NodeId) -> bool {
+        false
+    }
+    async fn send_raw_frame(&self, peer: &NodeId, bytes: &[u8]) -> Result<(), TransportError> {
+        let Frame::RequestInvoice {
+            request_id,
+            purpose,
+            ..
+        } = Frame::from_bytes(bytes).map_err(|e| TransportError::Other(e.to_string()))?
+        else {
+            return Ok(());
+        };
+        let admission = purpose.starts_with("konsensus:admission");
+        if admission {
+            self.admission_requests.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.message_requests.fetch_add(1, Ordering::SeqCst);
+        }
+        let requests = Arc::clone(&self.requests);
+        let peer = *peer;
+        let reason = if admission {
+            "test:should_not_request_admission"
+        } else {
+            invoice_refusal::ADMISSION_REQUIRED
+        };
+        tokio::spawn(async move {
+            if let Some(sender) = requests.lock().await.remove(&request_id) {
+                assert!(invoice_refusal::record(&request_id, &peer, reason));
+                let _ = sender.send(Err(InvoiceResponseError {
+                    recipient: peer,
+                    reason: reason.into(),
+                }));
+            }
+        });
+        Ok(())
+    }
+}
+
+async fn post_json(
+    state: &Arc<konsensus_api::AppState>,
+    token: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    let response = common::test_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 100_000).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::json!({"raw": String::from_utf8_lossy(&bytes)})
+        }),
+    )
+}
+
+/// Capped room fan-out with reconnecting members must refuse re-admission
+/// before any quote and pay nothing (pre-#111 / CoS: no aggregate-cap handoff).
+#[tokio::test]
+async fn capped_room_reconnect_refuses_readmission_and_pays_nothing() {
+    let wallet = Arc::new(common::CountingLightning::default());
+    let mut state = common::test_state_with_lightning(wallet.clone());
+    let first = common::setup_e2ee_session(&state.session_manager).await;
+    let second = common::setup_e2ee_session_with_mnemonic(
+        &state.session_manager,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    )
+    .await;
+    let transport = Arc::new(AdmissionRequiredPeers {
+        peers: vec![first, second],
+        requests: Arc::clone(&state.invoice_requests),
+        connected_at: Instant::now(),
+        message_requests: AtomicUsize::new(0),
+        admission_requests: AtomicUsize::new(0),
+    });
+    Arc::get_mut(&mut state).unwrap().transport = transport.clone();
+    let token = auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        auth::Scope::all(),
+    )
+    .unwrap();
+
+    let (_, room) = post_json(&state, &token, "/api/v1/rooms", serde_json::json!({"name": "cap"})).await;
+    let id = room["id"].as_str().unwrap();
+    for peer in [first, second] {
+        assert_eq!(
+            post_json(
+                &state,
+                &token,
+                &format!("/api/v1/rooms/{id}/members"),
+                serde_json::json!({"node_id": peer.to_hex()}),
+            )
+            .await
+            .0,
+            axum::http::StatusCode::OK
+        );
+    }
+
+    // Messages alone fit (2 × 1000 msat payable); re-admission must still refuse.
+    let (status, body) = post_json(
+        &state,
+        &token,
+        "/api/v1/messages/compose",
+        serde_json::json!({
+            "recipient": id,
+            "is_room": true,
+            "kind": konsensus_core::kind::KIND_CHAT,
+            "plaintext": "room after reconnect",
+            "max_routing_fee_msat": 0,
+            "max_total_msat": 2000,
+            "max_recipient_msat": {
+                first.to_hex(): 1000,
+                second.to_hex(): 1000,
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let rows = body["member_outcomes"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{body}");
+    assert!(
+        rows.iter().all(|r| r["status"] == "refused" && r["amount_msat"] == 0),
+        "{body}"
+    );
+    assert_eq!(body["amount_msat"], 0, "{body}");
+    assert!(body["readmission_msat"].is_null() || body["readmission_msat"] == 0, "{body}");
+    assert_eq!(wallet.money(), 0, "capped room must pay nothing on reconnect");
+    assert_eq!(
+        transport.admission_requests.load(Ordering::SeqCst),
+        0,
+        "must refuse before any admission quote"
+    );
+    assert!(
+        transport.message_requests.load(Ordering::SeqCst) >= 1,
+        "message invoice must force the admission_required path"
+    );
+}
+
+/// Capped file send that needs re-admission must refuse before pay and before
+/// any chat-priced admission quote (CoS: non-chat keeps pre-#111 refusal).
+#[tokio::test]
+async fn capped_file_reconnect_refuses_readmission_before_pay() {
+    let wallet = Arc::new(common::CountingLightning::default());
+    let mut state = common::test_state_with_lightning(wallet.clone());
+    let peer = common::setup_e2ee_session(&state.session_manager).await;
+    let transport = Arc::new(AdmissionRequiredPeers {
+        peers: vec![peer],
+        requests: Arc::clone(&state.invoice_requests),
+        connected_at: Instant::now(),
+        message_requests: AtomicUsize::new(0),
+        admission_requests: AtomicUsize::new(0),
+    });
+    Arc::get_mut(&mut state).unwrap().transport = transport.clone();
+    let token = auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        auth::Scope::all(),
+    )
+    .unwrap();
+
+    let (status, file) = post_json(
+        &state,
+        &token,
+        "/api/v1/files",
+        serde_json::json!({"filename": "hi.txt", "mime_type": "text/plain", "data_b64": "aGk="}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{file}");
+    let path = format!("/api/v1/files/{}/send", file["file_id"].as_str().unwrap());
+    // File principal alone fits; re-admission must still refuse before any quote.
+    let (status, body) = post_json(
+        &state,
+        &token,
+        &path,
+        serde_json::json!({
+            "recipient": peer.to_hex(),
+            "max_routing_fee_msat": 0,
+            "max_total_msat": 1000
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "price_cap_exceeded", "{body}");
+    assert_eq!(wallet.money(), 0, "capped file must pay nothing on reconnect");
+    assert_eq!(
+        transport.admission_requests.load(Ordering::SeqCst),
+        0,
+        "must refuse before any admission quote"
+    );
+    assert_eq!(
+        transport.message_requests.load(Ordering::SeqCst),
+        1,
+        "file invoice must force the admission_required path"
+    );
 }

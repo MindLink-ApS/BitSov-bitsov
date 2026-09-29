@@ -1228,6 +1228,8 @@ pub struct ConnectedStubTransport {
     /// Shared reference to the invoice_requests map so the transport can
     /// fulfill pending requests (simulating the peer responding).
     pub invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
+    /// One live connection per peer, established when the stub was built.
+    pub since: Option<std::time::Instant>,
 }
 
 impl ConnectedStubTransport {
@@ -1240,6 +1242,7 @@ impl ConnectedStubTransport {
             sent_envelopes: std::sync::Mutex::new(Vec::new()),
             invoice_responder: None,
             invoice_requests,
+            since: Some(std::time::Instant::now()),
         }
     }
 
@@ -1282,6 +1285,10 @@ impl MessageTransport for ConnectedStubTransport {
 
     async fn is_connected(&self, peer: &NodeId) -> bool {
         self.connected.lock().unwrap().contains(peer)
+    }
+
+    async fn connected_since(&self, peer: &NodeId) -> Option<std::time::Instant> {
+        self.since.filter(|_| self.connected.lock().unwrap().contains(peer))
     }
 
     async fn connected_peers(&self) -> Vec<NodeId> {
