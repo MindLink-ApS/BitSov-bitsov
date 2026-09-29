@@ -42,6 +42,8 @@ struct ReconnectingContact {
     paid: AtomicBool,
     flap_on_quote: AtomicBool,
     quotes: AtomicUsize,
+    /// The transport reports no live connection generation.
+    no_generation: AtomicBool,
 }
 
 impl ReconnectingContact {
@@ -87,7 +89,7 @@ impl MessageTransport for ReconnectingContact {
         vec![self.peer]
     }
     async fn connected_since(&self, _: &NodeId) -> Option<Instant> {
-        Some(*self.generation.lock().unwrap())
+        (!self.no_generation.load(Ordering::SeqCst)).then(|| *self.generation.lock().unwrap())
     }
     async fn admission_paid_on_connection(&self, _: &NodeId) -> bool {
         self.paid.load(Ordering::SeqCst)
@@ -164,6 +166,7 @@ async fn net() -> Net {
         paid: AtomicBool::new(false),
         flap_on_quote: AtomicBool::new(false),
         quotes: AtomicUsize::new(0),
+        no_generation: AtomicBool::new(false),
     });
     Arc::get_mut(&mut state).unwrap().transport = contact.clone();
     let token = auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, auth::Scope::all()).unwrap();
@@ -268,4 +271,18 @@ async fn quote_fetched_by_a_refused_send_is_the_one_paid_under_a_cap_that_fits()
     assert_eq!(status, 200, "{body}");
     assert_eq!(net.spent().await, 4_000);
     assert_eq!(net.contact.quotes.load(Ordering::SeqCst), 1, "one quote: the refused send's, shown and then paid");
+}
+
+#[tokio::test]
+async fn no_connection_generation_never_binds_or_pays_a_quote() {
+    // #127 review finding 2: `None == None` must not pass as the same connection.
+    let net = net().await;
+    net.contact.no_generation.store(true, Ordering::SeqCst);
+    let quote = serde_json::json!({"recipient": net.contact.peer.to_hex()});
+    let (status, body) = net.post("/api/v1/messages/first-contact/quote", quote).await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("not_dispatched")), "{body}");
+    let (status, body) = net.compose(&uuid::Uuid::new_v4().to_string(), 4_000).await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("not_dispatched")), "{body}");
+    assert_eq!(net.spent().await, 0);
+    assert_eq!(net.contact.quotes.load(Ordering::SeqCst), 0, "no quote was asked for");
 }

@@ -484,7 +484,10 @@ async fn fourteen_minute_admission_resend_renews_same_paid_envelope() {
     state.data_dir = Some(dir.path().to_path_buf());
     let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
     state.storage = db.clone();
-    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    // The journaled proof is re-sent on the connection it was never sent on:
+    // this stub reports no connection generation, so it is not classified as
+    // consumed by an earlier connection.
+    let transport = Arc::new(common::ConnectedStubTransport { since: None, ..common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()) });
     state.transport = transport.clone();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let mut old = UkmEnvelopeBuilder::new(konsensus_core::kind::KIND_CHAT,

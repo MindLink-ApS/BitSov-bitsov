@@ -48,7 +48,14 @@ quote stays cached for the same connection, and
 `POST /messages/first-contact/quote` returns it (admission, message, both fee
 ceilings, `total_msat`). The client shows it and sends the same `operation_id`
 again with `max_total_msat` = that total; the node pays exactly that invoice.
-Each connection generation pays admission at most once; a retry of a settled
+Whatever branch the re-admission took (a fresh quote, or resuming an admission
+an earlier call paid or left in flight, or a connection already admitted), the
+message price it carries is checked again before the message is paid: its
+all-in must fit what is left of the cap after admission, and a paired caller
+pays a price above its reservation only when this call reserved the increase.
+Otherwise the send is refused (409 `readmission_required`, or the grant's
+`unpriced` refusal) with nothing more paid. A peer with no live connection
+generation is never quoted. Each connection generation pays admission at most once; a retry of a settled
 operation pays nothing. The response's `max_routing_fee_msat` (and the error's)
 is the sum of the ceilings actually given to the wallet, including a message
 repriced by the fresh quote.

@@ -664,20 +664,42 @@ async fn readmit_then_pay(
         }
     }
     // The stateless admission quote prices chat only. Never substitute it for
-    // another service kind's price. A higher quote on the re-admission path was
-    // reserved into the grant before admission pay (finding 3); only the
-    // already-covered path still refuses an unreserved increase.
+    // another service kind's price.
     let quoted_msat = if kind == Some(konsensus_core::kind::KIND_CHAT) {
         charge.message_price.unwrap_or(amount_msat)
     } else { amount_msat };
-    if covered && debit.is_metered() && quoted_msat > amount_msat {
+    let reserved_msat = amount_msat;
+    let amount_msat = quoted_msat;
+    if amount_msat == 0 { return Ok(generate_valid_proof(0)); }
+    let amount_msat = amount_msat.max(MIN_INVOICE_AMOUNT_MSAT);
+    // Whatever branch the re-admission took (a fresh quote, a recovered or
+    // in-flight admission, or a connection already covered), the message price
+    // it produced is checked again here, before the message is paid (#127
+    // review finding 1). Nothing new is paid on a refusal.
+    let message_all_in = amount_msat
+        .checked_add(debit.fee_limit(state, amount_msat))
+        .ok_or_else(|| ApiError::PriceCapExceeded("message all-in overflow".into()))?;
+    // A paired caller pays an increase only if this call reserved it (the
+    // fresh quote's top-up); otherwise the grant never checked it.
+    if debit.is_metered() && amount_msat > reserved_msat
+        && charge.message_reserved_all_in.is_none_or(|reserved| reserved < message_all_in)
+    {
         return Err(ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::Unpriced(
             "recipient's new message quote exceeds the reserved message amount; refresh the price before retrying".into(),
         )));
     }
-    let amount_msat = quoted_msat;
-    if amount_msat == 0 { return Ok(generate_valid_proof(0)); }
-    let amount_msat = amount_msat.max(MIN_INVOICE_AMOUNT_MSAT);
+    // Any caller cap bounds the message after every admission this call paid.
+    if let Some(cap) = readmission.caller_cap {
+        let left = cap.saturating_sub(charge.settled_msat.saturating_add(charge.fee_ceiling_msat));
+        if message_all_in > left {
+            return Err(ApiError::PriceCapExceeded(format!(
+                "{peer_id} prices this message at {amount_msat} msat, {message_all_in} msat all-in with \
+                 its routing fee, more than the {left} msat left under the confirmed cap after \
+                 admission; nothing more was paid. Ask for the admission quote and send again under \
+                 a cap that fits."
+            )).with_reason(READMISSION_REQUIRED));
+        }
+    }
     charge.message_authorized = Some(amount_msat);
 
     let deadline = tokio::time::Instant::now() + READMIT_PROMOTION_TIMEOUT;
@@ -1787,6 +1809,9 @@ pub(crate) struct FirstContactCharge {
     /// A separate admission debit may be unresolved before any message dispatch.
     pub(crate) readmission_blocks_message: bool,
     message_price: Option<u64>,
+    /// All-in message amount a fresh re-admission quote reserved in the grant
+    /// (the parent's top-up), if any.
+    message_reserved_all_in: Option<u64>,
     /// Message principal this call last authorized the wallet to pay; a
     /// fresh signed quote on re-admission may reprice it (#111 finding 2).
     message_authorized: Option<u64>,
@@ -1805,6 +1830,7 @@ impl FirstContactCharge {
         self.prior_settled_msat = self.prior_settled_msat.saturating_add(attempt.prior_settled_msat);
         self.current_dispatch |= attempt.current_dispatch;
         if attempt.message_price.is_some() { self.message_price = attempt.message_price; }
+        if attempt.message_reserved_all_in.is_some() { self.message_reserved_all_in = attempt.message_reserved_all_in; }
     }
     pub(crate) fn error(&self, error: ApiError) -> ApiError {
         if self.reserved_msat > self.settled_msat {
@@ -2142,6 +2168,12 @@ async fn request_generation_bound_quote(
     state: &AppState, peer_id: &NodeId, kind: u16, debit: &Debit,
 ) -> Result<(Option<Instant>, String, InvoiceResponseData), ApiError> {
     let generation = state.transport.connected_since(peer_id).await;
+    // No live connection is no generation: never bind a quote to it (#127 review finding 2).
+    if generation.is_none() {
+        return Err(ApiError::NotDispatched(format!(
+            "{peer_id} has no live connection to bind an admission quote to — nothing was paid"
+        )));
+    }
     let (request_id, response) = request_admission_invoice(state, peer_id, kind, debit).await?;
     if state.transport.connected_since(peer_id).await != generation {
         return Err(quote_generation_changed(peer_id));
@@ -2648,7 +2680,6 @@ async fn first_contact_admission_at(
     // See docs/v2/F1-CAPPED-FIRST-CONTACT.md; never debit only the message.
     // The target is authoritative for BOTH prices. A stale local price cannot
     // spuriously reject a stranger or cause an additional unchecked payment.
-    charge.fee_ceiling_msat = debit.fee_limit(state, admission_msat);
     let admission_all_in = admission_msat.checked_add(debit.fee_limit(state, admission_msat)).ok_or_else(|| ApiError::PriceCapExceeded("admission debit overflow".into()))?;
     let message_all_in = message_price.checked_add(debit.fee_limit(state, message_price)).ok_or_else(|| ApiError::PriceCapExceeded("message debit overflow".into()))?;
     if let Err(error) = super::caps::first_contact_total(
@@ -2669,6 +2700,8 @@ async fn first_contact_admission_at(
             admission_all_in.saturating_add(message_all_in), cap.unwrap_or(ADMISSION_MAX_MSAT),
         )).with_reason(READMISSION_REQUIRED));
     }
+    // Only a quote that fits gives the wallet an admission fee ceiling.
+    charge.fee_ceiling_msat = debit.fee_limit(state, admission_msat);
     charge.message_price = Some(message_price);
     // Generation must still match before we reserve or pay.
     if state.transport.connected_since(peer_id).await != quote_generation {
@@ -2683,11 +2716,17 @@ async fn first_contact_admission_at(
     });
     let readmission_fee_counter = readmit.as_ref().map(|r| r.fee_ceiling);
     let debit: &Debit = match readmit.as_mut() {
-        Some(r) => r.reserved.insert(r.parent.reserve_quoted_readmission(
-            &peer_id.to_hex(),
-            if r.reprice_message { message_all_in } else { 0 },
-            admission_all_in,
-        )?),
+        Some(r) => {
+            let reserved = r.reserved.insert(r.parent.reserve_quoted_readmission(
+                &peer_id.to_hex(),
+                if r.reprice_message { message_all_in } else { 0 },
+                admission_all_in,
+            )?);
+            if r.reprice_message && r.parent.is_metered() {
+                charge.message_reserved_all_in = Some(message_all_in);
+            }
+            reserved
+        }
         None => debit,
     };
 
