@@ -294,9 +294,36 @@ async fn get_peer_pricing(
 }
 
 /// Registers pricing routes for querying own and peer pricing schedules.
+/// What calling a peer costs, asked of the peer now: the offer (kind 400) and
+/// each later signal (401-403). Nothing is paid.
+#[derive(Serialize)]
+pub struct PeerCallPriceResponse {
+    pub peer_id: String,
+    pub offer_msat: u64,
+    pub signal_msat: u64,
+}
+
+/// `GET /api/v1/pricing/peers/:id/call` — the peer's live call price.
+async fn get_peer_call_pricing(
+    _auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    Path(peer_id): Path<String>,
+) -> Result<Json<PeerCallPriceResponse>, ApiError> {
+    let peer = konsensus_core::NodeId::from_hex(&peer_id).map_err(|e| ApiError::BadRequest(format!("invalid peer id: {e}")))?;
+    let offer_msat = crate::calls::peer_call_price(&state, &peer).await?;
+    let height = state.chain.get_block_height().await.unwrap_or(0);
+    let answer = konsensus_core::kind::KIND_CALL_ANSWER;
+    let signal_msat = match state.peer_prices.get_fresh_discounted_peer_price(&peer, answer, height, std::time::Duration::from_secs(3600)).await {
+        Some(p) => p,
+        None => state.pricing.get_price_msat(answer).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?,
+    };
+    Ok(Json(PeerCallPriceResponse { peer_id: peer.to_hex(), offer_msat, signal_msat }))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/pricing", get(get_own_pricing))
         .route("/api/v1/pricing/peers", get(list_peer_pricing))
         .route("/api/v1/pricing/peers/:id", get(get_peer_pricing))
+        .route("/api/v1/pricing/peers/:id/call", get(get_peer_call_pricing))
 }

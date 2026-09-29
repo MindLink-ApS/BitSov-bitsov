@@ -56,6 +56,7 @@
 pub mod audit;
 pub mod auth;
 pub mod bootstrap;
+pub mod calls;
 pub mod control;
 pub mod error;
 pub mod freshness;

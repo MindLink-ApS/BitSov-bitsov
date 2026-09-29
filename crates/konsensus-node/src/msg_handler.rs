@@ -510,6 +510,26 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             &audit_for_recv,
                         ).await;
 
+                        // 1:1 calls: the gate made this envelope paid and single-use;
+                        // the call registry makes the offer single-use per call id and
+                        // accepts answer/ICE/hangup only for a live call with this
+                        // sender. A refused signal never reaches the app.
+                        if konsensus_api::calls::is_call_kind(envelope.kind) {
+                            if let Err(refusal) = konsensus_api::calls::admit_incoming(&sender, envelope.kind, plaintext.as_deref()) {
+                                warn!(sender = %sender, kind = envelope.kind, reason = %refusal, "call signal refused; not forwarded");
+                                audit_for_recv.record(
+                                    konsensus_api::audit::events::MESSAGE_REJECTED,
+                                    &sender.to_hex(),
+                                    Some(serde_json::json!({ "reason": refusal.to_string(), "kind": envelope.kind })),
+                                );
+                                let reject = Frame::MessageReject { id: msg_id, reason: refusal.to_string() };
+                                if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
+                                    warn!(peer = %sender, error = %e, "failed to send MessageReject");
+                                }
+                                continue;
+                            }
+                        }
+
                         // Broadcast to WebSocket clients (with plaintext if decrypted)
                         if let Err(e) = ws_tx_for_recv.send(Arc::new(
                             WsMessage {

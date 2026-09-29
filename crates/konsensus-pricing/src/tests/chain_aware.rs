@@ -121,8 +121,10 @@ async fn non_finite_provider_fee_falls_back_to_static() {
 async fn realtime_signaling_uses_payment_gate_price() {
     let engine = make_engine(10.0);
     // Base 50 + ceil(50 * 10.0 * 1.8 / 100) = 50 + 9 = 59
-    assert_eq!(engine.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 59);
     assert_eq!(engine.get_price_msat(KIND_ICE_CANDIDATE).await.unwrap(), 59);
+    // The call offer's own base (call_msat 10 000) takes the same multiplier.
+    assert!(engine.get_price_msat(KIND_CALL_INVITE).await.unwrap() > 10_000);
+    assert_eq!(engine.category_price_overrides(), Some(vec![konsensus_core::kind::KIND_LONGFORM, KIND_CALL_INVITE]));
 }
 
 #[tokio::test]

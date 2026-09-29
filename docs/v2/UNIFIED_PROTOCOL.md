@@ -731,7 +731,7 @@ in the Agreements layer (ADR-028), not in core.
 
 Should control messages (typing indicators, read receipts) be free? **No.** Even at 1/100th of base rate, payment proves authenticity and prevents abuse. A presence flood attack from a compromised node would cost real sats. The payment gate is universal — no exceptions, no edge cases, no bypass paths.
 
-The only exception: kinds 401-404 (call answer, ICE candidates, hangup) are covered by the kind=400 call invite payment. Once the caller has paid for the session, the signaling messages within that session are pre-authorized. This prevents a "pay to answer your own phone" UX problem.
+Calls follow the same rule (see [CALLS-PROTOTYPE.md](CALLS-PROTOTYPE.md)): the offer (400) is the per-call admission, priced at the callee's `call_msat`, and each answer, ICE candidate and hangup (401-403) is its own small paid act at the realtime price. Nothing in a call is pre-authorized.
 
 ---
 

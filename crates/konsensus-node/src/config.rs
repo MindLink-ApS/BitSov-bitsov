@@ -546,6 +546,11 @@ pub struct PricingConfig {
     /// Price for real-time signaling messages (kinds 400-499) in millisatoshis.
     #[serde(default = "default_realtime_signal_msat")]
     pub realtime_signal_msat: u64,
+    /// Per-call admission: what a call offer (kind 400) to this node costs,
+    /// in millisatoshis. Paid once per call; answers, ICE and hangups keep
+    /// `realtime_signal_msat`.
+    #[serde(default = "default_call_msat")]
+    pub call_msat: u64,
     /// Price for application extension messages (kinds 1000+) in millisatoshis.
     #[serde(default = "default_app_ext_msat")]
     pub app_ext_msat: u64,
@@ -571,6 +576,7 @@ impl Default for PricingConfig {
             control_msat: default_control_msat(),
             collaboration_msat: default_collab_msat(),
             realtime_signal_msat: default_realtime_signal_msat(),
+            call_msat: default_call_msat(),
             app_ext_msat: default_app_ext_msat(),
             web_content_msat: default_web_content_msat(),
         }
@@ -1085,6 +1091,7 @@ impl NodeConfig {
             || self.pricing.control_msat == 0
             || self.pricing.collaboration_msat == 0
             || self.pricing.realtime_signal_msat == 0
+            || self.pricing.call_msat == 0
             || self.pricing.app_ext_msat == 0
             || self.pricing.web_content_msat == 0
         {
@@ -1489,6 +1496,10 @@ fn default_control_msat() -> u64 {
 fn default_collab_msat() -> u64 {
     25
 }
+fn default_call_msat() -> u64 {
+    10_000
+}
+
 fn default_realtime_signal_msat() -> u64 {
     50
 }

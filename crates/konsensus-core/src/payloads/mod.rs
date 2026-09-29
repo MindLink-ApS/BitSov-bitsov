@@ -4,5 +4,6 @@
 //! the `ciphertext` field of a UKM envelope for its corresponding kind range.
 
 pub mod calendar;
+pub mod call;
 pub mod content;
 pub mod discovery;

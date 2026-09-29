@@ -3070,6 +3070,9 @@ pub(super) async fn compose_message(
             req.references.len()
         )));
     }
+    if req.is_room && crate::calls::is_call_kind(req.kind) {
+        return Err(ApiError::BadRequest("calls are 1:1; a room cannot be called".into()).with_reason("call_room"));
+    }
 
     // Parse references (shared by peer and room paths)
     let references: Vec<MessageId> = req
@@ -3285,6 +3288,11 @@ pub(super) async fn compose_peer(
         // ── Peer compose: existing single-recipient path ──
         let peer_id = NodeId::from_hex(&req.recipient)
             .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+        // Calls: a reused call id, or an answer/ICE/hangup for no live call,
+        // is refused here, before any quote or payment.
+        if crate::calls::is_call_kind(req.kind) {
+            crate::calls::admit_outgoing(&peer_id, req.kind, &req.plaintext)?;
+        }
         let _admission_guard = acquire_peer_admission_lock(&peer_id).await.ok_or_else(||
             ApiError::Internal("too many concurrent peer sends".into()))?;
         reconcile_admission_budget(&state, &peer_id, None).await?;
@@ -3293,6 +3301,10 @@ pub(super) async fn compose_peer(
 
         let height = if state.lightning.money_ready().await { state.chain.get_block_height().await.unwrap_or(0) } else { 0 };
         let mut price_msat = quoted_price(&state, &peer_id, req.kind, height).await?;
+        // A call offer pays the callee's own call price, asked of it just now.
+        if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
+            price_msat = super::caps::payable(crate::calls::peer_call_price(&state, &peer_id).await?);
+        }
         let mut cap = req.max_total_msat;
         if let Some(per) = &req.max_recipient_msat {
             let recipient_cap = *per.get(&peer_id.to_hex()).ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
