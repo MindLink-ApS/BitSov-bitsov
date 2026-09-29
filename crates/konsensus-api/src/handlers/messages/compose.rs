@@ -835,6 +835,11 @@ async fn create_payment_proof_via_invoice(
         )));
     }
 
+    // Message invoices only refuse an already-expired BOLT11 (`is_expired()`
+    // uses the payer clock). They do not reject a future `timestamp`, so a
+    // recipient a fraction of a second ahead of NTP cannot stall a paid
+    // message the way the admission path used to. Expired invoices stay
+    // refused; do not add a skew that would keep them payable.
     if response.recipient != *peer_id || response.payment_hash != invoice.payment_hash().to_string() || invoice.is_expired() {
         return Err(ApiError::Lightning("recipient invoice provenance/hash/expiry mismatch".into()));
     }
@@ -1882,6 +1887,47 @@ async fn request_admission_invoice(
     Ok((request_id, response))
 }
 
+/// How far a BOLT11 `timestamp` may lead the payer's clock.
+///
+/// BOLT11 timestamps are whole seconds from the **recipient** clock. A payer
+/// a fraction of a second behind NTP can see a same-second invoice as
+/// future-dated and refuse it before dispatch (`duration_since_epoch() > now`
+/// with zero slack). This bound is **only** for that future-timestamp check:
+/// it must not extend invoice expiry, the live attempt window, or what is paid.
+const INVOICE_TIMESTAMP_SKEW: Duration = Duration::from_secs(5);
+
+/// Admission-invoice time bounds with an injected payer clock (`now`).
+///
+/// `attempt_end` is the unix second the live attempt expires
+/// ([`konsensus_core::admission_quote::expires_at`]). Relative TTL must still
+/// be ≤ [`konsensus_core::admission_quote::EXPIRY_SECS`].
+fn admission_invoice_time_valid(
+    created: Duration,
+    expires_at: Option<Duration>,
+    relative_expiry_secs: u64,
+    now: Duration,
+    attempt_end: Option<u64>,
+) -> bool {
+    let Some(end) = attempt_end else {
+        return false;
+    };
+    if created > now.saturating_add(INVOICE_TIMESTAMP_SKEW) {
+        return false;
+    }
+    let Some(expiry) = expires_at else {
+        return false;
+    };
+    // Payer clock: already expired. Do not add skew here (would keep paying).
+    if now >= expiry {
+        return false;
+    }
+    // Live attempt window. Do not add skew here (would stretch the attempt).
+    if expiry > Duration::from_secs(end) {
+        return false;
+    }
+    relative_expiry_secs <= u64::from(konsensus_core::admission_quote::EXPIRY_SECS)
+}
+
 /// Check a target's admission invoice before anything is paid: the
 /// authenticated responder, its bounded price, hash, live request-bound
 /// expiry, known payee and the signed first-message price.
@@ -1920,15 +1966,16 @@ async fn validate_admission_invoice(
     );
     // A short relative TTL alone does not bound a future-dated or delayed
     // invoice. Its signed absolute expiry must fit the original live attempt.
-    let valid_invoice_time = attempt_expiry.is_some_and(|end| {
-        invoice.duration_since_epoch() <= now
-            && invoice.expires_at().is_some_and(|expiry| {
-                now < expiry && expiry <= Duration::from_secs(end)
-            })
-    });
-    if response.payment_hash != invoice.payment_hash().to_string()
-        || !valid_invoice_time
-        || invoice.expiry_time().as_secs() > u64::from(konsensus_core::admission_quote::EXPIRY_SECS) {
+    // The only slack is `INVOICE_TIMESTAMP_SKEW` on the BOLT11 timestamp
+    // itself (recipient clock); it must not stretch expiry or the attempt.
+    let valid_invoice_time = admission_invoice_time_valid(
+        invoice.duration_since_epoch(),
+        invoice.expires_at(),
+        invoice.expiry_time().as_secs(),
+        now,
+        attempt_expiry,
+    );
+    if response.payment_hash != invoice.payment_hash().to_string() || !valid_invoice_time {
         return Err(ApiError::Lightning(
             "admission invoice hash/expiry mismatch".into(),
         ));
@@ -3280,6 +3327,93 @@ pub(super) async fn compose_peer(
             Err(_) => debit.released(&peer_key),
         }
         result.map_err(|e| e.with_routing_fee(debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat)))
+}
+
+#[cfg(test)]
+mod admission_invoice_clock_tests {
+    use super::*;
+
+    const NOW: u64 = 1_700_000_000;
+    /// Attempt issued at NOW, live until NOW + EXPIRY_SECS.
+    const ATTEMPT_END: u64 = NOW + 60;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn check(created: u64, relative_expiry: u64, now: u64, attempt_end: Option<u64>) -> bool {
+        admission_invoice_time_valid(
+            secs(created),
+            Some(secs(created.saturating_add(relative_expiry))),
+            relative_expiry,
+            secs(now),
+            attempt_end,
+        )
+    }
+
+    #[test]
+    fn timestamp_up_to_skew_is_accepted() {
+        // Invoice stamped +5 s still fits the attempt (short relative TTL).
+        assert!(check(NOW + 5, 50, NOW, Some(ATTEMPT_END)));
+        assert!(check(NOW, 60, NOW, Some(ATTEMPT_END)));
+    }
+
+    #[test]
+    fn timestamp_beyond_skew_is_refused() {
+        assert!(!check(NOW + 6, 50, NOW, Some(ATTEMPT_END)));
+    }
+
+    #[test]
+    fn expired_invoice_is_refused() {
+        // Created in the past; relative TTL already elapsed on the payer clock.
+        assert!(!check(NOW - 60, 60, NOW, Some(ATTEMPT_END)));
+        // Exactly at expiry is expired (`now >= expiry`).
+        assert!(!check(NOW - 30, 30, NOW, Some(ATTEMPT_END)));
+    }
+
+    #[test]
+    fn expiry_beyond_attempt_end_is_refused() {
+        // Fresh 60 s TTL issued one second into the attempt overruns the end.
+        assert!(!check(NOW + 1, 60, NOW + 1, Some(ATTEMPT_END)));
+    }
+
+    #[test]
+    fn skew_does_not_extend_attempt_window() {
+        // +5 s timestamp with a 60 s TTL would expire at NOW+65 > attempt end.
+        assert!(!check(NOW + 5, 60, NOW, Some(ATTEMPT_END)));
+    }
+
+    #[test]
+    fn skew_does_not_keep_expired_invoice_payable() {
+        let created = NOW - 10;
+        let relative = 10; // expired exactly at NOW
+        assert!(!admission_invoice_time_valid(
+            secs(created),
+            Some(secs(created + relative)),
+            relative,
+            secs(NOW),
+            Some(ATTEMPT_END),
+        ));
+        // Even if created looks slightly in the future of a *wrong* now, expiry
+        // vs the injected payer clock stays strict.
+        assert!(!admission_invoice_time_valid(
+            secs(NOW + 1),
+            Some(secs(NOW)), // already expired at payer now
+            60,
+            secs(NOW),
+            Some(ATTEMPT_END),
+        ));
+    }
+
+    #[test]
+    fn relative_ttl_above_cap_is_refused() {
+        assert!(!check(NOW, 61, NOW, Some(ATTEMPT_END)));
+    }
+
+    #[test]
+    fn missing_attempt_end_is_refused() {
+        assert!(!check(NOW, 50, NOW, None));
+    }
 }
 
 #[cfg(test)]
