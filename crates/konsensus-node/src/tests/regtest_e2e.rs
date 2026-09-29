@@ -67,6 +67,24 @@ impl Steps {
     }
 }
 
+/// Talk-track beat timings for `scripts/demo-rehearsal.sh` (one line per beat).
+struct Beats {
+    last: std::time::Instant,
+}
+
+impl Beats {
+    fn new() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+        }
+    }
+    fn pass(&mut self, name: &str) {
+        let now = std::time::Instant::now();
+        println!("BEAT PASS {name}: {:.3}s", (now - self.last).as_secs_f64());
+        self.last = now;
+    }
+}
+
 /// The forwarding policy `node`'s peer C announced on their channel, as `node`
 /// sees it: this is what C charges on its hop towards `node`, and what `node`'s
 /// invoices carry in their route hints.
@@ -503,4 +521,245 @@ async fn real_ldk_predispatch_refusal() {
     drop(alice);
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
+}
+
+/// Mexico demo talk-track rehearsal on real LDK regtest: first contact with
+/// owner approval, paid message, paid reply, over-cap refusal at 0 msat, and
+/// exact msat reconciliation. Run via `scripts/demo-rehearsal.sh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Bitcoin Core and electrs; scripts/demo-rehearsal.sh"]
+async fn mexico_demo_rehearsal() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let chain = infra::Chain::start().await;
+    let dirs = [(); 3].map(|_| tempfile::tempdir().unwrap());
+    let (a, _) = infra::lightning(dirs[0].path(), &chain).await;
+    let (b, addr_b) = infra::lightning(dirs[1].path(), &chain).await;
+    let (c, addr_c) = infra::router(dirs[2].path(), &chain).await;
+    let c_pubkey = c.node_id().to_string();
+    chain.fund(a.node()).await;
+    chain.fund(&c).await;
+
+    a.open_channel(&c_pubkey, &addr_c, 1_000_000, false, None)
+        .await
+        .unwrap();
+    chain.confirm_channel(a.node(), &c, &[b.node()]).await;
+    c.open_channel(
+        b.node().node_id(),
+        addr_b.parse().unwrap(),
+        1_000_000,
+        None,
+        None,
+    )
+    .unwrap();
+    chain.confirm_channel(&c, b.node(), &[a.node()]).await;
+    assert!(
+        a.node()
+            .list_channels()
+            .iter()
+            .all(|ch| ch.counterparty_node_id != b.node().node_id()),
+        "A and B must not share a channel"
+    );
+
+    wait("C's channel_update reaches A and B", || async {
+        hop_policy(a.node(), &c).is_some() && hop_policy(b.node(), &c).is_some()
+    })
+    .await;
+    let (to_b, to_a) = (
+        hop_policy(b.node(), &c).unwrap(),
+        hop_policy(a.node(), &c).unwrap(),
+    );
+    let (fee_b, fee_a) = (hop_fee(to_b, 2_001), hop_fee(to_a, 2_001));
+    assert!(
+        fee_b > 0 && fee_a > 0,
+        "C must charge a positive forwarding fee"
+    );
+
+    let liquidity = 50_000_000;
+    let inv = b
+        .create_invoice(liquidity, "demo reply liquidity", 600)
+        .await
+        .unwrap();
+    a.pay_invoice_with_fee_limit(&inv.bolt11, hop_fee(to_b, liquidity))
+        .await
+        .unwrap();
+    settle(&a, &inv.payment_hash).await;
+    settle(&b, &inv.payment_hash).await;
+    wait("liquidity committed", || async {
+        capacity(b.node()) > 10_000_000
+    })
+    .await;
+    let (before_a, before_b, before_c) = (capacity(a.node()), capacity(b.node()), capacity(&c));
+
+    let mut alice = app::App::start(dirs[0].path(), &chain, a.clone()).await;
+    let mut bob = app::App::start(dirs[1].path(), &chain, b.clone()).await;
+    let peer = bob.state.identity.node_id().to_hex();
+    use konsensus_core::traits::transport::MessageTransport;
+    alice
+        .transport
+        .connect(
+            bob.state.identity.node_id(),
+            &bob.transport.listen_addr().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+    wait("Noise connected", || {
+        bob.transport.is_connected(alice.state.identity.node_id())
+    })
+    .await;
+    println!("SETUP three nodes paired on 127.0.0.1 (A--C--B)");
+    let mut beats = Beats::new();
+
+    // Beat 1: first contact with owner approval.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (status, quote) = alice
+        .post(
+            "/api/v1/messages/first-contact/quote",
+            json!({"recipient": peer}),
+            false,
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{quote}");
+    let grant = alice.service.grant_view_for(&alice.client).unwrap();
+    let (status, body) = alice
+        .post(
+            "/api/v1/pair/first-contact-grant",
+            json!({
+                "client_id": alice.client, "grant_op_id": grant.op_id, "recipient": peer,
+                "max_total_msat": quote["total_msat"], "contact_budget_msat": 100_000
+            }),
+            true,
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    alice.compose(&mut bob, "hello stranger").await;
+    assert!(
+        alice
+            .state
+            .session_manager
+            .has_session(bob.state.identity.node_id())
+            .await
+    );
+    beats.pass("first contact with owner approval");
+
+    // Beat 2: paid follow-up message under budget.
+    alice.compose(&mut bob, "paid follow-up").await;
+    beats.pass("paid message");
+
+    // Beat 3: paid reply after A's owner lists B.
+    let (status, body) = alice
+        .post(
+            "/api/v1/peers",
+            json!({
+                "node_id": peer, "addr": bob.transport.listen_addr().unwrap().to_string(),
+                "auto_connect": false
+            }),
+            true,
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    bob.compose(&mut alice, "B replies").await;
+    beats.pass("paid reply");
+
+    // Beat 4: refuse a route above the fee cap; nothing moves (0 msat).
+    let (used_a, cap_a, cap_b, cap_c) = (
+        alice.used(),
+        capacity(a.node()),
+        capacity(b.node()),
+        capacity(&c),
+    );
+    let over = b
+        .create_invoice(2_001, "over fee ceiling", 600)
+        .await
+        .unwrap();
+    let (status, body) = alice
+        .post(
+            "/api/v1/payments/pay",
+            json!({"bolt11": over.bolt11, "max_routing_fee_msat": fee_b - 1}),
+            false,
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "not_dispatched", "{body}");
+    assert_eq!(alice.used(), used_a, "reservation must be released");
+    assert_eq!(capacity(a.node()), cap_a);
+    assert_eq!(capacity(b.node()), cap_b);
+    assert_eq!(capacity(&c), cap_c);
+    assert_eq!(
+        a.get_payment_status(&over.payment_hash)
+            .await
+            .unwrap()
+            .status,
+        PaymentStatus::Failed
+    );
+    assert_eq!(
+        b.get_payment_status(&over.payment_hash)
+            .await
+            .unwrap()
+            .status,
+        PaymentStatus::Pending
+    );
+    beats.pass("refusal over cap at 0 msat");
+
+    // Beat 5: exact msat reconciliation (talk-track money only; refusal excluded).
+    let sent_a = 3 * 2_001;
+    let expected_a = before_a - sent_a - 3 * fee_b + 2_001;
+    let expected_b = before_b + sent_a - 2_001 - fee_a;
+    let expected_c = before_c + 3 * fee_b + fee_a;
+    wait(
+        "exact channel deltas after talk-track settlements",
+        || async {
+            capacity(a.node()) == expected_a
+                && capacity(b.node()) == expected_b
+                && capacity(&c) == expected_c
+        },
+    )
+    .await;
+    for (node, amounts, fee) in [
+        (&a, vec![liquidity, 2_001, 2_001, 2_001], fee_b),
+        (&b, vec![2_001], fee_a),
+    ] {
+        let payments = node.list_payments(100).await.unwrap();
+        let mut settled: Vec<_> = payments
+            .iter()
+            .filter(|p| {
+                p.direction == PaymentDirection::Outgoing
+                    && p.status == PaymentStatus::Settled
+                    && !p.payment_hash.is_empty()
+            })
+            .collect();
+        settled.sort_by_key(|p| std::cmp::Reverse(p.amount_msat));
+        assert_eq!(
+            settled.iter().map(|p| p.amount_msat).collect::<Vec<_>>(),
+            amounts,
+            "{settled:?}"
+        );
+        for payment in &settled {
+            let expected_fee = if payment.amount_msat == liquidity {
+                hop_fee(to_b, liquidity)
+            } else {
+                fee
+            };
+            assert_eq!(payment.fee_msat, Some(expected_fee), "{payment:?}");
+            use sha2::{Digest, Sha256};
+            let preimage = hex::decode(payment.preimage.as_ref().unwrap()).unwrap();
+            assert_eq!(hex::encode(Sha256::digest(preimage)), payment.payment_hash);
+        }
+    }
+    assert_eq!(alice.used(), 3 * (2_001 + fee_b));
+    assert_eq!(bob.used(), 2_001 + fee_a);
+    println!(
+        "reconciled: A {before_a}->{expected_a} ({}), B {before_b}->{expected_b} ({}), C {before_c}->{expected_c} ({})",
+        expected_a as i64 - before_a as i64,
+        expected_b as i64 - before_b as i64,
+        expected_c as i64 - before_c as i64
+    );
+    beats.pass("exact msat reconciliation");
+
+    drop(alice);
+    drop(bob);
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.stop().unwrap();
 }

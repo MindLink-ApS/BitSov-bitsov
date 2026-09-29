@@ -53,6 +53,9 @@ pub(crate) struct SessionHandlerDeps {
     pub send_timestamps: Arc<tokio::sync::Mutex<std::collections::HashMap<konsensus_core::types::MessageId, std::time::Instant>>>,
     pub lightning: Arc<dyn LightningProvider>,
     pub lightning_addr: Option<String>,
+    /// True only for Mock/SharedMock Lightning. Gates the connect-time
+    /// profile envelope, which carries a mock payment proof.
+    pub mock_lightning: bool,
     pub invoice_requests: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>>,
     pub peer_ln_pubkeys: Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, String>>>,
     pub ws_broadcast: broadcast::Sender<Arc<konsensus_api::state::WsMessage>>,
@@ -144,6 +147,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         send_timestamps,
         lightning,
         lightning_addr,
+        mock_lightning,
         invoice_requests,
         peer_ln_pubkeys,
         ws_broadcast,
@@ -213,6 +217,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             &storage,
                             &ws_delivery_tx,
                             our_node_id,
+                            mock_lightning,
                         ).await;
                     }
 
@@ -531,6 +536,7 @@ async fn handle_peer_connected(
     storage: &Arc<dyn konsensus_storage::Storage>,
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
     our_node_id: NodeId,
+    mock_lightning: bool,
 ) {
     info!(peer = %peer_id, "peer connected, sending prekey offer + price table");
 
@@ -589,7 +595,8 @@ async fn handle_peer_connected(
     }
 
     // Send our KIND_PROFILE (103) so the peer can display our identity.
-    crate::profile_handler::send_profile_to(identity, transport, peer_id).await;
+    // Mock backends only: a real backend never sends a mock payment proof.
+    crate::profile_handler::send_profile_to(identity, transport, peer_id, mock_lightning).await;
 }
 
 #[allow(clippy::too_many_arguments)]

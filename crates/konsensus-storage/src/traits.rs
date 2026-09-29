@@ -879,4 +879,30 @@ pub trait Storage: Send + Sync {
             "operator hosting payments not implemented for this backend".into(),
         ))
     }
+
+    /// Record a paid outbound page/manifest request for reply binding.
+    /// Default is a no-op (gate falls through to the price floor).
+    async fn record_outgoing_web_request(
+        &self,
+        _payment_hash: &[u8; 32],
+        _request: konsensus_core::web_reply::OutstandingWebRequest,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Atomically take an outstanding web request by payment hash.
+    async fn take_outstanding_web_request(
+        &self,
+        _payment_hash: &[u8; 32],
+    ) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, StorageError> {
+        Ok(None)
+    }
+
+    /// Delete up to `max` outstanding web requests that expired before
+    /// `now_ms`. Returns how many were removed. An expired entry can never
+    /// bind a reply (`reply_matches_outstanding` checks expiry), so this only
+    /// reclaims space.
+    async fn sweep_outstanding_web_requests(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
+        Ok(0)
+    }
 }

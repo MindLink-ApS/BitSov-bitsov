@@ -1527,6 +1527,7 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
         send_timestamps: Default::default(),
         lightning: provider.clone(),
         lightning_addr: None,
+        mock_lightning: true,
         invoice_requests: Default::default(),
         peer_ln_pubkeys: Default::default(),
         ws_broadcast: ws,

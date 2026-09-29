@@ -4,8 +4,16 @@
 //! # Wire format
 //! Sends a `KIND_PROFILE` (103) `UkmEnvelope` with:
 //! - AES-256-GCM encrypted `NodeProfile` JSON (key derived from both node IDs)
-//! - 25 msat mock payment proof (replace with real LN invoice in production)
+//! - 25 msat mock payment proof
 //! - Ed25519 signature over `signable_bytes()`
+//!
+//! # Mock backends only
+//! The proof is a self-derived mock preimage, not a Lightning payment. A real
+//! backend's payment gate correctly rejects it, so sending it there only
+//! produces a rejected unpaid act and the profile never arrives. Every act
+//! is paid (Principle 2), so on a non-Mock backend nothing is sent: fail
+//! closed rather than emit a fake proof. A real paid profile exchange belongs
+//! on the owner-initiated paid compose path, not on connect.
 //!
 //! # Key derivation
 //! `key = SHA-256(DOMAIN || sender_id_bytes || recipient_id_bytes)`
@@ -16,6 +24,7 @@
 //! # Auto-trigger
 //! Called by `session_handler::handle_peer_connected` immediately after the
 //! peer is connected so they can display our identity in their contact book.
+//! Only fires when the node runs a Mock/SharedMock Lightning backend.
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -26,7 +35,7 @@ use konsensus_core::{
     profile::{NodeProfile, KIND_PROFILE},
     traits::transport::MessageTransport,
     types::{NodeId, Nonce, PaymentProof, Recipient, Signature},
-    UkmEnvelopeBuilder,
+    UkmEnvelope, UkmEnvelopeBuilder,
 };
 use konsensus_message::NoiseTransport;
 use sha2::{Digest, Sha256};
@@ -41,23 +50,51 @@ const PROFILE_KEY_DOMAIN: &[u8] = b"konsensus-v2 profile-key v1\0";
 
 /// Send our `KIND_PROFILE` (103) envelope to `peer_id`.
 ///
-/// Errors are logged as warnings; this is a best-effort exchange that should
-/// not block or crash the connection flow.
+/// `mock_lightning` must be true only for Mock/SharedMock backends; otherwise
+/// nothing is sent (see module docs). Errors are logged as warnings; this is
+/// a best-effort exchange that should not block or crash the connection flow.
 pub(crate) async fn send_profile_to(
     identity: &NodeIdentity,
     transport: &NoiseTransport,
     peer_id: &NodeId,
+    mock_lightning: bool,
 ) {
-    if let Err(e) = try_send_profile(identity, transport, peer_id).await {
+    let envelope = match profile_envelope(identity, peer_id, mock_lightning) {
+        Ok(Some(envelope)) => envelope,
+        Ok(None) => {
+            info!(
+                peer = %&peer_id.to_hex()[..8],
+                "skipping KIND_PROFILE on connect: real Lightning backend, no mock proof"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(peer = %peer_id, error = %e, "failed to build KIND_PROFILE envelope");
+            return;
+        }
+    };
+    if let Err(e) = transport.send(peer_id, &envelope).await {
         warn!(peer = %peer_id, error = %e, "failed to send KIND_PROFILE to peer");
+        return;
     }
+    info!(
+        peer = %&peer_id.to_hex()[..8],
+        "sent KIND_PROFILE envelope (25 msat mock)"
+    );
 }
 
-async fn try_send_profile(
+/// Build the connect-time profile envelope, or `None` on a non-Mock backend.
+///
+/// The envelope carries a mock payment proof, so it must never be built for
+/// a real backend.
+pub(crate) fn profile_envelope(
     identity: &NodeIdentity,
-    transport: &NoiseTransport,
     peer_id: &NodeId,
-) -> anyhow::Result<()> {
+    mock_lightning: bool,
+) -> anyhow::Result<Option<UkmEnvelope>> {
+    if !mock_lightning {
+        return Ok(None);
+    }
     let sender = *identity.node_id();
     let now_secs = chrono::Utc::now().timestamp();
 
@@ -82,7 +119,7 @@ async fn try_send_profile(
     let ciphertext = aes_encrypt(&plaintext, &key_bytes, &nonce)?;
 
     // Mock payment proof: preimage = SHA-256(nonce || sender_id).
-    // Replace with a real Lightning invoice flow in production.
+    // Only reachable on a Mock backend (checked above).
     let preimage = mock_preimage(&nonce, &sender);
     let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
     let proof = PaymentProof::new(payment_hash, preimage, PROFILE_PAYMENT_MSAT);
@@ -117,12 +154,7 @@ async fn try_send_profile(
         .signature(sig)
         .build();
 
-    transport.send(peer_id, &envelope).await?;
-    info!(
-        peer = %&peer_id.to_hex()[..8],
-        "sent KIND_PROFILE envelope (25 msat mock)"
-    );
-    Ok(())
+    Ok(Some(envelope))
 }
 
 /// Derive the AES-256-GCM key for a sender↔recipient pair.
@@ -163,3 +195,7 @@ fn mock_preimage(nonce: &Nonce, sender_id: &NodeId) -> [u8; 32] {
     h.update(sender_id.as_bytes());
     h.finalize().into()
 }
+
+#[cfg(test)]
+#[path = "tests/profile_handler.rs"]
+mod tests;

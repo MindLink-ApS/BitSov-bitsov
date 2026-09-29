@@ -231,11 +231,17 @@ the owner already budgeted**, without a prompt.
   one-time confirmation for exactly that contact (steps 1 and 2 above) then
   covers the re-admission, is consumed by it, and bounds its amount. Never for a
   stranger without it.
-- Any confirmed total/recipient cap refuses an additional unquoted reconnect
-  admission (`price_cap_exceeded`), for owner and paired callers alike. Without
-  that request cap, existing admission authority may pay it under G1 all-in
-  limits. The reply's `amount_msat` remains message principal; `readmission_msat`
-  reports admission principal and `max_routing_fee_msat` sums authorized fees.
+- A confirmed `max_total_msat` may cover reconnect re-admission for
+  **single-recipient chat** only, and only when the payee returns a fresh signed
+  quote and admission + message + both routing fee ceilings fit that cap (and
+  the grant). The all-in amount is reserved before dispatch, as for first
+  contact. Rooms, files, and other non-chat kinds refuse a capped reconnect
+  before any quote. A chat call with a zero or below-message-all-in cap also
+  refuses before asking. No quote, or a quote that does not fit, is refused
+  before payment (`price_cap_exceeded` / grant refusal). Without a request cap,
+  existing admission authority may pay it under G1 all-in limits. The reply's
+  `amount_msat` remains message principal; `readmission_msat` reports admission
+  principal and `max_routing_fee_msat` sums authorized fees.
 
 The node enforces independent owner authority for confirmation, exact client
 and grant binding, exact recipient, bounded amount, single use, short life, and

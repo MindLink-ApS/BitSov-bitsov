@@ -990,6 +990,7 @@ pub fn test_state() -> Arc<AppState> {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: None,
     })
@@ -1050,6 +1051,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: None,
     })
@@ -1098,6 +1100,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: None,
     })
@@ -1156,6 +1159,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: None,
     })
@@ -1204,6 +1208,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: None,
     })
@@ -1228,6 +1233,8 @@ pub struct ConnectedStubTransport {
     /// Shared reference to the invoice_requests map so the transport can
     /// fulfill pending requests (simulating the peer responding).
     pub invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
+    /// One live connection per peer, established when the stub was built.
+    pub since: Option<std::time::Instant>,
 }
 
 impl ConnectedStubTransport {
@@ -1240,6 +1247,7 @@ impl ConnectedStubTransport {
             sent_envelopes: std::sync::Mutex::new(Vec::new()),
             invoice_responder: None,
             invoice_requests,
+            since: Some(std::time::Instant::now()),
         }
     }
 
@@ -1282,6 +1290,10 @@ impl MessageTransport for ConnectedStubTransport {
 
     async fn is_connected(&self, peer: &NodeId) -> bool {
         self.connected.lock().unwrap().contains(peer)
+    }
+
+    async fn connected_since(&self, peer: &NodeId) -> Option<std::time::Instant> {
+        self.since.filter(|_| self.connected.lock().unwrap().contains(peer))
     }
 
     async fn connected_peers(&self) -> Vec<NodeId> {
@@ -1427,6 +1439,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: Some(Arc::new(konsensus_gossip::GossipValidator::new(
             Default::default(),
@@ -1658,6 +1671,7 @@ pub fn test_state_with_lightning(lightning: Arc<dyn LightningProvider>) -> Arc<A
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: None,
     })

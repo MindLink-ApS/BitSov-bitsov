@@ -437,6 +437,7 @@ impl PostgresStorage {
             (23, "delivery price quotes", include_str!("../migrations/023_delivery_price_quotes.sql")),
     (24, "outbox operations", include_str!("../migrations/postgres/024_outbox_operations.sql")),
     (25, "outbox recovery", include_str!("../migrations/postgres/025_outbox_recovery.sql")),
+    (26, "outstanding web requests", include_str!("../migrations/026_outstanding_web_requests.sql")),
         ]
     }
 
@@ -1593,6 +1594,48 @@ impl Storage for PostgresStorage {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn record_outgoing_web_request(
+        &self,
+        payment_hash: &[u8; 32],
+        request: konsensus_core::web_reply::OutstandingWebRequest,
+    ) -> Result<(), StorageError> {
+        // Durable (#129 R1): a restart between paying and the reply keeps the binding.
+        let expires = i64::try_from(request.expires_at_ms).map_err(|_| StorageError::Conversion("web request expiry overflow".into()))?;
+        sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
+            .bind(hex::encode(payment_hash))
+            .bind(request.request_id.to_hex())
+            .bind(request.peer.to_hex())
+            .bind(i64::from(request.expected_reply_kind))
+            .bind(expires)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn take_outstanding_web_request(
+        &self,
+        payment_hash: &[u8; 32],
+    ) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, StorageError> {
+        // One statement: two concurrent takes cannot both get the row.
+        let row: Option<(String, String, i64, i64)> = sqlx::query_as(
+            "DELETE FROM outstanding_web_requests WHERE payment_hash = $1 RETURNING request_id, peer, expected_reply_kind, expires_at_ms",
+        )
+        .bind(hex::encode(payment_hash))
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(outstanding_from_row).transpose()
+    }
+
+    async fn sweep_outstanding_web_requests(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
+        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("sweep time overflow".into()))?;
+        let result = sqlx::query("DELETE FROM outstanding_web_requests WHERE payment_hash IN (SELECT payment_hash FROM outstanding_web_requests WHERE expires_at_ms < $1 ORDER BY expires_at_ms LIMIT $2)")
+            .bind(now)
+            .bind(i64::from(max))
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
@@ -3335,6 +3378,40 @@ mod accepted_invites_guard {
 mod migration_recovery_tests {
     use super::*;
 
+    /// #129 R1/R2 on Postgres: the outstanding web request survives a reconnect,
+    /// is taken once, and expired rows are swept with a bound.
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn outstanding_web_requests_survive_reconnect_and_are_swept() {
+        use konsensus_core::web_reply::OutstandingWebRequest;
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+        let admin = PgPool::connect(&url).await.unwrap();
+        let name = format!("webreq_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+        let db_url = format!("{}/{name}", url.rsplit_once('/').unwrap().0);
+        let row = |b: u8, expires_at_ms: u64| OutstandingWebRequest {
+            request_id: konsensus_core::types::MessageId::from_bytes([b; 32]),
+            peer: NodeId::from_bytes([b; 32]),
+            expected_reply_kind: konsensus_core::kind::KIND_PAGE_RESPONSE,
+            expires_at_ms,
+        };
+        {
+            let db = PostgresStorage::connect(&db_url).await.unwrap();
+            db.record_outgoing_web_request(&[1; 32], row(1, 10_000)).await.unwrap();
+            for b in 2..5 {
+                db.record_outgoing_web_request(&[b; 32], row(b, 100 + u64::from(b))).await.unwrap();
+            }
+            db.pool.close().await;
+        }
+        let db = PostgresStorage::connect(&db_url).await.unwrap();
+        assert_eq!(db.sweep_outstanding_web_requests(1_000, 2).await.unwrap(), 2);
+        assert_eq!(db.sweep_outstanding_web_requests(1_000, 2).await.unwrap(), 1);
+        assert_eq!(db.take_outstanding_web_request(&[1; 32]).await.unwrap(), Some(row(1, 10_000)));
+        assert_eq!(db.take_outstanding_web_request(&[1; 32]).await.unwrap(), None);
+        db.pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+    }
+
     // This test creates and removes its own databases on a disposable server.
     #[tokio::test]
     #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
@@ -3345,7 +3422,9 @@ mod migration_recovery_tests {
             let name = format!("migration_{}", uuid::Uuid::new_v4().simple());
             sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
             let base = url.rsplit_once('/').unwrap().0;
-            let db = PostgresStorage { pool: PgPool::connect(&format!("{base}/{name}")).await.unwrap() };
+            let db = PostgresStorage {
+                pool: PgPool::connect(&format!("{base}/{name}")).await.unwrap(),
+            };
             sqlx::raw_sql("CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)").execute(&db.pool).await.unwrap();
             for (v, name, sql) in PostgresStorage::pg_migrations().into_iter().filter(|(v, _, _)| *v < 20) {
                 sqlx::raw_sql(sql).execute(&db.pool).await.unwrap();
@@ -3450,4 +3529,17 @@ mod migration_recovery_tests {
         }
         admin.close().await;
     }
+}
+
+/// A taken `outstanding_web_requests` row. A corrupt row is an error, never a binding.
+fn outstanding_from_row(
+    (request_id, peer, kind, expires): (String, String, i64, i64),
+) -> Result<konsensus_core::web_reply::OutstandingWebRequest, StorageError> {
+    let bad = |what: &str| StorageError::Conversion(format!("outstanding web request: bad {what}"));
+    Ok(konsensus_core::web_reply::OutstandingWebRequest {
+        request_id: konsensus_core::types::MessageId::from_hex(&request_id).map_err(|_| bad("request id"))?,
+        peer: konsensus_core::types::NodeId::from_hex(&peer).map_err(|_| bad("peer"))?,
+        expected_reply_kind: u16::try_from(kind).map_err(|_| bad("reply kind"))?,
+        expires_at_ms: u64::try_from(expires).map_err(|_| bad("expiry"))?,
+    })
 }

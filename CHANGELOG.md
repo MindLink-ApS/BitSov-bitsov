@@ -6,14 +6,26 @@ also live on the corresponding GitHub pre-release pages.
 ## [0.3.0-rc8] — 2026-09-29 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Source range: `v0.3.0-rc7` (`958e399`) →
-this branch tip on `main`. Full narrative: [`docs/releases/v0.3.0-rc8.md`](docs/releases/v0.3.0-rc8.md).
+this branch tip on `main` (through #132). Full narrative: [`docs/releases/v0.3.0-rc8.md`](docs/releases/v0.3.0-rc8.md).
 Retained-node upgrade: [`docs/UPGRADING.md`](docs/UPGRADING.md).
 
 ### Payments safety
 - Proven `PaymentNotDispatched` survives API conversion as `400` / `not_dispatched` across pay, keysend, open-channel, send-onchain, and related paths (#115, #117).
 - Lightning spend caps cover principal **and** routing fees (#99); node-enforced paid-send caps (#80); capped re-admission refuses with a stable reason (#121).
+- Quoted capped re-admission is generation-bound (#127); admission fee ceilings are reported only at wallet dispatch (#128).
+- Invoice timestamps tolerate small recipient clock skew (#126).
 - Incomplete paid recovery fails closed to `payment_unknown` (#119); paid resends back off while the peer is offline (#118); outbox scans are bounded and keep replay tombstones (#116).
 - Paid envelopes are retained until atomic acceptance ACK (#103); channel fee/announcement requests are enforced (#101).
+
+### Web services
+- Web service replies bind to the requester's paid proof (#129); outstanding paid requests persist in SQLite/Postgres (migration **026**) with expiry sweep (#132).
+
+### Front door
+- FrontDoorCard v1 with owner API and unprivileged open for Knock (#130).
+
+### Owner / CLI / demo
+- `sign-challenge` aligns with `/auth/token` owner-token challenges (#125).
+- One-command regtest rehearsal (#122); no mock-proof profile on real backends (#123).
 
 ### Exactly-once
 - Compose operations persist for exactly-once delivery (#113).
@@ -26,9 +38,10 @@ Retained-node upgrade: [`docs/UPGRADING.md`](docs/UPGRADING.md).
 - BitSov-Data-As-Of / Data-Stale on pinned reads (#78, #79, #84); node energy (N1) and membrane events (N2) (#82, #96, #97).
 
 ### Upgrade path
-- Fail closed when `KONSENSUS_SQLITE_MIGRATIONS_DIR` omits embedded migration versions (#120).
+- Fail closed when `KONSENSUS_SQLITE_MIGRATIONS_DIR` omits embedded migration versions (#120); embedded set through **026**.
 - Document `NODE_INITIALIZED` repair for pre-#76/#77 retained nodes (`konsensus repair mark-initialized`) (#120, #76/#77).
 - Pairing, identity-free bootstrap, owner CLI, and scoped tokens (#72/#73, #76/#77, #92, #94).
+- MSRV **1.88** (#128).
 
 ### Dependencies
 - Workspace crate version set to `0.3.0-rc8` (was `0.1.0` for earlier RCs).

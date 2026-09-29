@@ -887,6 +887,7 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: None,
     });

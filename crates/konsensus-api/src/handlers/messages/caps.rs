@@ -3,6 +3,14 @@ use std::collections::HashMap;
 use crate::error::ApiError;
 
 pub const CAPABILITY: &str = "paid_send_caps_v1";
+
+/// A capped single-recipient chat pays a reconnect's re-admission when the
+/// contact's fresh signed quote (admission + message + both routing ceilings)
+/// fits the cap and any grant. A cap that does not fit is refused before any
+/// payment with 409 `price_cap_exceeded`, `reason: readmission_required`; the
+/// quote it fetched is then served by `POST /messages/first-contact/quote` on
+/// the same connection, so the same operation can be sent again under it.
+pub const QUOTED_READMISSION_CAPABILITY: &str = "quoted_readmission_v1";
 pub const ROOM_CAPABILITY: &str = "room_terminal_outcomes_v1";
 
 pub fn payable(price: u64) -> u64 { if price == 0 { 0 } else { price.max(1000) } }

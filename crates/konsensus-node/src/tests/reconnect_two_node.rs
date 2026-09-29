@@ -282,6 +282,7 @@ async fn start_sender(
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: None,
     });

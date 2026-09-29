@@ -440,8 +440,10 @@ async fn web_manifest_no_content_server_returns_label() {
 
     let sender = *alice.node_id();
 
+    let request = make_envelope(alice.as_ref(), *bob.node_id(), konsensus_core::kind::KIND_WEB_MANIFEST, b"enc".to_vec());
     let result = process_web_manifest(
         &sender,
+        &request,
         &None,
         &chain,
         &pricing,
@@ -473,9 +475,11 @@ async fn web_manifest_with_content_server_returns_label() {
     }).unwrap());
 
     let sender = *alice.node_id();
+    let request = make_envelope(alice.as_ref(), *bob.node_id(), konsensus_core::kind::KIND_WEB_MANIFEST, b"enc".to_vec());
 
     let result = process_web_manifest(
         &sender,
+        &request,
         &Some(cs),
         &chain,
         &pricing,
@@ -486,6 +490,40 @@ async fn web_manifest_with_content_server_returns_label() {
     .await;
 
     assert_eq!(result, Some("[web manifest request]".to_string()));
+}
+
+#[tokio::test]
+async fn web_reply_is_bound_to_request_payment_not_self_minted() {
+    // The reply proof reuses the request hash/preimage at amount 0 and references
+    // the request id — never a fresh generate_valid_proof amount.
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let request = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_PAGE_REQUEST,
+        b"enc".to_vec(),
+    );
+    assert!(request.payment_proof.amount_msat > 0);
+
+    let bound = konsensus_core::reply_bound_proof(&request.payment_proof);
+    assert_eq!(bound.amount_msat, 0);
+    assert_eq!(bound.payment_hash, request.payment_proof.payment_hash);
+    assert_eq!(bound.preimage, request.payment_proof.preimage);
+
+    let reply = UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_PAGE_RESPONSE,
+        *bob.node_id(),
+        Recipient::Node(*alice.node_id()),
+        b"page-bytes".to_vec(),
+        bound,
+    )
+    .references(vec![request.id])
+    .build();
+    assert!(konsensus_core::is_web_service_reply(&reply));
+    assert_eq!(reply.references, vec![request.id]);
+    // A self-minted priced proof would have a different hash or non-zero amount.
+    assert_ne!(reply.payment_proof.amount_msat, request.payment_proof.amount_msat);
 }
 
 // ── process_page_request tests ──────────────────────────────────────

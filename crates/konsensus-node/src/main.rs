@@ -157,9 +157,14 @@ async fn main() -> Result<()> {
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
             cmd_node_id(&mnemonic_path, &passphrase)?;
         }
-        Command::SignChallenge { mnemonic, config, passphrase } => {
+        Command::SignChallenge {
+            challenge,
+            mnemonic,
+            config,
+            passphrase,
+        } => {
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
-            cmd_sign_challenge(&mnemonic_path, &passphrase)?;
+            cmd_sign_challenge(&mnemonic_path, &passphrase, &challenge)?;
         }
         Command::Scb { command } => match command {
             ScbCommand::Restore {
@@ -611,17 +616,54 @@ fn cmd_node_id(mnemonic_path: &Path, passphrase: &str) -> Result<()> {
     Ok(())
 }
 
-/// `konsensus sign-challenge` — sign "konsensus-auth" and print hex signature.
-fn cmd_sign_challenge(mnemonic_path: &Path, passphrase: &str) -> Result<()> {
+/// `konsensus sign-challenge` — sign a live `/auth/challenge` string; print hex.
+///
+/// The mnemonic file is read for key material only and is never written to stdout.
+fn cmd_sign_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) -> Result<()> {
+    let signature = sign_auth_challenge(mnemonic_path, passphrase, challenge)?;
+    println!("{signature}");
+    Ok(())
+}
+
+/// True iff `challenge` matches the server format from `GET /api/v1/auth/challenge`:
+/// `bitsov-auth-v1:<64 lowercase hex nonce>:<unix expiry digits>`.
+fn is_well_formed_auth_challenge(challenge: &str) -> bool {
+    const PREFIX: &str = "bitsov-auth-v1:";
+    let Some(rest) = challenge.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some((nonce, exp)) = rest.split_once(':') else {
+        return false;
+    };
+    nonce.len() == 64
+        && nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && !exp.is_empty()
+        && exp.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Produce the hex Ed25519 signature `/api/v1/auth/token` expects for `challenge`.
+fn sign_auth_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) -> Result<String> {
+    let challenge = challenge.trim();
+    if challenge.is_empty() {
+        anyhow::bail!("challenge is required (from GET /api/v1/auth/challenge)");
+    }
+    // Refuse to sign anything that is not the exact live challenge wire format.
+    if !is_well_formed_auth_challenge(challenge) {
+        anyhow::bail!(
+            "challenge must match ^bitsov-auth-v1:[0-9a-f]{{64}}:[0-9]+$ from GET /api/v1/auth/challenge"
+        );
+    }
+
     let mnemonic = mnemonic_crypto::read_mnemonic(mnemonic_path, None)
         .with_context(|| format!("failed to read mnemonic from {}", mnemonic_path.display()))?;
 
     let identity = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, passphrase)
         .context("failed to derive identity from mnemonic")?;
 
-    let signature = identity.sign(b"konsensus-auth");
-    println!("{}", hex::encode(signature.to_bytes()));
-    Ok(())
+    let signature = identity.sign(challenge.as_bytes());
+    Ok(hex::encode(signature.to_bytes()))
 }
 
 /// `konsensus start` — boot the node.
@@ -954,6 +996,14 @@ async fn cmd_start(
             network: config.lightning.bitcoin_network(),
             endpoint: config.network.introduction_endpoint(),
         },
+        front_door: konsensus_api::handlers::front_door::FrontDoorStore::load(
+            if config.web.enabled {
+                Some(std::path::Path::new(&config.web.content_dir))
+            } else {
+                None
+            },
+            config_path.parent(),
+        ),
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
     });
@@ -1077,6 +1127,7 @@ async fn cmd_start(
         send_timestamps: Arc::clone(&api_state.send_timestamps),
         lightning: Arc::clone(node.lightning()),
         lightning_addr: advertised_lightning_addr,
+        mock_lightning: config.lightning.is_mock(),
         invoice_requests: Arc::clone(&api_state.invoice_requests),
         peer_ln_pubkeys: Arc::clone(&api_state.peer_ln_pubkeys),
         ws_broadcast: api_state.ws_broadcast.clone(),

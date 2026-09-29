@@ -53,7 +53,12 @@ fn parse_init_all_flags() {
 fn parse_start_default_config() {
     let cli = Cli::parse_from(["konsensus", "start"]);
     match cli.command {
-        Command::Start { config, password, admission_mode, owner_control } => {
+        Command::Start {
+            config,
+            password,
+            admission_mode,
+            owner_control,
+        } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert!(password.is_none());
             assert!(!owner_control);
@@ -69,7 +74,12 @@ fn parse_start_default_config() {
 fn parse_start_custom_config() {
     let cli = Cli::parse_from(["konsensus", "start", "--config", "/etc/konsensus.toml"]);
     match cli.command {
-        Command::Start { config, password, admission_mode, owner_control } => {
+        Command::Start {
+            config,
+            password,
+            admission_mode,
+            owner_control,
+        } => {
             assert_eq!(config, PathBuf::from("/etc/konsensus.toml"));
             assert!(password.is_none());
             assert!(!owner_control);
@@ -83,7 +93,12 @@ fn parse_start_custom_config() {
 fn parse_start_with_password() {
     let cli = Cli::parse_from(["konsensus", "start", "--password", "secret123"]);
     match cli.command {
-        Command::Start { config, password, admission_mode, owner_control } => {
+        Command::Start {
+            config,
+            password,
+            admission_mode,
+            owner_control,
+        } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert_eq!(password.as_deref(), Some("secret123"));
             assert!(!owner_control);
@@ -99,7 +114,12 @@ fn parse_start_admission_mode_price_open() {
     // cmd_start maps it to ReachabilityMode::PriceOpen before building the node.
     let cli = Cli::parse_from(["konsensus", "start", "--admission-mode", "price-open"]);
     match cli.command {
-        Command::Start { config, password, admission_mode, owner_control } => {
+        Command::Start {
+            config,
+            password,
+            admission_mode,
+            owner_control,
+        } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert!(password.is_none());
             assert!(!owner_control);
@@ -112,7 +132,13 @@ fn parse_start_admission_mode_price_open() {
 #[test]
 fn parse_start_owner_control_is_explicit() {
     let cli = Cli::parse_from(["konsensus", "start", "--owner-control"]);
-    assert!(matches!(cli.command, Command::Start { owner_control: true, .. }));
+    assert!(matches!(
+        cli.command,
+        Command::Start {
+            owner_control: true,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -120,7 +146,10 @@ fn parse_start_admission_mode_rejects_unknown() {
     // clap's value_parser constrains the flag to {whitelist, price-open};
     // any other value is a parse error (defensive — never silently misconfigured).
     let result = Cli::try_parse_from(["konsensus", "start", "--admission-mode", "open"]);
-    assert!(result.is_err(), "unknown admission mode must be rejected by clap");
+    assert!(
+        result.is_err(),
+        "unknown admission mode must be rejected by clap"
+    );
 }
 
 #[test]
@@ -229,13 +258,22 @@ fn parse_restore_with_mnemonic() {
 
 #[test]
 fn parse_sign_challenge() {
-    let cli = Cli::parse_from(["konsensus", "sign-challenge", "--mnemonic", "/keys/m.txt"]);
+    let cli = Cli::parse_from([
+        "konsensus",
+        "sign-challenge",
+        "--challenge",
+        "bitsov-auth-v1:ab:1",
+        "--mnemonic",
+        "/keys/m.txt",
+    ]);
     match cli.command {
         Command::SignChallenge {
+            challenge,
             mnemonic,
             config,
             passphrase,
         } => {
+            assert_eq!(challenge, "bitsov-auth-v1:ab:1");
             assert_eq!(mnemonic, Some(PathBuf::from("/keys/m.txt")));
             assert!(config.is_none());
             assert_eq!(passphrase, "");
@@ -249,15 +287,19 @@ fn parse_sign_challenge_with_config() {
     let cli = Cli::parse_from([
         "konsensus",
         "sign-challenge",
+        "--challenge",
+        "bitsov-auth-v1:cd:2",
         "--config",
         "/data/konsensus.toml",
     ]);
     match cli.command {
         Command::SignChallenge {
+            challenge,
             mnemonic,
             config,
             passphrase,
         } => {
+            assert_eq!(challenge, "bitsov-auth-v1:cd:2");
             assert!(mnemonic.is_none());
             assert_eq!(config, Some(PathBuf::from("/data/konsensus.toml")));
             assert_eq!(passphrase, "");
@@ -271,6 +313,8 @@ fn parse_sign_challenge_with_passphrase() {
     let cli = Cli::parse_from([
         "konsensus",
         "sign-challenge",
+        "--challenge",
+        "bitsov-auth-v1:ef:3",
         "--mnemonic",
         "/keys/m.txt",
         "--passphrase",
@@ -278,10 +322,12 @@ fn parse_sign_challenge_with_passphrase() {
     ]);
     match cli.command {
         Command::SignChallenge {
+            challenge,
             mnemonic,
             config,
             passphrase,
         } => {
+            assert_eq!(challenge, "bitsov-auth-v1:ef:3");
             assert_eq!(mnemonic, Some(PathBuf::from("/keys/m.txt")));
             assert!(config.is_none());
             assert_eq!(passphrase, "my-pass");
@@ -345,20 +391,63 @@ fn parse_node_id_missing_both_fails() {
 #[test]
 fn parse_sign_challenge_missing_both_fails() {
     // Either --mnemonic or --config is required for sign-challenge
-    let result = Cli::try_parse_from(["konsensus", "sign-challenge"]);
+    let result = Cli::try_parse_from([
+        "konsensus",
+        "sign-challenge",
+        "--challenge",
+        "bitsov-auth-v1:ab:1",
+    ]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_sign_challenge_missing_challenge_fails() {
+    let result = Cli::try_parse_from(["konsensus", "sign-challenge", "--mnemonic", "/keys/m.txt"]);
     assert!(result.is_err());
 }
 
 #[test]
 fn owner_approval_commands_require_the_complete_tuple() {
-    let first = ["konsensus", "approve", "first-contact", "--client", "client-1", "--op", "grant-1", "--to", "recipient", "--max-msat", "4000"];
-    let gift = ["konsensus", "approve", "gift", "--intro", "intro-1", "--newcomer", "key", "--hash", "hash", "--gift-msat", "20000", "--fee-max-msat", "1000", "--code", "012345"];
+    let first = [
+        "konsensus",
+        "approve",
+        "first-contact",
+        "--client",
+        "client-1",
+        "--op",
+        "grant-1",
+        "--to",
+        "recipient",
+        "--max-msat",
+        "4000",
+    ];
+    let gift = [
+        "konsensus",
+        "approve",
+        "gift",
+        "--intro",
+        "intro-1",
+        "--newcomer",
+        "key",
+        "--hash",
+        "hash",
+        "--gift-msat",
+        "20000",
+        "--fee-max-msat",
+        "1000",
+        "--code",
+        "012345",
+    ];
     for args in [&first[..], &gift[..]] {
         assert!(Cli::try_parse_from(args).is_ok());
         for index in (3..args.len()).step_by(2) {
             let mut incomplete = args.to_vec();
             incomplete.drain(index..index + 2);
-            assert!(Cli::try_parse_from(incomplete).is_err(), "missing {}", args[index]);
+            assert!(
+                Cli::try_parse_from(incomplete).is_err(),
+                "missing {}",
+                args[index]
+            );
         }
     }
     for invalid in ["12345", "1234567", "abcdef", "１２３４５６", " 123456"] {
@@ -437,11 +526,13 @@ fn owner_approval_strings_reject_controls_and_surrounding_whitespace() {
                     args[index] = &value;
                     match Cli::try_parse_from(args) {
                         Ok(_) => accepted.push(format!("{} {flag} {value:?}", command[2])),
-                        Err(error) if character.is_control() || !character.is_whitespace() => assert!(
-                            !error.to_string().contains(&value),
-                            "diagnostic echoed {} {flag} {value:?}",
-                            command[2]
-                        ),
+                        Err(error) if character.is_control() || !character.is_whitespace() => {
+                            assert!(
+                                !error.to_string().contains(&value),
+                                "diagnostic echoed {} {flag} {value:?}",
+                                command[2]
+                            )
+                        }
                         Err(_) => {}
                     }
                 }

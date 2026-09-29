@@ -20,13 +20,15 @@ async fn kit(budget: u64) -> (Fx, String, Value) {
     fx.state = Arc::new(AppState {
         sponsor: SponsorPolicy::new(true, GIFT, FEE, 1_000_000, 2).unwrap(),
         introduction: intro(9001),
+        front_door: Default::default(),
         ..(*fx.state).clone()
     });
     let token = fx.grant(None, GrantTerms::new(budget)).await;
     let path = fx.tmp.path().join("newcomer-ln.db");
     let (_, identity) = konsensus_core::identity::NodeIdentity::generate().unwrap();
     let base = test_state_with_lightning(Arc::new(SharedMockProvider::new(&path, "newcomer", 0).unwrap()));
-    let newcomer = Arc::new(AppState { identity: Arc::new(identity), introduction: intro(9002), ..(*base).clone() });
+    let newcomer = Arc::new(AppState { identity: Arc::new(identity), introduction: intro(9002),
+        front_door: Default::default(), ..(*base).clone() });
     let newcomer_token = konsensus_api::auth::create_token(
         &newcomer.identity.node_id().to_hex(), &newcomer.jwt_secret, Scope::all()).unwrap();
 

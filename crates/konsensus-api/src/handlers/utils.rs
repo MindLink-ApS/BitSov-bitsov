@@ -4,10 +4,10 @@ use sha2::{Digest, Sha256};
 
 /// Generate a synthetic payment proof (preimage + hash).
 ///
-/// Used for:
-/// - Zero-price control messages (kind 0) that don't require real payment
-/// - Server response envelopes (web manifest, page response) where the
-///   requester already paid for the request
+/// Used for zero-price control paths that still need a structurally valid
+/// proof pair. **Web service replies** (KIND_WEB_MANIFEST / KIND_PAGE_RESPONSE)
+/// must NOT use this — they use [`konsensus_core::reply_bound_proof`] so the
+/// reply is bound to the requester's paid request (no self-minted proof).
 ///
 /// **NOT** a fallback for Lightning unavailability — if Lightning is down,
 /// the compose handler returns an error (fail-closed, Principle 2).

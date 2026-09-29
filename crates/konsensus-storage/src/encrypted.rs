@@ -597,6 +597,25 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
             .await
     }
 
+    async fn record_outgoing_web_request(
+        &self,
+        payment_hash: &[u8; 32],
+        request: konsensus_core::web_reply::OutstandingWebRequest,
+    ) -> Result<(), StorageError> {
+        self.inner.record_outgoing_web_request(payment_hash, request).await
+    }
+
+    async fn take_outstanding_web_request(
+        &self,
+        payment_hash: &[u8; 32],
+    ) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, StorageError> {
+        self.inner.take_outstanding_web_request(payment_hash).await
+    }
+
+    async fn sweep_outstanding_web_requests(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
+        self.inner.sweep_outstanding_web_requests(now_ms, max).await
+    }
+
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
         self.inner.has_nonce(nonce).await
     }
