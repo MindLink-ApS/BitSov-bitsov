@@ -31,15 +31,21 @@ use crate::state::AppState;
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const CARD_FILE: &str = "front-door.json";
+const SEQ_FILE: &str = "front-door.seq";
 
 /// Advertised on `/api/v1/status`.
 pub const CAPABILITY: &str = "front_door_v1";
 
 /// Published card, loaded from and written to `pages/front-door.json`.
+///
+/// A separate `front-door.seq` floor survives a corrupt or tampered card file
+/// so the next publish never silently restarts at seq 1.
 #[derive(Debug, Clone, Default)]
 pub struct FrontDoorStore {
     pub card: Arc<Mutex<Option<FrontDoorCard>>>,
-    /// Absolute path of the persistence file, when a content or data dir exists.
+    /// Highest seq we have ever issued or salvaged; next publish is floor+1.
+    pub seq_floor: Arc<Mutex<u64>>,
+    /// Absolute path of the card file, when a content or data dir exists.
     persist: Option<PathBuf>,
 }
 
@@ -52,20 +58,57 @@ impl FrontDoorStore {
         data_dir.map(|d| d.join("pages").join(CARD_FILE))
     }
 
+    fn seq_path(card_path: &Path) -> PathBuf {
+        card_path.with_file_name(SEQ_FILE)
+    }
+
     /// Load any previously published card from disk.
-    pub fn load(content_dir: Option<&Path>, data_dir: Option<&Path>) -> Self {
+    ///
+    /// `own_node_id` is this node's hex Ed25519 id. Foreign cards are ignored
+    /// (R2). Corrupt/tampered cards do not load, but their seq (and any
+    /// `front-door.seq` floor) still raises the monotonic floor (R1).
+    pub fn load(content_dir: Option<&Path>, data_dir: Option<&Path>, own_node_id: &str) -> Self {
         let persist = Self::persist_path(content_dir, data_dir);
-        let card = persist
+        let mut floor = persist
             .as_ref()
-            .and_then(|p| match load_card(p) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(path = %p.display(), error = %e, "front-door card load failed");
-                    None
+            .map(|p| read_seq_floor(&Self::seq_path(p)))
+            .unwrap_or(0);
+        let card = persist.as_ref().and_then(|p| match load_card(p, own_node_id) {
+            LoadOutcome::Ours(c) => {
+                floor = floor.max(c.seq);
+                Some(*c)
+            }
+            LoadOutcome::Foreign { seq } => {
+                tracing::warn!(
+                    path = %p.display(),
+                    seq,
+                    "ignoring foreign front-door card (not our node_id)"
+                );
+                // Do not adopt a stranger's seq as ours — only our seq file counts.
+                None
+            }
+            LoadOutcome::Missing => None,
+            LoadOutcome::Corrupt { salvaged_seq, error } => {
+                tracing::warn!(
+                    path = %p.display(),
+                    error = %error,
+                    salvaged_seq,
+                    "front-door card load failed; keeping seq floor"
+                );
+                if let Some(s) = salvaged_seq {
+                    floor = floor.max(s);
                 }
-            });
+                None
+            }
+        });
+        if floor > 0 {
+            if let Some(path) = persist.as_ref() {
+                let _ = write_seq_floor(&Self::seq_path(path), floor);
+            }
+        }
         Self {
             card: Arc::new(Mutex::new(card)),
+            seq_floor: Arc::new(Mutex::new(floor)),
             persist,
         }
     }
@@ -88,18 +131,82 @@ impl FrontDoorStore {
         std::fs::rename(&tmp, path).map_err(|e| {
             ApiError::Internal(format!("front_door persist rename {}: {e}", path.display()))
         })?;
+        write_seq_floor(&Self::seq_path(path), card.seq)?;
         Ok(())
     }
 }
 
-fn load_card(path: &Path) -> Result<Option<FrontDoorCard>, String> {
+enum LoadOutcome {
+    Ours(Box<FrontDoorCard>),
+    Foreign { seq: u64 },
+    Missing,
+    Corrupt {
+        salvaged_seq: Option<u64>,
+        error: String,
+    },
+}
+
+fn load_card(path: &Path, own_node_id: &str) -> LoadOutcome {
     if !path.exists() {
-        return Ok(None);
+        return LoadOutcome::Missing;
     }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let card: FrontDoorCard = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    card.verify_signature().map_err(|e| e.to_string())?;
-    Ok(Some(card))
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            return LoadOutcome::Corrupt {
+                salvaged_seq: None,
+                error: e.to_string(),
+            }
+        }
+    };
+    let salvaged_seq = salvage_seq(&bytes);
+    let card: FrontDoorCard = match serde_json::from_slice(&bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            return LoadOutcome::Corrupt {
+                salvaged_seq,
+                error: e.to_string(),
+            }
+        }
+    };
+    if let Err(e) = card.verify_signature() {
+        return LoadOutcome::Corrupt {
+            salvaged_seq: salvaged_seq.or(Some(card.seq)),
+            error: e.to_string(),
+        };
+    }
+    if !own_node_id.is_empty() && card.node_id != own_node_id {
+        return LoadOutcome::Foreign { seq: card.seq };
+    }
+    LoadOutcome::Ours(Box::new(card))
+}
+
+fn salvage_seq(bytes: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    v.get("seq")?.as_u64()
+}
+
+fn read_seq_floor(path: &Path) -> u64 {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    text.trim().parse::<u64>().unwrap_or(0)
+}
+
+fn write_seq_floor(path: &Path, seq: u64) -> Result<(), ApiError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ApiError::Internal(format!("front_door seq mkdir {}: {e}", parent.display()))
+        })?;
+    }
+    let tmp = path.with_extension("seq.tmp");
+    std::fs::write(&tmp, format!("{seq}\n")).map_err(|e| {
+        ApiError::Internal(format!("front_door seq write {}: {e}", tmp.display()))
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        ApiError::Internal(format!("front_door seq rename {}: {e}", path.display()))
+    })?;
+    Ok(())
 }
 
 /// `GET` / `PUT` / verify response.
@@ -231,7 +338,8 @@ async fn put_front_door(
     let height = state.chain.get_block_height().await.unwrap_or(0);
 
     let mut store = state.front_door.card.lock().await;
-    let prior_seq = store.as_ref().map(|c| c.seq).unwrap_or(0);
+    let mut floor = state.front_door.seq_floor.lock().await;
+    let prior_seq = store.as_ref().map(|c| c.seq).unwrap_or(0).max(*floor);
     let next_seq = prior_seq.saturating_add(1);
     if next_seq <= prior_seq {
         return Err(ApiError::Conflict(format!(
@@ -267,7 +375,9 @@ async fn put_front_door(
     )
     .map_err(|e| ApiError::Conflict(format!("front_door_unavailable: {e}")))?;
     state.front_door.save(&card)?;
+    *floor = card.seq;
     *store = Some(card.clone());
+    drop(floor);
     drop(store);
     let body = response_for(card, Some(network.as_str()), now_unix()?)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)))
@@ -285,7 +395,13 @@ async fn verify_front_door(
     let card = FrontDoorCard::parse(&req.card).map_err(map_err)?;
     // F1: signature before expiry/network — unsigned cards never look verified.
     card.verify_signature().map_err(map_err)?;
-    let network = state.introduction.network.as_deref().unwrap_or("regtest");
+    // R3: never invent a network; fail closed when the node has none.
+    let network = state.introduction.network.as_deref().ok_or_else(|| {
+        ApiError::Conflict(
+            "front_door_unavailable: this node's Lightning backend does not state a Bitcoin network"
+                .into(),
+        )
+    })?;
     let now = now_unix()?;
     let fresh = match card.verify(now, network) {
         Ok(()) => true,
