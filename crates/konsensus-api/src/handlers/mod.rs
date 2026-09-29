@@ -6,6 +6,7 @@ pub mod chain;
 pub mod content;
 pub mod export;
 pub mod files;
+pub mod front_door;
 pub mod gossip;
 pub mod health;
 pub mod hosting;

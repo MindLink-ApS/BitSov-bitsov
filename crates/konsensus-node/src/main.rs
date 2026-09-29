@@ -996,6 +996,7 @@ async fn cmd_start(
             network: config.lightning.bitcoin_network(),
             endpoint: config.network.introduction_endpoint(),
         },
+        front_door: Default::default(),
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
     });

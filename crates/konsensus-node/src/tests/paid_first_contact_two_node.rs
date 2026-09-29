@@ -484,6 +484,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         lightning_backend: "shared_mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: None,
         file_staging: Default::default(),

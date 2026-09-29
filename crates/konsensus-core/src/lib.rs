@@ -11,6 +11,7 @@ pub mod envelope;
 pub mod error;
 pub mod federation;
 pub mod fee_rate;
+pub mod front_door;
 pub mod gate;
 pub mod identity;
 pub mod introduction;
