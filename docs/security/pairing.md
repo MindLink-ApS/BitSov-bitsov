@@ -165,6 +165,6 @@ that widens issuance, and no fallback to a stronger scope to keep a screen
 green. #74 and #75 remain separate follow-ups, and bitsov-app#19 is not started
 here.
 
-Scopes landed on `main` in `ade8b536` and are not in `v0.3.0-rc6` or
-`v0.3.0-rc7`. Everything above becomes true of the product only when a build
-carrying it ships and the app is re-pinned.
+Scopes landed on `main` in `ade8b536` and were not in `v0.3.0-rc6` or
+`v0.3.0-rc7`. They ship in the `v0.3.0-rc8` cut (see `docs/releases/v0.3.0-rc8.md`)
+once that tag is published and the app is re-pinned.

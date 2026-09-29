@@ -3,6 +3,10 @@
 This note covers two common failure modes when replacing the `konsensus` binary on a
 production data directory without re-running `konsensus init`.
 
+**rc8:** both issues below are in `v0.3.0-rc8` (and current `main`). Read this before
+swapping a long-lived data directory onto the new binary. Fresh `konsensus init`
+installs are unaffected.
+
 ## Missing `NODE_INITIALIZED` after upgrade (pre-#76/#77 nodes)
 
 Nodes deployed before bootstrap (#76/#77) never wrote a `NODE_INITIALIZED` marker. After
