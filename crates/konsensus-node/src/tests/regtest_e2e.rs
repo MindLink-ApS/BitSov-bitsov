@@ -549,7 +549,7 @@ async fn recv_from(
 }
 
 /// One call signal through `from`'s real compose API.
-async fn signal(
+async fn call_signal(
     from: &app::App,
     to: &konsensus_core::NodeId,
     kind: u16,
@@ -941,25 +941,25 @@ async fn mexico_demo_rehearsal() {
         let call_id = format!("{:032x}", rand::random::<u128>());
         let sdp = r"v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
         let offer = format!(r#"{{"v":1,"call_id":"{call_id}","media":"audio","sdp":"{sdp}"}}"#);
-        let (status, body) = signal(&alice, &bob_id, 400, &offer).await;
+        let (status, body) = call_signal(&alice, &bob_id, 400, &offer).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["amount_msat"], call_msat, "{body}");
         let rung = recv_from(&mut bob, &alice_id, 400).await;
         assert_eq!(rung.plaintext.as_deref(), Some(offer.as_str()));
         let paid = settled_outgoing(&a).await.len();
-        let (status, body) = signal(&alice, &bob_id, 400, &offer).await;
+        let (status, body) = call_signal(&alice, &bob_id, 400, &offer).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["reason"], "call_id_used", "{body}");
         assert_eq!(settled_outgoing(&a).await.len(), paid, "refusal pays nothing");
 
         let answer = format!(r#"{{"v":1,"call_id":"{call_id}","sdp":"{sdp}"}}"#);
-        let (status, body) = signal(&bob, &alice_id, 401, &answer).await;
+        let (status, body) = call_signal(&bob, &alice_id, 401, &answer).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["amount_msat"], signal_msat, "{body}");
         let answered = recv_from(&mut alice, &bob_id, 401).await;
         assert_eq!(answered.plaintext.as_deref(), Some(answer.as_str()));
         let hangup = format!(r#"{{"v":1,"call_id":"{call_id}","reason":"hangup"}}"#);
-        let (status, body) = signal(&alice, &bob_id, 403, &hangup).await;
+        let (status, body) = call_signal(&alice, &bob_id, 403, &hangup).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["amount_msat"], signal_msat, "{body}");
         recv_from(&mut bob, &alice_id, 403).await;
