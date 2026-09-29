@@ -62,10 +62,29 @@ async fn write(store: Store<'_>, peer: &NodeId, call_id: &str, entry: Option<&Ca
     }
 }
 
-/// A new call id must fit the per-peer and total bounds. Nothing unexpired is evicted.
+/// Room for a new call id. Open calls must fit their bounds and are never
+/// evicted. Burned ids have their own bounds: past one, the oldest ids burned
+/// for at least `BURN_MIN_MS` make room, so ended calls cannot block a pair or
+/// the node for the whole tombstone (Fable N3); younger ones are never
+/// dropped, and if they alone fill a bound the call is refused.
 async fn room(store: Store<'_>, peer: &NodeId, now: u64) -> Result<(), CallRefusal> {
-    let (mine, total) = store.call_counts(peer, now).await.map_err(|_| CallRefusal::Invalid("call state unavailable"))?;
-    rules::has_room(mine as usize, total as usize)
+    let unavailable = |_: konsensus_storage::StorageError| CallRefusal::Invalid("call state unavailable");
+    let counts = store.call_counts(peer, now).await.map_err(unavailable)?;
+    rules::has_room(&counts)?;
+    let until = rules::evictable_until(now);
+    let excess = rules::burned_excess(counts.burned_peer, rules::MAX_BURNED_PER_PEER);
+    let mut freed = 0;
+    if excess > 0 {
+        freed = store.call_evict_burned(Some(peer), until, now, excess).await.map_err(unavailable)?;
+        if freed < excess {
+            return Err(CallRefusal::Full);
+        }
+    }
+    let excess = rules::burned_excess(counts.burned_total.saturating_sub(freed), rules::MAX_BURNED_CALLS);
+    if excess > 0 && store.call_evict_burned(None, until, now, excess).await.map_err(unavailable)? < excess {
+        return Err(CallRefusal::Full);
+    }
+    Ok(())
 }
 
 /// Admit a signal this node received (after the payment gate). A refusal
@@ -96,11 +115,19 @@ fn refused(e: CallRefusal) -> ApiError {
 }
 
 /// Reserve one of our signals under `operation_id`, before any quote or payment.
+/// An operation id already reserving a signal for another call is refused
+/// (Fable N2): one operation pays for one signal of one call.
 pub async fn reserve_outgoing(store: Store<'_>, peer: &NodeId, kind: u16, plaintext: &str, operation_id: &str) -> Result<(), ApiError> {
     let signal = CallSignal::parse(kind, plaintext).map_err(refused)?;
     let _g = lock().lock().await;
     let now = now_ms();
     let storage = |e: konsensus_storage::StorageError| ApiError::Internal(format!("call state: {e}"));
+    let elsewhere = store.call_pending().await.map_err(storage)?.into_iter().any(|(p, call_id, e)| {
+        e.pending.is_some_and(|x| x.operation_id == operation_id) && (p != *peer || call_id != signal.call_id)
+    });
+    if elsewhere {
+        return Err(ApiError::OperationConflict("operation_mismatch"));
+    }
     let entry = current(store, peer, &signal.call_id, now).await.map_err(storage)?;
     if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
         room(store, peer, now).await.map_err(refused)?;
@@ -139,10 +166,13 @@ pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, o
 }
 
 /// After compose returned (either way): read the operation journal and commit,
-/// release (definite nonpayment) or keep (ambiguous) the reservation.
-pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str) {
+/// release (definite nonpayment) or keep (ambiguous) the reservation. A
+/// journal entry for a different request (`request_hash`) never paid for this
+/// signal: the reservation is released (Fable N2).
+pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
     let Ok(signal) = serde_json::from_str::<CallSignal>(plaintext) else { return };
     let state = match store.get_outbox_operation(operation_id).await {
+        Ok(Some(op)) if op.request_hash != request_hash => None,
         Ok(op) => op.map(|o| o.state),
         Err(e) => {
             tracing::warn!(error = %e, "call reservation kept: operation state unreadable");
@@ -152,6 +182,36 @@ pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, 
     let how = rules::settlement(state.as_deref());
     if let Err(e) = settle(store, peer, &signal.call_id, operation_id, how).await {
         tracing::warn!(peer = %peer, error = %e, "call reservation not resolved; recovery will retry");
+    }
+}
+
+/// The background reconciler (`reconcile_operations`) resolved call operation
+/// `op` without a compose request: commit or release its reservation exactly
+/// as `resolve_outgoing` would, before the paid envelope is resent, so the
+/// callee's answer finds a ringing call (Fable N1). Ambiguous stays reserved.
+/// Never fails the sweep; a store error leaves it for the next one.
+pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOperation) {
+    if !u16::try_from(op.kind).is_ok_and(is_call_kind) {
+        return;
+    }
+    let Ok(peer) = NodeId::from_hex(&op.recipient) else { return };
+    let how = rules::settlement(Some(&op.state));
+    if how == Settlement::Ambiguous {
+        return;
+    }
+    let pending = match store.call_pending().await {
+        Ok(pending) => pending,
+        Err(e) => {
+            tracing::warn!(operation_id = %op.operation_id, error = %e, "call reservation not settled; next sweep retries");
+            return;
+        }
+    };
+    for (p, call_id, entry) in pending {
+        if p == peer && entry.pending.is_some_and(|x| x.operation_id == op.operation_id) {
+            if let Err(e) = settle(store, &peer, &call_id, &op.operation_id, how).await {
+                tracing::warn!(operation_id = %op.operation_id, error = %e, "call reservation not settled; next sweep retries");
+            }
+        }
     }
 }
 
@@ -197,7 +257,10 @@ pub async fn peer_call_price(state: &AppState, peer: &NodeId) -> Result<u64, Api
         .with_reason("call_price_unknown")
     };
     let now = Instant::now();
-    let asked = {
+    // A query counts as asked only once it was sent (Fable N4): the slot is
+    // claimed so concurrent callers share one frame, and given back if the
+    // send fails, so nobody waits for an answer to a query never sent.
+    let (asked, send) = {
         let mut last = last_query().lock().unwrap_or_else(|e| e.into_inner());
         match last.get(peer).copied().filter(|t| now.duration_since(*t) < PRICE_QUERY_MIN_INTERVAL) {
             Some(recent) => (recent, false),
@@ -210,23 +273,35 @@ pub async fn peer_call_price(state: &AppState, peer: &NodeId) -> Result<u64, Api
             }
         }
     };
-    let (asked, send) = asked;
+    let still_asked = || last_query().lock().unwrap_or_else(|e| e.into_inner()).get(peer).is_some_and(|t| *t >= asked);
     if send {
-        let frame = konsensus_message::Frame::PriceQuery { kind }
-            .to_bytes()
-            .map_err(|e| ApiError::Internal(format!("frame serialization error: {e}")))?;
-        state.transport.send_raw_frame(peer, &frame).await.map_err(|_| unknown())?;
+        let sent = match (konsensus_message::Frame::PriceQuery { kind }).to_bytes() {
+            Ok(frame) => state.transport.send_raw_frame(peer, &frame).await.map_err(|_| unknown()),
+            Err(e) => Err(ApiError::Internal(format!("frame serialization error: {e}"))),
+        };
+        if let Err(e) = sent {
+            let mut last = last_query().lock().unwrap_or_else(|e| e.into_inner());
+            if last.get(peer) == Some(&asked) {
+                last.remove(peer);
+            }
+            return Err(e);
+        }
     }
     tokio::time::timeout(PRICE_QUERY_TIMEOUT, async {
         loop {
             if state.peer_prices.kind_answered_at(peer, kind).await.is_some_and(|at| at >= asked) {
-                break;
+                return Ok(());
+            }
+            if !send && !still_asked() {
+                // The query we were sharing was never sent (and no newer one was).
+                return Err(());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .map_err(|_| unknown())?;
+    .map_err(|_| unknown())?
+    .map_err(|()| unknown())?;
     let height = state.chain.get_block_height().await.unwrap_or(0);
     state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, PRICE_ANSWER_MAX_AGE).await.ok_or_else(unknown)
 }

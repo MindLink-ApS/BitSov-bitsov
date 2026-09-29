@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::{body::Body, http::Request};
 use konsensus_api::calls;
-use konsensus_core::payloads::call::{CallSignal, Phase, MAX_CALLS_PER_PEER, MAX_TRACKED_CALLS};
+use konsensus_core::payloads::call::{CallEntry, CallSignal, Phase, Side, BURN_MIN_MS, MAX_BURNED_PER_PEER, MAX_OPEN_CALLS_PER_PEER, TOMBSTONE_MS};
 use konsensus_core::traits::lightning::LightningProvider;
 use konsensus_core::{NodeId, PaymentProof, Recipient, UkmEnvelopeBuilder};
 use konsensus_storage::{SqliteStorage, Storage};
@@ -90,35 +90,99 @@ async fn an_unpaid_answer_leaves_the_call_ringing_and_retryable() {
     assert_eq!((entry.phase, entry.pending), (Phase::Ringing, None));
 }
 
-/// Probe `unexpired_burned_id_is_readmitted_under_capacity_pressure`, fixed:
-/// a full table refuses new ids instead of evicting unexpired replay
-/// protection, per peer and in total.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+/// Offer and hang up `n` calls from `peer`, one at a time (ids `from..from+n`).
+async fn burn(store: &SqliteStorage, peer: &NodeId, from: usize, n: usize) {
+    for i in from..from + n {
+        calls::admit_incoming(store, peer, 400, Some(&body(400, &id(i)))).await.unwrap();
+        calls::admit_incoming(store, peer, 403, Some(&body(403, &id(i)))).await.unwrap();
+    }
+}
+
+/// Probe `unexpired_burned_id_is_readmitted_under_capacity_pressure`, still
+/// fixed: under pressure, an id burned less than `BURN_MIN_MS` ago is never
+/// dropped; the pair is refused instead. Fable N3: that refusal is per pair,
+/// not node-wide, and ended calls never count against open ones.
 #[tokio::test]
-async fn a_full_table_refuses_new_calls_and_never_forgets_a_burned_id() {
+async fn young_burned_ids_are_never_dropped_and_only_block_their_own_pair() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let peer = NodeId::from_bytes([80; 32]);
-    for i in 0..MAX_CALLS_PER_PEER {
+    burn(&store, &peer, 0, MAX_BURNED_PER_PEER as usize).await;
+    let err = calls::admit_incoming(&store, &peer, 400, Some(&body(400, &id(100_000)))).await.unwrap_err();
+    assert_eq!(err.to_string(), "too many calls tracked; try again later");
+    assert!(calls::admit_incoming(&store, &peer, 400, Some(&body(400, &id(0)))).await.is_err(), "burned id stays burned");
+    assert!(store.call_get(&peer, &id(0)).await.unwrap().is_some(), "nothing young was evicted");
+    // Another pair is unaffected, and so is our own call to someone else.
+    let other = NodeId::from_bytes([79; 32]);
+    calls::admit_incoming(&store, &other, 400, Some(&body(400, &id(100_001)))).await.unwrap();
+    calls::reserve_outgoing(&store, &NodeId::from_bytes([78; 32]), 400, &body(400, &id(100_002)), "op-elsewhere").await.unwrap();
+}
+
+/// Fable N3: past `BURN_MIN_MS`, the oldest burned ids of a pair make room for
+/// a new call instead of blocking the pair for the rest of the day; younger
+/// ones stay burned.
+#[tokio::test]
+async fn burned_ids_older_than_the_minimum_make_room_oldest_first() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([77; 32]);
+    let now = now_ms();
+    // 255 calls that ended more than BURN_MIN_MS ago (oldest = id 0) ...
+    for i in 0..MAX_BURNED_PER_PEER as usize - 1 {
+        let ended = now - BURN_MIN_MS - 60_000 * (MAX_BURNED_PER_PEER - i as u64);
+        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None };
+        store.call_put(&peer, &id(i), &entry).await.unwrap();
+    }
+    // ... and one that just ended.
+    let young = MAX_BURNED_PER_PEER as usize - 1;
+    burn(&store, &peer, young, 1).await;
+    calls::admit_incoming(&store, &peer, 400, Some(&body(400, &id(1_000)))).await.unwrap();
+    assert!(store.call_get(&peer, &id(0)).await.unwrap().is_none(), "the oldest burned id made room");
+    assert!(store.call_get(&peer, &id(1)).await.unwrap().is_some(), "only as many as needed");
+    assert!(calls::admit_incoming(&store, &peer, 400, Some(&body(400, &id(young)))).await.is_err(), "the young id stays burned");
+    assert!(calls::admit_incoming(&store, &peer, 400, Some(&body(400, &id(1)))).await.is_err(), "an old id not needed for room stays burned");
+}
+
+/// Fable N3: open calls have their own small bound, and ending one frees it.
+#[tokio::test]
+async fn open_calls_are_bounded_per_peer_and_freed_by_hangup() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([76; 32]);
+    for i in 0..MAX_OPEN_CALLS_PER_PEER as usize {
         calls::admit_incoming(&store, &peer, 400, Some(&body(400, &id(i)))).await.unwrap();
     }
+    let next = id(MAX_OPEN_CALLS_PER_PEER as usize);
+    assert!(calls::admit_incoming(&store, &peer, 400, Some(&body(400, &next))).await.is_err());
     calls::admit_incoming(&store, &peer, 403, Some(&body(403, &id(0)))).await.unwrap();
-    assert!(calls::admit_incoming(&store, &peer, 400, Some(&body(400, &id(MAX_CALLS_PER_PEER)))).await.is_err(), "per-peer bound");
-    assert!(calls::admit_incoming(&store, &peer, 400, Some(&body(400, &id(0)))).await.is_err(), "burned id stays burned");
-    // Other peers still fit until the total bound.
-    let mut n = MAX_CALLS_PER_PEER;
-    'fill: for p in 1..=u8::MAX {
-        let other = NodeId::from_bytes([p; 32]);
-        for _ in 0..MAX_CALLS_PER_PEER {
-            if n == MAX_TRACKED_CALLS {
-                break 'fill;
-            }
-            calls::admit_incoming(&store, &other, 400, Some(&body(400, &id(n)))).await.unwrap();
-            n += 1;
-        }
-    }
-    let fresh = NodeId::from_bytes([7; 32]);
-    let err = calls::admit_incoming(&store, &fresh, 400, Some(&body(400, &id(99_999)))).await.unwrap_err();
-    assert_eq!(err.to_string(), "too many calls tracked; try again later");
-    assert!(calls::admit_incoming(&store, &peer, 400, Some(&body(400, &id(0)))).await.is_err());
+    calls::admit_incoming(&store, &peer, 400, Some(&body(400, &next))).await.unwrap();
+}
+
+/// Fable N2: one operation id pays for one signal of one call. Reusing it for
+/// another call id is refused before any reservation, whether the first
+/// request is still reserved or already in the journal.
+#[tokio::test]
+async fn an_operation_id_reused_for_another_call_is_refused_before_reserving() {
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let state = sqlite_state(wallet.clone()).await;
+    let store = state.storage.as_ref();
+    let peer = NodeId::from_bytes([75; 32]);
+    // Still reserved under the operation.
+    calls::reserve_outgoing(store, &peer, 400, &body(400, &id(1)), "op-reused").await.unwrap();
+    calls::reserve_outgoing(store, &peer, 400, &body(400, &id(1)), "op-reused").await.unwrap();
+    let err = calls::reserve_outgoing(store, &peer, 400, &body(400, &id(2)), "op-reused").await.unwrap_err();
+    assert!(format!("{err:?}").contains("operation_mismatch"), "{err:?}");
+    assert!(store.call_get(&peer, &id(2)).await.unwrap().is_none());
+    // In the journal (the first request was refused and released).
+    let op = uuid::Uuid::new_v4().to_string();
+    let first = compose(&state, &op, &peer, 400, &body(400, &id(3))).await;
+    assert!(first["reason"].is_string(), "{first}");
+    let second = compose(&state, &op, &peer, 400, &body(400, &id(4))).await;
+    assert_eq!(second["code"], "operation_mismatch", "{second}");
+    assert!(store.call_get(&peer, &id(4)).await.unwrap().is_none(), "no reservation for the second call");
+    assert!(calls::admit_incoming(store, &peer, 401, Some(&body(401, &id(4)))).await.is_err(), "nothing to answer");
+    assert!(wallet.list_payments(100).await.unwrap().is_empty());
 }
 
 /// Probe `unrelated_price_response_satisfies_call_quote`, fixed: only a kind-400
@@ -167,6 +231,32 @@ async fn price_queries_to_one_peer_are_rate_limited() {
         .filter(|f| matches!(konsensus_message::wire::Frame::from_bytes(f), Ok(konsensus_message::wire::Frame::PriceQuery { kind: 400 })))
         .count();
     assert_eq!(queries, 1);
+}
+
+/// Fable N4: a price query that could not be sent does not hold the peer's
+/// query slot: it fails at once, and the next quote sends its own query.
+#[tokio::test]
+async fn a_price_query_that_was_not_sent_does_not_hold_the_slot() {
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let mut state = common::test_state_with_lightning(wallet);
+    let peer = NodeId::from_bytes([74; 32]);
+    // The default stub cannot send raw frames.
+    let started = std::time::Instant::now();
+    let err = calls::peer_call_price(&state, &peer).await.unwrap_err();
+    assert!(format!("{err:?}").contains("call_price_unknown"), "{err:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "no wait for an unsent query");
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    Arc::get_mut(&mut state).unwrap().transport = Arc::clone(&transport) as _;
+    let answer = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        state.peer_prices.update_kind_price(peer, 400, 10_000, 100).await;
+    };
+    let (price, ()) = tokio::join!(calls::peer_call_price(&state, &peer), answer);
+    assert_eq!(price.unwrap(), 10_000);
+    let queries = transport.raw_frames.lock().unwrap().iter()
+        .filter(|f| matches!(konsensus_message::wire::Frame::from_bytes(f), Ok(konsensus_message::wire::Frame::PriceQuery { kind: 400 })))
+        .count();
+    assert_eq!(queries, 1, "within the 2 s window, the retry still asked");
 }
 
 /// Probe `rejected_stored_call_signal_reaches_ws_through_resync`, fixed: once

@@ -924,8 +924,17 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call state".into()))
     }
 
-    /// `(for this peer, in total)`: entries whose replay protection runs past `now_ms`.
-    async fn call_counts(&self, _peer: &konsensus_core::NodeId, _now_ms: u64) -> Result<(u64, u64), StorageError> {
+    /// Open calls and burned ids as of `now_ms`, for this peer and in total.
+    /// Open: a pending signal of ours, or reserved/ringing/live before its
+    /// deadline. Burned: otherwise, while replay protection runs past `now_ms`.
+    async fn call_counts(&self, _peer: &konsensus_core::NodeId, _now_ms: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Drop up to `max` burned ids (of `peer`, or of anyone) whose replay
+    /// protection ends at or before `replay_until_at_most`, oldest first. Never
+    /// an open call or a row with a pending signal. Returns how many went.
+    async fn call_evict_burned(&self, _peer: Option<&konsensus_core::NodeId>, _replay_until_at_most: u64, _now_ms: u64, _max: u64) -> Result<u64, StorageError> {
         Err(StorageError::Unsupported("call state".into()))
     }
 

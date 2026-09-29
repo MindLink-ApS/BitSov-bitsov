@@ -56,10 +56,22 @@ row and cached plaintext are deleted, and its receipt is marked
 application-rejected (`accepted = -1`): history, resync and a resend never
 present it as delivered, and its payment hash and nonce stay burned.
 
-**Bounds never evict replay protection.** At most 256 ids per peer and 4 096
-in total whose replay protection has not ended; a new call beyond that is
-refused (`call_busy`). Expired rows are swept every 5 minutes (never one with a
-pending signal).
+**Bounds.** Open calls (reserved, ringing, live, or with a signal of ours
+being paid) are bounded at 16 per peer and 4 096 in total and are never
+evicted; a new call beyond that is refused (`call_busy`). Burned ids (ended
+calls under replay protection) are bounded separately, 256 per peer and 65 536
+in total, so ended calls never block new ones for the whole tombstone: past a
+bound, the oldest ids burned for at least 1 hour make room; an id burned less
+than 1 hour ago is never dropped, and if those alone fill a bound the call is
+refused. Otherwise an id stays burned for 24 h. Expired rows are swept every 5
+minutes (never one with a pending signal).
+
+**One operation, one signal.** An operation id reused for another call id is
+refused (`operation_mismatch`) before any reservation; a retry of an operation
+that already paid is answered from the journal. The background operation
+reconciler settles a call reservation the same way the compose retry would,
+before any resend, so an offer whose payment resolved later rings the callee
+and accepts the answer.
 
 **Pricing freshness is per kind.** The caller asks the callee (`PriceQuery`
 400) and accepts only a kind-400 answer that arrived after that query; an

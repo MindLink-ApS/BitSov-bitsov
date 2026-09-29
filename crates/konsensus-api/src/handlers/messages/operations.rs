@@ -442,6 +442,19 @@ fn contextual(error: ApiError, op: &OutboxOperation) -> ApiError {
     }
 }
 
+/// The request an operation id is bound to (`OutboxOperation::request_hash`).
+pub(super) fn request_digest(peer: &NodeId, req: &ComposeRequest) -> Result<String, ApiError> {
+    // Length-delimited canonical representation prevents ambiguous concatenation.
+    let request = serde_json::to_vec(&(peer.to_hex(), req.kind, &req.plaintext, &req.references))
+        .map_err(storage)?;
+    Ok(blake3::hash(&request).to_hex().to_string())
+}
+
+/// The refusal for an operation id reused with a different request.
+pub(super) fn mismatch(op: &OutboxOperation) -> ApiError {
+    contextual(ApiError::OperationConflict("operation_mismatch"), op)
+}
+
 pub(super) async fn compose(
     auth: MeteredSpend,
     state: Arc<AppState>,
@@ -452,10 +465,7 @@ pub(super) async fn compose(
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
     let id = operation_id(req.operation_id.as_deref())?;
     let _guard = lock(&state, &id).await?;
-    // Length-delimited canonical representation prevents ambiguous concatenation.
-    let request = serde_json::to_vec(&(peer.to_hex(), req.kind, &req.plaintext, &req.references))
-        .map_err(storage)?;
-    let digest = blake3::hash(&request).to_hex().to_string();
+    let digest = request_digest(&peer, &req)?;
     let mut op = OutboxOperation::prepared(id.clone(), peer.to_hex(), req.kind, digest.clone());
     encode(
         &mut op,
@@ -483,10 +493,7 @@ pub(super) async fn compose(
             ));
         }
         if op.request_hash != digest {
-            return Err(contextual(
-                ApiError::OperationConflict("operation_mismatch"),
-                &op,
-            ));
+            return Err(mismatch(&op));
         }
         recover_budget(&state, &mut op).await?;
         // Pre-fix rows may have terminalized incomplete settlement as failed_paid.
@@ -1007,6 +1014,9 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
                 reconcile(state, &mut op).await?;
             }
             recover_budget(state, &mut op).await?;
+            // A call signal's reservation follows its operation here too, and
+            // before any resend (Fable N1).
+            crate::calls::settle_operation(state.storage.as_ref(), &op).await;
             if op.state == "paid" {
                 recover_paid(state, &mut op).await?;
             }

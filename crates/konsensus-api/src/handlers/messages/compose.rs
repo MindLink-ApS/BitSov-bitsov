@@ -3284,9 +3284,23 @@ pub(super) async fn compose_message(
         let peer_id = NodeId::from_hex(&req.recipient)
             .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
         let plaintext = req.plaintext.clone();
-        crate::calls::reserve_outgoing(state.storage.as_ref(), &peer_id, req.kind, &plaintext, &operation_id).await?;
+        // One operation id, one request (Fable N2): an id reused for another
+        // signal is refused before any reservation. A retry of an operation
+        // that already paid is answered from the journal, without reserving.
+        let request_hash = super::operations::request_digest(&peer_id, &req)?;
+        let journal = state.storage.get_outbox_operation(&operation_id).await
+            .map_err(|e| ApiError::Internal(format!("operation journal: {e}")))?;
+        if let Some(op) = journal.as_ref().filter(|op| op.request_hash != request_hash) {
+            return Err(super::operations::mismatch(op));
+        }
+        let paid = journal.as_ref().is_some_and(|op| {
+            konsensus_core::payloads::call::settlement(Some(&op.state)) == konsensus_core::payloads::call::Settlement::Paid
+        });
+        if !paid {
+            crate::calls::reserve_outgoing(state.storage.as_ref(), &peer_id, req.kind, &plaintext, &operation_id).await?;
+        }
         let result = super::operations::compose(auth, Arc::clone(&state), req, references).await;
-        crate::calls::resolve_outgoing(state.storage.as_ref(), &peer_id, &plaintext, &operation_id).await;
+        crate::calls::resolve_outgoing(state.storage.as_ref(), &peer_id, &plaintext, &operation_id, &request_hash).await;
         result
     } else {
         super::operations::compose(auth, state, req, references).await

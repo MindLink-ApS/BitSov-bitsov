@@ -1280,3 +1280,58 @@ async fn terminal_retention_keeps_duplicate_post_and_receipt_binding() {
     );
     assert!(f.db.get_message(&id).await.unwrap().is_none());
 }
+
+/// Fable N1 (#131 delta): a call offer whose payment was dispatched but not
+/// resolved when compose was cut off (crash, cancel, app gave up) stays
+/// reserved through startup recovery; when the background reconciler later
+/// finds it paid, it commits the call before resending, so the callee's
+/// answer is admitted without a same-operation re-POST, and nothing is paid
+/// twice.
+#[tokio::test]
+async fn background_reconcile_commits_a_paid_call_offer_before_resending() {
+    use konsensus_core::payloads::call::Phase;
+    let f = Fixture::new().await;
+    let peer = f.peer;
+    let prices = f.state.peer_prices.clone();
+    // The callee answers every call price query.
+    let answering = tokio::spawn(async move {
+        loop {
+            prices.update_kind_price(peer, 400, 10_000, 100).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    });
+    let call = format!("{:032x}", 0xca11_u128);
+    let offer = format!(r#"{{"v":1,"call_id":"{call}","media":"audio","sdp":"v=0"}}"#);
+    let answer = format!(r#"{{"v":1,"call_id":"{call}","sdp":"v=0"}}"#);
+    // Dispatched, but the wallet cannot say yet whether it settled.
+    f.wallet.mode.store(1, Ordering::SeqCst);
+    let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", common::auth_header(&f.state)).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"operation_id": f.id, "recipient": peer.to_hex(), "kind": 400, "plaintext": offer, "wait_ack_ms": 0}).to_string()))
+        .unwrap();
+    let app = common::test_router(f.state.clone());
+    let job = tokio::spawn(async move { app.oneshot(request).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while f.db.get_outbox_operation(&f.id).await.unwrap().is_none_or(|op| op.payment_hash.is_none()) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+    // Startup recovery keeps an ambiguous reservation; nobody is rung yet.
+    assert_eq!(konsensus_api::calls::recover(f.db.as_ref()).await.unwrap(), (0, 0));
+    assert_eq!(f.db.call_get(&peer, &call).await.unwrap().unwrap().phase, Phase::Reserved);
+    // It settles. The app only polls; the background sweep resolves it.
+    f.wallet.mode.store(0, Ordering::SeqCst);
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    let state = f.op().await.state;
+    assert!(matches!(state.as_str(), "paid" | "sent" | "acked"), "{state}");
+    let entry = f.db.call_get(&peer, &call).await.unwrap().unwrap();
+    assert_eq!((entry.phase, entry.pending), (Phase::Ringing, None), "committed by the sweep");
+    konsensus_api::calls::admit_incoming(f.db.as_ref(), &peer, 401, Some(&answer)).await.unwrap();
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "paid once");
+    answering.abort();
+}

@@ -40,10 +40,19 @@ pub const RING_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_CALL_MS: u64 = 4 * 60 * 60 * 1000;
 /// How long an ended or expired call id stays burned.
 pub const TOMBSTONE_MS: u64 = 24 * 60 * 60 * 1000;
-/// Bound on tracked calls (live + unexpired replay protection), in total.
-pub const MAX_TRACKED_CALLS: usize = 4096;
-/// Bound per peer, so one paying peer cannot fill the node's table.
-pub const MAX_CALLS_PER_PEER: usize = 256;
+/// Every burned id stays burned at least this long, whatever the pressure.
+/// Past it, and only when a burned-id bound is reached, the oldest burned ids
+/// make room; otherwise they stay burned for [`TOMBSTONE_MS`].
+pub const BURN_MIN_MS: u64 = 60 * 60 * 1000;
+/// Open calls (reserved, ringing, live, or with a signal of ours being paid)
+/// in total. Open calls are never evicted.
+pub const MAX_OPEN_CALLS: u64 = 4096;
+/// Open calls per peer, so one paying peer cannot fill the node's table.
+pub const MAX_OPEN_CALLS_PER_PEER: u64 = 16;
+/// Burned ids (ended calls still under replay protection) per peer.
+pub const MAX_BURNED_PER_PEER: u64 = 256;
+/// Burned ids in total.
+pub const MAX_BURNED_CALLS: u64 = 65_536;
 
 /// What media an offer asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,10 +339,37 @@ pub fn receive(entry: Option<CallEntry>, kind: u16, now_ms: u64) -> Result<CallE
     }
 }
 
-/// Room for one more new call id? `per_peer` and `total` count entries whose
-/// replay protection has not expired. Nothing unexpired is ever evicted.
-pub fn has_room(per_peer: usize, total: usize) -> Result<(), CallRefusal> {
-    if per_peer >= MAX_CALLS_PER_PEER || total >= MAX_TRACKED_CALLS { Err(CallRefusal::Full) } else { Ok(()) }
+/// Stored call rows as of one instant, split by what they hold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallCounts {
+    /// Open calls with this peer (reserved, ringing, live, or pending).
+    pub open_peer: u64,
+    pub open_total: u64,
+    /// Burned ids with this peer (ended, replay protection not yet over).
+    pub burned_peer: u64,
+    pub burned_total: u64,
+}
+
+/// Room for one more open call? Open calls are bounded and never evicted.
+/// Burned ids are bounded separately (see [`burned_excess`]), so ended calls
+/// never block new ones for the whole tombstone.
+pub fn has_room(counts: &CallCounts) -> Result<(), CallRefusal> {
+    if counts.open_peer >= MAX_OPEN_CALLS_PER_PEER || counts.open_total >= MAX_OPEN_CALLS {
+        Err(CallRefusal::Full)
+    } else {
+        Ok(())
+    }
+}
+
+/// How many burned ids must make room before one more call id fits under `cap`.
+pub fn burned_excess(burned: u64, cap: u64) -> u64 {
+    burned.saturating_add(1).saturating_sub(cap)
+}
+
+/// A burned id may make room only if its replay protection ends at or before
+/// this, i.e. it has been burned for at least [`BURN_MIN_MS`].
+pub fn evictable_until(now_ms: u64) -> u64 {
+    now_ms.saturating_add(TOMBSTONE_MS).saturating_sub(BURN_MIN_MS)
 }
 
 /// What to do with a reservation given its operation's journal state.
@@ -445,11 +481,19 @@ mod tests {
     }
 
     #[test]
-    fn room_is_bounded_per_peer_and_in_total_without_eviction() {
-        assert!(has_room(0, 0).is_ok());
-        assert_eq!(has_room(MAX_CALLS_PER_PEER, 0), Err(CallRefusal::Full));
-        assert_eq!(has_room(0, MAX_TRACKED_CALLS), Err(CallRefusal::Full));
-        assert!(has_room(MAX_CALLS_PER_PEER - 1, MAX_TRACKED_CALLS - 1).is_ok());
+    fn open_calls_are_bounded_and_burned_ids_are_bounded_separately() {
+        let c = |open_peer, open_total, burned_peer, burned_total| CallCounts { open_peer, open_total, burned_peer, burned_total };
+        assert!(has_room(&c(0, 0, 0, 0)).is_ok());
+        assert_eq!(has_room(&c(MAX_OPEN_CALLS_PER_PEER, 0, 0, 0)), Err(CallRefusal::Full));
+        assert_eq!(has_room(&c(0, MAX_OPEN_CALLS, 0, 0)), Err(CallRefusal::Full));
+        // Burned ids never count against open calls (Fable N3).
+        assert!(has_room(&c(MAX_OPEN_CALLS_PER_PEER - 1, MAX_OPEN_CALLS - 1, u64::MAX, u64::MAX)).is_ok());
+        assert_eq!(burned_excess(MAX_BURNED_PER_PEER - 1, MAX_BURNED_PER_PEER), 0);
+        assert_eq!(burned_excess(MAX_BURNED_PER_PEER, MAX_BURNED_PER_PEER), 1);
+        // An id ended at t is evictable only from t + BURN_MIN_MS.
+        let ended = commit(reserve(Some(receive(None, 400, 0).unwrap()), 403, "h", 0).unwrap(), "h", 0);
+        assert!(ended.replay_until_ms() > evictable_until(BURN_MIN_MS - 1));
+        assert!(ended.replay_until_ms() <= evictable_until(BURN_MIN_MS));
     }
 
     #[test]

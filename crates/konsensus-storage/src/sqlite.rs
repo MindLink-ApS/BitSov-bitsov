@@ -1577,11 +1577,32 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn call_counts(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<(u64, u64), StorageError> {
+    async fn call_counts(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
-        let (mine, total): (i64, i64) = sqlx::query_as("SELECT COALESCE(SUM(CASE WHEN peer = ? THEN 1 ELSE 0 END), 0), COUNT(*) FROM call_state WHERE replay_until_ms > ? OR pending_operation_id IS NOT NULL")
-            .bind(peer.to_hex()).bind(now).fetch_one(&self.pool).await?;
-        Ok((u64::try_from(mine).unwrap_or(0), u64::try_from(total).unwrap_or(0)))
+        // Open: ours pending, or not ended and before its deadline. Burned: the rest, while protected.
+        let (open_peer, open_total, burned_peer, burned_total): (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+                COALESCE(SUM(CASE WHEN open = 1 AND peer = ? THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN open = 1 THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN open = 0 AND peer = ? THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN open = 0 THEN 1 ELSE 0 END), 0) \
+             FROM (SELECT peer, CASE WHEN pending_operation_id IS NOT NULL OR (phase <> 'ended' AND deadline_ms > ?) THEN 1 ELSE 0 END AS open \
+                   FROM call_state WHERE replay_until_ms > ? OR pending_operation_id IS NOT NULL) AS rows")
+            .bind(peer.to_hex()).bind(peer.to_hex()).bind(now).bind(now).fetch_one(&self.pool).await?;
+        let n = |v: i64| u64::try_from(v).unwrap_or(0);
+        Ok(konsensus_core::payloads::call::CallCounts { open_peer: n(open_peer), open_total: n(open_total), burned_peer: n(burned_peer), burned_total: n(burned_total) })
+    }
+
+    async fn call_evict_burned(&self, peer: Option<&konsensus_core::NodeId>, replay_until_at_most: u64, now_ms: u64, max: u64) -> Result<u64, StorageError> {
+        let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call time overflow".into()));
+        let done = sqlx::query(
+            "DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state \
+             WHERE (? IS NULL OR peer = ?) AND pending_operation_id IS NULL AND (phase = 'ended' OR deadline_ms <= ?) \
+             AND replay_until_ms <= ? ORDER BY replay_until_ms LIMIT ?)")
+            .bind(peer.map(|p| p.to_hex())).bind(peer.map(|p| p.to_hex()))
+            .bind(ms(now_ms)?).bind(ms(replay_until_at_most)?).bind(ms(max)?)
+            .execute(&self.pool).await?;
+        Ok(done.rows_affected())
     }
 
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {

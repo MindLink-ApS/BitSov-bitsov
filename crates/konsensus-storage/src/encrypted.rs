@@ -628,8 +628,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_delete(peer, call_id).await
     }
 
-    async fn call_counts(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<(u64, u64), StorageError> {
+    async fn call_counts(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
         self.inner.call_counts(peer, now_ms).await
+    }
+
+    async fn call_evict_burned(&self, peer: Option<&konsensus_core::NodeId>, replay_until_at_most: u64, now_ms: u64, max: u64) -> Result<u64, StorageError> {
+        self.inner.call_evict_burned(peer, replay_until_at_most, now_ms, max).await
     }
 
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
