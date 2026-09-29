@@ -24,6 +24,9 @@ use crate::traits::Storage;
 /// PostgreSQL-backed storage for T2+ sovereignty tiers.
 pub struct PostgresStorage {
     pool: PgPool,
+    outstanding_web: std::sync::Mutex<
+        std::collections::HashMap<[u8; 32], konsensus_core::web_reply::OutstandingWebRequest>,
+    >,
 }
 
 impl PostgresStorage {
@@ -34,7 +37,7 @@ impl PostgresStorage {
             .connect(url)
             .await?;
 
-        let storage = Self { pool };
+        let storage = Self { pool, outstanding_web: std::sync::Mutex::new(std::collections::HashMap::new()) };
         storage.run_migrations().await?;
         Ok(storage)
     }
@@ -1593,6 +1596,29 @@ impl Storage for PostgresStorage {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn record_outgoing_web_request(
+        &self,
+        payment_hash: &[u8; 32],
+        request: konsensus_core::web_reply::OutstandingWebRequest,
+    ) -> Result<(), StorageError> {
+        self.outstanding_web
+            .lock()
+            .map_err(|e| StorageError::Serialization(format!("outstanding_web lock: {e}")))?
+            .insert(*payment_hash, request);
+        Ok(())
+    }
+
+    async fn take_outstanding_web_request(
+        &self,
+        payment_hash: &[u8; 32],
+    ) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, StorageError> {
+        Ok(self
+            .outstanding_web
+            .lock()
+            .map_err(|e| StorageError::Serialization(format!("outstanding_web lock: {e}")))?
+            .remove(payment_hash))
     }
 
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
@@ -3345,7 +3371,10 @@ mod migration_recovery_tests {
             let name = format!("migration_{}", uuid::Uuid::new_v4().simple());
             sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
             let base = url.rsplit_once('/').unwrap().0;
-            let db = PostgresStorage { pool: PgPool::connect(&format!("{base}/{name}")).await.unwrap() };
+            let db = PostgresStorage {
+                pool: PgPool::connect(&format!("{base}/{name}")).await.unwrap(),
+                outstanding_web: std::sync::Mutex::new(std::collections::HashMap::new()),
+            };
             sqlx::raw_sql("CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)").execute(&db.pool).await.unwrap();
             for (v, name, sql) in PostgresStorage::pg_migrations().into_iter().filter(|(v, _, _)| *v < 20) {
                 sqlx::raw_sql(sql).execute(&db.pool).await.unwrap();

@@ -189,6 +189,7 @@ pub fn classify(rejection: &GateRejection) -> (Code, Option<u64>, bool) {
         }
         GateRejection::LightningUnavailable(_) => (Code::SettlementUnavailable, None, true),
         GateRejection::PaymentProofReused { .. } => (Code::ProofReused, None, true),
+        GateRejection::WebReplyUnbound => (Code::SettlementMismatch, None, true),
     }
 }
 

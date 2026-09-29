@@ -620,9 +620,28 @@ async fn decrypt_and_process(
         process_calendar_event(&bytes, sender, envelope, storage).await
     } else if envelope.kind == konsensus_core::kind::KIND_RSVP {
         process_rsvp(&bytes, sender, envelope, storage).await
+    } else if konsensus_core::is_web_service_reply(envelope) {
+        // 510/501 reply bound to our paid request: deliver plaintext to the
+        // frontend, never treat it as a fresh manifest/page request (F3).
+        match String::from_utf8(bytes) {
+            Ok(text) => {
+                info!(
+                    sender = %sender,
+                    kind = envelope.kind,
+                    msg_id = %envelope.id,
+                    "received web service reply — forwarding to frontend"
+                );
+                Some(text)
+            }
+            Err(_) => {
+                debug!(sender = %sender, kind = envelope.kind, "web service reply payload is not UTF-8");
+                None
+            }
+        }
     } else if envelope.kind == konsensus_core::kind::KIND_WEB_MANIFEST {
         process_web_manifest(
             sender,
+            envelope,
             content_server,
             chain,
             pricing,
@@ -860,8 +879,10 @@ async fn process_rsvp(
 }
 
 /// Process an incoming web manifest request (KIND_WEB_MANIFEST).
+#[allow(clippy::too_many_arguments)]
 async fn process_web_manifest(
     sender: &konsensus_core::types::NodeId,
+    request: &konsensus_core::UkmEnvelope,
     content_server: &Option<Arc<ContentServer>>,
     chain: &Arc<dyn ChainProvider>,
     pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
@@ -885,11 +906,11 @@ async fn process_web_manifest(
     if session_mgr.can_send(sender).await {
         send_encrypted_response(
             sender,
+            request,
             &manifest,
             konsensus_core::kind::KIND_WEB_MANIFEST,
             identity,
             session_mgr,
-            pricing,
             transport,
         )
         .await;
@@ -905,7 +926,7 @@ async fn process_page_request(
     sender: &konsensus_core::types::NodeId,
     envelope: &konsensus_core::UkmEnvelope,
     content_server: &Option<Arc<ContentServer>>,
-    pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
+    _pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     identity: &Arc<NodeIdentity>,
     session_mgr: &SessionManager,
     transport: &Arc<NoiseTransport>,
@@ -936,11 +957,11 @@ async fn process_page_request(
     if session_mgr.can_send(sender).await {
         send_encrypted_response(
             sender,
+            envelope,
             &response,
             konsensus_core::kind::KIND_PAGE_RESPONSE,
             identity,
             session_mgr,
-            pricing,
             transport,
         )
         .await;
@@ -955,20 +976,20 @@ async fn process_page_request(
         })),
     );
 
-    // Also record from envelope for traceability
-    let _ = envelope;
-
     Some(format!("[page request: {}]", page_req.path))
 }
 
-/// Encrypt and send a response envelope back to a peer.
+/// Encrypt and send a web service reply bound to the requester's paid request.
+///
+/// Uses [`konsensus_core::reply_bound_proof`] (amount 0, request's hash/preimage)
+/// and references the request MessageId. Never calls `generate_valid_proof`.
 async fn send_encrypted_response<T: serde::Serialize>(
     peer_id: &konsensus_core::types::NodeId,
+    request: &konsensus_core::UkmEnvelope,
     payload: &T,
     kind: u16,
     identity: &NodeIdentity,
     session_mgr: &SessionManager,
-    pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     transport: &Arc<NoiseTransport>,
 ) {
     let json_bytes = match serde_json::to_vec(payload) {
@@ -989,9 +1010,7 @@ async fn send_encrypted_response<T: serde::Serialize>(
 
     let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
     let our_id = *identity.node_id();
-    let price = pricing.get_price_msat(kind).await.unwrap_or(50);
-    let (hash, preimage, amount) = konsensus_api::handlers::utils::generate_valid_proof(price);
-    let proof = konsensus_core::PaymentProof::new(hash, preimage, amount);
+    let proof = konsensus_core::reply_bound_proof(&request.payment_proof);
     let mut resp_envelope = konsensus_core::UkmEnvelopeBuilder::new(
         kind,
         our_id,
@@ -999,6 +1018,7 @@ async fn send_encrypted_response<T: serde::Serialize>(
         ciphertext,
         proof,
     )
+    .references(vec![request.id])
     .build();
     let sig = identity.sign(&resp_envelope.signable_bytes());
     resp_envelope.signature = konsensus_core::Signature::from_ed25519(&sig);

@@ -247,6 +247,27 @@ impl<S: Storage + ?Sized> konsensus_core::gate::NonceStore for StorageNonceAdapt
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
+
+    async fn record_outgoing_web_request(
+        &self,
+        payment_hash: &[u8; 32],
+        request: konsensus_core::web_reply::OutstandingWebRequest,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner
+            .record_outgoing_web_request(payment_hash, request)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    async fn take_outstanding_web_request(
+        &self,
+        payment_hash: &[u8; 32],
+    ) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner
+            .take_outstanding_web_request(payment_hash)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
 }
 
 pub mod outbox;
