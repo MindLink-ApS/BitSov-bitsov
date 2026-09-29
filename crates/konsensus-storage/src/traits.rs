@@ -897,4 +897,12 @@ pub trait Storage: Send + Sync {
     ) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, StorageError> {
         Ok(None)
     }
+
+    /// Delete up to `max` outstanding web requests that expired before
+    /// `now_ms`. Returns how many were removed. An expired entry can never
+    /// bind a reply (`reply_matches_outstanding` checks expiry), so this only
+    /// reclaims space.
+    async fn sweep_outstanding_web_requests(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
+        Ok(0)
+    }
 }
