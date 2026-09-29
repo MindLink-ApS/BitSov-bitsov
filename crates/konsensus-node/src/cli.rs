@@ -109,12 +109,19 @@ pub enum Command {
         encrypt: Option<Option<String>>,
     },
 
-    /// Sign the auth challenge and print the hex signature.
+    /// Sign an auth challenge and print the hex Ed25519 signature.
     ///
-    /// Used by smoke tests and scripts to authenticate against the node API.
-    /// Outputs the hex-encoded Ed25519 signature of "konsensus-auth".
+    /// Used by smoke tests and `docs/ops/owner-token.sh` to mint an owner JWT
+    /// via `POST /api/v1/auth/token`. The challenge must be the opaque string
+    /// returned by `GET /api/v1/auth/challenge` (`bitsov-auth-v1:<nonce>:<exp>`).
+    /// The signature is over the challenge bytes exactly as the token endpoint
+    /// verifies them. The mnemonic is read from disk and never printed.
     /// Either `--mnemonic` or `--config` must be provided.
     SignChallenge {
+        /// Opaque challenge from `GET /api/v1/auth/challenge`.
+        #[arg(long)]
+        challenge: String,
+
         /// Path to the mnemonic file.
         #[arg(short, long, required_unless_present = "config")]
         mnemonic: Option<PathBuf>,
