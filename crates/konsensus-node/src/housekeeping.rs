@@ -1,4 +1,4 @@
-//! Periodic housekeeping tasks — nonce cleanup, pending delivery cleanup,
+//! Periodic housekeeping tasks — nonce cleanup, expired web-request sweep, pending delivery cleanup,
 //! send timestamp cleanup, message retention, and price table re-announcement.
 
 use std::sync::Arc;
@@ -12,6 +12,31 @@ use konsensus_message::{Frame, NoiseTransport};
 
 use crate::node::KonsensusNode;
 
+/// Most expired web requests removed per sweep, so one sweep is a bounded
+/// statement even after a long outage. Leftovers go on the next tick.
+pub(crate) const WEB_REQUEST_SWEEP_MAX: u32 = 10_000;
+
+/// Remove paid web requests whose reply window has closed (#129 R2). An
+/// expired entry can never bind a reply, so this only reclaims space.
+pub(crate) async fn sweep_outstanding_web_requests(storage: &dyn konsensus_storage::Storage) -> u64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    match storage.sweep_outstanding_web_requests(now_ms, WEB_REQUEST_SWEEP_MAX).await {
+        Ok(removed) => {
+            if removed > 0 {
+                debug!(removed, "swept expired outstanding web requests");
+            }
+            removed
+        }
+        Err(e) => {
+            warn!(error = %e, "outstanding web request sweep failed");
+            0
+        }
+    }
+}
+
 /// Spawns the nonce cleanup task — periodically removes expired replay-protection nonces.
 ///
 /// Without this, the nonces table grows unbounded as every incoming message
@@ -23,9 +48,12 @@ pub(crate) async fn run_nonce_cleanup(
 ) {
     let cleanup_interval = std::time::Duration::from_secs(300); // every 5 minutes
     let max_nonce_age_secs: u64 = 3600; // 1 hour
+    // Expired paid web requests (#129 R2): once at startup, then every tick.
+    sweep_outstanding_web_requests(storage.as_ref()).await;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(cleanup_interval) => {
+                sweep_outstanding_web_requests(storage.as_ref()).await;
                 match storage.cleanup_expired_nonces(max_nonce_age_secs).await {
                     Ok(removed) if removed > 0 => {
                         debug!(removed, "cleaned up expired nonces");
