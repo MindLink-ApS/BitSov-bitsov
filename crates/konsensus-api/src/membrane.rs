@@ -196,7 +196,7 @@ pub fn classify(rejection: &GateRejection) -> (Code, Option<u64>, bool) {
 #[must_use]
 pub fn outbound_code(err: &ApiError) -> Option<Code> {
     match err {
-        ApiError::Operation { source, .. } | ApiError::RoutingFee { source, .. } => outbound_code(source),
+        ApiError::Operation { source, .. } | ApiError::RoutingFee { source, .. } | ApiError::Reasoned { source, .. } => outbound_code(source),
         ApiError::PriceCapExceeded(_) => Some(Code::PriceCapExceeded),
         ApiError::BudgetExceeded(_) => Some(Code::BudgetExceeded),
         _ => None,

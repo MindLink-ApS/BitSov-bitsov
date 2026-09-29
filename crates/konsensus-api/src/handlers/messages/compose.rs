@@ -511,6 +511,10 @@ const READMIT_PROMOTION_TIMEOUT: Duration = Duration::from_secs(20);
 /// Interval between invoice requests while that promotion lands.
 const READMIT_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Stable `reason` on the 409 `price_cap_exceeded` that refuses a capped
+/// reconnect re-admission (clients match this, not the English message).
+pub(crate) const READMISSION_REQUIRED: &str = "readmission_required";
+
 /// Start of the message of the error for an `admission_required` refusal.
 const ADMISSION_REFUSAL_MESSAGE: &str = "the recipient requires admission on this connection";
 
@@ -564,7 +568,7 @@ async fn readmit_then_pay(
         return Err(ApiError::PriceCapExceeded(format!(
             "{peer_id} requires admission again on a new connection, and the confirmed cap \
              covers the message only; no invoice was paid. Send without a cap to pay admission."
-        )));
+        )).with_reason(READMISSION_REQUIRED));
     }
     let peer_key = peer_id.to_hex();
     debit.readmission_allowed(&peer_key)?;
@@ -1757,7 +1761,7 @@ impl FirstContactCharge {
         // A recovered admission belongs to an earlier call. A definitive cap
         // or grant refusal before this call paid must retain its API/N2 code.
         if self.settled_msat == 0 && self.message_settled == 0
-            && matches!(&error, ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_))
+            && matches!(error.without_reason(), ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_))
         {
             return error;
         }
