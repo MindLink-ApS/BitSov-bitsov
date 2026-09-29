@@ -612,6 +612,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.take_outstanding_web_request(payment_hash).await
     }
 
+    async fn sweep_outstanding_web_requests(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
+        self.inner.sweep_outstanding_web_requests(now_ms, max).await
+    }
+
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
         self.inner.has_nonce(nonce).await
     }

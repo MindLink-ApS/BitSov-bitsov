@@ -26,9 +26,6 @@ use crate::traits::Storage;
 /// SQLite-backed storage for T1 Light and development.
 pub struct SqliteStorage {
     pool: SqlitePool,
-    outstanding_web: std::sync::Mutex<
-        std::collections::HashMap<[u8; 32], konsensus_core::web_reply::OutstandingWebRequest>,
-    >,
 }
 
 /// The on-disk file a SQLite connection string names, resolved with the same
@@ -93,7 +90,7 @@ impl SqliteStorage {
             .connect_with(options)
             .await?;
 
-        let storage = Self { pool, outstanding_web: std::sync::Mutex::new(std::collections::HashMap::new()) };
+        let storage = Self { pool };
         storage.run_migrations(migrations_dir).await?;
         Ok(storage)
     }
@@ -110,7 +107,7 @@ impl SqliteStorage {
             .connect_with(options)
             .await?;
 
-        let storage = Self { pool, outstanding_web: std::sync::Mutex::new(std::collections::HashMap::new()) };
+        let storage = Self { pool };
         let dir = std::env::var_os("KONSENSUS_SQLITE_MIGRATIONS_DIR").map(std::path::PathBuf::from);
         storage.run_migrations(dir.as_deref()).await?;
         Ok(storage)
@@ -191,6 +188,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (23, "delivery price quotes", include_str!("../migrations/023_delivery_price_quotes.sql")),
     (24, "outbox operations", include_str!("../migrations/024_outbox_operations.sql")),
     (25, "outbox recovery", include_str!("../migrations/025_outbox_recovery.sql")),
+    (26, "outstanding web requests", include_str!("../migrations/026_outstanding_web_requests.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -1516,10 +1514,16 @@ impl Storage for SqliteStorage {
         payment_hash: &[u8; 32],
         request: konsensus_core::web_reply::OutstandingWebRequest,
     ) -> Result<(), StorageError> {
-        self.outstanding_web
-            .lock()
-            .map_err(|e| StorageError::Serialization(format!("outstanding_web lock: {e}")))?
-            .insert(*payment_hash, request);
+        // Durable (#129 R1): a restart between paying and the reply keeps the binding.
+        let expires = i64::try_from(request.expires_at_ms).map_err(|_| StorageError::Conversion("web request expiry overflow".into()))?;
+        sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
+            .bind(hex::encode(payment_hash))
+            .bind(request.request_id.to_hex())
+            .bind(request.peer.to_hex())
+            .bind(i64::from(request.expected_reply_kind))
+            .bind(expires)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1527,11 +1531,24 @@ impl Storage for SqliteStorage {
         &self,
         payment_hash: &[u8; 32],
     ) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, StorageError> {
-        Ok(self
-            .outstanding_web
-            .lock()
-            .map_err(|e| StorageError::Serialization(format!("outstanding_web lock: {e}")))?
-            .remove(payment_hash))
+        // One statement: two concurrent takes cannot both get the row.
+        let row: Option<(String, String, i64, i64)> = sqlx::query_as(
+            "DELETE FROM outstanding_web_requests WHERE payment_hash = ? RETURNING request_id, peer, expected_reply_kind, expires_at_ms",
+        )
+        .bind(hex::encode(payment_hash))
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(outstanding_from_row).transpose()
+    }
+
+    async fn sweep_outstanding_web_requests(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
+        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("sweep time overflow".into()))?;
+        let result = sqlx::query("DELETE FROM outstanding_web_requests WHERE payment_hash IN (SELECT payment_hash FROM outstanding_web_requests WHERE expires_at_ms < ? ORDER BY expires_at_ms LIMIT ?)")
+            .bind(now)
+            .bind(i64::from(max))
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
@@ -3375,4 +3392,17 @@ mod accepted_invites_guard {
             super::ACTIVE_ACCEPTED_INVITES_SELECT
         );
     }
+}
+
+/// A taken `outstanding_web_requests` row. A corrupt row is an error, never a binding.
+fn outstanding_from_row(
+    (request_id, peer, kind, expires): (String, String, i64, i64),
+) -> Result<konsensus_core::web_reply::OutstandingWebRequest, StorageError> {
+    let bad = |what: &str| StorageError::Conversion(format!("outstanding web request: bad {what}"));
+    Ok(konsensus_core::web_reply::OutstandingWebRequest {
+        request_id: konsensus_core::types::MessageId::from_hex(&request_id).map_err(|_| bad("request id"))?,
+        peer: konsensus_core::types::NodeId::from_hex(&peer).map_err(|_| bad("peer"))?,
+        expected_reply_kind: u16::try_from(kind).map_err(|_| bad("reply kind"))?,
+        expires_at_ms: u64::try_from(expires).map_err(|_| bad("expiry"))?,
+    })
 }
