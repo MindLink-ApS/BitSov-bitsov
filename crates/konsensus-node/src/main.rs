@@ -625,16 +625,34 @@ fn cmd_sign_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) -
     Ok(())
 }
 
+/// True iff `challenge` matches the server format from `GET /api/v1/auth/challenge`:
+/// `bitsov-auth-v1:<64 lowercase hex nonce>:<unix expiry digits>`.
+fn is_well_formed_auth_challenge(challenge: &str) -> bool {
+    const PREFIX: &str = "bitsov-auth-v1:";
+    let Some(rest) = challenge.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some((nonce, exp)) = rest.split_once(':') else {
+        return false;
+    };
+    nonce.len() == 64
+        && nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && !exp.is_empty()
+        && exp.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Produce the hex Ed25519 signature `/api/v1/auth/token` expects for `challenge`.
 fn sign_auth_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) -> Result<String> {
     let challenge = challenge.trim();
     if challenge.is_empty() {
         anyhow::bail!("challenge is required (from GET /api/v1/auth/challenge)");
     }
-    // Refuse to sign arbitrary operator-supplied messages with the node key.
-    if !challenge.starts_with("bitsov-auth-v1:") {
+    // Refuse to sign anything that is not the exact live challenge wire format.
+    if !is_well_formed_auth_challenge(challenge) {
         anyhow::bail!(
-            "challenge must be a bitsov-auth-v1 value from GET /api/v1/auth/challenge"
+            "challenge must match ^bitsov-auth-v1:[0-9a-f]{{64}}:[0-9]+$ from GET /api/v1/auth/challenge"
         );
     }
 

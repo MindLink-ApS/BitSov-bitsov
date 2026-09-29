@@ -322,11 +322,32 @@ fn sign_challenge_rejects_legacy_static_string() {
 }
 
 #[test]
+fn sign_challenge_rejects_malformed_challenge() {
+    let tmp = TempDir::new().unwrap();
+    let mnemonic_path = write_test_mnemonic(tmp.path()).unwrap();
+    for bad in [
+        "bitsov-auth-v1:",
+        "bitsov-auth-v1:aa:1",
+        "bitsov-auth-v1:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        // uppercase hex refused (server emits lowercase)
+        "bitsov-auth-v1:00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF:1",
+        "bitsov-auth-v1:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff:1:extra",
+        "  bitsov-auth-v1:zz:1  ",
+    ] {
+        let err = sign_auth_challenge(&mnemonic_path, "", bad).unwrap_err();
+        assert!(
+            format!("{err}").contains("bitsov-auth-v1"),
+            "expected format refusal for {bad:?}, got {err}"
+        );
+    }
+}
+
+#[test]
 fn sign_challenge_missing_file_errors() {
     let err = cmd_sign_challenge(
         Path::new("/nonexistent/mnemonic.txt"),
         "",
-        "bitsov-auth-v1:aa:1",
+        "bitsov-auth-v1:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff:1",
     )
     .unwrap_err();
     assert!(

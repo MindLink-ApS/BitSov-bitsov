@@ -207,3 +207,23 @@ async fn cli_sign_challenge_accepted_by_auth_token_wrong_nonce_refused() {
         "signature over a wrong nonce must not mint a token"
     );
 }
+
+/// Drive `docs/ops/test-owner-token.sh` so cargo test covers the sourced-script
+/// error path and loopback URL guard (see PR #125 review).
+#[test]
+fn owner_token_script_error_path_and_url_guard() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root");
+    let script = repo_root.join("docs/ops/test-owner-token.sh");
+    let status = Command::new("bash")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .status()
+        .expect("spawn bash docs/ops/test-owner-token.sh");
+    assert!(
+        status.success(),
+        "docs/ops/test-owner-token.sh failed (status {status})"
+    );
+}
