@@ -284,30 +284,51 @@ fn node_id_missing_file_errors() {
 fn sign_challenge_produces_valid_signature() -> Result<()> {
     let tmp = TempDir::new()?;
     let mnemonic_path = write_test_mnemonic(tmp.path())?;
-
-    // Just verify it doesn't error (output goes to stdout)
-    cmd_sign_challenge(&mnemonic_path, "")?;
+    let challenge = "bitsov-auth-v1:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff:1700000000";
+    let hex_sig = sign_auth_challenge(&mnemonic_path, "", challenge)?;
+    assert_eq!(hex_sig.len(), 128, "ed25519 signature is 64 bytes hex");
+    cmd_sign_challenge(&mnemonic_path, "", challenge)?;
     Ok(())
 }
 
 #[test]
 fn sign_challenge_signature_verifies() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let mnemonic_path = write_test_mnemonic(tmp.path())?;
+    let challenge = "bitsov-auth-v1:ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100:1700000001";
+    let hex_sig = sign_auth_challenge(&mnemonic_path, "", challenge)?;
     let identity = konsensus_core::NodeIdentity::from_mnemonic(TEST_MNEMONIC, "")?;
-    let signature = identity.sign(b"konsensus-auth");
-
-    // Verify the signature with the public key
+    let signature = ed25519_dalek::Signature::from_slice(&hex::decode(hex_sig)?)?;
     use ed25519_dalek::Verifier;
-    let verifying_key = identity.ed25519_verifying_key();
     assert!(
-        verifying_key.verify(b"konsensus-auth", &signature).is_ok(),
-        "signature must verify with the identity's public key"
+        identity
+            .ed25519_verifying_key()
+            .verify(challenge.as_bytes(), &signature)
+            .is_ok(),
+        "CLI signature must verify over the challenge bytes"
     );
     Ok(())
 }
 
 #[test]
+fn sign_challenge_rejects_legacy_static_string() {
+    let tmp = TempDir::new().unwrap();
+    let mnemonic_path = write_test_mnemonic(tmp.path()).unwrap();
+    let err = sign_auth_challenge(&mnemonic_path, "", "konsensus-auth").unwrap_err();
+    assert!(
+        format!("{err}").contains("bitsov-auth-v1"),
+        "expected format refusal, got {err}"
+    );
+}
+
+#[test]
 fn sign_challenge_missing_file_errors() {
-    let err = cmd_sign_challenge(Path::new("/nonexistent/mnemonic.txt"), "").unwrap_err();
+    let err = cmd_sign_challenge(
+        Path::new("/nonexistent/mnemonic.txt"),
+        "",
+        "bitsov-auth-v1:aa:1",
+    )
+    .unwrap_err();
     assert!(
         format!("{err}").contains("failed to read mnemonic"),
         "expected file read error"
