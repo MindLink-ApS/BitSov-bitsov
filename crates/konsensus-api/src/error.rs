@@ -18,6 +18,10 @@ pub enum ApiError {
 
     #[error("{source}")]
     RoutingFee { source: Box<ApiError>, max_routing_fee_msat: u64 },
+    /// `source`'s response plus a stable machine `reason`, for clients that
+    /// must not parse the English message. Status and `code` are unchanged.
+    #[error("{source}")]
+    Reasoned { source: Box<ApiError>, reason: &'static str },
     /// The backend positively refused the operation before any dispatch.
     #[error("not dispatched: {0}")]
     NotDispatched(String),
@@ -101,6 +105,13 @@ impl ApiError {
     pub(crate) fn with_routing_fee(self, max_routing_fee_msat: u64) -> Self {
         Self::RoutingFee { source: Box::new(self), max_routing_fee_msat }
     }
+    pub(crate) fn with_reason(self, reason: &'static str) -> Self {
+        Self::Reasoned { source: Box::new(self), reason }
+    }
+    /// The error a `reason` was added to.
+    pub(crate) fn without_reason(&self) -> &Self {
+        match self { Self::Reasoned { source, .. } => source.without_reason(), other => other }
+    }
     fn response_parts(&self) -> (StatusCode, serde_json::Value) {
         if let Self::Operation { source, operation_id, state, payment_hash, retry_allowed } = self {
             let (status, mut body) = source.response_parts();
@@ -120,6 +131,11 @@ impl ApiError {
         if let Self::RoutingFee { source, max_routing_fee_msat } = self {
             let (status, mut body) = source.response_parts();
             body["max_routing_fee_msat"] = (*max_routing_fee_msat).into();
+            return (status, body);
+        }
+        if let Self::Reasoned { source, reason } = self {
+            let (status, mut body) = source.response_parts();
+            body["reason"] = (*reason).into();
             return (status, body);
         }
         if let Self::NotDispatched(reason) = self {
@@ -158,7 +174,7 @@ impl ApiError {
             }));
         }
         let (status, message) = match &self {
-            ApiError::Operation { .. } | ApiError::OperationConflict(_) | ApiError::NotReady | ApiError::RoutingFee { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
+            ApiError::Operation { .. } | ApiError::OperationConflict(_) | ApiError::NotReady | ApiError::RoutingFee { .. } | ApiError::Reasoned { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
@@ -219,6 +235,16 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn reasoned_price_cap_keeps_status_and_code_and_adds_only_reason() {
+        let (status, body) = error_body(ApiError::PriceCapExceeded("capped".into()).with_reason("readmission_required")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, serde_json::json!({"error": "capped", "code": "price_cap_exceeded", "reason": "readmission_required"}));
+        let (status, body) = error_body(ApiError::PriceCapExceeded("capped".into())).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, serde_json::json!({"error": "capped", "code": "price_cap_exceeded"}), "other producers unchanged");
     }
 
     #[tokio::test]

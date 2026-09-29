@@ -851,3 +851,45 @@ async fn capped_paired_send_cannot_add_unquoted_reconnection_debit() {
     assert_eq!(net.sender.grant().used_msat, 0);
     net.shutdown();
 }
+
+/// Real-UI 10b / app #62 follow-up: after a reconnect, a capped send is refused
+/// before any payment with the same 409 `price_cap_exceeded` as before, plus a
+/// stable `reason` the app matches instead of the English message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capped_reconnect_readmission_refusal_carries_a_stable_reason() {
+    let mut net = two_nodes(|bob| Some(budget(bob, Some(50_000)))).await;
+    let bob = net.bob_id;
+    net.connect().await;
+    net.send_delivered("before the drop").await;
+    net.drop_and_reconnect().await;
+    let paid = net.sender.paid_out().await;
+    let used = net.sender.grant().used_msat;
+    let compose = serde_json::json!({
+        "recipient": bob.to_hex(), "kind": konsensus_core::kind::KIND_CHAT,
+        "plaintext": "after the reconnect", "max_total_msat": 14_000, "max_routing_fee_msat": 0,
+    });
+    let expected = |operation_id: &serde_json::Value| serde_json::json!({
+        "error": format!("{bob} requires admission again on a new connection, and the confirmed cap \
+             covers the message only; no invoice was paid. Send without a cap to pay admission."),
+        "code": "price_cap_exceeded",
+        "reason": "readmission_required",
+        "max_routing_fee_msat": 0,
+        "operation_id": operation_id, "state": "prepared", "payment_hash": null,
+        "accepted": false, "retry_allowed": true,
+    });
+    // The node's own operation, and the app's (#60): only `reason` is new.
+    let (status, body) = net.sender.post("/api/v1/messages/compose", compose.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["operation_id"].is_string(), "{body}");
+    assert_eq!(body, expected(&body["operation_id"]));
+    let mut with_op = compose;
+    with_op["operation_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+    let (status, body) = net.sender.post("/api/v1/messages/compose", with_op.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body, expected(&with_op["operation_id"]));
+
+    // Refused before anything was paid or debited.
+    assert_eq!(net.sender.paid_out().await, paid);
+    assert_eq!(net.sender.grant().used_msat, used);
+    net.shutdown();
+}
