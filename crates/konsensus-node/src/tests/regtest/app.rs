@@ -201,6 +201,7 @@ impl App {
             lightning_backend: "ldk".into(),
             chain_backend: "esplora".into(),
             introduction: Default::default(),
+        front_door: Default::default(),
             sponsor: Default::default(),
             gossip_validator: None,
             file_staging: Default::default(),

@@ -69,6 +69,7 @@ async fn owner_router(identity: Arc<NodeIdentity>) -> axum::Router {
         lightning_backend: "mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
+        front_door: Default::default(),
         sponsor: Default::default(),
         gossip_validator: None,
     });

@@ -252,6 +252,9 @@ pub struct AppState {
     /// introduction (`GET /api/v1/introduction`). Default: none offered.
     pub introduction: crate::handlers::introduction::IntroductionSettings,
 
+    /// Front-door card store (owner-published signed card).
+    pub front_door: crate::handlers::front_door::FrontDoorStore,
+
     /// K1 slice 2: the owner's sponsoring policy (`[sponsor]`). Off by default.
     pub sponsor: crate::handlers::sponsor::SponsorPolicy,
 }

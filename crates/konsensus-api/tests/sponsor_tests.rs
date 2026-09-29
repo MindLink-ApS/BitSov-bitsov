@@ -47,6 +47,7 @@ async fn pair(policy: SponsorPolicy) -> Pair {
     let sponsor_dir = dir.path().join("sponsor-node");
     let sponsor = Arc::new(AppState {
         introduction: intro(9001),
+        front_door: Default::default(),
         sponsor: policy,
         data_dir: Some(sponsor_dir),
         ..(*base).clone()
@@ -59,6 +60,7 @@ async fn pair(policy: SponsorPolicy) -> Pair {
         identity: Arc::new(identity),
         storage,
         introduction: intro(9002),
+        front_door: Default::default(),
         data_dir: Some(dir.path().join("newcomer-node")),
         ..(*nbase).clone()
     });
@@ -638,6 +640,7 @@ async fn configured_network_requires_its_exact_invoice_currency() {
             let p = pair(policy(1_000_000, 2)).await;
             let state = Arc::new(AppState {
                 introduction: IntroductionSettings { network: Some((*network).into()), endpoint: Some("127.0.0.1:9001".into()) },
+                front_door: Default::default(),
                 ..(*p.sponsor).clone()
             });
             let (s, offer) = call(&state, "POST", "/api/v1/sponsor/offer", None).await;
