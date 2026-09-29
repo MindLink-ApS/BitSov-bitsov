@@ -1077,6 +1077,7 @@ async fn cmd_start(
         send_timestamps: Arc::clone(&api_state.send_timestamps),
         lightning: Arc::clone(node.lightning()),
         lightning_addr: advertised_lightning_addr,
+        mock_lightning: config.lightning.is_mock(),
         invoice_requests: Arc::clone(&api_state.invoice_requests),
         peer_ln_pubkeys: Arc::clone(&api_state.peer_ln_pubkeys),
         ws_broadcast: api_state.ws_broadcast.clone(),

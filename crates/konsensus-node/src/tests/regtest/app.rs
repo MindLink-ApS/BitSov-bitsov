@@ -237,6 +237,7 @@ impl App {
                 send_timestamps: state.send_timestamps.clone(),
                 lightning: state.lightning.clone(),
                 lightning_addr: None,
+                mock_lightning: false,
                 invoice_requests: state.invoice_requests.clone(),
                 peer_ln_pubkeys: state.peer_ln_pubkeys.clone(),
                 ws_broadcast: state.ws_broadcast.clone(),
