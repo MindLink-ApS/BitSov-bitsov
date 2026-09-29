@@ -21,6 +21,7 @@ pub mod payloads;
 pub mod profile;
 pub mod traits;
 pub mod types;
+pub mod web_reply;
 
 // Re-export primary types for convenience.
 pub use contracts::{
@@ -37,6 +38,7 @@ pub use types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, RoomId, Signa
 // Re-export core traits.
 pub use gate::{GateConfig, GateRejection, NonceStore, PaymentGate};
 pub use invite::{BitSovInvite, InviteError, InviteToken};
+pub use web_reply::{is_web_service_reply, reply_bound_proof};
 pub use traits::{
     BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel,
     Invoice, LightningError, LightningProvider, PaymentDetails, PaymentDirection, PaymentStatus,

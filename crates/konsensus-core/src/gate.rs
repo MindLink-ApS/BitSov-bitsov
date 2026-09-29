@@ -119,6 +119,11 @@ pub enum GateRejection {
         ours: NodeId,
     },
 
+    /// A web service reply (page/manifest) was not bound to an outgoing payment
+    /// this node made — self-minted or unbound replies are rejected.
+    #[error("web reply not bound to a paid request we made")]
+    WebReplyUnbound,
+
 }
 
 /// Trait for nonce replay protection storage.
@@ -447,6 +452,16 @@ impl PaymentGate {
             }
         }
 
+        // ── Step 4.5: Web service replies (page / manifest) ────────────
+        // Bound to the requester's paid request: amount 0, references the
+        // request MessageId, reuses that request's hash/preimage. Not a new
+        // Lightning payment — never self-minted via generate_valid_proof.
+        if crate::web_reply::is_web_service_reply(envelope) {
+            self.verify_web_service_reply(envelope, lightning).await?;
+            debug!("web service reply: bound to paid request, skipping price/settlement");
+            return Ok(false);
+        }
+
         // ── Step 5: Price verification ─────────────────────────────────
         // Determine the required price for this message kind and verify
         // the payment amount meets or exceeds it. Plasticity pricing
@@ -511,6 +526,52 @@ impl PaymentGate {
             .map_err(|e: ed25519_dalek::SignatureError| {
                 GateRejection::InvalidSignature(e.to_string())
             })
+    }
+
+    /// Accept a web service reply only when it reuses a payment this node made
+    /// (outgoing, settled). When Lightning settlement checks are off (tests /
+    /// Mock), the structural reply-bound shape is enough.
+    async fn verify_web_service_reply(
+        &self,
+        envelope: &UkmEnvelope,
+        lightning: Option<&dyn LightningProvider>,
+    ) -> Result<(), GateRejection> {
+        if !self.config.verify_lightning_settlement {
+            return Ok(());
+        }
+        let Some(ln) = lightning else {
+            return Err(GateRejection::LightningUnavailable(
+                "web reply binding requires Lightning when settlement verification is on".into(),
+            ));
+        };
+        let payment_hash = hex::encode(envelope.payment_proof.payment_hash);
+        let details = ln
+            .get_payment_status(&payment_hash)
+            .await
+            .map_err(|e| GateRejection::LightningUnavailable(e.to_string()))?;
+        if details.status != PaymentStatus::Settled
+            || details.direction != PaymentDirection::Outgoing
+        {
+            warn!(
+                %payment_hash,
+                status = ?details.status,
+                direction = ?details.direction,
+                "rejected: web reply not bound to an outgoing settled payment"
+            );
+            return Err(GateRejection::WebReplyUnbound);
+        }
+        let Some(preimage_hex) = details.preimage.as_deref() else {
+            return Err(GateRejection::PaymentSettlementMismatch(
+                "outgoing payment has no preimage".into(),
+            ));
+        };
+        let returned_preimage = decode_hex_32("preimage", preimage_hex)?;
+        if returned_preimage != envelope.payment_proof.preimage {
+            return Err(GateRejection::PaymentSettlementMismatch(
+                "web reply preimage does not match our outgoing payment".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Verify the payment amount meets the required price.
@@ -763,7 +824,8 @@ mod tests {
     use super::*;
     use crate::UkmEnvelopeBuilder;
     use crate::identity::NodeIdentity;
-    use crate::kind::{KIND_CHAT, KindCategory};
+    use crate::kind::{KIND_CHAT, KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE, KindCategory};
+    use crate::web_reply::{is_web_service_reply, reply_bound_proof};
     use crate::traits::lightning::{Invoice, LightningError, PaymentDetails, PaymentDirection};
     use crate::types::{PaymentProof, Recipient};
     use sha2::{Digest, Sha256};
@@ -1694,6 +1756,125 @@ mod tests {
         assert!(
             result.is_ok(),
             "zero price with zero payment should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_web_service_reply_bound_to_paid_request() {
+        let requester = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let server = NodeIdentity::from_mnemonic(
+            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+            "",
+        )
+        .unwrap();
+        let request_proof = make_proof(50);
+        let mut request = UkmEnvelopeBuilder::new(
+            KIND_PAGE_REQUEST,
+            *requester.node_id(),
+            Recipient::Node(*server.node_id()),
+            b"page-req".to_vec(),
+            request_proof.clone(),
+        )
+        .timestamp(now_ms())
+        .build();
+        request.signature =
+            crate::types::Signature::from_ed25519(&requester.sign(&request.signable_bytes()));
+
+        let mut reply = UkmEnvelopeBuilder::new(
+            KIND_PAGE_RESPONSE,
+            *server.node_id(),
+            Recipient::Node(*requester.node_id()),
+            b"page-body".to_vec(),
+            reply_bound_proof(&request.payment_proof),
+        )
+        .references(vec![request.id])
+        .timestamp(now_ms())
+        .build();
+        reply.signature =
+            crate::types::Signature::from_ed25519(&server.sign(&reply.signable_bytes()));
+
+        assert!(is_web_service_reply(&reply));
+
+        let gate = PaymentGate::new(); // settlement verification off
+        let nonce_store = MockNonceStore::new();
+        let pricing = MockPricing { price_msat: 50 }; // reply kind is priced, but reply-bound skips it
+        let result = gate
+            .verify(
+                &reply,
+                &nonce_store,
+                &pricing,
+                None,
+                None,
+                0.0,
+                Some(requester.node_id()),
+            )
+            .await;
+        assert!(result.is_ok(), "bound web reply should be accepted: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn reject_web_reply_when_settlement_on_and_not_our_outgoing() {
+        let requester = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let server = NodeIdentity::from_mnemonic(
+            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+            "",
+        )
+        .unwrap();
+        let request_proof = make_proof(50);
+        let mut request = UkmEnvelopeBuilder::new(
+            KIND_PAGE_REQUEST,
+            *requester.node_id(),
+            Recipient::Node(*server.node_id()),
+            b"page-req".to_vec(),
+            request_proof,
+        )
+        .timestamp(now_ms())
+        .build();
+        request.signature =
+            crate::types::Signature::from_ed25519(&requester.sign(&request.signable_bytes()));
+
+        let mut reply = UkmEnvelopeBuilder::new(
+            KIND_PAGE_RESPONSE,
+            *server.node_id(),
+            Recipient::Node(*requester.node_id()),
+            b"page-body".to_vec(),
+            reply_bound_proof(&request.payment_proof),
+        )
+        .references(vec![request.id])
+        .timestamp(now_ms())
+        .build();
+        reply.signature =
+            crate::types::Signature::from_ed25519(&server.sign(&reply.signable_bytes()));
+
+        let gate = PaymentGate::with_config(GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        });
+        let nonce_store = MockNonceStore::new();
+        let pricing = MockPricing { price_msat: 50 };
+        // Incoming settled ≠ our outgoing payment
+        let lightning = MockLightning {
+            funding_only: false,
+            settled: true,
+            amount_msat: 50,
+            direction: PaymentDirection::Incoming,
+            preimage: Some(request.payment_proof.preimage),
+            payment_hash_override: None,
+        };
+        let result = gate
+            .verify(
+                &reply,
+                &nonce_store,
+                &pricing,
+                None,
+                Some(&lightning),
+                0.0,
+                Some(requester.node_id()),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GateRejection::WebReplyUnbound)),
+            "expected WebReplyUnbound, got {result:?}"
         );
     }
 
