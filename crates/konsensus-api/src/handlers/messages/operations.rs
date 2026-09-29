@@ -97,7 +97,7 @@ fn caller(auth: &MeteredSpend) -> Option<String> {
         .as_ref()
         .map(|p| format!("{}:{}", p.client_id, p.epoch))
 }
-fn operation_id(id: Option<&str>) -> Result<String, ApiError> {
+pub(super) fn operation_id(id: Option<&str>) -> Result<String, ApiError> {
     let id = match id {
         Some(s) => uuid::Uuid::parse_str(s)
             .map_err(|_| ApiError::BadRequest("operation_id must be a UUIDv4".into()))?,
@@ -510,6 +510,10 @@ pub(super) async fn compose(
         if matches!(op.state.as_str(), "paying" | "payment_unknown") {
             reconcile(&state, &mut op).await?;
         }
+        // A call signal this retry found paid is committed before the resend,
+        // so the callee's immediate answer finds a ringing call (Codex
+        // delta2 #3). Never a release here: an unpaid one is paid again below.
+        crate::calls::settle_operation(state.storage.as_ref(), &op, false).await;
         match op.state.as_str() {
             "acked" => return Ok(Json(response(&op, true)?)),
             "paid" | "sent" | "rejected_retryable" => {
@@ -1016,7 +1020,7 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             recover_budget(state, &mut op).await?;
             // A call signal's reservation follows its operation here too, and
             // before any resend (Fable N1).
-            crate::calls::settle_operation(state.storage.as_ref(), &op).await;
+            crate::calls::settle_operation(state.storage.as_ref(), &op, true).await;
             if op.state == "paid" {
                 recover_paid(state, &mut op).await?;
             }

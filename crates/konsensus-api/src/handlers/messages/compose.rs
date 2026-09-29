@@ -3279,8 +3279,11 @@ pub(super) async fn compose_message(
         // Calls: reserve under the operation id before any quote or payment;
         // the paid transition is published at settlement (compose_peer), and a
         // definite nonpayment releases the reservation afterwards.
+        // The journal keys operations by their canonical UUID; reserve,
+        // commit and resolve under that same key (Codex delta2 #1).
         let mut req = req;
-        let operation_id = req.operation_id.get_or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone();
+        let operation_id = super::operations::operation_id(req.operation_id.as_deref())?;
+        req.operation_id = Some(operation_id.clone());
         let peer_id = NodeId::from_hex(&req.recipient)
             .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
         let plaintext = req.plaintext.clone();
@@ -3297,7 +3300,7 @@ pub(super) async fn compose_message(
             konsensus_core::payloads::call::settlement(Some(&op.state)) == konsensus_core::payloads::call::Settlement::Paid
         });
         if !paid {
-            crate::calls::reserve_outgoing(state.storage.as_ref(), &peer_id, req.kind, &plaintext, &operation_id).await?;
+            crate::calls::reserve_outgoing(state.storage.as_ref(), &peer_id, req.kind, &plaintext, &operation_id, &request_hash).await?;
         }
         let result = super::operations::compose(auth, Arc::clone(&state), req, references).await;
         crate::calls::resolve_outgoing(state.storage.as_ref(), &peer_id, &plaintext, &operation_id, &request_hash).await;
@@ -3504,7 +3507,8 @@ pub(super) async fn compose_peer(
         let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
         if crate::calls::is_call_kind(req.kind) {
             // Paid: publish the call transition before the envelope goes out.
-            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id).await;
+            let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
+            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id, &request_hash).await;
         }
 
         if let Some(expected) = konsensus_core::expected_reply_kind(req.kind) {

@@ -95,7 +95,9 @@ pub async fn admit_incoming(store: Store<'_>, peer: &NodeId, kind: u16, plaintex
     let now = now_ms();
     let unavailable = |_| CallRefusal::Invalid("call state unavailable");
     let entry = current(store, peer, &signal.call_id, now).await.map_err(unavailable)?;
-    if entry.is_none() {
+    // Only an offer opens a new call id; an unknown-id answer/ICE/hangup is
+    // refused below and must never make room by evicting a burned id (Fable R2).
+    if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
         room(store, peer, now).await?;
     }
     let next = rules::receive(entry, kind, now)?;
@@ -114,36 +116,43 @@ fn refused(e: CallRefusal) -> ApiError {
     ApiError::BadRequest(e.to_string()).with_reason(reason)
 }
 
-/// Reserve one of our signals under `operation_id`, before any quote or payment.
-/// An operation id already reserving a signal for another call is refused
-/// (Fable N2): one operation pays for one signal of one call.
-pub async fn reserve_outgoing(store: Store<'_>, peer: &NodeId, kind: u16, plaintext: &str, operation_id: &str) -> Result<(), ApiError> {
+/// Reserve one of our signals under `operation_id` and the exact request
+/// (`request_hash`), before any quote or payment. The operation id must be the
+/// canonical one the journal uses. One operation reserves one signal of one
+/// call for one request: the same id reserving another call (Fable N2) or the
+/// same call with another payload (Codex delta2 #2) is refused without
+/// touching the existing reservation.
+pub async fn reserve_outgoing(store: Store<'_>, peer: &NodeId, kind: u16, plaintext: &str, operation_id: &str, request_hash: &str) -> Result<(), ApiError> {
     let signal = CallSignal::parse(kind, plaintext).map_err(refused)?;
     let _g = lock().lock().await;
     let now = now_ms();
     let storage = |e: konsensus_storage::StorageError| ApiError::Internal(format!("call state: {e}"));
-    let elsewhere = store.call_pending().await.map_err(storage)?.into_iter().any(|(p, call_id, e)| {
-        e.pending.is_some_and(|x| x.operation_id == operation_id) && (p != *peer || call_id != signal.call_id)
+    let taken = store.call_pending().await.map_err(storage)?.into_iter().any(|(p, call_id, e)| {
+        e.pending.is_some_and(|x| {
+            x.operation_id == operation_id && (p != *peer || call_id != signal.call_id || !x.is(operation_id, request_hash))
+        })
     });
-    if elsewhere {
+    if taken {
         return Err(ApiError::OperationConflict("operation_mismatch"));
     }
     let entry = current(store, peer, &signal.call_id, now).await.map_err(storage)?;
     if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
         room(store, peer, now).await.map_err(refused)?;
     }
-    let next = rules::reserve(entry.clone(), kind, operation_id, now).map_err(refused)?;
+    let next = rules::reserve(entry.clone(), kind, operation_id, request_hash, now).map_err(refused)?;
     if entry.as_ref() != Some(&next) {
         write(store, peer, &signal.call_id, Some(&next)).await.map_err(storage)?;
     }
     Ok(())
 }
 
-async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &str, how: Settlement) -> Result<(), konsensus_storage::StorageError> {
+/// Commit or release the reservation of exactly this request; anything else
+/// (another request's reservation, none at all) is left alone.
+async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &str, request_hash: &str, how: Settlement) -> Result<(), konsensus_storage::StorageError> {
     let _g = lock().lock().await;
     let now = now_ms();
     let Some(entry) = store.call_get(peer, call_id).await? else { return Ok(()) };
-    if entry.pending.as_ref().is_none_or(|p| p.operation_id != operation_id) {
+    if !entry.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash)) {
         return Ok(());
     }
     let next = match how {
@@ -158,45 +167,60 @@ async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &s
 /// envelope goes out, so the peer's reply finds a paid call. Never fails the
 /// send (money already moved): a store error is logged and `resolve` or
 /// `recover` commits later from the operation journal.
-pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str) {
+pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
     let Ok(signal) = serde_json::from_str::<CallSignal>(plaintext) else { return };
-    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, Settlement::Paid).await {
+    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, Settlement::Paid).await {
         tracing::warn!(peer = %peer, error = %e, "call commit after settlement failed; recovery will retry");
     }
 }
 
+/// How the journal says this request's reservation ends. A journal entry of
+/// another request (other payload, kind or recipient) never paid for it
+/// (Fable N2 / R1): unpaid, and since `settle` only touches this request's own
+/// reservation, never the winner's.
+fn journal_settlement(op: Option<&konsensus_storage::OutboxOperation>, peer: &NodeId, kind: u16, request_hash: &str) -> Settlement {
+    match op {
+        Some(op) if op.request_hash != request_hash || op.kind != i64::from(kind) || op.recipient != peer.to_hex() => Settlement::Unpaid,
+        op => rules::settlement(op.map(|o| o.state.as_str())),
+    }
+}
+
 /// After compose returned (either way): read the operation journal and commit,
-/// release (definite nonpayment) or keep (ambiguous) the reservation. A
-/// journal entry for a different request (`request_hash`) never paid for this
-/// signal: the reservation is released (Fable N2).
+/// release (definite nonpayment) or keep (ambiguous) this request's reservation.
 pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str, request_hash: &str) {
     let Ok(signal) = serde_json::from_str::<CallSignal>(plaintext) else { return };
-    let state = match store.get_outbox_operation(operation_id).await {
-        Ok(Some(op)) if op.request_hash != request_hash => None,
-        Ok(op) => op.map(|o| o.state),
+    // The reservation's own kind (an ICE reserves nothing; then this is moot).
+    let kind = match store.call_get(peer, &signal.call_id).await {
+        Ok(Some(CallEntry { pending: Some(p), .. })) => p.kind,
+        _ => return,
+    };
+    let how = match store.get_outbox_operation(operation_id).await {
+        Ok(op) => journal_settlement(op.as_ref(), peer, kind, request_hash),
         Err(e) => {
             tracing::warn!(error = %e, "call reservation kept: operation state unreadable");
             return;
         }
     };
-    let how = rules::settlement(state.as_deref());
-    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, how).await {
+    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, request_hash, how).await {
         tracing::warn!(peer = %peer, error = %e, "call reservation not resolved; recovery will retry");
     }
 }
 
-/// The background reconciler (`reconcile_operations`) resolved call operation
-/// `op` without a compose request: commit or release its reservation exactly
-/// as `resolve_outgoing` would, before the paid envelope is resent, so the
-/// callee's answer finds a ringing call (Fable N1). Ambiguous stays reserved.
-/// Never fails the sweep; a store error leaves it for the next one.
-pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOperation) {
+/// The journal moved call operation `op` without the compose request that
+/// reserved it: the background reconciler (Fable N1) or a same-operation
+/// retry that reconciled an ambiguous payment (Codex delta2 #3). Commit (or,
+/// with `release`, also release) that request's reservation, before the paid
+/// envelope is (re)sent, so the callee's answer finds a ringing call. A retry
+/// passes `release = false`: an unpaid operation it is about to pay again
+/// keeps its reservation. Ambiguous stays reserved. Never fails the caller; a
+/// store error leaves it for the next sweep or the compose resolve.
+pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOperation, release: bool) {
     if !u16::try_from(op.kind).is_ok_and(is_call_kind) {
         return;
     }
     let Ok(peer) = NodeId::from_hex(&op.recipient) else { return };
     let how = rules::settlement(Some(&op.state));
-    if how == Settlement::Ambiguous {
+    if how == Settlement::Ambiguous || (how == Settlement::Unpaid && !release) {
         return;
     }
     let pending = match store.call_pending().await {
@@ -207,8 +231,8 @@ pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOp
         }
     };
     for (p, call_id, entry) in pending {
-        if p == peer && entry.pending.is_some_and(|x| x.operation_id == op.operation_id) {
-            if let Err(e) = settle(store, &peer, &call_id, &op.operation_id, how).await {
+        if p == peer && entry.pending.is_some_and(|x| x.is(&op.operation_id, &op.request_hash) && i64::from(x.kind) == op.kind) {
+            if let Err(e) = settle(store, &peer, &call_id, &op.operation_id, &op.request_hash, how).await {
                 tracing::warn!(operation_id = %op.operation_id, error = %e, "call reservation not settled; next sweep retries");
             }
         }
@@ -222,9 +246,13 @@ pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_stora
     let (mut committed, mut released) = (0, 0);
     for (peer, call_id, entry) in store.call_pending().await? {
         let Some(p) = entry.pending.clone() else { continue };
-        let state = store.get_outbox_operation(&p.operation_id).await?.map(|o| o.state);
-        let how = rules::settlement(state.as_deref());
-        settle(store, &peer, &call_id, &p.operation_id, how).await?;
+        let op = store.get_outbox_operation(&p.operation_id).await?;
+        // A legacy reservation without a request hash follows its operation.
+        let hash = if p.request_hash.is_empty() { op.as_ref().map(|o| o.request_hash.clone()).unwrap_or_default() } else { p.request_hash.clone() };
+        // Startup commits only if the journal row is this request: same
+        // payload hash, kind and recipient (Fable R1).
+        let how = journal_settlement(op.as_ref(), &peer, p.kind, &hash);
+        settle(store, &peer, &call_id, &p.operation_id, &p.request_hash, how).await?;
         match how {
             Settlement::Paid => committed += 1,
             Settlement::Unpaid => released += 1,
@@ -232,6 +260,25 @@ pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_stora
         }
     }
     Ok((committed, released))
+}
+
+/// How long an incoming signal may stay held by a live handler before the
+/// periodic sweep treats it as abandoned and withdraws it.
+pub const HOLD_MAX_MS: u64 = 5 * 60 * 1000;
+
+/// Hold an incoming call signal before its paid acceptance (Codex delta2 #4):
+/// until released, it is invisible to history, resync and duplicate ACKs.
+pub async fn hold_incoming(store: Store<'_>, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, konsensus_storage::StorageError> {
+    store.call_admission_hold(envelope, now_ms()).await
+}
+
+/// Withdraw held signals whose admission never finished (a refusal whose
+/// cleanup failed, or a crash): message and plaintext deleted, receipt marked
+/// application-rejected. `all` at startup, before the receive loop runs;
+/// otherwise only holds older than [`HOLD_MAX_MS`].
+pub async fn withdraw_held(store: Store<'_>, all: bool) -> Result<u64, konsensus_storage::StorageError> {
+    let before = if all { u64::MAX } else { now_ms().saturating_sub(HOLD_MAX_MS) };
+    store.call_admission_withdraw(before).await
 }
 
 fn last_query() -> &'static Mutex<HashMap<NodeId, Instant>> {

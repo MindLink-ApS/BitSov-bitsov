@@ -956,4 +956,31 @@ pub trait Storage: Send + Sync {
     async fn reject_accepted_envelope(&self, _envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("reject accepted envelope".into()))
     }
+
+    // ── Incoming call signal admission hold (Codex delta2 #4) ──────────
+    // A held message is invisible to history, resync and duplicate ACKs.
+
+    /// Hold `envelope` before its paid acceptance, unless a message with its
+    /// id is already stored. Returns whether this call placed the hold.
+    async fn call_admission_hold(&self, _envelope: &konsensus_core::UkmEnvelope, _now_ms: u64) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call admission hold".into()))
+    }
+
+    /// The signal was admitted (or never stored): make it visible / forget the hold.
+    async fn call_admission_release(&self, _id: &MessageId) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call admission hold".into()))
+    }
+
+    /// Whether `id` is held.
+    async fn call_admission_held(&self, _id: &MessageId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call admission hold".into()))
+    }
+
+    /// Fail closed on every hold placed before `held_before_ms` (a refusal
+    /// whose cleanup failed, or a crash before admission finished): withdraw
+    /// its message and plaintext, mark its receipt application-rejected, drop
+    /// the hold. Returns how many holds were withdrawn.
+    async fn call_admission_withdraw(&self, _held_before_ms: u64) -> Result<u64, StorageError> {
+        Ok(0)
+    }
 }

@@ -67,7 +67,7 @@ async fn an_unpaid_offer_burns_nothing_and_accepts_no_answer() {
     assert_eq!(retry["reason"], reason.as_str(), "same operation, same refusal, not call_id_used: {retry}");
     assert!(calls::admit_incoming(state.storage.as_ref(), &peer, 401, Some(&body(401, &call))).await.is_err());
     // Released: the id was never sent, so another operation may offer it.
-    assert!(calls::reserve_outgoing(state.storage.as_ref(), &peer, 400, &body(400, &call), "other-op").await.is_ok());
+    assert!(calls::reserve_outgoing(state.storage.as_ref(), &peer, 400, &body(400, &call), "other-op", "h").await.is_ok());
 }
 
 /// Probe `unpaid_failed_answer_advances_call_and_blocks_retry`, fixed: the call
@@ -118,7 +118,7 @@ async fn young_burned_ids_are_never_dropped_and_only_block_their_own_pair() {
     // Another pair is unaffected, and so is our own call to someone else.
     let other = NodeId::from_bytes([79; 32]);
     calls::admit_incoming(&store, &other, 400, Some(&body(400, &id(100_001)))).await.unwrap();
-    calls::reserve_outgoing(&store, &NodeId::from_bytes([78; 32]), 400, &body(400, &id(100_002)), "op-elsewhere").await.unwrap();
+    calls::reserve_outgoing(&store, &NodeId::from_bytes([78; 32]), 400, &body(400, &id(100_002)), "op-elsewhere", "h").await.unwrap();
 }
 
 /// Fable N3: past `BURN_MIN_MS`, the oldest burned ids of a pair make room for
@@ -169,9 +169,9 @@ async fn an_operation_id_reused_for_another_call_is_refused_before_reserving() {
     let store = state.storage.as_ref();
     let peer = NodeId::from_bytes([75; 32]);
     // Still reserved under the operation.
-    calls::reserve_outgoing(store, &peer, 400, &body(400, &id(1)), "op-reused").await.unwrap();
-    calls::reserve_outgoing(store, &peer, 400, &body(400, &id(1)), "op-reused").await.unwrap();
-    let err = calls::reserve_outgoing(store, &peer, 400, &body(400, &id(2)), "op-reused").await.unwrap_err();
+    calls::reserve_outgoing(store, &peer, 400, &body(400, &id(1)), "op-reused", "h").await.unwrap();
+    calls::reserve_outgoing(store, &peer, 400, &body(400, &id(1)), "op-reused", "h").await.unwrap();
+    let err = calls::reserve_outgoing(store, &peer, 400, &body(400, &id(2)), "op-reused", "h").await.unwrap_err();
     assert!(format!("{err:?}").contains("operation_mismatch"), "{err:?}");
     assert!(store.call_get(&peer, &id(2)).await.unwrap().is_none());
     // In the journal (the first request was refused and released).
@@ -304,8 +304,8 @@ async fn call_state_survives_a_restart() {
         let store = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
         calls::admit_incoming(&store, &peer, 400, Some(&body(400, &theirs))).await.unwrap();
         calls::admit_incoming(&store, &peer, 403, Some(&body(403, &theirs))).await.unwrap();
-        calls::reserve_outgoing(&store, &peer, 400, &body(400, &mine), "op-mine").await.unwrap();
-        calls::commit_outgoing(&store, &peer, &body(400, &mine), "op-mine").await;
+        calls::reserve_outgoing(&store, &peer, 400, &body(400, &mine), "op-mine", "h").await.unwrap();
+        calls::commit_outgoing(&store, &peer, &body(400, &mine), "op-mine", "h").await;
         store.pool().close().await;
     }
     let store = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
@@ -320,7 +320,7 @@ async fn recovery_commits_paid_releases_unpaid_and_keeps_ambiguous() {
     let peer = NodeId::from_bytes([87; 32]);
     for (n, state) in [(1, Some("acked")), (2, Some("prepared")), (3, Some("payment_unknown")), (4, None)] {
         let op = format!("00000000-0000-4000-8000-00000000000{n}");
-        calls::reserve_outgoing(&store, &peer, 400, &body(400, &id(n)), &op).await.unwrap();
+        calls::reserve_outgoing(&store, &peer, 400, &body(400, &id(n)), &op, "h").await.unwrap();
         if let Some(state) = state {
             let mut row = konsensus_storage::OutboxOperation::prepared(op.clone(), peer.to_hex(), 400, "h".into());
             assert!(store.insert_outbox_operation(&row).await.unwrap());
@@ -336,4 +336,54 @@ async fn recovery_commits_paid_releases_unpaid_and_keeps_ambiguous() {
     assert!(store.call_get(&peer, &id(4)).await.unwrap().is_none());
     // The kept one resolves when its same-operation retry finds it paid.
     let _ = CallSignal::parse(400, &body(400, &id(3))).unwrap();
+}
+
+/// Fable R1 (delta2): startup recovery commits a reservation only if the
+/// journal row under its operation id is this very request. A call reserved
+/// under an operation id whose journal row is a paid chat (app misuse plus a
+/// crash) is released, never rung unpaid.
+#[tokio::test]
+async fn recovery_never_commits_a_call_under_another_requests_journal_row() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([73; 32]);
+    let op = "00000000-0000-4000-8000-0000000000a1".to_string();
+    calls::reserve_outgoing(&store, &peer, 400, &body(400, &id(1)), &op, "h").await.unwrap();
+    let mut chat = konsensus_storage::OutboxOperation::prepared(op.clone(), peer.to_hex(), 1, "h".into());
+    assert!(store.insert_outbox_operation(&chat).await.unwrap());
+    chat.state = "acked".into();
+    assert!(store.update_outbox_operation(&chat).await.unwrap());
+    assert_eq!(calls::recover(&store).await.unwrap(), (0, 1));
+    assert!(store.call_get(&peer, &id(1)).await.unwrap().is_none(), "released, not ringing");
+    // Same for another recipient under the same payload hash and kind.
+    let other = NodeId::from_bytes([72; 32]);
+    let op2 = "00000000-0000-4000-8000-0000000000a2".to_string();
+    calls::reserve_outgoing(&store, &peer, 400, &body(400, &id(2)), &op2, "h").await.unwrap();
+    let mut elsewhere = konsensus_storage::OutboxOperation::prepared(op2.clone(), other.to_hex(), 400, "h".into());
+    assert!(store.insert_outbox_operation(&elsewhere).await.unwrap());
+    elsewhere.state = "acked".into();
+    assert!(store.update_outbox_operation(&elsewhere).await.unwrap());
+    assert_eq!(calls::recover(&store).await.unwrap(), (0, 1));
+    assert!(store.call_get(&peer, &id(2)).await.unwrap().is_none());
+}
+
+/// Fable R2 (delta2): a refused answer/ICE/hangup for an unknown call id never
+/// makes room, so it cannot evict a burned id even past the minimum age.
+#[tokio::test]
+async fn unknown_call_signals_never_evict_burned_ids() {
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let peer = NodeId::from_bytes([71; 32]);
+    let now = now_ms();
+    for i in 0..MAX_BURNED_PER_PEER as usize {
+        let ended = now - BURN_MIN_MS - 60_000 * (MAX_BURNED_PER_PEER - i as u64);
+        let entry = CallEntry { side: Side::Callee, phase: Phase::Ended, deadline_ms: ended + TOMBSTONE_MS, pending: None };
+        store.call_put(&peer, &id(i), &entry).await.unwrap();
+    }
+    for kind in [401, 402, 403] {
+        assert!(calls::admit_incoming(&store, &peer, kind, Some(&body(kind, &id(9_000 + kind as usize)))).await.is_err());
+    }
+    assert!(store.call_get(&peer, &id(0)).await.unwrap().is_some(), "the oldest burned id is still there");
+    // An offer does make room, evicting exactly the oldest.
+    calls::admit_incoming(&store, &peer, 400, Some(&body(400, &id(9_999)))).await.unwrap();
+    assert!(store.call_get(&peer, &id(0)).await.unwrap().is_none());
+    assert!(store.call_get(&peer, &id(1)).await.unwrap().is_some());
 }

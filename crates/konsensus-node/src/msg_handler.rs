@@ -300,6 +300,24 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
+                        // A call signal is held (invisible to history, resync and
+                        // duplicate ACKs) from before its paid acceptance until its
+                        // admission is final; a hold that outlives this handler is
+                        // withdrawn by the startup/periodic sweep (Codex delta2 #4).
+                        let mut call_hold = false;
+                        if gate_result.is_ok() && !is_relay_control && konsensus_api::calls::is_call_kind(envelope.kind) {
+                            match konsensus_api::calls::hold_incoming(storage_for_recv.as_ref(), &envelope).await {
+                                Ok(placed) => call_hold = placed,
+                                Err(e) => {
+                                    // Fail closed: unheld, a refused signal could stay visible.
+                                    error!(msg_id = %msg_id, error = %e, "call signal not held; not accepted");
+                                    let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                            }
+                        }
+
                         if gate_result.is_ok() && !is_relay_control {
                             use konsensus_storage::PaidAcceptance;
                             match storage_for_recv.accept_paid_envelope(&envelope).await {
@@ -307,6 +325,15 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     audit_for_recv.membrane().admitted(&envelope, gate_result.as_ref().expect("validated").0);
                                 }
                                 Ok(PaidAcceptance::AlreadyAccepted) => {
+                                    // A call signal still held was never admitted: never
+                                    // acknowledge it as delivered.
+                                    if konsensus_api::calls::is_call_kind(envelope.kind)
+                                        && storage_for_recv.call_admission_held(&msg_id).await.unwrap_or(true)
+                                    {
+                                        let reject = Frame::MessageReject { id: msg_id, reason: "call signal withdrawn".into() };
+                                        let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                        continue;
+                                    }
                                     // No second promotion, decrypt, application side effect or write.
                                     let ack = Frame::MessageAck { id: msg_id, duplicate: true };
                                     if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
@@ -327,6 +354,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     gate_result = Err(rejection);
                                 }
                                 Err(e) => {
+                                    if call_hold {
+                                        let _ = storage_for_recv.call_admission_release(&msg_id).await;
+                                    }
                                     error!(error = %e, "atomic paid acceptance failed; replay keys rolled back");
                                     audit_for_recv.membrane().refused(&envelope,
                                         &konsensus_core::gate::GateRejection::NonceCheckFailed(e.to_string()));
@@ -335,6 +365,11 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     continue;
                                 }
                             }
+                        }
+
+                        if call_hold && gate_result.is_err() {
+                            // Nothing of ours was stored under this hold.
+                            let _ = storage_for_recv.call_admission_release(&msg_id).await;
                         }
 
                         if let Err(rejection) = gate_result {
@@ -515,14 +550,32 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // accepts answer/ICE/hangup only for a live call with this
                         // sender. A refused signal never reaches the app.
                         if konsensus_api::calls::is_call_kind(envelope.kind) {
-                            if let Err(refusal) = konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), &sender, envelope.kind, plaintext.as_deref()).await {
+                            let admitted = konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), &sender, envelope.kind, plaintext.as_deref()).await;
+                            // Admitted: lift the hold before the app sees it. If that
+                            // write fails the signal stays held and is withdrawn by the
+                            // sweep: fail closed, the peer gets a reject, not an ACK.
+                            let admitted = match admitted {
+                                Ok(signal) => match storage_for_recv.call_admission_release(&msg_id).await {
+                                    Ok(()) => Ok(signal),
+                                    Err(e) => {
+                                        error!(msg_id = %msg_id, error = %e, "admitted call signal could not be released; withheld");
+                                        let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                        let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                        continue;
+                                    }
+                                },
+                                Err(refusal) => Err(refusal),
+                            };
+                            if let Err(refusal) = admitted {
                                 warn!(sender = %sender, kind = envelope.kind, reason = %refusal, "call signal refused; not forwarded");
                                 // Paid but refused: withdraw the stored message and its
                                 // plaintext and mark the receipt application-rejected, so
                                 // history, resync and a resend never present it as
                                 // delivered (Codex P1). Payment hash and nonce stay burned.
+                                // If this fails the hold keeps it invisible and the
+                                // startup/periodic sweep withdraws it (Codex delta2 #4).
                                 if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
-                                    error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused call signal");
+                                    error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused call signal; it stays held until the sweep");
                                 }
                                 audit_for_recv.record(
                                     konsensus_api::audit::events::MESSAGE_REJECTED,

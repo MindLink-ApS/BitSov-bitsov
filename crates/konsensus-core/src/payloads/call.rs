@@ -204,10 +204,22 @@ impl Phase {
 }
 
 /// One of our own signals, reserved under its operation id and not yet paid.
+/// Bound to the exact request (`request_hash`, the operation journal's
+/// digest), so a concurrent request sharing the operation id but carrying
+/// another payload never shares, commits or releases it (Codex delta2 #2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
     pub operation_id: String,
     pub kind: u16,
+    /// Empty only for rows written before the binding existed.
+    pub request_hash: String,
+}
+
+impl Pending {
+    /// Whether this reservation belongs to exactly this request.
+    pub fn is(&self, operation_id: &str, request_hash: &str) -> bool {
+        self.operation_id == operation_id && (self.request_hash == request_hash || self.request_hash.is_empty())
+    }
 }
 
 /// The state of one `(peer, call_id)`.
@@ -253,9 +265,9 @@ impl CallEntry {
 /// Reserve one of our own signals before paying for it. `entry` is the
 /// current state (already passed through [`CallEntry::at`]). Returns the entry
 /// to store. The same operation reserving again is idempotent (a retry).
-pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, now_ms: u64) -> Result<CallEntry, CallRefusal> {
-    let pending = Pending { operation_id: operation_id.to_string(), kind };
-    let mine = |e: &CallEntry| e.pending.as_ref().is_some_and(|p| p.operation_id == operation_id && p.kind == kind);
+pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, request_hash: &str, now_ms: u64) -> Result<CallEntry, CallRefusal> {
+    let pending = Pending { operation_id: operation_id.to_string(), kind, request_hash: request_hash.to_string() };
+    let mine = |e: &CallEntry| e.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash) && p.kind == kind);
     match kind {
         KIND_CALL_INVITE => match entry {
             None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending) }),
@@ -417,11 +429,11 @@ mod tests {
 
     #[test]
     fn a_reserved_offer_rings_nobody_until_paid_and_unpaid_ones_are_forgotten() {
-        let r = reserve(None, 400, "op1", 0).unwrap();
+        let r = reserve(None, 400, "op1", "h", 0).unwrap();
         assert_eq!((r.phase, r.side), (Phase::Reserved, Side::Caller));
         // Same operation retrying: idempotent. Another operation: the id is taken.
-        assert_eq!(reserve(Some(r.clone()), 400, "op1", 1).unwrap(), r);
-        assert_eq!(reserve(Some(r.clone()), 400, "op2", 1), Err(CallRefusal::Replayed));
+        assert_eq!(reserve(Some(r.clone()), 400, "op1", "h", 1).unwrap(), r);
+        assert_eq!(reserve(Some(r.clone()), 400, "op2", "h", 1), Err(CallRefusal::Replayed));
         // Codex P1: an answer cannot be accepted for an offer that was never paid.
         assert_eq!(receive(Some(r.clone()), 401, 1), Err(CallRefusal::UnknownCall));
         // Definite nonpayment: forgotten, so the same id can be offered again.
@@ -439,31 +451,31 @@ mod tests {
     #[test]
     fn our_answer_and_hangup_change_state_only_when_paid() {
         let ringing = receive(None, 400, 0).unwrap();
-        assert_eq!(reserve(Some(ringing.clone()), 401, "a", 1).unwrap().phase, Phase::Ringing, "reserved, not yet live");
-        let pending = reserve(Some(ringing.clone()), 401, "a", 1).unwrap();
+        assert_eq!(reserve(Some(ringing.clone()), 401, "a", "h", 1).unwrap().phase, Phase::Ringing, "reserved, not yet live");
+        let pending = reserve(Some(ringing.clone()), 401, "a", "h", 1).unwrap();
         // A second signal while the answer is being paid waits.
-        assert_eq!(reserve(Some(pending.clone()), 403, "h", 1), Err(CallRefusal::InFlight));
+        assert_eq!(reserve(Some(pending.clone()), 403, "h", "h", 1), Err(CallRefusal::InFlight));
         // Codex P1: an unpaid answer leaves the call ringing, so it can be retried.
         let back = release(pending.clone(), "a").unwrap();
         assert_eq!(back, ringing);
-        assert!(reserve(Some(back), 401, "a2", 2).is_ok());
+        assert!(reserve(Some(back), 401, "a2", "h", 2).is_ok());
         let live = commit(pending, "a", 3);
         assert_eq!(live.phase, Phase::Live);
-        let hang = reserve(Some(live.clone()), 403, "h", 4).unwrap();
+        let hang = reserve(Some(live.clone()), 403, "h", "h", 4).unwrap();
         assert_eq!(hang.phase, Phase::Live);
         assert_eq!(release(hang.clone(), "h").unwrap(), live);
         let ended = commit(hang, "h", 5);
         assert_eq!((ended.phase, ended.deadline_ms), (Phase::Ended, 5 + TOMBSTONE_MS));
         // The caller cannot answer its own call.
-        let own = commit(reserve(None, 400, "o", 0).unwrap(), "o", 0);
-        assert_eq!(reserve(Some(own), 401, "x", 1), Err(CallRefusal::WrongSide));
+        let own = commit(reserve(None, 400, "o", "h", 0).unwrap(), "o", 0);
+        assert_eq!(reserve(Some(own), 401, "x", "h", 1), Err(CallRefusal::WrongSide));
     }
 
     #[test]
     fn signals_need_an_open_call_and_ids_stay_burned_until_their_deadline() {
         for k in [401, 402, 403] {
             assert_eq!(receive(None, k, 0), Err(CallRefusal::UnknownCall));
-            assert_eq!(reserve(None, k, "op", 0), Err(CallRefusal::UnknownCall));
+            assert_eq!(reserve(None, k, "op", "h", 0), Err(CallRefusal::UnknownCall));
         }
         let ringing = receive(None, 400, 0).unwrap();
         assert_eq!(receive(Some(ringing.clone()), 400, 1), Err(CallRefusal::Replayed));
@@ -491,7 +503,7 @@ mod tests {
         assert_eq!(burned_excess(MAX_BURNED_PER_PEER - 1, MAX_BURNED_PER_PEER), 0);
         assert_eq!(burned_excess(MAX_BURNED_PER_PEER, MAX_BURNED_PER_PEER), 1);
         // An id ended at t is evictable only from t + BURN_MIN_MS.
-        let ended = commit(reserve(Some(receive(None, 400, 0).unwrap()), 403, "h", 0).unwrap(), "h", 0);
+        let ended = commit(reserve(Some(receive(None, 400, 0).unwrap()), 403, "h", "h", 0).unwrap(), "h", 0);
         assert!(ended.replay_until_ms() > evictable_until(BURN_MIN_MS - 1));
         assert!(ended.replay_until_ms() <= evictable_until(BURN_MIN_MS));
     }

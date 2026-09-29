@@ -190,6 +190,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (25, "outbox recovery", include_str!("../migrations/025_outbox_recovery.sql")),
     (26, "outstanding web requests", include_str!("../migrations/026_outstanding_web_requests.sql")),
     (27, "call state", include_str!("../migrations/027_call_state.sql")),
+    (28, "call request hold", include_str!("../migrations/028_call_request_hold.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -831,12 +832,12 @@ impl Storage for SqliteStorage {
         let refs_json =
             serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-        let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = 1 AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
+        let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE message_id NOT IN (SELECT message_id FROM call_admission_hold) AND payment_hash = ? AND message_id = ? AND sender = ? AND accepted = 1 AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
             .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
             .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
             .fetch_one(&self.pool).await?;
         if durable == 1 { return Ok(true); }
-        let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
+        let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.message_id NOT IN (SELECT message_id FROM call_admission_hold) AND r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
             .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
             .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
             .fetch_one(&self.pool).await?;
@@ -1035,7 +1036,7 @@ impl Storage for SqliteStorage {
         )>(
             "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
              ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-             FROM messages WHERE id = ?",
+             FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND id = ?",
         )
         .bind(&id_hex)
         .fetch_optional(&self.pool)
@@ -1069,7 +1070,7 @@ impl Storage for SqliteStorage {
         )>(
             "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
              ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-             FROM messages WHERE recipient_type = ? AND recipient_id = ? AND timestamp_ms < ? \
+             FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND recipient_type = ? AND recipient_id = ? AND timestamp_ms < ? \
              ORDER BY timestamp_ms DESC LIMIT ?",
         )
         .bind(rtype)
@@ -1107,7 +1108,7 @@ impl Storage for SqliteStorage {
             )>(
                 "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
                  ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-                 FROM messages WHERE recipient_type = 'room' AND recipient_id = ? AND timestamp_ms < ? \
+                 FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND recipient_type = 'room' AND recipient_id = ? AND timestamp_ms < ? \
                  ORDER BY timestamp_ms DESC LIMIT ?",
             )
             .bind(peer_or_room_id)
@@ -1122,7 +1123,7 @@ impl Storage for SqliteStorage {
             )>(
                 "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
                  ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-                 FROM messages WHERE (\
+                 FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND (\
                    (sender = ? AND recipient_type = 'node' AND recipient_id = ?) \
                    OR (sender = ? AND recipient_type = 'node' AND recipient_id = ?) \
                  ) AND timestamp_ms < ? \
@@ -1553,20 +1554,21 @@ impl Storage for SqliteStorage {
     }
 
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
-        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind FROM call_state WHERE peer = ? AND call_id = ?")
+        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state WHERE peer = ? AND call_id = ?")
             .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
         row.map(call_entry_from_row).transpose()
     }
 
     async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
         let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
-        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind")
+        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash")
             .bind(peer.to_hex()).bind(call_id)
             .bind(entry.side.as_str()).bind(entry.phase.as_str())
             .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
             .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
             .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
+            .bind(entry.pending.as_ref().map(|p| p.request_hash.clone()))
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -1606,12 +1608,12 @@ impl Storage for SqliteStorage {
     }
 
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind FROM call_state WHERE pending_operation_id IS NOT NULL")
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash FROM call_state WHERE pending_operation_id IS NOT NULL")
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind)| {
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind))?))
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash))?))
         }).collect()
     }
 
@@ -1629,8 +1631,43 @@ impl Storage for SqliteStorage {
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
         sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = ? AND message_id = ?")
             .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
+            .bind(&id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
+        let id = envelope.id.to_hex();
+        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
+        let done = sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = ?) ON CONFLICT DO NOTHING")
+            .bind(&id).bind(envelope.sender.to_hex()).bind(now).bind(&id).execute(&self.pool).await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn call_admission_release(&self, id: &MessageId) -> Result<(), StorageError> {
+        sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
+            .bind(id.to_hex()).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn call_admission_held(&self, id: &MessageId) -> Result<bool, StorageError> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_admission_hold WHERE message_id = ?")
+            .bind(id.to_hex()).fetch_one(&self.pool).await?;
+        Ok(n > 0)
+    }
+
+    async fn call_admission_withdraw(&self, held_before_ms: u64) -> Result<u64, StorageError> {
+        let before = i64::try_from(held_before_ms).unwrap_or(i64::MAX);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE (message_id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
+            .bind(before).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM messages WHERE (id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
+            .bind(before).execute(&mut *tx).await?;
+        let done = sqlx::query("DELETE FROM call_admission_hold WHERE held_at_ms < ?")
+            .bind(before).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(done.rows_affected())
     }
 
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
@@ -1980,7 +2017,7 @@ impl Storage for SqliteStorage {
         id: &MessageId,
     ) -> Result<Option<Vec<u8>>, StorageError> {
         let row: Option<(Option<Vec<u8>>,)> =
-            sqlx::query_as("SELECT plaintext_enc FROM messages WHERE id = ?")
+            sqlx::query_as("SELECT plaintext_enc FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND id = ?")
                 .bind(id.to_hex())
                 .fetch_optional(&self.pool)
                 .await?;
@@ -3489,15 +3526,15 @@ fn outstanding_from_row(
     })
 }
 
-/// `(side, phase, deadline_ms, pending_operation_id, pending_kind)` of `call_state`.
-type CallRow = (String, String, i64, Option<String>, Option<i64>);
+/// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash)` of `call_state`.
+type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>);
 
 /// A stored call row. A corrupt row is an error, never a call.
-fn call_entry_from_row((side, phase, deadline, op, kind): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
+fn call_entry_from_row((side, phase, deadline, op, kind, hash): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
     use konsensus_core::payloads::call::{CallEntry, Pending, Phase, Side};
     let bad = |what: &str| StorageError::Conversion(format!("call state: bad {what}"));
     let pending = match (op, kind) {
-        (Some(operation_id), Some(kind)) => Some(Pending { operation_id, kind: u16::try_from(kind).map_err(|_| bad("pending kind"))? }),
+        (Some(operation_id), Some(kind)) => Some(Pending { operation_id, kind: u16::try_from(kind).map_err(|_| bad("pending kind"))?, request_hash: hash.unwrap_or_default() }),
         (None, None) => None,
         _ => return Err(bad("pending")),
     };

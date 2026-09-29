@@ -1335,3 +1335,189 @@ async fn background_reconcile_commits_a_paid_call_offer_before_resending() {
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "paid once");
     answering.abort();
 }
+
+// ── Codex delta2 (#131, FAIL at 088d198): the four probes as regressions ──
+
+fn call_request(f: &Fixture, op: &str, call: &str, sdp: &str, wait: u64) -> Request<Body> {
+    Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", common::auth_header(&f.state)).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"operation_id": op, "recipient": f.peer.to_hex(), "kind": 400,
+            "plaintext": format!(r#"{{"v":1,"call_id":"{call}","media":"audio","sdp":"{sdp}"}}"#), "wait_ack_ms": wait}).to_string()))
+        .unwrap()
+}
+
+fn answer_call_prices(f: &Fixture) -> tokio::task::JoinHandle<()> {
+    let (prices, peer) = (f.state.peer_prices.clone(), f.peer);
+    tokio::spawn(async move {
+        loop {
+            prices.update_kind_price(peer, 400, 10_000, 100).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+}
+
+async fn until_dispatched(f: &Fixture) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while f.db.get_outbox_operation(&f.id).await.unwrap().is_none_or(|op| op.payment_hash.is_none()) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// Probe `codex_review_uppercase_uuid_loses_paid_call_and_allows_second_charge`,
+/// fixed: an uppercase operation id is canonicalized before the reservation,
+/// so the paid offer commits under the journal's key, rings, and the same
+/// call id cannot be paid for again.
+#[tokio::test]
+async fn an_uppercase_operation_id_commits_the_paid_call_under_one_key() {
+    use konsensus_core::payloads::call::Phase;
+    let f = Fixture::new().await;
+    let answering = answer_call_prices(&f);
+    let call = format!("{:032x}", 0xc011_u128);
+    let raw = "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF";
+    let response = common::test_router(f.state.clone()).oneshot(call_request(&f, raw, &call, "v=0", 0)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+    assert!(f.db.get_outbox_operation(&raw.to_lowercase()).await.unwrap().is_some());
+    let entry = f.db.call_get(&f.peer, &call).await.unwrap().expect("paid call state kept");
+    assert_eq!((entry.phase, entry.pending), (Phase::Ringing, None));
+    let answer = format!(r#"{{"v":1,"call_id":"{call}","sdp":"v=0"}}"#);
+    konsensus_api::calls::admit_incoming(f.db.as_ref(), &f.peer, 401, Some(&answer)).await.unwrap();
+    let response = common::test_router(f.state.clone()).oneshot(call_request(&f, &f.id, &call, "v=0", 0)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "the same call id is never paid twice");
+    answering.abort();
+}
+
+/// Probe `codex_review_concurrent_mismatch_releases_winners_ambiguous_call`,
+/// fixed: two concurrent requests sharing the operation id and call id but
+/// not the payload never share a reservation. The loser is refused
+/// (operation_mismatch) and neither commits nor releases the winner's
+/// still-ambiguous reservation, so no other operation can take that call id.
+#[tokio::test]
+async fn a_concurrent_mismatch_never_touches_the_winners_reservation() {
+    use konsensus_core::payloads::call::Phase;
+    for _ in 0..8 {
+        let f = Fixture::new().await;
+        let answering = answer_call_prices(&f);
+        let call = format!("{:032x}", 0xc014_u128);
+        f.wallet.mode.store(1, Ordering::SeqCst);
+        let (app_a, req_a) = (common::test_router(f.state.clone()), call_request(&f, &f.id, &call, "v=0", 0));
+        let (app_b, req_b) = (common::test_router(f.state.clone()), call_request(&f, &f.id, &call, "v=1", 0));
+        let job_a = tokio::spawn(async move { app_a.oneshot(req_a).await });
+        let job_b = tokio::spawn(async move { app_b.oneshot(req_b).await });
+        until_dispatched(&f).await;
+        let offer_a = format!(r#"{{"v":1,"call_id":"{call}","media":"audio","sdp":"v=0"}}"#);
+        let digest_a = blake3::hash(&serde_json::to_vec(&(f.peer.to_hex(), 400u16, &offer_a, Vec::<String>::new())).unwrap()).to_hex().to_string();
+        let winner_hash = f.op().await.request_hash;
+        let (winner, loser) = if winner_hash == digest_a { (job_a, job_b) } else { (job_b, job_a) };
+        winner.abort();
+        let _ = winner.await;
+        let response = loser.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(json["code"], "operation_mismatch");
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+        let entry = f.db.call_get(&f.peer, &call).await.unwrap().expect("winner's reservation kept");
+        let pending = entry.pending.expect("still reserved while ambiguous");
+        assert_eq!((entry.phase, pending.operation_id.as_str(), pending.request_hash.as_str()), (Phase::Reserved, f.id.as_str(), winner_hash.as_str()));
+        assert!(konsensus_api::calls::reserve_outgoing(f.db.as_ref(), &f.peer, 400, &offer_a, &uuid::Uuid::new_v4().to_string(), "other").await.is_err());
+        answering.abort();
+    }
+}
+
+/// Probe `codex_review_retry_resends_before_committing_call`, fixed: a
+/// same-operation retry that reconciles the ambiguous payment commits the
+/// call before resending, so an answer arriving right after the resend is
+/// admitted.
+#[tokio::test]
+async fn a_retry_that_finds_the_offer_paid_commits_before_resending() {
+    use konsensus_core::payloads::call::Phase;
+    let f = Fixture::new().await;
+    let answering = answer_call_prices(&f);
+    let call = format!("{:032x}", 0xc012_u128);
+    f.wallet.mode.store(1, Ordering::SeqCst);
+    let (app, req) = (common::test_router(f.state.clone()), call_request(&f, &f.id, &call, "v=0", 0));
+    let first = tokio::spawn(async move { app.oneshot(req).await });
+    until_dispatched(&f).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    f.wallet.mode.store(0, Ordering::SeqCst);
+    let (app, req) = (common::test_router(f.state.clone()), call_request(&f, &f.id, &call, "v=0", 3000));
+    let retry = tokio::spawn(async move { app.oneshot(req).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while f.op().await.state != "sent" {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.db.call_get(&f.peer, &call).await.unwrap().unwrap().phase, Phase::Ringing, "committed before the resend");
+    let answer = format!(r#"{{"v":1,"call_id":"{call}","sdp":"v=0"}}"#);
+    konsensus_api::calls::admit_incoming(f.db.as_ref(), &f.peer, 401, Some(&answer)).await.unwrap();
+    assert_eq!(retry.await.unwrap().unwrap().status(), StatusCode::OK);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+    answering.abort();
+}
+
+/// Probe `codex_review_failed_refusal_cleanup_exposes_signal_through_resync`,
+/// fixed: the receive path holds a call signal before its paid acceptance.
+/// When the refusal cleanup fails (or the node crashes before it), the held
+/// signal stays out of history, duplicate acceptance and resync; the startup
+/// sweep then withdraws it for good. A fresh hold is left to its live handler.
+#[tokio::test]
+async fn a_refused_signal_whose_cleanup_failed_stays_invisible_and_is_withdrawn() {
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    let mut f = Fixture::new().await;
+    let cipher = Arc::new(konsensus_crypto::plaintext_cache::PlaintextCacheCipher::new(&[1; 32]));
+    Arc::get_mut(&mut f.state).unwrap().plaintext_cipher = Some(cipher.clone());
+    let me = Recipient::Node(*f.state.identity.node_id());
+    let text = format!(r#"{{"v":1,"call_id":"{:032x}","candidate":"x"}}"#, 0xc013_u128);
+    let env = UkmEnvelopeBuilder::new(402, f.peer, me, vec![], PaymentProof::new([2; 32], [3; 32], 1000)).build();
+    // As the receive path does it: hold, paid acceptance, plaintext, admission.
+    assert!(konsensus_api::calls::hold_incoming(f.db.as_ref(), &env).await.unwrap());
+    assert_eq!(f.db.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted);
+    f.db.store_message_plaintext(&env.id, &cipher.encrypt(text.as_bytes()).unwrap()).await.unwrap();
+    assert!(konsensus_api::calls::admit_incoming(f.db.as_ref(), &f.peer, 402, Some(&text)).await.is_err());
+    sqlx::raw_sql("CREATE TRIGGER cleanup_failure BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END").execute(f.db.pool()).await.unwrap();
+    assert!(f.db.reject_accepted_envelope(&env).await.is_err());
+    sqlx::raw_sql("DROP TRIGGER cleanup_failure").execute(f.db.pool()).await.unwrap();
+    // Still held: invisible everywhere, even across periodic recovery.
+    konsensus_api::calls::recover(f.db.as_ref()).await.unwrap();
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(konsensus_api::calls::withdraw_held(f.db.as_ref(), false).await.unwrap(), 0, "a fresh hold is left to its handler");
+    assert!(!f.db.get_messages_for_recipient(&me, 100, None).await.unwrap().iter().any(|e| e.id == env.id));
+    assert!(f.db.get_message(&env.id).await.unwrap().is_none());
+    assert!(f.db.get_message_plaintext(&env.id).await.unwrap().is_none());
+    assert!(!f.db.is_paid_envelope_accepted(&env).await.unwrap(), "no duplicate ACK for a held signal");
+    let mut ws = f.state.ws_broadcast.subscribe();
+    let req = Request::builder().method("POST").uri("/api/v1/messages/resync")
+        .header("authorization", common::auth_header(&f.state)).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"phase": "fulfill", "peer_id": f.peer.to_hex(), "message_ids": [env.id.to_hex()]}).to_string()))
+        .unwrap();
+    let _ = common::test_router(f.state.clone()).oneshot(req).await.unwrap();
+    assert!(ws.try_recv().is_err(), "a held signal never reaches WS");
+    // Startup: withdrawn for good; a resend is not re-accepted.
+    assert_eq!(konsensus_api::calls::withdraw_held(f.db.as_ref(), true).await.unwrap(), 1);
+    assert!(!f.db.call_admission_held(&env.id).await.unwrap());
+    assert!(!matches!(
+        f.db.accept_paid_envelope(&env).await.unwrap(),
+        konsensus_storage::PaidAcceptance::Accepted | konsensus_storage::PaidAcceptance::AlreadyAccepted
+    ));
+    // A crash between acceptance and admission fails closed the same way.
+    let crashed = UkmEnvelopeBuilder::new(402, f.peer, me, vec![], PaymentProof::new([4; 32], [5; 32], 1000)).build();
+    assert!(konsensus_api::calls::hold_incoming(f.db.as_ref(), &crashed).await.unwrap());
+    assert_eq!(f.db.accept_paid_envelope(&crashed).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted);
+    assert!(f.db.get_message(&crashed.id).await.unwrap().is_none());
+    assert_eq!(konsensus_api::calls::withdraw_held(f.db.as_ref(), true).await.unwrap(), 1);
+    assert!(!f.db.is_paid_envelope_accepted(&crashed).await.unwrap());
+    // An admitted signal is released and visible; a later hold never hides it.
+    let admitted = UkmEnvelopeBuilder::new(0, f.peer, me, b"x".to_vec(), PaymentProof::new([6; 32], [7; 32], 1000)).build();
+    assert!(konsensus_api::calls::hold_incoming(f.db.as_ref(), &admitted).await.unwrap());
+    assert_eq!(f.db.accept_paid_envelope(&admitted).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted);
+    f.db.call_admission_release(&admitted.id).await.unwrap();
+    assert!(!konsensus_api::calls::hold_incoming(f.db.as_ref(), &admitted).await.unwrap(), "stored messages are never held again");
+    assert!(f.db.get_message(&admitted.id).await.unwrap().is_some());
+}

@@ -648,6 +648,22 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.reject_accepted_envelope(envelope).await
     }
 
+    async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
+        self.inner.call_admission_hold(envelope, now_ms).await
+    }
+
+    async fn call_admission_release(&self, id: &MessageId) -> Result<(), StorageError> {
+        self.inner.call_admission_release(id).await
+    }
+
+    async fn call_admission_held(&self, id: &MessageId) -> Result<bool, StorageError> {
+        self.inner.call_admission_held(id).await
+    }
+
+    async fn call_admission_withdraw(&self, held_before_ms: u64) -> Result<u64, StorageError> {
+        self.inner.call_admission_withdraw(held_before_ms).await
+    }
+
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
         self.inner.has_nonce(nonce).await
     }

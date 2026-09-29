@@ -50,6 +50,14 @@ recovers without a second charge. At startup, before the receive loop and the
 outbox resend, `calls::recover` applies the same rule to every reservation a
 crash left.
 
+**Incoming signals are held until admitted.** Before its paid acceptance an
+incoming call signal is held (`call_admission_hold`): history, resync and
+duplicate ACKs treat it as absent until its admission is final. Admitted, the
+hold is lifted before the app sees it; refused, message, plaintext, receipt and
+hold are withdrawn in one transaction. A hold that outlives its handler (the
+withdrawal failed, or the node crashed) is withdrawn at startup, before the
+receive loop runs, and by the periodic sweep after 5 minutes: fail closed.
+
 **Incoming refusals are withdrawn.** A paid signal refused by the call rules
 (after the gate and decryption) is answered with `MessageReject`, its message
 row and cached plaintext are deleted, and its receipt is marked
@@ -66,11 +74,14 @@ than 1 hour ago is never dropped, and if those alone fill a bound the call is
 refused. Otherwise an id stays burned for 24 h. Expired rows are swept every 5
 minutes (never one with a pending signal).
 
-**One operation, one signal.** An operation id reused for another call id is
-refused (`operation_mismatch`) before any reservation; a retry of an operation
+**One operation, one signal.** Operation ids are canonicalized (lowercase
+UUIDv4) before the reservation, which is bound to the exact request (the
+journal's request hash, kind and recipient). An operation id reused for
+another call id or another payload is refused (`operation_mismatch`) before
+any reservation and never commits or releases the first request's; a retry of an operation
 that already paid is answered from the journal. The background operation
-reconciler settles a call reservation the same way the compose retry would,
-before any resend, so an offer whose payment resolved later rings the callee
+reconciler and a same-operation retry that finds the payment settled both
+commit the call reservation before any resend, so an offer whose payment resolved later rings the callee
 and accepts the answer.
 
 **Pricing freshness is per kind.** The caller asks the callee (`PriceQuery`

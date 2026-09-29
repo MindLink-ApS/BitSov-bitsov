@@ -59,6 +59,10 @@ pub(crate) async fn run_nonce_cleanup(
                 if let Err(e) = storage.call_sweep(now_ms, 10_000).await {
                     warn!(error = %e, "call state sweep failed");
                 }
+                // Held call signals whose handler never finished: fail closed.
+                if let Err(e) = konsensus_api::calls::withdraw_held(storage.as_ref(), false).await {
+                    warn!(error = %e, "held call signal sweep failed; they stay invisible");
+                }
                 match storage.cleanup_expired_nonces(max_nonce_age_secs).await {
                     Ok(removed) if removed > 0 => {
                         debug!(removed, "cleaned up expired nonces");
