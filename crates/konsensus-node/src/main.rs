@@ -1003,6 +1003,7 @@ async fn cmd_start(
                 None
             },
             config_path.parent(),
+            &node.identity().node_id().to_hex(),
         ),
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,

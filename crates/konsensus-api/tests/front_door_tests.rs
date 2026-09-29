@@ -32,10 +32,15 @@ fn state_with(intro: IntroductionSettings) -> Arc<AppState> {
 
 fn state_with_persist(intro: IntroductionSettings, dir: std::path::PathBuf) -> Arc<AppState> {
     let base = test_state();
+    let own = base.identity.node_id().to_hex();
     Arc::new(AppState {
         introduction: intro,
         content_dir: Some(dir.clone()),
-        front_door: konsensus_api::handlers::front_door::FrontDoorStore::load(Some(&dir), None),
+        front_door: konsensus_api::handlers::front_door::FrontDoorStore::load(
+            Some(&dir),
+            None,
+            &own,
+        ),
         ..(*base).clone()
     })
 }
@@ -418,4 +423,124 @@ async fn open_refuses_own_card_and_needs_local_consent() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
     assert!(resp.to_string().contains("local_consent"), "{resp}");
+}
+
+#[tokio::test]
+async fn corrupt_card_keeps_seq_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let intro = settings(Some("node.example.org:9000"));
+    let state = state_with_persist(intro.clone(), dir.path().to_path_buf());
+    let (status, body, _) = call(
+        &state,
+        "PUT",
+        "/api/v1/front-door",
+        bearer(&state, vec![auth::Scope::Admin]),
+        Some(json!({ "display_name": "Rasmus" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["seq"], 1);
+    assert!(dir.path().join("front-door.seq").exists());
+
+    // Tamper the card so signature fails, but leave seq visible in JSON.
+    let path = dir.path().join("front-door.json");
+    let mut card: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    card["profile"]["display_name"] = json!("Hax");
+    card["sig"] = json!("00".repeat(64));
+    card["seq"] = json!(7);
+    std::fs::write(&path, serde_json::to_vec_pretty(&card).unwrap()).unwrap();
+
+    let restarted = state_with_persist(intro, dir.path().to_path_buf());
+    // Card must not load as ours.
+    let (status, got, _) = call(
+        &restarted,
+        "GET",
+        "/api/v1/front-door",
+        bearer(&restarted, vec![auth::Scope::Read]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{got}");
+    // Next publish continues past the salvaged floor, not at 1.
+    let (status, body2, _) = call(
+        &restarted,
+        "PUT",
+        "/api/v1/front-door",
+        bearer(&restarted, vec![auth::Scope::Admin]),
+        Some(json!({ "display_name": "Rasmus" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body2}");
+    assert!(
+        body2["card"]["seq"].as_u64().unwrap() >= 8,
+        "expected seq >= 8 after floor 7, got {}",
+        body2["card"]["seq"]
+    );
+}
+
+#[tokio::test]
+async fn foreign_card_is_ignored_on_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let intro = settings(Some("node.example.org:9000"));
+    // Write a well-signed stranger card into our pages dir.
+    let stranger = stranger_card("peer.example.org:9000", "regtest", now());
+    std::fs::write(
+        dir.path().join("front-door.json"),
+        serde_json::to_vec_pretty(&stranger).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("front-door.seq"), b"3\n").unwrap();
+
+    let state = state_with_persist(intro, dir.path().to_path_buf());
+    let (status, got, _) = call(
+        &state,
+        "GET",
+        "/api/v1/front-door",
+        bearer(&state, vec![auth::Scope::Read]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{got}");
+    // Seq floor from our seq file still applies; stranger seq is not adopted.
+    let (status, body, _) = call(
+        &state,
+        "PUT",
+        "/api/v1/front-door",
+        bearer(&state, vec![auth::Scope::Admin]),
+        Some(json!({ "display_name": "Me" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["seq"], 4, "{body}");
+    assert_eq!(
+        body["card"]["node_id"],
+        state.identity.node_id().to_hex(),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn verify_fails_closed_without_network() {
+    let state = state_with(IntroductionSettings {
+        network: None,
+        endpoint: Some("node.example.org:9000".into()),
+    });
+    let card = stranger_card("peer.example.org:9000", "regtest", now());
+    let (status, body, _) = call(
+        &state,
+        "POST",
+        "/api/v1/front-door/verify",
+        bearer(&state, vec![auth::Scope::Read]),
+        Some(json!({ "card": card.to_link().unwrap() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.to_string().contains("front_door_unavailable"),
+        "{body}"
+    );
+    assert!(
+        body.to_string().contains("Bitcoin network"),
+        "{body}"
+    );
 }
