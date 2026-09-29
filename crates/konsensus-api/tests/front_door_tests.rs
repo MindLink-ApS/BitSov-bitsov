@@ -13,7 +13,9 @@ use tower::ServiceExt;
 use konsensus_api::auth;
 use konsensus_api::handlers::introduction::IntroductionSettings;
 use konsensus_api::state::AppState;
-use konsensus_core::front_door::{FrontDoorCard, FrontDoorFields, FrontDoorPrices, FrontDoorProfile, ProfileKind, LINK_PREFIX};
+use konsensus_core::front_door::{
+    FrontDoorCard, FrontDoorFields, FrontDoorPrices, FrontDoorProfile, ProfileKind, LINK_PREFIX,
+};
 
 fn settings(endpoint: Option<&str>) -> IntroductionSettings {
     IntroductionSettings {
@@ -46,8 +48,12 @@ fn state_with_persist(intro: IntroductionSettings, dir: std::path::PathBuf) -> A
 }
 
 fn bearer(state: &AppState, scopes: Vec<auth::Scope>) -> String {
-    let token =
-        auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, scopes).unwrap();
+    let token = auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        scopes,
+    )
+    .unwrap();
     format!("Bearer {token}")
 }
 
@@ -80,8 +86,7 @@ async fn call(
         .unwrap();
     (
         status,
-        serde_json::from_slice(&bytes)
-            .unwrap_or(json!({ "raw": String::from_utf8_lossy(&bytes) })),
+        serde_json::from_slice(&bytes).unwrap_or(json!({ "raw": String::from_utf8_lossy(&bytes) })),
         cache,
     )
 }
@@ -244,7 +249,10 @@ async fn no_card_without_endpoint_or_network() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.to_string().contains("front_door_unavailable"), "{body}");
+    assert!(
+        body.to_string().contains("front_door_unavailable"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -520,6 +528,71 @@ async fn foreign_card_is_ignored_on_load() {
 }
 
 #[tokio::test]
+async fn absurd_seq_floor_is_not_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+    let intro = settings(Some("node.example.org:9000"));
+    let state = state_with_persist(intro.clone(), dir.path().to_path_buf());
+    let (status, body, _) = call(
+        &state,
+        "PUT",
+        "/api/v1/front-door",
+        bearer(&state, vec![auth::Scope::Admin]),
+        Some(json!({ "display_name": "Rasmus" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["seq"], 1);
+
+    // Hand-edit the floor to u64::MAX — without a cap, next publish saturates
+    // and locks forever with SeqNotMonotonic.
+    std::fs::write(dir.path().join("front-door.seq"), format!("{}\n", u64::MAX)).unwrap();
+
+    let restarted = state_with_persist(intro, dir.path().to_path_buf());
+    let (status, body2, _) = call(
+        &restarted,
+        "PUT",
+        "/api/v1/front-door",
+        bearer(&restarted, vec![auth::Scope::Admin]),
+        Some(json!({ "display_name": "Rasmus" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body2}");
+    let seq = body2["card"]["seq"].as_u64().unwrap();
+    assert!(
+        seq == 2,
+        "expected publish to continue at 2 after refusing MAX floor, got {seq}"
+    );
+    // Poison is rewritten to the capped floor (own card seq).
+    let floor_text = std::fs::read_to_string(dir.path().join("front-door.seq")).unwrap();
+    let rewritten: u64 = floor_text.trim().parse().unwrap();
+    assert_eq!(rewritten, seq, "seq file should track the issued card");
+}
+
+#[tokio::test]
+async fn absurd_seq_floor_alone_starts_at_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let intro = settings(Some("node.example.org:9000"));
+    // No card — only a poisoned floor file.
+    std::fs::write(dir.path().join("front-door.seq"), format!("{}\n", u64::MAX)).unwrap();
+
+    let state = state_with_persist(intro, dir.path().to_path_buf());
+    let (status, body, _) = call(
+        &state,
+        "PUT",
+        "/api/v1/front-door",
+        bearer(&state, vec![auth::Scope::Admin]),
+        Some(json!({ "display_name": "Me" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["card"]["seq"], 1,
+        "refused MAX with no own card must start at seq 1, got {}",
+        body["card"]["seq"]
+    );
+}
+
+#[tokio::test]
 async fn verify_fails_closed_without_network() {
     let state = state_with(IntroductionSettings {
         network: None,
@@ -539,8 +612,5 @@ async fn verify_fails_closed_without_network() {
         body.to_string().contains("front_door_unavailable"),
         "{body}"
     );
-    assert!(
-        body.to_string().contains("Bitcoin network"),
-        "{body}"
-    );
+    assert!(body.to_string().contains("Bitcoin network"), "{body}");
 }
