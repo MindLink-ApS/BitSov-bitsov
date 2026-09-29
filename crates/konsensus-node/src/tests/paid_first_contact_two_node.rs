@@ -531,6 +531,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         send_timestamps,
         lightning: Arc::clone(&lightning),
         lightning_addr: None,
+        mock_lightning: true,
         invoice_requests,
         peer_ln_pubkeys: Arc::clone(&peer_ln_pubkeys),
         ws_broadcast,
