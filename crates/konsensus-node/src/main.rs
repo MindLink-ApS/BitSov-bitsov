@@ -996,7 +996,14 @@ async fn cmd_start(
             network: config.lightning.bitcoin_network(),
             endpoint: config.network.introduction_endpoint(),
         },
-        front_door: Default::default(),
+        front_door: konsensus_api::handlers::front_door::FrontDoorStore::load(
+            if config.web.enabled {
+                Some(std::path::Path::new(&config.web.content_dir))
+            } else {
+                None
+            },
+            config_path.parent(),
+        ),
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
     });

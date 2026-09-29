@@ -45,6 +45,11 @@ pub const MAX_THUMB_INLINE: usize = 4 * 1024;
 pub const MAX_MEDIA_TITLE: usize = 64;
 pub const MAX_LINKS: usize = 5;
 pub const MAX_SITE_TITLES: usize = 20;
+pub const MAX_PATH_LEN: usize = 128;
+pub const MAX_MIME_LEN: usize = 64;
+pub const MAX_LINK_LABEL: usize = 64;
+pub const MAX_LINK_URL: usize = 512;
+pub const HASH_HEX_LEN: usize = 64;
 
 /// Errors from building, decoding or verifying a front-door card.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -73,6 +78,10 @@ pub enum FrontDoorError {
     InvalidSignature,
     #[error("field too long: {0}")]
     FieldTooLong(&'static str),
+    #[error("invalid field: {0}")]
+    InvalidField(&'static str),
+    #[error("reach does not match endpoint: {0}")]
+    ReachMismatch(&'static str),
     #[error("seq must increase when updating")]
     SeqNotMonotonic,
 }
@@ -321,7 +330,10 @@ impl FrontDoorCard {
         if self.endpoint.is_empty() || self.endpoint.len() > MAX_ENDPOINT_LEN {
             return Err(FrontDoorError::InvalidEndpoint("length".into()));
         }
-        let _ = reach_of_endpoint(&self.endpoint)?;
+        let literal = reach_of_endpoint(&self.endpoint)?;
+        if self.reach == Reach::Public && literal == Reach::Local {
+            return Err(FrontDoorError::ReachMismatch("public"));
+        }
         if self.expires_at <= self.issued_at || self.expires_at - self.issued_at > LIFETIME_SECS {
             return Err(FrontDoorError::LifetimeTooLong);
         }
@@ -343,11 +355,19 @@ impl FrontDoorCard {
                     return Err(FrontDoorError::FieldTooLong("avatar.inline"));
                 }
             }
+            if let Some(h) = &av.hash {
+                check_hash_hex(h, "avatar.hash")?;
+            }
+            if let Some(m) = &av.mime {
+                check_mime(m, "avatar.mime")?;
+            }
         }
         if self.media.len() > MAX_MEDIA {
             return Err(FrontDoorError::FieldTooLong("media"));
         }
         for m in &self.media {
+            check_hash_hex(&m.hash, "media.hash")?;
+            check_mime(&m.mime, "media.mime")?;
             if m.title.len() > MAX_MEDIA_TITLE {
                 return Err(FrontDoorError::FieldTooLong("media.title"));
             }
@@ -363,18 +383,52 @@ impl FrontDoorCard {
         if self.links.len() > MAX_LINKS {
             return Err(FrontDoorError::FieldTooLong("links"));
         }
+        for link in &self.links {
+            if link.label.is_empty() || link.label.len() > MAX_LINK_LABEL {
+                return Err(FrontDoorError::FieldTooLong("links.label"));
+            }
+            check_link_url(&link.url)?;
+        }
+        if let Some(cv) = &self.cv {
+            check_safe_path(&cv.path, "cv.path")?;
+            check_hash_hex(&cv.hash, "cv.hash")?;
+        }
         if let Some(site) = &self.site {
             if site.titles.len() > MAX_SITE_TITLES {
                 return Err(FrontDoorError::FieldTooLong("site.titles"));
+            }
+            for t in &site.titles {
+                if t.len() > MAX_MEDIA_TITLE {
+                    return Err(FrontDoorError::FieldTooLong("site.titles"));
+                }
+            }
+            if let Some(p) = &site.index_path {
+                check_safe_path(p, "site.index_path")?;
+            }
+            if let Some(h) = &site.manifest_hash {
+                check_hash_hex(h, "site.manifest_hash")?;
             }
         }
         Ok(())
     }
 
-    /// Verify shape, network, expiry and signature.
-    pub fn verify(&self, now_unix: u64, network: &str) -> Result<(), FrontDoorError> {
+    /// Shape, size and Ed25519 signature — no clock or network checks.
+    ///
+    /// Callers that want to render an expired card "as of <date>" must still
+    /// pass this; expiry is never a substitute for a valid signature.
+    pub fn verify_signature(&self) -> Result<(), FrontDoorError> {
         self.check_shape()?;
         self.ensure_size()?;
+        let key = decode_fixed::<32>(&self.node_id).ok_or(FrontDoorError::InvalidKey)?;
+        let key = VerifyingKey::from_bytes(&key).map_err(|_| FrontDoorError::InvalidKey)?;
+        let sig = decode_fixed::<64>(&self.sig).ok_or(FrontDoorError::InvalidSignature)?;
+        key.verify_strict(&self.digest()?, &Signature::from_bytes(&sig))
+            .map_err(|_| FrontDoorError::InvalidSignature)
+    }
+
+    /// Verify signature first, then network and expiry.
+    pub fn verify(&self, now_unix: u64, network: &str) -> Result<(), FrontDoorError> {
+        self.verify_signature()?;
         if self.network != network {
             return Err(FrontDoorError::WrongNetwork {
                 card: self.network.clone(),
@@ -387,11 +441,7 @@ impl FrontDoorCard {
         if self.expires_at <= now_unix {
             return Err(FrontDoorError::Expired(self.expires_at));
         }
-        let key = decode_fixed::<32>(&self.node_id).ok_or(FrontDoorError::InvalidKey)?;
-        let key = VerifyingKey::from_bytes(&key).map_err(|_| FrontDoorError::InvalidKey)?;
-        let sig = decode_fixed::<64>(&self.sig).ok_or(FrontDoorError::InvalidSignature)?;
-        key.verify_strict(&self.digest()?, &Signature::from_bytes(&sig))
-            .map_err(|_| FrontDoorError::InvalidSignature)
+        Ok(())
     }
 
     /// `bitsov://front-door#<base64url(JSON)>` for QR / share.
@@ -451,6 +501,49 @@ fn decode_fixed<const N: usize>(hex_str: &str) -> Option<[u8; N]> {
     let mut out = [0u8; N];
     out.copy_from_slice(&bytes);
     Some(out)
+}
+
+fn check_hash_hex(value: &str, field: &'static str) -> Result<(), FrontDoorError> {
+    if value.len() != HASH_HEX_LEN || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(FrontDoorError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn check_mime(value: &str, field: &'static str) -> Result<(), FrontDoorError> {
+    if value.is_empty() || value.len() > MAX_MIME_LEN || value.chars().any(|c| c.is_control()) {
+        return Err(FrontDoorError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn check_safe_path(path: &str, field: &'static str) -> Result<(), FrontDoorError> {
+    if path.is_empty() || path.len() > MAX_PATH_LEN {
+        return Err(FrontDoorError::FieldTooLong(field));
+    }
+    if path.starts_with('/')
+        || path.contains("..")
+        || path.contains('\\')
+        || path.contains('\0')
+        || path.contains('/')
+    {
+        return Err(FrontDoorError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn check_link_url(url: &str) -> Result<(), FrontDoorError> {
+    if url.len() > MAX_LINK_URL {
+        return Err(FrontDoorError::FieldTooLong("links.url"));
+    }
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err(FrontDoorError::InvalidField("links.url"));
+    }
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(FrontDoorError::InvalidField("links.url"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -539,5 +632,110 @@ mod tests {
         let json = serde_json::to_string(&card).unwrap();
         let parsed = FrontDoorCard::parse(&json).unwrap();
         assert_eq!(parsed.seq, 2);
+    }
+
+    #[test]
+    fn public_reach_with_loopback_refused() {
+        use ed25519_dalek::Signer;
+        let id = NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
+        let mut card = FrontDoorCard::issue(&id, fields(1, 1_700_000_000)).unwrap();
+        card.endpoint = "127.0.0.1:9000".into();
+        card.reach = Reach::Public;
+        card.sig = hex::encode(
+            id.ed25519_signing_key()
+                .sign(&card.digest().unwrap())
+                .to_bytes(),
+        );
+        assert_eq!(
+            card.verify_signature(),
+            Err(FrontDoorError::ReachMismatch("public"))
+        );
+    }
+
+    #[test]
+    fn path_traversal_refused() {
+        let id = NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
+        let mut f = fields(1, 1_700_000_000);
+        f.cv = Some(FrontDoorCv {
+            path: "../secret.md".into(),
+            hash: "ab".repeat(32),
+            size: 10,
+        });
+        assert!(matches!(
+            FrontDoorCard::issue(&id, f),
+            Err(FrontDoorError::InvalidField("cv.path"))
+        ));
+    }
+
+    #[test]
+    fn unsigned_expired_fails_signature_not_expiry() {
+        let id = NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
+        let now = 1_700_000_000u64;
+        let mut card = FrontDoorCard::issue(&id, fields(1, now)).unwrap();
+        card.sig = "00".repeat(64);
+        // Even when "expired", a forged sig must fail as InvalidSignature.
+        assert_eq!(
+            card.verify(now + LIFETIME_SECS + 1, "regtest"),
+            Err(FrontDoorError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn introduction_domain_sig_does_not_verify_front_door() {
+        use ed25519_dalek::Signer;
+        let id = NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
+        let now = 1_700_000_000u64;
+        let mut card = FrontDoorCard::issue(&id, fields(1, now)).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(crate::introduction::DOMAIN_V1);
+        buf.extend_from_slice(&card.canonical_json().unwrap());
+        let digest = *blake3::hash(&buf).as_bytes();
+        card.sig = hex::encode(id.ed25519_signing_key().sign(&digest).to_bytes());
+        assert_eq!(
+            card.verify_signature(),
+            Err(FrontDoorError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn front_door_domain_sig_does_not_verify_introduction() {
+        use ed25519_dalek::Signer;
+        let id = NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
+        let now = 1_700_000_000u64;
+        let intro = crate::introduction::Introduction::issue(
+            &id,
+            crate::introduction::IntroductionFields {
+                network: "regtest".into(),
+                endpoint: "node.example.org:9000".into(),
+                admission_msat: 1000,
+                message_msat: 1000,
+                price_epoch: 0,
+                issued_at: now,
+                intro_id: [7u8; 16],
+            },
+        )
+        .unwrap();
+        // Re-sign the introduction payload under the front-door domain tag.
+        let mut body = intro.canonical_bytes().unwrap();
+        body.drain(..crate::introduction::DOMAIN_V1.len());
+        let mut buf = Vec::new();
+        buf.extend_from_slice(DOMAIN_V1);
+        buf.extend_from_slice(&body);
+        let digest = *blake3::hash(&buf).as_bytes();
+        let mut forged = intro.clone();
+        forged.sig = hex::encode(id.ed25519_signing_key().sign(&digest).to_bytes());
+        assert!(forged.verify(now + 1, "regtest").is_err());
+    }
+
+    #[test]
+    fn expired_but_signed_still_has_valid_signature() {
+        let id = NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
+        let now = 1_700_000_000u64;
+        let card = FrontDoorCard::issue(&id, fields(1, now)).unwrap();
+        card.verify_signature().unwrap();
+        assert!(matches!(
+            card.verify(now + LIFETIME_SECS + 1, "regtest"),
+            Err(FrontDoorError::Expired(_))
+        ));
     }
 }

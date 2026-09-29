@@ -30,6 +30,16 @@ fn state_with(intro: IntroductionSettings) -> Arc<AppState> {
     })
 }
 
+fn state_with_persist(intro: IntroductionSettings, dir: std::path::PathBuf) -> Arc<AppState> {
+    let base = test_state();
+    Arc::new(AppState {
+        introduction: intro,
+        content_dir: Some(dir.clone()),
+        front_door: konsensus_api::handlers::front_door::FrontDoorStore::load(Some(&dir), None),
+        ..(*base).clone()
+    })
+}
+
 fn bearer(state: &AppState, scopes: Vec<auth::Scope>) -> String {
     let token =
         auth::create_token(&state.identity.node_id().to_hex(), &state.jwt_secret, scopes).unwrap();
@@ -248,6 +258,8 @@ async fn verify_accepts_link_and_never_dials() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(cache.as_deref(), Some("no-store"));
     assert_eq!(body["card"]["profile"]["display_name"], "Ada");
+    assert_eq!(body["verified"], true);
+    assert_eq!(body["fresh"], true);
     assert!(body["link"].as_str().unwrap().starts_with(LINK_PREFIX));
 }
 
@@ -266,6 +278,94 @@ async fn verify_rejects_forged_signature() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.to_string().contains("front_door_invalid"), "{body}");
+}
+
+#[tokio::test]
+async fn verify_rejects_unsigned_expired_card() {
+    let state = state_with(settings(Some("node.example.org:9000")));
+    let mut card = stranger_card(
+        "peer.example.org:9000",
+        "regtest",
+        now().saturating_sub(8 * 24 * 3600),
+    );
+    card.profile.display_name = "Forged Name".into();
+    card.sig = "00".repeat(64);
+    let (status, body, _) = call(
+        &state,
+        "POST",
+        "/api/v1/front-door/verify",
+        bearer(&state, vec![auth::Scope::Read]),
+        Some(json!({ "card": serde_json::to_string(&card).unwrap() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("front_door_invalid"), "{body}");
+    assert!(!body.to_string().contains("Forged Name"), "{body}");
+}
+
+#[tokio::test]
+async fn verify_expired_but_signed_returns_verified_not_fresh() {
+    let state = state_with(settings(Some("node.example.org:9000")));
+    let card = stranger_card(
+        "peer.example.org:9000",
+        "regtest",
+        now().saturating_sub(8 * 24 * 3600),
+    );
+    let (status, body, _) = call(
+        &state,
+        "POST",
+        "/api/v1/front-door/verify",
+        bearer(&state, vec![auth::Scope::Read]),
+        Some(json!({ "card": card.to_link().unwrap() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["verified"], true);
+    assert_eq!(body["fresh"], false);
+    assert_eq!(body["card"]["profile"]["display_name"], "Ada");
+}
+
+#[tokio::test]
+async fn seq_survives_restart_via_pages_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let intro = settings(Some("node.example.org:9000"));
+    let state = state_with_persist(intro.clone(), dir.path().to_path_buf());
+    let admin = bearer(&state, vec![auth::Scope::Admin]);
+    let (status, body, _) = call(
+        &state,
+        "PUT",
+        "/api/v1/front-door",
+        admin,
+        Some(json!({ "display_name": "Rasmus", "tagline": "one" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["seq"], 1);
+    assert!(dir.path().join("front-door.json").exists());
+
+    // Fresh AppState loading the same pages dir continues seq.
+    let restarted = state_with_persist(intro, dir.path().to_path_buf());
+    let (status, body2, _) = call(
+        &restarted,
+        "PUT",
+        "/api/v1/front-door",
+        bearer(&restarted, vec![auth::Scope::Admin]),
+        Some(json!({ "display_name": "Rasmus", "tagline": "two" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body2}");
+    assert_eq!(body2["card"]["seq"], 2, "{body2}");
+    let (status, got, _) = call(
+        &restarted,
+        "GET",
+        "/api/v1/front-door",
+        bearer(&restarted, vec![auth::Scope::Read]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["card"]["seq"], 2);
+    assert_eq!(got["card"]["profile"]["tagline"], "two");
 }
 
 #[tokio::test]

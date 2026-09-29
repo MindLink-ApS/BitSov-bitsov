@@ -3,6 +3,7 @@
 //! can use the existing first-contact flow. Opening is never admission.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use konsensus_core::front_door::{
-    Avatar, FrontDoorCard, FrontDoorCv, FrontDoorFields, FrontDoorLink, FrontDoorMedia,
-    FrontDoorPrices, FrontDoorProfile, FrontDoorSite, ProfileKind,
+    Avatar, FrontDoorCard, FrontDoorCv, FrontDoorError, FrontDoorFields, FrontDoorLink,
+    FrontDoorMedia, FrontDoorPrices, FrontDoorProfile, FrontDoorSite, ProfileKind,
 };
 use konsensus_core::introduction::{
     dial_allowed, first_contact_prices, split_endpoint, Reach,
@@ -29,17 +30,79 @@ use crate::state::AppState;
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+const CARD_FILE: &str = "front-door.json";
 
 /// Advertised on `/api/v1/status`.
 pub const CAPABILITY: &str = "front_door_v1";
 
-/// In-memory published card (also written to pages/ when a content dir exists).
+/// Published card, loaded from and written to `pages/front-door.json`.
 #[derive(Debug, Clone, Default)]
 pub struct FrontDoorStore {
     pub card: Arc<Mutex<Option<FrontDoorCard>>>,
+    /// Absolute path of the persistence file, when a content or data dir exists.
+    persist: Option<PathBuf>,
 }
 
-/// `GET` / `PUT` response.
+impl FrontDoorStore {
+    /// Resolve `content_dir/front-door.json`, else `data_dir/pages/front-door.json`.
+    pub fn persist_path(content_dir: Option<&Path>, data_dir: Option<&Path>) -> Option<PathBuf> {
+        if let Some(dir) = content_dir {
+            return Some(dir.join(CARD_FILE));
+        }
+        data_dir.map(|d| d.join("pages").join(CARD_FILE))
+    }
+
+    /// Load any previously published card from disk.
+    pub fn load(content_dir: Option<&Path>, data_dir: Option<&Path>) -> Self {
+        let persist = Self::persist_path(content_dir, data_dir);
+        let card = persist
+            .as_ref()
+            .and_then(|p| match load_card(p) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(path = %p.display(), error = %e, "front-door card load failed");
+                    None
+                }
+            });
+        Self {
+            card: Arc::new(Mutex::new(card)),
+            persist,
+        }
+    }
+
+    fn save(&self, card: &FrontDoorCard) -> Result<(), ApiError> {
+        let Some(path) = self.persist.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ApiError::Internal(format!("front_door persist mkdir {}: {e}", parent.display()))
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(card)
+            .map_err(|e| ApiError::Internal(format!("front_door persist encode: {e}")))?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| {
+            ApiError::Internal(format!("front_door persist write {}: {e}", tmp.display()))
+        })?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            ApiError::Internal(format!("front_door persist rename {}: {e}", path.display()))
+        })?;
+        Ok(())
+    }
+}
+
+fn load_card(path: &Path) -> Result<Option<FrontDoorCard>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let card: FrontDoorCard = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    card.verify_signature().map_err(|e| e.to_string())?;
+    Ok(Some(card))
+}
+
+/// `GET` / `PUT` / verify response.
 #[derive(Debug, Serialize)]
 pub struct FrontDoorResponse {
     pub card: FrontDoorCard,
@@ -47,6 +110,10 @@ pub struct FrontDoorResponse {
     pub link: String,
     /// Same as `link`; named for clients that expect a dedicated QR field.
     pub qr_payload: String,
+    /// Signature (and shape) checked. Always true on success from this route.
+    pub verified: bool,
+    /// Within lifetime and on this node's network.
+    pub fresh: bool,
 }
 
 /// Owner body for create/update. Omitted price fields fall back to the node's
@@ -107,16 +174,22 @@ fn now_unix() -> Result<u64, ApiError> {
         .map_err(|e| ApiError::Internal(format!("system clock before UNIX_EPOCH: {e}")))
 }
 
-fn map_err(e: konsensus_core::front_door::FrontDoorError) -> ApiError {
+fn map_err(e: FrontDoorError) -> ApiError {
     ApiError::BadRequest(format!("front_door_invalid: {e}"))
 }
 
-async fn response_for(card: FrontDoorCard) -> Result<FrontDoorResponse, ApiError> {
+fn response_for(card: FrontDoorCard, network: Option<&str>, now: u64) -> Result<FrontDoorResponse, ApiError> {
     let link = card.to_link().map_err(map_err)?;
+    let fresh = match network {
+        Some(net) => card.verify(now, net).is_ok(),
+        None => card.expires_at > now,
+    };
     Ok(FrontDoorResponse {
         qr_payload: link.clone(),
         link,
         card,
+        verified: true,
+        fresh,
     })
 }
 
@@ -126,8 +199,10 @@ async fn get_front_door(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let guard = state.front_door.card.lock().await;
-    let card = guard.clone().ok_or_else(|| ApiError::NotFound("front_door_missing: publish one first".into()))?;
-    let body = response_for(card).await?;
+    let card = guard
+        .clone()
+        .ok_or_else(|| ApiError::NotFound("front_door_missing: publish one first".into()))?;
+    let body = response_for(card, state.introduction.network.as_deref(), now_unix()?)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)))
 }
 
@@ -156,11 +231,18 @@ async fn put_front_door(
     let height = state.chain.get_block_height().await.unwrap_or(0);
 
     let mut store = state.front_door.card.lock().await;
-    let next_seq = store.as_ref().map(|c| c.seq.saturating_add(1)).unwrap_or(1);
+    let prior_seq = store.as_ref().map(|c| c.seq).unwrap_or(0);
+    let next_seq = prior_seq.saturating_add(1);
+    if next_seq <= prior_seq {
+        return Err(ApiError::Conflict(format!(
+            "front_door_unavailable: {}",
+            FrontDoorError::SeqNotMonotonic
+        )));
+    }
     let card = FrontDoorCard::issue(
         &state.identity,
         FrontDoorFields {
-            network,
+            network: network.clone(),
             endpoint,
             seq: next_seq,
             issued_at: now_unix()?,
@@ -184,42 +266,43 @@ async fn put_front_door(
         },
     )
     .map_err(|e| ApiError::Conflict(format!("front_door_unavailable: {e}")))?;
+    state.front_door.save(&card)?;
     *store = Some(card.clone());
     drop(store);
-    let body = response_for(card).await?;
+    let body = response_for(card, Some(network.as_str()), now_unix()?)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)))
 }
 
 /// `POST /api/v1/front-door/verify` — validate a pasted/scanned card for display.
+///
+/// Signature is always required. Expired or wrong-network cards may still be
+/// returned for "as of <date>" UI with `verified: true, fresh: false`.
 async fn verify_front_door(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<VerifyFrontDoorRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let card = FrontDoorCard::parse(&req.card).map_err(map_err)?;
+    // F1: signature before expiry/network — unsigned cards never look verified.
+    card.verify_signature().map_err(map_err)?;
     let network = state.introduction.network.as_deref().unwrap_or("regtest");
-    // Display verify: allow expired cards to parse for "as of" UI, but report via verify when fresh.
-    if let Err(e) = card.verify(now_unix()?, network) {
-        // Still return the card for display; include verification error in a soft way by failing
-        // only on crypto/shape — expiry is a BadRequest with the card link for refresh UX.
-        match e {
-            konsensus_core::front_door::FrontDoorError::Expired(_)
-            | konsensus_core::front_door::FrontDoorError::WrongNetwork { .. } => {
-                let link = card.to_link().map_err(map_err)?;
-                return Ok((
-                    [(header::CACHE_CONTROL, "no-store")],
-                    Json(FrontDoorResponse {
-                        qr_payload: link.clone(),
-                        link,
-                        card,
-                    }),
-                ));
-            }
-            other => return Err(map_err(other)),
-        }
-    }
-    let body = response_for(card).await?;
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)))
+    let now = now_unix()?;
+    let fresh = match card.verify(now, network) {
+        Ok(()) => true,
+        Err(FrontDoorError::Expired(_)) | Err(FrontDoorError::WrongNetwork { .. }) => false,
+        Err(other) => return Err(map_err(other)),
+    };
+    let link = card.to_link().map_err(map_err)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(FrontDoorResponse {
+            qr_payload: link.clone(),
+            link,
+            card,
+            verified: true,
+            fresh,
+        }),
+    ))
 }
 
 fn verified_for_open(state: &AppState, text: &str) -> Result<FrontDoorCard, ApiError> {
