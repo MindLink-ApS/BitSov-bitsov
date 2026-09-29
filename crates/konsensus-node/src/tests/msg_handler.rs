@@ -1976,6 +1976,13 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     source.send(bob.node_id(), &env).await.unwrap();
     assert!(outcome(source.clone()).await.unwrap_err().contains("replayed"));
     assert!(ws_rx.try_recv().is_err());
+    // Codex P1: the refused signal is withdrawn (no history/resync), and a
+    // resend of the very same paid envelope is refused, not duplicate-ACKed.
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    assert!(ws_rx.try_recv().is_err());
 
     // Alice made the offer, so an answer from Alice is from the wrong side.
     let env = signal(401, 50, format!(r#"{{"v":1,"call_id":"{id}","sdp":"v=0"}}"#)).await;

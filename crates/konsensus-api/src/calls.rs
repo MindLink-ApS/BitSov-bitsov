@@ -1,58 +1,40 @@
 //! This node's 1:1 call state (kinds 400-403), shared by the compose path
-//! (outgoing) and the receive path (incoming). See
-//! [`konsensus_core::payloads::call`] for the rules.
+//! (outgoing) and the receive path (incoming). The rules are the pure
+//! transitions in [`konsensus_core::payloads::call`]; the state is stored
+//! durably (`call_state`), so a restart keeps used ids, live calls and our
+//! reserved signals.
 //!
-//! Process-wide, like the admission ledger: a `std` mutex never held across
-//! `await`, recovered from poison so a panic elsewhere cannot block calls.
+//! Outgoing: `reserve` (before any quote or payment, bound to the operation
+//! id) → `commit` (once the payment settled, before dispatch) → `resolve`
+//! (after compose returns: release a definite nonpayment, keep an ambiguous
+//! one for a same-operation retry). `recover` settles or releases what a crash
+//! left, before the receive and outbox workers start.
+//!
+//! Read-modify-write is serialised by one process-wide async lock; the
+//! backing store is one node's database.
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use konsensus_core::payloads::call::{CallRefusal, CallRegistry, CallSignal, Direction};
+use konsensus_core::payloads::call::{self as rules, CallEntry, CallRefusal, CallSignal, Settlement};
 use konsensus_core::types::NodeId;
+use konsensus_storage::Storage;
 
 use crate::error::ApiError;
 use crate::state::AppState;
 
 /// How long to wait for the callee's own answer to a call price query.
-const PRICE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// A cached table older than this is not a quote.
-const MAX_PRICE_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+const PRICE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// A call price answer older than this is not a quote.
+const PRICE_ANSWER_MAX_AGE: Duration = Duration::from_secs(60);
+/// At most one `PriceQuery` per peer this often; callers inside the window
+/// wait for that query's answer instead of sending another (Fable follow-up).
+const PRICE_QUERY_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
-/// The callee's current call-offer price (trust discount applied), asked of
-/// the callee itself just now: a `PriceQuery` for kind 400 and its
-/// `PriceResponse`. A sender never falls back to its own tariff for a call
-/// offer: with no fresh answer, nothing is paid.
-pub async fn peer_call_price(state: &AppState, peer: &NodeId) -> Result<u64, ApiError> {
-    let kind = konsensus_core::kind::KIND_CALL_INVITE;
-    let asked = std::time::Instant::now();
-    let frame = konsensus_message::Frame::PriceQuery { kind }
-        .to_bytes()
-        .map_err(|e| ApiError::Internal(format!("frame serialization error: {e}")))?;
-    let unknown = || {
-        ApiError::BadRequest("their node did not answer with a call price; nothing was paid".into())
-            .with_reason("call_price_unknown")
-    };
-    state.transport.send_raw_frame(peer, &frame).await.map_err(|_| unknown())?;
-    let key = konsensus_pricing::peer_prices::kind_key(kind);
-    tokio::time::timeout(PRICE_QUERY_TIMEOUT, async {
-        loop {
-            let fresh = state.peer_prices.get_peer_entry(peer).await
-                .is_some_and(|e| e.received_at >= asked && e.prices.contains_key(&key));
-            if fresh {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .map_err(|_| unknown())?;
-    let height = state.chain.get_block_height().await.unwrap_or(0);
-    state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await.ok_or_else(unknown)
-}
-
-fn registry() -> MutexGuard<'static, CallRegistry> {
-    static CALLS: OnceLock<Mutex<CallRegistry>> = OnceLock::new();
-    CALLS.get_or_init(|| Mutex::new(CallRegistry::new())).lock().unwrap_or_else(|p| p.into_inner())
+fn lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn now_ms() -> u64 {
@@ -67,44 +49,184 @@ pub fn is_call_kind(kind: u16) -> bool {
     (konsensus_core::kind::KIND_CALL_INVITE..=konsensus_core::kind::KIND_CALL_HANGUP).contains(&kind)
 }
 
+type Store<'a> = &'a dyn Storage;
+
+async fn current(store: Store<'_>, peer: &NodeId, call_id: &str, now: u64) -> Result<Option<CallEntry>, konsensus_storage::StorageError> {
+    Ok(store.call_get(peer, call_id).await?.and_then(|e| e.at(now)))
+}
+
+async fn write(store: Store<'_>, peer: &NodeId, call_id: &str, entry: Option<&CallEntry>) -> Result<(), konsensus_storage::StorageError> {
+    match entry {
+        Some(e) => store.call_put(peer, call_id, e).await,
+        None => store.call_delete(peer, call_id).await,
+    }
+}
+
+/// A new call id must fit the per-peer and total bounds. Nothing unexpired is evicted.
+async fn room(store: Store<'_>, peer: &NodeId, now: u64) -> Result<(), CallRefusal> {
+    let (mine, total) = store.call_counts(peer, now).await.map_err(|_| CallRefusal::Invalid("call state unavailable"))?;
+    rules::has_room(mine as usize, total as usize)
+}
+
 /// Admit a signal this node received (after the payment gate). A refusal
-/// means it must not reach the app.
-pub fn admit_incoming(peer: &NodeId, kind: u16, plaintext: Option<&str>) -> Result<CallSignal, CallRefusal> {
+/// means it must not reach the app (the caller also withdraws the stored message).
+pub async fn admit_incoming(store: Store<'_>, peer: &NodeId, kind: u16, plaintext: Option<&str>) -> Result<CallSignal, CallRefusal> {
     let signal = CallSignal::parse(kind, plaintext.ok_or(CallRefusal::Invalid("undecryptable"))?)?;
-    registry().admit(Direction::Incoming, peer, kind, &signal, now_ms())?;
+    let _g = lock().lock().await;
+    let now = now_ms();
+    let unavailable = |_| CallRefusal::Invalid("call state unavailable");
+    let entry = current(store, peer, &signal.call_id, now).await.map_err(unavailable)?;
+    if entry.is_none() {
+        room(store, peer, now).await?;
+    }
+    let next = rules::receive(entry, kind, now)?;
+    write(store, peer, &signal.call_id, Some(&next)).await.map_err(unavailable)?;
     Ok(signal)
 }
 
-/// Admit a signal this node is about to pay for and send. Refused before
-/// any price is quoted or any payment starts.
-pub fn admit_outgoing(peer: &NodeId, kind: u16, plaintext: &str) -> Result<(), ApiError> {
-    let refused = |e: CallRefusal, reason: &'static str| ApiError::BadRequest(e.to_string()).with_reason(reason);
-    let signal = CallSignal::parse(kind, plaintext).map_err(|e| refused(e, "call_signal_invalid"))?;
-    registry().admit(Direction::Outgoing, peer, kind, &signal, now_ms()).map_err(|e| {
-        let reason = match e {
-            CallRefusal::Replayed => "call_id_used",
-            CallRefusal::Full => "call_busy",
-            _ => "call_not_live",
-        };
-        refused(e, reason)
-    })
+fn refused(e: CallRefusal) -> ApiError {
+    let reason = match e {
+        CallRefusal::Replayed => "call_id_used",
+        CallRefusal::Full => "call_busy",
+        CallRefusal::InFlight => "call_signal_in_flight",
+        CallRefusal::Invalid(_) | CallRefusal::NotCallKind => "call_signal_invalid",
+        _ => "call_not_live",
+    };
+    ApiError::BadRequest(e.to_string()).with_reason(reason)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn outgoing_refusals_are_named_before_any_payment() {
-        let peer = NodeId::from_bytes([7; 32]);
-        let id = format!("{:032x}", 0xca11_u128 + u128::from(std::process::id()));
-        let offer = format!(r#"{{"v":1,"call_id":"{id}","media":"audio","sdp":"v=0"}}"#);
-        admit_outgoing(&peer, 400, &offer).unwrap();
-        let again = admit_outgoing(&peer, 400, &offer).unwrap_err();
-        assert!(matches!(&again, ApiError::Reasoned { reason: "call_id_used", .. }), "{again:?}");
-        let ice = format!(r#"{{"v":1,"call_id":"{:032x}","candidate":"c"}}"#, 1);
-        assert!(matches!(admit_outgoing(&peer, 402, &ice).unwrap_err(), ApiError::Reasoned { reason: "call_not_live", .. }));
-        assert!(matches!(admit_outgoing(&peer, 400, "hi").unwrap_err(), ApiError::Reasoned { reason: "call_signal_invalid", .. }));
-        assert!(is_call_kind(403) && !is_call_kind(404) && !is_call_kind(0));
+/// Reserve one of our signals under `operation_id`, before any quote or payment.
+pub async fn reserve_outgoing(store: Store<'_>, peer: &NodeId, kind: u16, plaintext: &str, operation_id: &str) -> Result<(), ApiError> {
+    let signal = CallSignal::parse(kind, plaintext).map_err(refused)?;
+    let _g = lock().lock().await;
+    let now = now_ms();
+    let storage = |e: konsensus_storage::StorageError| ApiError::Internal(format!("call state: {e}"));
+    let entry = current(store, peer, &signal.call_id, now).await.map_err(storage)?;
+    if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
+        room(store, peer, now).await.map_err(refused)?;
     }
+    let next = rules::reserve(entry.clone(), kind, operation_id, now).map_err(refused)?;
+    if entry.as_ref() != Some(&next) {
+        write(store, peer, &signal.call_id, Some(&next)).await.map_err(storage)?;
+    }
+    Ok(())
+}
+
+async fn settle(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &str, how: Settlement) -> Result<(), konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    let now = now_ms();
+    let Some(entry) = store.call_get(peer, call_id).await? else { return Ok(()) };
+    if entry.pending.as_ref().is_none_or(|p| p.operation_id != operation_id) {
+        return Ok(());
+    }
+    let next = match how {
+        Settlement::Paid => Some(rules::commit(entry, operation_id, now)),
+        Settlement::Unpaid => rules::release(entry, operation_id),
+        Settlement::Ambiguous => return Ok(()),
+    };
+    write(store, peer, call_id, next.as_ref()).await
+}
+
+/// The reserved signal's payment settled: publish its transition before the
+/// envelope goes out, so the peer's reply finds a paid call. Never fails the
+/// send (money already moved): a store error is logged and `resolve` or
+/// `recover` commits later from the operation journal.
+pub async fn commit_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str) {
+    let Ok(signal) = serde_json::from_str::<CallSignal>(plaintext) else { return };
+    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, Settlement::Paid).await {
+        tracing::warn!(peer = %peer, error = %e, "call commit after settlement failed; recovery will retry");
+    }
+}
+
+/// After compose returned (either way): read the operation journal and commit,
+/// release (definite nonpayment) or keep (ambiguous) the reservation.
+pub async fn resolve_outgoing(store: Store<'_>, peer: &NodeId, plaintext: &str, operation_id: &str) {
+    let Ok(signal) = serde_json::from_str::<CallSignal>(plaintext) else { return };
+    let state = match store.get_outbox_operation(operation_id).await {
+        Ok(op) => op.map(|o| o.state),
+        Err(e) => {
+            tracing::warn!(error = %e, "call reservation kept: operation state unreadable");
+            return;
+        }
+    };
+    let how = rules::settlement(state.as_deref());
+    if let Err(e) = settle(store, peer, &signal.call_id, operation_id, how).await {
+        tracing::warn!(peer = %peer, error = %e, "call reservation not resolved; recovery will retry");
+    }
+}
+
+/// Startup: settle or release every reservation a crash left, from the
+/// operation journal. Ambiguous ones stay for a same-operation retry. Run
+/// before the receive loop and the outbox resend start.
+pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_storage::StorageError> {
+    let (mut committed, mut released) = (0, 0);
+    for (peer, call_id, entry) in store.call_pending().await? {
+        let Some(p) = entry.pending.clone() else { continue };
+        let state = store.get_outbox_operation(&p.operation_id).await?.map(|o| o.state);
+        let how = rules::settlement(state.as_deref());
+        settle(store, &peer, &call_id, &p.operation_id, how).await?;
+        match how {
+            Settlement::Paid => committed += 1,
+            Settlement::Unpaid => released += 1,
+            Settlement::Ambiguous => {}
+        }
+    }
+    Ok((committed, released))
+}
+
+fn last_query() -> &'static Mutex<HashMap<NodeId, Instant>> {
+    static LAST: OnceLock<Mutex<HashMap<NodeId, Instant>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The callee's current call-offer price (trust discount applied), answered
+/// by the callee itself to a `PriceQuery` for kind 400. Only an answer *for
+/// kind 400* that arrived after the query counts (Codex P2): another kind's
+/// response refreshing the peer entry never satisfies it. Queries to one peer
+/// are sent at most every 2 s; callers in between wait for that answer. The
+/// sender never falls back to its own tariff: with no fresh answer, nothing
+/// is paid.
+pub async fn peer_call_price(state: &AppState, peer: &NodeId) -> Result<u64, ApiError> {
+    let kind = konsensus_core::kind::KIND_CALL_INVITE;
+    let unknown = || {
+        ApiError::BadRequest(
+            "their node did not answer with a call price (not connected, or this connection is not admitted yet: \
+             send them a message first); nothing was paid"
+                .into(),
+        )
+        .with_reason("call_price_unknown")
+    };
+    let now = Instant::now();
+    let asked = {
+        let mut last = last_query().lock().unwrap_or_else(|e| e.into_inner());
+        match last.get(peer).copied().filter(|t| now.duration_since(*t) < PRICE_QUERY_MIN_INTERVAL) {
+            Some(recent) => (recent, false),
+            None => {
+                if last.len() >= 4096 {
+                    last.retain(|_, t| now.duration_since(*t) < PRICE_QUERY_MIN_INTERVAL);
+                }
+                last.insert(*peer, now);
+                (now, true)
+            }
+        }
+    };
+    let (asked, send) = asked;
+    if send {
+        let frame = konsensus_message::Frame::PriceQuery { kind }
+            .to_bytes()
+            .map_err(|e| ApiError::Internal(format!("frame serialization error: {e}")))?;
+        state.transport.send_raw_frame(peer, &frame).await.map_err(|_| unknown())?;
+    }
+    tokio::time::timeout(PRICE_QUERY_TIMEOUT, async {
+        loop {
+            if state.peer_prices.kind_answered_at(peer, kind).await.is_some_and(|at| at >= asked) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| unknown())?;
+    let height = state.chain.get_block_height().await.unwrap_or(0);
+    state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, PRICE_ANSWER_MAX_AGE).await.ok_or_else(unknown)
 }

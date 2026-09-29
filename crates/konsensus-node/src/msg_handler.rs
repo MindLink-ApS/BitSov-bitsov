@@ -515,8 +515,15 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // accepts answer/ICE/hangup only for a live call with this
                         // sender. A refused signal never reaches the app.
                         if konsensus_api::calls::is_call_kind(envelope.kind) {
-                            if let Err(refusal) = konsensus_api::calls::admit_incoming(&sender, envelope.kind, plaintext.as_deref()) {
+                            if let Err(refusal) = konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), &sender, envelope.kind, plaintext.as_deref()).await {
                                 warn!(sender = %sender, kind = envelope.kind, reason = %refusal, "call signal refused; not forwarded");
+                                // Paid but refused: withdraw the stored message and its
+                                // plaintext and mark the receipt application-rejected, so
+                                // history, resync and a resend never present it as
+                                // delivered (Codex P1). Payment hash and nonce stay burned.
+                                if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
+                                    error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused call signal");
+                                }
                                 audit_for_recv.record(
                                     konsensus_api::audit::events::MESSAGE_REJECTED,
                                     &sender.to_hex(),

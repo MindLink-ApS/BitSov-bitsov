@@ -1050,6 +1050,14 @@ async fn cmd_start(
         None
     };
 
+    // Calls: settle or release call reservations a crash left (from the
+    // operation journal) before the receive loop and the outbox resend start.
+    match konsensus_api::calls::recover(node.storage().as_ref()).await {
+        Ok((committed, released)) if committed + released > 0 => info!(committed, released, "recovered call reservations"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "call state recovery failed; reservations stay for a same-operation retry"),
+    }
+
     // Incoming message handler (routes P2P messages through payment gate to storage + WS)
     let msg_handle = tokio::spawn(msg_handler::run(msg_handler::MsgHandlerDeps {
         transport: Arc::clone(node.transport()),

@@ -3275,6 +3275,19 @@ pub(super) async fn compose_message(
             amount_msat: total_amount_msat,
             readmission_msat: readmission.paid_msat(),
         }))
+    } else if crate::calls::is_call_kind(req.kind) {
+        // Calls: reserve under the operation id before any quote or payment;
+        // the paid transition is published at settlement (compose_peer), and a
+        // definite nonpayment releases the reservation afterwards.
+        let mut req = req;
+        let operation_id = req.operation_id.get_or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone();
+        let peer_id = NodeId::from_hex(&req.recipient)
+            .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+        let plaintext = req.plaintext.clone();
+        crate::calls::reserve_outgoing(state.storage.as_ref(), &peer_id, req.kind, &plaintext, &operation_id).await?;
+        let result = super::operations::compose(auth, Arc::clone(&state), req, references).await;
+        crate::calls::resolve_outgoing(state.storage.as_ref(), &peer_id, &plaintext, &operation_id).await;
+        result
     } else {
         super::operations::compose(auth, state, req, references).await
     }
@@ -3288,11 +3301,6 @@ pub(super) async fn compose_peer(
         // ── Peer compose: existing single-recipient path ──
         let peer_id = NodeId::from_hex(&req.recipient)
             .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
-        // Calls: a reused call id, or an answer/ICE/hangup for no live call,
-        // is refused here, before any quote or payment.
-        if crate::calls::is_call_kind(req.kind) {
-            crate::calls::admit_outgoing(&peer_id, req.kind, &req.plaintext)?;
-        }
         let _admission_guard = acquire_peer_admission_lock(&peer_id).await.ok_or_else(||
             ApiError::Internal("too many concurrent peer sends".into()))?;
         reconcile_admission_budget(&state, &peer_id, None).await?;
@@ -3301,16 +3309,27 @@ pub(super) async fn compose_peer(
 
         let height = if state.lightning.money_ready().await { state.chain.get_block_height().await.unwrap_or(0) } else { 0 };
         let mut price_msat = quoted_price(&state, &peer_id, req.kind, height).await?;
-        // A call offer pays the callee's own call price, asked of it just now.
-        if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
-            price_msat = super::caps::payable(crate::calls::peer_call_price(&state, &peer_id).await?);
-        }
         let mut cap = req.max_total_msat;
         if let Some(per) = &req.max_recipient_msat {
             let recipient_cap = *per.get(&peer_id.to_hex()).ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;
             cap = Some(cap.map_or(recipient_cap, |total| total.min(recipient_cap)));
         }
         let first_contact = !state.session_manager.has_session(&peer_id).await;
+        if crate::calls::is_call_kind(req.kind) {
+            // A call never pays first-contact admission: without an E2EE
+            // session the contact is new, and first contact is a chat message
+            // under the owner's approval. (Re-admission after a reconnect uses
+            // the existing flow below, as for any non-chat kind.)
+            if first_contact {
+                return Err(ApiError::BadRequest(
+                    "calls go to contacts you already message: send them a message first; nothing was paid".into(),
+                ).with_reason("call_needs_contact"));
+            }
+            // The offer pays the callee's own call price, asked of it just now.
+            if req.kind == konsensus_core::kind::KIND_CALL_INVITE {
+                price_msat = super::caps::payable(crate::calls::peer_call_price(&state, &peer_id).await?);
+            }
+        }
         // G1 × F1 (#85): an aggregate cap alone never lets a budget pay a
         // stranger. A paired caller also needs the owner's one-time
         // confirmation for exactly this recipient (a first-contact grant,
@@ -3469,6 +3488,10 @@ pub(super) async fn compose_peer(
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
 
         let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
+        if crate::calls::is_call_kind(req.kind) {
+            // Paid: publish the call transition before the envelope goes out.
+            crate::calls::commit_outgoing(state.storage.as_ref(), &peer_id, &req.plaintext, &operation.id).await;
+        }
 
         if let Some(expected) = konsensus_core::expected_reply_kind(req.kind) {
             let Recipient::Node(peer) = envelope.recipient else {

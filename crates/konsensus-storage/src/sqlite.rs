@@ -189,6 +189,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (24, "outbox operations", include_str!("../migrations/024_outbox_operations.sql")),
     (25, "outbox recovery", include_str!("../migrations/025_outbox_recovery.sql")),
     (26, "outstanding web requests", include_str!("../migrations/026_outstanding_web_requests.sql")),
+    (27, "call state", include_str!("../migrations/027_call_state.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -1549,6 +1550,66 @@ impl Storage for SqliteStorage {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+
+    async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind FROM call_state WHERE peer = ? AND call_id = ?")
+            .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
+        row.map(call_entry_from_row).transpose()
+    }
+
+    async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
+        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind")
+            .bind(peer.to_hex()).bind(call_id)
+            .bind(entry.side.as_str()).bind(entry.phase.as_str())
+            .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
+            .bind(entry.pending.as_ref().map(|p| p.operation_id.clone()))
+            .bind(entry.pending.as_ref().map(|p| i64::from(p.kind)))
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
+        sqlx::query("DELETE FROM call_state WHERE peer = ? AND call_id = ?")
+            .bind(peer.to_hex()).bind(call_id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn call_counts(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<(u64, u64), StorageError> {
+        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
+        let (mine, total): (i64, i64) = sqlx::query_as("SELECT COALESCE(SUM(CASE WHEN peer = ? THEN 1 ELSE 0 END), 0), COUNT(*) FROM call_state WHERE replay_until_ms > ? OR pending_operation_id IS NOT NULL")
+            .bind(peer.to_hex()).bind(now).fetch_one(&self.pool).await?;
+        Ok((u64::try_from(mine).unwrap_or(0), u64::try_from(total).unwrap_or(0)))
+    }
+
+    async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind FROM call_state WHERE pending_operation_id IS NOT NULL")
+            .fetch_all(&self.pool).await?;
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind)| {
+            let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind))?))
+        }).collect()
+    }
+
+    async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
+        let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
+        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= ? AND pending_operation_id IS NULL ORDER BY replay_until_ms LIMIT ?)")
+            .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
+        Ok(done.rows_affected())
+    }
+
+    async fn reject_accepted_envelope(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+        let id = envelope.id.to_hex();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM messages WHERE id = ? AND sender = ?")
+            .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = ? AND message_id = ?")
+            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
@@ -3404,5 +3465,25 @@ fn outstanding_from_row(
         peer: konsensus_core::types::NodeId::from_hex(&peer).map_err(|_| bad("peer"))?,
         expected_reply_kind: u16::try_from(kind).map_err(|_| bad("reply kind"))?,
         expires_at_ms: u64::try_from(expires).map_err(|_| bad("expiry"))?,
+    })
+}
+
+/// `(side, phase, deadline_ms, pending_operation_id, pending_kind)` of `call_state`.
+type CallRow = (String, String, i64, Option<String>, Option<i64>);
+
+/// A stored call row. A corrupt row is an error, never a call.
+fn call_entry_from_row((side, phase, deadline, op, kind): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
+    use konsensus_core::payloads::call::{CallEntry, Pending, Phase, Side};
+    let bad = |what: &str| StorageError::Conversion(format!("call state: bad {what}"));
+    let pending = match (op, kind) {
+        (Some(operation_id), Some(kind)) => Some(Pending { operation_id, kind: u16::try_from(kind).map_err(|_| bad("pending kind"))? }),
+        (None, None) => None,
+        _ => return Err(bad("pending")),
+    };
+    Ok(CallEntry {
+        side: Side::parse(&side).ok_or_else(|| bad("side"))?,
+        phase: Phase::parse(&phase).ok_or_else(|| bad("phase"))?,
+        deadline_ms: u64::try_from(deadline).map_err(|_| bad("deadline"))?,
+        pending,
     })
 }

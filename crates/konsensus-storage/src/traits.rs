@@ -905,4 +905,46 @@ pub trait Storage: Send + Sync {
     async fn sweep_outstanding_web_requests(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
         Ok(0)
     }
+
+    // ── 1:1 call state (kinds 400-403) ─────────────────────────────────
+    // Defaults refuse: a backend without durable call state cannot take calls.
+
+    /// The stored state of `(peer, call_id)`, as written (not yet aged).
+    async fn call_get(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Insert or replace `(peer, call_id)`.
+    async fn call_put(&self, _peer: &konsensus_core::NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Forget `(peer, call_id)` (an offer that was never paid).
+    async fn call_delete(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// `(for this peer, in total)`: entries whose replay protection runs past `now_ms`.
+    async fn call_counts(&self, _peer: &konsensus_core::NodeId, _now_ms: u64) -> Result<(u64, u64), StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Every entry with a reserved, unsettled signal of ours.
+    async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Drop up to `max` entries whose replay protection ended, with no pending signal.
+    async fn call_sweep(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+
+    /// An envelope the gate accepted and stored was refused by the application
+    /// (a call signal for no live call): remove the message and its cached
+    /// plaintext and mark its receipt application-rejected (`accepted = -1`), so
+    /// history, resync and duplicate ACKs never present it as delivered, while
+    /// its payment hash and nonce stay burned.
+    async fn reject_accepted_envelope(&self, _envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("reject accepted envelope".into()))
+    }
 }

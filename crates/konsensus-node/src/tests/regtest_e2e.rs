@@ -790,6 +790,27 @@ async fn real_ldk_regtest_calls() {
         fee_b10k + fee_b1k, 2 * fee_a1k, fee_b10k + fee_b1k + 2 * fee_a1k
     );
     steps.pass("msat reconciliation: channels and budgets");
+
+    // Codex P2 (#131): a call after a reconnect must not be stuck behind the
+    // call price query. Observed on real LDK: the uncapped (owner) call asks
+    // B's call price, re-admits the new connection through the existing flow
+    // (reported separately as readmission_msat), then pays the call once.
+    alice.transport.disconnect(bob.state.identity.node_id()).await.unwrap();
+    wait("disconnected", || async { !bob.transport.is_connected(alice.state.identity.node_id()).await }).await;
+    alice.transport.connect(bob.state.identity.node_id(), &bob.transport.listen_addr().unwrap().to_string()).await.unwrap();
+    wait("reconnected", || bob.transport.is_connected(alice.state.identity.node_id())).await;
+    let pays = a.list_payments(200).await.unwrap().len();
+    let fresh = format!("{:032x}", rand::random::<u128>());
+    let offer2 = format!(r#"{{"v":1,"call_id":"{fresh}","media":"audio","sdp":"{sdp}"}}"#);
+    let (status, body) = signal(&alice, &bob_hex, 400, offer2.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!((body["amount_msat"].as_u64(), body["readmission_msat"].as_u64()), (Some(10_000), Some(2_001)), "{body}");
+    assert_eq!(recv_kind(&mut bob, &alice_id, 400).await.plaintext.as_deref(), Some(offer2.as_str()));
+    assert!(a.list_payments(200).await.unwrap().len() > pays);
+    let entry = alice.state.storage.call_get(&bob_id, &fresh).await.unwrap().unwrap();
+    assert_eq!((entry.phase, entry.pending), (konsensus_core::payloads::call::Phase::Ringing, None), "committed only once paid");
+    println!("call after reconnect: {body}");
+    steps.pass("call after reconnect re-admitted once (2001 msat), then paid the call and rang B");
     drop(alice);
     drop(bob);
     a.shutdown().await.unwrap();

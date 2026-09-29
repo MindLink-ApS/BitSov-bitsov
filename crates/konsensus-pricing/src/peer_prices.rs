@@ -105,6 +105,10 @@ impl PeerPriceEntry {
 /// endpoint (reader). Uses `RwLock` for read-heavy access pattern.
 pub struct PeerPriceCache {
     entries: RwLock<HashMap<NodeId, PeerPriceEntry>>,
+    /// When each peer last answered a `PriceQuery` for each kind. The entry's
+    /// own `received_at` moves with any table or kind update, so it cannot
+    /// tell whether *this* kind was answered.
+    kind_answers: RwLock<HashMap<(NodeId, u16), Instant>>,
 }
 
 impl PeerPriceCache {
@@ -112,6 +116,7 @@ impl PeerPriceCache {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            kind_answers: RwLock::new(HashMap::new()),
         }
     }
 
@@ -258,6 +263,18 @@ impl PeerPriceCache {
         price_msat: u64,
         block_height: u64,
     ) {
+        {
+            // Only privileged peers reach here; still bound the map (4 096
+            // answers), dropping answers older than an hour first.
+            let mut answers = self.kind_answers.write().await;
+            if answers.len() >= 4096 {
+                answers.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(3600));
+                if answers.len() >= 4096 {
+                    answers.clear();
+                }
+            }
+            answers.insert((peer_id, kind), Instant::now());
+        }
         // A call offer's price is per kind: never overwrite the category the
         // call's answers and ICE are priced at.
         let category_name = if kind == konsensus_core::kind::KIND_CALL_INVITE {
@@ -299,9 +316,15 @@ impl PeerPriceCache {
         }
     }
 
+    /// When `peer` last answered a price query for `kind` (see `kind_answers`).
+    pub async fn kind_answered_at(&self, peer_id: &NodeId, kind: u16) -> Option<Instant> {
+        self.kind_answers.read().await.get(&(*peer_id, kind)).copied()
+    }
+
     /// Remove a peer's cached pricing (e.g., on disconnect).
     pub async fn remove(&self, peer_id: &NodeId) {
         self.entries.write().await.remove(peer_id);
+        self.kind_answers.write().await.retain(|(peer, _), _| peer != peer_id);
     }
 
     /// Number of cached peer price tables.

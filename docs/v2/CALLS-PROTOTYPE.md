@@ -26,22 +26,55 @@ defaults). Mainnet only after review.
 - Answer, ICE and hangup pay `realtime_signal_msat` (the app floors every
   payment at 1 sat). No per-minute payment for direct media.
 
-## Call state (`CallRegistry`)
+## Call state (durable, `call_state`, migration 027)
 
-Per node, per `(peer, call_id)`, bounded (4 096 tracked):
+Per `(peer, call_id)`: side, phase, deadline, replay deadline and any pending
+signal of ours. Stored in the node database, so a restart keeps used ids,
+live calls and reservations. Pure rules: `konsensus_core::payloads::call`.
 
 | Signal | Accepted only when | Effect |
 |---|---|---|
-| 400 offer | the id was never used with that peer | ringing, 60 s |
+| 400 offer | the id was never used with that peer (or its replay protection ended) | ringing, 60 s |
 | 401 answer | ringing, and sent by the callee | live, 4 h cap |
 | 402 ICE | ringing or live | — |
 | 403 hangup | ringing or live | ended; id burned for 24 h |
 
-Outgoing signals are checked in `compose` **before any quote or payment**
-(`call_id_used`, `call_not_live`, `call_signal_invalid`). Incoming signals are
-checked after the gate and decryption; a refused one is answered with
-`MessageReject` and **never reaches the WebSocket**. Replays of the same
-envelope stay the gate's job (duplicate ACK, nonce and payment-hash reuse).
+**Our own signals are transactional.** Compose *reserves* the signal under its
+operation id (generated if absent) before any quote or payment; a reserved
+offer rings nobody and accepts no answer. The transition is *committed* right
+after the payment settles, before the envelope is dispatched. After compose
+returns, the operation journal decides: paid → commit, `prepared`/`released`
+(definitely unpaid) → release (an unsent offer is forgotten, so its id is
+free), `paying`/`payment_unknown` → keep, so a retry of the same operation
+recovers without a second charge. At startup, before the receive loop and the
+outbox resend, `calls::recover` applies the same rule to every reservation a
+crash left.
+
+**Incoming refusals are withdrawn.** A paid signal refused by the call rules
+(after the gate and decryption) is answered with `MessageReject`, its message
+row and cached plaintext are deleted, and its receipt is marked
+application-rejected (`accepted = -1`): history, resync and a resend never
+present it as delivered, and its payment hash and nonce stay burned.
+
+**Bounds never evict replay protection.** At most 256 ids per peer and 4 096
+in total whose replay protection has not ended; a new call beyond that is
+refused (`call_busy`). Expired rows are swept every 5 minutes (never one with a
+pending signal).
+
+**Pricing freshness is per kind.** The caller asks the callee (`PriceQuery`
+400) and accepts only a kind-400 answer that arrived after that query; an
+unrelated price update never counts. Queries to one peer are sent at most every
+2 s; concurrent callers share the answer.
+
+**Admission.** A call never pays first-contact admission: a contact without an
+E2EE session is refused (`call_needs_contact`, nothing paid). After a
+reconnect, re-admission follows the existing non-chat rule: an uncapped
+(owner) call re-admits once, reported separately as `readmission_msat`, then
+pays the call (verified on real LDK); a capped (paired app) call refuses
+re-admission before any quote, as files do (#127), and re-admission happens on
+the chat path under the owner's quoted approval. If the callee does not answer
+the price query at all, the call is refused before paying
+(`call_price_unknown`) and its reservation released.
 
 Calls are 1:1: a room compose of 400-403 is refused (`call_room`).
 
@@ -52,4 +85,8 @@ Calls are 1:1: a room compose of 400-403 is refused (`call_room`).
   replayed id, wrong-side answer, ICE for live/unknown call, hangup.
 - `regtest_e2e::real_ldk_regtest_calls` (real Core + electrs + LDK, A–C–B):
   live price query, paid offer, local refusals, answer/ICE/hangup both ways,
-  msat-exact channel and budget reconciliation.
+  msat-exact channel and budget reconciliation, and a call after reconnect
+  refused before paying with its id released.
+- `konsensus-api/tests/call_state_tests.rs`: the #131 review probes as
+  regressions (unpaid offer/answer, capacity, unrelated price response,
+  refused signal via resync), restart, recovery and price-query rate limit.

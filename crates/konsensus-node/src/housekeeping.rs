@@ -54,6 +54,11 @@ pub(crate) async fn run_nonce_cleanup(
         tokio::select! {
             _ = tokio::time::sleep(cleanup_interval) => {
                 sweep_outstanding_web_requests(storage.as_ref()).await;
+                // Call ids whose replay protection ended (never one still pending).
+                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+                if let Err(e) = storage.call_sweep(now_ms, 10_000).await {
+                    warn!(error = %e, "call state sweep failed");
+                }
                 match storage.cleanup_expired_nonces(max_nonce_age_secs).await {
                     Ok(removed) if removed > 0 => {
                         debug!(removed, "cleaned up expired nonces");
