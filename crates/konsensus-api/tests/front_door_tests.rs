@@ -282,3 +282,40 @@ async fn status_advertises_front_door_v1() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn open_refuses_own_card_and_needs_local_consent() {
+    let state = state_with(settings(Some("node.example.org:9000")));
+    // Publish ours, then try to open it.
+    let (_, body, _) = call(
+        &state,
+        "PUT",
+        "/api/v1/front-door",
+        bearer(&state, vec![auth::Scope::Admin]),
+        Some(json!({ "display_name": "Me" })),
+    )
+    .await;
+    let link = body["link"].as_str().unwrap().to_string();
+    let (status, resp, _) = call(
+        &state,
+        "POST",
+        "/api/v1/front-door/open",
+        bearer(&state, vec![auth::Scope::Read]),
+        Some(json!({ "card": link })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert!(resp.to_string().contains("your own front door"), "{resp}");
+
+    let local = stranger_card("127.0.0.1:9000", "regtest", now());
+    let (status, resp, _) = call(
+        &state,
+        "POST",
+        "/api/v1/front-door/open",
+        bearer(&state, vec![auth::Scope::Read]),
+        Some(json!({ "card": local.to_link().unwrap() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert!(resp.to_string().contains("local_consent"), "{resp}");
+}

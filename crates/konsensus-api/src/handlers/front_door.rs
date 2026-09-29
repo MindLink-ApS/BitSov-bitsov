@@ -1,7 +1,10 @@
 //! Owner API for FrontDoorCard v1: create/update/export as link + QR payload,
-//! and verify a pasted card for display (no dial, no payment).
+//! verify a pasted card for display, and open (unprivileged dial) so Knock
+//! can use the existing first-contact flow. Opening is never admission.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::header;
@@ -15,11 +18,17 @@ use konsensus_core::front_door::{
     Avatar, FrontDoorCard, FrontDoorCv, FrontDoorFields, FrontDoorLink, FrontDoorMedia,
     FrontDoorPrices, FrontDoorProfile, FrontDoorSite, ProfileKind,
 };
-use konsensus_core::introduction::first_contact_prices;
+use konsensus_core::introduction::{
+    dial_allowed, first_contact_prices, split_endpoint, Reach,
+};
+use konsensus_core::traits::transport::TransportError;
 
 use crate::auth::scoped::{Admin, Read, ScopedAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
+
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Advertised on `/api/v1/status`.
 pub const CAPABILITY: &str = "front_door_v1";
@@ -74,6 +83,21 @@ pub struct UpsertFrontDoorRequest {
 #[serde(deny_unknown_fields)]
 pub struct VerifyFrontDoorRequest {
     pub card: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenFrontDoorRequest {
+    pub card: String,
+    #[serde(default)]
+    pub allow_local: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenFrontDoorResponse {
+    pub node_id: String,
+    pub dialed: String,
+    pub connected: bool,
 }
 
 fn now_unix() -> Result<u64, ApiError> {
@@ -198,8 +222,90 @@ async fn verify_front_door(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)))
 }
 
+fn verified_for_open(state: &AppState, text: &str) -> Result<FrontDoorCard, ApiError> {
+    let card = FrontDoorCard::parse(text).map_err(map_err)?;
+    let network = state.introduction.network.as_deref().ok_or_else(|| {
+        ApiError::Conflict(
+            "front_door_unavailable: this node's Lightning backend does not state a Bitcoin network"
+                .into(),
+        )
+    })?;
+    card.verify(now_unix()?, network).map_err(map_err)?;
+    Ok(card)
+}
+
+async fn pin_endpoint(card: &FrontDoorCard) -> Result<SocketAddr, ApiError> {
+    let (host, port) = split_endpoint(&card.endpoint)
+        .map_err(|e| ApiError::BadRequest(format!("front_door_invalid: {e}")))?;
+    let addrs: Vec<SocketAddr> = match tokio::time::timeout(
+        DNS_TIMEOUT,
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(addrs)) => addrs.collect(),
+        Ok(Err(e)) => return Err(ApiError::Transport(format!("cannot resolve {host}: {e}"))),
+        Err(_) => return Err(ApiError::Transport(format!("resolving {host} timed out"))),
+    };
+    if addrs.is_empty() {
+        return Err(ApiError::Transport(format!("{host} has no address")));
+    }
+    if let Some(bad) = addrs.iter().find(|a| !dial_allowed(card.reach, a.ip())) {
+        return Err(ApiError::BadRequest(format!(
+            "front_door_invalid: {} resolves to {}, not dialable for a {} front door",
+            card.endpoint,
+            bad.ip(),
+            card.reach
+        )));
+    }
+    Ok(addrs[0])
+}
+
+/// `POST /api/v1/front-door/open` — verify and dial unprivileged (never admission).
+async fn open_front_door(
+    _auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OpenFrontDoorRequest>,
+) -> Result<Json<OpenFrontDoorResponse>, ApiError> {
+    let card = verified_for_open(&state, &req.card)?;
+    let node = card.node().map_err(map_err)?;
+    if node == *state.identity.node_id() {
+        return Err(ApiError::BadRequest(
+            "front_door_invalid: this is your own front door".into(),
+        ));
+    }
+    if card.reach == Reach::Local && !req.allow_local {
+        return Err(ApiError::BadRequest(
+            "front_door_local_consent_required: approve the displayed local peer endpoint before knocking".into(),
+        ));
+    }
+    let pinned = pin_endpoint(&card).await?;
+    match tokio::time::timeout(
+        DIAL_TIMEOUT,
+        state.transport.connect(&node, &pinned.to_string()),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(Json(OpenFrontDoorResponse {
+            node_id: node.to_hex(),
+            dialed: pinned.to_string(),
+            connected: true,
+        })),
+        Ok(Err(TransportError::Rejected(_))) => Err(ApiError::Conflict(
+            "front_door_closed_mesh: this node dials only peers its owner added; a front door does not add one".into(),
+        )),
+        Ok(Err(e)) => Err(ApiError::Transport(format!(
+            "could not reach the front-door node: {e}"
+        ))),
+        Err(_) => Err(ApiError::Transport(
+            "could not reach the front-door node: timed out".into(),
+        )),
+    }
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/front-door", get(get_front_door).put(put_front_door))
         .route("/api/v1/front-door/verify", post(verify_front_door))
+        .route("/api/v1/front-door/open", post(open_front_door))
 }
