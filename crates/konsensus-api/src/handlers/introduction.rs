@@ -46,6 +46,8 @@ pub mod reason {
     pub const STUN_UNREACHABLE: &str = "stun_unreachable";
     /// The STUN server answered with something that is not a usable Binding Success.
     pub const STUN_INVALID_RESPONSE: &str = "stun_invalid_response";
+    /// Mapped address family does not match the peer TCP listener family.
+    pub const STUN_FAMILY_MISMATCH: &str = "stun_family_mismatch";
 }
 
 /// Where a peer endpoint came from.

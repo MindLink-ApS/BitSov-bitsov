@@ -151,8 +151,11 @@ pub fn binding_success(txid: &[u8; 12], source: SocketAddr) -> Vec<u8> {
 pub enum QueryError {
     /// DNS, socket, or timeout: nothing usable came back.
     Unreachable,
-    /// The server answered but not with a usable Binding Success.
+    /// The server answered but not with a usable Binding Success (including a
+    /// non-public mapped address).
     InvalidResponse,
+    /// No STUN result matched the TCP peer listener's address family.
+    FamilyMismatch,
 }
 
 impl QueryError {
@@ -161,8 +164,43 @@ impl QueryError {
         match self {
             Self::Unreachable => reason::STUN_UNREACHABLE,
             Self::InvalidResponse => reason::STUN_INVALID_RESPONSE,
+            Self::FamilyMismatch => reason::STUN_FAMILY_MISMATCH,
         }
     }
+}
+
+/// Address family of the peer TCP listener (`listen_addr`). Discovery only
+/// advertises a mapped address in this family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerFamily {
+    V4,
+    V6,
+}
+
+impl ListenerFamily {
+    /// Family of a configured listen address (wildcard or concrete).
+    pub fn of(addr: SocketAddr) -> Self {
+        if addr.is_ipv4() {
+            Self::V4
+        } else {
+            Self::V6
+        }
+    }
+
+    fn matches(self, addr: SocketAddr) -> bool {
+        match self {
+            Self::V4 => addr.is_ipv4(),
+            Self::V6 => addr.is_ipv6(),
+        }
+    }
+}
+
+/// Discovery may only advertise a **public** reflexive address. Owner-configured
+/// local/`advertised_addr` endpoints stay available through the configured
+/// endpoint path and are never overwritten by STUN.
+pub fn discovered_mapped_ok(ip: IpAddr) -> bool {
+    konsensus_core::introduction::ip_reach(ip)
+        == Some(konsensus_core::introduction::Reach::Public)
 }
 
 /// A Binding Request with no attributes.
@@ -237,22 +275,41 @@ fn parse_xor_mapped(v: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
+/// Accept a parsed Binding Success only when it is public and matches `family`.
+pub(crate) fn accept_discovered(mapped: SocketAddr, family: ListenerFamily) -> Result<SocketAddr, QueryError> {
+    if !family.matches(mapped) {
+        return Err(QueryError::FamilyMismatch);
+    }
+    if !discovered_mapped_ok(mapped.ip()) {
+        return Err(QueryError::InvalidResponse);
+    }
+    Ok(mapped)
+}
+
 /// Ask `server` (`host:port`, resolved now) for this host's mapped address.
 ///
-/// Sends the request a few times within `timeout` (UDP may drop it). Datagrams
-/// from other hosts or for other transactions are ignored, so an off-path
-/// host cannot inject an answer without also guessing the random transaction
-/// id and the server's address.
-pub async fn query(server: &str, timeout: Duration) -> Result<SocketAddr, QueryError> {
+/// Only addresses matching `family` are used for the STUN UDP exchange and for
+/// the advertised result. Sends the request a few times within `timeout` (UDP
+/// may drop it). Datagrams from other hosts or for other transactions are
+/// ignored, so an off-path host cannot inject an answer without also guessing
+/// the random transaction id and the server's address.
+pub async fn query(server: &str, timeout: Duration, family: ListenerFamily) -> Result<SocketAddr, QueryError> {
     const TRIES: u32 = 3;
     let deadline = tokio::time::Instant::now() + timeout;
-    let target = tokio::time::timeout(timeout, tokio::net::lookup_host(server))
+    let resolved: Vec<SocketAddr> = tokio::time::timeout(timeout, tokio::net::lookup_host(server))
         .await
         .map_err(|_| QueryError::Unreachable)?
         .map_err(|_| QueryError::Unreachable)?
-        .next()
-        .ok_or(QueryError::Unreachable)?;
-    let bind: SocketAddr = if target.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { ([0u16; 8], 0).into() };
+        .collect();
+    let target = resolved
+        .into_iter()
+        .find(|a| family.matches(*a))
+        .ok_or(QueryError::FamilyMismatch)?;
+    let bind: SocketAddr = if target.is_ipv4() {
+        ([0, 0, 0, 0], 0).into()
+    } else {
+        ([0u16; 8], 0).into()
+    };
     let socket = UdpSocket::bind(bind).await.map_err(|_| QueryError::Unreachable)?;
     socket.connect(target).await.map_err(|_| QueryError::Unreachable)?;
 
@@ -271,7 +328,10 @@ pub async fn query(server: &str, timeout: Duration) -> Result<SocketAddr, QueryE
                 continue;
             }
             match parse_binding_success(&buf[..n], &txid) {
-                Some(mapped) => return Ok(mapped),
+                Some(mapped) => match accept_discovered(mapped, family) {
+                    Ok(mapped) => return Ok(mapped),
+                    Err(e) => failure = e,
+                },
                 None => failure = QueryError::InvalidResponse,
             }
             break;
@@ -286,9 +346,14 @@ pub fn endpoint_from_mapped(mapped: SocketAddr, peer_port: u16) -> String {
     SocketAddr::new(mapped.ip(), peer_port).to_string()
 }
 
-/// One discovery attempt against `server`.
-pub async fn discover_peer_endpoint(server: &str, peer_port: u16, timeout: Duration) -> PeerEndpointView {
-    match query(server, timeout).await {
+/// One discovery attempt against `server`, constrained to `family`.
+pub async fn discover_peer_endpoint(
+    server: &str,
+    peer_port: u16,
+    timeout: Duration,
+    family: ListenerFamily,
+) -> PeerEndpointView {
+    match query(server, timeout, family).await {
         Ok(mapped) => PeerEndpointView::found(endpoint_from_mapped(mapped, peer_port), source::STUN),
         Err(e) => PeerEndpointView::missing(e.reason()),
     }
@@ -327,6 +392,7 @@ pub async fn refresh_loop(
     settings: IntroductionSettings,
     server: String,
     peer_port: u16,
+    family: ListenerFamily,
     last_ok: bool,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -341,7 +407,10 @@ pub async fn refresh_loop(
         if *shutdown_rx.borrow() {
             return;
         }
-        ok = record(&settings, discover_peer_endpoint(&server, peer_port, ATTEMPT_TIMEOUT).await);
+        ok = record(
+            &settings,
+            discover_peer_endpoint(&server, peer_port, ATTEMPT_TIMEOUT, family).await,
+        );
         backoff = if ok { RETRY_MIN } else { (backoff * 2).min(RETRY_MAX) };
     }
 }
@@ -754,20 +823,109 @@ mod tests {
         assert_eq!(parse_binding_success(&zero, &TXID), None);
     }
 
+    #[test]
+    fn discovery_rejects_non_public_mapped_addresses() {
+        for bad in [
+            "10.1.2.3",
+            "127.0.0.1",
+            "192.168.1.9",
+            "100.64.0.1",
+            "169.254.10.1",
+            "192.0.2.1",
+            "203.0.113.9",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.0.1",
+            "2001:db8::7",
+        ] {
+            let ip: IpAddr = bad.parse().unwrap();
+            assert!(!discovered_mapped_ok(ip), "{bad} must not be advertised from STUN");
+            assert_eq!(
+                accept_discovered(SocketAddr::new(ip, 3478), ListenerFamily::of(SocketAddr::new(ip, 0))),
+                Err(QueryError::InvalidResponse),
+                "{bad}"
+            );
+        }
+        assert!(discovered_mapped_ok("8.8.8.8".parse().unwrap()));
+        assert!(discovered_mapped_ok("2606:4700::1".parse().unwrap()));
+        assert_eq!(
+            accept_discovered("8.8.8.8:3478".parse().unwrap(), ListenerFamily::V4),
+            Ok("8.8.8.8:3478".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn discovery_rejects_mapped_family_that_listener_does_not_serve() {
+        let v4: SocketAddr = "8.8.8.8:3478".parse().unwrap();
+        let v6: SocketAddr = "[2606:4700::1]:3478".parse().unwrap();
+        assert_eq!(ListenerFamily::of("0.0.0.0:9000".parse().unwrap()), ListenerFamily::V4);
+        assert_eq!(ListenerFamily::of("[::]:9000".parse().unwrap()), ListenerFamily::V6);
+        assert_eq!(accept_discovered(v4, ListenerFamily::V4), Ok(v4));
+        assert_eq!(accept_discovered(v6, ListenerFamily::V6), Ok(v6));
+        assert_eq!(accept_discovered(v4, ListenerFamily::V6), Err(QueryError::FamilyMismatch));
+        assert_eq!(accept_discovered(v6, ListenerFamily::V4), Err(QueryError::FamilyMismatch));
+        assert_eq!(QueryError::FamilyMismatch.reason(), "stun_family_mismatch");
+    }
+
     #[tokio::test]
-    async fn client_discovers_ip_from_a_local_responder_and_uses_the_peer_port() {
+    async fn client_discovers_a_public_mapped_ip_and_uses_the_peer_port() {
+        // Reflect a public XOR-MAPPED-ADDRESS (not the UDP source): a real STUN
+        // server behind NAT reports the public IP, and discovery must require that.
+        let public: SocketAddr = "8.8.8.8:40000".parse().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = socket.local_addr().unwrap();
+        let answer = Arc::new(socket);
+        let serve = Arc::clone(&answer);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok((n, from)) = serve.recv_from(&mut buf).await else { return };
+                if let Some(txid) = parse_binding_request(&buf[..n]) {
+                    let _ = serve.send_to(&binding_success(&txid, public), from).await;
+                }
+            }
+        });
+
+        let mapped = query(&server.to_string(), Duration::from_secs(2), ListenerFamily::V4)
+            .await
+            .unwrap();
+        assert_eq!(mapped.ip(), public.ip());
+        let view = discover_peer_endpoint(&server.to_string(), 9000, Duration::from_secs(2), ListenerFamily::V4).await;
+        assert_eq!(view, PeerEndpointView::found("8.8.8.8:9000".into(), "stun"));
+    }
+
+    #[tokio::test]
+    async fn client_rejects_loopback_mapped_as_invalid_response() {
         let socket = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let server = socket.local_addr().unwrap();
         let (tx, rx) = watch::channel(false);
         let task = tokio::spawn(serve(socket, Limits::default(), rx));
 
-        let mapped = query(&server.to_string(), Duration::from_secs(2)).await.unwrap();
-        assert_eq!(mapped.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let view = discover_peer_endpoint(&server.to_string(), 9000, Duration::from_secs(2)).await;
-        assert_eq!(view, PeerEndpointView::found("127.0.0.1:9000".into(), "stun"));
+        assert_eq!(
+            query(&server.to_string(), Duration::from_secs(2), ListenerFamily::V4).await,
+            Err(QueryError::InvalidResponse)
+        );
+        let view = discover_peer_endpoint(&server.to_string(), 9000, Duration::from_secs(2), ListenerFamily::V4).await;
+        assert_eq!(view, PeerEndpointView::missing("stun_invalid_response"));
 
         tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_reports_family_mismatch_when_stun_has_no_matching_address() {
+        // IPv4-only STUN listener; an IPv6-only peer listener must not advertise.
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = socket.local_addr().unwrap().to_string();
+        drop(socket);
+        assert_eq!(
+            query(&server, Duration::from_millis(300), ListenerFamily::V6).await,
+            Err(QueryError::FamilyMismatch)
+        );
+        let view = discover_peer_endpoint(&server, 9000, Duration::from_millis(300), ListenerFamily::V6).await;
+        assert_eq!(view, PeerEndpointView::missing("stun_family_mismatch"));
     }
 
     #[tokio::test]
@@ -775,10 +933,16 @@ mod tests {
         // A bound socket nobody reads from: no reply.
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = silent.local_addr().unwrap().to_string();
-        assert_eq!(query(&addr, Duration::from_millis(300)).await, Err(QueryError::Unreachable));
-        let view = discover_peer_endpoint(&addr, 9000, Duration::from_millis(300)).await;
+        assert_eq!(
+            query(&addr, Duration::from_millis(300), ListenerFamily::V4).await,
+            Err(QueryError::Unreachable)
+        );
+        let view = discover_peer_endpoint(&addr, 9000, Duration::from_millis(300), ListenerFamily::V4).await;
         assert_eq!(view, PeerEndpointView::missing("stun_unreachable"));
-        assert_eq!(query("not a host:1", Duration::from_millis(300)).await, Err(QueryError::Unreachable));
+        assert_eq!(
+            query("not a host:1", Duration::from_millis(300), ListenerFamily::V4).await,
+            Err(QueryError::Unreachable)
+        );
 
         // A server that answers with the right transaction id but junk.
         let liar = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -796,8 +960,11 @@ mod tests {
                 }
             }
         });
-        assert_eq!(query(&addr, Duration::from_secs(1)).await, Err(QueryError::InvalidResponse));
-        let view = discover_peer_endpoint(&addr, 9000, Duration::from_secs(1)).await;
+        assert_eq!(
+            query(&addr, Duration::from_secs(1), ListenerFamily::V4).await,
+            Err(QueryError::InvalidResponse)
+        );
+        let view = discover_peer_endpoint(&addr, 9000, Duration::from_secs(1), ListenerFamily::V4).await;
         assert_eq!(view, PeerEndpointView::missing("stun_invalid_response"));
     }
 

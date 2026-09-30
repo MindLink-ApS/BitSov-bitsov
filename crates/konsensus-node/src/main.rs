@@ -972,9 +972,10 @@ async fn cmd_start(
                 konsensus_api::handlers::introduction::reason::STUN_PENDING,
             ));
             let peer_port = config.network.listen_addr.port();
-            let first = stun::discover_peer_endpoint(&server, peer_port, stun::ATTEMPT_TIMEOUT).await;
+            let family = stun::ListenerFamily::of(config.network.listen_addr);
+            let first = stun::discover_peer_endpoint(&server, peer_port, stun::ATTEMPT_TIMEOUT, family).await;
             let ok = stun::record(&introduction, first);
-            Some((server, peer_port, ok))
+            Some((server, peer_port, family, ok))
         }
         _ => None,
     };
@@ -1050,8 +1051,15 @@ async fn cmd_start(
         tokio::spawn(stun::serve(socket, stun::Limits::default(), node.shutdown_rx()))
     });
 
-    let stun_discovery_handle = stun_discovery.map(|(server, peer_port, ok)| {
-        tokio::spawn(stun::refresh_loop(introduction.clone(), server, peer_port, ok, node.shutdown_rx()))
+    let stun_discovery_handle = stun_discovery.map(|(server, peer_port, family, ok)| {
+        tokio::spawn(stun::refresh_loop(
+            introduction.clone(),
+            server,
+            peer_port,
+            family,
+            ok,
+            node.shutdown_rx(),
+        ))
     });
 
     // ── Spawn background tasks ─────────────────────────────────────────

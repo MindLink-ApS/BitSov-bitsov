@@ -276,18 +276,25 @@ impl NetworkConfig {
     }
 }
 
-/// Parse `[network] stun_server`: `stun:host:port`, `stuns:host:port` or plain
-/// `host:port` (IPv6 in brackets). Returns `host:port` for resolution at query
-/// time, so a DNS name is looked up afresh on every refresh.
+/// Parse `[network] stun_server`: `stun:host:port` or plain `host:port`
+/// (IPv6 in brackets). Returns `host:port` for resolution at query time, so a
+/// DNS name is looked up afresh on every refresh.
 ///
-/// `stuns:` is accepted for compatibility but the client only speaks UDP.
+/// `stuns:` is rejected until TLS STUN with server-identity verification is
+/// supported — accepting it would silently downgrade to cleartext UDP.
 pub fn parse_stun_server(raw: &str) -> Result<String, String> {
     let raw = raw.trim();
     let lower = raw.to_ascii_lowercase();
-    let rest = ["stun:", "stuns:"]
-        .iter()
-        .find(|p| lower.starts_with(**p))
-        .map_or(raw, |p| &raw[p.len()..]);
+    if lower.starts_with("stuns:") {
+        return Err(format!(
+            "[network] stun_server {raw:?}: stuns: (TLS STUN) is not supported yet; use stun:host:port until server identity verification is available"
+        ));
+    }
+    let rest = if lower.starts_with("stun:") {
+        &raw["stun:".len()..]
+    } else {
+        raw
+    };
     let (host, port) = rest
         .rsplit_once(':')
         .ok_or_else(|| format!("[network] stun_server {raw:?} must be host:port"))?;
