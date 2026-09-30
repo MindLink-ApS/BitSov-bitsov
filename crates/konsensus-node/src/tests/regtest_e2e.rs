@@ -831,7 +831,6 @@ async fn real_ldk_regtest_calls() {
 #[ignore = "requires local Bitcoin Core and electrs; scripts/regress/regtest_e2e.sh"]
 async fn real_ldk_regtest_meeting() {
     use axum::http::StatusCode;
-    use konsensus_core::traits::transport::MessageTransport;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
@@ -876,31 +875,6 @@ async fn real_ldk_regtest_meeting() {
     let mut carol = app::App::start(dirs[2].path(), &chain, c.clone()).await;
     // The stateless quote gate deliberately quarantines the first second.
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    // Each pair becomes contacts the ordinary way: x pays first contact, lists
-    // y, and y replies. No meeting shortcut.
-    async fn contacts(x: &mut app::App, y: &mut app::App) {
-        let y_hex = y.state.identity.node_id().to_hex();
-        x.transport.connect(y.state.identity.node_id(), &y.transport.listen_addr().unwrap().to_string()).await.unwrap();
-        wait("Noise connected", || y.transport.is_connected(x.state.identity.node_id())).await;
-        let (status, quote) = x.post("/api/v1/messages/first-contact/quote", json!({"recipient": y_hex}), false).await;
-        assert_eq!(status, StatusCode::OK, "{quote}");
-        let grant = x.service.grant_view_for(&x.client).unwrap();
-        let (status, body) = x
-            .post(
-                "/api/v1/pair/first-contact-grant",
-                json!({"client_id": x.client, "grant_op_id": grant.op_id, "recipient": y_hex,
-                       "max_total_msat": quote["total_msat"], "contact_budget_msat": 200_000}),
-                true,
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        x.compose(y, "hello").await;
-        let (status, body) = x
-            .post("/api/v1/peers", json!({"node_id": y_hex, "addr": y.transport.listen_addr().unwrap().to_string(), "auto_connect": false}), true)
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        y.compose(x, "hello back").await;
-    }
     // A cycle, so each node is first-contacted once: the admission ledger is
     // process-global and all three apps share this test process.
     contacts(&mut alice, &mut bob).await;
@@ -1037,6 +1011,223 @@ async fn real_ldk_regtest_meeting() {
     println!("REGTEST-MEETING complete in {:?}", steps.started.elapsed());
 }
 
+/// Rooms MVP over real LDK on regtest. Topology: apps A (sender), B, C, D,
+/// each with one channel to the routing node R. A room is ordinary chat
+/// (kind 0) carrying a room binding {id, roster}; A pays each other member
+/// through the room fan-out: B, C and D each get their own envelope and are
+/// paid their chat price (2,001 msat) plus R's fee on the hop to them.
+/// Refusals, msat-exact: A's own node refuses a roster without A and a 1:1
+/// room chat to a non-member before paying; a member whose node does not
+/// advertise `room_binding_v1` is skipped and paid nothing; and A refuses
+/// (withdraws, never shows) a paid room chat from B whose roster lacks B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Bitcoin Core and electrs; scripts/regress/regtest_e2e.sh"]
+async fn real_ldk_regtest_room() {
+    use axum::http::StatusCode;
+    use konsensus_core::traits::transport::MessageTransport;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let mut steps = Steps::new();
+    let chain = infra::Chain::start().await;
+    let dirs = [(); 5].map(|_| tempfile::tempdir().unwrap());
+    let (a, _) = infra::lightning(dirs[0].path(), &chain).await;
+    let (b, addr_b) = infra::lightning(dirs[1].path(), &chain).await;
+    let (c, addr_c) = infra::lightning(dirs[2].path(), &chain).await;
+    let (d, addr_d) = infra::lightning(dirs[3].path(), &chain).await;
+    let (r, addr_r) = infra::router(dirs[4].path(), &chain).await;
+    steps.pass("chain + 5 real LDK nodes started (apps A, B, C, D; router R)");
+    chain.fund(a.node()).await;
+    chain.fund(&r).await;
+    a.open_channel(&r.node_id().to_string(), &addr_r, 1_000_000, false, None).await.unwrap();
+    chain.confirm_channel(a.node(), &r, &[b.node(), c.node(), d.node()]).await;
+    r.open_channel(b.node().node_id(), addr_b.parse().unwrap(), 800_000, None, None).unwrap();
+    chain.confirm_channel(&r, b.node(), &[a.node(), c.node(), d.node()]).await;
+    r.open_channel(c.node().node_id(), addr_c.parse().unwrap(), 800_000, None, None).unwrap();
+    chain.confirm_channel(&r, c.node(), &[a.node(), b.node(), d.node()]).await;
+    r.open_channel(d.node().node_id(), addr_d.parse().unwrap(), 800_000, None, None).unwrap();
+    chain.confirm_channel(&r, d.node(), &[a.node(), b.node(), c.node()]).await;
+    steps.pass("channels A->R, R->B, R->C, R->D opened and usable");
+
+    wait("R's channel_updates reach A, B, C and D", || async {
+        [a.node(), b.node(), c.node(), d.node()].iter().all(|n| hop_policy(n, &r).is_some())
+    })
+    .await;
+    let [to_a, to_b, to_c, to_d] = [a.node(), b.node(), c.node(), d.node()].map(|n| hop_policy(n, &r).unwrap());
+    // Members need outbound liquidity to reply as contacts (and B to pay A).
+    for (to, node, policy) in [(&b, "B", to_b), (&c, "C", to_c), (&d, "D", to_d)] {
+        let liquidity = 50_000_000;
+        let inv = to.create_invoice(liquidity, "regtest room liquidity", 600).await.unwrap();
+        a.pay_invoice_with_fee_limit(&inv.bolt11, hop_fee(policy, liquidity)).await.unwrap();
+        settle(&a, &inv.payment_hash).await;
+        settle(to, &inv.payment_hash).await;
+        println!("liquidity to {node} settled");
+    }
+    wait("liquidity committed", || async {
+        [b.node(), c.node(), d.node()].iter().all(|n| capacity(n) > 10_000_000)
+    })
+    .await;
+    steps.pass("routed liquidity A->R->{B,C,D} settled");
+
+    let mut alice = app::App::start(dirs[0].path(), &chain, a.clone()).await;
+    let mut bob = app::App::start(dirs[1].path(), &chain, b.clone()).await;
+    let mut carol = app::App::start(dirs[2].path(), &chain, c.clone()).await;
+    let mut dave = app::App::start(dirs[3].path(), &chain, d.clone()).await;
+    // The stateless quote gate deliberately quarantines the first second.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // A first-contacts each member once (the admission ledger is process-global).
+    let bob_reply = contacts(&mut alice, &mut bob).await;
+    contacts(&mut alice, &mut carol).await;
+    contacts(&mut alice, &mut dave).await;
+    steps.pass("A-B, A-C, A-D are paid contacts with E2EE sessions");
+
+    let (a_id, b_id, c_id, d_id) = (*alice.state.identity.node_id(), *bob.state.identity.node_id(), *carol.state.identity.node_id(), *dave.state.identity.node_id());
+    for peer in [b_id, c_id, d_id] {
+        let info = alice.transport.peer_info(&peer).await.expect("connected");
+        assert!(info.capabilities.iter().any(|c| c == r#"Custom("room_binding_v1")"#), "{:?}", info.capabilities);
+    }
+    let roster_of = |ids: &[konsensus_core::NodeId]| {
+        let mut roster: Vec<String> = ids.iter().map(|id| id.to_hex()).collect();
+        roster.sort();
+        roster
+    };
+    let room = format!("{:032x}", rand::random::<u128>());
+    let room_chat = |roster: &[String], text: &str| json!({"v": 1, "room": {"id": room, "roster": roster}, "text": text}).to_string();
+    let send_room = |plaintext: String| {
+        let alice = &alice;
+        let room = room.clone();
+        async move {
+            alice.post("/api/v1/messages/compose", json!({"recipient": room, "is_room": true, "kind": 0, "plaintext": plaintext}), false).await
+        }
+    };
+    let pays = |n: &Arc<LdkProvider>| {
+        let n = n.clone();
+        async move { n.list_payments(500).await.unwrap().len() }
+    };
+    let chat_msat: u64 = 2_001;
+    let (a_used0, b_used0) = (alice.used(), bob.used());
+    let caps0 = [capacity(a.node()), capacity(b.node()), capacity(c.node()), capacity(d.node()), capacity(&r)];
+    let a_pays0 = pays(&a).await;
+
+    // Refused by A's own node before any quote or payment.
+    let (status, body) = send_room(room_chat(&roster_of(&[b_id, c_id, d_id]), "not mine")).await;
+    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("room_sender_not_member")), "{body}");
+    let (status, body) = alice
+        .post("/api/v1/messages/compose", json!({"recipient": d_id.to_hex(), "kind": 0, "plaintext": room_chat(&roster_of(&[a_id, b_id, c_id]), "not yours")}), false)
+        .await;
+    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("room_recipient_not_member")), "{body}");
+    assert_eq!((pays(&a).await, alice.used()), (a_pays0, a_used0), "nothing paid");
+    steps.pass("roster without A, and a 1:1 room chat to a non-member: refused by A's node, nothing paid");
+
+    // Fan-out to 3 members: each paid once, on its own envelope.
+    let full = roster_of(&[a_id, b_id, c_id, d_id]);
+    let text = room_chat(&full, "hello room");
+    for app in [&mut bob, &mut carol, &mut dave] {
+        app.received = app.state.ws_broadcast.subscribe();
+    }
+    let (status, body) = send_room(text.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["amount_msat"], 3 * chat_msat, "{body}");
+    let outcomes = body["member_outcomes"].as_array().unwrap();
+    assert_eq!(outcomes.len(), 3, "{body}");
+    for o in outcomes {
+        assert_eq!((o["status"].as_str(), o["amount_msat"].as_u64()), (Some("settled"), Some(chat_msat)), "{o}");
+    }
+    for app in [&mut bob, &mut carol, &mut dave] {
+        let got = recv_from(app, &a_id, 0).await;
+        assert_eq!(got.plaintext.as_deref(), Some(text.as_str()));
+        assert_eq!(got.envelope.recipient, konsensus_core::Recipient::Node(*app.state.identity.node_id()), "addressed to the member");
+        assert_eq!(got.envelope.payment_proof.amount_msat, chat_msat);
+    }
+    steps.pass("A -> {B, C, D}: 3 paid envelopes, 2001 msat each, all delivered");
+
+    // A member whose node does not advertise room_binding_v1 (here: a node
+    // A is not connected to) is skipped before any quote, paid nothing.
+    let absent = NodeIdentity::generate().unwrap().1;
+    let partial = room_chat(&roster_of(&[a_id, b_id, *absent.node_id()]), "partial");
+    bob.received = bob.state.ws_broadcast.subscribe();
+    let (status, body) = send_room(partial.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["amount_msat"], chat_msat, "{body}");
+    let skipped = body["member_outcomes"].as_array().unwrap().iter().find(|o| o["recipient"] == absent.node_id().to_hex()).unwrap().clone();
+    assert_eq!((skipped["status"].as_str(), skipped["amount_msat"].as_u64(), skipped["code"].as_str()), (Some("refused"), Some(0), Some("room_binding_unsupported")));
+    assert_eq!(recv_from(&mut bob, &a_id, 0).await.plaintext.as_deref(), Some(partial.as_str()));
+    steps.pass("unsupported member skipped (0 msat); B paid 2001 msat");
+
+    // Receive side: B pays A for a room chat whose roster lacks B (only a
+    // modified node would send one; B's own compose refuses it). A's gate
+    // admits the payment, then A refuses the binding: withdrawn, never shown.
+    let price = bob_reply["amount_msat"].as_u64().unwrap();
+    assert_eq!(price, chat_msat);
+    let rogue = json!({"v": 1, "room": {"id": room, "roster": roster_of(&[a_id, c_id, d_id])}, "text": "let me in"}).to_string();
+    let invoice = a.create_invoice(price, "rogue room chat", 600).await.unwrap();
+    b.pay_invoice_with_fee_limit(&invoice.bolt11, hop_fee(to_a, price)).await.unwrap();
+    settle(&b, &invoice.payment_hash).await;
+    let preimage = b.get_payment_status(&invoice.payment_hash).await.unwrap().preimage.expect("preimage");
+    let hex32 = |s: &str| <[u8; 32]>::try_from(hex::decode(s).unwrap()).unwrap();
+    let ratchet = bob.state.session_manager.encrypt(&a_id, rogue.as_bytes()).await.unwrap();
+    let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
+        0,
+        b_id,
+        konsensus_core::Recipient::Node(a_id),
+        konsensus_crypto::ratchet_message_to_bytes(&ratchet),
+        konsensus_core::PaymentProof::new(hex32(&invoice.payment_hash), hex32(&preimage), price),
+    )
+    .build();
+    envelope.signature = konsensus_core::Signature::from_ed25519(&bob.state.identity.sign(&envelope.signable_bytes()));
+    bob.state.storage.store_message(&envelope).await.unwrap();
+    bob.state.storage.prepare_delivery(&envelope.id, &a_id).await.unwrap();
+    let mut b_delivery = bob.state.ws_delivery_broadcast.subscribe();
+    alice.received = alice.state.ws_broadcast.subscribe();
+    bob.transport.send(&a_id, &envelope).await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let s = b_delivery.recv().await.unwrap();
+            if s.message_id == envelope.id.to_hex() {
+                return s;
+            }
+        }
+    })
+    .await
+    .expect("A answered the rogue room chat");
+    assert_eq!(status.status, "failed_paid", "terminal: {status:?}");
+    assert!(status.reason.as_deref().unwrap_or_default().starts_with("room_sender_not_member:"), "{status:?}");
+    assert!(alice.state.storage.get_message(&envelope.id).await.unwrap().is_none(), "withdrawn on A");
+    while let Ok(m) = alice.received.try_recv() {
+        assert_ne!(m.envelope.id, envelope.id, "the refused room chat reached A's app");
+    }
+    steps.pass("A refused B's paid room chat without B in the roster (room_sender_not_member), withdrawn");
+
+    // msat-exact, between the snapshots:
+    //   A paid 3 fan-out legs + 1 partial leg; B paid A once (refused).
+    let f = hop_fee;
+    let a_paid = chat_msat + f(to_b, chat_msat) + chat_msat + f(to_c, chat_msat) + chat_msat + f(to_d, chat_msat) + chat_msat + f(to_b, chat_msat);
+    let b_paid = price + f(to_a, price);
+    let (a_got, b_got, c_got, d_got) = (price, 2 * chat_msat, chat_msat, chat_msat);
+    let r_earned = (a_paid - 4 * chat_msat) + (b_paid - price);
+    wait("exact channel deltas after the room", || async {
+        capacity(a.node()) == caps0[0] - a_paid + a_got
+            && capacity(b.node()) == caps0[1] - b_paid + b_got
+            && capacity(c.node()) == caps0[2] + c_got
+            && capacity(d.node()) == caps0[3] + d_got
+            && capacity(&r) == caps0[4] + r_earned
+    })
+    .await;
+    assert_eq!(alice.used() - a_used0, a_paid, "A budget = principals + actual fees");
+    assert_eq!(bob.used(), b_used0, "B's rogue payment bypassed its app budget");
+    println!(
+        "ROOM RECONCILED: A paid {a_paid} got {a_got}; B paid {b_paid} got {b_got}; C got {c_got}; D got {d_got}; R earned {r_earned} msat"
+    );
+    steps.pass("msat reconciliation: channels and budgets, per member");
+    drop((alice, bob, carol, dave));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+    d.shutdown().await.unwrap();
+    r.stop().unwrap();
+    println!("REGTEST-ROOM complete in {:?}", steps.started.elapsed());
+}
+
 /// Real pre-dispatch reservation release. This is deliberately a NO-ROUTE
 /// control, not a claim that a two-node direct channel charges forwarding fees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1092,6 +1283,34 @@ async fn real_ldk_predispatch_refusal() {
     drop(alice);
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
+}
+
+/// `x` and `y` become contacts the ordinary way: x pays first contact, lists
+/// y, and y replies (returns y's reply receipt). No meeting or room shortcut.
+async fn contacts(x: &mut app::App, y: &mut app::App) -> Value {
+    use axum::http::StatusCode;
+    use konsensus_core::traits::transport::MessageTransport;
+    let y_hex = y.state.identity.node_id().to_hex();
+    x.transport.connect(y.state.identity.node_id(), &y.transport.listen_addr().unwrap().to_string()).await.unwrap();
+    wait("Noise connected", || y.transport.is_connected(x.state.identity.node_id())).await;
+    let (status, quote) = x.post("/api/v1/messages/first-contact/quote", json!({"recipient": y_hex}), false).await;
+    assert_eq!(status, StatusCode::OK, "{quote}");
+    let grant = x.service.grant_view_for(&x.client).unwrap();
+    let (status, body) = x
+        .post(
+            "/api/v1/pair/first-contact-grant",
+            json!({"client_id": x.client, "grant_op_id": grant.op_id, "recipient": y_hex,
+                   "max_total_msat": quote["total_msat"], "contact_budget_msat": 200_000}),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    x.compose(y, "hello").await;
+    let (status, body) = x
+        .post("/api/v1/peers", json!({"node_id": y_hex, "addr": y.transport.listen_addr().unwrap().to_string(), "auto_connect": false}), true)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    y.compose(x, "hello back").await
 }
 
 /// Next message on `app`'s feed from `from` of `kind` (the feed also echoes

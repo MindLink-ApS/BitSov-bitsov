@@ -7,7 +7,8 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use konsensus_core::types::{MessageId, Recipient};
+use konsensus_core::payloads::room::RoomBinding;
+use konsensus_core::types::{MessageId, NodeId, Recipient};
 
 use crate::audit::events;
 use crate::auth::scoped::{ScopedAuth, Admin, Read};
@@ -31,6 +32,10 @@ pub struct ListMessagesQuery {
     /// When set, returns both sent and received messages for the conversation.
     /// Without this, only incoming messages (recipient = this node) are returned.
     pub peer: Option<String>,
+    /// Only chats bound to this room id (32 lowercase hex): a room thread.
+    /// Filters the most recent [`MAX_SEARCH_SCAN`] messages of the scope above
+    /// (received, or the `peer` conversation).
+    pub room: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -68,9 +73,21 @@ pub struct MessageResponse {
     /// Present on KIND_REPLY (kind=2) messages; omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<String>,
+    /// The room this chat belongs to (its binding, both ends in the roster).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomBinding>,
 }
 
 impl MessageResponse {
+    /// This chat's room: its binding, if sender and recipient node are both in
+    /// the roster (a refused one is withdrawn on receive; this holds on read).
+    fn room_of(&self, plaintext: &str) -> Option<RoomBinding> {
+        let room = crate::room_binding::binding(self.kind, plaintext).ok()??;
+        let (from, to) = (NodeId::from_hex(&self.sender).ok()?, NodeId::from_hex(&self.recipient).ok()?);
+        room.check(&from, &to).ok()?;
+        Some(room)
+    }
+
     pub(super) fn from_envelope(env: &konsensus_core::UkmEnvelope) -> Self {
         let recipient_str = match &env.recipient {
             Recipient::Node(id) => id.to_hex(),
@@ -88,6 +105,7 @@ impl MessageResponse {
             payment_hash: hex::encode(env.payment_proof.payment_hash),
             plaintext: None,
             references: env.references.iter().map(|r| r.to_hex()).collect(),
+            room: None,
         }
     }
 
@@ -97,6 +115,7 @@ impl MessageResponse {
             match c.decrypt(&enc) {
                 Ok(bytes) => {
                     if let Ok(text) = String::from_utf8(bytes) {
+                        self.room = self.room_of(&text);
                         self.plaintext = Some(text);
                     }
                 }
@@ -190,6 +209,8 @@ pub(super) async fn get_message_plaintext(
 /// Without `peer` param: returns incoming messages (recipient = this node).
 /// With `peer` param: returns both sent and received messages for that
 /// conversation, enabling full conversation history including outgoing messages.
+/// With `room` param (32 lowercase hex): only chats carrying a valid binding
+/// to that room id, scanning up to `MAX_SEARCH_SCAN` messages.
 ///
 /// `BitSov-Data-As-Of` is the time the message store was read for this
 /// response (the store is local and authoritative, so normally "now").
@@ -200,6 +221,13 @@ pub(super) async fn list_messages(
 ) -> Result<(DataFreshness, Json<Vec<MessageResponse>>), ApiError> {
     let my_node_hex = state.identity.node_id().to_hex();
     let store_read = DataFreshness::now();
+    if let Some(room) = &params.room {
+        if room.len() != 32 || !room.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(ApiError::BadRequest("invalid room: expected a 32-char lowercase hex room id".into()));
+        }
+    }
+    let limit = clamp_limit(params.limit);
+    let scan = if params.room.is_some() { MAX_SEARCH_SCAN } else { limit };
 
     let messages = if let Some(ref peer_id) = params.peer {
         // Validate peer_id format: either a hex node ID or a UUID room ID.
@@ -223,7 +251,7 @@ pub(super) async fn list_messages(
                 &my_node_hex,
                 peer_id,
                 is_room,
-                clamp_limit(params.limit),
+                scan,
                 params.before,
             )
             .await
@@ -232,7 +260,7 @@ pub(super) async fn list_messages(
         let recipient = Recipient::Node(*state.identity.node_id());
         state
             .storage
-            .get_messages_for_recipient(&recipient, clamp_limit(params.limit), params.before)
+            .get_messages_for_recipient(&recipient, scan, params.before)
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     };
@@ -240,6 +268,9 @@ pub(super) async fn list_messages(
     let cipher = state.plaintext_cipher.as_deref();
     let mut responses = Vec::with_capacity(messages.len());
     for env in &messages {
+        if responses.len() >= limit as usize {
+            break;
+        }
         let mut resp = MessageResponse::from_envelope(env);
         if cipher.is_some() {
             let cached = state
@@ -248,6 +279,9 @@ pub(super) async fn list_messages(
                 .await
                 .unwrap_or(None);
             resp = resp.with_cached_plaintext(cached, cipher);
+        }
+        if params.room.as_ref().is_some_and(|id| resp.room.as_ref().is_none_or(|room| room.id != *id)) {
+            continue;
         }
         responses.push(resp);
     }

@@ -593,10 +593,13 @@ pub(crate) fn merge_persisted_peers(
 pub(crate) fn default_advertised_capabilities(relay_enabled: bool) -> Vec<Capability> {
     // Mesh meetings: peers' apps ring this node with a meeting leg only when
     // they see this advert (older nodes withdraw such a leg after payment).
-    // `Custom` is an existing variant, so older nodes still decode the Hello.
+    // Rooms: likewise, peers send room-bound chat only to nodes that list
+    // `room_binding_v1`. `Custom` is an existing variant, so older nodes still
+    // decode the Hello.
     let mut caps = vec![
         Capability::X3dh,
         Capability::Custom(konsensus_core::payloads::call::MEETING_CAPABILITY.to_string()),
+        Capability::Custom(konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY.to_string()),
     ];
     if relay_enabled {
         caps.push(Capability::Relay);
@@ -631,6 +634,14 @@ mod relay_capability_tests {
         // An older node decodes it: `Custom` is an existing, name-tagged variant.
         let wire = serde_json::to_string(&caps).unwrap();
         assert_eq!(serde_json::from_str::<Vec<Capability>>(&wire).unwrap(), caps);
+    }
+
+    #[test]
+    fn room_binding_capability_is_advertised_in_the_form_peers_list_shows() {
+        let caps = default_advertised_capabilities(false);
+        let room = Capability::Custom("room_binding_v1".into());
+        assert!(caps.contains(&room));
+        assert_eq!(format!("{room:?}"), r#"Custom("room_binding_v1")"#);
     }
 
     #[test]

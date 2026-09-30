@@ -590,6 +590,26 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                         }
 
+                        // Rooms: a room-bound chat whose roster lacks the sender or
+                        // this node is refused like a call signal: withdrawn (the
+                        // payment hash and nonce stay burned) and never shown.
+                        if let Err(refusal) = konsensus_api::room_binding::admit_incoming(identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()) {
+                            warn!(sender = %sender, reason = %refusal, "room chat refused; not forwarded");
+                            if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
+                                error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused room chat");
+                            }
+                            audit_for_recv.record(
+                                konsensus_api::audit::events::MESSAGE_REJECTED,
+                                &sender.to_hex(),
+                                Some(serde_json::json!({ "reason": refusal.code(), "kind": envelope.kind })),
+                            );
+                            let reject = Frame::MessageReject { id: msg_id, reason: format!("{}: {refusal}", refusal.code()) };
+                            if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
+                                warn!(peer = %sender, error = %e, "failed to send MessageReject");
+                            }
+                            continue;
+                        }
+
                         // Broadcast to WebSocket clients (with plaintext if decrypted)
                         if let Err(e) = ws_tx_for_recv.send(Arc::new(
                             WsMessage {

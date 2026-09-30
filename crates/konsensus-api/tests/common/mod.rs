@@ -1242,6 +1242,9 @@ pub struct ConnectedStubTransport {
     pub since: Option<std::time::Instant>,
     /// Every raw control frame sent (e.g. `PriceQuery`), in order.
     pub raw_frames: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Capabilities each connected peer advertised (as `peer_info` renders
+    /// them); a peer without an entry reports no peer info.
+    pub peer_capabilities: std::sync::Mutex<HashMap<NodeId, Vec<String>>>,
 }
 
 impl ConnectedStubTransport {
@@ -1256,7 +1259,13 @@ impl ConnectedStubTransport {
             invoice_requests,
             since: Some(std::time::Instant::now()),
             raw_frames: std::sync::Mutex::new(Vec::new()),
+            peer_capabilities: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `peer` advertised `capabilities` in its Hello (e.g. `Custom("room_binding_v1")`).
+    pub fn advertise(&self, peer: NodeId, capabilities: &[&str]) {
+        self.peer_capabilities.lock().unwrap().insert(peer, capabilities.iter().map(|c| c.to_string()).collect());
     }
 
     pub fn with_invoice_responder(
@@ -1302,6 +1311,14 @@ impl MessageTransport for ConnectedStubTransport {
 
     async fn connected_since(&self, peer: &NodeId) -> Option<std::time::Instant> {
         self.since.filter(|_| self.connected.lock().unwrap().contains(peer))
+    }
+
+    async fn peer_info(&self, peer: &NodeId) -> Option<konsensus_core::traits::ConnectedPeerInfo> {
+        if !self.connected.lock().unwrap().contains(peer) {
+            return None;
+        }
+        let capabilities = self.peer_capabilities.lock().unwrap().get(peer)?.clone();
+        Some(konsensus_core::traits::ConnectedPeerInfo { tier: "T1".into(), capabilities })
     }
 
     async fn connected_peers(&self) -> Vec<NodeId> {

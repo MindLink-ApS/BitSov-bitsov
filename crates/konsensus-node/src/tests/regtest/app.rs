@@ -135,6 +135,7 @@ impl App {
             TransportConfig {
                 listen_addr: "127.0.0.1:0".parse().unwrap(),
                 admission_mode: ReachabilityMode::PriceOpen,
+                capabilities: crate::node::default_advertised_capabilities(false),
                 ..Default::default()
             },
         ));

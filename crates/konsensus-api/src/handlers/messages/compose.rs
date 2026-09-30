@@ -99,6 +99,9 @@ pub struct MemberPaymentOutcome {
     pub amount_msat: u64,
     pub message_id: Option<String>,
     pub reason: Option<String>,
+    /// Stable code for a member skipped before any quote (bound rooms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
 }
 
 async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, height: u64) -> Result<u64, ApiError> {
@@ -2897,7 +2900,9 @@ struct RoomFanoutCtx<'a> {
     debit: &'a Debit,
     readmission: &'a Readmission,
     sender: NodeId,
-    room_recipient: Recipient,
+    /// The admin room's id; `None` (a bound room) addresses each envelope to
+    /// its member, so the room id stays inside the encrypted plaintext.
+    room_recipient: Option<Recipient>,
     plaintext: &'a str,
     references: &'a [MessageId],
     kind: u16,
@@ -2919,8 +2924,14 @@ struct RoomMemberOutcome {
 impl RoomMemberOutcome {
     fn stopped(member: NodeId, status: &'static str, amount: u64, reason: String) -> Self {
         Self { envelope: None, delivered: false, receipt: MemberPaymentOutcome {
-            recipient: member.to_hex(), status, amount_msat: amount, message_id: None, reason: Some(reason),
+            recipient: member.to_hex(), status, amount_msat: amount, message_id: None, reason: Some(reason), code: None,
         } }
+    }
+}
+
+impl MemberPaymentOutcome {
+    fn skipped(member: NodeId, code: &'static str, reason: String) -> Self {
+        Self { recipient: member.to_hex(), status: "refused", amount_msat: 0, message_id: None, reason: Some(reason), code: Some(code) }
     }
 }
 
@@ -2987,7 +2998,7 @@ async fn compose_room_member(
     let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
         ctx.kind,
         ctx.sender,
-        ctx.room_recipient,
+        ctx.room_recipient.unwrap_or(Recipient::Node(member)),
         ciphertext,
         proof,
     )
@@ -3035,9 +3046,84 @@ async fn compose_room_member(
 
     RoomMemberOutcome {
         receipt: MemberPaymentOutcome { recipient: member.to_hex(), status: "settled", amount_msat,
-            message_id: Some(envelope.id.to_hex()), reason: None },
+            message_id: Some(envelope.id.to_hex()), reason: None, code: None },
         envelope: Some(envelope), delivered,
     }
+}
+
+/// Who a room send goes to: the envelope recipient (`None`: each member), the
+/// other members to pay, and members already skipped with nothing paid.
+type RoomMembers = (Option<Recipient>, Vec<NodeId>, Vec<MemberPaymentOutcome>);
+
+/// Members of an admin room on this node (`POST /api/v1/rooms`).
+async fn admin_room_members(state: &AppState, req: &ComposeRequest) -> Result<RoomMembers, ApiError> {
+    let room_id = konsensus_core::RoomId::parse(&req.recipient)
+        .map_err(|e| ApiError::BadRequest(format!("invalid room ID: {e}")))?;
+
+    // DBH2 / ROOM-FANOUT-STREAM: get_room_members() is now UNBOUNDED (the old
+    // LIMIT 10000 was a silent-truncation fail-open). This compose path is the
+    // heavier fan-out — it encrypts (Double Ratchet) AND requests a Lightning
+    // invoice per member in the loop below — so collecting the full member set
+    // into a single Vec and iterating is the worst-case memory/latency cliff on a
+    // very large room. Tracked follow-up ROOM-FANOUT-STREAM (TASK_QUEUE.md, Track
+    // DBH) replaces this collect-then-send with chunked/streamed per-member
+    // delivery + backpressure. Bounded by present mesh size until then.
+    let members = state
+        .storage
+        .get_room_members(&room_id)
+        .await
+        .map_err(|e| ApiError::Storage(e.to_string()))?;
+
+    if members.is_empty() {
+        return Err(ApiError::BadRequest("room has no members".into()));
+    }
+
+    // Bounded fan-out guard (HARD-12 / ROOM-FANOUT-STREAM interim).
+    //
+    // Room compose performs one payment + encrypt + deliver per member. A
+    // single request to an oversized room would amplify into an unbounded
+    // number of Lightning operations and a multi-minute synchronous HTTP
+    // request. Reject with explicit back-pressure rather than processing it.
+    if members.len() > MAX_ROOM_FANOUT_MEMBERS {
+        state.audit_log.record(
+            "room_compose_rejected_too_large",
+            &state.identity.node_id().to_hex(),
+            Some(serde_json::json!({
+                "kind": req.kind,
+                "room_id": req.recipient,
+                "member_count": members.len(),
+                "max_members": MAX_ROOM_FANOUT_MEMBERS,
+            })),
+        );
+        return Err(ApiError::BadRequest(format!(
+            "room too large for synchronous fan-out: {} members (max {MAX_ROOM_FANOUT_MEMBERS}) — \
+             split the room or wait for streamed room delivery",
+            members.len()
+        )));
+    }
+    Ok((Some(Recipient::Room(room_id)), members, Vec::new()))
+}
+
+/// The other members of a bound room (roster from the binding, at most 3).
+/// Skipped before any quote, with nothing paid: a member whose node does not
+/// list `room_binding_v1`, or with no E2EE session.
+async fn bound_room_members(state: &AppState, recipient: &str, room: &konsensus_core::payloads::room::RoomBinding) -> Result<RoomMembers, ApiError> {
+    use crate::room_binding::{NO_SESSION, UNSUPPORTED};
+    if recipient != room.id {
+        return Err(crate::room_binding::refused(konsensus_core::payloads::room::RoomRefusal::Invalid("recipient must be the room id")));
+    }
+    let own = state.identity.node_id();
+    let (mut members, mut skipped) = (Vec::new(), Vec::new());
+    for member in room.members().into_iter().filter(|m| m != own) {
+        if !crate::room_binding::advertises(state.transport.as_ref(), &member).await {
+            skipped.push(MemberPaymentOutcome::skipped(member, UNSUPPORTED, "their node does not advertise room_binding_v1 (not connected, or an older node); nothing paid".into()));
+        } else if !state.session_manager.has_session(&member).await {
+            skipped.push(MemberPaymentOutcome::skipped(member, NO_SESSION, "E2EE session unavailable; nothing paid".into()));
+        } else {
+            members.push(member);
+        }
+    }
+    Ok((None, members, skipped))
 }
 
 /// `POST /api/v1/messages/compose` — compose, encrypt, pay, and send a message.
@@ -3087,57 +3173,17 @@ pub(super) async fn compose_message(
         .collect();
 
     let sender = *state.identity.node_id();
+    let room = crate::room_binding::outgoing(&sender, req.kind, &req.plaintext)?;
 
     if req.is_room {
         if req.operation_id.is_some() {
             return Err(ApiError::BadRequest("operation_id for rooms requires per-member operations (slice 4)".into()));
         }
         // ── Room compose: encrypt + pay + deliver to each member individually ──
-        let room_id = konsensus_core::RoomId::parse(&req.recipient)
-            .map_err(|e| ApiError::BadRequest(format!("invalid room ID: {e}")))?;
-        let room_recipient = Recipient::Room(room_id);
-
-        // DBH2 / ROOM-FANOUT-STREAM: get_room_members() is now UNBOUNDED (the old
-        // LIMIT 10000 was a silent-truncation fail-open). This compose path is the
-        // heavier fan-out — it encrypts (Double Ratchet) AND requests a Lightning
-        // invoice per member in the loop below — so collecting the full member set
-        // into a single Vec and iterating is the worst-case memory/latency cliff on a
-        // very large room. Tracked follow-up ROOM-FANOUT-STREAM (TASK_QUEUE.md, Track
-        // DBH) replaces this collect-then-send with chunked/streamed per-member
-        // delivery + backpressure. Bounded by present mesh size until then.
-        let members = state
-            .storage
-            .get_room_members(&room_id)
-            .await
-            .map_err(|e| ApiError::Storage(e.to_string()))?;
-
-        if members.is_empty() {
-            return Err(ApiError::BadRequest("room has no members".into()));
-        }
-
-        // Bounded fan-out guard (HARD-12 / ROOM-FANOUT-STREAM interim).
-        //
-        // Room compose performs one payment + encrypt + deliver per member. A
-        // single request to an oversized room would amplify into an unbounded
-        // number of Lightning operations and a multi-minute synchronous HTTP
-        // request. Reject with explicit back-pressure rather than processing it.
-        if members.len() > MAX_ROOM_FANOUT_MEMBERS {
-            state.audit_log.record(
-                "room_compose_rejected_too_large",
-                &sender.to_hex(),
-                Some(serde_json::json!({
-                    "kind": req.kind,
-                    "room_id": req.recipient,
-                    "member_count": members.len(),
-                    "max_members": MAX_ROOM_FANOUT_MEMBERS,
-                })),
-            );
-            return Err(ApiError::BadRequest(format!(
-                "room too large for synchronous fan-out: {} members (max {MAX_ROOM_FANOUT_MEMBERS}) — \
-                 split the room or wait for streamed room delivery",
-                members.len()
-            )));
-        }
+        let (room_recipient, members, skipped) = match room {
+            Some(room) => bound_room_members(&state, &req.recipient, &room).await?,
+            None => admin_room_members(&state, &req).await?,
+        };
 
         let current_block_height = if !state.lightning.money_ready().await { 0 } else { match state.chain.get_block_height().await {
             Ok(h) => h,
@@ -3150,6 +3196,13 @@ pub(super) async fn compose_message(
         let mut prices = Vec::new();
         for member in members.iter().filter(|m| *m != state.identity.node_id()) {
             prices.push((*member, quoted_price(&state, member, req.kind, current_block_height).await?));
+        }
+        if prices.is_empty() && !skipped.is_empty() {
+            return Ok(Json(ComposeResponse {
+                operation_id: None, state: "untracked".into(), accepted: false, payment_hash: None, retry_allowed: false,
+                max_routing_fee_msat: 0, member_outcomes: Some(skipped), message_id: String::new(),
+                delivered: false, amount_msat: 0, readmission_msat: None,
+            }));
         }
         let debit_prices = prices.iter().map(|(peer, price)|
             super::caps::all_in(&state, *price, req.max_routing_fee_msat).map(|total| (*peer, total))
@@ -3266,16 +3319,27 @@ pub(super) async fn compose_message(
             })),
         );
 
-        Ok(Json(ComposeResponse {
+        let mut receipts: Vec<_> = outcomes.into_iter().map(|(_, o)| o.receipt).chain(skipped).collect();
+        if room_recipient.is_none() {
+            // A bound room reports in roster order.
+            receipts.sort_by(|a, b| a.recipient.cmp(&b.recipient));
+        }
+        return Ok(Json(ComposeResponse {
             operation_id: None, state: "untracked".into(), accepted: false, payment_hash: None, retry_allowed: false,
             max_routing_fee_msat: max_routing_fee_msat.saturating_add(readmission.fee_ceiling_msat()),
-            member_outcomes: Some(outcomes.into_iter().map(|(_, o)| o.receipt).collect()),
+            member_outcomes: Some(receipts),
             message_id,
             delivered: any_delivered,
             amount_msat: total_amount_msat,
             readmission_msat: readmission.paid_msat(),
-        }))
-    } else if crate::calls::is_call_kind(req.kind) {
+        }));
+    }
+    // A room-bound chat to one member: checked before any quote or payment.
+    if let Some(room) = &room {
+        let peer = NodeId::from_hex(&req.recipient).map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+        crate::room_binding::check_one(state.transport.as_ref(), &sender, &peer, room).await?;
+    }
+    if crate::calls::is_call_kind(req.kind) {
         // Calls: reserved before any quote or payment and resolved afterwards,
         // under the operation's lock; the paid transition is published at
         // settlement (compose_peer).

@@ -243,6 +243,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
             super::liquidity::CAPABILITY,
             super::sponsor::CAPABILITY,
             konsensus_core::payloads::call::MEETING_CAPABILITY,
+            konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY,
         ],
         status: "ok",
         node_id: state.identity.node_id().to_hex(),

@@ -67,6 +67,7 @@ pub mod metered;
 pub mod metrics;
 pub mod pairing;
 pub mod rate_limit;
+pub mod room_binding;
 pub mod spend_budget;
 pub mod state;
 pub mod ws;
