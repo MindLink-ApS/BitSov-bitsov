@@ -22,7 +22,7 @@ use konsensus_core::front_door::{
 use konsensus_core::introduction::{dial_allowed, first_contact_prices, split_endpoint, Reach};
 use konsensus_core::traits::transport::TransportError;
 
-use crate::auth::scoped::{Admin, Read, ScopedAuth};
+use crate::auth::scoped::{FrontDoorWrite, Read, ScopedAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -372,8 +372,12 @@ async fn get_front_door(
 }
 
 /// `PUT /api/v1/front-door` — create or update; bumps `seq`, re-signs, 7-day expiry.
+///
+/// Demands `front_door` or `admin` ([`FrontDoorWrite`]). A paired app holds
+/// `front_door` only while an owner grant is live; `admin` is never granted to
+/// it. Publishing moves no value.
 async fn put_front_door(
-    _auth: ScopedAuth<Admin>,
+    auth: ScopedAuth<FrontDoorWrite>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<UpsertFrontDoorRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -434,6 +438,13 @@ async fn put_front_door(
     )
     .map_err(|e| ApiError::Conflict(format!("front_door_unavailable: {e}")))?;
     state.front_door.save(&card)?;
+    // Logged like the grant that allowed it: who published which sequence.
+    tracing::info!(
+        seq = card.seq,
+        paired_client = auth.pairing.as_ref().map(|p| p.client_id.as_str()).unwrap_or("-"),
+        via = if auth.has(crate::auth::Scope::Admin) { "admin" } else { "front_door grant" },
+        "front door published"
+    );
     *floor = card.seq;
     *store = Some(card.clone());
     drop(floor);

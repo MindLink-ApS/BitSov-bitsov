@@ -79,6 +79,16 @@ pub enum ControlRequest {
         /// never falls back to the client's proposal on its own.
         terms: GrantTerms,
     },
+    /// Write a `front_door` grant (publish the front-door card only; no
+    /// budget, no spend) for a pending request that asked for exactly that.
+    GrantFrontDoor {
+        /// Pending operation id.
+        op_id: String,
+        /// The phrase the owner typed. Must name `op_id`.
+        confirmation: String,
+        /// The window the owner approves, at most 24 h.
+        ttl_secs: i64,
+    },
     /// Approve one recipient and cap under this exact live budget grant.
     ApproveFirstContact {
         /// Paired client receiving the authorization.
@@ -158,6 +168,9 @@ pub enum ControlResponse {
         /// Live budget grants and what is left of each.
         #[serde(default)]
         grants: Vec<GrantView>,
+        /// Live `front_door` grants.
+        #[serde(default)]
+        front_door_grants: Vec<FrontDoorGrantSummary>,
     },
     /// A rendered pending operation and public label, never its secret nonce.
     Describe {
@@ -169,6 +182,9 @@ pub enum ControlResponse {
         /// may accept, narrow or replace. Carries no authority.
         #[serde(default)]
         proposed_terms: Option<GrantTerms>,
+        /// The request asks for `front_door` (no budget), not `spend`.
+        #[serde(default)]
+        front_door: bool,
     },
     /// The operation succeeded.
     Ok {
@@ -193,6 +209,17 @@ pub struct ClientSummary {
     pub scopes: Vec<String>,
     /// Revocation epoch.
     pub epoch: u64,
+}
+
+/// A live `front_door` grant as rendered to the owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrontDoorGrantSummary {
+    /// Operation the owner confirmed.
+    pub op_id: String,
+    /// Client holding it.
+    pub client_id: String,
+    /// Unix seconds after which it is inert.
+    pub expires_at: i64,
 }
 
 /// A pending elevation as rendered to the owner.
@@ -335,6 +362,15 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                     })
                     .collect(),
                 grants: service.grant_views(),
+                front_door_grants: service
+                    .front_door_grants()
+                    .into_iter()
+                    .map(|g| FrontDoorGrantSummary {
+                        op_id: g.op_id,
+                        client_id: g.client_id,
+                        expires_at: g.expires_at,
+                    })
+                    .collect(),
             }
         }
         ControlRequest::Describe { op_id } => describe(service, &op_id),
@@ -368,6 +404,21 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
             },
             Err(e) => error(e),
         },
+        ControlRequest::GrantFrontDoor {
+            op_id,
+            confirmation,
+            ttl_secs,
+        } => match service.grant_front_door(&op_id, &confirmation, ttl_secs) {
+            Ok(g) => ControlResponse::Ok {
+                detail: format!(
+                    "granted front_door to client {} until {} (epoch {}): it may publish or \
+                     update this node's front-door card and nothing else; it moves no value. \
+                     Revoke any time with: konsensus grant-revoke --client-id {}",
+                    g.client_id, g.expires_at, g.epoch, g.client_id,
+                ),
+            },
+            Err(e) => error(e),
+        },
         ControlRequest::ApproveFirstContact {
             client_id, grant_op_id, recipient, max_total_msat, contact_budget_msat,
         } => match service.grant_first_contact(
@@ -386,7 +437,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
             match service.revoke_grants(client_id.as_deref()) {
                 Ok(n) => ControlResponse::Ok {
                     detail: format!(
-                        "revoked {n} spend grant(s){} — spend stops on the client's next request",
+                        "revoked {n} grant(s){} (spend and front_door) — they stop on the client's next request",
                         client_id
                             .map(|id| format!(" for {id}"))
                             .unwrap_or_default()
@@ -529,6 +580,27 @@ fn error(e: PairingError) -> ControlResponse {
 
 fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
     let file = service.snapshot();
+    if let Some(op) = file
+        .pending_elevations
+        .iter()
+        .find(|e| e.op_id == op_id && e.scopes.contains(&crate::auth::Scope::FrontDoor))
+    {
+        let summary = format!(
+            "FRONT DOOR PUBLISH REQUEST\n  operation:   {}\n  client:      {} ({})\n  scopes:      \
+             front_door\n  request expires at:  {}\n\nGranting this lets that client publish or \
+             update THIS NODE'S FRONT-DOOR CARD, signed with the node's key: the display name, \
+             profile, links and the prices shown on the card. It moves no value, reaches no \
+             other route, and lasts until the window closes (1 h unless you pass --for, 24 h at \
+             most). Revoke with konsensus grant-revoke.",
+            op.op_id, op.client_name, op.client_id, op.expires_at
+        );
+        return ControlResponse::Describe {
+            confirmation_label: grant_confirmation_phrase(op),
+            summary,
+            proposed_terms: None,
+            front_door: true,
+        };
+    }
     if let Some(op) = file.pending_elevations.iter().find(|e| e.op_id == op_id) {
         let proposal = match &op.proposed_terms {
             Some(t) => format!(
@@ -557,6 +629,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             confirmation_label: grant_confirmation_phrase(op),
             summary,
             proposed_terms: op.proposed_terms.clone(),
+            front_door: false,
         };
     }
     if let Some(a) = file.replacement_approvals.iter().find(|a| a.op_id == op_id) {
@@ -580,6 +653,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             confirmation_label: replacement_confirmation_phrase(a),
             summary,
             proposed_terms: None,
+            front_door: false,
         };
     }
     ControlResponse::Error {
