@@ -20,7 +20,9 @@ Now:
    **owner-approval key**, over `client_pubkey`, `epoch`, the node and the
    device key. The node keeps only that key's public half and re-verifies the
    signature on every use, so a device-key record written into `data_dir`
-   authorizes nothing (`docs/protocol/ACCOUNT-LAYER.md` §4).
+   without that signature authorizes nothing. This covers device-key records
+   only: spend grants in the same file are not yet signed
+   (`docs/protocol/ACCOUNT-LAYER.md` §3 and §4 GAPs).
 2. **Per contact, one tap.** To let messages pay a contact, the app signs a
    `RelationIntent` (peer, budget, per-act maximum, window, nonce) with that
    key. Touch ID unlocks the key for that one signature. The node verifies the

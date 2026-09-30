@@ -518,6 +518,25 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
                 .device
                 .context("that operation is not a device-key registration")?;
             println!("\n{}\n", described.summary);
+            // The socket is not trusted to say what is being signed: show the
+            // fingerprints computed here, from the exact bytes that get signed.
+            let device = hex::decode(&tuple.device_public_key)
+                .ok()
+                .filter(|k| k.len() == 65 && k[0] == 0x04)
+                .context("the node described a malformed device key; nothing was signed")?;
+            let client = hex::decode(&tuple.client_pubkey)
+                .ok()
+                .filter(|k| k.len() == 32)
+                .context("the node described a malformed pairing key; nothing was signed")?;
+            use konsensus_api::pairing::device::{key_fingerprint, key_id_for};
+            println!(
+                "YOU ARE SIGNING (computed by this command, not by the node):\n  device fingerprint:  {}\n  \
+                 pairing key:         {}\n  pairing epoch:       {}\nCompare the device fingerprint with \
+                 the one the app shows. If they differ, press Enter to cancel.\n",
+                key_fingerprint(&key_id_for(&device)),
+                key_fingerprint(&key_id_for(&client)),
+                tuple.epoch
+            );
             let Some(confirmation) = read_owner_code()? else {
                 println!("not registered");
                 return Ok(());

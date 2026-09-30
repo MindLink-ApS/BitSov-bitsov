@@ -12,6 +12,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 const DEVICE: &str = "04aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 async fn approve(dir: &std::path::Path, node: String) -> (std::process::Output, Vec<ControlRequest>) {
+    approve_with(dir, node, DEVICE).await
+}
+
+async fn approve_with(dir: &std::path::Path, node: String, device: &'static str) -> (std::process::Output, Vec<ControlRequest>) {
     let listener = tokio::net::UnixListener::bind(dir.join("control.sock")).unwrap();
     let server = tokio::spawn(async move {
         let mut seen = Vec::new();
@@ -29,7 +33,7 @@ async fn approve(dir: &std::path::Path, node: String) -> (std::process::Output, 
                         node: node.clone(),
                         client_pubkey: "11".repeat(32),
                         epoch: 3,
-                        device_public_key: DEVICE.into(),
+                        device_public_key: device.into(),
                     }),
                 },
                 _ => ControlResponse::Ok { detail: "registered".into() },
@@ -80,6 +84,10 @@ async fn the_owner_key_signs_the_described_tuple_for_its_own_node() {
         panic!("{seen:?}")
     };
     assert_eq!(confirmation, "K7QM-3XWD");
+    // The fingerprint the owner compares is computed by the CLI from the signed bytes.
+    let expected = konsensus_api::pairing::device::key_fingerprint(&konsensus_api::pairing::device::key_id_for(&hex::decode(DEVICE).unwrap()));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&format!("device fingerprint:  {expected}")), "{stdout}");
     let message = konsensus_api::pairing::device::owner_approval_message(&fp, &"11".repeat(32), 3, DEVICE);
     let sig = ed25519_dalek::Signature::from_slice(&hex::decode(owner_signature).unwrap()).unwrap();
     // Verifies under the node's owner-approval public key, not its identity key.
@@ -93,5 +101,16 @@ async fn it_refuses_to_sign_for_another_node() {
     let (out, seen) = approve(dir.path(), "0".repeat(32)).await;
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("nothing was signed"));
+    assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "{seen:?}");
+}
+
+#[tokio::test]
+async fn it_refuses_a_malformed_tuple_before_signing() {
+    let (dir, mnemonic) = init();
+    let id = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, "").unwrap();
+    let fp = konsensus_api::pairing::identity_fingerprint(&id.node_id().to_hex());
+    // Same fake node, but it now claims a device key that is not a P-256 point.
+    let (out, seen) = approve_with(dir.path(), fp, "04zz").await;
+    assert!(!out.status.success());
     assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "{seen:?}");
 }
