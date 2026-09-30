@@ -1,6 +1,13 @@
 //! K1 introductions (slice 1): the node's signed door card, and dialing a
 //! node from one.
 //!
+//! **Profile cards:** [`FrontDoorCard`](konsensus_core::front_door::FrontDoorCard)
+//! via `/api/v1/front-door` is the single user-facing profile format. These
+//! `/api/v1/introduction` routes remain for the sponsor kit
+//! (`bitsov://introduce` with starter-bitcoin offers) and still-wired app host
+//! commands. Successful responses carry `Deprecation` / `Link` pointing at
+//! front-door. See `docs/v2/LEGACY-INTRO-AND-INVITE-MIGRATION.md`.
+//!
 //! **An introduction is never admission.** Issuing one stores nothing and
 //! grants nothing. Opening one dials the introduced node *unprivileged*: no
 //! whitelist entry, no persisted peer, no session, no payment. The reader then
@@ -14,7 +21,7 @@ use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::header;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::RngCore;
@@ -198,20 +205,35 @@ fn now_unix() -> Result<u64, ApiError> {
         .map_err(|e| ApiError::Internal(format!("system clock before UNIX_EPOCH: {e}")))
 }
 
+/// Profile-card successor: FrontDoorCard. Introduction stays for sponsor kits.
+const FRONT_DOOR_SUCCESSOR: &str = "</api/v1/front-door>; rel=\"successor-version\"";
+
+fn deprecate_profile_card<T: Serialize>(body: T) -> Response {
+    (
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::HeaderName::from_static("deprecation"), "true"),
+            (header::LINK, FRONT_DOOR_SUCCESSOR),
+        ],
+        Json(body),
+    )
+        .into_response()
+}
+
 /// `GET /api/v1/introduction` — this node's door card: its key, its peer
 /// endpoint and its current first-contact and message prices, signed by the
 /// node key, valid for ten minutes. Read scope: every field is the node's own
 /// and public by design. Pays, stores and grants nothing.
+///
+/// **Deprecated as a profile card** in favour of `GET /api/v1/front-door`; kept
+/// for sponsor offers and existing app host commands.
 async fn get_introduction(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let card = issue_card(&state).await?;
     let link = card.to_link();
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(IntroductionResponse { card, link }),
-    ))
+    Ok(deprecate_profile_card(IntroductionResponse { card, link }))
 }
 
 /// Sign a fresh card for this node (also used by the sponsor kit's offer).
@@ -268,13 +290,10 @@ async fn verify_introduction(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<VerifyIntroductionRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let card = verified_card(&state, &req.card)?;
     let link = card.to_link();
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(IntroductionResponse { card, link }),
-    ))
+    Ok(deprecate_profile_card(IntroductionResponse { card, link }))
 }
 
 /// Resolve `endpoint` once, refuse it unless every address is allowed for
@@ -324,7 +343,7 @@ async fn open_introduction(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenIntroductionRequest>,
-) -> Result<Json<OpenIntroductionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let invalid = |e: konsensus_core::introduction::IntroductionError| {
         ApiError::BadRequest(format!("introduction_invalid: {e}"))
     };
@@ -340,7 +359,7 @@ async fn open_introduction(
     }
     let pinned = pin_endpoint(&card).await?;
     match tokio::time::timeout(DIAL_TIMEOUT, state.transport.connect(&node, &pinned.to_string())).await {
-        Ok(Ok(())) => Ok(Json(OpenIntroductionResponse {
+        Ok(Ok(())) => Ok(deprecate_profile_card(OpenIntroductionResponse {
             node_id: node.to_hex(),
             dialed: pinned.to_string(),
             connected: true,

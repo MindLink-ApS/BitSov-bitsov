@@ -1466,10 +1466,11 @@ async fn peer_import_too_many_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-// ─── Invite Tests ───────────────────────────────────────────────────
+
+// ─── Legacy Invite routes removed (410 Gone) ───────────────────────
 
 #[tokio::test]
-async fn invite_generate_returns_token_and_uri() {
+async fn legacy_invite_issue_is_gone() {
     let state = test_state();
     let auth = auth_header(&state);
     let app = build_router(state);
@@ -1480,220 +1481,61 @@ async fn invite_generate_returns_token_and_uri() {
         .header("content-type", "application/json")
         .header("authorization", &auth)
         .body(Body::from(
-            serde_json::json!({
-                "addr": "10.0.0.1:9735",
-                "label": "Alice",
-                "expiry_secs": 3600
-            })
-            .to_string(),
+            serde_json::json!({ "addr": "10.0.0.1:9735", "label": "Alice", "expiry_secs": 3600 }).to_string(),
         ))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["token"].is_string());
-    let uri = json["uri"].as_str().unwrap();
-    assert!(uri.starts_with("konsensus://invite/"));
-    assert!(json["expiry"].as_u64().unwrap() > 0);
-}
-
-#[tokio::test]
-async fn invite_generate_no_expiry() {
-    let state = test_state();
-    let auth = auth_header(&state);
-    let app = build_router(state);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "addr": "10.0.0.1:9735" }).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["expiry"].as_u64().unwrap(), 0);
-}
-
-#[tokio::test]
-async fn invite_generate_empty_addr_rejected() {
-    let state = test_state();
-    let auth = auth_header(&state);
-    let app = build_router(state);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "addr": "" }).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn invite_generate_requires_auth() {
-    let state = test_state();
-    let app = build_router(state);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({ "addr": "10.0.0.1:9735" }).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn invite_redeem_adds_peer() {
-    let state = test_state();
-    let auth = auth_header(&state);
-
-    // Generate an invite from a different identity
-    let other = konsensus_core::NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
-    let token = konsensus_core::InviteToken::generate(
-        &other,
-        "10.0.0.2:9735",
-        Some("Bob"),
-        0,
-    )
-    .unwrap();
-
-    let app = build_router(Arc::clone(&state));
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite/redeem")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "invite": token }).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["addr"], "10.0.0.2:9735");
-    assert_eq!(json["label"], "Bob");
-    assert!(json["added"].as_bool().unwrap());
-    assert!(json["fingerprint"].is_string());
-
-    // Verify peer is in registry
-    let registry = state.peer_registry.read().await;
-    let peer = registry
-        .get(other.node_id())
-        .expect("peer should be in registry");
-    assert_eq!(peer.label.as_deref(), Some("Bob"));
-}
-
-/// P3-2c: the legacy redeem route emits RFC 8594/9745 deprecation headers while the
-/// body and behaviour stay UNCHANGED (same flow as `invite_redeem_adds_peer`).
-#[tokio::test]
-async fn invite_redeem_emits_deprecation_headers() {
-    let state = test_state();
-    let auth = auth_header(&state);
-    let other =
-        konsensus_core::NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
-            .unwrap();
-    let token =
-        konsensus_core::InviteToken::generate(&other, "10.0.0.2:9735", Some("Bob"), 0).unwrap();
-    let app = build_router(Arc::clone(&state));
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite/redeem")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "invite": token }).to_string(),
-        ))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::GONE);
     assert_eq!(
-        resp.headers().get("deprecation").map(|v| v.to_str().unwrap()),
-        Some("true"),
-        "legacy redeem must advertise Deprecation: true"
-    );
-    assert!(
-        resp.headers().contains_key("sunset"),
-        "legacy redeem must advertise a Sunset target"
+        resp.headers().get("deprecation").and_then(|v| v.to_str().ok()),
+        Some("true")
     );
     assert!(
         resp.headers()
             .get("link")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("/api/v1/invites/accept")),
-        "legacy redeem must Link the successor route"
+            .is_some_and(|v| v.contains("/api/v1/invites")),
+        "Link successor for issue"
     );
-
-    // Headers are additive — the body is byte-for-byte what it was before.
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["addr"], "10.0.0.2:9735");
-    assert_eq!(json["label"], "Bob");
-    assert!(json["added"].as_bool().unwrap());
+    assert_eq!(json["code"], "legacy_invite_removed");
 }
 
-/// P3-2c: the legacy invite-generate route emits deprecation headers too.
 #[tokio::test]
-async fn invite_generate_emits_deprecation_headers() {
+async fn legacy_invite_redeem_is_gone() {
     let state = test_state();
     let auth = auth_header(&state);
+    let other = konsensus_core::NodeIdentity::from_mnemonic(
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+        "",
+    )
+    .unwrap();
+    let token = konsensus_core::InviteToken::generate(&other, "10.0.0.2:9735", Some("Bob"), 0).unwrap();
     let app = build_router(Arc::clone(&state));
 
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/invite")
+        .uri("/api/v1/invite/redeem")
         .header("content-type", "application/json")
         .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "addr": "10.0.0.9:9735" }).to_string(),
-        ))
+        .body(Body::from(serde_json::json!({ "invite": token }).to_string()))
         .unwrap();
+
     let resp = app.oneshot(req).await.unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("deprecation").map(|v| v.to_str().unwrap()),
-        Some("true"),
-        "legacy generate must advertise Deprecation: true"
+    assert_eq!(resp.status(), StatusCode::GONE);
+    assert!(
+        resp.headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("/api/v1/invites/accept"))
     );
-    assert!(resp.headers().contains_key("sunset"));
-
-    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["token"].is_string(), "generate still returns a token");
+    // Peer must not have been added.
+    assert!(state.peer_registry.read().await.get(other.node_id()).is_none());
 }
 
-/// P3-2c non-interchangeability (other direction): a legacy base58 `InviteToken`
-/// must NOT be accepted on the canonical `/api/v1/invites/accept` route.
+/// A legacy base58 `InviteToken` must still NOT parse on the canonical accept route.
 #[tokio::test]
 async fn canonical_accept_rejects_legacy_invite_token() {
     let state = test_state();
@@ -1721,190 +1563,6 @@ async fn canonical_accept_rejects_legacy_invite_token() {
         StatusCode::BAD_REQUEST,
         "a base58 InviteToken must not parse as a base64url BitSovInvite on the canonical accept route"
     );
-}
-
-#[tokio::test]
-async fn invite_redeem_uri_format() {
-    let state = test_state();
-    let auth = auth_header(&state);
-
-    let other = konsensus_core::NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
-    let uri = konsensus_core::InviteToken::generate_uri(
-        &other,
-        "10.0.0.2:9735",
-        None,
-        0,
-    )
-    .unwrap();
-
-    let app = build_router(Arc::clone(&state));
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite/redeem")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "invite": uri }).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["added"].as_bool().unwrap());
-}
-
-#[tokio::test]
-async fn invite_redeem_duplicate_returns_not_added() {
-    let state = test_state();
-    let auth = auth_header(&state);
-
-    let other = konsensus_core::NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
-    let token = konsensus_core::InviteToken::generate(
-        &other,
-        "10.0.0.2:9735",
-        None,
-        0,
-    )
-    .unwrap();
-
-    // First redeem
-    let app = build_router(Arc::clone(&state));
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite/redeem")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "invite": &token }).to_string(),
-        ))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Second redeem — same invite
-    let app2 = build_router(Arc::clone(&state));
-    let req2 = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite/redeem")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "invite": &token }).to_string(),
-        ))
-        .unwrap();
-    let resp2 = app2.oneshot(req2).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::OK);
-
-    let body = axum::body::to_bytes(resp2.into_body(), 4096).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(!json["added"].as_bool().unwrap());
-}
-
-#[tokio::test]
-async fn invite_redeem_self_rejected() {
-    let state = test_state();
-    let auth = auth_header(&state);
-
-    // Generate invite from the SAME identity as the test state
-    let token = konsensus_core::InviteToken::generate(
-        &state.identity,
-        "10.0.0.1:9735",
-        None,
-        0,
-    )
-    .unwrap();
-
-    let app = build_router(Arc::clone(&state));
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite/redeem")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "invite": token }).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn invite_redeem_invalid_token_rejected() {
-    let state = test_state();
-    let auth = auth_header(&state);
-    let app = build_router(state);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite/redeem")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "invite": "not-a-valid-token" }).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn invite_roundtrip_generate_then_redeem() {
-    let state = test_state();
-    let auth = auth_header(&state);
-
-    // Generate invite
-    let app1 = build_router(Arc::clone(&state));
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({
-                "addr": "10.0.0.1:9735",
-                "label": "TestNode"
-            })
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp = app1.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-    let gen_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let token = gen_json["token"].as_str().unwrap().to_string();
-
-    // Redeem from a different node's perspective —
-    // this is a self-invite so it should be rejected
-    let app2 = build_router(Arc::clone(&state));
-    let req2 = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite/redeem")
-        .header("content-type", "application/json")
-        .header("authorization", &auth)
-        .body(Body::from(
-            serde_json::json!({ "invite": token }).to_string(),
-        ))
-        .unwrap();
-
-    let resp2 = app2.oneshot(req2).await.unwrap();
-    // Self-invite gets rejected
-    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
 }
 
 // ─── Routing Endpoint Tests ────────────────────────────────────────
@@ -2247,93 +1905,7 @@ async fn gossip_status_without_validator_returns_error() {
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Invite handler — input validation boundary tests
-// ═══════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn invite_generate_rejects_overlong_addr() {
-    let state = test_state();
-    let auth = auth_header(&state);
-    let app = build_router(Arc::clone(&state));
-
-    let long_addr = "a".repeat(256);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite")
-        .header("authorization", &auth)
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({ "addr": long_addr }).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn invite_generate_rejects_overlong_label() {
-    let state = test_state();
-    let auth = auth_header(&state);
-    let app = build_router(Arc::clone(&state));
-
-    let long_label = "b".repeat(256);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite")
-        .header("authorization", &auth)
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({ "addr": "10.0.0.1:9735", "label": long_label }).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn invite_generate_rejects_unknown_fields() {
-    let state = test_state();
-    let auth = auth_header(&state);
-    let app = build_router(Arc::clone(&state));
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite")
-        .header("authorization", &auth)
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({
-                "addr": "10.0.0.1:9735",
-                "bogus_field": true
-            })
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn invite_redeem_requires_auth() {
-    let state = test_state();
-    let app = build_router(state);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/v1/invite/redeem")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({ "invite": "test" }).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
+// Legacy invite input-validation tests removed with the unbound InviteToken routes.
 
 // ═══════════════════════════════════════════════════════════════════
 // Peers handler — add/remove/connect validation tests

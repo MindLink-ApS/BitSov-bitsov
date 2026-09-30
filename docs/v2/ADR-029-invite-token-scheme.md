@@ -47,6 +47,12 @@ The codebase carries **two** invite mechanisms with **non-interchangeable** toke
 
 **Route removal is gated on the operator** ratifying: (a) a `BitSovInvite`-based peer-add UX that replaces the symmetric `redeemInvite` flow in `PeerList.tsx`, and (b) a confirmed near-zero legacy-route call rate (via the `deprecated = true` telemetry). Until both hold, the legacy routes stay.
 
+## Amendment (2026-09-30) — legacy unbound invite routes removed
+
+**Decision:** `POST /api/v1/invite` and `POST /api/v1/invite/redeem` are **removed**. They return **410 Gone** with `code: legacy_invite_removed`, `Deprecation: true`, and a `Link` to `/api/v1/invites` or `/api/v1/invites/accept`. Only invitee-bound `BitSovInvite` (`POST /api/v1/invites` + `POST /api/v1/invites/accept`) remains.
+
+**App check (bitsov-app):** the host uses `/invites` and `/invites/accept` only; no callers of the unbound routes were found. See `docs/v2/LEGACY-INTRO-AND-INVITE-MIGRATION.md`.
+
 ## Decision
 
 ### Token shape
