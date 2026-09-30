@@ -570,6 +570,7 @@ async fn owner_terms_win_over_the_proposal_and_the_window_is_capped_at_24h() {
         summary,
         proposed_terms,
         confirmation_label,
+        ..
     } = described
     else {
         panic!("{described:?}")

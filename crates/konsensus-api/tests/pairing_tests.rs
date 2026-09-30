@@ -137,7 +137,8 @@ async fn live_pairing_flows_never_mint_admin() {
     // POST /peers grants a live connection privilege. Pairing must never
     // confer the Admin scope that authorizes it, even with an owner grant.
     assert!(!pairing::grantable_scopes().contains(&Scope::Admin));
-    assert_eq!(pairing::grantable_scopes(), &[Scope::Spend]);
+    // `front_door` publishes the node's own card only; see front_door_scope_tests.
+    assert_eq!(pairing::grantable_scopes(), &[Scope::Spend, Scope::FrontDoor]);
 
     for owner_control in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
