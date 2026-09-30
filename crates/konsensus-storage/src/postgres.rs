@@ -783,6 +783,9 @@ impl Storage for PostgresStorage {
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable') ORDER BY created_at").fetch_all(&self.pool).await?)
     }
+    async fn list_failed_prepared_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE state = 'prepared' AND last_error IS NOT NULL ORDER BY created_at").fetch_all(&self.pool).await?)
+    }
     async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE accounting_pending = FALSE AND recovery_compacted = FALSE AND state IN ('acked', 'failed_paid') AND updated_at < $1 ORDER BY updated_at LIMIT $2")
             .bind(before_ms).bind(i64::from(limit)).fetch_all(&self.pool).await?)
@@ -3625,6 +3628,12 @@ mod migration_recovery_tests {
                     }
                 }
                 assert_eq!(db.list_recoverable_operations().await.unwrap().len(), 14);
+                assert!(db.list_failed_prepared_operations().await.unwrap().is_empty());
+                let mut failed = crate::OutboxOperation::prepared("prepared-failed".into(), peer.to_hex(), 1, "request".into());
+                failed.last_error = Some("admission journal: os error 2".into());
+                assert!(db.insert_outbox_operation(&failed).await.unwrap());
+                let listed = db.list_failed_prepared_operations().await.unwrap();
+                assert_eq!(listed.iter().map(|op| op.operation_id.as_str()).collect::<Vec<_>>(), ["prepared-failed"]);
                 // Exercise retained receipt acceptance on PostgreSQL too.
                 let sender = NodeId::from_bytes([1; 32]);
                 let peer = NodeId::from_bytes([2; 32]);

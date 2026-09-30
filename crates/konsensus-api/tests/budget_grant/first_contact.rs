@@ -315,7 +315,7 @@ async fn failed_admission_operation_journal_does_not_poison_unpaid_retry() {
     assert_eq!(sender.get_balance_msat().await.unwrap(), 100_000, "no Lightning dispatch occurred");
     assert_eq!(fx.used(), 0, "known unpaid reservation released");
     let op = db.get_outbox_operation(&id).await.unwrap().unwrap();
-    assert_eq!(op.state, "prepared");
+    assert_eq!(op.state, "released");
     assert!(op.admission_payment_hash.is_none());
     sqlx::raw_sql("DROP TRIGGER review113_crash").execute(db.pool()).await.unwrap();
     // False dispatch marker survives both failed and committed SQL writes.
@@ -396,7 +396,7 @@ async fn first_contact_non_dispatch_preserves_partial_settlement_and_unknown_hol
         if leg == 0 && !unknown {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(body["code"], "not_dispatched");
-            assert_eq!(body["state"], "prepared");
+            assert_eq!(body["state"], "released");
         } else {
             assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
             assert_ne!(body["code"], "not_dispatched", "a paid admission or unknown leg prevents an aggregate non-dispatch claim");

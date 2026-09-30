@@ -1579,3 +1579,146 @@ async fn a_capped_refusal_never_releases_the_uncapped_same_request_reservation()
 fn own() -> konsensus_core::types::NodeId {
     konsensus_core::types::NodeId::from_bytes([0xee; 32])
 }
+
+impl Fixture {
+    /// Fail the compose at its encrypted-draft checkpoint: after the operation
+    /// is claimed, before any wallet call.
+    async fn fail_before_payment(&self) {
+        sqlx::raw_sql("CREATE TRIGGER no_draft BEFORE UPDATE ON outbox_operations WHEN NEW.state = 'paying' AND json_extract(CAST(NEW.recovery AS TEXT), '$.draft.id') IS NOT NULL BEGIN SELECT RAISE(ABORT, 'disk gone'); END")
+            .execute(self.db.pool()).await.unwrap();
+    }
+    async fn allow_payment(&self) {
+        sqlx::raw_sql("DROP TRIGGER no_draft").execute(self.db.pool()).await.unwrap();
+    }
+    async fn get(&self) -> serde_json::Value {
+        let response = common::test_router(self.state.clone())
+            .oneshot(Request::builder().uri(format!("/api/v1/messages/operations/{}", self.id))
+                .header("authorization", common::auth_header(&self.state)).body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 16384).await.unwrap()).unwrap()
+    }
+    /// The row an older build left behind: `prepared` with its failure recorded.
+    async fn stick_prepared(&self) {
+        sqlx::query("UPDATE outbox_operations SET state = 'prepared', last_error = 'storage error: admission journal: No such file or directory (os error 2)' WHERE operation_id = ?")
+            .bind(&self.id).execute(self.db.pool()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_compose_that_fails_before_paying_is_released_and_retries_once() {
+    let f = Fixture::new().await;
+    f.fail_before_payment().await;
+    let (status, body) = f.post().await;
+    assert!(!status.is_success(), "{body}");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+    let op = f.op().await;
+    assert_eq!(op.state, "released", "{op:?}");
+    assert!(op.last_error.as_deref().is_some_and(|e| e.contains("disk gone")), "{op:?}");
+    assert_eq!(body["state"], "released");
+    assert_eq!(body["retry_allowed"], true);
+    let reported = f.get().await;
+    assert_eq!((reported["state"].as_str(), reported["retry_allowed"].as_bool()), (Some("released"), Some(true)));
+    // Nothing held: the same operation pays once when the cause is gone.
+    f.allow_payment().await;
+    let (status, body) = f.post().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn restart_releases_a_stuck_prepared_row_that_never_paid() {
+    let mut f = Fixture::new().await;
+    f.fail_before_payment().await;
+    f.post().await;
+    f.allow_payment().await;
+    f.stick_prepared().await;
+    assert_eq!(f.get().await["state"], "prepared");
+    f.restart().await;
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    let op = f.op().await;
+    assert_eq!(op.state, "released", "{op:?}");
+    assert!(!op.accounting_pending, "no liability stays held: {op:?}");
+    assert!(op.last_error.is_some(), "the cause stays readable");
+    assert_eq!(f.get().await["state"], "released");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0, "recovery never pays");
+    // A second sweep leaves it alone.
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(f.op().await.version, op.version);
+}
+
+#[tokio::test]
+async fn a_stuck_prepared_row_is_released_only_when_no_payment_can_exist() {
+    let paid = |f: &Fixture| {
+        let wallet = f.wallet.clone();
+        async move {
+            let invoice = wallet.inner.create_invoice(1_000, "admission", 600).await.unwrap();
+            wallet.inner.pay_invoice(&invoice.bolt11).await.unwrap().payment_hash
+        }
+    };
+    let cases: [(&str, &str); 5] = [
+        ("wallet knows the admission hash", "admission"),
+        ("message dispatch started", "$.dispatched"),
+        ("admission pending", "$.admission_pending"),
+        ("proof journaled", "$.envelope_ready"),
+        ("message payment hash recorded", "payment_hash"),
+    ];
+    for (case, evidence) in cases {
+        let mut f = Fixture::new().await;
+        f.fail_before_payment().await;
+        f.post().await;
+        f.allow_payment().await;
+        f.stick_prepared().await;
+        match evidence {
+            "admission" => {
+                let hash = paid(&f).await;
+                sqlx::query("UPDATE outbox_operations SET admission_payment_hash = ? WHERE operation_id = ?")
+                    .bind(hash).bind(&f.id).execute(f.db.pool()).await.unwrap();
+            }
+            "payment_hash" => {
+                sqlx::query("UPDATE outbox_operations SET payment_hash = ? WHERE operation_id = ?")
+                    .bind("ef".repeat(32)).bind(&f.id).execute(f.db.pool()).await.unwrap();
+            }
+            path => {
+                sqlx::query("UPDATE outbox_operations SET recovery = CAST(json_set(CAST(recovery AS TEXT), ?, json('true')) AS BLOB) WHERE operation_id = ?")
+                    .bind(path).bind(&f.id).execute(f.db.pool()).await.unwrap();
+            }
+        }
+        f.restart().await;
+        konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+        assert_ne!(f.op().await.state, "released", "{case}: never marked nothing-paid");
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0, "{case}");
+    }
+    // Control: an admission hash the wallet has never seen is no payment.
+    let mut f = Fixture::new().await;
+    f.fail_before_payment().await;
+    f.post().await;
+    f.allow_payment().await;
+    f.stick_prepared().await;
+    sqlx::query("UPDATE outbox_operations SET admission_payment_hash = ? WHERE operation_id = ?")
+        .bind("01".repeat(32)).bind(&f.id).execute(f.db.pool()).await.unwrap();
+    f.restart().await;
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(f.op().await.state, "released");
+}
+
+#[tokio::test]
+async fn a_started_payment_that_errors_stays_payment_unknown_across_restart() {
+    let mut f = Fixture::new().await;
+    f.wallet.mode.store(3, Ordering::SeqCst); // the wallet paid; its reply was lost
+    let (status, body) = f.post().await;
+    assert!(!status.is_success(), "{body}");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+    let op = f.op().await;
+    assert_eq!(op.state, "payment_unknown", "{op:?}");
+    assert!(op.last_error.is_some());
+    f.restart().await;
+    f.wallet.mode.store(1, Ordering::SeqCst); // still in flight
+    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+    assert_eq!(f.op().await.state, "payment_unknown");
+    assert_eq!(f.get().await["state"], "payment_unknown");
+    let (status, body) = f.post().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "payment_unresolved");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "never paid twice");
+}

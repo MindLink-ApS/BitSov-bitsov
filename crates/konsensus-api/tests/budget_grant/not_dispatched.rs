@@ -44,7 +44,7 @@ async fn invoice_non_dispatch_retry_cannot_release_a_later_unknown_attempt() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "not_dispatched");
     assert_eq!(body["operation_id"], id);
-    assert_eq!(body["state"], "prepared");
+    assert_eq!(body["state"], "released");
     assert_eq!(body["max_routing_fee_msat"], 500);
     assert_eq!(fx.used(), 0);
     assert_eq!(fx.wallet.money(), 0);
