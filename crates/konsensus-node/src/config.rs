@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 thread_local! {
     /// When set, the next [`NodeConfig::save`] fails after the atomic rename
     /// and before the parent-directory fsync, simulating a sync failure.
-    static FAIL_CONFIG_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_CONFIG_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Arm a one-shot failure of the config parent-directory sync in [`NodeConfig::save`].
@@ -1236,13 +1236,20 @@ impl NodeConfig {
     /// Atomically replace `path` with `bytes`, fsyncing the file and its
     /// parent directory. Failures propagate so callers can refuse to publish a
     /// success marker against a non-durable config.
-    fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    /// The temporary file [`Self::write_atomic`] writes (and removes) next to
+    /// `path`. Anything that must not be clobbered by a config save (the
+    /// recovery phrase in `seed encrypt`) is checked against it.
+    pub(crate) fn write_atomic_temp(path: &Path) -> PathBuf {
+        path.with_extension("toml.tmp")
+    }
+
+        fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
         // Sibling temp in the same directory so rename is atomic on the volume.
-        let tmp = path.with_extension("toml.tmp");
+        let tmp = Self::write_atomic_temp(path);
         let _ = std::fs::remove_file(&tmp);
 
         konsensus_api::pairing::write_protected(&tmp, bytes).map_err(|e| {

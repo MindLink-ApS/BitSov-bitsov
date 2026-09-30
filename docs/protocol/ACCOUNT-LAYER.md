@@ -133,6 +133,7 @@ Why the gate lives in the node, and why the key needs the password:
   - `mnemonic_file` is a relative path;
   - the plaintext is not a regular file, or has more than one hard link;
   - another run holds the lock;
+  - the plaintext, the `.enc` it would create, or the lock file is the same file as the config or the config writer's temp file (`konsensus.toml.tmp`), including through a symlinked parent directory or a different letter case;
   - any `mnemonic.enc` exists, including a symlink.
 
   Otherwise:
@@ -142,7 +143,9 @@ Why the gate lives in the node, and why the key needs the password:
   4. it points the config at the new file and checks that the config reloads that way;
   5. only then does it overwrite the plaintext with zeros, delete it, and flush the directory.
 
-  The `.enc` is created exclusively (`O_EXCL`, 0600). If the config update fails, the config is restored and the new file is removed only once the config is proven to point back at the plaintext; otherwise **both** files are kept and the message says where the config points.
+  The `.enc` is created exclusively (`O_EXCL`, 0600).
+
+  **Recovery invariant.** After the `.enc` exists, any failure removes it only if the file the config **now** points at is a plaintext phrase that exists and reads back to the **same node identity**. Restoring the config's path string is not enough. Otherwise every file is kept, and the message names the encrypted file (encrypted with the password just typed) and the path the config points at.
 
   The running-node check can only see an owner-run node (its control socket), so stop the node yourself first. On SSDs, APFS snapshots and Time Machine, older copies of the plaintext can persist; they hold the same words as the owner's written backup, which stays the recovery.
 - **Starting an encrypted node.** `konsensus start` prompts for the password on the terminal. That includes a dev node the app launches: the prompt appears in the terminal that started the app.
