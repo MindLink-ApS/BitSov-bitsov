@@ -213,7 +213,21 @@ fn read_seq_floor(path: &Path) -> u64 {
     let Ok(text) = std::fs::read_to_string(path) else {
         return 0;
     };
-    text.trim().parse::<u64>().unwrap_or(0)
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(n) => n,
+        Err(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                value = %trimmed,
+                "front-door seq file is not a valid u64; ignoring (floor stays 0 until a card seq is known)"
+            );
+            0
+        }
+    }
 }
 
 /// Refuse a candidate floor above `own_card_seq + SEQ_FLOOR_ADOPT_BOUND`.
