@@ -1907,6 +1907,7 @@ async fn compose_happy_path_keysend() {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
 
@@ -2038,6 +2039,7 @@ async fn compose_happy_path_invoice_flow() {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
 
@@ -2146,6 +2148,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
 
@@ -2294,6 +2297,7 @@ async fn compose_keysend_fallback_to_invoice() {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
 
@@ -2417,6 +2421,7 @@ async fn compose_queues_when_transport_send_fails() {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
 
@@ -2514,6 +2519,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
 
@@ -2645,6 +2651,7 @@ async fn compose_broadcasts_to_websocket() {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
 
@@ -2739,6 +2746,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
 
@@ -2836,6 +2844,7 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
 
@@ -2993,6 +3002,7 @@ async fn compose_room_rejects_oversized_member_count() {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
 

@@ -61,6 +61,40 @@ pub struct HealthResponse {
     /// Current Bitcoin block height from the chain backend (`null` if unavailable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_height: Option<u64>,
+    /// UDP port of this node's STUN binding responder (`[calls] stun_listen`);
+    /// omitted when it is off. Owner-only: the app may offer it as the STUN
+    /// server for calls, never switch to it by itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stun_port: Option<u16>,
+    /// `stun:host:port` for that responder at this node's dialable peer host
+    /// (`[network] advertised_addr`); omitted when the responder is off or the
+    /// node knows no reachable host (wildcard bind, loopback).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stun_url: Option<String>,
+}
+
+/// `stun:host:port` for the STUN responder at the host of the node's
+/// dialable peer endpoint (`host:port`, IPv6 in brackets). `None` for a
+/// loopback or unspecified host, which no other machine can reach.
+pub fn stun_url(endpoint: Option<&str>, stun_port: Option<u16>) -> Option<String> {
+    let port = stun_port?;
+    let (host, _) = endpoint?.trim().rsplit_once(':')?;
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        let ip = v6.parse::<std::net::Ipv6Addr>().ok()?;
+        return (!ip.is_loopback() && !ip.is_unspecified()).then(|| format!("stun:[{ip}]:{port}"));
+    }
+    if host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return None;
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        if ip.is_loopback() || ip.is_unspecified() {
+            return None;
+        }
+    }
+    Some(format!("stun:{host}:{port}"))
 }
 
 /// Public (unauthenticated) health response.
@@ -212,6 +246,8 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         lightning_node_pubkey: state.lightning.get_node_pubkey().await,
         chain_backend: state.chain_backend.clone(),
         block_height,
+        stun_port: state.stun_port,
+        stun_url: stun_url(state.introduction.endpoint.as_deref(), state.stun_port),
     })
 }
 
