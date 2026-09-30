@@ -1094,8 +1094,10 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
 
 /// Positive evidence that an operation holds no payment: nothing was
 /// dispatched or left pending, no settlement, proof or admission was recorded,
-/// and the wallet knows no payment for the admission hash the row names. Any
-/// doubt (including a wallet that cannot answer) is not evidence.
+/// the peer's admission journal (every retained attempt) shows no dispatch or
+/// settlement, and the wallet knows no payment for any admission hash involved.
+/// Any doubt (an unreadable journal, another operation's attempt, a hash that
+/// does not match, a wallet that cannot answer) is not evidence.
 async fn proven_unpaid(state: &AppState, op: &OutboxOperation, data: &Recovery) -> bool {
     if data.dispatched
         || data.admission_pending
@@ -1108,13 +1110,44 @@ async fn proven_unpaid(state: &AppState, op: &OutboxOperation, data: &Recovery) 
     {
         return false;
     }
-    match &op.admission_payment_hash {
-        None => true,
-        Some(hash) => matches!(
-            state.lightning.get_payment_status(hash).await,
-            Err(LightningError::PaymentNotFound(_))
-        ),
+    let Ok(peer) = NodeId::from_hex(&op.recipient) else {
+        return false;
+    };
+    // The journal is written before an admission reaches this row, and a
+    // recovered attempt may never reach it: wallet absence alone proves nothing.
+    let Ok(journal) = super::admission_journal::load(state, &peer) else {
+        return false;
+    };
+    let mut hashes = Vec::new();
+    let mut attempt = journal.as_ref();
+    while let Some(a) = attempt {
+        if a.dispatch_started
+            || a.message_may_have_dispatched
+            || a.envelope.is_some()
+            || a.settled_at_unix.is_some()
+            || a.readmission.as_ref().is_some_and(|r| r.reported)
+            || a.operation.as_ref().is_some_and(|l| l.operation_id != op.operation_id)
+        {
+            return false;
+        }
+        hashes.push(a.payment_hash.clone());
+        attempt = a.previous_attempt.as_deref();
     }
+    if let Some(hash) = &op.admission_payment_hash {
+        if journal.is_some() && !hashes.contains(hash) {
+            return false;
+        }
+        hashes.push(hash.clone());
+    }
+    for hash in hashes {
+        if !matches!(
+            state.lightning.get_payment_status(&hash).await,
+            Err(LightningError::PaymentNotFound(_))
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Rows left `prepared` with a `last_error` by builds before the failure path

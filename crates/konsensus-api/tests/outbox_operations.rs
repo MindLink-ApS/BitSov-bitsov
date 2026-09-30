@@ -268,6 +268,7 @@ impl Fixture {
         mutable.storage = db.clone();
         mutable.transport = transport;
         mutable.identity = self.state.identity.clone();
+        mutable.data_dir = self.state.data_dir.clone();
         // Deliberately no sending ratchet and no known Lightning pubkey. Recovery
         // must use the stored ciphertext/proof, never call encrypt or keysend.
         self.db = db;
@@ -1598,6 +1599,19 @@ impl Fixture {
         assert_eq!(response.status(), StatusCode::OK);
         serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 16384).await.unwrap()).unwrap()
     }
+    /// Give the node a data directory and write the peer's admission journal.
+    fn journal(&mut self, contents: Option<&[u8]>) {
+        let directory = self._dir.path().join("admission-attempts");
+        std::fs::create_dir_all(&directory).unwrap();
+        if let Some(contents) = contents {
+            std::fs::write(directory.join(self.peer.to_hex()), contents).unwrap();
+        }
+        self.state = Arc::new(AppState { data_dir: Some(self._dir.path().to_path_buf()), ..(*self.state).clone() });
+    }
+    async fn wallet_paid_hash(&self) -> String {
+        let invoice = self.wallet.inner.create_invoice(1_000, "admission", 600).await.unwrap();
+        self.wallet.inner.pay_invoice(&invoice.bolt11).await.unwrap().payment_hash
+    }
     /// The row an older build left behind: `prepared` with its failure recorded.
     async fn stick_prepared(&self) {
         sqlx::query("UPDATE outbox_operations SET state = 'prepared', last_error = 'storage error: admission journal: No such file or directory (os error 2)' WHERE operation_id = ?")
@@ -1721,4 +1735,132 @@ async fn a_started_payment_that_errors_stays_payment_unknown_across_restart() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "payment_unresolved");
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "never paid twice");
+}
+
+fn attempt(hash: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut attempt = serde_json::json!({"dispatch_started": false, "payment_hash": hash, "amount_msat": 2000,
+        "quote": [0, 2000], "envelope": null, "proof_delivered": false});
+    attempt.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    attempt
+}
+
+#[tokio::test]
+async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() {
+    let unknown = "fe".repeat(32);
+    let other = uuid::Uuid::new_v4().to_string();
+    let link = |id: &str| serde_json::json!({"operation": {"operation_id": id, "execution_id": "e", "readmission": false}});
+    for case in [
+        "dispatch started",
+        "legacy record",
+        "settled",
+        "settled envelope",
+        "readmission reported",
+        "message may have dispatched",
+        "previous attempt dispatched",
+        "wallet knows the journal hash",
+        "journal hash differs from the row",
+        "another operation's attempt",
+        "row hash with a dispatched journal",
+        "unparsable",
+        "unreadable",
+    ] {
+        let mut f = Fixture::new().await;
+        f.fail_before_payment().await;
+        f.post().await;
+        f.allow_payment().await;
+        f.stick_prepared().await;
+        let paid = f.wallet_paid_hash().await;
+        let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+        let contents = match case {
+            "dispatch started" => json(attempt(&unknown, serde_json::json!({"dispatch_started": true}))),
+            // Written before dispatch_started existed: counts as dispatched.
+            "legacy record" => json(serde_json::json!({"payment_hash": unknown, "amount_msat": 2000, "quote": [0, 2000], "envelope": null})),
+            "settled" => json(attempt(&unknown, serde_json::json!({"settled_at_unix": 1}))),
+            "settled envelope" => {
+                let env = konsensus_core::UkmEnvelopeBuilder::new(0, *f.state.identity.node_id(), konsensus_core::Recipient::Node(f.peer),
+                    b"konsensus:admission:v1".to_vec(), konsensus_core::PaymentProof::new([3; 32], [4; 32], 2000)).build();
+                json(attempt(&unknown, serde_json::json!({"envelope": env})))
+            }
+            "readmission reported" => json(attempt(&unknown, serde_json::json!({"readmission": {"budget_msat": null, "reported": true}}))),
+            "message may have dispatched" => json(attempt(&unknown, serde_json::json!({"message_may_have_dispatched": true}))),
+            "previous attempt dispatched" => json(attempt(&unknown, serde_json::json!({
+                "previous_attempt": attempt(&"fd".repeat(32), serde_json::json!({"dispatch_started": true}))}))),
+            "wallet knows the journal hash" => json(attempt(&paid, serde_json::json!({}))),
+            "journal hash differs from the row" => {
+                sqlx::query("UPDATE outbox_operations SET admission_payment_hash = ? WHERE operation_id = ?")
+                    .bind("fd".repeat(32)).bind(&f.id).execute(f.db.pool()).await.unwrap();
+                json(attempt(&unknown, serde_json::json!({})))
+            }
+            "another operation's attempt" => json(attempt(&unknown, link(&other))),
+            "row hash with a dispatched journal" => {
+                sqlx::query("UPDATE outbox_operations SET admission_payment_hash = ? WHERE operation_id = ?")
+                    .bind(&unknown).bind(&f.id).execute(f.db.pool()).await.unwrap();
+                json(attempt(&unknown, serde_json::json!({"dispatch_started": true})))
+            }
+            "unparsable" => b"unreadable evidence".to_vec(),
+            "unreadable" => Vec::new(),
+            _ => unreachable!(),
+        };
+        if case == "unreadable" {
+            f.journal(None);
+            std::fs::create_dir(f._dir.path().join("admission-attempts").join(f.peer.to_hex())).unwrap();
+        } else {
+            f.journal(Some(&contents));
+        }
+        f.restart().await;
+        konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+        let op = f.op().await;
+        assert_eq!(op.state, "prepared", "{case}: never released, left as it was");
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0, "{case}");
+    }
+    // Controls. The pilot: an empty journal directory. And an undispatched
+    // attempt of this operation whose hash the wallet has never seen.
+    for control in ["empty journal directory", "undispatched attempt of this operation"] {
+        let mut f = Fixture::new().await;
+        f.fail_before_payment().await;
+        f.post().await;
+        f.allow_payment().await;
+        f.stick_prepared().await;
+        if control == "empty journal directory" {
+            f.journal(None);
+        } else {
+            sqlx::query("UPDATE outbox_operations SET admission_payment_hash = ? WHERE operation_id = ?")
+                .bind(&unknown).bind(&f.id).execute(f.db.pool()).await.unwrap();
+            let id = f.id.clone();
+            f.journal(Some(&serde_json::to_vec(&attempt(&unknown, link(&id))).unwrap()));
+        }
+        f.restart().await;
+        konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+        assert_eq!(f.op().await.state, "released", "{control}");
+    }
+}
+
+#[tokio::test]
+async fn a_live_compose_failure_is_not_released_against_a_dispatched_journal() {
+    let mut f = Fixture::new().await;
+    f.journal(Some(&serde_json::to_vec(&attempt(&"fe".repeat(32), serde_json::json!({"dispatch_started": true}))).unwrap()));
+    f.fail_before_payment().await;
+    let (status, body) = f.post().await;
+    assert!(!status.is_success(), "{body}");
+    assert_ne!(body["state"], "released", "{body}");
+    assert_ne!(f.op().await.state, "released");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+}
+
+/// Codex review of #144: first contact resumes a possibly dispatched admission
+/// the wallet does not know; the operation must not report nothing paid.
+#[tokio::test]
+async fn a_recovered_dispatch_unknown_admission_is_not_released() {
+    let mut f = Fixture::new().await;
+    f.restart().await; // no E2EE session: enter first-contact recovery
+    f.journal(Some(&serde_json::to_vec(&attempt(&"fe".repeat(32), serde_json::json!({"dispatch_started": true}))).unwrap()));
+    let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", common::auth_header(&f.state)).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"operation_id": f.id, "recipient": f.peer.to_hex(),
+            "kind": 0, "plaintext": "resume prior admission", "max_total_msat": 5000, "wait_ack_ms": 0}).to_string())).unwrap();
+    let response = common::test_router(f.state.clone()).oneshot(request).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("outcome unknown"), "{body}");
+    assert_ne!(body["state"], "released", "{body}");
+    assert_ne!(f.op().await.state, "released", "a possibly dispatched admission is not unpaid");
 }
