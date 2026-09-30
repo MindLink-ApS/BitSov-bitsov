@@ -3570,8 +3570,14 @@ mod migration_recovery_tests {
             let result = db.run_migrations().await;
             if result.is_ok() {
                 db.run_migrations().await.unwrap();
+                // Pre-seed applied everything below 20; resume must record every
+                // remaining entry in `pg_migrations()` (count follows the set).
+                let expected = PostgresStorage::pg_migrations()
+                    .iter()
+                    .filter(|(v, _, _)| *v >= 20)
+                    .count() as i64;
                 let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _konsensus_migrations WHERE version >= 20").fetch_one(&db.pool).await.unwrap();
-                assert_eq!(versions, 6);
+                assert_eq!(versions, expected);
                 // Slice 2 backend contract: insert/CAS, atomic paid publication,
                 // transport receipt, and ACK cannot regress across stale writers.
                 let sender = NodeId::from_bytes([1; 32]);
