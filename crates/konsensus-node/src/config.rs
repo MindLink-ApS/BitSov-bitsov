@@ -30,7 +30,8 @@ pub(crate) fn fail_next_config_dir_sync() {
 /// User-facing onboarding tier.
 ///
 /// This determines the default configuration and UI presentation.
-/// - **Cloud/Relay**: paired remote access with user-held keys
+/// - **Cloud/Relay**: paired remote access; until a remote signer exists the
+///   node holds its seed, so it reports `hosted_custody` (REMOTE-SIGNER.md)
 /// - **Light**: local node with user-selected Lightning
 /// - **Full**: fully sovereign node with own Lightning (maximum sovereignty)
 ///
@@ -41,6 +42,8 @@ pub(crate) fn fail_next_config_dir_sync() {
 pub enum NodeTier {
     /// Relay-compatible remote access mode.
     /// The operator may provide reachability but must not hold user keys.
+    /// Until a remote signer exists it does, so the node reports
+    /// `hosted_custody` (`docs/protocol/REMOTE-SIGNER.md`).
     Cloud,
     /// Local node with hosted Lightning.
     /// Your keys, your data, hosted wallet.
@@ -80,7 +83,7 @@ impl NodeTier {
     /// Short human-readable description of the tier.
     pub fn description(self) -> &'static str {
         match self {
-            Self::Cloud => "Cloud/Relay — paired remote access, user-held keys",
+            Self::Cloud => "Cloud/Relay — paired remote access, hosted custody (the server holds the seed)",
             Self::Light => "Light Node — your device, user-selected Lightning",
             Self::Full => "Full Node — fully sovereign",
         }
@@ -220,6 +223,12 @@ pub struct IdentityConfig {
     /// This is NOT the encryption password — it changes the derived keys.
     #[serde(default)]
     pub passphrase: String,
+
+    /// The machine this node runs on is operated for the owner (a cloud VM),
+    /// so whoever runs it can spend. The node then reports `hosted_custody`
+    /// (`docs/protocol/REMOTE-SIGNER.md` §6). The Cloud tier implies it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hosted: bool,
 }
 
 /// Network configuration — listen address and sovereignty tier.
@@ -1365,6 +1374,7 @@ impl NodeConfig {
             identity: IdentityConfig {
                 mnemonic_file,
                 passphrase: String::new(),
+                hosted: false,
             },
             network: NetworkConfig {
                 listen_addr: default_listen_addr(),

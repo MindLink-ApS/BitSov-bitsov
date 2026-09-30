@@ -178,7 +178,8 @@ Why the gate lives in the node, and why the key needs the password:
 - A node may run on a cloud VM **only** if the seed stays on owner hardware. The node then asks a **remote signer**, the owner's device or a hardware key, for owner approvals and, eventually, for LN signing.
 - Otherwise the app's badge must say **"hosted custody"**: whoever runs the VM can spend.
 - The owner-approval key is the first key built this way: the node needs only its public half, so moving the private half to a remote signer changes no verifier.
-- **GAP.** No remote signer exists. LDK signs in-process from the on-node seed, and the badge is not built.
+- The node reports where its seed lives as `custody_mode` in `/status`, and the app shows it as a badge. Design, the signer protocol and the build order: `REMOTE-SIGNER.md`.
+- **GAP.** No remote signer exists. LDK signs in-process from the on-node seed, so no node reports `remote_signer` yet.
 
 ## 8. Node-key rotation
 

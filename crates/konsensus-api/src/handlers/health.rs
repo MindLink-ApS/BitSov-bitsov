@@ -71,6 +71,9 @@ pub struct HealthResponse {
     /// node knows no reachable host (wildcard bind, loopback).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stun_url: Option<String>,
+    /// Where the seed lives: `local_seed`, `encrypted_seed`, `hosted_custody`
+    /// or `remote_signer` (`docs/protocol/REMOTE-SIGNER.md` §2). Owner-only.
+    pub custody_mode: crate::custody::CustodyMode,
 }
 
 /// `stun:host:port` for the STUN responder at the host of the node's
@@ -249,6 +252,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         block_height,
         stun_port: state.stun_port,
         stun_url: stun_url(state.introduction.endpoint.as_deref(), state.stun_port),
+        custody_mode: state.custody_mode,
     })
 }
 

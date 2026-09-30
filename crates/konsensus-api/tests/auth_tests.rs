@@ -1840,3 +1840,29 @@ fn stun_url_uses_the_dialable_host_only() {
     assert_eq!(stun_url(None, Some(3478)), None);
     assert_eq!(stun_url(Some("203.0.113.5:9000"), None), None);
 }
+
+/// `custody_mode` (REMOTE-SIGNER.md §2) is owner-only: the owner's `/status`
+/// reports it, the public `/health` never does.
+#[tokio::test]
+async fn status_reports_custody_mode_to_the_owner_only() {
+    use konsensus_api::custody::CustodyMode;
+    async fn get(state: &Arc<AppState>, uri: &str, auth: bool) -> serde_json::Value {
+        let mut req = Request::builder().uri(uri);
+        if auth {
+            req = req.header("authorization", auth_header(state));
+        }
+        let resp = build_router(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap()).unwrap()
+    }
+    for (mode, wire) in [
+        (CustodyMode::LocalSeed, "local_seed"),
+        (CustodyMode::EncryptedSeed, "encrypted_seed"),
+        (CustodyMode::HostedCustody, "hosted_custody"),
+        (CustodyMode::RemoteSigner, "remote_signer"),
+    ] {
+        let state = Arc::new(AppState { custody_mode: mode, ..(*test_state()).clone() });
+        assert_eq!(get(&state, "/api/v1/status", true).await["custody_mode"], wire);
+        assert!(get(&state, "/api/v1/health", false).await.get("custody_mode").is_none());
+    }
+}
