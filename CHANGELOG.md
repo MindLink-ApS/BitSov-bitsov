@@ -3,10 +3,10 @@
 All notable BitSov node (`konsensus`) releases are documented here. Pre-rc8 notes
 also live on the corresponding GitHub pre-release pages.
 
-## [0.3.0-rc8] — 2026-09-29 (prep; not tagged yet)
+## [0.3.0-rc8] — 2026-09-30 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Source range: `v0.3.0-rc7` (`958e399`) →
-this branch tip on `main` (through #132). Full narrative: [`docs/releases/v0.3.0-rc8.md`](docs/releases/v0.3.0-rc8.md).
+this branch tip on `main` (through #131 / #135). Full narrative: [`docs/releases/v0.3.0-rc8.md`](docs/releases/v0.3.0-rc8.md).
 Retained-node upgrade: [`docs/UPGRADING.md`](docs/UPGRADING.md).
 
 ### Payments safety
@@ -17,15 +17,23 @@ Retained-node upgrade: [`docs/UPGRADING.md`](docs/UPGRADING.md).
 - Incomplete paid recovery fails closed to `payment_unknown` (#119); paid resends back off while the peer is offline (#118); outbox scans are bounded and keep replay tombstones (#116).
 - Paid envelopes are retained until atomic acceptance ACK (#103); channel fee/announcement requests are enforced (#101).
 
+### Calls (regtest prototype)
+- Paid 1:1 call signalling, kinds **400–403** (#131); durable call state and admission holds (migrations **027**, **028**).
+- `[pricing] call_msat` (default 10 000 msat, must be > 0) prices the offer; answers / ICE / hangup keep `realtime_signal_msat`.
+- Media path is WebRTC in the app; ICE uses an **owner-set STUN** URL only (no TURN / no hard-coded STUN in the node).
+
 ### Web services
 - Web service replies bind to the requester's paid proof (#129); outstanding paid requests persist in SQLite/Postgres (migration **026**) with expiry sweep (#132).
 
 ### Front door
 - FrontDoorCard v1 with owner API and unprivileged open for Knock (#130).
+- Seq floor survives corrupt cards; foreign cards ignored; verify fails closed without a Bitcoin network (#133).
+- Adopted seq floor is capped so a hand-edited `u64::MAX` cannot lock publishing forever (#135).
 
 ### Owner / CLI / demo
 - `sign-challenge` aligns with `/auth/token` owner-token challenges (#125).
-- One-command regtest rehearsal (#122); no mock-proof profile on real backends (#123).
+- One-command regtest rehearsal (#122); rehearsal **v2** adds front-door, voice-note, and 1:1 call beats (#134).
+- No mock-proof profile on real backends (#123).
 
 ### Exactly-once
 - Compose operations persist for exactly-once delivery (#113).
@@ -38,7 +46,7 @@ Retained-node upgrade: [`docs/UPGRADING.md`](docs/UPGRADING.md).
 - BitSov-Data-As-Of / Data-Stale on pinned reads (#78, #79, #84); node energy (N1) and membrane events (N2) (#82, #96, #97).
 
 ### Upgrade path
-- Fail closed when `KONSENSUS_SQLITE_MIGRATIONS_DIR` omits embedded migration versions (#120); embedded set through **026**.
+- Fail closed when `KONSENSUS_SQLITE_MIGRATIONS_DIR` omits embedded migration versions (#120); embedded set through **028**.
 - Document `NODE_INITIALIZED` repair for pre-#76/#77 retained nodes (`konsensus repair mark-initialized`) (#120, #76/#77).
 - Pairing, identity-free bootstrap, owner CLI, and scoped tokens (#72/#73, #76/#77, #92, #94).
 - MSRV **1.88** (#128).
