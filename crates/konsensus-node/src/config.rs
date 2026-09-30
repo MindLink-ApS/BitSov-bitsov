@@ -239,18 +239,82 @@ pub struct NetworkConfig {
     /// bind such as `0.0.0.0:9000`. Never the API address.
     #[serde(default)]
     pub advertised_addr: Option<String>,
+
+    /// Owner-chosen STUN server (`stun:host:port` or `host:port`, UDP) used to
+    /// learn this node's public IP when `advertised_addr` is unset and
+    /// `listen_addr` is a wildcard bind. There is no default and no third-party
+    /// fallback; it may be another node's `[calls] stun_listen`. Never
+    /// overrides `advertised_addr`. See [`crate::stun`] for what is (and is
+    /// not) discovered.
+    #[serde(default)]
+    pub stun_server: Option<String>,
 }
 
 impl NetworkConfig {
-    /// The peer endpoint an introduction may name: `advertised_addr`, else
-    /// `listen_addr` unless it is a wildcard bind.
-    pub fn introduction_endpoint(&self) -> Option<String> {
+    /// The peer endpoint fixed by configuration, without any network access:
+    /// `advertised_addr` (trimmed, non-empty), else `listen_addr` unless it is
+    /// a wildcard bind, with where it came from. Never consults (or is changed
+    /// by) STUN discovery.
+    pub fn configured_endpoint(&self) -> Option<(String, &'static str)> {
+        use konsensus_api::handlers::introduction::source;
         self.advertised_addr
             .as_ref()
             .map(|a| a.trim().to_string())
             .filter(|a| !a.is_empty())
-            .or_else(|| (!self.listen_addr.ip().is_unspecified()).then(|| self.listen_addr.to_string()))
+            .map(|a| (a, source::ADVERTISED))
+            .or_else(|| {
+                (!self.listen_addr.ip().is_unspecified()).then(|| (self.listen_addr.to_string(), source::LISTEN))
+            })
     }
+
+    /// The validated `host:port` of `stun_server`, if the owner set one.
+    pub fn stun_server_addr(&self) -> Result<Option<String>, String> {
+        match self.stun_server.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => parse_stun_server(raw).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Parse `[network] stun_server`: `stun:host:port` or plain `host:port`
+/// (IPv6 in brackets). Returns `host:port` for resolution at query time, so a
+/// DNS name is looked up afresh on every refresh.
+///
+/// `stuns:` is rejected until TLS STUN with server-identity verification is
+/// supported — accepting it would silently downgrade to cleartext UDP.
+pub fn parse_stun_server(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("stuns:") {
+        return Err(format!(
+            "[network] stun_server {raw:?}: stuns: (TLS STUN) is not supported yet; use stun:host:port until server identity verification is available"
+        ));
+    }
+    let rest = if lower.starts_with("stun:") {
+        &raw["stun:".len()..]
+    } else {
+        raw
+    };
+    let (host, port) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| format!("[network] stun_server {raw:?} must be host:port"))?;
+    let port: u16 = port
+        .parse()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| format!("[network] stun_server {raw:?} has an invalid port"))?;
+    let host_ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => {
+            !host.is_empty()
+                && host.len() <= 253
+                && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        }
+    };
+    if !host_ok {
+        return Err(format!("[network] stun_server {raw:?} has an invalid host"));
+    }
+    Ok(format!("{host}:{port}"))
 }
 
 impl Default for NetworkConfig {
@@ -259,6 +323,7 @@ impl Default for NetworkConfig {
             listen_addr: default_listen_addr(),
             tier: SovereigntyTier::T1,
             advertised_addr: None,
+            stun_server: None,
         }
     }
 }
@@ -996,6 +1061,7 @@ impl NodeConfig {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         self.validate_routing_fee_backend()?;
         self.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?;
+        self.network.stun_server_addr().map_err(|e| anyhow::anyhow!(e))?;
         // Check mnemonic file exists and is readable
         if !self.identity.mnemonic_file.exists() {
             anyhow::bail!(
@@ -1363,6 +1429,7 @@ impl NodeConfig {
                 listen_addr: default_listen_addr(),
                 tier: network_tier,
                 advertised_addr: None,
+                stun_server: None,
             },
             lightning,
             chain,

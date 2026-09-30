@@ -386,12 +386,7 @@ async fn put_front_door(
             "front_door_unavailable: this node's Lightning backend does not state a Bitcoin network".into(),
         )
     })?;
-    let endpoint = state.introduction.endpoint.clone().ok_or_else(|| {
-        ApiError::Conflict(
-            "front_door_unavailable: no dialable peer endpoint; set [network] advertised_addr"
-                .into(),
-        )
-    })?;
+    let endpoint = state.introduction.require_endpoint("front_door_unavailable")?;
     let chat = state
         .pricing
         .get_price_msat(konsensus_core::kind::KIND_CHAT)

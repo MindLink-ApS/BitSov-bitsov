@@ -18,10 +18,7 @@ use konsensus_core::front_door::{
 };
 
 fn settings(endpoint: Option<&str>) -> IntroductionSettings {
-    IntroductionSettings {
-        network: Some("regtest".into()),
-        endpoint: endpoint.map(Into::into),
-    }
+    IntroductionSettings::fixed(Some("regtest"), endpoint)
 }
 
 fn state_with(intro: IntroductionSettings) -> Arc<AppState> {
@@ -250,7 +247,7 @@ async fn no_card_without_endpoint_or_network() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
-        body.to_string().contains("front_door_unavailable"),
+        body.to_string().contains("front_door_unavailable: no_dialable_endpoint"),
         "{body}"
     );
 }
@@ -627,10 +624,7 @@ async fn garbage_seq_file_is_ignored_and_publish_starts_at_one() {
 
 #[tokio::test]
 async fn verify_fails_closed_without_network() {
-    let state = state_with(IntroductionSettings {
-        network: None,
-        endpoint: Some("node.example.org:9000".into()),
-    });
+    let state = state_with(IntroductionSettings::fixed(None, Some("node.example.org:9000")));
     let card = stranger_card("peer.example.org:9000", "regtest", now());
     let (status, body, _) = call(
         &state,

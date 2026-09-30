@@ -42,7 +42,7 @@ async fn pair(policy: SponsorPolicy) -> Pair {
     let ledger = dir.path().join("ledger.db");
     let sponsor_ln = Arc::new(SharedMockProvider::new(&ledger, "sponsor", 1_000_000).unwrap());
     let newcomer_ln = Arc::new(SharedMockProvider::new(&ledger, "newcomer", 0).unwrap());
-    let intro = |port: u16| IntroductionSettings { network: Some("regtest".into()), endpoint: Some(format!("127.0.0.1:{port}")) };
+    let intro = |port: u16| IntroductionSettings::fixed(Some("regtest"), Some(&format!("127.0.0.1:{port}")));
     let base = test_state_with_lightning(sponsor_ln.clone());
     let sponsor_dir = dir.path().join("sponsor-node");
     let sponsor = Arc::new(AppState {
@@ -639,7 +639,7 @@ async fn configured_network_requires_its_exact_invoice_currency() {
         for (_, currency) in &networks {
             let p = pair(policy(1_000_000, 2)).await;
             let state = Arc::new(AppState {
-                introduction: IntroductionSettings { network: Some((*network).into()), endpoint: Some("127.0.0.1:9001".into()) },
+                introduction: IntroductionSettings::fixed(Some(network), Some("127.0.0.1:9001")),
                 front_door: Default::default(),
                 ..(*p.sponsor).clone()
             });
