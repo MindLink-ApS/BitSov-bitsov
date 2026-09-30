@@ -713,3 +713,80 @@ impl PairingService {
         Ok(issued)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spend_budget::{BudgetRefusal, Charge};
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+    /// Codex #146 P1: A has a 60 s envelope, B a 3600 s one. A payment to A
+    /// reserved inside A's window must not dispatch after it, even though B
+    /// keeps the shared grant alive.
+    #[test]
+    fn an_expired_peer_envelope_cannot_dispatch_on_a_live_peers_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = PairingService::open(tmp.path(), "f".repeat(32), true)
+            .unwrap()
+            .with_owner_console(Box::new(std::io::sink()))
+            .without_stdout_code();
+        // Pair a client.
+        let ck = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let cpub = hex::encode(ck.verifying_key().to_bytes());
+        let pending = service.request_pairing("app", &cpub).unwrap();
+        let challenge = std::fs::read(service.dir().join(format!("challenge-{}", pending.pair_id))).unwrap();
+        use ed25519_dalek::Signer;
+        let sig = hex::encode(ck.sign(&PairingService::proof_message(&pending.pair_id, &cpub, &challenge)).to_bytes());
+        let client = service.confirm_pairing(&pending.pair_id, &sig, super::super::default_pairing_scopes()).unwrap();
+        // A registered device key (approval tested elsewhere; the record is the effect).
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let device = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+        let public = device.public_key().as_ref().to_vec();
+        let key_id = key_id_for(&public);
+        {
+            let mut inner = service.lock();
+            inner.file.device_keys.push(DeviceKey {
+                key_id: key_id.clone(),
+                client_id: client.client_id.clone(),
+                public_key: hex::encode(&public),
+                name: "mac".into(),
+                registered_at: 0,
+                epoch: client.epoch,
+            });
+        }
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let now = chrono::Utc::now().timestamp();
+        for (peer, window) in [(&a, 60), (&b, 3600)] {
+            let mut nonce = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut nonce);
+            let intent = RelationIntent {
+                device_key_id: key_id.clone(),
+                peer: peer.clone(),
+                level: LEVEL_CONTACT,
+                budget_msat: 10_000,
+                per_act_max_msat: 10_000,
+                window_secs: window,
+                issued_at: now,
+                nonce: hex::encode(nonce),
+            };
+            let msg = intent_message(&"f".repeat(32), &client.client_id, &intent);
+            let sig = hex::encode(device.sign(&rng, msg.as_bytes()).unwrap().as_ref());
+            service.apply_relation_intent(&client.client_id, client.epoch, &intent, &sig).unwrap();
+        }
+        // Reserved at second ~0, inside A's window.
+        let to_a = service
+            .reserve_spend(&client.client_id, client.epoch, vec![Charge { recipient: a.clone(), amount_msat: 1_000 }])
+            .unwrap();
+        let to_b = service
+            .reserve_spend(&client.client_id, client.epoch, vec![Charge { recipient: b.clone(), amount_msat: 1_000 }])
+            .unwrap();
+        // Second 59: both may dispatch.
+        assert!(service.with_spend_authority_at(&to_a, now + 59, || ()).is_ok());
+        // Second 61: A's envelope is over; B's grant time does not carry A.
+        assert!(matches!(service.with_spend_authority_at(&to_a, now + 61, || ()), Err(BudgetRefusal::NoGrant)));
+        assert!(service.with_spend_authority_at(&to_b, now + 61, || ()).is_ok());
+        // And past B's deadline, B stops too.
+        assert!(matches!(service.with_spend_authority_at(&to_b, now + 3601, || ()), Err(BudgetRefusal::NoGrant)));
+    }
+}

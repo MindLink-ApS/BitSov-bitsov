@@ -311,6 +311,13 @@ impl GrantBudget {
         Ok(())
     }
 
+    /// Whether every recipient still has a live envelope at `now`. Always
+    /// true for an owner console grant, whose only deadline is the grant's.
+    pub fn envelopes_live<'a>(&self, mut recipients: impl Iterator<Item = &'a String>, now: i64) -> bool {
+        !self.recipients_only
+            || recipients.all(|r| self.recipient_expires_at.get(r).is_some_and(|at| *at > now))
+    }
+
     /// [`Self::reserve`], first holding a relation grant to its envelopes.
     pub fn reserve_at(&mut self, charges: &[Charge], now: i64) -> Result<(), BudgetRefusal> {
         let mut per_recipient: BTreeMap<&str, u64> = BTreeMap::new();
