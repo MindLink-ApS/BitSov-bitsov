@@ -120,16 +120,33 @@ Why the gate lives in the node, and why the key needs the password:
   - a node started from an encrypted phrase holds the decrypted seed in memory, so a same-user process that can read the node's memory can derive the key;
   - the BIP-39 `identity.passphrase` is plaintext in `konsensus.toml`.
   A remote signer (§7) is the real fix.
-- **Migration.** `konsensus seed encrypt --config <path>` (node stopped) encrypts an existing plaintext `mnemonic.txt` in place:
+- **Enabling Touch ID approvals on an existing node (the pilot path):**
+  1. Stop the node (quit the app).
+  2. Run `konsensus seed encrypt --config <absolute path>` once.
+  3. Start the node again from a terminal and **type** the password when asked.
+
+  The node then reports `device_approvals: "enabled"`, and the app's "Set up Touch ID approvals" works. Nothing else is needed.
+
+- **Migration.** `konsensus seed encrypt --config <path>` (node stopped) encrypts an existing plaintext `mnemonic.txt` in place.
+
+  It refuses first, with nothing changed, when any of these holds:
+  - `mnemonic_file` is a relative path;
+  - the plaintext is not a regular file, or has more than one hard link;
+  - another run holds the lock;
+  - any `mnemonic.enc` exists, including a symlink.
+
+  Otherwise:
   1. it asks for a new password twice, on the terminal only (at least 10 characters);
   2. it writes `mnemonic.enc` (0600) and flushes it;
   3. it reads the file back and checks that it derives the **same node identity**;
   4. it points the config at the new file and checks that the config reloads that way;
   5. only then does it overwrite the plaintext with zeros, delete it, and flush the directory.
 
-  A failure before step 5 removes the new file and leaves the plaintext and the config untouched. On SSDs, APFS snapshots and Time Machine, older copies of the plaintext can persist; they hold the same words as the owner's written backup, which stays the recovery.
+  The `.enc` is created exclusively (`O_EXCL`, 0600). If the config update fails, the config is restored and the new file is removed only once the config is proven to point back at the plaintext; otherwise **both** files are kept and the message says where the config points.
+
+  The running-node check can only see an owner-run node (its control socket), so stop the node yourself first. On SSDs, APFS snapshots and Time Machine, older copies of the plaintext can persist; they hold the same words as the owner's written backup, which stays the recovery.
 - **Starting an encrypted node.** `konsensus start` prompts for the password on the terminal. That includes a dev node the app launches: the prompt appears in the terminal that started the app.
-- **Password file (opt-in).** `--password-file <path>` reads the password from a file instead. Only a regular file with no group or other permissions is accepted (symlinks are refused). The node warns that any program running as this user, including a paired app, can read it. With it, the owner key is protected from **other OS users only**, the same as a plaintext seed against a same-user app. `konsensus device approve` never reads it; it always prompts.
+- **Password file (opt-in).** `--password-file <path>` reads the password from a file instead. It must be a regular file owned by the current user, with no group or other permissions. Symlinks are refused, and the opened file is checked against the one inspected. Starting this way leaves **Touch ID approvals off** (`seed_password_not_typed`), because the password was not typed. The node warns that any program running as this user, including a paired app, can read it. With it, the owner key is protected from **other OS users only**, the same as a plaintext seed against a same-user app. `konsensus device approve` never reads it; it always prompts.
 - **GAP.** An app launched from Finder has no terminal to prompt on. It would need the password file, with the weaker boundary above, or a remote signer (§7). An encrypted mnemonic (`.enc`) or a remote signer (§7) closes this.
 - **GAP.** The file-key tier and its label are not built. Today a Mac without a usable Touch ID falls back to the console grant.
 

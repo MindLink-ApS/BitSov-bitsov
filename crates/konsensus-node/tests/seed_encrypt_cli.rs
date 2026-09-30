@@ -62,6 +62,8 @@ fn without_a_terminal_for_the_password_nothing_changes() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("failed to read the password from the terminal"), "failed for the right reason: {stderr}");
     assert_eq!(snapshot(dir.path()), before);
 }
 
