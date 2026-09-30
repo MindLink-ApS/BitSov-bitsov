@@ -167,6 +167,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             pending_elevations,
             pending_replacements,
             grants,
+            front_door_grants,
         } => {
             if clients.is_empty() {
                 println!("no paired clients");
@@ -190,6 +191,13 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                     spend_budget::sats(g.per_call_max_msat),
                     g.expires_at,
                     g.client_id
+                );
+            }
+            for g in &front_door_grants {
+                println!(
+                    "FRONT DOOR GRANT client={}  may publish the front-door card only  \
+                     expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
+                    g.client_id, g.expires_at, g.client_id
                 );
             }
             for e in &pending_elevations {
@@ -230,6 +238,7 @@ struct Described {
     summary: String,
     label: String,
     proposed_terms: Option<GrantTerms>,
+    front_door: bool,
 }
 
 async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
@@ -245,10 +254,12 @@ async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
             summary,
             confirmation_label,
             proposed_terms,
+            front_door,
         } => Ok(Described {
             summary,
             label: confirmation_label,
             proposed_terms,
+            front_door,
         }),
         ControlResponse::Error { message } => anyhow::bail!("refused: {message}"),
         other => anyhow::bail!("unexpected control response: {other:?}"),
@@ -352,6 +363,9 @@ pub fn resolve_terms(flags: &GrantFlags, proposal: Option<&GrantTerms>) -> Resul
 /// budget-scoped spend window.
 pub async fn cmd_grant(config_path: &Path, op_id: &str, flags: GrantFlags) -> Result<()> {
     let described = describe(config_path, op_id).await?;
+    if described.front_door {
+        return grant_front_door(config_path, op_id, &flags, &described).await;
+    }
     let terms = resolve_terms(&flags, described.proposed_terms.as_ref())?;
     println!("\n{}\n", described.summary);
     println!(
@@ -379,6 +393,68 @@ pub async fn cmd_grant(config_path: &Path, op_id: &str, flags: GrantFlags) -> Re
                 op_id: op_id.to_string(),
                 confirmation,
                 terms,
+            },
+        )
+        .await?,
+    )
+}
+
+/// The window of a front-door grant: `--for`, else one hour. Budget flags are
+/// refused: a front-door grant moves no value, so a budget would only mislead.
+pub fn front_door_ttl(flags: &GrantFlags) -> Result<i64> {
+    if flags.budget_sats.is_some()
+        || flags.per_call_sats.is_some()
+        || !flags.recipients.is_empty()
+        || flags.allow_liquidity_fees
+    {
+        anyhow::bail!(
+            "this request asks for front_door only, which carries no budget; drop --budget, \
+             --per-call, --recipient and --allow-liquidity-fees (keep --for)"
+        );
+    }
+    let ttl = match &flags.window {
+        Some(w) => spend_budget::parse_duration(w).map_err(anyhow::Error::msg)?,
+        None => konsensus_api::pairing::DEFAULT_FRONT_DOOR_GRANT_TTL_SECS,
+    };
+    if ttl <= 0 || ttl > spend_budget::MAX_SPEND_GRANT_TTL_SECS {
+        anyhow::bail!("--for must be at most 24h");
+    }
+    Ok(ttl)
+}
+
+async fn grant_front_door(
+    config_path: &Path,
+    op_id: &str,
+    flags: &GrantFlags,
+    described: &Described,
+) -> Result<()> {
+    let ttl_secs = front_door_ttl(flags)?;
+    println!("\n{}\n", described.summary);
+    println!(
+        "YOU ARE GRANTING: publish or update this node's front-door card, for {} minutes. \
+         No spend, no other route.\n",
+        ttl_secs / 60
+    );
+    if !flags.yes {
+        print!("Grant this? [y/N] ");
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("failed to read the answer from stdin")?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("not granted");
+            return Ok(());
+        }
+    }
+    let confirmation = read_confirmation(&described.label)?;
+    report(
+        send(
+            config_path,
+            ControlRequest::GrantFrontDoor {
+                op_id: op_id.to_string(),
+                confirmation,
+                ttl_secs,
             },
         )
         .await?,
@@ -1003,6 +1079,19 @@ mod startup_tests {
             window: window.map(str::to_string),
             ..GrantFlags::default()
         }
+    }
+
+    #[test]
+    fn a_front_door_grant_takes_a_window_and_refuses_budget_flags() {
+        assert_eq!(front_door_ttl(&flags(None, None)).unwrap(), 3600);
+        assert_eq!(front_door_ttl(&flags(None, Some("10m"))).unwrap(), 600);
+        assert!(front_door_ttl(&flags(None, Some("25h"))).is_err());
+        let err = front_door_ttl(&flags(Some(100), Some("10m"))).unwrap_err().to_string();
+        assert!(err.contains("no budget"), "{err}");
+        let per_call = GrantFlags { per_call_sats: Some(1), ..GrantFlags::default() };
+        assert!(front_door_ttl(&per_call).is_err());
+        let fees = GrantFlags { allow_liquidity_fees: true, ..GrantFlags::default() };
+        assert!(front_door_ttl(&fees).is_err());
     }
 
     #[test]

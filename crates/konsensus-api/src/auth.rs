@@ -156,6 +156,12 @@ pub enum Scope {
     Identity,
     /// Mint credentials at least as strong as one's own.
     Credential,
+    /// Publish or update this node's own front-door card (`PUT /front-door`)
+    /// and nothing else. Moves no value and reaches no other route: a paired
+    /// app gets it only through an owner grant at the control socket, so the
+    /// app never needs `admin` to publish the owner's card.
+    #[serde(rename = "front_door")]
+    FrontDoor,
 }
 
 impl Scope {
@@ -168,6 +174,7 @@ impl Scope {
             Scope::Admin => "admin",
             Scope::Identity => "identity",
             Scope::Credential => "credential",
+            Scope::FrontDoor => "front_door",
         }
     }
 
@@ -181,6 +188,7 @@ impl Scope {
             Scope::Admin,
             Scope::Identity,
             Scope::Credential,
+            Scope::FrontDoor,
         ]
     }
 
@@ -563,6 +571,11 @@ pub mod scoped {
     /// Marker trait: which scope an extractor demands.
     pub trait RequiredScope {
         const SCOPE: Scope;
+        /// Whether `user` satisfies this requirement. Only [`FrontDoorWrite`]
+        /// widens it (to `admin` as well); every other marker is exactly `SCOPE`.
+        fn permits(user: &AuthUser) -> bool {
+            user.has(Self::SCOPE)
+        }
     }
 
     macro_rules! scope_marker {
@@ -581,6 +594,17 @@ pub mod scoped {
     scope_marker!(Admin, Scope::Admin, "Requires `admin`.");
     scope_marker!(Identity, Scope::Identity, "Requires `identity`.");
     scope_marker!(Credential, Scope::Credential, "Requires `credential`.");
+
+    /// Requires `front_door` or `admin`: publishing the node's own front-door
+    /// card. `admin` already reaches every configuration route, so accepting it
+    /// here widens nothing; `front_door` alone reaches only this requirement.
+    pub struct FrontDoorWrite;
+    impl RequiredScope for FrontDoorWrite {
+        const SCOPE: Scope = Scope::FrontDoor;
+        fn permits(user: &AuthUser) -> bool {
+            user.has(Scope::FrontDoor) || user.has(Scope::Admin)
+        }
+    }
 
     /// An authenticated caller that has been checked for `S`.
     pub struct ScopedAuth<S: RequiredScope> {
@@ -610,7 +634,7 @@ pub mod scoped {
             state: &Arc<crate::AppState>,
         ) -> Result<Self, Self::Rejection> {
             let user = AuthUser::from_request_parts(parts, state).await?;
-            if !user.has(S::SCOPE) {
+            if !S::permits(&user) {
                 metrics::counter!(crate::metrics::AUTH_FAILURES).increment(1);
                 tracing::warn!(
                     required = S::SCOPE.as_str(),

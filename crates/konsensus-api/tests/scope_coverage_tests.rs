@@ -361,3 +361,34 @@ fn unmetered_spend_routes_refuse_paired_callers() {
     let metered = std::fs::read_to_string(src_dir().join("metered.rs")).expect("read metered.rs");
     assert!(metered.contains("user.has(Scope::Spend)"), "MeteredSpend must demand spend");
 }
+
+/// `front_door` must reach exactly one handler: publishing the node's own
+/// front-door card. A second use would widen what an owner grants when they
+/// allow the app to publish its card.
+#[test]
+fn front_door_scope_reaches_only_the_front_door_publish_route() {
+    let mut uses = Vec::new();
+    for (file, src) in all_sources() {
+        if file.ends_with("src/auth.rs") {
+            continue;
+        }
+        for (n, line) in src.lines().enumerate() {
+            if line.contains("ScopedAuth<FrontDoorWrite>") || line.contains("Scope::FrontDoor") && !line.trim_start().starts_with("//") {
+                uses.push(format!("{file}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    let handlers: Vec<_> = uses.iter().filter(|u| u.contains("ScopedAuth<FrontDoorWrite>")).collect();
+    assert_eq!(handlers.len(), 1, "exactly one handler may accept front_door: {handlers:#?}");
+    assert!(handlers[0].contains("handlers/front_door.rs"), "{handlers:#?}");
+    let sig = signature_of(
+        &std::fs::read_to_string(handlers_dir().join("front_door.rs")).unwrap(),
+        "put_front_door",
+    )
+    .expect("put_front_door");
+    assert!(sig.contains("ScopedAuth<FrontDoorWrite>"), "{sig}");
+    // Elsewhere the scope appears only where grants are stored and checked.
+    for u in uses.iter().filter(|u| !u.contains("ScopedAuth<FrontDoorWrite>")) {
+        assert!(u.contains("src/pairing.rs") || u.contains("src/control.rs"), "unexpected front_door use: {u}");
+    }
+}

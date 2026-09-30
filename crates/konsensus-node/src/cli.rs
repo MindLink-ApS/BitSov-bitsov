@@ -168,7 +168,9 @@ pub enum Command {
     /// The owner channel. The requesting app can create the pending request and
     /// read its status over HTTP; only this command can write the grant. One
     /// command per budget window: `konsensus grant --op <id> --budget 2000
-    /// --for 24h`. A summary is printed before you confirm.
+    /// --for 24h`. A summary is printed before you confirm. A request for
+    /// `front_door` (publish the front-door card only) takes no budget:
+    /// `konsensus grant --op <id> [--for 1h]`.
     Grant {
         /// Also authorize capped LSP deductions from this same budget.
         #[arg(long)]

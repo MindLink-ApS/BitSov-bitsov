@@ -361,7 +361,8 @@ async fn open_window(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElevationRequestBody {
-    /// Scopes requested. Only `spend` is ever grantable to a pairing.
+    /// Scopes requested. Only `spend`, or `front_door` on its own (no budget),
+    /// is ever grantable to a pairing.
     pub scopes: Vec<Scope>,
     /// The budget window the client proposes (G1). A suggestion rendered to
     /// the owner, who sets the actual terms at the control socket.
@@ -445,7 +446,8 @@ async fn elevation_request(
     } else {
         "unavailable in this deployment: the node was not started in owner-run mode, so there \
          is no owner control socket. A packaged sidecar app is a read+receive client by \
-         design — to spend, run the node yourself and grant over <data_dir>/control.sock."
+         design — to spend or publish a front door, run the node yourself and grant over \
+         <data_dir>/control.sock."
             .to_string()
     };
     Ok(Json(ElevationRequestResponse {

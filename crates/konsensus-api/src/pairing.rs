@@ -127,19 +127,28 @@ pub fn bootstrap_pairing_scopes() -> Vec<Scope> {
     vec![Scope::Read, Scope::Receive, Scope::Identity]
 }
 
-/// The only scope an owner may grant to a pairing after the fact (policy lock B).
+/// The only scopes an owner may grant to a pairing after the fact (policy lock B).
 ///
 /// `spend` is an explicit per-pairing grant by the owner, not a per-message
 /// confirmation: under "payment IS the connection" every message send is a
 /// spend, so per-operation prompts would fire on every message and be unusable.
+///
+/// `front_door` lets the app publish the owner's front-door card and nothing
+/// else. It is granted on its own (never together with `spend`), carries no
+/// budget, and is kept in [`PairingFile::front_door_grants`] so no spend path
+/// can ever mistake it for a spend grant.
 ///
 /// `identity` is deliberately NOT grantable this way — replacing a live
 /// identity is destructive and stays a per-operation approval. `credential`
 /// is never grantable at all: a pairing that could mint credentials at least
 /// as strong as its own would be the privilege escalation this ticket removes.
 pub fn grantable_scopes() -> &'static [Scope] {
-    &[Scope::Spend]
+    &[Scope::Spend, Scope::FrontDoor]
 }
+
+/// Default window of a front-door grant when the owner names none: long enough
+/// to publish and correct a card, short enough not to linger.
+pub const DEFAULT_FRONT_DOOR_GRANT_TTL_SECS: i64 = 3600;
 
 /// Errors from the pairing and elevation surface.
 #[derive(Debug, thiserror::Error)]
@@ -187,7 +196,8 @@ pub enum PairingError {
     #[error(
         "elevation is unavailable: this node was not started in owner-run mode, so no owner \
          control socket exists. A packaged sidecar app is a read+receive client by design — \
-         run the node yourself and grant over <data_dir>/control.sock to obtain spend."
+         run the node yourself and grant over <data_dir>/control.sock to obtain spend or \
+         front_door."
     )]
     OwnerChannelUnavailable,
     /// Durable state could not be read or written.
@@ -266,6 +276,42 @@ impl SpendGrant {
     }
 }
 
+/// An owner-written grant of `front_door` to one pairing (publish the node's
+/// own front-door card). No budget: it moves no value. Otherwise bound exactly
+/// like a [`SpendGrant`]: client, epoch, identity, a window of at most 24 h,
+/// written only by the owner CLI, and revoked by every path that revokes
+/// grants.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrontDoorGrant {
+    /// The pending operation the owner confirmed.
+    pub op_id: String,
+    /// Client this grant is bound to. Not transferable.
+    pub client_id: String,
+    /// Unix seconds when the owner confirmed it.
+    pub granted_at: i64,
+    /// Unix seconds after which the grant is inert.
+    pub expires_at: i64,
+    /// Identity the grant was written against.
+    pub identity_fingerprint: String,
+    /// Pairing epoch at grant time.
+    pub epoch: u64,
+    /// Always `"cli"`.
+    pub granted_by: String,
+    /// Set on revocation, so the grant is inert at once even if the durable
+    /// deletion has to be retried.
+    #[serde(default)]
+    pub revoked: bool,
+}
+
+impl FrontDoorGrant {
+    /// Unrevoked, unexpired, and no longer-lived than the 24-hour cap.
+    pub fn is_live(&self, now: i64) -> bool {
+        !self.revoked
+            && self.expires_at > now
+            && self.expires_at - self.granted_at <= MAX_SPEND_GRANT_TTL_SECS
+    }
+}
+
 /// A pending elevation request created over HTTP. Carries **no authority**.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingElevation {
@@ -320,6 +366,10 @@ pub struct PairingFile {
     pub clients: Vec<PairedClient>,
     /// Owner-written grants.
     pub grants: Vec<SpendGrant>,
+    /// Owner-written `front_door` grants. Separate from `grants` so that no
+    /// budget path can pick one up. Absent in files written before it existed.
+    #[serde(default)]
+    pub front_door_grants: Vec<FrontDoorGrant>,
     /// Pending elevation requests (no authority).
     pub pending_elevations: Vec<PendingElevation>,
     /// Pending / approved replacement approvals.
@@ -345,7 +395,24 @@ impl PairingFile {
                 revoked += 1;
             }
         }
+        for grant in &mut self.front_door_grants {
+            if client_id.is_none_or(|id| grant.client_id == id) {
+                grant.revoked = true;
+                revoked += 1;
+            }
+        }
         revoked
+    }
+
+    /// Any grant, of either kind, that can no longer authorise anything.
+    fn has_dead_grant(&self, now: i64) -> bool {
+        self.grants.iter().any(|g| !g.is_live(now))
+            || self.front_door_grants.iter().any(|g| !g.is_live(now))
+    }
+
+    fn retain_live_grants(&mut self, now: i64) {
+        self.grants.retain(|g| g.is_live(now));
+        self.front_door_grants.retain(|g| g.is_live(now));
     }
 }
 
@@ -715,9 +782,7 @@ impl PairingService {
         let inner = self.lock();
         let mut snapshot = inner.file.clone();
         // Cleanup failures stay retryable internally, never visible as grants.
-        snapshot
-            .grants
-            .retain(|g| g.is_live(chrono::Utc::now().timestamp()));
+        snapshot.retain_live_grants(chrono::Utc::now().timestamp());
         snapshot
     }
 
@@ -1213,6 +1278,15 @@ impl PairingService {
                 }
             }
         }
+        let front_door = inner.file.front_door_grants.iter().any(|g| {
+            g.client_id == record.client_id
+                && g.is_live(now_unix)
+                && g.epoch == record.epoch
+                && g.identity_fingerprint == inner.identity_fingerprint
+        });
+        if front_door && !scopes.contains(&Scope::FrontDoor) {
+            scopes.push(Scope::FrontDoor);
+        }
         scopes
     }
 
@@ -1405,6 +1479,20 @@ impl PairingService {
         if let Some(bad) = scopes.iter().find(|s| !grantable_scopes().contains(s)) {
             return Err(PairingError::NotGrantable(bad.as_str().to_string()));
         }
+        // `front_door` is asked for alone and carries no budget: one request,
+        // one kind of authority, rendered to the owner as exactly that.
+        if scopes.contains(&Scope::FrontDoor) {
+            if scopes.iter().any(|s| *s != Scope::FrontDoor) {
+                return Err(PairingError::NotGrantable(
+                    "front_door is requested on its own, never together with another scope".into(),
+                ));
+            }
+            if proposed_terms.is_some() {
+                return Err(PairingError::Malformed(
+                    "a front_door request carries no budget".into(),
+                ));
+            }
+        }
         let now = chrono::Utc::now().timestamp();
         let mut op_bytes = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut op_bytes);
@@ -1467,12 +1555,20 @@ impl PairingService {
             if op.expires_at <= now {
                 return ElevationStatus::Expired;
             }
-            if inner
-                .file
-                .grants
-                .iter()
-                .any(|g| g.client_id == op.client_id && g.is_live(now))
-            {
+            let granted = if op.scopes.contains(&Scope::FrontDoor) {
+                inner
+                    .file
+                    .front_door_grants
+                    .iter()
+                    .any(|g| g.client_id == op.client_id && g.is_live(now))
+            } else {
+                inner
+                    .file
+                    .grants
+                    .iter()
+                    .any(|g| g.client_id == op.client_id && g.is_live(now))
+            };
+            if granted {
                 return ElevationStatus::Granted;
             }
             return ElevationStatus::Pending;
@@ -1484,6 +1580,11 @@ impl PairingService {
             .grants
             .iter()
             .any(|g| g.op_id == op_id && g.is_live(now))
+            || inner
+                .file
+                .front_door_grants
+                .iter()
+                .any(|g| g.op_id == op_id && g.is_live(now))
         {
             return ElevationStatus::Granted;
         }
@@ -1520,6 +1621,13 @@ impl PairingService {
             self.persist(&mut inner.file)?;
             return Err(PairingError::Expired);
         }
+        if op.scopes.contains(&Scope::FrontDoor) {
+            return Err(PairingError::NotGrantable(
+                "this request asks for front_door, which carries no budget; grant it as a \
+                 front-door grant"
+                    .into(),
+            ));
+        }
         Self::verify_owner_confirmation(&inner, op_id, confirmation)?;
         let client = inner
             .file
@@ -1540,7 +1648,13 @@ impl PairingService {
             budget: Some(GrantBudget::from_terms(&terms)),
         };
         inner.file.pending_elevations.retain(|e| e.op_id != op_id);
-        inner.file.revoke_grants(Some(&grant.client_id));
+        // A new budget window replaces the client's old one. A live front-door
+        // grant is a different authority and stays.
+        for old in &mut inner.file.grants {
+            if old.client_id == grant.client_id {
+                old.budget = None;
+            }
+        }
         inner.file.grants.push(grant.clone());
         self.persist(&mut inner.file)?;
         inner.owner_confirmations.remove(op_id);
@@ -1548,6 +1662,95 @@ impl PairingService {
             return Err(PairingError::Expired);
         }
         Ok(grant)
+    }
+
+    /// Write a `front_door` grant. **Owner CLI only.**
+    ///
+    /// Same consent as a spend grant: the operation-bound confirmation printed
+    /// only to the owner console. `ttl_secs` is the owner's window (at most
+    /// 24 h). It replaces the client's previous front-door grant and leaves a
+    /// live spend grant alone.
+    pub fn grant_front_door(
+        &self,
+        op_id: &str,
+        confirmation: &str,
+        ttl_secs: i64,
+    ) -> Result<FrontDoorGrant, PairingError> {
+        if !self.owner_control_enabled {
+            return Err(PairingError::OwnerChannelUnavailable);
+        }
+        if ttl_secs <= 0 || ttl_secs > MAX_SPEND_GRANT_TTL_SECS {
+            return Err(PairingError::Malformed(format!(
+                "a front-door grant lasts between 1 second and {} hours",
+                MAX_SPEND_GRANT_TTL_SECS / 3600
+            )));
+        }
+        let mut inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
+        let op = inner
+            .file
+            .pending_elevations
+            .iter()
+            .find(|e| e.op_id == op_id)
+            .cloned()
+            .ok_or(PairingError::UnknownOperation)?;
+        if op.expires_at <= now {
+            inner.file.pending_elevations.retain(|e| e.op_id != op_id);
+            self.persist(&mut inner.file)?;
+            return Err(PairingError::Expired);
+        }
+        if op.scopes != [Scope::FrontDoor] {
+            return Err(PairingError::NotGrantable(
+                "this request does not ask for front_door; grant it with a budget".into(),
+            ));
+        }
+        Self::verify_owner_confirmation(&inner, op_id, confirmation)?;
+        let client = inner
+            .file
+            .clients
+            .iter()
+            .find(|c| c.client_id == op.client_id)
+            .cloned()
+            .ok_or(PairingError::UnknownClient)?;
+        let grant = FrontDoorGrant {
+            op_id: op.op_id.clone(),
+            client_id: op.client_id.clone(),
+            granted_at: now,
+            expires_at: now + ttl_secs,
+            identity_fingerprint: inner.identity_fingerprint.clone(),
+            epoch: client.epoch,
+            granted_by: "cli".to_string(),
+            revoked: false,
+        };
+        inner.file.pending_elevations.retain(|e| e.op_id != op_id);
+        for old in &mut inner.file.front_door_grants {
+            if old.client_id == grant.client_id {
+                old.revoked = true;
+            }
+        }
+        inner.file.front_door_grants.push(grant.clone());
+        self.persist(&mut inner.file)?;
+        inner.owner_confirmations.remove(op_id);
+        tracing::info!(
+            client_id = %grant.client_id,
+            op_id = %grant.op_id,
+            expires_at = grant.expires_at,
+            "owner granted front_door (publish the front-door card only; no spend)"
+        );
+        Ok(grant)
+    }
+
+    /// The live front-door grants, as the owner sees them.
+    pub fn front_door_grants(&self) -> Vec<FrontDoorGrant> {
+        let inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
+        inner
+            .file
+            .front_door_grants
+            .iter()
+            .filter(|g| g.is_live(now))
+            .cloned()
+            .collect()
     }
 
     /// Create a pending live-identity replacement, binding five fields.
@@ -2280,11 +2483,11 @@ impl PairingService {
 
     fn prune_expired_locked(&self, file: &mut PairingFile) -> Result<usize, PairingError> {
         let now = chrono::Utc::now().timestamp();
-        let before = file.grants.len();
-        if file.grants.iter().any(|g| !g.is_live(now)) {
+        let before = file.grants.len() + file.front_door_grants.len();
+        if file.has_dead_grant(now) {
             self.persist(file)?;
         }
-        Ok(before - file.grants.len())
+        Ok(before - file.grants.len() - file.front_door_grants.len())
     }
 
     /// Delay to the next absolute expiry. Recheck wall-clock changes at least
@@ -2296,7 +2499,9 @@ impl PairingService {
             .file
             .grants
             .iter()
-            .map(|g| g.expires_at.saturating_mul(1000).saturating_sub(now).max(0) as u64)
+            .map(|g| g.expires_at)
+            .chain(inner.file.front_door_grants.iter().map(|g| g.expires_at))
+            .map(|at| at.saturating_mul(1000).saturating_sub(now).max(0) as u64)
             .min()
             .unwrap_or(1000);
         Duration::from_millis(millis.min(1000))
@@ -2357,7 +2562,7 @@ impl PairingService {
         let tmp = self.file_path.with_extension("json.tmp");
         loop {
             let now = clock();
-            candidate.grants.retain(|g| g.is_live(now));
+            candidate.retain_live_grants(now);
             let bytes = serde_json::to_vec_pretty(&candidate)
                 .map_err(|e| PairingError::Io(format!("serializing pairing store: {e}")))?;
             if let Err(e) = write_protected(&tmp, &bytes) {
@@ -2367,7 +2572,7 @@ impl PairingService {
                 return Err(e.into());
             }
             let now = clock();
-            if candidate.grants.iter().any(|g| !g.is_live(now)) {
+            if candidate.has_dead_grant(now) {
                 continue;
             }
             if let Err(e) = std::fs::rename(&tmp, &self.file_path) {
@@ -2376,7 +2581,7 @@ impl PairingService {
             }
             fsync_dir(&self.dir)?;
             let now = clock();
-            if candidate.grants.iter().any(|g| !g.is_live(now)) {
+            if candidate.has_dead_grant(now) {
                 continue;
             }
             *file = candidate;
