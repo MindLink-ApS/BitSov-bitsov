@@ -235,6 +235,10 @@ pub struct PendingSummary {
     pub scopes: Vec<String>,
     /// Unix seconds after which it can no longer be confirmed.
     pub expires_at: i64,
+    /// Made before this node run (or cancelled by wrong codes): nothing can
+    /// approve it any more, and the app must ask again.
+    #[serde(default)]
+    pub lost: bool,
 }
 
 /// A pending replacement approval as rendered to the owner.
@@ -344,6 +348,8 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                         client_name: e.client_name.clone(),
                         scopes: e.scopes.iter().map(|s| s.as_str().to_string()).collect(),
                         expires_at: e.expires_at,
+                        lost: e.expires_at > chrono::Utc::now().timestamp()
+                            && !service.elevation_confirmable(&e.op_id),
                     })
                     .collect(),
                 pending_replacements: file
@@ -580,6 +586,16 @@ fn error(e: PairingError) -> ControlResponse {
 
 fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
     let file = service.snapshot();
+    // Say so before the owner reads terms and types a code that cannot work.
+    let now = chrono::Utc::now().timestamp();
+    if let Some(op) = file.pending_elevations.iter().find(|e| e.op_id == op_id) {
+        if op.expires_at <= now {
+            return error(PairingError::Expired);
+        }
+        if !service.elevation_confirmable(op_id) {
+            return error(PairingError::ConfirmationLost);
+        }
+    }
     if let Some(op) = file
         .pending_elevations
         .iter()

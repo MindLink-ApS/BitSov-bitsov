@@ -525,3 +525,57 @@ fn the_owner_is_shown_a_front_door_request_as_exactly_that() {
     assert!(!pairing::default_pairing_scopes().contains(&Scope::FrontDoor));
     assert!(!Scope::loopback_only().contains(&Scope::FrontDoor));
 }
+
+#[tokio::test]
+async fn a_request_that_died_in_a_restart_reads_lost_and_asking_again_works() {
+    let fx = fixture();
+    let (status, op) = fx.ask(json!({"scopes": ["front_door"]})).await;
+    assert_eq!(status, StatusCode::OK, "{op}");
+    let op_id = op["op_id"].as_str().unwrap().to_string();
+    let (read, _) = fx.token().await;
+    let path = format!("/api/v1/pair/elevation/{op_id}");
+    let (_, before) = call(&fx.state, "GET", &path, None, Some(&read)).await;
+    assert_eq!(before["status"], "pending", "{before}");
+
+    // Restart the node over the same data directory, now started with a config.
+    let fingerprint = fx.service.bound_fingerprint();
+    let console = OwnerConsole::default();
+    let service = Arc::new(
+        PairingService::open(fx.tmp.path(), fingerprint, true)
+            .unwrap()
+            .with_owner_console(Box::new(console.clone()))
+            .without_stdout_code()
+            .with_owner_config("/Users/owner/bitsov/konsensus.toml".into()),
+    );
+    let state = Arc::new(AppState {
+        pairing: Some(Arc::clone(&service)),
+        ..(*fx.state).clone()
+    });
+    let restarted = Fx { state, service, console, ..fx };
+
+    let (read, _) = restarted.token().await;
+    let (_, after) = call(&restarted.state, "GET", &path, None, Some(&read)).await;
+    assert_eq!(after["status"], "lost", "{after}");
+    assert_eq!(after["owner_confirmation_required"], false, "{after}");
+
+    // Asking again: a live request, and the owner command names the config.
+    let (status, again) = restarted.ask(json!({"scopes": ["front_door"]})).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    let again_id = again["op_id"].as_str().unwrap();
+    assert_eq!(
+        again["owner_action"],
+        format!("konsensus grant --op {again_id} --config /Users/owner/bitsov/konsensus.toml")
+    );
+    let code = restarted.console.owner_code(again_id);
+    assert!(!again.to_string().contains(&code), "the app never sees the code");
+    let (_, live) = call(
+        &restarted.state,
+        "GET",
+        &format!("/api/v1/pair/elevation/{again_id}"),
+        None,
+        Some(&read),
+    )
+    .await;
+    assert_eq!(live["status"], "pending", "{live}");
+    assert!(!live.to_string().contains(&code));
+}

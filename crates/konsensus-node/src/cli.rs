@@ -168,7 +168,9 @@ pub enum Command {
     /// The owner channel. The requesting app can create the pending request and
     /// read its status over HTTP; only this command can write the grant. One
     /// command per budget window: `konsensus grant --op <id> --budget 2000
-    /// --for 24h`. A summary is printed before you confirm. A request for
+    /// --for 24h`. It prints the terms, then asks for the short approval code
+    /// the node printed on its own terminal; typing it is the approval. A
+    /// request for
     /// `front_door` (publish the front-door card only) takes no budget:
     /// `konsensus grant --op <id> [--for 1h]`.
     Grant {
@@ -195,9 +197,9 @@ pub enum Command {
         #[arg(long)]
         recipient: Vec<String>,
 
-        /// Skip the "grant these terms?" question. The console confirmation
-        /// code is still required.
-        #[arg(long)]
+        /// Accepted for older scripts; has no effect. There is no separate
+        /// yes/no question: typing the console code is the confirmation.
+        #[arg(long, hide = true)]
         yes: bool,
 
         /// Path to the configuration file.

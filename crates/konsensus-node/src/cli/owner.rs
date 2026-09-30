@@ -9,8 +9,10 @@
 //!
 //! A message arriving on that socket is not consent by itself. Each mutating
 //! elevation/replacement command renders the pending operation and requires a
-//! confirmation containing the random nonce printed only to the owner node's
-//! controlling terminal. The public operation id alone is not consent.
+//! secret printed only to the owner node's controlling terminal: for a grant,
+//! the short owner code (or the full `GRANT … CODE <nonce>` line); for an
+//! identity replacement, the full line. The public operation id alone is not
+//! consent.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -228,15 +230,20 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                 );
             }
             for e in &pending_elevations {
+                let next = if e.lost {
+                    "can no longer be approved (the node restarted, or wrong codes cancelled it); \
+                     ask again from the app"
+                        .to_string()
+                } else {
+                    format!("approve with: konsensus grant --op {}", e.op_id)
+                };
                 println!(
-                    "PENDING ELEVATION op={}  client={} ({})  scopes={}  expires_at={}\n  \
-                     approve with: konsensus grant --op {}",
+                    "PENDING ELEVATION op={}  client={} ({})  scopes={}  expires_at={}\n  {next}",
                     e.op_id,
                     e.client_name,
                     e.client_id,
                     e.scopes.join("+"),
                     e.expires_at,
-                    e.op_id
                 );
             }
             for r in &pending_replacements {
@@ -315,6 +322,25 @@ fn read_confirmation(phrase: &str) -> Result<String> {
     Ok(typed.trim().to_string())
 }
 
+/// Read the grant confirmation: the short code the node printed on its own
+/// terminal (or, as a fallback, that terminal's full `GRANT … CODE` line).
+/// Typing it after reading the terms is the approval; an empty line cancels.
+fn read_owner_code() -> Result<Option<String>> {
+    println!(
+        "To grant, type the approval code shown in the node's terminal (the window running \
+         the node, or the app that started it), e.g. K7QM-3XWD.\n\
+         The full GRANT ... CODE line printed there also works. Press Enter to cancel.\n"
+    );
+    print!("code> ");
+    std::io::stdout().flush().ok();
+    let mut typed = String::new();
+    std::io::stdin()
+        .read_line(&mut typed)
+        .context("failed to read the approval code from stdin")?;
+    let typed = typed.trim();
+    Ok((!typed.is_empty()).then(|| typed.to_string()))
+}
+
 /// The owner's flags for `konsensus grant`.
 #[derive(Debug, Default)]
 pub struct GrantFlags {
@@ -328,8 +354,6 @@ pub struct GrantFlags {
     pub per_call_sats: Option<u64>,
     /// `--recipient <key>=<sats>`, repeatable.
     pub recipients: Vec<String>,
-    /// `--yes`: skip the terms question (never the console code).
-    pub yes: bool,
 }
 
 fn sats_to_msat(sats: u64, what: &str) -> Result<u64> {
@@ -400,19 +424,10 @@ pub async fn cmd_grant(config_path: &Path, op_id: &str, flags: GrantFlags) -> Re
          with budget_exceeded when it runs out):\n{}\n",
         spend_budget::describe_terms(&terms)
     );
-    if !flags.yes {
-        print!("Grant these terms? [y/N] ");
-        std::io::stdout().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .context("failed to read the answer from stdin")?;
-        if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            println!("not granted");
-            return Ok(());
-        }
-    }
-    let confirmation = read_confirmation(&described.label)?;
+    let Some(confirmation) = read_owner_code()? else {
+        println!("not granted");
+        return Ok(());
+    };
     report(
         send(
             config_path,
@@ -462,19 +477,10 @@ async fn grant_front_door(
          No spend, no other route.\n",
         ttl_secs / 60
     );
-    if !flags.yes {
-        print!("Grant this? [y/N] ");
-        std::io::stdout().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .context("failed to read the answer from stdin")?;
-        if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            println!("not granted");
-            return Ok(());
-        }
-    }
-    let confirmation = read_confirmation(&described.label)?;
+    let Some(confirmation) = read_owner_code()? else {
+        println!("not granted");
+        return Ok(());
+    };
     report(
         send(
             config_path,
