@@ -79,7 +79,7 @@ Anything that changes configuration, relationships, or stored content:
 
 `POST /peers` (add) · `PUT /peers/:id` · `DELETE /peers/:id` · `POST /peers/:node_id/connect` ·
 `/peers/:node_id/discover` · `/peers/import` · `GET /peers/export` · `GET /export/bundle` ·
-`POST /gossip/publish` · `/invite` · `/invite/redeem` · `/invites` · `/invites/accept` ·
+`POST /gossip/publish` · `/invites` · `/invites/accept` ·
 `DELETE` an invite (revoke) · `POST /rooms` (create) · `DELETE /rooms/:id` ·
 `POST /rooms/:id/members` · `DELETE` a room member · calendar event create/update/delete +
 `/calendar/events/:id/rsvp` ·  `POST|PUT|DELETE /content/pages/*` ·

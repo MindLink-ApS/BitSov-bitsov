@@ -136,6 +136,31 @@ async fn read_scope_gets_a_signed_card_of_this_node() {
 }
 
 #[tokio::test]
+async fn introduction_responses_point_at_front_door_as_profile_successor() {
+    let state = state_with(Arc::default(), settings(Some("node.example.org:9000")));
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/introduction")
+        .header("authorization", bearer(&state, vec![auth::Scope::Read]))
+        .body(Body::empty())
+        .unwrap();
+    let response = test_router(state).oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("deprecation").and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    assert!(
+        response
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("/api/v1/front-door")),
+        "profile successor is front-door"
+    );
+}
+
+#[tokio::test]
 async fn no_card_without_a_dialable_endpoint_or_network() {
     let state = state_with(Arc::default(), settings(None));
     let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
