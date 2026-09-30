@@ -197,7 +197,18 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             pending_replacements,
             grants,
             front_door_grants,
+            device_keys,
+            pending_device_keys,
         } => {
+            for k in &device_keys {
+                println!("DEVICE KEY {}  {:?}  client={}", k.fingerprint, k.name, k.client_id);
+            }
+            for p in pending_device_keys.iter().filter(|p| !p.lost) {
+                println!(
+                    "PENDING DEVICE KEY {}  {:?}  client={}\n  approve with: konsensus device approve --op {}",
+                    p.fingerprint, p.name, p.client_id, p.op_id
+                );
+            }
             if clients.is_empty() {
                 println!("no paired clients");
             }
@@ -492,6 +503,51 @@ async fn grant_front_door(
         )
         .await?,
     )
+}
+
+/// `konsensus device approve|list|revoke`.
+pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
+    use crate::cli::DeviceCommand;
+    match command {
+        DeviceCommand::Approve { op_id, config } => {
+            let described = describe(&config, &op_id).await?;
+            println!("\n{}\n", described.summary);
+            let Some(confirmation) = read_owner_code()? else {
+                println!("not registered");
+                return Ok(());
+            };
+            report(send(&config, ControlRequest::ApproveDeviceKey { op_id, confirmation }).await?)
+        }
+        DeviceCommand::Revoke { key_id, config } => {
+            report(send(&config, ControlRequest::RevokeDeviceKey { key_id }).await?)
+        }
+        DeviceCommand::List { config } => match send(&config, ControlRequest::Status).await? {
+            ControlResponse::Status { device_keys, pending_device_keys, .. } => {
+                if device_keys.is_empty() && pending_device_keys.is_empty() {
+                    println!("no device keys");
+                }
+                for k in &device_keys {
+                    println!(
+                        "DEVICE KEY {}  {:?}  client={}  registered_at={}\n  revoke with: konsensus device revoke --key {}",
+                        k.fingerprint, k.name, k.client_id, k.registered_at, k.key_id
+                    );
+                }
+                for p in &pending_device_keys {
+                    let next = if p.lost {
+                        "cancelled by wrong codes; ask again from the app".to_string()
+                    } else {
+                        format!("approve with: konsensus device approve --op {}", p.op_id)
+                    };
+                    println!(
+                        "PENDING DEVICE KEY {}  {:?}  client={} ({})  expires_at={}\n  {next}",
+                        p.fingerprint, p.name, p.client_name, p.client_id, p.expires_at
+                    );
+                }
+                Ok(())
+            }
+            other => report(other),
+        },
+    }
 }
 
 /// `konsensus grant-revoke --client-id <id> | --all` — stop spend now.

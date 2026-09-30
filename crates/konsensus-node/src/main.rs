@@ -127,6 +127,9 @@ async fn main() -> Result<()> {
         Command::Approve { command } => {
             owner_cmd::cmd_approve(command).await?;
         }
+        Command::Device { command } => {
+            owner_cmd::cmd_device(command).await?;
+        }
         Command::PairStatus { config } => {
             owner_cmd::cmd_pair_status(&config).await?;
         }
@@ -942,6 +945,15 @@ async fn cmd_start(
         // The owner command the app and console show names this exact config.
         .with_owner_config(config_path.to_path_buf()),
     );
+    // Approvals are durable; only their codes lived in memory. Print fresh
+    // codes for any that survived the restart instead of losing them.
+    if owner_control {
+        match pairing_service.reissue_owner_challenges() {
+            Ok(0) => {}
+            Ok(n) => info!(pending = n, "re-issued owner approval codes after restart"),
+            Err(e) => warn!(error = %e, "could not re-issue owner approval codes"),
+        }
+    }
 
     // Calls: bind the owner's STUN responder before the API reports its port.
     // A configured address that cannot be bound fails boot, like the P2P port.

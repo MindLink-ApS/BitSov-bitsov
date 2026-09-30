@@ -58,6 +58,11 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, Scope, TokenError};
+
+pub mod device;
+pub use device::{
+    DeviceKey, DeviceKeyStatus, PendingDeviceKey, RelationIntent, device_confirmation_phrase,
+};
 use crate::spend_budget::{
     BudgetRefusal, Charge, GrantBudget, GrantTerms, GrantView, Reservation,
     MAX_SPEND_GRANT_TTL_SECS,
@@ -415,6 +420,19 @@ pub struct PairingFile {
     /// recreate an earlier `(client_id, epoch)` and resurrect a revoked JWT.
     #[serde(default)]
     pub last_epoch: BTreeMap<String, u64>,
+    /// Owner-approved device keys (see [`device`]).
+    #[serde(default)]
+    pub device_keys: Vec<DeviceKey>,
+    /// Device keys awaiting the owner's one-time approval.
+    #[serde(default)]
+    pub pending_device_keys: Vec<PendingDeviceKey>,
+    /// Registration op id → key id, so the client can read "registered".
+    #[serde(default)]
+    pub registered_ops: BTreeMap<String, String>,
+    /// Used relation-intent nonces (`key_id:nonce` → client, issued_at), kept
+    /// an hour for replay refusal and the per-client rate limit.
+    #[serde(default)]
+    pub intent_nonces: BTreeMap<String, (String, i64)>,
 }
 
 impl PairingFile {
@@ -455,7 +473,10 @@ impl PairingFile {
 ///
 /// 2 (G1): grants carry a budget. A pre-G1 node must refuse this file rather
 /// than read a metered grant as an unmetered one.
-pub const PAIRING_FILE_VERSION: u32 = 2;
+///
+/// 3 (device keys): device keys and relation grants. A version-2 node must not
+/// read a relation grant as an unrestricted budget, so it refuses the file.
+pub const PAIRING_FILE_VERSION: u32 = 3;
 
 /// A pending pairing request. Held in memory; the challenge itself lives in the
 /// protected file under `data_dir`, which is the actual control.
@@ -672,6 +693,13 @@ fn normalize_owner_code(typed: &str) -> String {
         .collect()
 }
 
+/// Invisible formatting characters that could hide or reorder what an owner
+/// reads (bidi controls, zero-width characters, soft hyphen and the like).
+fn invisible_format(c: char) -> bool {
+    matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+        | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+}
+
 /// `s` single-quoted for a shell only when it needs it. `None` when it holds a
 /// character no owner should be asked to paste (control or invisible
 /// formatting) or one that single quotes do not neutralize in every shell.
@@ -683,8 +711,7 @@ fn shell_word(s: &str) -> Option<String> {
             c.is_control()
                 || c == '\\'
                 || c == '\''
-                || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
-                    | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+                || invisible_format(c)
         })
     {
         return None;
@@ -827,8 +854,9 @@ impl PairingService {
         op_id: &str,
         label: &str,
         expires_at: i64,
-        short_code: bool,
+        command: Option<String>,
     ) -> Result<(), PairingError> {
+        let short_code = command.is_some();
         if !self.owner_control_enabled {
             return Ok(());
         }
@@ -841,13 +869,13 @@ impl PairingService {
         if let Some(code) = &code {
             text.push_str(&format!(
                 "To approve, run: {}\n  and type this code when it asks: {code}\n",
-                self.owner_grant_command(op_id)
+                command.as_deref().unwrap_or_default()
             ));
-        } else if short_code {
+        } else if let Some(command) = &command {
             text.push_str(&format!(
-                "To approve, run: {}\n  and paste the GRANT ... CODE line above (short codes are \
-                 off until restart: too many wrong codes)\n",
-                self.owner_grant_command(op_id)
+                "To approve, run: {command}\n  and paste the {} ... CODE line above (short codes \
+                 are off until restart: too many wrong codes)\n",
+                label.split(' ').next().unwrap_or("GRANT")
             ));
         }
         let mut console = self
@@ -976,14 +1004,23 @@ impl PairingService {
     /// show it: `konsensus grant --op <id> --config <absolute path>`. The path
     /// is left out when unknown or unsafe to show.
     pub fn owner_grant_command(&self, op_id: &str) -> String {
+        self.owner_command("grant", op_id)
+    }
+
+    /// `konsensus device approve --op <id> --config <path>`, likewise.
+    pub fn owner_device_command(&self, op_id: &str) -> String {
+        self.owner_command("device approve", op_id)
+    }
+
+    fn owner_command(&self, verb: &str, op_id: &str) -> String {
         let config = self
             .owner_config
             .as_deref()
             .and_then(|p| p.to_str())
             .and_then(shell_word);
         match config {
-            Some(path) => format!("konsensus grant --op {op_id} --config {path}"),
-            None => format!("konsensus grant --op {op_id}"),
+            Some(path) => format!("konsensus {verb} --op {op_id} --config {path}"),
+            None => format!("konsensus {verb} --op {op_id}"),
         }
     }
 
@@ -1571,6 +1608,11 @@ impl PairingService {
             .file
             .replacement_approvals
             .retain(|a| a.client_id != client_id);
+        inner.file.device_keys.retain(|k| k.client_id != client_id);
+        inner
+            .file
+            .pending_device_keys
+            .retain(|p| p.client_id != client_id);
         self.persist(&mut inner.file)?;
         Ok(())
     }
@@ -1670,6 +1712,10 @@ impl PairingService {
         inner.file.revoke_grants(None);
         inner.file.pending_elevations.clear();
         inner.file.replacement_approvals.clear();
+        // Device keys signed for the old identity's pairings; start over.
+        inner.file.device_keys.clear();
+        inner.file.pending_device_keys.clear();
+        inner.file.registered_ops.clear();
         inner.owner_confirmations.clear();
         self.persist(&mut inner.file)?;
         Ok(())
@@ -1745,7 +1791,7 @@ impl PairingService {
             &op.op_id,
             &grant_confirmation_phrase(&op),
             op.expires_at,
-            true,
+            Some(self.owner_grant_command(&op.op_id)),
         )?;
         inner.file.pending_elevations.retain(|e| e.expires_at > now);
         inner.file.pending_elevations.push(op.clone());
@@ -2032,7 +2078,7 @@ impl PairingService {
             &approval.op_id,
             &replacement_confirmation_phrase(&approval),
             approval.expires_at,
-            false,
+            None,
         )?;
         inner
             .file
@@ -2266,7 +2312,7 @@ impl PairingService {
         if budget.pending.len() >= 1024 {
             return Err(BudgetRefusal::Ledger("too many unresolved reservations".into()));
         }
-        budget.reserve(&charges)?;
+        budget.reserve_at(&charges, now)?;
         let mut recipients = std::collections::BTreeMap::new();
         for charge in &charges {
             *recipients.entry(charge.recipient.clone()).or_insert(0u64) += charge.amount_msat;
@@ -2553,7 +2599,7 @@ impl PairingService {
         let before = inner.file.grants[grant_idx].budget.clone();
         if message_top_up > 0 {
             let budget = inner.file.grants[grant_idx].budget.as_mut().ok_or(BudgetRefusal::NoGrant)?;
-            if let Err(e) = budget.reserve(&[Charge { recipient: recipient.clone(), amount_msat: message_top_up }]) {
+            if let Err(e) = budget.reserve_at(&[Charge { recipient: recipient.clone(), amount_msat: message_top_up }], chrono::Utc::now().timestamp()) {
                 inner.file.grants[grant_idx].budget = before;
                 return Err(e);
             }
@@ -2864,6 +2910,9 @@ fn grant_view(g: &SpendGrant) -> Option<GrantView> {
         per_call_max_msat: b.per_call_max_msat,
         per_recipient_msat: b.per_recipient_msat.clone(),
         used_by_recipient: b.used_by_recipient.clone(),
+        recipients_only: b.recipients_only,
+        per_act_max_by_recipient: b.per_act_max_by_recipient.clone(),
+        recipient_expires_at: b.recipient_expires_at.clone(),
     })
 }
 

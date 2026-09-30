@@ -117,6 +117,19 @@ pub enum ControlRequest {
         /// Six-digit code compared with the newcomer.
         code: String,
     },
+    /// Register a device key the owner reviewed (fingerprint shown by the
+    /// app and by the node). The typed code is the owner's approval.
+    ApproveDeviceKey {
+        /// Pending registration id.
+        op_id: String,
+        /// The code (or full line) the owner typed.
+        confirmation: String,
+    },
+    /// Retire a device key; its relation envelopes end with it.
+    RevokeDeviceKey {
+        /// Key id.
+        key_id: String,
+    },
     /// Revoke spend grants now — one client's, or every client's.
     RevokeGrant {
         /// Client whose grant to revoke; `None` revokes all.
@@ -171,6 +184,12 @@ pub enum ControlResponse {
         /// Live `front_door` grants.
         #[serde(default)]
         front_door_grants: Vec<FrontDoorGrantSummary>,
+        /// Registered device keys.
+        #[serde(default)]
+        device_keys: Vec<DeviceKeySummary>,
+        /// Device keys awaiting the owner.
+        #[serde(default)]
+        pending_device_keys: Vec<PendingDeviceKeySummary>,
     },
     /// A rendered pending operation and public label, never its secret nonce.
     Describe {
@@ -209,6 +228,41 @@ pub struct ClientSummary {
     pub scopes: Vec<String>,
     /// Revocation epoch.
     pub epoch: u64,
+}
+
+/// A registered device key as rendered to the owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceKeySummary {
+    /// Key id.
+    pub key_id: String,
+    /// Short fingerprint.
+    pub fingerprint: String,
+    /// Client it belongs to.
+    pub client_id: String,
+    /// Device name.
+    pub name: String,
+    /// Unix seconds it was approved.
+    pub registered_at: i64,
+}
+
+/// A device key awaiting the owner, as rendered to the owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingDeviceKeySummary {
+    /// Operation id.
+    pub op_id: String,
+    /// Short fingerprint to compare with the app's screen.
+    pub fingerprint: String,
+    /// Requesting client.
+    pub client_id: String,
+    /// Requesting client's name.
+    pub client_name: String,
+    /// Device name.
+    pub name: String,
+    /// Unix seconds after which it can no longer be approved.
+    pub expires_at: i64,
+    /// Cancelled by wrong codes.
+    #[serde(default)]
+    pub lost: bool,
 }
 
 /// A live `front_door` grant as rendered to the owner.
@@ -377,6 +431,31 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                         expires_at: g.expires_at,
                     })
                     .collect(),
+                device_keys: service
+                    .device_keys()
+                    .into_iter()
+                    .map(|k| DeviceKeySummary {
+                        fingerprint: crate::pairing::device::key_fingerprint(&k.key_id),
+                        key_id: k.key_id,
+                        client_id: k.client_id,
+                        name: k.name,
+                        registered_at: k.registered_at,
+                    })
+                    .collect(),
+                pending_device_keys: service
+                    .pending_device_keys()
+                    .into_iter()
+                    .filter(|p| p.expires_at > chrono::Utc::now().timestamp())
+                    .map(|p| PendingDeviceKeySummary {
+                        lost: !service.elevation_confirmable(&p.op_id),
+                        fingerprint: crate::pairing::device::key_fingerprint(&p.key_id),
+                        op_id: p.op_id,
+                        client_id: p.client_id,
+                        client_name: p.client_name,
+                        name: p.name,
+                        expires_at: p.expires_at,
+                    })
+                    .collect(),
             }
         }
         ControlRequest::Describe { op_id } => describe(service, &op_id),
@@ -438,6 +517,30 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
         },
         ControlRequest::ApproveGift { .. } => ControlResponse::Error {
             message: "gift approval requires the running node's sponsor service".into(),
+        },
+        ControlRequest::ApproveDeviceKey { op_id, confirmation } => {
+            match service.approve_device_key(&op_id, &confirmation) {
+                Ok(k) => ControlResponse::Ok {
+                    detail: format!(
+                        "registered device key {} ({:?}) for client {}. The app can now open \
+                         per-contact spend envelopes with Touch ID; each one is a signature the \
+                         node checks. Revoke any time with: konsensus device revoke --key {}",
+                        crate::pairing::device::key_fingerprint(&k.key_id),
+                        k.name,
+                        k.client_id,
+                        k.key_id
+                    ),
+                },
+                Err(e) => error(e),
+            }
+        }
+        ControlRequest::RevokeDeviceKey { key_id } => match service.revoke_device_key(&key_id, None) {
+            Ok(()) => ControlResponse::Ok {
+                detail: format!(
+                    "revoked device key {key_id}; its client's relation envelopes stop on the next request"
+                ),
+            },
+            Err(e) => error(e),
         },
         ControlRequest::RevokeGrant { client_id } => {
             match service.revoke_grants(client_id.as_deref()) {
@@ -645,6 +748,36 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             confirmation_label: grant_confirmation_phrase(op),
             summary,
             proposed_terms: op.proposed_terms.clone(),
+            front_door: false,
+        };
+    }
+    if let Some(p) = file.pending_device_keys.iter().find(|p| p.op_id == op_id) {
+        if p.expires_at <= now {
+            return error(PairingError::Expired);
+        }
+        if !service.elevation_confirmable(op_id) {
+            return error(PairingError::ConfirmationLost);
+        }
+        let summary = format!(
+            "DEVICE KEY REGISTRATION\n  operation:    {}\n  client:       {} ({})\n  device:       \
+             {:?}\n  fingerprint:  {}\n  expires at:   {}\n\nCompare the fingerprint with the \
+             one the app shows. Approving lets that device open per-contact spend envelopes \
+             on this node by signing them (Touch ID on the device, for each one), without \
+             coming back to this terminal. Each envelope is capped per contact, per act and \
+             in time, and the node checks every signature. Revoke with: konsensus device \
+             revoke --key {}.",
+            p.op_id,
+            p.client_name,
+            p.client_id,
+            p.name,
+            crate::pairing::device::key_fingerprint(&p.key_id),
+            p.expires_at,
+            p.key_id
+        );
+        return ControlResponse::Describe {
+            confirmation_label: crate::pairing::device_confirmation_phrase(p),
+            summary,
+            proposed_terms: None,
             front_door: false,
         };
     }

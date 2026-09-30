@@ -34,6 +34,8 @@ ed25519-dalek.workspace = true
 sha2.workspace = true
 rand.workspace = true
 blake3.workspace = true
+# P-256 ECDSA verification of device-key signatures (Secure Enclave keys).
+ring = "0.17"
 base64.workspace = true
 lightning-invoice.workspace = true
 futures.workspace = true

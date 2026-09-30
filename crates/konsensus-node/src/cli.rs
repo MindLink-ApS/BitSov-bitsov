@@ -141,6 +141,15 @@ pub enum Command {
         command: ApprovalCommand,
     },
 
+    /// Paired device keys: approve one once, list, or revoke.
+    ///
+    /// A device key lets the paired app open per-contact spend envelopes by
+    /// signing them on the device (Touch ID), instead of `konsensus grant`.
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
+
     /// Static channel backup (SCB) operations.
     Scb {
         #[command(subcommand)]
@@ -382,6 +391,36 @@ pub enum WhitelistCommand {
 #[cfg(test)]
 #[path = "tests/cli.rs"]
 mod tests;
+
+/// Owner commands for paired device keys.
+#[derive(Subcommand)]
+pub enum DeviceCommand {
+    /// Register a device key the app asked for. Prints the device and its
+    /// fingerprint, then asks for the code the node printed.
+    Approve {
+        /// Pending registration id (the app shows the command).
+        #[arg(long = "op")]
+        op_id: String,
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+    /// List registered and pending device keys.
+    List {
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+    /// Retire a device key now; its spend envelopes end with it.
+    Revoke {
+        /// Key id (see `konsensus device list`).
+        #[arg(long = "key")]
+        key_id: String,
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+}
 
 /// Complete owner-reviewed tuples; no field is inferred from paired-app state.
 #[derive(Subcommand)]

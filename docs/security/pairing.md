@@ -93,10 +93,13 @@ terminal, and can reach the `0600` socket. It can allocate a pseudo-terminal
 property of the peer or its terminal separates the app from the owner. What the
 app cannot do is read the terminal's screen; the code travels only there.
 
-Pending challenges are memory-only and lost on restart. A request made before
-the restart is still on file until it expires, but `GET
-/api/v1/pair/elevation/{op_id}` reports it as `lost`, `konsensus pair-status`
-marks it, and `konsensus grant` refuses it up front; the client asks again.
+Codes are memory-only; the pending records are durable. When an owner-run node
+starts, it prints fresh codes for every approval that survived the restart, so
+the request stays `pending` and old codes stop working. A request cancelled by
+wrong codes reads `lost` from `GET /api/v1/pair/elevation/{op_id}`,
+`konsensus pair-status` marks it, and `konsensus grant` refuses it up front;
+the client asks again. See `device-keys.md` for Touch ID device keys, which
+replace the console code for per-contact spend.
 Arbitrary access to the owner's terminal or process memory remains outside this
 tier's threat model.
 

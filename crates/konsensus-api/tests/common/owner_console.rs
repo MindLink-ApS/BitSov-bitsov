@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Default)]
 pub struct OwnerConsole(Arc<Mutex<Vec<u8>>>);
 
+#[allow(dead_code)]
 impl OwnerConsole {
     pub fn confirmation(&self, label: &str) -> String {
         let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
@@ -24,7 +25,7 @@ impl OwnerConsole {
         let mut lines = text.lines();
         let mut found = None;
         while let Some(line) = lines.next() {
-            if line.starts_with("To approve, run: konsensus grant --op ")
+            if line.starts_with("To approve, run: konsensus ")
                 && line.split_whitespace().any(|w| w == op_id)
             {
                 found = lines
