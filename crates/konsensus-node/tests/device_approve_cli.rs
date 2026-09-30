@@ -45,7 +45,9 @@ async fn approve(dir: &std::path::Path, node: String, device: &'static str) -> (
         }
         seen
     });
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_konsensus"))
+    let mut std_cmd = std::process::Command::new(env!("CARGO_BIN_EXE_konsensus"));
+    detach(&mut std_cmd);
+    let mut child = tokio::process::Command::from(std_cmd)
         .args(["device", "approve", "--op", "op1", "--config"])
         .arg(dir.join("konsensus.toml"))
         .stdin(Stdio::piped())
@@ -117,4 +119,20 @@ async fn a_malformed_tuple_is_refused_before_signing() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("malformed device key"));
     assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "{seen:?}");
+}
+
+/// Run the command in a new session with no controlling terminal, so a
+/// password prompt fails at once even when the tests run in a terminal.
+fn detach(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `setsid` is async-signal-safe and touches no Rust state; it runs
+    // in the forked child before exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }

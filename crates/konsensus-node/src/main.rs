@@ -25,6 +25,8 @@ mod scb_restore;
 mod whitelist_cmd;
 #[path = "cli/owner.rs"]
 mod owner_cmd;
+#[path = "cli/seed.rs"]
+mod seed_cmd;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,11 +123,27 @@ async fn main() -> Result<()> {
         Command::Init { dir, non_interactive, tier, encrypt } => {
             cmd_init(&dir, non_interactive, tier.as_deref(), encrypt)?;
         }
-        Command::Start { config, password, admission_mode, owner_control } => {
-            cmd_start(&config, password.as_deref(), admission_mode.as_deref(), owner_control).await?;
+        Command::Start { config, password, password_file, admission_mode, owner_control } => {
+            let from_file = match &password_file {
+                Some(path) => {
+                    eprintln!(
+                        "WARNING: reading the recovery-phrase password from {}. Any program running as \
+                         this user can read that file, so the seed is protected from other OS users \
+                         only. Prompting at start is the stronger setting.",
+                        path.display()
+                    );
+                    Some(seed_cmd::read_password_file(path)?)
+                }
+                None => None,
+            };
+            let password = password.as_deref().or(from_file.as_deref().map(|p| p.as_str()));
+            cmd_start(&config, password, admission_mode.as_deref(), owner_control).await?;
         }
         Command::Approve { command } => {
             owner_cmd::cmd_approve(command).await?;
+        }
+        Command::Seed { command: cli::SeedCommand::Encrypt { config } } => {
+            seed_cmd::cmd_seed_encrypt(&config)?;
         }
         Command::Device { command } => {
             owner_cmd::cmd_device(command).await?;

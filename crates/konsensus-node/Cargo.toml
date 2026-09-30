@@ -66,3 +66,6 @@ tower = { workspace = true, features = ["util"] }
 bitcoin.workspace = true
 lightning-invoice.workspace = true
 secp256k1 = "0.29"
+# Tests detach the CLI from any controlling terminal (setsid), so password
+# prompts fail fast instead of waiting on a developer's terminal.
+libc = "0.2"

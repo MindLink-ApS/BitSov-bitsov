@@ -106,7 +106,17 @@ bitsov-relation-intent-v1\nnode:{fp}\nclient:{client_id}\ndevice:{key_id}\npeer:
   - a node started from an encrypted phrase holds the decrypted seed in memory, so a same-user process that can read the node's memory can derive the key;
   - the BIP-39 `identity.passphrase` is plaintext in `konsensus.toml`.
   A remote signer (§7) is the real fix.
-- **GAP (migration).** There is no in-place command to encrypt an existing plaintext `mnemonic.txt`. An existing node must be restored or re-created from its recovery phrase with `--encrypt` (`konsensus restore --encrypt`) before it can approve devices. An in-place migration command is the follow-up. An encrypted mnemonic (`.enc`) or a remote signer (§7) closes this.
+- **Migration.** `konsensus seed encrypt --config <path>` (node stopped) encrypts an existing plaintext `mnemonic.txt` in place:
+  1. it asks for a new password twice, on the terminal only (at least 10 characters);
+  2. it writes `mnemonic.enc` (0600) and flushes it;
+  3. it reads the file back and checks that it derives the **same node identity**;
+  4. it points the config at the new file and checks that the config reloads that way;
+  5. only then does it overwrite the plaintext with zeros, delete it, and flush the directory.
+
+  A failure before step 5 removes the new file and leaves the plaintext and the config untouched. On SSDs, APFS snapshots and Time Machine, older copies of the plaintext can persist; they hold the same words as the owner's written backup, which stays the recovery.
+- **Starting an encrypted node.** `konsensus start` prompts for the password on the terminal. That includes a dev node the app launches: the prompt appears in the terminal that started the app.
+- **Password file (opt-in).** `--password-file <path>` reads the password from a file instead. Only a regular file with no group or other permissions is accepted (symlinks are refused). The node warns that any program running as this user, including a paired app, can read it. With it, the owner key is protected from **other OS users only**, the same as a plaintext seed against a same-user app. `konsensus device approve` never reads it; it always prompts.
+- **GAP.** An app launched from Finder has no terminal to prompt on. It would need the password file, with the weaker boundary above, or a remote signer (§7). An encrypted mnemonic (`.enc`) or a remote signer (§7) closes this.
 - **GAP.** The file-key tier and its label are not built. Today a Mac without a usable Touch ID falls back to the console grant.
 
 ## 5. The profile card is the public profile

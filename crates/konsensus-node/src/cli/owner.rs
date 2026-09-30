@@ -817,7 +817,7 @@ pub fn cmd_repair_mark_initialized(config_path: &Path, confirm: bool) -> Result<
 ///
 /// Uses [`NodeConfig::save`]'s atomic durable replace so the aligned config
 /// reaches stable storage before the caller publishes `NODE_INITIALIZED`.
-fn align_config_mnemonic(config_path: &Path, mnemonic_path: &Path) -> Result<()> {
+pub(crate) fn align_config_mnemonic(config_path: &Path, mnemonic_path: &Path) -> Result<()> {
     if !config_path.try_exists()? {
         return Ok(());
     }

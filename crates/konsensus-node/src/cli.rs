@@ -45,8 +45,15 @@ pub enum Command {
         /// Password to decrypt an encrypted mnemonic file (`.enc`).
         /// If the mnemonic file has `.enc` extension and no password is
         /// provided, the node will prompt interactively.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "password_file")]
         password: Option<String>,
+
+        /// Read that password from a file instead of prompting. Opt-in: only a
+        /// regular file readable by its owner alone (chmod 600) is accepted.
+        /// Any program running as you can read it, including a paired app, so
+        /// it protects the seed from other OS users only.
+        #[arg(long)]
+        password_file: Option<PathBuf>,
 
         /// Override admission mode for this run: `whitelist` (default) or `price-open`.
         /// Operator-selectable price-admission mode; this is NOT an open network.
@@ -139,6 +146,12 @@ pub enum Command {
     Approve {
         #[command(subcommand)]
         command: ApprovalCommand,
+    },
+
+    /// The recovery phrase file: encrypt a plaintext one in place.
+    Seed {
+        #[command(subcommand)]
+        command: SeedCommand,
     },
 
     /// Paired device keys: approve one once, list, or revoke.
@@ -391,6 +404,20 @@ pub enum WhitelistCommand {
 #[cfg(test)]
 #[path = "tests/cli.rs"]
 mod tests;
+
+/// Owner commands for the recovery-phrase file.
+#[derive(Subcommand)]
+pub enum SeedCommand {
+    /// Encrypt a plaintext recovery phrase (mnemonic.txt) in place. Stop the
+    /// node first. Asks for a new password twice, writes the `.enc`, checks it
+    /// decrypts to the same node identity, points the config at it, and only
+    /// then overwrites and removes the plaintext file.
+    Encrypt {
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+}
 
 /// Owner commands for paired device keys.
 #[derive(Subcommand)]
