@@ -3,11 +3,9 @@
 use crate::{error::ApiError, state::AppState};
 use konsensus_core::{NodeId, UkmEnvelope};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    path::Path,
-};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 
 /// Original context for the N2 settlement notification, never admission authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +68,13 @@ pub(super) fn load(state: &AppState, peer: &NodeId) -> Result<Option<Attempt>, A
     }
 }
 fn sync_dir(dir: &Path) -> Result<(), ApiError> {
+    // `Path::new("konsensus.toml").parent()` is the empty path. Opening it
+    // fails with os error 2; treat it as the current directory.
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
     fs::File::open(dir)
         .and_then(|f| f.sync_all())
         .map_err(error)
@@ -78,7 +83,12 @@ pub(super) fn save(state: &AppState, peer: &NodeId, attempt: &Attempt) -> Result
     let Some(dir) = directory(state) else {
         return Ok(());
     }; // ephemeral test states
-    fs::create_dir_all(&dir).map_err(error)?;
+    save_in(&dir, peer, attempt)
+}
+
+/// Persist `attempt` under `dir` (normally `<data_dir>/admission-attempts`).
+fn save_in(dir: &Path, peer: &NodeId, attempt: &Attempt) -> Result<(), ApiError> {
+    fs::create_dir_all(dir).map_err(error)?;
     if let Some(parent) = dir.parent() {
         sync_dir(parent)?;
     }
@@ -96,7 +106,7 @@ pub(super) fn save(state: &AppState, peer: &NodeId, attempt: &Attempt) -> Result
             .map_err(error)?;
         file.sync_all().map_err(error)?;
         fs::rename(&tmp, dir.join(peer.to_hex())).map_err(error)?;
-        sync_dir(&dir)
+        sync_dir(dir)
     })();
     if result.is_err() {
         let _ = fs::remove_file(tmp);
@@ -152,4 +162,82 @@ pub(super) fn mark_undispatched(state: &AppState, peer: &NodeId, hash: &str) -> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod relative_config_tests {
+    use super::*;
+    use konsensus_core::NodeId;
+    use std::env;
+
+    fn sample_attempt() -> Attempt {
+        Attempt {
+            dispatch_started: false,
+            previous_attempt: None,
+            operation: None,
+            max_routing_fee_msat: None,
+            payment_hash: "ab".repeat(32),
+            amount_msat: 1_000,
+            quote: None,
+            envelope: None,
+            settled_at_unix: None,
+            original_reservation: None,
+            message_may_have_dispatched: false,
+            readmission: None,
+            proof_delivered: false,
+        }
+    }
+
+    #[test]
+    fn empty_parent_syncs_as_cwd() {
+        sync_dir(Path::new("")).expect("empty path must mean the current directory");
+    }
+
+    /// Pilot bug: `konsensus start --config konsensus.toml` → empty parent →
+    /// journal save failed with os error 2. With cwd set to a temp data dir and
+    /// a relative config name, absolute resolution + empty-parent sync must let
+    /// an admission journal save and reload.
+    #[test]
+    fn relative_config_path_can_save_admission_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = env::current_dir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            std::fs::write("konsensus.toml", "# relative\n")?;
+            let relative = Path::new("konsensus.toml");
+            assert!(
+                relative.parent().is_some_and(|p| p.as_os_str().is_empty()),
+                "bare relative config must have an empty parent"
+            );
+
+            // Absolute join (startup does canonicalize-or-join the same way).
+            let absolute = env::current_dir()?.join(relative);
+            let data_dir = absolute
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            assert!(data_dir.is_absolute());
+            assert_eq!(
+                data_dir.canonicalize()?,
+                tmp.path().canonicalize()?
+            );
+
+            let peer = NodeId::from_bytes([9; 32]);
+            let dir = data_dir.join("admission-attempts");
+            save_in(&dir, &peer, &sample_attempt())?;
+            let bytes = std::fs::read(dir.join(peer.to_hex()))?;
+            let loaded: Attempt = serde_json::from_slice(&bytes)?;
+            assert_eq!(loaded.payment_hash, "ab".repeat(32));
+            assert_eq!(loaded.amount_msat, 1_000);
+
+            // Defense in depth: even the bare empty parent must fsync.
+            sync_dir(relative.parent().unwrap())?;
+            Ok(())
+        })();
+
+        env::set_current_dir(prev).unwrap();
+        result.expect("relative config journal save");
+    }
 }

@@ -107,9 +107,35 @@ pub fn replacement_guard(data_dir: &Path, config: &NodeConfig) -> control::Repla
     }
 }
 
+/// Resolve a config path to an absolute path.
+///
+/// Relative paths (`konsensus start --config konsensus.toml`) otherwise make
+/// `config_path.parent()` the empty path. Every durable write that fsyncs that
+/// parent then fails with `os error 2`, including the admission journal.
+pub fn absolute_config_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .with_context(|| format!("current directory for config {}", path.display()))?
+            .join(path)
+    };
+    // Prefer the real path when the file exists; otherwise keep the absolute join
+    // (bootstrap may prepare a not-yet-written config).
+    Ok(absolute.canonicalize().unwrap_or(absolute))
+}
+
 /// The data directory is the config file's directory, matching `AppState::data_dir`.
-fn data_dir_of(config_path: &Path) -> PathBuf {
-    config_path
+/// Always absolute when the process cwd is known, so it is never the empty path.
+pub fn data_dir_of(config_path: &Path) -> PathBuf {
+    let absolute = absolute_config_path(config_path).unwrap_or_else(|_| {
+        if config_path.is_absolute() {
+            config_path.to_path_buf()
+        } else {
+            PathBuf::from(".")
+        }
+    });
+    absolute
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.to_path_buf())
@@ -692,6 +718,25 @@ pub async fn serve_bootstrap_mode(config_path: &Path, config: &NodeConfig) -> Re
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[test]
+    fn relative_config_path_yields_absolute_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            std::fs::write("konsensus.toml", "# test\n").unwrap();
+            let absolute = absolute_config_path(Path::new("konsensus.toml")).unwrap();
+            assert!(absolute.is_absolute());
+            assert!(absolute.ends_with("konsensus.toml"));
+            let data = data_dir_of(Path::new("konsensus.toml"));
+            assert!(data.is_absolute());
+            assert!(!data.as_os_str().is_empty());
+            assert_eq!(data.canonicalize().unwrap(), tmp.path().canonicalize().unwrap());
+        });
+        std::env::set_current_dir(prev).unwrap();
+        result.unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
