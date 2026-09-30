@@ -1448,7 +1448,7 @@ fn run_wide_cap_turns_short_codes_off_but_not_the_full_line() {
         let scope = if round % 2 == 0 { Scope::Spend } else { Scope::FrontDoor };
         round += 1;
         let op = service
-            .create_elevation_request(&a.client_id, vec![scope.clone()])
+            .create_elevation_request(&a.client_id, vec![scope])
             .unwrap();
         for _ in 0..pairing::OWNER_CODE_ATTEMPTS {
             if spent == pairing::OWNER_CODE_FAILURES_PER_RUN {
