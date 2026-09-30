@@ -688,6 +688,34 @@ fn sign_auth_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) 
     Ok(hex::encode(signature.to_bytes()))
 }
 
+/// The owner-approval public key, or why device approvals stay off.
+///
+/// Only an encrypted recovery phrase, with no plaintext copy beside it, whose
+/// password was typed at this start, yields a key: then a same-user program
+/// holding the files (or an old plaintext copy) cannot derive it, because the
+/// key also needs the password (see `mnemonic_crypto::owner_secret`).
+fn owner_approval_key(
+    config: &NodeConfig,
+    password: Option<&str>,
+    password_typed: bool,
+    node_id_hex: &str,
+) -> std::result::Result<ed25519_dalek::VerifyingKey, &'static str> {
+    use konsensus_api::pairing::device::{OWNER_KEY_UNAVAILABLE, SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
+    let path = &config.identity.mnemonic_file;
+    if !mnemonic_crypto::is_encrypted_path(path) || path.with_extension("txt").exists() {
+        return Err(SEED_NOT_ENCRYPTED);
+    }
+    if !password_typed {
+        return Err(SEED_PASSWORD_NOT_TYPED);
+    }
+    let password = password.ok_or(OWNER_KEY_UNAVAILABLE)?;
+    let mnemonic = mnemonic_crypto::read_mnemonic(path, Some(password)).map_err(|_| OWNER_KEY_UNAVAILABLE)?;
+    let secret = mnemonic_crypto::owner_secret(password, node_id_hex).map_err(|_| OWNER_KEY_UNAVAILABLE)?;
+    konsensus_core::OwnerApprovalKey::from_mnemonic(&mnemonic, &config.identity.passphrase, &secret)
+        .map(|k| k.verifying_key())
+        .map_err(|_| OWNER_KEY_UNAVAILABLE)
+}
+
 /// `konsensus start` — boot the node.
 async fn cmd_start(
     config_path: &Path,
@@ -695,6 +723,8 @@ async fn cmd_start(
     admission_mode: Option<&str>,
     owner_control: bool,
 ) -> Result<()> {
+    // A password given by flag or file was not typed here; see owner_approval_key.
+    let password_typed = password.is_none();
     // Relative configs must become absolute before any parent()/data_dir use.
     let config_path = owner_cmd::absolute_config_path(config_path)?;
     let config_path = config_path.as_path();
@@ -953,18 +983,39 @@ async fn cmd_start(
     // trusted-client list that widens it.
     let identity_fingerprint =
         konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
-    let pairing_service = Arc::new(
-        konsensus_api::pairing::PairingService::open(
+    // Device approvals (Touch ID) need an owner key a same-user program cannot
+    // derive: from an encrypted seed whose password was typed at this start.
+    // Otherwise they are off node-wide, with the reason the app shows.
+    let device_authority = owner_approval_key(
+        &config,
+        mnemonic_password.as_deref(),
+        password_typed,
+        &node.identity().node_id().to_hex(),
+    );
+    let pairing_service = Arc::new({
+        let service = konsensus_api::pairing::PairingService::open(
             &data_dir,
             identity_fingerprint.clone(),
             owner_control,
         )
         .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?
         // The owner command the app and console show names this exact config.
-        .with_owner_config(config_path.to_path_buf())
-        // Only the public half: the owner CLI derives the private key itself.
-        .with_owner_approval_key(*node.identity().owner_approval_public()),
-    );
+        .with_owner_config(config_path.to_path_buf());
+        match device_authority {
+            Ok(key) => {
+                info!("device approvals (Touch ID) enabled: owner key from the encrypted seed");
+                service.with_owner_approval_key(key)
+            }
+            Err(reason) => {
+                warn!(
+                    reason,
+                    "device approvals (Touch ID) are OFF: {}",
+                    konsensus_api::pairing::device::device_approvals_off_message(reason)
+                );
+                service.with_device_authority_disabled(reason)
+            }
+        }
+    });
     // Approvals are durable; only their codes lived in memory. Print fresh
     // codes for any that survived the restart instead of losing them.
     if owner_control {
@@ -1790,6 +1841,64 @@ mod whitelist_replay_tests {
 #[cfg(test)]
 #[path = "tests/main_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod owner_key_startup_tests {
+    use super::*;
+    use konsensus_api::pairing::device::{SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
+
+    const PHRASE: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn config(password: Option<&str>) -> (tempfile::TempDir, NodeConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password).unwrap();
+        let config = NodeConfig::default_for_tier(crate::config::NodeTier::Light, path, dir.path());
+        (dir, config)
+    }
+
+    fn node_id() -> String {
+        konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "").unwrap().node_id().to_hex()
+    }
+
+    #[test]
+    fn device_approvals_stay_off_unless_the_seed_is_encrypted_and_the_password_typed() {
+        // Plaintext seed: off, whatever the password.
+        let (_d, plain) = config(None);
+        assert_eq!(owner_approval_key(&plain, None, true, &node_id()).unwrap_err(), SEED_NOT_ENCRYPTED);
+        // Encrypted, but a plaintext copy is still beside it: off.
+        let (dir, enc) = config(Some("correct horse"));
+        std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
+        assert_eq!(owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap_err(), SEED_NOT_ENCRYPTED);
+        std::fs::remove_file(dir.path().join("mnemonic.txt")).unwrap();
+        // Encrypted, password from a flag or file: off.
+        assert_eq!(owner_approval_key(&enc, Some("correct horse"), false, &node_id()).unwrap_err(), SEED_PASSWORD_NOT_TYPED);
+        // Encrypted and typed: on, and it is exactly the key the owner CLI signs with.
+        let node_key = owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap();
+        let secret = mnemonic_crypto::owner_secret("correct horse", &node_id()).unwrap();
+        let cli_key = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &secret).unwrap().verifying_key();
+        assert_eq!(node_key, cli_key);
+        // A wrong password yields no key at all.
+        assert!(owner_approval_key(&enc, Some("wrong"), true, &node_id()).is_err());
+    }
+
+    #[test]
+    fn an_old_plaintext_copy_of_the_seed_does_not_yield_the_owner_key() {
+        // Whoever copied mnemonic.txt before `seed encrypt` has the seed but not
+        // the password; the owner key needs both.
+        let (_d, enc) = config(Some("correct horse"));
+        let node_key = owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap();
+        for guess in [[0u8; 32], [1u8; 32]] {
+            let from_seed_only = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &guess).unwrap();
+            assert_ne!(from_seed_only.verifying_key(), node_key);
+        }
+        let other_password = mnemonic_crypto::owner_secret("another password", &node_id()).unwrap();
+        assert_ne!(
+            konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &other_password).unwrap().verifying_key(),
+            node_key
+        );
+    }
+}
 
 #[cfg(all(test, feature = "regtest-e2e"))]
 #[path = "tests/regtest_e2e.rs"]

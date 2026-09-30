@@ -23,6 +23,31 @@ use super::{
 use crate::auth::Scope;
 use crate::spend_budget::{GrantBudget, GrantView, MAX_SPEND_GRANT_TTL_SECS};
 
+/// Reason code: the node runs from a plaintext recovery phrase.
+pub const SEED_NOT_ENCRYPTED: &str = "seed_not_encrypted";
+/// Reason code: the encrypted phrase's password came from a flag or file, not
+/// typed at start, so a same-user program could have it.
+pub const SEED_PASSWORD_NOT_TYPED: &str = "seed_password_not_typed";
+/// Reason code: no owner-approval key was configured at start.
+pub const OWNER_KEY_UNAVAILABLE: &str = "owner_key_unavailable";
+
+/// What the owner is told for a reason code.
+pub fn device_approvals_off_message(reason: &str) -> &'static str {
+    match reason {
+        SEED_NOT_ENCRYPTED => {
+            "Touch ID approvals are off on this node: its recovery phrase is not encrypted. Encrypt \
+             your recovery phrase to enable Touch ID approvals (`konsensus seed encrypt`, then \
+             restart the node)."
+        }
+        SEED_PASSWORD_NOT_TYPED => {
+            "Touch ID approvals are off on this node: it was started with the recovery-phrase \
+             password from a flag or file. Restart it and type the password at start to enable \
+             Touch ID approvals."
+        }
+        _ => "Touch ID approvals are off on this node: it has no owner-approval key.",
+    }
+}
+
 /// Registered device keys per paired client.
 pub const MAX_DEVICE_KEYS_PER_CLIENT: usize = 4;
 
@@ -248,6 +273,7 @@ impl PairingService {
         if !self.owner_control_enabled {
             return Err(PairingError::OwnerChannelUnavailable);
         }
+        self.device_authority()?;
         let public_key_hex = public_key_hex.to_ascii_lowercase();
         let raw = parse_public_key(&public_key_hex)?;
         let name = clean_name(name)?;
@@ -403,9 +429,7 @@ impl PairingService {
         if !self.owner_control_enabled {
             return Err(PairingError::OwnerChannelUnavailable);
         }
-        let owner = self.owner_approval_key.ok_or_else(|| {
-            PairingError::NotGrantable("this node has no owner-approval key configured".into())
-        })?;
+        let owner = self.device_authority()?;
         let mut inner = self.lock();
         let now = chrono::Utc::now().timestamp();
         let op = inner
@@ -570,6 +594,7 @@ impl PairingService {
         if !self.owner_control_enabled {
             return Err(PairingError::OwnerChannelUnavailable);
         }
+        self.device_authority()?;
         let peer = intent.peer.to_ascii_lowercase();
         if !is_hex(&peer, 64) || peer != intent.peer {
             return Err(PairingError::Malformed("peer must be a lowercase 64-hex node id".into()));
@@ -708,6 +733,15 @@ impl PairingService {
 
     /// The registered key an intent names, for this client at its current
     /// epoch, or why not.
+    /// Fail closed while device authority is off node-wide.
+    fn device_authority(&self) -> Result<ed25519_dalek::VerifyingKey, PairingError> {
+        if let Some(reason) = self.device_authority_off {
+            return Err(PairingError::DeviceApprovalsDisabled(reason));
+        }
+        self.owner_approval_key
+            .ok_or(PairingError::DeviceApprovalsDisabled(OWNER_KEY_UNAVAILABLE))
+    }
+
     fn intent_key(&self, inner: &Inner, client_id: &str, epoch: u64, key_id: &str) -> Result<DeviceKey, PairingError> {
         let client = inner
             .file
@@ -727,9 +761,7 @@ impl PairingService {
             .ok_or_else(|| PairingError::NotGrantable("unknown or revoked device key".into()))?;
         // The root of the chain: the owner-approval key signed exactly this
         // pairing key, epoch and device key for this node.
-        let owner = self.owner_approval_key.ok_or_else(|| {
-            PairingError::NotGrantable("this node has no owner-approval key configured".into())
-        })?;
+        let owner = self.device_authority()?;
         let unsigned = || PairingError::NotGrantable("device key has no valid owner approval".into());
         if key.client_pubkey != client.client_pubkey {
             return Err(unsigned());
@@ -794,7 +826,7 @@ mod tests {
     #[test]
     fn an_expired_peer_envelope_cannot_dispatch_on_a_live_peers_time() {
         let tmp = tempfile::tempdir().unwrap();
-        let owner = konsensus_core::OwnerApprovalKey::from_seed(&[7u8; 64]).unwrap();
+        let owner = konsensus_core::OwnerApprovalKey::from_seed(&[7u8; 64], &[9u8; 32]).unwrap();
         let service = PairingService::open(tmp.path(), "f".repeat(32), true)
             .unwrap()
             .with_owner_console(Box::new(std::io::sink()))
@@ -858,11 +890,48 @@ mod tests {
             .reserve_spend(&client.client_id, client.epoch, vec![Charge { recipient: b.clone(), amount_msat: 1_000 }])
             .unwrap();
         // Second 59: both may dispatch.
-        assert!(service.with_spend_authority_at(&to_a, now + 59, || ()).is_ok());
+        assert!(service.with_spend_authority_at(&to_a, || now + 59, || ()).is_ok());
         // Second 61: A's envelope is over; B's grant time does not carry A.
-        assert!(matches!(service.with_spend_authority_at(&to_a, now + 61, || ()), Err(BudgetRefusal::NoGrant)));
-        assert!(service.with_spend_authority_at(&to_b, now + 61, || ()).is_ok());
+        assert!(matches!(service.with_spend_authority_at(&to_a, || now + 61, || ()), Err(BudgetRefusal::NoGrant)));
+        assert!(service.with_spend_authority_at(&to_b, || now + 61, || ()).is_ok());
         // And past B's deadline, B stops too.
-        assert!(matches!(service.with_spend_authority_at(&to_b, now + 3601, || ()), Err(BudgetRefusal::NoGrant)));
+        assert!(matches!(service.with_spend_authority_at(&to_b, || now + 3601, || ()), Err(BudgetRefusal::NoGrant)));
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use crate::spend_budget::{BudgetRefusal, Charge};
+
+    /// Codex #146 delta: the dispatch deadline is judged at the moment the
+    /// lock is held, not when the caller arrived. The clock runs only after
+    /// the lock is acquired (it would deadlock re-locking otherwise), and a
+    /// clock read then that is past the deadline refuses.
+    #[test]
+    fn the_dispatch_clock_is_read_under_the_pairing_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = PairingService::open(tmp.path(), "f".repeat(32), true)
+            .unwrap()
+            .with_owner_console(Box::new(std::io::sink()))
+            .without_stdout_code();
+        let reservation = crate::spend_budget::Reservation {
+            id: "r".into(),
+            client_id: "c".into(),
+            op_id: "op".into(),
+            charges: vec![Charge { recipient: "a".repeat(64), amount_msat: 1 }],
+        };
+        let held = std::cell::Cell::new(false);
+        let out = service.with_spend_authority_at(
+            &reservation,
+            || {
+                // The pairing mutex is held while the clock is read.
+                held.set(service.inner.try_lock().is_err());
+                0
+            },
+            || (),
+        );
+        assert!(held.get(), "the clock must be sampled while holding the lock");
+        assert!(matches!(out, Err(BudgetRefusal::NoGrant)));
     }
 }

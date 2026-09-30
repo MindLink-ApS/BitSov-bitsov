@@ -38,6 +38,9 @@ fn binding(auth: &ScopedAuth<Read>) -> Result<&PairingBinding, ApiError> {
 /// token: never a 401 that would send the app back to pairing.
 fn map_err(e: PairingError) -> ApiError {
     match e {
+        PairingError::DeviceApprovalsDisabled(reason) => {
+            ApiError::Forbidden(e.to_string()).with_reason(reason)
+        }
         PairingError::BadProof => ApiError::Forbidden(
             "the device signature did not verify, or that intent was already used".into(),
         ),
@@ -148,6 +151,8 @@ async fn list_device_keys(
         "node": svc.bound_fingerprint(),
         "client_id": binding.client_id,
         "owner_control": svc.owner_control_enabled(),
+        // "enabled", or the reason code device approvals are off node-wide.
+        "device_approvals": svc.device_authority_off().unwrap_or("enabled"),
         "device_keys": keys,
     })))
 }

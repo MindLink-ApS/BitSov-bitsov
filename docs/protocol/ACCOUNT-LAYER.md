@@ -23,7 +23,7 @@ a backup", never "ID is money".
 | Transport (X25519) | `konsensus-v2 x25519 key exchange` | Noise_XX static key | node |
 | Storage (AES-256) | `konsensus-v2 aes256 storage key` | at-rest encryption; JWT secret derived from it | node |
 | Lightning + on-chain wallet | `konsensus-v2 ldk-lightning` (64-byte LDK entropy, `konsensus-lightning/src/ldk.rs`) | LN node key, channel keys, the LDK on-chain wallet | node (LDK) |
-| **Owner approval (Ed25519)** | `konsensus-v2 ed25519 owner-approval key` | signs owner decisions (§4) | owner CLI, which signs with it. The node derives it at startup from the seed it already holds, keeps only the public half (`NodeIdentity::owner_approval_public`), and never retains the private half |
+| **Owner approval (Ed25519)** | `konsensus-v2 ed25519 owner-approval key v2 (seed+owner secret)`, over seed ‖ **owner secret** (argon2id of the recovery-phrase password, salted per node) | signs owner decisions (§4) | owner CLI, which signs with it. The node derives only the public half, at a start from the encrypted seed with the password typed (§4) |
 
 - **GAP (cleanup).** `NodeIdentity` also derives a secp256k1 key (`konsensus-v2 secp256k1 bitcoin key`) that no production path uses. The wallet lives inside the LDK entropy. The key should be removed, or reserved for pairwise LN identities.
 - **GAP.** Pairwise LN identities (one per relation) are not implemented. One LN node key exists per seed.
@@ -92,6 +92,20 @@ bitsov-relation-intent-v1\nnode:{fp}\nclient:{client_id}\ndevice:{key_id}\npeer:
 - `level` is the relation-ladder rung: 0 Knock, 1 Contact, 2 Close, 3 Anchored. Only 1 is accepted until first contact (step 4). The field is fixed now so that plasticity can move relations later.
 - Enforcement, limits and residual risks are in `docs/security/device-keys.md`.
 
+**Node-wide gate (the authority boundary).** Device-key registration, owner approval of a device and relation intents all run only if the node **started from an encrypted recovery phrase whose password was typed at that start**. Otherwise the node refuses them with HTTP 403 and a stable `reason`. `GET /api/v1/pair/device-keys` reports the same value as `device_approvals`, so the app can say why before the owner tries.
+
+| `reason` | when | the app shows |
+|---|---|---|
+| `seed_not_encrypted` | plaintext `mnemonic.txt`, or a plaintext copy beside the `.enc` | "Encrypt your recovery phrase to enable Touch ID approvals." |
+| `seed_password_not_typed` | started with `--password` or `--password-file` | "Restart the node and type the password to enable Touch ID approvals." |
+| `owner_key_unavailable` | no owner key at start (for example a wrong password) | "Touch ID approvals are off on this node." |
+
+Why the gate lives in the node, and why the key needs the password:
+- A same-user program that can read a plaintext seed could derive a seed-only owner key and write a correctly signed device record. Refusing in the CLI can't stop that, because the program never runs the CLI.
+- So the node enables device authority only when it can derive an owner key that such a program can't: the key is derived from the seed **and** the typed password (argon2id, the same cost as the file encryption).
+- An old copy of `mnemonic.txt`, taken before the phrase was encrypted, therefore does not yield the owner key.
+- Changing the password changes the owner key. Devices must then be registered again (fail closed).
+
 **Tiers, labelled in the app:**
 - **Secure Enclave + Touch ID**: the default where available.
 - **File key (weaker)**: a software key readable by the OS user. The app must label it as weaker wherever it is used.
@@ -155,6 +169,7 @@ bitsov-relation-intent-v1\nnode:{fp}\nclient:{client_id}\ndevice:{key_id}\npeer:
 
 - No HTTP route writes an owner approval, a console grant or a device registration. Guard tests: `pairing_routes.rs`, `device_routes.rs`.
 - Over the API, a paired token alone never carries spend. Spend requires a console grant, or a registered key's signature over exact terms. Direct writes to `data_dir` are outside this invariant; see §3.
-- The running node never **retains** the owner-approval private key. It derives the key once at startup from the seed it holds and keeps only the public half (`NodeIdentity::owner_approval_public`).
+- The running node never **retains** the owner-approval private key, and derives its public half only when started from an encrypted seed with the password typed. Otherwise every device-key path refuses node-wide (`device_key_tests::a_node_running_from_a_plaintext_seed_disables_device_authority_node_wide`, `owner_key_startup_tests`).
+- A copy of the seed without the recovery-phrase password does not yield the owner key (`owner_key_startup_tests::an_old_plaintext_copy_of_the_seed_does_not_yield_the_owner_key`).
 - A device-key record without a valid owner signature for the current pairing key and epoch is refused on every use (`device_key_tests::a_device_key_written_into_data_dir_authorizes_nothing`).
 - Every key is domain-separated from the seed (`identity::tests::owner_approval_key_is_domain_separated_and_public_only_on_the_node`).
