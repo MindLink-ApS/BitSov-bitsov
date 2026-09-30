@@ -674,6 +674,9 @@ async fn cmd_start(
     admission_mode: Option<&str>,
     owner_control: bool,
 ) -> Result<()> {
+    // Relative configs must become absolute before any parent()/data_dir use.
+    let config_path = owner_cmd::absolute_config_path(config_path)?;
+    let config_path = config_path.as_path();
     let (startup_mode, mut config) = owner_cmd::prepare_start(config_path)
         .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
 
@@ -686,11 +689,7 @@ async fn cmd_start(
     //
     // Balance is not consulted, here or in `classify`: an initialized node with
     // no funds is initialized.
-    let data_dir = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let data_dir = owner_cmd::data_dir_of(config_path);
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
             return owner_cmd::serve_bootstrap_mode(config_path, &config).await;
@@ -999,7 +998,7 @@ async fn cmd_start(
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         invoice_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        data_dir: config_path.parent().map(|p| p.to_path_buf()),
+        data_dir: Some(data_dir.clone()),
         backup_dir: Some(std::path::PathBuf::from(&config.backup.scb_dir)),
         lightning_backend: config.lightning.backend_name().to_string(),
         chain_backend: config.chain.backend_name().to_string(),
@@ -1014,7 +1013,7 @@ async fn cmd_start(
             } else {
                 None
             },
-            config_path.parent(),
+            Some(data_dir.as_path()),
             &node.identity().node_id().to_hex(),
         ),
         // Validated at config load; an over-ceiling policy never starts.
