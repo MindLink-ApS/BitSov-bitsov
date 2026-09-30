@@ -107,22 +107,23 @@ pub fn replacement_guard(data_dir: &Path, config: &NodeConfig) -> control::Repla
     }
 }
 
-/// Resolve a config path to an absolute path.
+/// Resolve a config path to an absolute path without following symlinks.
 ///
 /// Relative paths (`konsensus start --config konsensus.toml`) otherwise make
 /// `config_path.parent()` the empty path. Every durable write that fsyncs that
 /// parent then fails with `os error 2`, including the admission journal.
+///
+/// Do not `canonicalize`: a config that is a symlink must keep the *link's*
+/// parent as `data_dir` (e.g. `/srv/node/konsensus.toml` → `/etc/node.toml`
+/// still uses `/srv/node`), matching pre-fix startup.
 pub fn absolute_config_path(path: &Path) -> Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
     } else {
-        std::env::current_dir()
+        Ok(std::env::current_dir()
             .with_context(|| format!("current directory for config {}", path.display()))?
-            .join(path)
-    };
-    // Prefer the real path when the file exists; otherwise keep the absolute join
-    // (bootstrap may prepare a not-yet-written config).
-    Ok(absolute.canonicalize().unwrap_or(absolute))
+            .join(path))
+    }
 }
 
 /// The data directory is the config file's directory, matching `AppState::data_dir`.
@@ -736,6 +737,54 @@ mod startup_tests {
         });
         std::env::set_current_dir(prev).unwrap();
         result.unwrap();
+    }
+
+    /// Config symlink must not relocate `data_dir` to the target's parent.
+    /// `/srv/node/konsensus.toml` → `/etc/node.toml` still uses `/srv/node`.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_keeps_link_parent_as_data_dir() {
+        let node = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let layout = DataDirLayout::new(node.path());
+        let outcome = bootstrap::commit_first_run(&layout, phrase, None).unwrap();
+
+        // Real file lives elsewhere; only a symlink sits beside NODE_INITIALIZED.
+        let real_config = elsewhere.path().join("node.toml");
+        NodeConfig::default_for_tier(NodeTier::Full, outcome.mnemonic_path.clone(), node.path())
+            .save(&real_config)
+            .unwrap();
+        let link = node.path().join("konsensus.toml");
+        std::os::unix::fs::symlink(&real_config, &link).unwrap();
+
+        let absolute = absolute_config_path(&link).unwrap();
+        assert_eq!(absolute, link);
+        assert!(absolute.is_absolute());
+        // Following the symlink would select `elsewhere` as data_dir — must not.
+        assert_eq!(
+            absolute.canonicalize().unwrap(),
+            real_config.canonicalize().unwrap()
+        );
+        assert_ne!(
+            absolute.canonicalize().unwrap().parent().unwrap(),
+            absolute.parent().unwrap()
+        );
+
+        let data = data_dir_of(&link);
+        assert_eq!(data, node.path());
+        assert_ne!(
+            data.canonicalize().unwrap(),
+            elsewhere.path().canonicalize().unwrap()
+        );
+        assert!(DataDirLayout::new(&data).marker().exists());
+
+        let (mode, _) = prepare_start(&link).unwrap();
+        assert_eq!(
+            mode,
+            StartupMode::Initialized,
+            "marker beside the symlink must still classify as initialized"
+        );
     }
 
     #[cfg(unix)]
