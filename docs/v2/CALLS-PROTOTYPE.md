@@ -101,6 +101,36 @@ the price query at all, the call is refused before paying
 
 Calls are 1:1: a room compose of 400-403 is refused (`call_room`).
 
+## Mesh meetings (up to 4)
+
+A meeting is a set of ordinary 1:1 calls ("legs") that share a meeting id and
+a fixed roster. The offer (400) of a leg carries one optional field:
+
+```json
+"meeting": {"id": "<32 lowercase hex>", "roster": ["<host node id>", "<invitee>", ...]}
+```
+
+- The roster is 2 to 4 distinct node ids (64 lowercase hex), host first
+  (`MAX_MEETING_PARTICIPANTS`). Only an offer may carry it; unknown fields are
+  refused.
+- **The earlier participant places each leg:** a leg is accepted only if both
+  caller and callee are in the roster and the caller comes first
+  (`CallSignal::check_leg`). So each pair has exactly one payer, and two
+  participants never ring each other. Checked on compose before the
+  reservation (`call_signal_invalid`, nothing reserved or paid) and on
+  receive after the gate (withdrawn like any refused call signal).
+- Everything else is the 1:1 call, unchanged: the leg's offer pays the
+  callee's `call_msat` once, answers and hangups pay the realtime price, the
+  same reservation/commit/release rules, operation ids, per-peer and total
+  bounds. The node keeps no meeting state.
+- Evidence: `payloads::call` tests (roster shape, leg order),
+  `call_state_tests::a_meeting_leg_out_of_roster_order_is_refused_before_reservation_or_payment`,
+  and `regtest_e2e::real_ldk_regtest_meeting` (apps A, B, C and router R on
+  real LDK: legs A→B, A→C, B→C, an out-of-order leg refused before paying,
+  C leaves while A–B stays live, msat-exact per participant).
+- Design and open decisions: MindLink-Private
+  `pm/projects/bitsov/research/MESH-MEETINGS-DESIGN.md`.
+
 ## Own STUN responder (`[calls] stun_listen`, optional)
 
 Direct media across routers needs each app to learn its public address. Rather

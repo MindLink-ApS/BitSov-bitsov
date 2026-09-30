@@ -819,6 +819,224 @@ async fn real_ldk_regtest_calls() {
     println!("REGTEST-CALLS complete in {:?}", steps.started.elapsed());
 }
 
+/// Mesh meeting of three over real LDK on regtest (small group meetings,
+/// prototype). Topology: apps A (host), B, C each with one channel to the
+/// routing node R. A meeting is nothing but 1:1 calls sharing a meeting id
+/// and roster [A, B, C]; the earlier participant places (and pays) each leg:
+/// A->B, A->C, B->C. Each leg offer pays the callee's `call_msat` once
+/// (10,000 msat); answers and hangups pay the realtime price (1,000 msat), each
+/// plus R's forwarding fee. A leg out of roster order is refused by the
+/// caller's own node before anything is paid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Bitcoin Core and electrs; scripts/regress/regtest_e2e.sh"]
+async fn real_ldk_regtest_meeting() {
+    use axum::http::StatusCode;
+    use konsensus_core::traits::transport::MessageTransport;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let mut steps = Steps::new();
+    let chain = infra::Chain::start().await;
+    let dirs = [(); 4].map(|_| tempfile::tempdir().unwrap());
+    let (a, _) = infra::lightning(dirs[0].path(), &chain).await;
+    let (b, addr_b) = infra::lightning(dirs[1].path(), &chain).await;
+    let (c, addr_c) = infra::lightning(dirs[2].path(), &chain).await;
+    let (r, addr_r) = infra::router(dirs[3].path(), &chain).await;
+    steps.pass("chain + 4 real LDK nodes started (apps A, B, C; router R)");
+    chain.fund(a.node()).await;
+    chain.fund(&r).await;
+    a.open_channel(&r.node_id().to_string(), &addr_r, 1_000_000, false, None).await.unwrap();
+    chain.confirm_channel(a.node(), &r, &[b.node(), c.node()]).await;
+    r.open_channel(b.node().node_id(), addr_b.parse().unwrap(), 1_000_000, None, None).unwrap();
+    chain.confirm_channel(&r, b.node(), &[a.node(), c.node()]).await;
+    r.open_channel(c.node().node_id(), addr_c.parse().unwrap(), 1_000_000, None, None).unwrap();
+    chain.confirm_channel(&r, c.node(), &[a.node(), b.node()]).await;
+    steps.pass("channels A->R, R->B, R->C opened and usable");
+
+    wait("R's channel_updates reach A, B and C", || async {
+        hop_policy(a.node(), &r).is_some() && hop_policy(b.node(), &r).is_some() && hop_policy(c.node(), &r).is_some()
+    })
+    .await;
+    // R's fee on its hop towards each app.
+    let (to_a, to_b, to_c) = (hop_policy(a.node(), &r).unwrap(), hop_policy(b.node(), &r).unwrap(), hop_policy(c.node(), &r).unwrap());
+    // B and C need outbound liquidity to answer, hang up and (B) place a leg.
+    for (to, node, policy) in [(&b, "B", to_b), (&c, "C", to_c)] {
+        let liquidity = 50_000_000;
+        let inv = to.create_invoice(liquidity, "regtest meeting liquidity", 600).await.unwrap();
+        a.pay_invoice_with_fee_limit(&inv.bolt11, hop_fee(policy, liquidity)).await.unwrap();
+        settle(&a, &inv.payment_hash).await;
+        settle(to, &inv.payment_hash).await;
+        println!("liquidity to {node} settled");
+    }
+    wait("liquidity committed", || async { capacity(b.node()) > 10_000_000 && capacity(c.node()) > 10_000_000 }).await;
+    steps.pass("routed liquidity A->R->B and A->R->C settled");
+
+    let mut alice = app::App::start(dirs[0].path(), &chain, a.clone()).await;
+    let mut bob = app::App::start(dirs[1].path(), &chain, b.clone()).await;
+    let mut carol = app::App::start(dirs[2].path(), &chain, c.clone()).await;
+    // The stateless quote gate deliberately quarantines the first second.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // Each pair becomes contacts the ordinary way: x pays first contact, lists
+    // y, and y replies. No meeting shortcut.
+    async fn contacts(x: &mut app::App, y: &mut app::App) {
+        let y_hex = y.state.identity.node_id().to_hex();
+        x.transport.connect(y.state.identity.node_id(), &y.transport.listen_addr().unwrap().to_string()).await.unwrap();
+        wait("Noise connected", || y.transport.is_connected(x.state.identity.node_id())).await;
+        let (status, quote) = x.post("/api/v1/messages/first-contact/quote", json!({"recipient": y_hex}), false).await;
+        assert_eq!(status, StatusCode::OK, "{quote}");
+        let grant = x.service.grant_view_for(&x.client).unwrap();
+        let (status, body) = x
+            .post(
+                "/api/v1/pair/first-contact-grant",
+                json!({"client_id": x.client, "grant_op_id": grant.op_id, "recipient": y_hex,
+                       "max_total_msat": quote["total_msat"], "contact_budget_msat": 200_000}),
+                true,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        x.compose(y, "hello").await;
+        let (status, body) = x
+            .post("/api/v1/peers", json!({"node_id": y_hex, "addr": y.transport.listen_addr().unwrap().to_string(), "auto_connect": false}), true)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        y.compose(x, "hello back").await;
+    }
+    // A cycle, so each node is first-contacted once: the admission ledger is
+    // process-global and all three apps share this test process.
+    contacts(&mut alice, &mut bob).await;
+    contacts(&mut bob, &mut carol).await;
+    contacts(&mut carol, &mut alice).await;
+    steps.pass("A-B, A-C, B-C are paid contacts with E2EE sessions");
+
+    let (a_id, b_id, c_id) = (*alice.state.identity.node_id(), *bob.state.identity.node_id(), *carol.state.identity.node_id());
+    let (a_hex, b_hex, c_hex) = (a_id.to_hex(), b_id.to_hex(), c_id.to_hex());
+    let meeting = format!("{:032x}", rand::random::<u128>());
+    let sdp = r"v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
+    let leg = |call_id: &str| {
+        format!(r#"{{"v":1,"call_id":"{call_id}","media":"audio","sdp":"{sdp}","meeting":{{"id":"{meeting}","roster":["{a_hex}","{b_hex}","{c_hex}"]}}}}"#)
+    };
+    let answer = |call_id: &str| format!(r#"{{"v":1,"call_id":"{call_id}","sdp":"{sdp}"}}"#);
+    let hangup = |call_id: &str| format!(r#"{{"v":1,"call_id":"{call_id}","reason":"hangup"}}"#);
+    let (ab, ac, bc) = [(); 3].map(|_| format!("{:032x}", rand::random::<u128>())).into();
+
+    let (a_used0, b_used0, c_used0) = (alice.used(), bob.used(), carol.used());
+    let (a_cap0, b_cap0, c_cap0, r_cap0) = (capacity(a.node()), capacity(b.node()), capacity(c.node()), capacity(&r));
+    let pays = |n: &Arc<LdkProvider>| {
+        let n = n.clone();
+        async move { n.list_payments(500).await.unwrap().len() }
+    };
+    let c_pays0 = pays(&c).await;
+
+    // A leg out of roster order: C (last) may not ring A. C's node refuses it
+    // before any price query or payment.
+    let wrong = format!("{:032x}", rand::random::<u128>());
+    let (status, body) = signal(&carol, &a_hex, 400, leg(&wrong)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "call_signal_invalid", "{body}");
+    assert_eq!(pays(&c).await, c_pays0, "refused leg pays nothing");
+    assert_eq!(carol.used(), c_used0);
+    steps.pass("out-of-order leg (C->A) refused by C's own node, nothing paid");
+
+    // Host invites: one leg to each invitee, each paid once at the callee's call price.
+    for (to, to_hex, to_id, call) in [(&mut bob, &b_hex, b_id, &ab), (&mut carol, &c_hex, c_id, &ac)] {
+        to.received = to.state.ws_broadcast.subscribe();
+        let (status, body) = signal(&alice, to_hex, 400, leg(call)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["amount_msat"], 10_000, "{body}");
+        let rung = recv_from(to, &a_id, 400).await;
+        assert_eq!(rung.plaintext.as_deref(), Some(leg(call).as_str()));
+        let _ = to_id;
+    }
+    steps.pass("host A placed legs A->B and A->C, 10000 msat each, both rang");
+
+    // The same leg again: refused before paying (single-use per leg).
+    let (status, body) = signal(&alice, &b_hex, 400, leg(&ab)).await;
+    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("call_id_used")), "{body}");
+
+    // B joins: answers the host's leg, then places its own leg to the later C.
+    alice.received = alice.state.ws_broadcast.subscribe();
+    let (status, body) = signal(&bob, &a_hex, 401, answer(&ab)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    recv_from(&mut alice, &b_id, 401).await;
+    // The call-price query limit (one per peer per 2 s) is process-global, and
+    // A just asked C: in this shared test process B must wait it out.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    carol.received = carol.state.ws_broadcast.subscribe();
+    let (status, body) = signal(&bob, &c_hex, 400, leg(&bc)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["amount_msat"], 10_000, "{body}");
+    recv_from(&mut carol, &b_id, 400).await;
+    steps.pass("B joined: answered A, placed leg B->C (10000 msat)");
+
+    // C joins: answers both ringing legs of the meeting.
+    alice.received = alice.state.ws_broadcast.subscribe();
+    bob.received = bob.state.ws_broadcast.subscribe();
+    let (status, body) = signal(&carol, &a_hex, 401, answer(&ac)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body2) = signal(&carol, &b_hex, 401, answer(&bc)).await;
+    assert_eq!(status, StatusCode::OK, "{body2}");
+    recv_from(&mut alice, &c_id, 401).await;
+    recv_from(&mut bob, &c_id, 401).await;
+    for (x, y, call) in [(&alice, &b_id, &ab), (&alice, &c_id, &ac), (&bob, &c_id, &bc)] {
+        let e = x.state.storage.call_get(y, call).await.unwrap().unwrap();
+        assert_eq!(e.phase, konsensus_core::payloads::call::Phase::Live);
+    }
+    steps.pass("C joined: all three legs live (full mesh)");
+
+    // C leaves: one paid hangup per live leg. A and B stay connected.
+    alice.received = alice.state.ws_broadcast.subscribe();
+    bob.received = bob.state.ws_broadcast.subscribe();
+    for (to, call) in [(&a_hex, &ac), (&b_hex, &bc)] {
+        let (status, body) = signal(&carol, to, 403, hangup(call)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    recv_from(&mut alice, &c_id, 403).await;
+    recv_from(&mut bob, &c_id, 403).await;
+    assert_eq!(alice.state.storage.call_get(&b_id, &ab).await.unwrap().unwrap().phase, konsensus_core::payloads::call::Phase::Live);
+    // An ended leg takes no more signals, even from a participant.
+    let (status, body) = signal(&bob, &c_hex, 403, hangup(&bc)).await;
+    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("call_not_live")), "{body}");
+    steps.pass("C left (2 paid hangups); A-B still live; ended leg refused");
+
+    // A ends the meeting's last leg.
+    bob.received = bob.state.ws_broadcast.subscribe();
+    let (status, body) = signal(&alice, &b_hex, 403, hangup(&ab)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    recv_from(&mut bob, &a_id, 403).await;
+    steps.pass("A hung up the last leg");
+
+    // msat-exact. Paid (principal + R's fee on the hop to the payee):
+    //   A: offers A->B, A->C (10000 each), hangup A->B (1000)
+    //   B: offer B->C (10000), answer B->A (1000)
+    //   C: answers C->A, C->B, hangups C->A, C->B (1000 each)
+    let f = |p, amt| hop_fee(p, amt);
+    let a_paid = 10_000 + f(to_b, 10_000) + 10_000 + f(to_c, 10_000) + 1_000 + f(to_b, 1_000);
+    let b_paid = 10_000 + f(to_c, 10_000) + 1_000 + f(to_a, 1_000);
+    let c_paid = 2 * (1_000 + f(to_a, 1_000)) + 2 * (1_000 + f(to_b, 1_000));
+    let (a_got, b_got, c_got) = (3_000, 13_000, 20_000);
+    let r_earned = (a_paid - 21_000) + (b_paid - 11_000) + (c_paid - 4_000);
+    wait("exact channel deltas after the meeting", || async {
+        capacity(a.node()) == a_cap0 - a_paid + a_got
+            && capacity(b.node()) == b_cap0 - b_paid + b_got
+            && capacity(c.node()) == c_cap0 - c_paid + c_got
+            && capacity(&r) == r_cap0 + r_earned
+    })
+    .await;
+    assert_eq!(alice.used() - a_used0, a_paid, "A budget = principals + actual fees");
+    assert_eq!(bob.used() - b_used0, b_paid, "B budget = principals + actual fees");
+    assert_eq!(carol.used() - c_used0, c_paid, "C budget = principals + actual fees");
+    println!(
+        "MEETING RECONCILED: A paid {a_paid} got {a_got}; B paid {b_paid} got {b_got}; C paid {c_paid} got {c_got}; R earned {r_earned} msat"
+    );
+    steps.pass("msat reconciliation: channels and budgets, per participant");
+    drop((alice, bob, carol));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+    r.stop().unwrap();
+    println!("REGTEST-MEETING complete in {:?}", steps.started.elapsed());
+}
+
 /// Real pre-dispatch reservation release. This is deliberately a NO-ROUTE
 /// control, not a claim that a two-node direct channel charges forwarding fees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

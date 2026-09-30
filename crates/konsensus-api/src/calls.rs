@@ -87,10 +87,13 @@ async fn room(store: Store<'_>, peer: &NodeId, now: u64) -> Result<(), CallRefus
     Ok(())
 }
 
-/// Admit a signal this node received (after the payment gate). A refusal
-/// means it must not reach the app (the caller also withdraws the stored message).
-pub async fn admit_incoming(store: Store<'_>, peer: &NodeId, kind: u16, plaintext: Option<&str>) -> Result<CallSignal, CallRefusal> {
+/// Admit a signal this node (`own`) received from `peer` (after the payment
+/// gate). A refusal means it must not reach the app (the caller also
+/// withdraws the stored message). A meeting leg must come from the earlier
+/// participant of its roster.
+pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind: u16, plaintext: Option<&str>) -> Result<CallSignal, CallRefusal> {
     let signal = CallSignal::parse(kind, plaintext.ok_or(CallRefusal::Invalid("undecryptable"))?)?;
+    signal.check_leg(peer, own)?;
     let _g = lock().lock().await;
     let now = now_ms();
     let unavailable = |_| CallRefusal::Invalid("call state unavailable");
@@ -121,9 +124,11 @@ fn refused(e: CallRefusal) -> ApiError {
 /// canonical one the journal uses. One operation reserves one signal of one
 /// call for one request: the same id reserving another call (Fable N2) or the
 /// same call with another payload (Codex delta2 #2) is refused without
-/// touching the existing reservation.
-pub async fn reserve_outgoing(store: Store<'_>, peer: &NodeId, kind: u16, plaintext: &str, operation_id: &str, request_hash: &str) -> Result<(), ApiError> {
+/// touching the existing reservation. A meeting leg we (`own`) place must go
+/// to a later participant of its roster.
+pub async fn reserve_outgoing(store: Store<'_>, own: &NodeId, peer: &NodeId, kind: u16, plaintext: &str, operation_id: &str, request_hash: &str) -> Result<(), ApiError> {
     let signal = CallSignal::parse(kind, plaintext).map_err(refused)?;
+    signal.check_leg(own, peer).map_err(refused)?;
     let _g = lock().lock().await;
     let now = now_ms();
     let storage = |e: konsensus_storage::StorageError| ApiError::Internal(format!("call state: {e}"));
