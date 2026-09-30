@@ -593,6 +593,30 @@ async fn absurd_seq_floor_alone_starts_at_one() {
 }
 
 #[tokio::test]
+async fn garbage_seq_file_is_ignored_and_publish_starts_at_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let intro = settings(Some("node.example.org:9000"));
+    // Hand-edited garbage — must not lock publishing and must not be adopted.
+    std::fs::write(dir.path().join("front-door.seq"), b"not-a-number\n").unwrap();
+
+    let state = state_with_persist(intro, dir.path().to_path_buf());
+    let (status, body, _) = call(
+        &state,
+        "PUT",
+        "/api/v1/front-door",
+        bearer(&state, vec![auth::Scope::Admin]),
+        Some(json!({ "display_name": "Me" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["card"]["seq"], 1,
+        "garbage seq file must be ignored; expected seq 1, got {}",
+        body["card"]["seq"]
+    );
+}
+
+#[tokio::test]
 async fn verify_fails_closed_without_network() {
     let state = state_with(IntroductionSettings {
         network: None,
