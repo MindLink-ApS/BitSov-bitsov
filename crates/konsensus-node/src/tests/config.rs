@@ -2349,3 +2349,26 @@ fn channel_fee_subsidy_defaults_to_zero_ceiling() {
         0
     );
 }
+
+#[test]
+fn calls_stun_listen_is_off_by_default_and_parses() {
+    let base = r#"
+[identity]
+mnemonic_file = "/tmp/m.txt"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+"#;
+    let off: NodeConfig = toml::from_str(base).unwrap();
+    assert!(off.calls.stun_listen.is_none(), "no STUN socket unless the owner sets one");
+
+    let on: NodeConfig = toml::from_str(&format!("{base}\n[calls]\nstun_listen = \"0.0.0.0:3478\"\n")).unwrap();
+    assert_eq!(on.calls.stun_listen, Some("0.0.0.0:3478".parse().unwrap()));
+
+    assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\nturn_listen = \"0.0.0.0:3478\"\n")).is_err());
+    assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\nstun_listen = \"not-an-addr\"\n")).is_err());
+}
