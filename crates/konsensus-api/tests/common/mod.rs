@@ -1235,6 +1235,8 @@ pub struct ConnectedStubTransport {
     pub invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>>,
     /// One live connection per peer, established when the stub was built.
     pub since: Option<std::time::Instant>,
+    /// Every raw control frame sent (e.g. `PriceQuery`), in order.
+    pub raw_frames: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl ConnectedStubTransport {
@@ -1248,6 +1250,7 @@ impl ConnectedStubTransport {
             invoice_responder: None,
             invoice_requests,
             since: Some(std::time::Instant::now()),
+            raw_frames: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1305,6 +1308,7 @@ impl MessageTransport for ConnectedStubTransport {
         _peer: &NodeId,
         frame_bytes: &[u8],
     ) -> Result<(), TransportError> {
+        self.raw_frames.lock().unwrap().push(frame_bytes.to_vec());
         // Parse the frame to detect invoice requests and auto-respond.
         if let Ok(konsensus_message::wire::Frame::RequestInvoice {
             ref request_id,

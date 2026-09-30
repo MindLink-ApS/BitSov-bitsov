@@ -905,4 +905,82 @@ pub trait Storage: Send + Sync {
     async fn sweep_outstanding_web_requests(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
         Ok(0)
     }
+
+    // ── 1:1 call state (kinds 400-403) ─────────────────────────────────
+    // Defaults refuse: a backend without durable call state cannot take calls.
+
+    /// The stored state of `(peer, call_id)`, as written (not yet aged).
+    async fn call_get(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Insert or replace `(peer, call_id)`.
+    async fn call_put(&self, _peer: &konsensus_core::NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Forget `(peer, call_id)` (an offer that was never paid).
+    async fn call_delete(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Open calls and burned ids as of `now_ms`, for this peer and in total.
+    /// Open: a pending signal of ours, or reserved/ringing/live before its
+    /// deadline. Burned: otherwise, while replay protection runs past `now_ms`.
+    async fn call_counts(&self, _peer: &konsensus_core::NodeId, _now_ms: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Drop up to `max` burned ids (of `peer`, or of anyone) whose replay
+    /// protection ends at or before `replay_until_at_most`, oldest first. Never
+    /// an open call or a row with a pending signal. Returns how many went.
+    async fn call_evict_burned(&self, _peer: Option<&konsensus_core::NodeId>, _replay_until_at_most: u64, _now_ms: u64, _max: u64) -> Result<u64, StorageError> {
+        Err(StorageError::Unsupported("call state".into()))
+    }
+
+    /// Every entry with a reserved, unsettled signal of ours.
+    async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Drop up to `max` entries whose replay protection ended, with no pending signal.
+    async fn call_sweep(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+
+    /// An envelope the gate accepted and stored was refused by the application
+    /// (a call signal for no live call): remove the message and its cached
+    /// plaintext and mark its receipt application-rejected (`accepted = -1`), so
+    /// history, resync and duplicate ACKs never present it as delivered, while
+    /// its payment hash and nonce stay burned.
+    async fn reject_accepted_envelope(&self, _envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("reject accepted envelope".into()))
+    }
+
+    // ── Incoming call signal admission hold (Codex delta2 #4) ──────────
+    // A held message is invisible to history, resync and duplicate ACKs.
+
+    /// Hold `envelope` before its paid acceptance, unless a message with its
+    /// id is already stored. Returns whether this call placed the hold.
+    async fn call_admission_hold(&self, _envelope: &konsensus_core::UkmEnvelope, _now_ms: u64) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call admission hold".into()))
+    }
+
+    /// The signal was admitted (or never stored): make it visible / forget the hold.
+    async fn call_admission_release(&self, _id: &MessageId) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call admission hold".into()))
+    }
+
+    /// Whether `id` is held.
+    async fn call_admission_held(&self, _id: &MessageId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call admission hold".into()))
+    }
+
+    /// Fail closed on every hold placed before `held_before_ms` (a refusal
+    /// whose cleanup failed, or a crash before admission finished): withdraw
+    /// its message and plaintext, mark its receipt application-rejected, drop
+    /// the hold. Returns how many holds were withdrawn.
+    async fn call_admission_withdraw(&self, _held_before_ms: u64) -> Result<u64, StorageError> {
+        Ok(0)
+    }
 }

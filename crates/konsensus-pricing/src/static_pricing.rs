@@ -32,6 +32,10 @@ pub struct StaticPricingConfig {
     /// Price for real-time signaling messages (kinds 400-499) in millisatoshis.
     #[serde(default = "default_realtime_signal_msat")]
     pub realtime_signal_msat: u64,
+    /// Per-call admission: the price of a call offer (KIND_CALL_INVITE = 400)
+    /// in millisatoshis. Answers, ICE and hangups keep `realtime_signal_msat`.
+    #[serde(default = "default_call_msat")]
+    pub call_msat: u64,
     /// Price for app extension messages (kinds 1000+) in millisatoshis.
     #[serde(default = "default_app_ext_msat")]
     pub app_ext_msat: u64,
@@ -52,6 +56,10 @@ fn default_collab_msat() -> u64 {
 
 fn default_realtime_signal_msat() -> u64 {
     50
+}
+
+fn default_call_msat() -> u64 {
+    10_000
 }
 
 fn default_app_ext_msat() -> u64 {
@@ -76,6 +84,7 @@ impl Default for StaticPricingConfig {
             control_msat: 1,
             collaboration_msat: 25,
             realtime_signal_msat: 50,
+            call_msat: default_call_msat(),
             app_ext_msat: 10,
             web_content_msat: 50,
             relay_storage_msat: 100,
@@ -116,9 +125,14 @@ impl StaticPricingEngine {
 #[async_trait]
 impl PricingEngine for StaticPricingEngine {
     fn category_price_overrides(&self) -> Option<Vec<u16>> {
-        Some(if self.config.longform_msat != self.config.chat_msat {
-            vec![konsensus_core::kind::KIND_LONGFORM]
-        } else { Vec::new() })
+        let mut kinds = Vec::new();
+        if self.config.longform_msat != self.config.chat_msat {
+            kinds.push(konsensus_core::kind::KIND_LONGFORM);
+        }
+        if self.config.call_msat != self.config.realtime_signal_msat {
+            kinds.push(konsensus_core::kind::KIND_CALL_INVITE);
+        }
+        Some(kinds)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -134,6 +148,11 @@ impl PricingEngine for StaticPricingEngine {
         // more than chat because they carry more data (email-style).
         if kind == konsensus_core::kind::KIND_LONGFORM {
             return Ok(self.config.longform_msat);
+        }
+        // A call offer is the per-call admission; the rest of the call's
+        // signalling stays at the realtime category price.
+        if kind == konsensus_core::kind::KIND_CALL_INVITE {
+            return Ok(self.config.call_msat);
         }
         self.price_for_category(category)
     }

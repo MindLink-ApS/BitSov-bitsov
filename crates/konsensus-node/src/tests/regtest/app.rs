@@ -200,8 +200,13 @@ impl App {
             peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             lightning_backend: "ldk".into(),
             chain_backend: "esplora".into(),
-            introduction: Default::default(),
-        front_door: Default::default(),
+            // A dialable loopback endpoint on regtest, so a front-door card
+            // can be issued and knocked on.
+            introduction: konsensus_api::handlers::introduction::IntroductionSettings {
+                network: Some("regtest".into()),
+                endpoint: transport.listen_addr().map(|a| a.to_string()),
+            },
+            front_door: Default::default(),
             sponsor: Default::default(),
             gossip_validator: None,
             file_staging: Default::default(),
@@ -293,6 +298,21 @@ impl App {
     }
 
     pub async fn post(&self, uri: &str, body: Value, owner: bool) -> (StatusCode, Value) {
+        self.request("POST", uri, Some(body), owner).await
+    }
+    pub async fn put(&self, uri: &str, body: Value, owner: bool) -> (StatusCode, Value) {
+        self.request("PUT", uri, Some(body), owner).await
+    }
+    pub async fn get(&self, uri: &str, owner: bool) -> (StatusCode, Value) {
+        self.request("GET", uri, None, owner).await
+    }
+    async fn request(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        owner: bool,
+    ) -> (StatusCode, Value) {
         let token = if owner {
             konsensus_api::auth::create_token(
                 &self.state.identity.node_id().to_hex(),
@@ -308,17 +328,17 @@ impl App {
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("POST")
+                    .method(method)
                     .uri(uri)
                     .header("authorization", format!("Bearer {token}"))
                     .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
+                    .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
                     .unwrap(),
             )
             .await
             .unwrap();
         let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        let bytes = axum::body::to_bytes(response.into_body(), 8 << 20)
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())

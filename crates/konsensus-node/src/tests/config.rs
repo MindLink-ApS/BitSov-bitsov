@@ -446,6 +446,7 @@ auto_connect = false
     // Default values for unset fields
     assert_eq!(config.pricing.control_msat, 1);
     assert_eq!(config.pricing.realtime_signal_msat, 50);
+    assert_eq!(config.pricing.call_msat, 10_000);
     assert_eq!(config.payment_gate.verify_lightning_settlement, Some(true));
     assert_eq!(config.peers.len(), 2);
     assert_eq!(config.peers[0].label.as_deref(), Some("Alice"));
@@ -1329,6 +1330,19 @@ fn validate_zero_realtime_pricing_rejected() {
     );
     config.peers.clear();
     config.pricing.realtime_signal_msat = 0;
+    let err = config.validate().unwrap_err();
+    assert!(err.to_string().contains("pricing"), "got: {err}");
+}
+
+#[test]
+fn validate_zero_call_pricing_rejected() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.peers.clear();
+    config.pricing.call_msat = 0;
     let err = config.validate().unwrap_err();
     assert!(err.to_string().contains("pricing"), "got: {err}");
 }

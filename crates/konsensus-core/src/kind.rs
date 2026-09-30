@@ -75,13 +75,14 @@ pub const KIND_TOPIC_UNSUBSCRIBE: u16 = 523;
 
 // ── Real-time Signaling (400–499) ──────────────────────────────────────
 
-/// Call invite. (Deferred — not implemented in v2.0)
+/// Call offer (SDP). Priced at the recipient's `call_msat`: the per-call admission.
+/// Payload: [`crate::payloads::call::CallSignal`].
 pub const KIND_CALL_INVITE: u16 = 400;
-/// Call answer. (Deferred)
+/// Call answer (SDP), from the callee while the offer rings.
 pub const KIND_CALL_ANSWER: u16 = 401;
-/// ICE candidate. (Deferred)
+/// Trickled ICE candidate for a live call.
 pub const KIND_ICE_CANDIDATE: u16 = 402;
-/// Call hangup. (Deferred)
+/// Call hangup / decline.
 pub const KIND_CALL_HANGUP: u16 = 403;
 
 // ── Control (900–999) ──────────────────────────────────────────────────

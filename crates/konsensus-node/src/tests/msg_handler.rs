@@ -1872,3 +1872,140 @@ async fn kind_offer_publication_serializes_discount_and_fails_closed() {
     source.shutdown();
     target.shutdown();
 }
+
+/// 1:1 call signalling (kinds 400-403) end to end over Noise, through the
+/// real receive loop: the offer is admitted only when paid at the recipient's
+/// `call_msat`, once per call id; answer/ICE/hangup reach the app only for a
+/// live call with that sender, from the right side. Nothing refused is
+/// forwarded to the WebSocket.
+#[tokio::test]
+async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call() {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| Arc::new(NoiseTransport::new(id, TransportConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        admission_mode: ReachabilityMode::PriceOpen, ..Default::default()
+    }));
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source.connect(bob.node_id(), &target.listen_addr().unwrap().to_string()).await.unwrap();
+    while !matches!(source.recv_control().await.unwrap(), ControlEvent::PeerConnected { .. }) {}
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let sessions_b = Arc::new(SessionManager::new(bob.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, mut ws_rx) = broadcast::channel(16);
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> =
+        Arc::new(konsensus_pricing::StaticPricingEngine::new(Default::default()));
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(), transport_ack: target.clone(), storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true, ..Default::default()
+        })),
+        pricing,
+        lightning: wallet.clone(), chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b, nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None, routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(), plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx, audit_log: audit, admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None, shutdown_rx,
+    }));
+
+    // Alice pays `msat` to Bob and sends one signal of `kind`.
+    let signal = |kind: u16, msat: u64, body: String| {
+        let (wallet, sessions_a, alice, bob) = (wallet.clone(), &sessions_a, alice.clone(), bob.clone());
+        async move {
+            let hash = wallet.inject_inbound_keysend(msat, None).await;
+            let payment = wallet.get_payment_status(&hash).await.unwrap();
+            let proof = PaymentProof::new(hex::decode(&hash).unwrap().try_into().unwrap(),
+                hex::decode(payment.preimage.unwrap()).unwrap().try_into().unwrap(), msat);
+            let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+                &sessions_a.encrypt(bob.node_id(), body.as_bytes()).await.unwrap());
+            let mut env = UkmEnvelopeBuilder::new(kind, *alice.node_id(), Recipient::Node(*bob.node_id()), ciphertext, proof).build();
+            env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+            env
+        }
+    };
+    let outcome = |source: Arc<NoiseTransport>| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { duplicate, .. } => break Ok(duplicate),
+                    ControlEvent::MessageRejected { reason, .. } => break Err(reason),
+                    _ => {}
+                }
+            }
+        }).await.unwrap()
+    };
+    let id = format!("{:032x}", rand::random::<u128>());
+    let offer = format!(r#"{{"v":1,"call_id":"{id}","media":"audio","sdp":"v=0\r\no=- 1 1 IN IP4 127.0.0.1"}}"#);
+
+    // Underpaid by a stranger (the realtime price, not the call admission):
+    // dropped without a word, nothing rings.
+    let env = signal(400, 50, offer.clone()).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(ws_rx.try_recv().is_err());
+
+    // Paid at Bob's call_msat (10 000 msat default): rings Bob's app once.
+    let env = signal(400, 10_000, offer.clone()).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    let rung = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv()).await.unwrap().unwrap();
+    assert_eq!((rung.envelope.kind, rung.plaintext.as_deref()), (400, Some(offer.as_str())));
+    // Now a paid peer: an underpaid offer for another call is refused openly.
+    let under = format!(r#"{{"v":1,"call_id":"{:032x}","media":"video","sdp":"v=0"}}"#, rand::random::<u128>());
+    let env_under = signal(400, 9_999, under).await;
+    source.send(bob.node_id(), &env_under).await.unwrap();
+    assert!(outcome(source.clone()).await.unwrap_err().to_lowercase().contains("insufficient"));
+    assert!(ws_rx.try_recv().is_err());
+    // The same envelope again is a duplicate: acked, never forwarded twice.
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(true));
+    // A freshly paid offer reusing the call id is a replay: refused.
+    let env = signal(400, 10_000, offer.clone()).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(outcome(source.clone()).await.unwrap_err().contains("replayed"));
+    assert!(ws_rx.try_recv().is_err());
+    // Codex P1: the refused signal is withdrawn (no history/resync), and a
+    // resend of the very same paid envelope is refused, not duplicate-ACKed.
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    assert!(ws_rx.try_recv().is_err());
+
+    // Alice made the offer, so an answer from Alice is from the wrong side.
+    let env = signal(401, 50, format!(r#"{{"v":1,"call_id":"{id}","sdp":"v=0"}}"#)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    // ICE for this live call reaches the app; ICE for an unknown call does not.
+    let ice = |call: &str| format!(r#"{{"v":1,"call_id":"{call}","candidate":"candidate:1 1 udp 2130706431 127.0.0.1 9 typ host","sdp_mid":"0","sdp_mline_index":0}}"#);
+    let env = signal(402, 50, ice(&id)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    assert_eq!(tokio::time::timeout(Duration::from_secs(5), ws_rx.recv()).await.unwrap().unwrap().envelope.kind, 402);
+    let other = format!("{:032x}", rand::random::<u128>());
+    let env = signal(402, 50, ice(&other)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(outcome(source.clone()).await.unwrap_err().contains("no live call"));
+    // Hangup ends it; later ICE for that call is refused.
+    let env = signal(403, 50, format!(r#"{{"v":1,"call_id":"{id}","reason":"hangup"}}"#)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    assert_eq!(tokio::time::timeout(Duration::from_secs(5), ws_rx.recv()).await.unwrap().unwrap().envelope.kind, 403);
+    let env = signal(402, 50, ice(&id)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    assert!(ws_rx.try_recv().is_err());
+    shutdown.send(true).unwrap(); worker.await.unwrap(); source.shutdown(); target.shutdown();
+}
