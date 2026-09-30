@@ -1874,6 +1874,7 @@ async fn status_reports_custody_mode_to_the_owner_only() {
         (CustodyMode::LocalSeed, "local_seed"),
         (CustodyMode::EncryptedSeed, "encrypted_seed"),
         (CustodyMode::HostedCustody, "hosted_custody"),
+        (CustodyMode::MoneySigner, "money_signer"),
         (CustodyMode::RemoteSigner, "remote_signer"),
     ] {
         let state = Arc::new(AppState { custody_mode: mode, ..(*test_state()).clone() });

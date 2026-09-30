@@ -82,8 +82,9 @@ pub struct HealthResponse {
     /// `stun_unreachable` or `stun_invalid_response`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_endpoint_reason: Option<String>,
-    /// Where the seed lives: `local_seed`, `encrypted_seed`, `hosted_custody`
-    /// or `remote_signer` (`docs/protocol/REMOTE-SIGNER.md` §2). Owner-only.
+    /// Where the seed lives: `local_seed`, `encrypted_seed`, `hosted_custody`,
+    /// `money_signer` or `remote_signer` (`docs/protocol/REMOTE-SIGNER.md` §2).
+    /// Owner-only.
     pub custody_mode: crate::custody::CustodyMode,
 }
 

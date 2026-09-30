@@ -31,43 +31,66 @@ So there are only two honest ways to run a node on someone else's machine:
 2. The seed is on the VM, and the app says **hosted custody** everywhere the
    node's money or identity is shown.
 
-There is no third option. "Encrypted on the VM" is not one: the node decrypts
-the seed into memory at start, and the operator can read that memory.
+There is no third option that pretends to be full remote signing. "Encrypted
+on the VM" is not one: the node decrypts the seed into memory at start, and
+the operator can read that memory. A **money-only** interim (`money_signer`)
+is allowed only when it is labelled as such and discloses that the identity
+root stays on the server (§2).
 
 ## 2. Custody modes
 
 The node reports one value in `GET /api/v1/status` as `custody_mode`
 (owner-only). The app shows it as a badge beside the node.
 
-| `custody_mode` | Meaning | Who can spend | App badge |
+| `custody_mode` | Meaning | Who can spend / speak | App badge |
 |---|---|---|---|
 | `local_seed` | The seed is a plaintext `mnemonic.txt` on the node's machine | Any program running as the node's OS user | **Seed on this machine** |
 | `encrypted_seed` | The seed is an encrypted `.enc` with no plaintext copy beside it | The node while it runs; at rest, only with the password | **Encrypted seed** |
 | `hosted_custody` | The node holds its seed on a machine operated for the owner (`tier = "cloud"`, or `[identity] hosted = true`) | **Whoever runs that machine** | **Hosted custody** (warning colour) |
-| `remote_signer` | The node holds no seed and no owner key. It asks the owner's signer | Only the owner's signer, within its policy | **Your keys, remote node** |
+| `money_signer` | Money and owner-approval keys are on the owner's signer; the **identity root stays on the VM** | Money: only the owner's signer. Identity: whoever runs the VM | **Money on your device** (warns that chat identity is server-held) |
+| `remote_signer` | The node holds no seed and no owner key, including the **identity root**. It asks the owner's signer | Only the owner's signer, within its policy | **Your keys, remote node** |
 
-Precedence, highest first: `remote_signer`, then `hosted_custody`, then
-`encrypted_seed`, then `local_seed`. An encrypted seed on a hosted machine is
-`hosted_custody`, because the node decrypts it into the operator's memory.
+Precedence, highest first: `remote_signer`, then `money_signer`, then
+`hosted_custody`, then `encrypted_seed`, then `local_seed`. An encrypted seed
+on a hosted machine is `hosted_custody`, because the node decrypts it into
+the operator's memory.
+
+**Gate for the full label.** A node may report `remote_signer` only when all
+of the following hold:
+
+```
+remote_signer_allowed =
+    money_keys_off_vm
+    && owner_approval_key_off_vm
+    && identity_root_off_vm
+```
+
+If money signing is ready but the identity root is still on the VM, the node
+reports `money_signer`, never `remote_signer`. The app badge for
+`money_signer` must name that the NodeId / chat-identity private key is
+server-held.
 
 **The node cannot know who owns its machine.** A VM with a default config
-looks like a laptop. So the app applies one more rule itself, and it can only
+looks like a laptop. The app applies one more rule itself, and it can only
 make the label stronger:
 
-- If the app talks to its node over a non-loopback address, and the node
-  reports anything other than `remote_signer`, or reports no `custody_mode`
-  at all (an older node), the app shows **Hosted custody**. The Tauri host
-  applies this rule (`control::custody_mode`); today the app only attaches
-  to loopback nodes, so it is a guard for the hosted-node onboarding to come.
-- A node on the owner's own home server, reached over the LAN, is also
-  labelled this way. That is accurate: whoever runs that machine can spend.
-  The owner is that person, and the tooltip says so.
+- A loopback URL is **not** proof the node runs on this machine: an SSH
+  forward or local proxy looks identical. The host may show `local_seed` or
+  `encrypted_seed` only with **verified local provenance** (for example, the
+  supervised node process is listening on the API port — same machine, same
+  user, the data dir the host started). Otherwise it classifies
+  conservatively as `hosted_custody`, including older nodes that report
+  nothing over an unverified connection.
+- `remote_signer` and `money_signer` are allowed without that provenance:
+  they do not claim the seed is local.
+- The Tauri host applies this (`control::custody_mode(reported,
+  verified_local_node)`).
 
 The app never shows a weaker label than the node reports, and it never shows
-`remote_signer` unless the node reports it.
+`remote_signer` or `money_signer` unless the node reports them.
 
-`remote_signer` is reserved: no node reports it until §3 to §5 are built
-(**GAP**).
+Both signer modes are reserved: no node reports them until the matching
+protocol slice is built (**GAP**).
 
 ## 3. What moves to the signer
 
@@ -75,14 +98,14 @@ Every key comes from the one seed (`ACCOUNT-LAYER.md` §1). A remote-signer
 node splits them by what must be online all the time and what must never be
 on the VM.
 
-| Key | Where it lives with a remote signer | Why |
-|---|---|---|
-| Owner approval (Ed25519) | **Signer only** | Already public-only on the node (`ACCOUNT-LAYER.md` §4). No verifier changes. This is the first key to move. |
-| Lightning node key, channel keys | **Signer only** | They move money. Every commitment update is signed by the signer (§4). |
-| On-chain wallet | **Signer only** | The node builds a PSBT; the signer signs it after checking the outputs. |
-| Node identity (Ed25519) | **Signer holds the root**; the VM holds an **operational key** certified by it | The mesh identity signs the front-door card, auth challenges and introductions many times an hour. The root signs a delegation (§3.1). |
-| Transport (X25519) | VM | Noise_XX handshakes happen whenever a peer connects. It is derived from the operational key's seed material, not the root. |
-| Storage (AES-256) | VM | The node must read its own database. **This is not protected from the operator** (§7). |
+| Key | Where it lives with `remote_signer` | With `money_signer` | Why |
+|---|---|---|---|
+| Owner approval (Ed25519) | **Signer only** | **Signer only** | Already public-only on the node (`ACCOUNT-LAYER.md` §4). |
+| Lightning node key, channel keys | **Signer only** | **Signer only** | They move money. Every commitment update is signed by the signer (§4). |
+| On-chain wallet | **Signer only** | **Signer only** | The node builds a PSBT; the signer signs it after checking the outputs. |
+| Node identity (Ed25519) | **Signer holds the root**; the VM holds an **operational key** certified by it | **VM holds the root** (disclosed) | Mesh identity signs the front-door card, auth challenges and introductions many times an hour. Full `remote_signer` requires the root off the VM (§3.1). |
+| Transport (X25519) | VM | VM | Noise_XX handshakes happen whenever a peer connects. |
+| Storage (AES-256) | VM | VM | The node must read its own database. **This is not protected from the operator** (§7). |
 
 ### 3.1 Operational key delegation
 
@@ -103,10 +126,10 @@ on the VM.
   by the root. The owner can leave a hosted node by rotating to a new index,
   or back to a node at home. The operator keeps a key that peers no longer
   accept.
-- **GAP.** Depends on §8 (rotation, M1.5). Until then, a remote-signer node
-  keeps its NodeId key on the VM, and the badge says so in its tooltip:
-  "Your money keys are on your device. This node's chat identity is on the
-  server."
+- **GAP.** Depends on §8 (rotation, M1.5). Until delegation ships, a node that
+  has money keys on the signer but still holds the NodeId root on the VM
+  reports **`money_signer`**, not `remote_signer`. It must never claim the
+  full remote-signer label while the identity root remains on the VM.
 
 ## 4. The signer protocol
 
@@ -171,8 +194,8 @@ that is easy to get wrong, and VLS exists to do it.
 
 ## 5. When the signer is offline
 
-The owner's laptop sleeps. The node must stay a safe, reachable, honest
-server without it.
+The owner's laptop sleeps. The node must stay a reachable, honest server
+without it. What still works without the signer:
 
 | Works without the signer | Does not work until it returns |
 |---|---|
@@ -180,24 +203,54 @@ server without it.
 | Serving the front-door card, which the owner pre-signs with its `expires_at` | Receiving a payment: accepting an HTLC needs a new commitment signature |
 | Answering `/health` and the owner's `/status` | Opening, splicing or cooperatively closing a channel |
 | Queuing work: approvals, grants and outbound sends wait with their expiry, as console grants already do | Approving a device, a grant or a front-door publish |
-| **Breach response**: the signer signs each justice transaction when it receives the revocation, and hands it to the node, so a cheating counterparty is punished while the signer sleeps | On-chain sends |
+| **Breach response** *only if* justice material was pre-signed and left on the node while the signer was connected (**GAP** until that path exists) | On-chain sends |
 
-Three rules keep the offline node safe:
+### 5.1 Planned disconnect
 
-1. **No pending HTLCs without the signer.** The node refuses new inbound and
-   outbound HTLCs and forwards while the signer is disconnected. It therefore
-   has nothing with a deadline that would need a signature to force-close in
-   time.
-2. **Peers see "not accepting payments", not silence.** Senders get the paid
+Before the owner deliberately takes the signer offline (sleep, travel, "pause
+payments"):
+
+1. The node **drains**: it refuses new inbound and outbound HTLCs and
+   forwards, then waits until every accepted HTLC is settled or failed.
+2. Only when the pending-HTLC set is empty does `/status` report
+   `signer: draining complete` and the app allow "signer offline" as a
+   planned state.
+3. Peers see "not accepting payments", not silence. Senders get the paid
    admission refusal they get today when the wallet cannot pay or receive.
-   Their own node queues the message, as it does for an offline peer.
-3. **Owner visibility.** `/status` reports `signer: connected | offline since
-   <t>`, and the app says "Your node is online. Payments wait until this
-   device is back." (**GAP**, with the protocol.)
 
-Force-closes the counterparty starts while the signer is offline sweep to
-the owner's wallet after `to_self_delay`. The sweep waits for the signer and
-has that whole window to do it.
+**GAP.** Drain + status signalling are not built.
+
+### 5.2 Abrupt loss
+
+A crash, network cut, or killed app can leave HTLCs that were already
+accepted while the signer was connected. Rejecting *new* HTLCs after
+disconnect does **not** clear those. They still have on-chain deadlines
+(BOLT 5: unresolved outputs must be monitored and resolved on distinct
+local/remote commitment and HTLC paths). Pre-signed justice transactions
+address revoked commitments, not every ordinary HTLC resolution.
+
+Required before any "funds stay safe while the signer sleeps" claim:
+
+```
+accept_htlc => safe_resolution_material_persisted_for_abrupt_signer_loss
+```
+
+That material must let the node (or a designated watchtower the owner chose)
+force-close and resolve HTLC outputs **without** exporting the owner key to
+the VM, with a validated fee strategy and enough time relative to the
+HTLC CLTV / `to_self_delay` windows.
+
+**GAP — offline funds safety.** Until that durable abrupt-loss path exists
+and is tested, this design does **not** claim that funds stay safe across an
+unexpected signer disappearance. The honest interim statement is: planned
+disconnects need a completed drain (§5.1); abrupt loss is an unresolved
+risk bounded by each channel's on-chain timeouts; the operator of the VM
+must not be handed the seed as a workaround.
+
+### 5.3 Owner visibility
+
+`/status` reports `signer: connected | draining | offline since <t>`, and
+the app says so. (**GAP**, with the protocol.)
 
 ## 6. The fallback: honest hosted custody
 
@@ -221,30 +274,36 @@ to use one:
   say this. **GAP**: the flow is not built.
 - Pilot VMs (Maya, Josh) are hosted custody today. They must set
   `[identity] hosted = true` at the next upgrade. Until then, the app's
-  non-loopback rule (§2) labels them anyway.
+  unverified-connection rule (§2) labels them anyway.
 
 ## 7. What a remote signer does not fix
 
 - **Confidentiality.** A hosted node decrypts messages, holds the storage key
   and serves the owner's data. The operator can read it. The remote signer
-  protects money and the identity root, not content. The `remote_signer`
-  badge tooltip must say "Messages are stored on the server."
-- **Liveness.** The operator can switch the node off. Funds stay safe; the
-  owner moves the node home.
+  protects money and (when `remote_signer`) the identity root, not content.
+  The `remote_signer` badge tooltip must say "Messages are stored on the
+  server." The `money_signer` badge must say the identity root stays on the
+  server.
+- **Liveness.** The operator can switch the node off. Offline funds safety
+  is §5 (**GAP**); the owner can still move the node home.
 - **Metadata.** The operator sees who the node talks to and when.
 
 ## 8. Build order
 
 1. **Now (this slice).** `custody_mode` in `/status`, `[identity] hosted`,
-   the Cloud tier maps to `hosted_custody`, and the app badge with the
-   non-loopback rule.
+   the Cloud tier maps to `hosted_custody`, and the app badge with verified
+   local provenance (not mere loopback).
 2. **Owner approvals over the signer channel.** §4.1 plus `owner_approval`
-   only. Smallest real remote signer: the owner-approval key is already off
-   the node, so only transport and setup are new.
+   only. Smallest real remote-signing channel: the owner-approval key is
+   already off the node, so only transport and setup are new.
 3. **On-chain PSBT signing.**
 4. **Lightning signing through VLS**, with the `ldk-node` constructor change.
-   Only after this may a node report `remote_signer`.
-5. **Operational-key delegation**, after node-key rotation (M1.5).
+   With identity still on the VM, the node may report **`money_signer`**
+   only — never `remote_signer`.
+5. **Operational-key delegation**, after node-key rotation (M1.5), plus the
+   §5 drain and abrupt-loss resolution material. Only when
+   `identity_root_off_vm` and the offline-safety invariant hold may a node
+   report `remote_signer`.
 
 ## 9. Invariants (tested now)
 
@@ -252,9 +311,10 @@ to use one:
   in the public `/health` (`auth_tests::status_reports_custody_mode_to_the_owner_only`).
 - A Cloud-tier node, or one with `hosted = true`, reports `hosted_custody`
   even when its seed is encrypted (`custody_mode_tests`).
-- No config value makes a node report `remote_signer` today
+- No config value makes a node report `remote_signer` or `money_signer` today
   (`custody_mode_tests::no_config_claims_a_remote_signer`).
-- The app never shows a weaker label than the node reports, and labels a
-  non-loopback node that holds its seed as hosted custody
+- The app never shows a weaker label than the node reports; local seed labels
+  require verified local provenance; an unverified loopback (e.g. SSH forward)
+  is classified as hosted custody
   (`control::tests::custody_mode_is_projected_and_only_ever_strengthened`
   and `tests/custody-badge.test.tsx`, in `bitsov-app`).

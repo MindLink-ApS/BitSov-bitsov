@@ -719,7 +719,8 @@ fn owner_approval_key(
 /// Where this node's seed lives, for the owner's badge
 /// (`docs/protocol/REMOTE-SIGNER.md` §2). A hosted node holding its seed is
 /// `hosted_custody` even when the seed is encrypted: it decrypts into the
-/// operator's memory. Nothing here yields `remote_signer`; no signer exists.
+/// operator's memory. Nothing here yields `remote_signer` or `money_signer`;
+/// no signer exists (REMOTE-SIGNER.md §2 gate).
 fn custody_mode(config: &NodeConfig) -> konsensus_api::custody::CustodyMode {
     use konsensus_api::custody::CustodyMode;
     let path = &config.identity.mnemonic_file;
@@ -1999,6 +2000,7 @@ mod custody_mode_tests {
                     let (_d, mut c) = config(password, tier);
                     c.identity.hosted = hosted;
                     assert_ne!(custody_mode(&c), CustodyMode::RemoteSigner);
+                    assert_ne!(custody_mode(&c), CustodyMode::MoneySigner);
                 }
             }
         }
