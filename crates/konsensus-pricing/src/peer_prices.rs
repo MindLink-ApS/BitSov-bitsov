@@ -54,6 +54,12 @@ impl PeerPriceEntry {
     /// Maps the kind to a category name and looks up the price in the table.
     /// Returns `None` if the kind's category isn't in the peer's table.
     pub fn get_price_for_kind(&self, kind: u16) -> Option<u64> {
+        // A per-kind price (the peer's call offer price) wins over its category.
+        if kind == konsensus_core::kind::KIND_CALL_INVITE {
+            if let Some(price) = self.prices.get(&kind_key(kind)) {
+                return Some(*price);
+            }
+        }
         let category = KindCategory::from_kind(kind);
         let category_name = category_to_string(category);
         self.prices.get(&category_name).copied()
@@ -99,6 +105,10 @@ impl PeerPriceEntry {
 /// endpoint (reader). Uses `RwLock` for read-heavy access pattern.
 pub struct PeerPriceCache {
     entries: RwLock<HashMap<NodeId, PeerPriceEntry>>,
+    /// When each peer last answered a `PriceQuery` for each kind. The entry's
+    /// own `received_at` moves with any table or kind update, so it cannot
+    /// tell whether *this* kind was answered.
+    kind_answers: RwLock<HashMap<(NodeId, u16), Instant>>,
 }
 
 impl PeerPriceCache {
@@ -106,6 +116,7 @@ impl PeerPriceCache {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            kind_answers: RwLock::new(HashMap::new()),
         }
     }
 
@@ -252,8 +263,13 @@ impl PeerPriceCache {
         price_msat: u64,
         block_height: u64,
     ) {
-        let category = KindCategory::from_kind(kind);
-        let category_name = category_to_string(category);
+        // A call offer's price is per kind: never overwrite the category the
+        // call's answers and ICE are priced at.
+        let category_name = if kind == konsensus_core::kind::KIND_CALL_INVITE {
+            kind_key(kind)
+        } else {
+            category_to_string(KindCategory::from_kind(kind))
+        };
         let mut entries = self.entries.write().await;
         if let Some(entry) = entries.get_mut(&peer_id) {
             entry.prices.insert(category_name.clone(), price_msat);
@@ -286,11 +302,33 @@ impl PeerPriceCache {
                 "created peer price entry from PriceResponse"
             );
         }
+        // Publish the fresh-answer time only now, while the price table is
+        // still write-locked (Codex delta3 #2): a reader that sees this answer
+        // reads the price under that lock afterwards, so it can never pair the
+        // new answer with the previous tariff. Lock order: entries, then answers.
+        // Only privileged peers reach here; still bound the map (4 096
+        // answers), dropping answers older than an hour first.
+        let mut answers = self.kind_answers.write().await;
+        if answers.len() >= 4096 {
+            answers.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(3600));
+            if answers.len() >= 4096 {
+                answers.clear();
+            }
+        }
+        answers.insert((peer_id, kind), Instant::now());
+        drop(answers);
+        drop(entries);
+    }
+
+    /// When `peer` last answered a price query for `kind` (see `kind_answers`).
+    pub async fn kind_answered_at(&self, peer_id: &NodeId, kind: u16) -> Option<Instant> {
+        self.kind_answers.read().await.get(&(*peer_id, kind)).copied()
     }
 
     /// Remove a peer's cached pricing (e.g., on disconnect).
     pub async fn remove(&self, peer_id: &NodeId) {
         self.entries.write().await.remove(peer_id);
+        self.kind_answers.write().await.retain(|(peer, _), _| peer != peer_id);
     }
 
     /// Number of cached peer price tables.
@@ -455,6 +493,12 @@ pub struct PriceTableMetadata {
     pub trust_level: konsensus_core::traits::chain::TrustLevel,
 }
 
+/// Price-table key for a per-kind price (`kind:400`), as the durable
+/// delivery-offer store names it.
+pub fn kind_key(kind: u16) -> String {
+    format!("kind:{kind}")
+}
+
 /// Build a price table HashMap from a `PricingEngine` for all categories.
 ///
 /// Used to construct the `PriceTable` frame to send to peers.
@@ -477,6 +521,15 @@ pub async fn build_price_table(
     for cat in categories {
         if let Ok(price) = pricing.get_category_price_msat(cat).await {
             prices.insert(category_to_string(cat), price);
+        }
+    }
+
+    // The call offer is the per-call admission. When it differs from the
+    // realtime category, peers need it by kind to pay it (and nothing else).
+    let call = konsensus_core::kind::KIND_CALL_INVITE;
+    if pricing.category_price_overrides().is_some_and(|k| k.contains(&call)) {
+        if let Ok(price) = pricing.get_price_msat(call).await {
+            prices.insert(kind_key(call), price);
         }
     }
 

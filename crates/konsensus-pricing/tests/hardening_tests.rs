@@ -477,8 +477,9 @@ async fn static_engine_boundary_kinds() {
     assert_eq!(engine.get_price_msat(300).await.unwrap(), 25);
     // Boundary: kind 399 is still Collaboration
     assert_eq!(engine.get_price_msat(399).await.unwrap(), 25);
-    // Boundary: kind 400 is RealTimeSignaling
-    assert_eq!(engine.get_price_msat(400).await.unwrap(), 50);
+    // Boundary: kind 400 is RealTimeSignaling, priced as the per-call admission
+    assert_eq!(engine.get_price_msat(400).await.unwrap(), 10_000);
+    assert_eq!(engine.get_price_msat(401).await.unwrap(), 50);
     // Boundary: kind 499 is still RealTimeSignaling
     assert_eq!(engine.get_price_msat(499).await.unwrap(), 50);
     // Boundary: kind 500 is WebContent

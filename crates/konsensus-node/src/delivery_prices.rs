@@ -46,7 +46,8 @@ pub(crate) async fn send_price_frame(
                 {
                     prices.extend(categories.iter().map(|(category, price)| {
                         (
-                            format!("category:{category}"),
+                            // Per-kind entries (`kind:400`) keep their scope.
+                            if category.starts_with("kind:") { category.clone() } else { format!("category:{category}") },
                             konsensus_pricing::peer_prices::apply_trust_discount(*price, discount),
                         )
                     }));

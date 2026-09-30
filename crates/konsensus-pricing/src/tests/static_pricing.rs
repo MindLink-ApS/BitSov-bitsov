@@ -64,7 +64,7 @@ async fn app_extension_price() {
 #[tokio::test]
 async fn realtime_signaling_price() {
     let e = engine();
-    assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 50);
+    assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 10_000);
     assert_eq!(e.get_price_msat(KIND_CALL_ANSWER).await.unwrap(), 50);
     assert_eq!(e.get_price_msat(KIND_ICE_CANDIDATE).await.unwrap(), 50);
 }
@@ -173,7 +173,27 @@ async fn custom_config() {
     assert_eq!(e.get_price_msat(KIND_LONGFORM).await.unwrap(), 200);
     assert_eq!(e.get_price_msat(KIND_FILE_REF).await.unwrap(), 500);
     assert_eq!(e.get_price_msat(KIND_TYPING).await.unwrap(), 5);
-    assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 90);
+    // A call offer is the per-call admission (call_msat); the rest of the
+    // call's signalling keeps the realtime category price.
+    assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 10_000);
+    assert_eq!(e.get_price_msat(konsensus_core::kind::KIND_CALL_ANSWER).await.unwrap(), 90);
+    assert_eq!(e.category_price_overrides(), Some(vec![KIND_LONGFORM, KIND_CALL_INVITE]));
+}
+
+#[tokio::test]
+async fn call_offer_uses_call_msat_and_is_advertised_per_kind() {
+    let e = StaticPricingEngine::new(StaticPricingConfig { call_msat: 25_000, ..Default::default() });
+    assert_eq!(e.get_price_msat(KIND_CALL_INVITE).await.unwrap(), 25_000);
+    for k in [401, 402, 403] {
+        assert_eq!(e.get_price_msat(k).await.unwrap(), 50);
+    }
+    let table = crate::peer_prices::build_price_table(&e).await;
+    assert_eq!(table["realtime_signaling"], 50);
+    assert_eq!(table["kind:400"], 25_000);
+    // No override, no per-kind entry.
+    let same = StaticPricingEngine::new(StaticPricingConfig { call_msat: 50, ..Default::default() });
+    assert!(!crate::peer_prices::build_price_table(&same).await.contains_key("kind:400"));
+    assert_eq!(same.category_price_overrides(), Some(vec![KIND_LONGFORM]));
 }
 
 #[test]
@@ -185,6 +205,7 @@ fn default_config_matches_toml_example() {
     assert_eq!(config.file_ref_msat, 100);
     assert_eq!(config.control_msat, 1);
     assert_eq!(config.realtime_signal_msat, 50);
+    assert_eq!(config.call_msat, 10_000);
 }
 
 #[test]

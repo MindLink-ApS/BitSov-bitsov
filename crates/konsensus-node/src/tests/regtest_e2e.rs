@@ -470,6 +470,355 @@ async fn real_ldk_regtest_e2e() {
     println!("REGTEST-E2E complete in {:?}", steps.started.elapsed());
 }
 
+/// One call signal through `from`'s real compose API.
+async fn signal(from: &app::App, to: &str, kind: u16, plaintext: String) -> (axum::http::StatusCode, Value) {
+    from.post("/api/v1/messages/compose", json!({"recipient": to, "kind": kind, "plaintext": plaintext}), false).await
+}
+
+/// Wait for `app` to receive a signal of `kind` from `from` (its feed also
+/// echoes its own sends).
+async fn recv_kind(app: &mut app::App, from: &konsensus_core::NodeId, kind: u16) -> Arc<konsensus_api::state::WsMessage> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let m = app.received.recv().await.unwrap();
+            if m.envelope.sender == *from && m.envelope.kind == kind {
+                return m;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timeout waiting for kind {kind}"))
+}
+
+/// 1:1 call signalling over real LDK on regtest (overnight ticket A, step 2).
+/// Same A -- C -- B topology as `real_ldk_regtest_e2e`. The offer (400) pays
+/// B's `call_msat` (10,000 msat default) once; answer/ICE/hangup pay the
+/// realtime price (1,000 msat after the 1-sat floor). A reused call id and a
+/// signal after hangup are refused by the sender's own node before paying.
+/// Media (WebRTC) never touches the node and is not part of this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local Bitcoin Core and electrs; scripts/regress/regtest_e2e.sh"]
+async fn real_ldk_regtest_calls() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let mut steps = Steps::new();
+    let chain = infra::Chain::start().await;
+    let dirs = [(); 3].map(|_| tempfile::tempdir().unwrap());
+    let (a, _) = infra::lightning(dirs[0].path(), &chain).await;
+    let (b, addr_b) = infra::lightning(dirs[1].path(), &chain).await;
+    let (c, addr_c) = infra::router(dirs[2].path(), &chain).await;
+    let c_pubkey = c.node_id().to_string();
+    steps.pass("chain + 3 real LDK nodes started");
+    chain.fund(a.node()).await;
+    chain.fund(&c).await;
+    steps.pass("A and C funded 3,000,000 sat each from regtest coinbase");
+
+    chain.refuse_explicit_rate(&a, &c_pubkey, &addr_c).await;
+    steps.pass("explicit per-channel funding fee rate refused (#101), no channel, no broadcast");
+
+    // A opens through the product's supported path (no explicit rate).
+    a.open_channel(&c_pubkey, &addr_c, 1_000_000, false, None)
+        .await
+        .unwrap();
+    let fee_ac = chain.confirm_channel(a.node(), &c, &[b.node()]).await;
+    c.open_channel(
+        b.node().node_id(),
+        addr_b.parse().unwrap(),
+        1_000_000,
+        None,
+        None,
+    )
+    .unwrap();
+    let fee_cb = chain.confirm_channel(&c, b.node(), &[a.node()]).await;
+    assert_eq!(
+        a.node().list_balances().total_onchain_balance_sats,
+        2_000_000 - fee_ac
+    );
+    assert_eq!(
+        c.list_balances().total_onchain_balance_sats,
+        2_000_000 - fee_cb
+    );
+    let b_id = b.node().node_id();
+    assert!(
+        a.node()
+            .list_channels()
+            .iter()
+            .all(|ch| ch.counterparty_node_id != b_id),
+        "A and B must not share a channel"
+    );
+    steps.pass("channels A->C and C->B opened via estimator and usable");
+
+    wait("C's channel_update reaches A and B", || async {
+        hop_policy(a.node(), &c).is_some() && hop_policy(b.node(), &c).is_some()
+    })
+    .await;
+    let (to_b, to_a) = (
+        hop_policy(b.node(), &c).unwrap(),
+        hop_policy(a.node(), &c).unwrap(),
+    );
+    let (fee_b, fee_a) = (hop_fee(to_b, 2_001), hop_fee(to_a, 2_001));
+    assert!(
+        fee_b > 0 && fee_a > 0,
+        "C must charge a positive forwarding fee"
+    );
+    println!("C forwarding policy: towards B {to_b:?}, towards A {to_a:?}; 2001 msat pays {fee_b} / {fee_a} msat");
+
+    // Give B outbound liquidity to clear its reserve and reply. A real routed
+    // transfer through C; it does not admit either Noise identity.
+    let liquidity = 50_000_000;
+    let inv = b
+        .create_invoice(liquidity, "regtest reply liquidity", 600)
+        .await
+        .unwrap();
+    let pending = a
+        .pay_invoice_with_fee_limit(&inv.bolt11, hop_fee(to_b, liquidity))
+        .await
+        .unwrap();
+    println!(
+        "initial payment status: {:?}, fee: {:?}",
+        pending.status, pending.fee_msat
+    );
+    settle(&a, &inv.payment_hash).await;
+    settle(&b, &inv.payment_hash).await;
+    assert_eq!(
+        a.get_payment_status(&inv.payment_hash)
+            .await
+            .unwrap()
+            .fee_msat,
+        Some(hop_fee(to_b, liquidity))
+    );
+    wait("liquidity committed", || async {
+        capacity(b.node()) > 10_000_000
+    })
+    .await;
+    let _ = (capacity(a.node()), capacity(b.node()), capacity(&c));
+    steps.pass("routed liquidity A->C->B settled at exactly C's fee");
+
+    let mut alice = app::App::start(dirs[0].path(), &chain, a.clone()).await;
+    let mut bob = app::App::start(dirs[1].path(), &chain, b.clone()).await;
+    let peer = bob.state.identity.node_id().to_hex();
+    use konsensus_core::traits::transport::MessageTransport;
+    alice
+        .transport
+        .connect(
+            bob.state.identity.node_id(),
+            &bob.transport.listen_addr().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+    wait("Noise connected", || {
+        bob.transport.is_connected(alice.state.identity.node_id())
+    })
+    .await;
+    assert!(
+        !alice
+            .state
+            .session_manager
+            .has_session(bob.state.identity.node_id())
+            .await
+    );
+    assert!(bob.transport.connected_privileged_peers().await.is_empty());
+    steps.pass("apps started, Noise connected, no session, B has no privileged peer");
+    // The stateless quote gate deliberately quarantines the first second.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let payments_before = b.list_payments(100).await.unwrap().len();
+    let (status, quote) = alice
+        .post(
+            "/api/v1/messages/first-contact/quote",
+            json!({"recipient":peer}),
+            false,
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{quote}");
+    println!("stateless quote: {quote}");
+    assert_eq!(quote["admission_msat"], 2_001);
+    assert_eq!(quote["message_msat"], 2_001);
+    assert_eq!(quote["total_msat"], 14_002);
+    assert_eq!(
+        b.list_payments(100).await.unwrap().len(),
+        payments_before,
+        "stateless quote must not persist a Lightning invoice record"
+    );
+    assert_eq!(alice.used(), 0);
+    let grant = alice.service.grant_view_for(&alice.client).unwrap();
+    let (status, body) = alice
+        .post(
+            "/api/v1/pair/first-contact-grant",
+            json!({
+                "client_id":alice.client, "grant_op_id":grant.op_id, "recipient":peer,
+                "max_total_msat":quote["total_msat"], "contact_budget_msat":100_000
+            }),
+            true,
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    steps.pass("stateless first-contact quote 14002 msat + owner grant");
+
+    alice.compose(&mut bob, "hello stranger").await;
+    assert!(
+        alice
+            .state
+            .session_manager
+            .has_session(bob.state.identity.node_id())
+            .await
+    );
+    assert!(
+        bob.state
+            .session_manager
+            .has_session(alice.state.identity.node_id())
+            .await
+    );
+    println!("budget after first contact: A used {} msat", alice.used());
+    steps.pass("first contact: admission + E2EE message delivered via C");
+    alice.compose(&mut bob, "paid follow-up").await;
+    println!("budget after follow-up: A used {} msat", alice.used());
+    steps.pass("paid follow-up delivered");
+    // #100: on the payer side a paid connection buys the session frames only;
+    // RequestInvoice stays privileged-only. Unlisted, B's reply would be a
+    // first contact of its own, refused for want of a grant, nothing paid.
+    let alice_hex = alice.state.identity.node_id().to_hex();
+    let payments_b = b.list_payments(100).await.unwrap().len();
+    let (status, body) = bob
+        .post(
+            "/api/v1/messages/compose",
+            json!({"recipient": alice_hex, "kind": 0, "plaintext": "unlisted reply"}),
+            false,
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "first_contact", "{body}");
+    assert_eq!(bob.used(), 0);
+    assert_eq!(b.list_payments(100).await.unwrap().len(), payments_b);
+    println!("unlisted reply refused, nothing paid: {body}");
+    steps.pass("unlisted reply refused before any invoice request or payment");
+    // The launcher reply case: A's owner lists B, which privileges the live
+    // connection; B then pays the message price only.
+    let (status, body) = alice
+        .post(
+            "/api/v1/peers",
+            json!({
+                "node_id": peer, "addr": bob.transport.listen_addr().unwrap().to_string(),
+                "auto_connect": false
+            }),
+            true,
+        )
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    bob.compose(&mut alice, "B replies").await;
+    println!("budget after reply: B used {} msat", bob.used());
+    steps.pass("B's paid reply delivered to A");
+
+    // A holds B's price table, which advertises the call offer by kind.
+    let bob_id = *bob.state.identity.node_id();
+    let alice_id = *alice.state.identity.node_id();
+    // A asks B for its call price (PriceQuery 400 -> PriceResponse); nothing is paid.
+    let price = konsensus_api::calls::peer_call_price(&alice.state, &bob_id).await.unwrap();
+    assert_eq!(price, 10_000);
+    let entry = alice.state.peer_prices.get_peer_entry(&bob_id).await.unwrap();
+    println!("A asked B's call price: kind:400={:?}; realtime_signaling={:?}", entry.prices.get("kind:400"), entry.prices.get("realtime_signaling"));
+    steps.pass("A asks B's live call price (10000 msat), nothing paid");
+
+    let (a_used0, b_used0) = (alice.used(), bob.used());
+    let (a_cap0, b_cap0, c_cap0) = (capacity(a.node()), capacity(b.node()), capacity(&c));
+    let a_pay0 = a.list_payments(200).await.unwrap().len();
+    let call_id = format!("{:032x}", rand::random::<u128>());
+    let sdp = r"v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
+    let bob_hex = bob_id.to_hex();
+    let alice_hex = alice_id.to_hex();
+
+    // Offer: paid once at B's call price; B's app is rung.
+    let offer = format!(r#"{{"v":1,"call_id":"{call_id}","media":"audio","sdp":"{sdp}"}}"#);
+    let started = std::time::Instant::now();
+    let (status, body) = signal(&alice, &bob_hex, 400, offer.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["amount_msat"], 10_000, "{body}");
+    let rung = recv_kind(&mut bob, &alice_id, 400).await;
+    assert_eq!(rung.plaintext.as_deref(), Some(offer.as_str()));
+    println!("offer paid 10000 msat and rang B in {:?}: {body}", started.elapsed());
+    steps.pass("call offer paid at call_msat and forwarded to B's WS");
+
+    // The same call id again: A's node refuses before any quote or payment.
+    let (status, body) = signal(&alice, &bob_hex, 400, offer.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "call_id_used", "{body}");
+    // The caller cannot answer its own call.
+    let answer = format!(r#"{{"v":1,"call_id":"{call_id}","sdp":"{sdp}"}}"#);
+    let (status, body) = signal(&alice, &bob_hex, 401, answer.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "call_not_live", "{body}");
+    assert_eq!(a.list_payments(200).await.unwrap().len(), a_pay0 + 1, "refusals pay nothing");
+    steps.pass("reused call id and caller-side answer refused before paying");
+
+    // B answers; A receives it. ICE flows while live; B hangs up.
+    let started = std::time::Instant::now();
+    let (status, body) = signal(&bob, &alice_hex, 401, answer.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(recv_kind(&mut alice, &bob_id, 401).await.plaintext.as_deref(), Some(answer.as_str()));
+    println!("answer paid {} msat, reached A in {:?}", body["amount_msat"], started.elapsed());
+    let ice = format!(r#"{{"v":1,"call_id":"{call_id}","candidate":"candidate:1 1 udp 2122260223 127.0.0.1 54321 typ host","sdp_mid":"0","sdp_mline_index":0}}"#);
+    let (status, body) = signal(&alice, &bob_hex, 402, ice.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    recv_kind(&mut bob, &alice_id, 402).await;
+    let hangup = format!(r#"{{"v":1,"call_id":"{call_id}","reason":"hangup"}}"#);
+    let (status, body) = signal(&bob, &alice_hex, 403, hangup).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    recv_kind(&mut alice, &bob_id, 403).await;
+    steps.pass("answer, ICE and hangup paid and delivered both ways");
+
+    // After the hangup, the call is over on both nodes.
+    let (status, body) = signal(&alice, &bob_hex, 402, ice).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "call_not_live", "{body}");
+    steps.pass("ICE after hangup refused before paying");
+
+    // msat-exact: A paid offer 10000 + ICE 1000; B paid answer 1000 + hangup 1000,
+    // each plus C's forwarding fee on its hop.
+    let (fee_b10k, fee_b1k, fee_a1k) = (hop_fee(to_b, 10_000), hop_fee(to_b, 1_000), hop_fee(to_a, 1_000));
+    let a_paid = 10_000 + 1_000 + fee_b10k + fee_b1k;
+    let b_paid = 2 * (1_000 + fee_a1k);
+    wait("exact channel deltas after the call", || async {
+        capacity(a.node()) == a_cap0 - a_paid + 2_000
+            && capacity(b.node()) == b_cap0 + 11_000 - b_paid
+            && capacity(&c) == c_cap0 + fee_b10k + fee_b1k + 2 * fee_a1k
+    })
+    .await;
+    assert_eq!(alice.used() - a_used0, a_paid, "A budget = principals + actual fees");
+    assert_eq!(bob.used() - b_used0, b_paid, "B budget = principals + actual fees");
+    println!(
+        "CALL RECONCILED: A paid {a_paid} msat (offer 10000 + ICE 1000 + fees {}), B paid {b_paid} msat (answer + hangup 2x1000 + fees {}), C earned {} msat",
+        fee_b10k + fee_b1k, 2 * fee_a1k, fee_b10k + fee_b1k + 2 * fee_a1k
+    );
+    steps.pass("msat reconciliation: channels and budgets");
+
+    // Codex P2 (#131): a call after a reconnect must not be stuck behind the
+    // call price query. Observed on real LDK: the uncapped (owner) call asks
+    // B's call price, re-admits the new connection through the existing flow
+    // (reported separately as readmission_msat), then pays the call once.
+    alice.transport.disconnect(bob.state.identity.node_id()).await.unwrap();
+    wait("disconnected", || async { !bob.transport.is_connected(alice.state.identity.node_id()).await }).await;
+    alice.transport.connect(bob.state.identity.node_id(), &bob.transport.listen_addr().unwrap().to_string()).await.unwrap();
+    wait("reconnected", || bob.transport.is_connected(alice.state.identity.node_id())).await;
+    let pays = a.list_payments(200).await.unwrap().len();
+    let fresh = format!("{:032x}", rand::random::<u128>());
+    let offer2 = format!(r#"{{"v":1,"call_id":"{fresh}","media":"audio","sdp":"{sdp}"}}"#);
+    let (status, body) = signal(&alice, &bob_hex, 400, offer2.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!((body["amount_msat"].as_u64(), body["readmission_msat"].as_u64()), (Some(10_000), Some(2_001)), "{body}");
+    assert_eq!(recv_kind(&mut bob, &alice_id, 400).await.plaintext.as_deref(), Some(offer2.as_str()));
+    assert!(a.list_payments(200).await.unwrap().len() > pays);
+    let entry = alice.state.storage.call_get(&bob_id, &fresh).await.unwrap().unwrap();
+    assert_eq!((entry.phase, entry.pending), (konsensus_core::payloads::call::Phase::Ringing, None), "committed only once paid");
+    println!("call after reconnect: {body}");
+    steps.pass("call after reconnect re-admitted once (2001 msat), then paid the call and rang B");
+    drop(alice);
+    drop(bob);
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.stop().unwrap();
+    println!("REGTEST-CALLS complete in {:?}", steps.started.elapsed());
+}
+
 /// Real pre-dispatch reservation release. This is deliberately a NO-ROUTE
 /// control, not a claim that a two-node direct channel charges forwarding fees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -616,6 +616,54 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.sweep_outstanding_web_requests(now_ms, max).await
     }
 
+    async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+        self.inner.call_get(peer, call_id).await
+    }
+
+    async fn call_put(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+        self.inner.call_put(peer, call_id, entry).await
+    }
+
+    async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
+        self.inner.call_delete(peer, call_id).await
+    }
+
+    async fn call_counts(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+        self.inner.call_counts(peer, now_ms).await
+    }
+
+    async fn call_evict_burned(&self, peer: Option<&konsensus_core::NodeId>, replay_until_at_most: u64, now_ms: u64, max: u64) -> Result<u64, StorageError> {
+        self.inner.call_evict_burned(peer, replay_until_at_most, now_ms, max).await
+    }
+
+    async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        self.inner.call_pending().await
+    }
+
+    async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
+        self.inner.call_sweep(now_ms, max).await
+    }
+
+    async fn reject_accepted_envelope(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+        self.inner.reject_accepted_envelope(envelope).await
+    }
+
+    async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
+        self.inner.call_admission_hold(envelope, now_ms).await
+    }
+
+    async fn call_admission_release(&self, id: &MessageId) -> Result<(), StorageError> {
+        self.inner.call_admission_release(id).await
+    }
+
+    async fn call_admission_held(&self, id: &MessageId) -> Result<bool, StorageError> {
+        self.inner.call_admission_held(id).await
+    }
+
+    async fn call_admission_withdraw(&self, held_before_ms: u64) -> Result<u64, StorageError> {
+        self.inner.call_admission_withdraw(held_before_ms).await
+    }
+
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
         self.inner.has_nonce(nonce).await
     }

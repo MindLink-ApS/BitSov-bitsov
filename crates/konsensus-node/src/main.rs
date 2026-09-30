@@ -1050,6 +1050,21 @@ async fn cmd_start(
         None
     };
 
+    // Calls: settle or release call reservations a crash left (from the
+    // operation journal) before the receive loop and the outbox resend start.
+    match konsensus_api::calls::recover(node.storage().as_ref()).await {
+        Ok((committed, released)) if committed + released > 0 => info!(committed, released, "recovered call reservations"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "call state recovery failed; reservations stay for a same-operation retry"),
+    }
+    // Incoming call signals still held were never admitted (refusal cleanup
+    // failed, or a crash): withdraw them before anything can read them.
+    match konsensus_api::calls::withdraw_held(node.storage().as_ref(), true).await {
+        Ok(n) if n > 0 => warn!(withdrawn = n, "withdrew call signals whose admission never finished"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "held call signals not withdrawn yet; they stay invisible until the next sweep"),
+    }
+
     // Incoming message handler (routes P2P messages through payment gate to storage + WS)
     let msg_handle = tokio::spawn(msg_handler::run(msg_handler::MsgHandlerDeps {
         transport: Arc::clone(node.transport()),

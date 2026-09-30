@@ -539,45 +539,41 @@ async fn realtime_signaling_kind_uses_payment_gate() {
     let id_bob = make_identity(MNEMONIC_BOB);
     let bob_id = *id_bob.node_id();
     let alice_id = *id_alice.node_id();
-
-    let preimage = rand::random::<[u8; 32]>();
-    let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
-    let proof = PaymentProof::new(payment_hash, preimage, 100);
-
-    // Kind 400 = realtime signaling and must be priceable, not a free lane.
-    let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
-        400,
-        *id_alice.node_id(),
-        Recipient::Node(bob_id),
-        b"signal".to_vec(),
-        proof,
-    )
-    .timestamp(chrono::Utc::now().timestamp_millis() as u64)
-    .build();
-
-    let sig = id_alice.sign(&envelope.signable_bytes());
-    envelope.signature = Signature::from_ed25519(&sig);
-
     let gate = PaymentGate::new();
     let nonce_store = InMemoryNonceStore::new();
     let pricing = default_pricing();
     let whitelist: HashSet<NodeId> = [alice_id].into_iter().collect();
 
-    let result = gate
-        .verify(
-            &envelope,
-            &nonce_store,
-            &pricing,
-            Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
-            None,
+    // Realtime kinds are priceable, not a free lane. The call offer (400) is
+    // the per-call admission at `call_msat`; answer/ICE/hangup keep the
+    // realtime category price.
+    for (kind, paid, admitted) in [(401, 100, true), (402, 100, true), (400, 100, false), (400, 10_000, true)] {
+        let preimage = rand::random::<[u8; 32]>();
+        let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
+        let proof = PaymentProof::new(payment_hash, preimage, paid);
+        let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
+            kind,
+            *id_alice.node_id(),
+            Recipient::Node(bob_id),
+            b"signal".to_vec(),
+            proof,
         )
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "paid realtime signaling kind should pass the payment gate, got: {result:?}"
-    );
+        .timestamp(chrono::Utc::now().timestamp_millis() as u64)
+        .build();
+        let sig = id_alice.sign(&envelope.signable_bytes());
+        envelope.signature = Signature::from_ed25519(&sig);
+        let result = gate
+            .verify(
+                &envelope,
+                &nonce_store,
+                &pricing,
+                Some(&whitelist),
+                None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+                None,
+            )
+            .await;
+        assert_eq!(result.is_ok(), admitted, "kind {kind} paying {paid} msat: {result:?}");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
