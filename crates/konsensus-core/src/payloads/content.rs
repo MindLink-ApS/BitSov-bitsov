@@ -15,6 +15,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Advertised by a node that answers porch reads (docs/protocol/BROWSE.md): as
+/// `Capability::Custom` in its federation Hello (peers see it in
+/// `GET /api/v1/peers` as `Custom("porch_read_v1")`) and in its own `/status`
+/// `api_capabilities`, where it also means `POST /api/v1/browse/fetch` exists.
+/// An older node leaves a paid `/front-door.json` read unanswered, so apps must
+/// not send it one.
+pub const PORCH_READ_CAPABILITY: &str = "porch_read_v1";
+
 /// Porch path of the owner's published front-door card (BROWSE.md §4).
 pub const PORCH_CARD_PATH: &str = "/front-door.json";
 

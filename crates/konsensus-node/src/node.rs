@@ -593,10 +593,12 @@ pub(crate) fn merge_persisted_peers(
 pub(crate) fn default_advertised_capabilities(relay_enabled: bool) -> Vec<Capability> {
     // Mesh meetings: peers' apps ring this node with a meeting leg only when
     // they see this advert (older nodes withdraw such a leg after payment).
+    // Porch reads: peers' apps offer a paid read only to a node that answers it.
     // `Custom` is an existing variant, so older nodes still decode the Hello.
     let mut caps = vec![
         Capability::X3dh,
         Capability::Custom(konsensus_core::payloads::call::MEETING_CAPABILITY.to_string()),
+        Capability::Custom(konsensus_core::payloads::content::PORCH_READ_CAPABILITY.to_string()),
     ];
     if relay_enabled {
         caps.push(Capability::Relay);
@@ -631,6 +633,13 @@ mod relay_capability_tests {
         // An older node decodes it: `Custom` is an existing, name-tagged variant.
         let wire = serde_json::to_string(&caps).unwrap();
         assert_eq!(serde_json::from_str::<Vec<Capability>>(&wire).unwrap(), caps);
+    }
+
+    #[test]
+    fn porch_read_capability_is_advertised_in_the_form_peers_list_shows() {
+        let porch = Capability::Custom("porch_read_v1".into());
+        assert!(default_advertised_capabilities(false).contains(&porch));
+        assert_eq!(format!("{porch:?}"), r#"Custom("porch_read_v1")"#);
     }
 
     #[test]

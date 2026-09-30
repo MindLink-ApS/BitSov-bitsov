@@ -37,7 +37,7 @@ use crate::metered::MeteredSpend;
 use crate::state::{AppState, WsMessage};
 
 /// Advertised on `/api/v1/status`.
-pub const CAPABILITY: &str = "porch_read_v1";
+pub const CAPABILITY: &str = konsensus_core::payloads::content::PORCH_READ_CAPABILITY;
 
 /// How long a paid read waits for its bound reply.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);

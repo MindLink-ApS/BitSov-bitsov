@@ -242,7 +242,9 @@ The transport's 16 MiB frame limit is never approached.
     path, waits for the bound reply, verifies and caches a card, and returns
     the body.
   - `GET /api/v1/browse/cards` lists the cached cards.
-  - `/api/v1/status` advertises `porch_read_v1`.
+  - `/api/v1/status` advertises `porch_read_v1`, and so does the federation
+    Hello (peers list it as `Custom("porch_read_v1")`), so a reader's app
+    offers a paid read only to an owner that answers one.
 - **Fix:** a bound web reply no longer promotes the replying connection and
   no longer counts as an admission.
 
