@@ -128,6 +128,14 @@ a fixed roster. The offer (400) of a leg carries one optional field:
   and `regtest_e2e::real_ldk_regtest_meeting` (apps A, B, C and router R on
   real LDK: legs A→B, A→C, B→C, an out-of-order leg refused before paying,
   C leaves while A–B stays live, msat-exact per participant).
+- **Capability advert `call_meeting_v1`.** A node that accepts the field
+  advertises `Capability::Custom("call_meeting_v1")` in its federation Hello
+  (a connected peer shows `Custom("call_meeting_v1")` in `GET /api/v1/peers`)
+  and lists `call_meeting_v1` in its own `/status` `api_capabilities`. An
+  older node has `deny_unknown_fields` on the payload, so it would withdraw a
+  meeting leg after it was paid: apps send a leg only to a connected peer
+  with the advert, from a node that lists it. `Custom` is an existing
+  variant, so older nodes still decode the Hello.
 - Design and open decisions: MindLink-Private
   `pm/projects/bitsov/research/MESH-MEETINGS-DESIGN.md`.
 
