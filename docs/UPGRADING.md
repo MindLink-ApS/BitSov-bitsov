@@ -97,10 +97,26 @@ want a different offer price on this node.
 call_msat = 10000
 ```
 
-## STUN (app setting, not node config)
+## STUN (optional node listener + app setting)
 
-Call **media** is WebRTC in the end-user app. Across NATs the owner optionally sets a
-`stun:host` or `stun:host:port` in app Settings. The node does **not** ship or require a
-STUN/TURN server; there is no hard-coded STUN in genome or the app, and TURN is unsupported.
-With no STUN configured, calls use host candidates only (same network or VPN). See
-[`docs/v2/CALLS-PROTOTYPE.md`](v2/CALLS-PROTOTYPE.md).
+Call **media** is WebRTC in the end-user app. Across NATs each peer needs a public
+address. **Off by default** the node does not listen for STUN. The owner may enable an
+optional binding-only responder:
+
+```toml
+[calls]
+stun_listen = "0.0.0.0:3478"   # UDP; omit to keep it off (default)
+```
+
+- RFC 5389 **binding request → XOR-MAPPED-ADDRESS** only. No TURN, no relay, no auth,
+  no per-call state (#136).
+- **Firewall:** open **UDP** on the chosen port to hosts that should learn their mapped
+  address (typically the public Internet, or a VPN path). Binding fails boot if the
+  address cannot be listened on.
+- Owner-only `GET /api/v1/status` reports `stun_port` and, when the node has a dialable
+  public host, `stun_url` (`stun:host:port`). `/health` reports neither.
+- In the app, Settings → Calls still requires the owner to set (or confirm) a
+  `stun:host[:port]`; nothing switches on automatically. With no STUN URL saved, calls
+  use host candidates only (same network / VPN). TURN is unsupported.
+
+See [`docs/v2/CALLS-PROTOTYPE.md`](v2/CALLS-PROTOTYPE.md).

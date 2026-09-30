@@ -6,7 +6,7 @@ also live on the corresponding GitHub pre-release pages.
 ## [0.3.0-rc8] — 2026-09-30 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Source range: `v0.3.0-rc7` (`958e399`) →
-this branch tip on `main` (through #131 / #135). Full narrative: [`docs/releases/v0.3.0-rc8.md`](docs/releases/v0.3.0-rc8.md).
+this branch tip on `main` (through #136). Full narrative: [`docs/releases/v0.3.0-rc8.md`](docs/releases/v0.3.0-rc8.md).
 Retained-node upgrade: [`docs/UPGRADING.md`](docs/UPGRADING.md).
 
 ### Payments safety
@@ -21,7 +21,8 @@ Retained-node upgrade: [`docs/UPGRADING.md`](docs/UPGRADING.md).
 ### Calls (regtest prototype)
 - Paid 1:1 call signalling, kinds **400–403** (#131); durable call state and admission holds (migrations **027**, **028**).
 - `[pricing] call_msat` (default 10 000 msat, must be > 0) prices the offer; answers / ICE / hangup keep `realtime_signal_msat`.
-- Media path is WebRTC in the app; ICE uses an **owner-set STUN** URL only (no TURN / no hard-coded STUN in the node).
+- Optional node STUN binding responder: `[calls] stun_listen` (UDP, **off by default**); open the port in the firewall when enabled (#136).
+- Media path is WebRTC in the app; ICE uses an **owner-set** `stun:` URL (may be the node's own `stun_url` from `/status`). No TURN / no hard-coded third-party STUN.
 
 ### Web services
 - Web service replies bind to the requester's paid proof (#129); outstanding paid requests persist in SQLite/Postgres (migration **026**) with expiry sweep (#132).
