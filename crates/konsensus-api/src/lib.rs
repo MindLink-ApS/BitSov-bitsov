@@ -67,6 +67,7 @@ pub mod metered;
 pub mod metrics;
 pub mod pairing;
 pub mod rate_limit;
+pub mod remote_access;
 pub mod spend_budget;
 pub mod state;
 pub mod ws;
@@ -108,6 +109,16 @@ async fn metrics_handler() -> impl IntoResponse {
 
 /// Build the Axum router with all routes and middleware.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    build_router_with_local_auth(state, true)
+}
+
+/// Build the ordinary API behind the encrypted remote tunnel, without the
+/// loopback-only token mint.
+pub fn build_remote_router(state: Arc<AppState>) -> Router {
+    build_router_with_local_auth(state, false)
+}
+
+fn build_router_with_local_auth(state: Arc<AppState>, local_auth_enabled: bool) -> Router {
     let cors = if state.cors_enabled {
         CorsLayer::new()
             .allow_origin(cors_allowed_origins())
@@ -135,7 +146,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             state.sensitive_identity_routes_enabled,
         ))
         .merge(handlers::auth_routes::routes(
-            state.sensitive_identity_routes_enabled,
+            state.sensitive_identity_routes_enabled && local_auth_enabled,
         ))
         .merge(handlers::pairing_routes::routes(state.pairing.is_some()))
         .merge(handlers::sessions::routes())

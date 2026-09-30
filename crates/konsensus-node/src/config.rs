@@ -131,6 +131,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub api: ApiConfig,
 
+    /// Noise-protected remote API tunnel. Closed unless `listen_addr` is set.
+    #[serde(default)]
+    pub remote_access: RemoteAccessConfig,
+
     /// Sovereign browser / web content server configuration.
     #[serde(default)]
     pub web: WebConfig,
@@ -925,6 +929,16 @@ impl Default for ApiConfig {
     }
 }
 
+/// Public Noise listener for remote app access.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAccessConfig {
+    #[serde(default)]
+    pub listen_addr: Option<SocketAddr>,
+    #[serde(default)]
+    pub advertised_endpoint: Option<String>,
+}
+
 /// Sovereign browser / web content server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1090,15 +1104,48 @@ impl NodeConfig {
         }
 
         // Check P2P and API ports don't collide
-        if self.network.listen_addr.port() == self.api.listen_addr.port()
-            && (self.network.listen_addr.ip().is_unspecified()
-                || self.api.listen_addr.ip().is_unspecified()
-                || self.network.listen_addr.ip() == self.api.listen_addr.ip())
-        {
+        if tcp_addrs_collide(self.network.listen_addr, self.api.listen_addr) {
             anyhow::bail!(
                 "P2P listen address ({}) and API listen address ({}) use the same port",
                 self.network.listen_addr,
                 self.api.listen_addr
+            );
+        }
+
+        if let Some(remote_addr) = self.remote_access.listen_addr {
+            if !self.api.listen_addr.ip().is_loopback() {
+                anyhow::bail!(
+                    "[api].listen_addr must be loopback when [remote_access] is enabled; \
+                     plaintext HTTP may not be exposed remotely"
+                );
+            }
+            let endpoint = self
+                .remote_access
+                .advertised_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[remote_access].advertised_endpoint is required when listen_addr is set"
+                    )
+                })?;
+            validate_remote_endpoint(endpoint).map_err(anyhow::Error::msg)?;
+            for (label, other) in [
+                ("P2P", self.network.listen_addr),
+                ("API", self.api.listen_addr),
+            ] {
+                if tcp_addrs_collide(remote_addr, other) {
+                    anyhow::bail!(
+                        "remote access listen address ({remote_addr}) and {label} listen address \
+                         ({other}) use the same TCP port"
+                    );
+                }
+            }
+        } else if self.remote_access.advertised_endpoint.is_some() {
+            anyhow::bail!(
+                "[remote_access].advertised_endpoint requires listen_addr; omit both to keep \
+                 remote access closed"
             );
         }
 
@@ -1144,6 +1191,14 @@ impl NodeConfig {
                         self.network.listen_addr,
                         ln_socket
                     );
+                }
+                if let Some(remote_addr) = self.remote_access.listen_addr {
+                    if tcp_addrs_collide(remote_addr, ln_socket) {
+                        anyhow::bail!(
+                            "remote access listen address ({remote_addr}) and Lightning listening \
+                             address ({ln_socket}) use the same TCP port"
+                        );
+                    }
                 }
             }
         }
@@ -1455,6 +1510,7 @@ impl NodeConfig {
                 operator_probes_enabled: Some(matches!(tier, NodeTier::Cloud)),
                 ..ApiConfig::default()
             },
+            remote_access: RemoteAccessConfig::default(),
             web: WebConfig::default(),
             // Boundary invariant (PUB-1): no bootstrap peers are compiled into
             // the binary. Embedding live node IDs/IPs here would publish the
@@ -1495,6 +1551,45 @@ fn default_listen_addr() -> SocketAddr {
 
 fn default_api_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 3141))
+}
+
+fn tcp_addrs_collide(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() == b.port() && (a.ip().is_unspecified() || b.ip().is_unspecified() || a.ip() == b.ip())
+}
+
+fn validate_remote_endpoint(endpoint: &str) -> Result<(), String> {
+    if endpoint.bytes().any(|b| b.is_ascii_whitespace()) || endpoint.contains("://") {
+        return Err(format!(
+            "[remote_access].advertised_endpoint {endpoint:?} must be a bare host:port"
+        ));
+    }
+    let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
+        format!("[remote_access].advertised_endpoint {endpoint:?} must be host:port")
+    })?;
+    let valid_host = if host.starts_with('[') && host.ends_with(']') {
+        host[1..host.len() - 1]
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
+    } else {
+        host.parse::<std::net::Ipv4Addr>().is_ok()
+            || (host.len() <= 253
+                && host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                }))
+    };
+    let valid_port = port.parse::<u16>().is_ok_and(|port| port != 0);
+    if !valid_host || !valid_port {
+        return Err(format!(
+            "[remote_access].advertised_endpoint {endpoint:?} must be a valid host:port"
+        ));
+    }
+    Ok(())
 }
 
 /// DESERIALIZATION default — frozen. An existing `[chain]` stanza that omits

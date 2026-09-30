@@ -295,6 +295,26 @@ async fn local_auth_rejects_non_localhost() {
 }
 
 #[tokio::test]
+async fn remote_router_never_mounts_local_token_mint() {
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let app = konsensus_api::build_remote_router(test_state())
+        .layer(MockConnectInfo(
+            "127.0.0.1:19001"
+                .parse::<std::net::SocketAddr>()
+                .unwrap(),
+        ));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/local")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn rate_limiter_basic() {
     let limiter = RateLimiter::new(3);
     let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
