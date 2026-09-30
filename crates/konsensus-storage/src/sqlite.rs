@@ -673,6 +673,9 @@ impl Storage for SqliteStorage {
     }
     // Pin the partial index: without statistics SQLite can prefer the old
     // state index, walking all terminal history and sorting before LIMIT.
+    async fn list_failed_prepared_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_state WHERE state = 'prepared' AND last_error IS NOT NULL ORDER BY created_at").fetch_all(&self.pool).await?)
+    }
     async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_retention WHERE accounting_pending = FALSE AND recovery_compacted = FALSE AND state IN ('acked', 'failed_paid') AND updated_at < ? ORDER BY updated_at LIMIT ?")
             .bind(before_ms).bind(i64::from(limit)).fetch_all(&self.pool).await?)

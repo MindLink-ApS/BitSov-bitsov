@@ -229,7 +229,7 @@ async fn reconnect_during_readmission_quote_response_pays_nothing() {
     net.contact.flap_on_quote.store(true, Ordering::SeqCst);
     let (status, body) = net.compose(&operation_id, 4_000).await;
     assert_eq!((status, body["code"].as_str()), (400, Some("not_dispatched")), "{body}");
-    assert_eq!(body["state"], "prepared", "{body}");
+    assert_eq!(body["state"], "released", "{body}");
     assert_eq!(net.spent().await, 0, "a quote asked on the earlier connection is never paid");
 
     // The same operation on the stable connection: admission once, message once.

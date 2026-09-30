@@ -613,11 +613,14 @@ async fn compose_locked(
             op = operation.load().await?;
             if op.state == "paying" {
                 let data = recovery(&op)?;
-                if !data.dispatched && !data.admission_pending {
-                    op.state = "prepared".into();
+                op.state = if proven_unpaid(&state, &op, &data).await {
+                    "released"
+                } else if !data.dispatched && !data.admission_pending {
+                    "prepared"
                 } else {
-                    op.state = "payment_unknown".into();
+                    "payment_unknown"
                 }
+                .into();
                 op.last_error = Some(error.to_string());
                 save(&state, &mut op).await?;
             }
@@ -1045,6 +1048,10 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
         .map(|op| op.operation_id)
         .collect();
     ids.extend(links.keys().cloned());
+    // Never let this listing hold up recovery of paid or unresolved rows.
+    if let Err(error) = release_failed_prepared(state).await {
+        tracing::warn!(%error, "failed operation release deferred");
+    }
     for id in ids.clone() {
         let Ok(_guard) = operation_lock(state, &id)?.try_lock_owned() else {
             continue;
@@ -1083,6 +1090,105 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
     }
     prune_paces(state, &ids);
     compact_terminal_operations(state, &links).await
+}
+
+/// Positive evidence that an operation holds no payment: nothing was
+/// dispatched or left pending, no settlement, proof or admission was recorded,
+/// the peer's admission journal (every retained attempt) shows no dispatch or
+/// settlement, and the wallet knows no payment for any admission hash involved.
+/// Any doubt (an unreadable journal, another operation's attempt, a hash that
+/// does not match, a wallet that cannot answer) is not evidence.
+async fn proven_unpaid(state: &AppState, op: &OutboxOperation, data: &Recovery) -> bool {
+    if data.dispatched
+        || data.admission_pending
+        || data.envelope_ready
+        || data.settlement.is_some()
+        || data.admission_msat != 0
+        || op.payment_hash.is_some()
+        || op.settled_msat != 0
+        || op.readmission_msat != 0
+    {
+        return false;
+    }
+    let Ok(peer) = NodeId::from_hex(&op.recipient) else {
+        return false;
+    };
+    // The journal is written before an admission reaches this row, and a
+    // recovered attempt may never reach it: wallet absence alone proves nothing.
+    let Ok(journal) = super::admission_journal::load(state, &peer) else {
+        return false;
+    };
+    let mut hashes = Vec::new();
+    let mut attempt = journal.as_ref();
+    while let Some(a) = attempt {
+        if a.dispatch_started
+            || a.message_may_have_dispatched
+            || a.envelope.is_some()
+            || a.settled_at_unix.is_some()
+            || a.readmission.as_ref().is_some_and(|r| r.reported)
+            || a.operation.as_ref().is_some_and(|l| l.operation_id != op.operation_id)
+        {
+            return false;
+        }
+        hashes.push(a.payment_hash.clone());
+        attempt = a.previous_attempt.as_deref();
+    }
+    if let Some(hash) = &op.admission_payment_hash {
+        if journal.is_some() && !hashes.contains(hash) {
+            return false;
+        }
+        hashes.push(hash.clone());
+    }
+    for hash in hashes {
+        if !matches!(
+            state.lightning.get_payment_status(&hash).await,
+            Err(LightningError::PaymentNotFound(_))
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Rows left `prepared` with a `last_error` by builds before the failure path
+/// released them: a compose that failed before paying. Release each one proven
+/// unpaid; anything else stays as it is.
+async fn release_failed_prepared(state: &AppState) -> Result<(), ApiError> {
+    for candidate in state
+        .storage
+        .list_failed_prepared_operations()
+        .await
+        .map_err(storage)?
+    {
+        let Ok(_guard) = operation_lock(state, &candidate.operation_id)?.try_lock_owned() else {
+            continue;
+        };
+        let result = async {
+            let Some(mut op) = state
+                .storage
+                .get_outbox_operation(&candidate.operation_id)
+                .await
+                .map_err(storage)?
+            else {
+                return Ok::<(), ApiError>(());
+            };
+            if op.state != "prepared" || op.last_error.is_none() {
+                return Ok(());
+            }
+            let data = recovery(&op)?;
+            if !proven_unpaid(state, &op, &data).await {
+                return Ok(());
+            }
+            op.state = "released".into();
+            save(state, &mut op).await?;
+            recover_budget(state, &mut op).await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(operation_id = %candidate.operation_id, %error, "failed operation release deferred");
+        }
+    }
+    Ok(())
 }
 
 async fn attach_recovered_reservations(

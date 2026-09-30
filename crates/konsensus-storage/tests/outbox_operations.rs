@@ -328,3 +328,24 @@ async fn encrypted_retention_is_batched_and_never_selects_pending_liabilities() 
     assert_eq!(pending[0].operation_id, "op-105");
     assert_eq!(pending[0].recovery, b"old recovery evidence");
 }
+
+#[tokio::test]
+async fn failed_prepared_listing_selects_only_prepared_rows_with_an_error() {
+    use konsensus_storage::EncryptedStorage;
+    let encrypted = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    for (id, state, error) in [
+        ("stuck", "prepared", Some("admission journal: os error 2")),
+        ("fresh", "prepared", None),
+        ("released", "released", Some("disk gone")),
+        ("unknown", "payment_unknown", Some("lost reply")),
+    ] {
+        let mut op = OutboxOperation::prepared(id.into(), "peer".into(), 1, "digest".into());
+        op.state = state.into();
+        op.last_error = error.map(Into::into);
+        op.recovery = b"{\"dispatched\":false}".to_vec();
+        assert!(encrypted.insert_outbox_operation(&op).await.unwrap());
+    }
+    let listed = encrypted.list_failed_prepared_operations().await.unwrap();
+    assert_eq!(listed.iter().map(|op| op.operation_id.as_str()).collect::<Vec<_>>(), ["stuck"]);
+    assert_eq!(listed[0].recovery, b"{\"dispatched\":false}", "recovery is decrypted");
+}

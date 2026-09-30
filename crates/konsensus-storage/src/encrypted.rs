@@ -378,6 +378,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         Ok(ops)
     }
 
+    async fn list_failed_prepared_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        let mut ops = self.inner.list_failed_prepared_operations().await?;
+        for op in &mut ops { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        Ok(ops)
+    }
+
     async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         let mut ops = self.inner.list_compactable_operations(before_ms, limit).await?;
         for op in &mut ops { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }

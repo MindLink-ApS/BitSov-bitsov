@@ -49,6 +49,12 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("outbox operations".into()))
     }
 
+    /// `prepared` rows that recorded a failure (`last_error`): compose attempts
+    /// that stopped before paying. Recovery proves each unpaid and releases it.
+    async fn list_failed_prepared_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// Bounded terminal payload retention. Permanent operation identity and
     /// recipient receipt bindings must never be deleted by this maintenance.
     async fn list_compactable_operations(&self, _before_ms: i64, _limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
