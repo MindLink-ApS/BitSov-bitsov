@@ -396,6 +396,15 @@ async fn status_advertises_front_door_v1() {
     );
 }
 
+/// Mesh meetings: this node lists the meeting capability for its own app.
+#[tokio::test]
+async fn status_advertises_call_meeting_v1() {
+    let state = state_with(settings(None));
+    let (status, body, _) = call(&state, "GET", "/api/v1/status", auth_header(&state), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["api_capabilities"].as_array().unwrap().iter().any(|c| c == "call_meeting_v1"), "{body}");
+}
+
 #[tokio::test]
 async fn open_refuses_own_card_and_needs_local_consent() {
     let state = state_with(settings(Some("node.example.org:9000")));

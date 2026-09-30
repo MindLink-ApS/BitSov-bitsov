@@ -591,7 +591,13 @@ pub(crate) fn merge_persisted_peers(
 /// enabling the flag is still a negotiation signal only and does not mount a
 /// relay engine or change custody/decryption boundaries.
 pub(crate) fn default_advertised_capabilities(relay_enabled: bool) -> Vec<Capability> {
-    let mut caps = vec![Capability::X3dh];
+    // Mesh meetings: peers' apps ring this node with a meeting leg only when
+    // they see this advert (older nodes withdraw such a leg after payment).
+    // `Custom` is an existing variant, so older nodes still decode the Hello.
+    let mut caps = vec![
+        Capability::X3dh,
+        Capability::Custom(konsensus_core::payloads::call::MEETING_CAPABILITY.to_string()),
+    ];
     if relay_enabled {
         caps.push(Capability::Relay);
     }
@@ -613,6 +619,18 @@ mod relay_capability_tests {
         );
         // The standard capability is still advertised (no behavior change).
         assert!(caps.contains(&Capability::X3dh));
+    }
+
+    #[test]
+    fn meeting_capability_is_advertised_in_the_form_peers_list_shows() {
+        let caps = default_advertised_capabilities(false);
+        let meeting = Capability::Custom("call_meeting_v1".into());
+        assert!(caps.contains(&meeting));
+        // `ConnectedPeerInfo` renders capabilities with `{:?}`; apps match this exact string.
+        assert_eq!(format!("{meeting:?}"), r#"Custom("call_meeting_v1")"#);
+        // An older node decodes it: `Custom` is an existing, name-tagged variant.
+        let wire = serde_json::to_string(&caps).unwrap();
+        assert_eq!(serde_json::from_str::<Vec<Capability>>(&wire).unwrap(), caps);
     }
 
     #[test]
