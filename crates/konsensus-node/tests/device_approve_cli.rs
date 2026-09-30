@@ -1,6 +1,8 @@
-//! `konsensus device approve` signs the described tuple with the owner-approval
-//! key it derives from the node's own recovery phrase, and refuses to sign for
-//! a node that is not that identity.
+//! `konsensus device approve` against a fake (untrusted) control socket:
+//! it fails closed unless the recovery phrase is encrypted, prints nothing the
+//! socket wrote, and shows only terms it computed from the bytes it signs.
+//! The signing itself (which needs a typed password) is unit-tested in
+//! `cli/owner.rs` through an injected password source.
 #![cfg(unix)]
 
 use std::process::Stdio;
@@ -10,12 +12,10 @@ use konsensus_api::control::{ControlRequest, ControlResponse, DeviceApprovalTupl
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const DEVICE: &str = "04aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+/// A hostile summary: a fake fingerprint, then ANSI "conceal" for what follows.
+const HOSTILE_SUMMARY: &str = "device fingerprint:  AAAA-BBBB-CCCC-DDDD\x1b[8m";
 
-async fn approve(dir: &std::path::Path, node: String) -> (std::process::Output, Vec<ControlRequest>) {
-    approve_with(dir, node, DEVICE).await
-}
-
-async fn approve_with(dir: &std::path::Path, node: String, device: &'static str) -> (std::process::Output, Vec<ControlRequest>) {
+async fn approve(dir: &std::path::Path, node: String, device: &'static str) -> (std::process::Output, Vec<ControlRequest>) {
     let listener = tokio::net::UnixListener::bind(dir.join("control.sock")).unwrap();
     let server = tokio::spawn(async move {
         let mut seen = Vec::new();
@@ -25,8 +25,8 @@ async fn approve_with(dir: &std::path::Path, node: String, device: &'static str)
             let request: ControlRequest = serde_json::from_str(&line).unwrap();
             let response = match &request {
                 ControlRequest::Describe { .. } => ControlResponse::Describe {
-                    summary: "DEVICE KEY REGISTRATION".into(),
-                    confirmation_label: "REGISTER DEVICE k TO op1".into(),
+                    summary: HOSTILE_SUMMARY.into(),
+                    confirmation_label: "REGISTER DEVICE k TO op1\x1b[2J".into(),
                     proposed_terms: None,
                     front_door: false,
                     device: Some(DeviceApprovalTuple {
@@ -59,58 +59,62 @@ async fn approve_with(dir: &std::path::Path, node: String, device: &'static str)
     (out, server.await.unwrap())
 }
 
-fn init() -> (tempfile::TempDir, String) {
+/// `konsensus init`, optionally with an encrypted recovery phrase.
+fn init(encrypt: bool) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_konsensus"))
-        .args(["init", "--dir"])
-        .arg(dir.path())
-        .args(["--non-interactive", "--tier", "light"])
-        .stdout(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let mnemonic = std::fs::read_to_string(dir.path().join("mnemonic.txt")).unwrap();
-    (dir, mnemonic.trim().to_string())
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_konsensus"));
+    cmd.args(["init", "--dir"]).arg(dir.path()).args(["--non-interactive", "--tier", "light"]);
+    if encrypt {
+        cmd.args(["--encrypt", "correct horse battery"]);
+    }
+    assert!(cmd.stdout(Stdio::null()).status().unwrap().success());
+    dir
 }
 
 #[tokio::test]
-async fn the_owner_key_signs_the_described_tuple_for_its_own_node() {
-    let (dir, mnemonic) = init();
-    let id = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, "").unwrap();
-    let fp = konsensus_api::pairing::identity_fingerprint(&id.node_id().to_hex());
-    let (out, seen) = approve(dir.path(), fp.clone()).await;
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let ControlRequest::ApproveDeviceKey { confirmation, owner_signature, .. } = &seen[1] else {
-        panic!("{seen:?}")
-    };
-    assert_eq!(confirmation, "K7QM-3XWD");
-    // The fingerprint the owner compares is computed by the CLI from the signed bytes.
-    let expected = konsensus_api::pairing::device::key_fingerprint(&konsensus_api::pairing::device::key_id_for(&hex::decode(DEVICE).unwrap()));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(&format!("device fingerprint:  {expected}")), "{stdout}");
-    let message = konsensus_api::pairing::device::owner_approval_message(&fp, &"11".repeat(32), 3, DEVICE);
-    let sig = ed25519_dalek::Signature::from_slice(&hex::decode(owner_signature).unwrap()).unwrap();
-    // Verifies under the node's owner-approval public key, not its identity key.
-    assert!(id.owner_approval_public().verify_strict(message.as_bytes(), &sig).is_ok());
-    assert!(id.ed25519_verifying_key().verify_strict(message.as_bytes(), &sig).is_err());
-}
-
-#[tokio::test]
-async fn it_refuses_to_sign_for_another_node() {
-    let (dir, _) = init();
-    let (out, seen) = approve(dir.path(), "0".repeat(32)).await;
+async fn a_plaintext_recovery_phrase_is_refused_before_anything_is_asked() {
+    let dir = init(false);
+    let (out, seen) = approve(dir.path(), "0".repeat(32), DEVICE).await;
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("nothing was signed"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not encrypted") && stderr.contains("Nothing was signed"), "{stderr}");
+    assert!(seen.is_empty(), "the socket is not even asked: {seen:?}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("code>"));
+}
+
+#[tokio::test]
+async fn a_leftover_plaintext_copy_is_refused_too() {
+    let dir = init(true);
+    std::fs::write(dir.path().join("mnemonic.txt"), "abandon ...").unwrap();
+    let (out, seen) = approve(dir.path(), "0".repeat(32), DEVICE).await;
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("plaintext copy"));
+    assert!(seen.is_empty());
+}
+
+#[tokio::test]
+async fn socket_text_is_never_printed_and_the_terms_shown_are_computed_locally() {
+    let dir = init(true);
+    let (out, seen) = approve(dir.path(), "0".repeat(32), DEVICE).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Nothing the socket wrote reaches the terminal: no escape byte, no fake fingerprint.
+    assert!(!out.stdout.contains(&0x1b) && !out.stderr.contains(&0x1b), "{stdout:?}");
+    assert!(!stdout.contains("AAAA-BBBB-CCCC-DDDD"), "{stdout}");
+    let expected = konsensus_api::pairing::device::key_fingerprint(
+        &konsensus_api::pairing::device::key_id_for(&hex::decode(DEVICE).unwrap()),
+    );
+    assert!(stdout.contains(&format!("device fingerprint:  {expected}")), "{stdout}");
+    assert!(stdout.contains("computed by this command"), "{stdout}");
+    // With no terminal to type the password on, nothing is signed or sent.
+    assert!(!out.status.success());
     assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "{seen:?}");
 }
 
 #[tokio::test]
-async fn it_refuses_a_malformed_tuple_before_signing() {
-    let (dir, mnemonic) = init();
-    let id = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, "").unwrap();
-    let fp = konsensus_api::pairing::identity_fingerprint(&id.node_id().to_hex());
-    // Same fake node, but it now claims a device key that is not a P-256 point.
-    let (out, seen) = approve_with(dir.path(), fp, "04zz").await;
+async fn a_malformed_tuple_is_refused_before_signing() {
+    let dir = init(true);
+    let (out, seen) = approve(dir.path(), "0".repeat(32), "04zz").await;
     assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("malformed device key"));
     assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "{seen:?}");
 }

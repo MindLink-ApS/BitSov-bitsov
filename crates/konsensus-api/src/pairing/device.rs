@@ -794,10 +794,12 @@ mod tests {
     #[test]
     fn an_expired_peer_envelope_cannot_dispatch_on_a_live_peers_time() {
         let tmp = tempfile::tempdir().unwrap();
+        let owner = konsensus_core::OwnerApprovalKey::from_seed(&[7u8; 64]).unwrap();
         let service = PairingService::open(tmp.path(), "f".repeat(32), true)
             .unwrap()
             .with_owner_console(Box::new(std::io::sink()))
-            .without_stdout_code();
+            .without_stdout_code()
+            .with_owner_approval_key(owner.verifying_key());
         // Pair a client.
         let ck = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
         let cpub = hex::encode(ck.verifying_key().to_bytes());
@@ -821,6 +823,12 @@ mod tests {
                 name: "mac".into(),
                 registered_at: 0,
                 epoch: client.epoch,
+                client_pubkey: cpub.clone(),
+                owner_approval: hex::encode(
+                    owner
+                        .sign(owner_approval_message(&"f".repeat(32), &cpub, client.epoch, &hex::encode(&public)).as_bytes())
+                        .to_bytes(),
+                ),
             });
         }
         let (a, b) = ("a".repeat(64), "b".repeat(64));

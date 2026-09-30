@@ -69,7 +69,11 @@ An app is a **paired client**. It never holds the seed or any node key.
    ```
    bitsov-device-register-v1\nnode:{fp}\nclient:{client_id}\npublic_key:{hex}
    ```
-2. The owner runs `konsensus device approve --op <id> --config <path>`. The control socket is **not trusted** to say what is being signed: the CLI computes the device fingerprint, the pairing key and the epoch itself, from the exact bytes it will sign, and the owner compares that fingerprint with the app's screen. The CLI then asks for the short code the node printed on its own terminal, and derives the **owner-approval key** from the seed. It refuses if the node on the socket isn't the identity that seed derives. It then signs:
+2. The owner runs `konsensus device approve --op <id> --config <path>`.
+   - **Owner-secret boundary (enforced, fail closed).** The CLI signs only if the recovery phrase is **encrypted**: a `.enc` file created by `konsensus init --encrypt` or `konsensus restore --encrypt`, with no plaintext `mnemonic.txt` beside it. The encryption password is typed at the CLI's prompt. There is no flag, environment variable or config field for it. Otherwise the CLI refuses before showing or asking anything, because a same-user app that can read a plaintext phrase could derive the owner-approval key and approve devices itself.
+   - The BIP-39 `identity.passphrase` in the config is a derivation input shared with the node. It is not the protection.
+   - The control socket is **not trusted**. Nothing it sends is printed in this flow; other owner commands print its text with control, bidi and invisible characters escaped. The CLI computes the device fingerprint, the pairing key and the epoch itself, from the exact bytes it will sign, and the owner compares that fingerprint with the app's screen.
+   - The CLI then asks for the short code the node printed on its own terminal, prompts for the password, and derives the **owner-approval key** from the seed. It refuses if the node on the socket isn't the identity that seed derives. It then signs:
 
    ```
    bitsov-owner-approval-v1\npurpose:device-key\nnode:{fp}\nclient_pubkey:{hex}\nepoch:{n}\ndevice_key:{hex}
@@ -97,7 +101,12 @@ bitsov-relation-intent-v1\nnode:{fp}\nclient:{client_id}\ndevice:{key_id}\npeer:
 - **GAP (revocation).** Revoking a device key deletes its record, but the owner signature stays valid for (node, client_pubkey, epoch, device key). A `data_dir` writer could restore a revoked key. Epoch bumps and pairing revocation are durable. Per-key revocation needs a signed revocation list or a per-registration nonce.
 - **GAP (socket).** `control.sock` lives in `data_dir`, so a same-user `data_dir` writer could replace it and phish a signature. The CLI's own fingerprint display and the owner's comparison are the defence. The signature is not bound to the console code.
 - **GAP.** No hardware attestation on macOS outside the App Store: the node cannot prove a key is in the Secure Enclave. The owner's approval is the root.
-- **GAP.** The owner-approval private key is derived from the mnemonic on the node's machine. With a plaintext `mnemonic.txt`, a process that can read it can derive the key. The BIP-39 `identity.passphrase` is also plaintext in `konsensus.toml`. An encrypted mnemonic (`.enc`) or a remote signer (§7) closes this.
+- **Boundary.** The owner-approval key is protected by the encryption password, which is required for signing (step 2). What is left:
+  - a same-user process that captures the typed password, for example with a keylogger, or reads the owner CLI's memory while it signs, is out of scope for this tier;
+  - a node started from an encrypted phrase holds the decrypted seed in memory, so a same-user process that can read the node's memory can derive the key;
+  - the BIP-39 `identity.passphrase` is plaintext in `konsensus.toml`.
+  A remote signer (§7) is the real fix.
+- **GAP (migration).** There is no in-place command to encrypt an existing plaintext `mnemonic.txt`. An existing node must be restored or re-created from its recovery phrase with `--encrypt` (`konsensus restore --encrypt`) before it can approve devices. An in-place migration command is the follow-up. An encrypted mnemonic (`.enc`) or a remote signer (§7) closes this.
 - **GAP.** The file-key tier and its label are not built. Today a Mac without a usable Touch ID falls back to the console grant.
 
 ## 5. The profile card is the public profile

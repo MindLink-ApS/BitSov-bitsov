@@ -171,15 +171,33 @@ async fn send(_config_path: &Path, _req: ControlRequest) -> Result<ControlRespon
     )
 }
 
+/// Text from the control socket, made safe for a terminal. The socket is not
+/// trusted (a same-user process could replace it), so control characters
+/// (ANSI escapes included) and invisible or bidi formatting are shown
+/// escaped, never interpreted. Newlines stay.
+pub fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let invisible = matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}');
+            if (c.is_control() && c != '\n') || invisible {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Print a response, returning an error if the node refused.
 fn report(resp: ControlResponse) -> Result<()> {
     match resp {
         ControlResponse::Ok { detail } => {
-            println!("{detail}");
+            println!("{}", terminal_safe(&detail));
             Ok(())
         }
         ControlResponse::Error { message } => {
-            anyhow::bail!("refused: {message}")
+            anyhow::bail!("refused: {}", terminal_safe(&message))
         }
         other => {
             println!("{}", serde_json::to_string_pretty(&other)?);
@@ -309,7 +327,7 @@ async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
             front_door,
             device,
         }),
-        ControlResponse::Error { message } => anyhow::bail!("refused: {message}"),
+        ControlResponse::Error { message } => anyhow::bail!("refused: {}", terminal_safe(&message)),
         other => anyhow::bail!("unexpected control response: {other:?}"),
     }
 }
@@ -320,7 +338,7 @@ async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
 /// must be copied from the owner-run node's terminal, never this API response.
 async fn confirm_interactively(config_path: &Path, op_id: &str) -> Result<String> {
     let described = describe(config_path, op_id).await?;
-    println!("\n{}\n", described.summary);
+    println!("\n{}\n", terminal_safe(&described.summary));
     read_confirmation(&described.label)
 }
 
@@ -432,7 +450,7 @@ pub async fn cmd_grant(config_path: &Path, op_id: &str, flags: GrantFlags) -> Re
         return grant_front_door(config_path, op_id, &flags, &described).await;
     }
     let terms = resolve_terms(&flags, described.proposed_terms.as_ref())?;
-    println!("\n{}\n", described.summary);
+    println!("\n{}\n", terminal_safe(&described.summary));
     println!(
         "YOU ARE GRANTING (the node debits every paid call before paying and refuses \
          with budget_exceeded when it runs out):\n{}\n",
@@ -485,7 +503,7 @@ async fn grant_front_door(
     described: &Described,
 ) -> Result<()> {
     let ttl_secs = front_door_ttl(flags)?;
-    println!("\n{}\n", described.summary);
+    println!("\n{}\n", terminal_safe(&described.summary));
     println!(
         "YOU ARE GRANTING: publish or update this node's front-door card, for {} minutes. \
          No spend, no other route.\n",
@@ -513,13 +531,15 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
     use crate::cli::DeviceCommand;
     match command {
         DeviceCommand::Approve { op_id, config } => {
+            // Fail closed before anything is shown or asked.
+            protected_owner_secret(&config)?;
             let described = describe(&config, &op_id).await?;
             let tuple = described
                 .device
                 .context("that operation is not a device-key registration")?;
-            println!("\n{}\n", described.summary);
-            // The socket is not trusted to say what is being signed: show the
-            // fingerprints computed here, from the exact bytes that get signed.
+            // The socket is not trusted: nothing it wrote is printed in this
+            // flow. Every approval-critical term below is computed here, from
+            // the exact bytes that get signed.
             let device = hex::decode(&tuple.device_public_key)
                 .ok()
                 .filter(|k| k.len() == 65 && k[0] == 0x04)
@@ -582,32 +602,73 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
     }
 }
 
-/// Sign a device registration with the owner-approval key, derived here from
-/// the seed and dropped when this returns. Refuses if the node on the socket
-/// is not the identity this seed derives: the owner signs only for their node.
-fn sign_device_approval(config_path: &Path, tuple: &control::DeviceApprovalTuple) -> Result<String> {
+/// The node's config, if its owner secret is protected from a same-user app:
+/// an encrypted recovery phrase with no plaintext copy beside it. Checked
+/// before the owner is asked anything.
+fn protected_owner_secret(config_path: &Path) -> Result<NodeConfig> {
     let config = NodeConfig::load_before_identity_validation(config_path)
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     let path = &config.identity.mnemonic_file;
-    let password = if path.extension().is_some_and(|e| e == "enc") {
+    if !crate::mnemonic_crypto::is_encrypted_path(path) {
+        anyhow::bail!(
+            "refusing to sign: the recovery phrase at {} is not encrypted, so any program running \
+             as this user could derive the owner-approval key and approve devices itself. \
+             Device approval needs an encrypted recovery phrase (a node created with \
+             `konsensus init --encrypt` or `konsensus restore --encrypt`). Nothing was signed.",
+            path.display()
+        );
+    }
+    let plaintext = path.with_extension("txt");
+    if plaintext.exists() {
+        anyhow::bail!(
+            "refusing to sign: a plaintext copy of the recovery phrase is still at {}. Remove it \
+             (after confirming your backup and that the node starts from the encrypted file). \
+             Nothing was signed.",
+            plaintext.display()
+        );
+    }
+    Ok(config)
+}
+
+/// Sign a device registration with the owner-approval key, derived here from
+/// the seed and dropped when this returns. Refuses if the node on the socket
+/// is not the identity this seed derives: the owner signs only for their node.
+///
+/// Fails closed unless the owner secret is protected from a same-user app:
+/// the recovery phrase must be encrypted (`.enc`, `konsensus init --encrypt`),
+/// no plaintext copy may sit beside it, and its password is typed at this
+/// prompt. There is no flag, environment variable or config field for it.
+fn sign_device_approval(config_path: &Path, tuple: &control::DeviceApprovalTuple) -> Result<String> {
+    sign_device_approval_with(config_path, tuple, || {
         print!("Password for the encrypted recovery phrase: ");
         std::io::stdout().flush().ok();
-        Some(zeroize::Zeroizing::new(
-            rpassword::read_password().context("failed to read the password")?,
+        Ok(zeroize::Zeroizing::new(
+            rpassword::read_password().context("failed to read the password from the terminal")?,
         ))
-    } else {
-        None
-    };
-    let mnemonic = crate::mnemonic_crypto::read_mnemonic(path, password.as_deref().map(|p| p.as_str()))
-        .with_context(|| format!("failed to read the recovery phrase from {}", path.display()))?;
+    })
+}
+
+fn sign_device_approval_with(
+    config_path: &Path,
+    tuple: &control::DeviceApprovalTuple,
+    password: impl FnOnce() -> Result<zeroize::Zeroizing<String>>,
+) -> Result<String> {
+    let config = protected_owner_secret(config_path)?;
+    let path = &config.identity.mnemonic_file;
+    let password = password()?;
+    let mnemonic = crate::mnemonic_crypto::read_mnemonic(path, Some(password.as_str()))
+        .with_context(|| format!("failed to decrypt the recovery phrase at {}", path.display()))?;
+    // The BIP-39 passphrase is a derivation input shared with the node, not
+    // the protection; the protection is the encryption password above.
     let passphrase = config.identity.passphrase.as_str();
     let node = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, passphrase)
         .context("failed to derive the node identity")?;
     let fingerprint = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
     if fingerprint != tuple.node {
         anyhow::bail!(
-            "the node on this socket ({}) is not the identity this recovery phrase derives ({fingerprint}); nothing was signed",
-            tuple.node
+            "the node on this socket ({}) is not the identity this recovery phrase derives \
+             ({fingerprint}); nothing was signed",
+            terminal_safe(&tuple.node)
         );
     }
     let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(&mnemonic, passphrase)
@@ -1421,5 +1482,73 @@ mod connection_error_tests {
             assert!(!diagnostic.contains(&format!("missing{control}dir")), "{diagnostic:?}");
             assert!(diagnostic.contains(&control.escape_debug().to_string()), "{diagnostic:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_signing_tests {
+    use super::*;
+
+    const PHRASE: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const DEVICE: &str = "04aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A node directory whose recovery phrase is encrypted with `password`
+    /// (or plaintext when `None`).
+    fn node(password: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let phrase_path = crate::mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password).unwrap();
+        let config_path = dir.path().join("konsensus.toml");
+        NodeConfig::default_for_tier(NodeTier::Light, phrase_path, dir.path()).save(&config_path).unwrap();
+        (dir, config_path)
+    }
+
+    fn tuple(node: String) -> control::DeviceApprovalTuple {
+        control::DeviceApprovalTuple { node, client_pubkey: "11".repeat(32), epoch: 3, device_public_key: DEVICE.into() }
+    }
+
+    fn fingerprint() -> String {
+        let id = konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "").unwrap();
+        konsensus_api::pairing::identity_fingerprint(&id.node_id().to_hex())
+    }
+
+    fn typed(pw: &'static str) -> impl FnOnce() -> Result<zeroize::Zeroizing<String>> {
+        move || Ok(zeroize::Zeroizing::new(pw.to_string()))
+    }
+
+    #[test]
+    fn signs_with_the_owner_key_only_behind_the_typed_password() {
+        let (_dir, config) = node(Some("correct horse"));
+        let sig = sign_device_approval_with(&config, &tuple(fingerprint()), typed("correct horse")).unwrap();
+        let message = konsensus_api::pairing::device::owner_approval_message(&fingerprint(), &"11".repeat(32), 3, DEVICE);
+        let sig = ed25519_dalek::Signature::from_slice(&hex::decode(sig).unwrap()).unwrap();
+        let id = konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "").unwrap();
+        assert!(id.owner_approval_public().verify_strict(message.as_bytes(), &sig).is_ok());
+        // A wrong password signs nothing.
+        assert!(sign_device_approval_with(&config, &tuple(fingerprint()), typed("wrong")).is_err());
+        // Nor for a node that is not this identity.
+        let err = sign_device_approval_with(&config, &tuple("0".repeat(32)), typed("correct horse")).unwrap_err();
+        assert!(err.to_string().contains("nothing was signed"), "{err}");
+    }
+
+    #[test]
+    fn fails_closed_on_a_plaintext_phrase_without_asking_for_a_password() {
+        let (_dir, config) = node(None);
+        let asked = std::cell::Cell::new(false);
+        let err = sign_device_approval_with(&config, &tuple(fingerprint()), || {
+            asked.set(true);
+            Ok(zeroize::Zeroizing::new(String::new()))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("not encrypted"), "{err}");
+        assert!(!asked.get(), "no password prompt before the refusal");
+    }
+
+    #[test]
+    fn terminal_safe_escapes_controls_and_bidi_but_keeps_text() {
+        let raw = "fp: AAAA\x1b[8m hidden \u{202E}rev\u{200B}\nnext";
+        let safe = terminal_safe(raw);
+        assert!(!safe.contains('\x1b') && !safe.contains('\u{202E}') && !safe.contains('\u{200B}'), "{safe}");
+        assert!(safe.contains("\\u{1b}[8m") && safe.contains("\\u{202e}") && safe.contains("\nnext"), "{safe}");
     }
 }
