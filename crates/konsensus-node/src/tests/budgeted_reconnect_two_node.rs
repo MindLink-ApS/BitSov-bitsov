@@ -209,6 +209,7 @@ async fn start_sender(
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
         file_staging: Default::default(),
     });

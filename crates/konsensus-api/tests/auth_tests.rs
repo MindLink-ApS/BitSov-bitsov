@@ -1793,3 +1793,50 @@ async fn auth_user_rejection_body_is_uniform_across_failure_classes() {
         );
     }
 }
+
+/// `[calls] stun_listen`: the owner's `/status` reports the STUN port only when
+/// the responder runs; the public `/health` never does.
+#[tokio::test]
+async fn status_reports_stun_port_only_when_listening() {
+    async fn get(state: &Arc<AppState>, uri: &str, auth: bool) -> serde_json::Value {
+        let mut req = Request::builder().uri(uri);
+        if auth {
+            req = req.header("authorization", auth_header(state));
+        }
+        let resp = build_router(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap()).unwrap()
+    }
+    let off = test_state();
+    assert!(get(&off, "/api/v1/status", true).await.get("stun_port").is_none());
+
+    let on = Arc::new(AppState { stun_port: Some(3478), ..(*test_state()).clone() });
+    let status = get(&on, "/api/v1/status", true).await;
+    assert_eq!(status["stun_port"], 3478);
+    assert!(status.get("stun_url").is_none(), "no dialable host, no URL");
+    let health = get(&on, "/api/v1/health", false).await;
+    assert!(health.get("stun_port").is_none() && health.get("stun_url").is_none());
+
+    let public = Arc::new(AppState {
+        stun_port: Some(3478),
+        introduction: konsensus_api::handlers::introduction::IntroductionSettings {
+            network: None,
+            endpoint: Some("node.example.org:9000".into()),
+        },
+        ..(*test_state()).clone()
+    });
+    assert_eq!(get(&public, "/api/v1/status", true).await["stun_url"], "stun:node.example.org:3478");
+}
+
+#[test]
+fn stun_url_uses_the_dialable_host_only() {
+    use konsensus_api::handlers::health::stun_url;
+    assert_eq!(stun_url(Some("203.0.113.5:9000"), Some(3478)).as_deref(), Some("stun:203.0.113.5:3478"));
+    assert_eq!(stun_url(Some("[2001:db8::1]:9000"), Some(3478)).as_deref(), Some("stun:[2001:db8::1]:3478"));
+    assert_eq!(stun_url(Some(" node.example.org:9000 "), Some(1)).as_deref(), Some("stun:node.example.org:1"));
+    for bad in ["127.0.0.1:9000", "[::1]:9000", "0.0.0.0:9000", "localhost:9000", "nohost", ":9000", "a b:1", "user@h:1", "2001:db8::1:9000"] {
+        assert_eq!(stun_url(Some(bad), Some(3478)), None, "{bad}");
+    }
+    assert_eq!(stun_url(None, Some(3478)), None);
+    assert_eq!(stun_url(Some("203.0.113.5:9000"), None), None);
+}

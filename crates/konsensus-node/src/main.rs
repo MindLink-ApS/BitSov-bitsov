@@ -16,6 +16,7 @@ mod pending_handler;
 mod profile_handler;
 mod relay;
 mod session_handler;
+mod stun;
 mod admission_quotes;
 mod invoice_refusals;
 #[path = "cli/scb_restore.rs"]
@@ -941,6 +942,17 @@ async fn cmd_start(
         .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?,
     );
 
+    // Calls: bind the owner's STUN responder before the API reports its port.
+    // A configured address that cannot be bound fails boot, like the P2P port.
+    let stun_socket = match config.calls.stun_listen {
+        Some(addr) => Some(
+            stun::bind(addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("[calls] stun_listen {addr} could not be bound: {e}"))?,
+        ),
+        None => None,
+    };
+
     let api_state = Arc::new(konsensus_api::AppState {
         identity: Arc::clone(node.identity()),
         pairing: Some(Arc::clone(&pairing_service)),
@@ -1007,6 +1019,12 @@ async fn cmd_start(
         ),
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
+        stun_port: stun_socket.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()),
+    });
+
+    // Calls: the owner's STUN binding responder, if configured.
+    let stun_handle = stun_socket.map(|socket| {
+        tokio::spawn(stun::serve(socket, stun::Limits::default(), node.shutdown_rx()))
     });
 
     // ── Spawn background tasks ─────────────────────────────────────────
@@ -1396,6 +1414,7 @@ async fn cmd_start(
             if let Err(e) = whitelist_backup_handle.await { warn!(error = %e, "whitelist backup task panicked"); }
             if let Err(e) = api_handle.await { warn!(error = %e, "API server task panicked"); }
             if let Err(e) = grant_cleanup_handle.await { warn!(error = %e, "grant cleanup task panicked"); }
+            if let Some(h) = stun_handle { if let Err(e) = h.await { warn!(error = %e, "STUN responder task panicked"); } }
         },
     )
     .await;

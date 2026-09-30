@@ -195,6 +195,12 @@ pub struct NodeConfig {
     /// never decrypts relay payloads or holds user keys.
     #[serde(default)]
     pub relay: RelayConfig,
+
+    /// Calls (`[calls]`): optional STUN binding responder so the owner's apps
+    /// can find their public address without a third-party server. OFF by
+    /// default. `#[serde(default)]` is mandatory (`deny_unknown_fields`).
+    #[serde(default)]
+    pub calls: CallsConfig,
 }
 
 /// Identity configuration — where the mnemonic is stored.
@@ -708,6 +714,22 @@ pub struct RelayConfig {
     /// silent fallback to the in-memory store.
     #[serde(default)]
     pub durable_db_path: Option<PathBuf>,
+}
+
+/// Calls configuration (`[calls]`).
+///
+/// Media never touches the node (see `docs/v2/CALLS-PROTOTYPE.md`). The only
+/// optional service is a minimal STUN binding responder (RFC 5389 binding
+/// request/response only: no TURN, no relay, no auth, no per-caller state). It
+/// tells a caller the public address its request came from, which is all an
+/// app needs to connect directly across a router. Off unless `stun_listen` is set.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallsConfig {
+    /// UDP address for the STUN responder, for example `0.0.0.0:3478`.
+    /// `None` (default): no UDP socket is opened.
+    #[serde(default)]
+    pub stun_listen: Option<SocketAddr>,
 }
 
 /// Storage backend selection.
@@ -1377,6 +1399,8 @@ impl NodeConfig {
             // T2R8: relay advertisement OFF by default — generated configs do
             // not present this node as a relay.
             relay: RelayConfig::default(),
+            // No STUN responder unless the owner sets `[calls] stun_listen`.
+            calls: CallsConfig::default(),
         }
     }
 }

@@ -45,6 +45,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
         onboarding_subsidy: crate::config::SubsidyConfig::default(),
         sponsor: crate::config::SponsorConfig::default(),
         relay: RelayConfig::default(),
+        calls: Default::default(),
     }
 }
 
@@ -74,6 +75,7 @@ fn snapshot_config(storage: StorageConfig) -> NodeConfig {
         onboarding_subsidy: crate::config::SubsidyConfig::default(),
         sponsor: crate::config::SponsorConfig::default(),
         relay: RelayConfig::default(),
+        calls: Default::default(),
     }
 }
 

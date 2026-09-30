@@ -71,6 +71,7 @@ async fn owner_router(identity: Arc<NodeIdentity>) -> axum::Router {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     });
     konsensus_api::build_router(state)

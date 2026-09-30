@@ -101,6 +101,37 @@ the price query at all, the call is refused before paying
 
 Calls are 1:1: a room compose of 400-403 is refused (`call_room`).
 
+## Own STUN responder (`[calls] stun_listen`, optional)
+
+Direct media across routers needs each app to learn its public address. Rather
+than asking a third-party STUN server, the owner can let their own node answer:
+
+```toml
+[calls]
+stun_listen = "0.0.0.0:3478"   # UDP; omit to keep it off (default)
+```
+
+- **Binding only** (RFC 5389 binding request → success with
+  XOR-MAPPED-ADDRESS). No TURN, no relay, no media, no authentication, no
+  per-call state: it only tells the sender the address its packet came from.
+- **Silent on anything else.** Other methods, responses, bad cookie or length,
+  malformed attributes, comprehension-required attributes (ICE checks,
+  credentials) and a wrong FINGERPRINT get no packet back (not even a 420).
+- **Rate-limited:** 20 answers per source (IPv4 address, IPv6 /64) and 2 000
+  in total per 10 s; the source table is bounded (16 384) and a full table
+  refuses new sources. Answers are ≤ 44 bytes, so it is a poor amplifier.
+- A configured address that cannot be bound fails boot.
+- The owner-only `GET /api/v1/status` reports `stun_port` while it runs, and
+  `stun_url` (`stun:host:port`) when the node has a dialable peer host
+  (`[network] advertised_addr`, not loopback or a wildcard). The public
+  `/health` reports neither. The app may *offer* that URL as the STUN server;
+  the owner confirms it, it is never switched on automatically.
+- It helps apps that reach the node from outside its network (the owner away
+  from home, or a contact). An app behind the same router as the node would
+  mostly learn its local address (router hairpinning varies).
+- Code: `konsensus-node/src/stun.rs` (tests: RFC 5769 vectors, malformed
+  packets, rate limits, a UDP round trip).
+
 ## Evidence
 
 - `msg_handler::tests::paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call`

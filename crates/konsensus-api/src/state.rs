@@ -257,6 +257,10 @@ pub struct AppState {
 
     /// K1 slice 2: the owner's sponsoring policy (`[sponsor]`). Off by default.
     pub sponsor: crate::handlers::sponsor::SponsorPolicy,
+
+    /// UDP port of this node's STUN binding responder (`[calls] stun_listen`),
+    /// reported to the owner in `/status`. `None`: not running (default).
+    pub stun_port: Option<u16>,
 }
 
 /// Authenticated terminal result of an invoice request.

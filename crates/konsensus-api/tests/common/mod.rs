@@ -992,6 +992,7 @@ pub fn test_state() -> Arc<AppState> {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     })
 }
@@ -1053,6 +1054,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     })
 }
@@ -1102,6 +1104,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     })
 }
@@ -1161,6 +1164,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     })
 }
@@ -1210,6 +1214,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     })
 }
@@ -1445,6 +1450,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: Some(Arc::new(konsensus_gossip::GossipValidator::new(
             Default::default(),
         ))),
@@ -1677,6 +1683,7 @@ pub fn test_state_with_lightning(lightning: Arc<dyn LightningProvider>) -> Arc<A
         introduction: Default::default(),
         front_door: Default::default(),
         sponsor: Default::default(),
+        stun_port: None,
         gossip_validator: None,
     })
 }
