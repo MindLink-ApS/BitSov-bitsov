@@ -17,6 +17,7 @@
 //! - Responses are rate-limited per source (IPv4 address, IPv6 /64) and in
 //!   total. The limiter's table is bounded and forgets a source after one
 //!   window; a full table refuses new sources (fail closed).
+//! - Multicast, broadcast, unspecified, and port-0 sources get no answer.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -226,6 +227,20 @@ fn source_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Whether this source may receive a binding success.
+///
+/// Drop multicast, broadcast, unspecified, and port 0: answering those is
+/// never useful for ICE and can be abused as a reflector.
+pub fn answerable_source(source: SocketAddr) -> bool {
+    if source.port() == 0 {
+        return false;
+    }
+    match source.ip().to_canonical() {
+        IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_broadcast() && !v4.is_multicast(),
+        IpAddr::V6(v6) => !v6.is_unspecified() && !v6.is_multicast(),
+    }
+}
+
 /// Bind the responder's UDP socket (`[calls] stun_listen`).
 pub async fn bind(addr: SocketAddr) -> std::io::Result<Arc<UdpSocket>> {
     Ok(Arc::new(UdpSocket::bind(addr).await?))
@@ -251,6 +266,9 @@ pub async fn serve(socket: Arc<UdpSocket>, limits: Limits, mut shutdown_rx: watc
             },
             _ = shutdown_rx.changed() => return,
         };
+        if !answerable_source(source) {
+            continue;
+        }
         let Some(txid) = parse_binding_request(&buf[..n]) else { continue };
         if !limiter.allow(source.ip(), Instant::now()) {
             continue;
@@ -451,6 +469,22 @@ mod tests {
         // After the window the table is pruned and the new source fits.
         assert!(l.allow(ip(3), t0 + Duration::from_secs(10)));
         assert_eq!(l.tracked(), 1);
+    }
+
+    #[test]
+    fn multicast_broadcast_unspecified_and_port_zero_are_not_answered() {
+        let ok = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 3478);
+        assert!(answerable_source(ok));
+        assert!(!answerable_source(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3478)));
+        assert!(!answerable_source(SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 3478)));
+        assert!(!answerable_source(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), 3478)));
+        assert!(!answerable_source(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 3478)));
+        assert!(!answerable_source(SocketAddr::new(
+            IpAddr::V6("ff02::1".parse().unwrap()),
+            3478,
+        )));
+        assert!(!answerable_source(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)));
+        assert!(answerable_source(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3478)));
     }
 
     async fn roundtrip(client: &UdpSocket, req: &[u8]) -> Option<Vec<u8>> {

@@ -49,7 +49,9 @@ pub const BURN_MIN_MS: u64 = 60 * 60 * 1000;
 /// in total. Open calls are never evicted.
 pub const MAX_OPEN_CALLS: u64 = 4096;
 /// Open calls per peer, so one paying peer cannot fill the node's table.
-pub const MAX_OPEN_CALLS_PER_PEER: u64 = 16;
+/// Kept small relative to [`MAX_OPEN_CALLS`]: at 4, filling the global 4096
+/// bound needs at least 1024 distinct peers.
+pub const MAX_OPEN_CALLS_PER_PEER: u64 = 4;
 /// Burned ids (ended calls still under replay protection) per peer.
 pub const MAX_BURNED_PER_PEER: u64 = 256;
 /// Burned ids in total.
@@ -597,6 +599,9 @@ mod tests {
 
     #[test]
     fn open_calls_are_bounded_and_burned_ids_are_bounded_separately() {
+        // One peer cannot fill the global table: 4 open calls per peer × 1024 peers = 4096.
+        assert_eq!(MAX_OPEN_CALLS_PER_PEER, 4);
+        assert_eq!(MAX_OPEN_CALLS, 4096);
         let c = |open_peer, open_total, burned_peer, burned_total| CallCounts { open_peer, open_total, burned_peer, burned_total };
         assert!(has_room(&c(0, 0, 0, 0)).is_ok());
         assert_eq!(has_room(&c(MAX_OPEN_CALLS_PER_PEER, 0, 0, 0)), Err(CallRefusal::Full));

@@ -65,7 +65,7 @@ application-rejected (`accepted = -1`): history, resync and a resend never
 present it as delivered, and its payment hash and nonce stay burned.
 
 **Bounds.** Open calls (reserved, ringing, live, or with a signal of ours
-being paid) are bounded at 16 per peer and 4 096 in total and are never
+being paid) are bounded at 4 per peer and 4 096 in total and are never
 evicted; a new call beyond that is refused (`call_busy`). Burned ids (ended
 calls under replay protection) are bounded separately, 256 per peer and 65 536
 in total, so ended calls never block new ones for the whole tombstone: past a
