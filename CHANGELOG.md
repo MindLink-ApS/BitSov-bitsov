@@ -16,6 +16,7 @@ Retained-node upgrade: [`docs/UPGRADING.md`](docs/UPGRADING.md).
 - Invoice timestamps tolerate small recipient clock skew (#126).
 - Incomplete paid recovery fails closed to `payment_unknown` (#119); paid resends back off while the peer is offline (#118); outbox scans are bounded and keep replay tombstones (#116).
 - Paid envelopes are retained until atomic acceptance ACK (#103); channel fee/announcement requests are enforced (#101).
+- Lightning circuit breaker: stabilize timing and concurrent admission — no queued call after open, no older success closing a new circuit, no older failures extending cooldown, cooldown expiry admits a single recovery probe (#112).
 
 ### Calls (regtest prototype)
 - Paid 1:1 call signalling, kinds **400–403** (#131); durable call state and admission holds (migrations **027**, **028**).
@@ -46,7 +47,8 @@ Retained-node upgrade: [`docs/UPGRADING.md`](docs/UPGRADING.md).
 - BitSov-Data-As-Of / Data-Stale on pinned reads (#78, #79, #84); node energy (N1) and membrane events (N2) (#82, #96, #97).
 
 ### Upgrade path
-- Fail closed when `KONSENSUS_SQLITE_MIGRATIONS_DIR` omits embedded migration versions (#120); embedded set through **028**.
+- Fail closed when `KONSENSUS_SQLITE_MIGRATIONS_DIR` omits embedded migration versions (#120).
+- rc7 (`958e399`) ends at **019**; rc8 adds SQLite **020–028** (#103 → 020–023; #113 → 024; #116 → 025; #132 → 026; #131 → 027–028) plus Postgres dialect files **021** / **024** / **025**. Full table: [`docs/UPGRADING.md`](docs/UPGRADING.md).
 - Document `NODE_INITIALIZED` repair for pre-#76/#77 retained nodes (`konsensus repair mark-initialized`) (#120, #76/#77).
 - Pairing, identity-free bootstrap, owner CLI, and scoped tokens (#72/#73, #76/#77, #92, #94).
 - MSRV **1.88** (#128).

@@ -58,17 +58,32 @@ version embedded in the binary. The error names the directory and the missing ve
 After fixing the migrations source, restart the node. The node applies any pending schema
 migrations itself on first open before serving traffic.
 
-## Migrations 026–028 (web requests + calls)
+## Migrations 020–028 (rc7 → rc8)
 
-rc8 embeds migrations **026–028**. Upgrades from a binary that stopped earlier apply them
-automatically when using embedded migrations. If you override
-`KONSENSUS_SQLITE_MIGRATIONS_DIR`, that directory must include all three or startup refuses:
+`v0.3.0-rc7` (`958e399`) ends at migration **019**. rc8 embeds **020–028** (nine
+SQLite migrations). Upgrades from rc7 apply them automatically when using
+embedded migrations. If you override `KONSENSUS_SQLITE_MIGRATIONS_DIR`, that
+directory must include **all nine** (plus every earlier version the binary
+embeds) or startup refuses.
 
-| Ver | File | Purpose |
-| --- | --- | --- |
-| **026** | `026_outstanding_web_requests.sql` | Durable table binding zero-amount `KIND_WEB_MANIFEST` / `KIND_PAGE_RESPONSE` replies to an outstanding paid 500/510 request (#129, #132). |
-| **027** | `027_call_state.sql` | Durable 1:1 call state (kinds 400–403): burned call ids, live phase, pending operation reservation (#131). |
-| **028** | `028_call_request_hold.sql` | Bind a reserved signal to its request hash; hold incoming call signals until admission finalizes (#131). |
+| Ver | SQLite file | Purpose | PR |
+| --- | --- | --- | --- |
+| **020** | `020_pending_delivery_state.sql` | Pending-delivery `state` / `dispatched` columns | #103 |
+| **021** | `021_paid_delivery_rejections.sql` | Paid-delivery rejection / retry-after columns | #103 |
+| **022** | `022_receipt_bindings.sql` | Receipt bindings for duplicate ACKs | #103 |
+| **023** | `023_delivery_price_quotes.sql` | Durable recipient-issued delivery price quotes | #103 |
+| **024** | `024_outbox_operations.sql` | Exactly-once compose `outbox_operations` | #113 |
+| **025** | `025_outbox_recovery.sql` | Bounded outbox recovery / replay tombstones | #116 |
+| **026** | `026_outstanding_web_requests.sql` | Outstanding paid web 500/510 requests | #132 |
+| **027** | `027_call_state.sql` | Durable 1:1 call state (kinds 400–403) | #131 |
+| **028** | `028_call_request_hold.sql` | Call admission holds + pending request hash | #131 |
+
+**Postgres** also ships dialect files for **021**, **024**, and **025** under
+`crates/konsensus-storage/migrations/postgres/` (`021_paid_delivery_rejections.sql`,
+`024_outbox_operations.sql`, `025_outbox_recovery.sql`). SQLite-only hosts ignore
+those; Postgres hosts need them alongside the SQLite set when overriding the
+migrations directory.
+
 
 ## `[pricing] call_msat`
 
