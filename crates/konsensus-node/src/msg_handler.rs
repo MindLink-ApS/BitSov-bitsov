@@ -550,7 +550,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // accepts answer/ICE/hangup only for a live call with this
                         // sender. A refused signal never reaches the app.
                         if konsensus_api::calls::is_call_kind(envelope.kind) {
-                            let admitted = konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), &sender, envelope.kind, plaintext.as_deref()).await;
+                            let admitted = konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await;
                             // Admitted: lift the hold before the app sees it. If that
                             // write fails the signal stays held and is withdrawn by the
                             // sweep: fail closed, the peer gets a reject, not an ACK.

@@ -499,7 +499,7 @@ pub(super) async fn compose_call(
     });
     let plaintext = req.plaintext.clone();
     if !paid {
-        crate::calls::reserve_outgoing(state.storage.as_ref(), &peer, req.kind, &plaintext, &id, &request_hash).await?;
+        crate::calls::reserve_outgoing(state.storage.as_ref(), state.identity.node_id(), &peer, req.kind, &plaintext, &id, &request_hash).await?;
     }
     let result = compose_locked(auth, Arc::clone(&state), req, references, peer, id.clone()).await;
     crate::calls::resolve_outgoing(state.storage.as_ref(), &peer, &plaintext, &id, &request_hash).await;

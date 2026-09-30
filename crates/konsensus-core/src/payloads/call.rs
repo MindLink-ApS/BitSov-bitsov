@@ -27,6 +27,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::kind::{KIND_CALL_ANSWER, KIND_CALL_HANGUP, KIND_CALL_INVITE, KIND_ICE_CANDIDATE};
+use crate::types::NodeId;
 
 /// Payload schema version.
 pub const CALL_SIGNAL_VERSION: u8 = 1;
@@ -53,6 +54,9 @@ pub const MAX_OPEN_CALLS_PER_PEER: u64 = 16;
 pub const MAX_BURNED_PER_PEER: u64 = 256;
 /// Burned ids in total.
 pub const MAX_BURNED_CALLS: u64 = 65_536;
+/// Most participants in a mesh meeting (host included). Every pair is one
+/// ordinary 1:1 call, so upload grows with each extra participant.
+pub const MAX_MEETING_PARTICIPANTS: usize = 4;
 
 /// What media an offer asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +89,25 @@ pub struct CallSignal {
     /// 403 only: why the call ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<HangupReason>,
+    /// 400 only: this call is one leg of a mesh meeting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting: Option<Meeting>,
+}
+
+/// A mesh meeting is a set of ordinary 1:1 calls ("legs") that share an id
+/// and a fixed roster. Each pair of participants is one leg, placed and paid
+/// (at the callee's `call_msat`) by the participant earlier in the roster, so
+/// every leg has exactly one payer and two participants never ring each other.
+/// The node keeps no meeting state: it only refuses a leg that breaks the
+/// roster rule ([`CallSignal::check_leg`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Meeting {
+    /// 32 lowercase hex characters, chosen by the host.
+    pub id: String,
+    /// Node ids (64 lowercase hex), host first; 2 to
+    /// [`MAX_MEETING_PARTICIPANTS`], all distinct.
+    pub roster: Vec<String>,
 }
 
 /// Why a call ended.
@@ -119,8 +142,27 @@ pub enum CallRefusal {
     InFlight,
 }
 
+fn is_lower_hex(id: &str, len: usize) -> bool {
+    id.len() == len && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn is_call_id(id: &str) -> bool {
-    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    is_lower_hex(id, 32)
+}
+
+impl Meeting {
+    fn valid(&self) -> bool {
+        let n = self.roster.len();
+        is_call_id(&self.id)
+            && (2..=MAX_MEETING_PARTICIPANTS).contains(&n)
+            && self.roster.iter().all(|id| is_lower_hex(id, 64))
+            && (1..n).all(|i| !self.roster[..i].contains(&self.roster[i]))
+    }
+
+    fn position(&self, node: &NodeId) -> Option<usize> {
+        let hex = node.to_hex();
+        self.roster.iter().position(|id| *id == hex)
+    }
 }
 
 impl CallSignal {
@@ -141,13 +183,15 @@ impl CallSignal {
         }
         let sdp_ok = |sdp: &Option<String>| sdp.as_deref().is_some_and(|x| !x.is_empty() && x.len() <= MAX_SDP_BYTES);
         let none_but = |media: bool, sdp: bool, cand: bool, reason: bool| {
-            (media || s.media.is_none())
+            (media || (s.media.is_none() && s.meeting.is_none()))
                 && (sdp || s.sdp.is_none())
                 && (cand || (s.candidate.is_none() && s.sdp_mid.is_none() && s.sdp_mline_index.is_none()))
                 && (reason || s.reason.is_none())
         };
         let ok = match kind {
-            KIND_CALL_INVITE => s.media.is_some() && sdp_ok(&s.sdp) && none_but(true, true, false, false),
+            KIND_CALL_INVITE => {
+                s.media.is_some() && sdp_ok(&s.sdp) && none_but(true, true, false, false) && s.meeting.as_ref().is_none_or(Meeting::valid)
+            }
             KIND_CALL_ANSWER => sdp_ok(&s.sdp) && none_but(false, true, false, false),
             KIND_ICE_CANDIDATE => {
                 s.candidate.as_deref().is_some_and(|c| c.len() <= MAX_CANDIDATE_BYTES)
@@ -157,6 +201,17 @@ impl CallSignal {
             _ => none_but(false, false, false, true),
         };
         if ok { Ok(s) } else { Err(CallRefusal::Invalid("fields do not match the kind")) }
+    }
+
+    /// A meeting leg must be placed by the earlier of its two participants,
+    /// both in the roster. Plain 1:1 calls always pass.
+    pub fn check_leg(&self, caller: &NodeId, callee: &NodeId) -> Result<(), CallRefusal> {
+        let Some(m) = &self.meeting else { return Ok(()) };
+        match (m.position(caller), m.position(callee)) {
+            (Some(a), Some(b)) if a < b => Ok(()),
+            (Some(_), Some(_)) => Err(CallRefusal::Invalid("a meeting leg is placed by the earlier participant")),
+            _ => Err(CallRefusal::Invalid("both ends of a meeting leg must be in its roster")),
+        }
     }
 }
 
@@ -425,6 +480,54 @@ mod tests {
         assert!(CallSignal::parse(401, &format!(r#"{{"v":1,"call_id":"{ID}","sdp":"{big}"}}"#)).is_err());
         assert_eq!(CallSignal::parse(0, "{}"), Err(CallRefusal::NotCallKind));
         assert_eq!(CallSignal::parse(404, "{}"), Err(CallRefusal::NotCallKind));
+    }
+
+    fn meeting_offer(roster: &[String]) -> String {
+        let roster = roster.iter().map(|r| format!("\"{r}\"")).collect::<Vec<_>>().join(",");
+        format!(r#"{{"v":1,"call_id":"{ID}","media":"audio","sdp":"v=0","meeting":{{"id":"{ID}","roster":[{roster}]}}}}"#)
+    }
+
+    fn node(b: u8) -> NodeId {
+        NodeId::from_bytes([b; 32])
+    }
+
+    #[test]
+    fn a_meeting_roster_is_2_to_4_distinct_ids_on_offers_only() {
+        let ids: Vec<String> = (0xa1..=0xa5).map(|b| node(b).to_hex()).collect();
+        let offer = CallSignal::parse(400, &meeting_offer(&ids[..4])).unwrap();
+        assert_eq!(offer.meeting.as_ref().unwrap().roster.len(), MAX_MEETING_PARTICIPANTS);
+        assert!(CallSignal::parse(400, &meeting_offer(&ids[..2])).is_ok());
+        assert!(CallSignal::parse(400, &meeting_offer(&ids)).is_err(), "5 participants");
+        assert!(CallSignal::parse(400, &meeting_offer(&ids[..1])).is_err(), "alone");
+        assert!(CallSignal::parse(400, &meeting_offer(&[ids[0].clone(), ids[1].clone(), ids[0].clone()])).is_err(), "duplicate");
+        assert!(CallSignal::parse(400, &meeting_offer(&[ids[0].clone(), ids[1].to_uppercase()])).is_err(), "not lowercase hex");
+        assert!(CallSignal::parse(400, &meeting_offer(&[ids[0].clone(), ids[1][..62].to_string()])).is_err(), "short id");
+        let bad_id = format!(r#"{{"v":1,"call_id":"{ID}","media":"audio","sdp":"v=0","meeting":{{"id":"x","roster":["{}","{}"]}}}}"#, ids[0], ids[1]);
+        assert!(CallSignal::parse(400, &bad_id).is_err(), "meeting id");
+        let extra = format!(r#"{{"v":1,"call_id":"{ID}","media":"audio","sdp":"v=0","meeting":{{"id":"{ID}","roster":["{}","{}"],"host":1}}}}"#, ids[0], ids[1]);
+        assert!(CallSignal::parse(400, &extra).is_err(), "unknown meeting field");
+        let answer = format!(r#"{{"v":1,"call_id":"{ID}","sdp":"v=0","meeting":{{"id":"{ID}","roster":["{}","{}"]}}}}"#, ids[0], ids[1]);
+        assert!(CallSignal::parse(401, &answer).is_err(), "only an offer carries a meeting");
+        let hangup = format!(r#"{{"v":1,"call_id":"{ID}","meeting":{{"id":"{ID}","roster":["{}","{}"]}}}}"#, ids[0], ids[1]);
+        assert!(CallSignal::parse(403, &hangup).is_err());
+    }
+
+    #[test]
+    fn a_meeting_leg_is_placed_by_the_earlier_participant() {
+        let ids: Vec<String> = (1..=3).map(|b| node(b).to_hex()).collect();
+        let offer = CallSignal::parse(400, &meeting_offer(&ids)).unwrap();
+        // Host (1) calls both; invitee 2 calls invitee 3; never the other way.
+        assert_eq!(offer.check_leg(&node(1), &node(2)), Ok(()));
+        assert_eq!(offer.check_leg(&node(1), &node(3)), Ok(()));
+        assert_eq!(offer.check_leg(&node(2), &node(3)), Ok(()));
+        assert!(offer.check_leg(&node(3), &node(2)).is_err());
+        assert!(offer.check_leg(&node(2), &node(1)).is_err());
+        assert!(offer.check_leg(&node(1), &node(1)).is_err(), "not a leg");
+        assert!(offer.check_leg(&node(1), &node(9)).is_err(), "callee outside the roster");
+        assert!(offer.check_leg(&node(9), &node(1)).is_err(), "caller outside the roster");
+        // A plain 1:1 call has no roster to check.
+        let plain = CallSignal::parse(400, &format!(r#"{{"v":1,"call_id":"{ID}","media":"audio","sdp":"v=0"}}"#)).unwrap();
+        assert_eq!(plain.check_leg(&node(9), &node(1)), Ok(()));
     }
 
     #[test]

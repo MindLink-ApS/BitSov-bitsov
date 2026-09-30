@@ -1342,7 +1342,7 @@ async fn background_reconcile_commits_a_paid_call_offer_before_resending() {
     assert!(matches!(state.as_str(), "paid" | "sent" | "acked"), "{state}");
     let entry = f.db.call_get(&peer, &call).await.unwrap().unwrap();
     assert_eq!((entry.phase, entry.pending), (Phase::Ringing, None), "committed by the sweep");
-    konsensus_api::calls::admit_incoming(f.db.as_ref(), &peer, 401, Some(&answer)).await.unwrap();
+    konsensus_api::calls::admit_incoming(f.db.as_ref(), &own(), &peer, 401, Some(&answer)).await.unwrap();
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "paid once");
     answering.abort();
 }
@@ -1395,7 +1395,7 @@ async fn an_uppercase_operation_id_commits_the_paid_call_under_one_key() {
     let entry = f.db.call_get(&f.peer, &call).await.unwrap().expect("paid call state kept");
     assert_eq!((entry.phase, entry.pending), (Phase::Ringing, None));
     let answer = format!(r#"{{"v":1,"call_id":"{call}","sdp":"v=0"}}"#);
-    konsensus_api::calls::admit_incoming(f.db.as_ref(), &f.peer, 401, Some(&answer)).await.unwrap();
+    konsensus_api::calls::admit_incoming(f.db.as_ref(), &own(), &f.peer, 401, Some(&answer)).await.unwrap();
     let response = common::test_router(f.state.clone()).oneshot(call_request(&f, &f.id, &call, "v=0", 0)).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "the same call id is never paid twice");
@@ -1434,7 +1434,7 @@ async fn a_concurrent_mismatch_never_touches_the_winners_reservation() {
         let entry = f.db.call_get(&f.peer, &call).await.unwrap().expect("winner's reservation kept");
         let pending = entry.pending.expect("still reserved while ambiguous");
         assert_eq!((entry.phase, pending.operation_id.as_str(), pending.request_hash.as_str()), (Phase::Reserved, f.id.as_str(), winner_hash.as_str()));
-        assert!(konsensus_api::calls::reserve_outgoing(f.db.as_ref(), &f.peer, 400, &offer_a, &uuid::Uuid::new_v4().to_string(), "other").await.is_err());
+        assert!(konsensus_api::calls::reserve_outgoing(f.db.as_ref(), &own(), &f.peer, 400, &offer_a, &uuid::Uuid::new_v4().to_string(), "other").await.is_err());
         answering.abort();
     }
 }
@@ -1467,7 +1467,7 @@ async fn a_retry_that_finds_the_offer_paid_commits_before_resending() {
     .unwrap();
     assert_eq!(f.db.call_get(&f.peer, &call).await.unwrap().unwrap().phase, Phase::Ringing, "committed before the resend");
     let answer = format!(r#"{{"v":1,"call_id":"{call}","sdp":"v=0"}}"#);
-    konsensus_api::calls::admit_incoming(f.db.as_ref(), &f.peer, 401, Some(&answer)).await.unwrap();
+    konsensus_api::calls::admit_incoming(f.db.as_ref(), &own(), &f.peer, 401, Some(&answer)).await.unwrap();
     assert_eq!(retry.await.unwrap().unwrap().status(), StatusCode::OK);
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
     answering.abort();
@@ -1491,7 +1491,7 @@ async fn a_refused_signal_whose_cleanup_failed_stays_invisible_and_is_withdrawn(
     assert!(konsensus_api::calls::hold_incoming(f.db.as_ref(), &env).await.unwrap());
     assert_eq!(f.db.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted);
     f.db.store_message_plaintext(&env.id, &cipher.encrypt(text.as_bytes()).unwrap()).await.unwrap();
-    assert!(konsensus_api::calls::admit_incoming(f.db.as_ref(), &f.peer, 402, Some(&text)).await.is_err());
+    assert!(konsensus_api::calls::admit_incoming(f.db.as_ref(), &own(), &f.peer, 402, Some(&text)).await.is_err());
     sqlx::raw_sql("CREATE TRIGGER cleanup_failure BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END").execute(f.db.pool()).await.unwrap();
     assert!(f.db.reject_accepted_envelope(&env).await.is_err());
     sqlx::raw_sql("DROP TRIGGER cleanup_failure").execute(f.db.pool()).await.unwrap();
@@ -1570,7 +1570,12 @@ async fn a_capped_refusal_never_releases_the_uncapped_same_request_reservation()
         let entry = f.db.call_get(&f.peer, &call).await.unwrap().expect("the paid call keeps its state");
         assert_eq!((entry.phase, entry.pending), (Phase::Ringing, None));
         let answer = format!(r#"{{"v":1,"call_id":"{call}","sdp":"v=0"}}"#);
-        konsensus_api::calls::admit_incoming(f.db.as_ref(), &f.peer, 401, Some(&answer)).await.unwrap();
+        konsensus_api::calls::admit_incoming(f.db.as_ref(), &own(), &f.peer, 401, Some(&answer)).await.unwrap();
         answering.abort();
     }
+}
+
+/// This node's own id in these tests: never one of the peers.
+fn own() -> konsensus_core::types::NodeId {
+    konsensus_core::types::NodeId::from_bytes([0xee; 32])
 }
