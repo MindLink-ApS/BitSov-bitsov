@@ -218,6 +218,17 @@ pub struct GrantBudget {
     /// Written atomically with the debit, before async operation attachment.
     #[serde(default)]
     pub operation_links: BTreeMap<String, OperationReservationLink>,
+    /// A relation grant (device-signed `RelationIntent`s): only recipients
+    /// with a live envelope may be paid. Everyone else is refused, rather than
+    /// falling through to the total as in an owner console grant.
+    #[serde(default)]
+    pub recipients_only: bool,
+    /// Relation grants: the most one act may pay each recipient, msat.
+    #[serde(default)]
+    pub per_act_max_by_recipient: BTreeMap<String, u64>,
+    /// Relation grants: when each recipient's envelope ends, unix seconds.
+    #[serde(default)]
+    pub recipient_expires_at: BTreeMap<String, i64>,
 }
 
 impl GrantBudget {
@@ -232,7 +243,90 @@ impl GrantBudget {
             used_by_recipient: BTreeMap::new(),
             pending: BTreeMap::new(),
             operation_links: BTreeMap::new(),
+            recipients_only: false,
+            per_act_max_by_recipient: BTreeMap::new(),
+            recipient_expires_at: BTreeMap::new(),
         }
+    }
+
+    /// An empty relation grant; envelopes are added by [`Self::open_envelope`].
+    pub fn relations() -> Self {
+        Self {
+            recipients_only: true,
+            ..Self::from_terms(&GrantTerms::new(0))
+        }
+    }
+
+    /// Open (or renew) one recipient's envelope: `budget_msat` more than it has
+    /// already used, at most `per_act_max_msat` per act, until `expires_at`.
+    /// Never lowers what another recipient may still spend.
+    pub fn open_envelope(
+        &mut self,
+        recipient: &str,
+        budget_msat: u64,
+        per_act_max_msat: u64,
+        expires_at: i64,
+    ) {
+        let used = self.used_by_recipient.get(recipient).copied().unwrap_or(0);
+        let old_left = self
+            .per_recipient_msat
+            .get(recipient)
+            .map(|cap| cap.saturating_sub(used))
+            .unwrap_or(0);
+        self.per_recipient_msat
+            .insert(recipient.to_string(), used.saturating_add(budget_msat));
+        self.per_act_max_by_recipient
+            .insert(recipient.to_string(), per_act_max_msat);
+        self.recipient_expires_at.insert(recipient.to_string(), expires_at);
+        // The total is what was used plus what every envelope has left.
+        self.budget_msat = self
+            .budget_msat
+            .saturating_sub(old_left)
+            .saturating_add(budget_msat);
+        self.per_call_max_msat = self.budget_msat;
+    }
+
+    /// Relation grants: refuse any charge outside a live envelope, or above
+    /// its per-act maximum. A no-op for owner console grants.
+    fn check_envelopes(&self, per_recipient: &BTreeMap<&str, u64>, now: i64) -> Result<(), BudgetRefusal> {
+        if !self.recipients_only {
+            return Ok(());
+        }
+        for (recipient, amount) in per_recipient {
+            let live = self
+                .recipient_expires_at
+                .get(*recipient)
+                .is_some_and(|expires| *expires > now);
+            if !live {
+                return Err(BudgetRefusal::Recipient {
+                    recipient: recipient.to_string(),
+                    remaining_msat: 0,
+                });
+            }
+            let per_act = self.per_act_max_by_recipient.get(*recipient).copied().unwrap_or(0);
+            if *amount > per_act {
+                return Err(BudgetRefusal::PerCall { max_msat: per_act });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every recipient still has a live envelope at `now`. Always
+    /// true for an owner console grant, whose only deadline is the grant's.
+    pub fn envelopes_live<'a>(&self, mut recipients: impl Iterator<Item = &'a String>, now: i64) -> bool {
+        !self.recipients_only
+            || recipients.all(|r| self.recipient_expires_at.get(r).is_some_and(|at| *at > now))
+    }
+
+    /// [`Self::reserve`], first holding a relation grant to its envelopes.
+    pub fn reserve_at(&mut self, charges: &[Charge], now: i64) -> Result<(), BudgetRefusal> {
+        let mut per_recipient: BTreeMap<&str, u64> = BTreeMap::new();
+        for charge in charges {
+            let entry = per_recipient.entry(charge.recipient.as_str()).or_insert(0);
+            *entry = entry.saturating_add(charge.amount_msat);
+        }
+        self.check_envelopes(&per_recipient, now)?;
+        self.reserve(charges)
     }
 
     /// Budget left, msat.
@@ -432,6 +526,15 @@ pub struct GrantView {
     pub per_recipient_msat: BTreeMap<String, u64>,
     /// Per-recipient usage, msat.
     pub used_by_recipient: BTreeMap<String, u64>,
+    /// A relation grant: only recipients with a live envelope may be paid.
+    #[serde(default)]
+    pub recipients_only: bool,
+    /// Relation grants: the most one act may pay each recipient, msat.
+    #[serde(default)]
+    pub per_act_max_by_recipient: BTreeMap<String, u64>,
+    /// Relation grants: when each recipient's envelope ends, unix seconds.
+    #[serde(default)]
+    pub recipient_expires_at: BTreeMap<String, i64>,
 }
 
 /// Render terms for a human before they approve them.
@@ -628,4 +731,37 @@ pub struct OperationReservationLink {
     pub operation_id: String,
     pub execution_id: String,
     pub readmission: bool,
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    fn charge(recipient: &str, amount_msat: u64) -> Charge {
+        Charge { recipient: recipient.to_string(), amount_msat }
+    }
+
+
+    #[test]
+    fn a_relation_envelope_binds_recipient_per_act_and_time() {
+        let mut b = GrantBudget::relations();
+        b.open_envelope("aa", 10_000, 4_000, 100);
+        // Unlisted recipients are refused even with budget left.
+        assert!(matches!(b.reserve_at(&[charge("bb", 1)], 50), Err(BudgetRefusal::Recipient { .. })));
+        assert!(matches!(b.reserve_at(&[charge("aa", 4_001)], 50), Err(BudgetRefusal::PerCall { .. })));
+        b.reserve_at(&[charge("aa", 4_000)], 50).unwrap();
+        // At and after the envelope's end: refused, nothing debited.
+        let used = b.used_msat;
+        assert!(matches!(b.reserve_at(&[charge("aa", 1)], 100), Err(BudgetRefusal::Recipient { .. })));
+        assert_eq!(b.used_msat, used);
+        // Renewal adds on top of what was used; other envelopes keep theirs.
+        b.open_envelope("bb", 5_000, 5_000, 200);
+        b.open_envelope("aa", 10_000, 4_000, 200);
+        assert_eq!(b.per_recipient_msat["aa"], 14_000);
+        assert_eq!(b.budget_msat, 4_000 + 10_000 + 5_000);
+        b.reserve_at(&[charge("aa", 4_000), charge("bb", 5_000)], 150).unwrap();
+        // An owner console grant is unaffected by envelopes.
+        let mut console = GrantBudget::from_terms(&GrantTerms::new(10_000));
+        console.reserve_at(&[charge("zz", 1_000)], 0).unwrap();
+    }
 }

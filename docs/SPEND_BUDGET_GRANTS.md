@@ -31,9 +31,14 @@ metered grant as an unmetered one.
    scripts and has no effect. See `docs/security/pairing.md` for why this still
    proves the owner is present.
 
-   A request made before the node restarted can no longer be approved (its
-   code lived in memory). `GET /api/v1/pair/elevation/{op_id}` then returns
-   `"status": "lost"`; the app asks again.
+   A node restart prints fresh codes for pending requests (old ones stop
+   working). A request cancelled by wrong codes returns `"status": "lost"`
+   from `GET /api/v1/pair/elevation/{op_id}`; the app asks again. A paired
+   client may withdraw its own request with `DELETE` on that path.
+
+   With a registered device key the app skips this step entirely: it signs a
+   per-contact `RelationIntent` with Touch ID (`docs/security/device-keys.md`).
+   This console path stays as the recovery fallback.
 3. The app re-issues its token. `GET /api/v1/pair/grant` returns the live
    grant (`budget_msat`, `used_msat`, `remaining_msat`, `per_call_max_msat`,
    `per_recipient_msat`, `used_by_recipient`, `granted_at`, `expires_at`), or

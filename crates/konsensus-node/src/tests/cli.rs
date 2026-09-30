@@ -58,6 +58,7 @@ fn parse_start_default_config() {
             password,
             admission_mode,
             owner_control,
+            ..
         } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert!(password.is_none());
@@ -79,6 +80,7 @@ fn parse_start_custom_config() {
             password,
             admission_mode,
             owner_control,
+            ..
         } => {
             assert_eq!(config, PathBuf::from("/etc/konsensus.toml"));
             assert!(password.is_none());
@@ -98,6 +100,7 @@ fn parse_start_with_password() {
             password,
             admission_mode,
             owner_control,
+            ..
         } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert_eq!(password.as_deref(), Some("secret123"));
@@ -119,6 +122,7 @@ fn parse_start_admission_mode_price_open() {
             password,
             admission_mode,
             owner_control,
+            ..
         } => {
             assert_eq!(config, PathBuf::from("konsensus.toml"));
             assert!(password.is_none());
@@ -620,4 +624,23 @@ fn owner_approval_config_preserves_non_utf8_paths() {
     }
     *args.last_mut().unwrap() = OsString::from_vec(b"node-\xff\r/konsensus.toml".to_vec());
     assert!(Cli::try_parse_from(args).is_err());
+}
+
+#[test]
+fn parse_seed_encrypt_and_password_file() {
+    let cli = Cli::parse_from(["konsensus", "seed", "encrypt", "--config", "/n/konsensus.toml"]);
+    assert!(matches!(
+        cli.command,
+        Command::Seed { command: crate::cli::SeedCommand::Encrypt { ref config } } if config == &PathBuf::from("/n/konsensus.toml")
+    ));
+    let cli = Cli::parse_from(["konsensus", "start", "--password-file", "/n/pw"]);
+    match cli.command {
+        Command::Start { password_file, password, .. } => {
+            assert_eq!(password_file, Some(PathBuf::from("/n/pw")));
+            assert!(password.is_none());
+        }
+        _ => panic!("expected Start"),
+    }
+    // Not both.
+    assert!(Cli::try_parse_from(["konsensus", "start", "--password", "x", "--password-file", "/n/pw"]).is_err());
 }
