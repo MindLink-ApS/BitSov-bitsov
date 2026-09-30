@@ -58,6 +58,7 @@ pub mod auth;
 pub mod bootstrap;
 pub mod calls;
 pub mod control;
+pub mod custody;
 pub mod error;
 pub mod freshness;
 pub mod file_staging;
