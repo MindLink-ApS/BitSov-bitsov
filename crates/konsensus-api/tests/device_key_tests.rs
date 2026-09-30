@@ -18,7 +18,9 @@ use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
 use konsensus_api::auth::Scope;
 use konsensus_api::control::{self, ControlContext, ControlRequest, ControlResponse};
-use konsensus_api::pairing::device::{self, intent_message, registration_message};
+use konsensus_api::pairing::device::{self, intent_message, owner_approval_message, registration_message};
+use konsensus_api::pairing::PendingDeviceKey;
+use konsensus_core::OwnerApprovalKey;
 use konsensus_api::pairing::{
     self, DeviceKeyStatus, PairedClient, PairingError, PairingService, RelationIntent,
 };
@@ -34,11 +36,22 @@ fn fingerprint() -> String {
     pairing::identity_fingerprint(&id.node_id().to_hex())
 }
 
+fn owner_key() -> OwnerApprovalKey {
+    OwnerApprovalKey::from_mnemonic(MNEMONIC, "").unwrap()
+}
+
+/// What the owner CLI signs for a pending registration.
+fn owner_sig(op: &PendingDeviceKey) -> String {
+    let msg = owner_approval_message(&fingerprint(), &op.client_pubkey, op.epoch, &op.public_key);
+    hex::encode(owner_key().sign(msg.as_bytes()).to_bytes())
+}
+
 fn owner_run(dir: &std::path::Path) -> (Arc<PairingService>, OwnerConsole) {
     let console = OwnerConsole::default();
     let service = Arc::new(
         PairingService::open(dir, fingerprint(), true)
             .unwrap()
+            .with_owner_approval_key(owner_key().verifying_key())
             .with_owner_console(Box::new(console.clone()))
             .without_stdout_code(),
     );
@@ -130,7 +143,7 @@ fn registered(
         .request_device_key(&client.client_id, &device.public_hex(), "Rasmus's MacBook", &device.proof(&client.client_id))
         .unwrap();
     let key = service
-        .approve_device_key(&op.op_id, &console.owner_code(&op.op_id))
+        .approve_device_key(&op.op_id, &console.owner_code(&op.op_id), &owner_sig(&op))
         .unwrap();
     (service, console, client, device, key.key_id)
 }
@@ -171,13 +184,13 @@ fn a_device_key_is_registered_only_with_proof_and_the_owner_code() {
     assert!(text.contains(&format!("REGISTER DEVICE {} TO {}", op.key_id, op.op_id)), "{text}");
 
     // Wrong code: nothing registered.
-    let err = service.approve_device_key(&op.op_id, "AAAA-AAAA").unwrap_err();
+    let err = service.approve_device_key(&op.op_id, "AAAA-AAAA", &owner_sig(&op)).unwrap_err();
     assert!(matches!(err, PairingError::WrongOwnerCode(_)), "{err}");
     assert!(service.device_keys().is_empty());
 
     // POSITIVE CONTROL: the owner's code registers it, once.
     let key = service
-        .approve_device_key(&op.op_id, &console.owner_code(&op.op_id))
+        .approve_device_key(&op.op_id, &console.owner_code(&op.op_id), &owner_sig(&op))
         .unwrap();
     assert_eq!(key.client_id, client.client_id);
     assert_eq!(service.device_key_status(&client.client_id, &op.op_id), DeviceKeyStatus::Registered);
@@ -453,7 +466,7 @@ fn http_cannot_reach_the_owner_approval_and_the_signature_is_the_only_way_in() {
     }
     let reply = control::handle(
         &ctx,
-        ControlRequest::ApproveDeviceKey { op_id: op.op_id.clone(), confirmation: console.owner_code(&op.op_id) },
+        ControlRequest::ApproveDeviceKey { op_id: op.op_id.clone(), confirmation: console.owner_code(&op.op_id), owner_signature: owner_sig(&op) },
     );
     assert!(matches!(reply, ControlResponse::Ok { .. }), "{reply:?}");
     match control::handle(&ctx, ControlRequest::Status) {
@@ -486,8 +499,8 @@ fn a_restart_reissues_codes_instead_of_losing_the_approval() {
     assert_eq!(service.elevation_status(&grant.op_id), pairing::ElevationStatus::Pending);
 
     // The old codes do not carry over; the new ones approve.
-    assert!(service.approve_device_key(&reg.op_id, &old_reg_code).is_err());
-    service.approve_device_key(&reg.op_id, &console.owner_code(&reg.op_id)).unwrap();
+    assert!(service.approve_device_key(&reg.op_id, &old_reg_code, &owner_sig(&reg)).is_err());
+    service.approve_device_key(&reg.op_id, &console.owner_code(&reg.op_id), &owner_sig(&reg)).unwrap();
     assert!(service
         .grant_elevation(&grant.op_id, &old_grant_code, konsensus_api::spend_budget::GrantTerms::new(1_000))
         .is_err());
@@ -529,7 +542,7 @@ fn a_rotated_pairing_can_register_the_same_device_again() {
     let op = service
         .request_device_key(&rotated.client_id, &device.public_hex(), "mac", &device.proof(&rotated.client_id))
         .unwrap();
-    service.approve_device_key(&op.op_id, &console.owner_code(&op.op_id)).unwrap();
+    service.approve_device_key(&op.op_id, &console.owner_code(&op.op_id), &owner_sig(&op)).unwrap();
 }
 
 #[test]
@@ -552,4 +565,87 @@ fn an_absurd_issued_at_is_refused_not_a_panic() {
     let i = RelationIntent { issued_at: i64::MIN, ..intent(&key_id, PEER, 1_000, 1_000) };
     let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
     assert!(matches!(service.apply_relation_intent(&client.client_id, client.epoch, &i, &s), Err(PairingError::Expired)));
+}
+
+// ─── The owner-approval key (identity model v2) ────────────────────
+
+#[test]
+fn registration_needs_the_owner_key_signature_over_this_exact_tuple() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console) = owner_run(tmp.path());
+    let (client, _) = pair(&service, 1);
+    let device = Device::new();
+    let op = service
+        .request_device_key(&client.client_id, &device.public_hex(), "mac", &device.proof(&client.client_id))
+        .unwrap();
+    let code = console.owner_code(&op.op_id);
+    let sign = |key: &OwnerApprovalKey, msg: String| hex::encode(key.sign(msg.as_bytes()).to_bytes());
+    let other_owner = OwnerApprovalKey::from_mnemonic(MNEMONIC, "someone else").unwrap();
+    let other_device = Device::new();
+    for bad in [
+        String::new(),
+        "zz".into(),
+        // Another seed's owner key.
+        sign(&other_owner, owner_approval_message(&fingerprint(), &op.client_pubkey, op.epoch, &op.public_key)),
+        // The right key over a different device, epoch, pairing or node.
+        sign(&owner_key(), owner_approval_message(&fingerprint(), &op.client_pubkey, op.epoch, &other_device.public_hex())),
+        sign(&owner_key(), owner_approval_message(&fingerprint(), &op.client_pubkey, op.epoch + 1, &op.public_key)),
+        sign(&owner_key(), owner_approval_message(&fingerprint(), &"11".repeat(32), op.epoch, &op.public_key)),
+        sign(&owner_key(), owner_approval_message(&"0".repeat(32), &op.client_pubkey, op.epoch, &op.public_key)),
+    ] {
+        let err = service.approve_device_key(&op.op_id, &code, &bad).unwrap_err();
+        assert!(matches!(err, PairingError::BadProof), "{err}");
+    }
+    assert!(service.device_keys().is_empty());
+    // A bad signature spends none of the owner's code attempts.
+    service.approve_device_key(&op.op_id, &code, &owner_sig(&op)).unwrap();
+    assert_eq!(service.device_keys()[0].owner_approval, owner_sig(&op));
+}
+
+#[test]
+fn a_device_key_written_into_data_dir_authorizes_nothing() {
+    // Write access to data_dir is no longer the root of the chain: a record
+    // added to the pairing store without the owner key's signature (or with
+    // a signature for another key) is refused on every use.
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _, client, device, key_id) = registered(tmp.path());
+    let attacker = Device::new();
+    let attacker_id = device::key_id_for(&hex::decode(attacker.public_hex()).unwrap());
+    drop(service);
+    let path = tmp.path().join("pairing").join("clients.json");
+    let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let genuine = file["device_keys"][0].clone();
+    for approval in [String::new(), genuine["owner_approval"].as_str().unwrap().to_string()] {
+        let mut forged = genuine.clone();
+        forged["key_id"] = attacker_id.clone().into();
+        forged["public_key"] = attacker.public_hex().into();
+        forged["owner_approval"] = approval.into();
+        file["device_keys"].as_array_mut().unwrap().push(forged);
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+    let (service, _) = owner_run(tmp.path());
+    let i = intent(&attacker_id, PEER, 10_000, 10_000);
+    let s = attacker.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let err = service.apply_relation_intent(&client.client_id, client.epoch, &i, &s).unwrap_err();
+    assert!(matches!(err, PairingError::NotGrantable(_)), "{err}");
+    assert!(service.grant_view_for(&client.client_id).is_none());
+
+    // POSITIVE CONTROL: the owner-approved key still works after the reload.
+    let i = intent(&key_id, PEER, 10_000, 10_000);
+    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    service.apply_relation_intent(&client.client_id, client.epoch, &i, &s).unwrap();
+}
+
+#[test]
+fn a_node_started_without_an_owner_key_honours_no_device_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, _, client, device, key_id) = registered(tmp.path());
+    // Same data_dir, but the node was not given the owner-approval public key.
+    let service = PairingService::open(tmp.path(), fingerprint(), true).unwrap().without_stdout_code();
+    let i = intent(&key_id, PEER, 10_000, 10_000);
+    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    assert!(matches!(
+        service.apply_relation_intent(&client.client_id, client.epoch, &i, &s).unwrap_err(),
+        PairingError::NotGrantable(_)
+    ));
 }

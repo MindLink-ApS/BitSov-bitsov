@@ -45,12 +45,15 @@ async fn register_once_then_sign_per_peer_over_http() {
     let base = test_state();
     let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
     let console = OwnerConsole::default();
+    let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "").unwrap();
     let service = Arc::new(
         PairingService::open(tmp.path(), fp.clone(), true)
             .unwrap()
             .with_owner_console(Box::new(console.clone()))
             .without_stdout_code()
-            .with_owner_config("/Users/owner/bitsov/konsensus.toml".into()),
+            .with_owner_config("/Users/owner/bitsov/konsensus.toml".into())
+            .with_owner_approval_key(owner.verifying_key()),
     );
     let state = Arc::new(AppState { pairing: Some(Arc::clone(&service)), data_dir: Some(tmp.path().to_path_buf()), ..(*base).clone() });
 
@@ -103,7 +106,15 @@ async fn register_once_then_sign_per_peer_over_http() {
             has_identity_passphrase: false,
         },
     };
-    let reply = control::handle(&ctx, ControlRequest::ApproveDeviceKey { op_id: op_id.clone(), confirmation: code });
+    // The owner CLI signs the tuple the node describes.
+    let tuple = match control::handle(&ctx, ControlRequest::Describe { op_id: op_id.clone() }) {
+        ControlResponse::Describe { device: Some(t), .. } => t,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((tuple.node.as_str(), tuple.client_pubkey.as_str(), tuple.device_public_key.as_str()), (fp.as_str(), pubkey.as_str(), public.as_str()));
+    let owner_signature = hex::encode(owner.sign(pairing::device::owner_approval_message(
+        &tuple.node, &tuple.client_pubkey, tuple.epoch, &tuple.device_public_key).as_bytes()).to_bytes());
+    let reply = control::handle(&ctx, ControlRequest::ApproveDeviceKey { op_id: op_id.clone(), confirmation: code, owner_signature });
     assert!(matches!(reply, ControlResponse::Ok { .. }), "{reply:?}");
     let (_, done) = call(&state, "GET", &status_path, None, Some(&read_token)).await;
     assert_eq!(done["status"], "registered");

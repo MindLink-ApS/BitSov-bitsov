@@ -58,6 +58,14 @@ pub struct DeviceKey {
     pub registered_at: i64,
     /// Pairing epoch at approval: a revocation or rotation retires the key.
     pub epoch: u64,
+    /// The pairing's client public key the owner approved this device for.
+    #[serde(default)]
+    pub client_pubkey: String,
+    /// The owner-approval key's Ed25519 signature over
+    /// [`owner_approval_message`], hex. Re-verified on every use: a record
+    /// written into `data_dir` by anyone but the owner authorizes nothing.
+    #[serde(default)]
+    pub owner_approval: String,
 }
 
 /// A device key awaiting the owner's one-time approval. Durable: a node
@@ -72,6 +80,9 @@ pub struct PendingDeviceKey {
     pub client_name: String,
     /// Pairing epoch at request time.
     pub epoch: u64,
+    /// The pairing's client public key at request time.
+    #[serde(default)]
+    pub client_pubkey: String,
     /// Key id of the key to register.
     pub key_id: String,
     /// The public key, hex.
@@ -139,6 +150,27 @@ pub fn key_fingerprint(key_id: &str) -> String {
         .map(|c| String::from_utf8_lossy(c).to_uppercase())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// Exact bytes the **owner-approval key** signs to register a device key:
+/// the pairing's `client_pubkey` and `epoch` (the root of the pairing chain),
+/// bound to this node and to the one device key being approved.
+pub fn owner_approval_message(node: &str, client_pubkey: &str, epoch: u64, device_public_key: &str) -> String {
+    format!(
+        "bitsov-owner-approval-v1\npurpose:device-key\nnode:{node}\nclient_pubkey:{client_pubkey}\n\
+         epoch:{epoch}\ndevice_key:{device_public_key}"
+    )
+}
+
+/// Verify an owner-approval signature (Ed25519, hex).
+pub fn verify_owner_approval(
+    owner: &ed25519_dalek::VerifyingKey,
+    message: &str,
+    signature_hex: &str,
+) -> Result<(), PairingError> {
+    let raw = hex::decode(signature_hex).map_err(|_| PairingError::BadProof)?;
+    let sig = ed25519_dalek::Signature::from_slice(&raw).map_err(|_| PairingError::BadProof)?;
+    owner.verify_strict(message.as_bytes(), &sig).map_err(|_| PairingError::BadProof)
 }
 
 /// Exact bytes the device signs to prove possession at registration.
@@ -275,6 +307,7 @@ impl PairingService {
             client_id: client_id.to_string(),
             client_name: client.name.clone(),
             epoch: client.epoch,
+            client_pubkey: client.client_pubkey.clone(),
             key_id,
             public_key: public_key_hex,
             name,
@@ -365,10 +398,14 @@ impl PairingService {
         &self,
         op_id: &str,
         confirmation: &str,
+        owner_signature: &str,
     ) -> Result<DeviceKey, PairingError> {
         if !self.owner_control_enabled {
             return Err(PairingError::OwnerChannelUnavailable);
         }
+        let owner = self.owner_approval_key.ok_or_else(|| {
+            PairingError::NotGrantable("this node has no owner-approval key configured".into())
+        })?;
         let mut inner = self.lock();
         let now = chrono::Utc::now().timestamp();
         let op = inner
@@ -383,6 +420,20 @@ impl PairingService {
             self.persist(&mut inner.file)?;
             return Err(PairingError::Expired);
         }
+        // The owner key signs first: a wrong signature spends no code attempt.
+        let client_pubkey = inner
+            .file
+            .clients
+            .iter()
+            .find(|c| c.client_id == op.client_id)
+            .map(|c| c.client_pubkey.clone())
+            .ok_or(PairingError::UnknownClient)?;
+        let node = inner.identity_fingerprint.clone();
+        verify_owner_approval(
+            &owner,
+            &owner_approval_message(&node, &client_pubkey, op.epoch, &op.public_key),
+            owner_signature,
+        )?;
         self.verify_grant_confirmation(
             &mut inner,
             &device_confirmation_phrase(&op),
@@ -408,6 +459,8 @@ impl PairingService {
             name: op.name.clone(),
             registered_at: now,
             epoch,
+            client_pubkey,
+            owner_approval: owner_signature.to_ascii_lowercase(),
         };
         let before = inner.file.clone();
         inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
@@ -546,7 +599,7 @@ impl PairingService {
         // signature check. Phase 3, under the lock again: re-check and write.
         let (node, key) = {
             let inner = self.lock();
-            let key = Self::intent_key(&inner, client_id, epoch, &intent.device_key_id)?;
+            let key = self.intent_key(&inner, client_id, epoch, &intent.device_key_id)?;
             (inner.identity_fingerprint.clone(), key)
         };
         let raw = parse_public_key(&key.public_key)?;
@@ -558,7 +611,7 @@ impl PairingService {
             return Err(PairingError::Expired);
         }
         if inner.identity_fingerprint != node
-            || Self::intent_key(&inner, client_id, epoch, &intent.device_key_id)? != key
+            || self.intent_key(&inner, client_id, epoch, &intent.device_key_id)? != key
         {
             return Err(PairingError::NotGrantable("the device key changed while checking; sign again".into()));
         }
@@ -655,24 +708,39 @@ impl PairingService {
 
     /// The registered key an intent names, for this client at its current
     /// epoch, or why not.
-    fn intent_key(inner: &Inner, client_id: &str, epoch: u64, key_id: &str) -> Result<DeviceKey, PairingError> {
-        let current = inner
+    fn intent_key(&self, inner: &Inner, client_id: &str, epoch: u64, key_id: &str) -> Result<DeviceKey, PairingError> {
+        let client = inner
             .file
             .clients
             .iter()
             .find(|c| c.client_id == client_id)
-            .map(|c| c.epoch)
             .ok_or(PairingError::UnknownClient)?;
-        if current != epoch {
+        if client.epoch != epoch {
             return Err(PairingError::PairingInvalid("stale token epoch".into()));
         }
-        inner
+        let key = inner
             .file
             .device_keys
             .iter()
             .find(|k| k.key_id == key_id && k.client_id == client_id && k.epoch == epoch)
             .cloned()
-            .ok_or_else(|| PairingError::NotGrantable("unknown or revoked device key".into()))
+            .ok_or_else(|| PairingError::NotGrantable("unknown or revoked device key".into()))?;
+        // The root of the chain: the owner-approval key signed exactly this
+        // pairing key, epoch and device key for this node.
+        let owner = self.owner_approval_key.ok_or_else(|| {
+            PairingError::NotGrantable("this node has no owner-approval key configured".into())
+        })?;
+        let unsigned = || PairingError::NotGrantable("device key has no valid owner approval".into());
+        if key.client_pubkey != client.client_pubkey {
+            return Err(unsigned());
+        }
+        verify_owner_approval(
+            &owner,
+            &owner_approval_message(&inner.identity_fingerprint, &key.client_pubkey, key.epoch, &key.public_key),
+            &key.owner_approval,
+        )
+        .map_err(|_| unsigned())?;
+        Ok(key)
     }
 
     /// Owner-run startup: print a fresh code for every approval that

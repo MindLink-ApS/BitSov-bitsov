@@ -284,6 +284,7 @@ struct Described {
     label: String,
     proposed_terms: Option<GrantTerms>,
     front_door: bool,
+    device: Option<control::DeviceApprovalTuple>,
 }
 
 async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
@@ -300,11 +301,13 @@ async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
             confirmation_label,
             proposed_terms,
             front_door,
+            device,
         } => Ok(Described {
             summary,
             label: confirmation_label,
             proposed_terms,
             front_door,
+            device,
         }),
         ControlResponse::Error { message } => anyhow::bail!("refused: {message}"),
         other => anyhow::bail!("unexpected control response: {other:?}"),
@@ -511,12 +514,22 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
     match command {
         DeviceCommand::Approve { op_id, config } => {
             let described = describe(&config, &op_id).await?;
+            let tuple = described
+                .device
+                .context("that operation is not a device-key registration")?;
             println!("\n{}\n", described.summary);
             let Some(confirmation) = read_owner_code()? else {
                 println!("not registered");
                 return Ok(());
             };
-            report(send(&config, ControlRequest::ApproveDeviceKey { op_id, confirmation }).await?)
+            let owner_signature = sign_device_approval(&config, &tuple)?;
+            report(
+                send(
+                    &config,
+                    ControlRequest::ApproveDeviceKey { op_id, confirmation, owner_signature },
+                )
+                .await?,
+            )
         }
         DeviceCommand::Revoke { key_id, config } => {
             report(send(&config, ControlRequest::RevokeDeviceKey { key_id }).await?)
@@ -548,6 +561,45 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
             other => report(other),
         },
     }
+}
+
+/// Sign a device registration with the owner-approval key, derived here from
+/// the seed and dropped when this returns. Refuses if the node on the socket
+/// is not the identity this seed derives: the owner signs only for their node.
+fn sign_device_approval(config_path: &Path, tuple: &control::DeviceApprovalTuple) -> Result<String> {
+    let config = NodeConfig::load_before_identity_validation(config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let path = &config.identity.mnemonic_file;
+    let password = if path.extension().is_some_and(|e| e == "enc") {
+        print!("Password for the encrypted recovery phrase: ");
+        std::io::stdout().flush().ok();
+        Some(zeroize::Zeroizing::new(
+            rpassword::read_password().context("failed to read the password")?,
+        ))
+    } else {
+        None
+    };
+    let mnemonic = crate::mnemonic_crypto::read_mnemonic(path, password.as_deref().map(|p| p.as_str()))
+        .with_context(|| format!("failed to read the recovery phrase from {}", path.display()))?;
+    let passphrase = config.identity.passphrase.as_str();
+    let node = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, passphrase)
+        .context("failed to derive the node identity")?;
+    let fingerprint = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
+    if fingerprint != tuple.node {
+        anyhow::bail!(
+            "the node on this socket ({}) is not the identity this recovery phrase derives ({fingerprint}); nothing was signed",
+            tuple.node
+        );
+    }
+    let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(&mnemonic, passphrase)
+        .context("failed to derive the owner-approval key")?;
+    let message = konsensus_api::pairing::device::owner_approval_message(
+        &tuple.node,
+        &tuple.client_pubkey,
+        tuple.epoch,
+        &tuple.device_public_key,
+    );
+    Ok(hex::encode(owner.sign(message.as_bytes()).to_bytes()))
 }
 
 /// `konsensus grant-revoke --client-id <id> | --all` — stop spend now.

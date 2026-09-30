@@ -610,6 +610,9 @@ pub struct PairingService {
     owner_console: Mutex<Box<dyn std::io::Write + Send>>,
     /// Absolute config path of an owner-run node, for the owner command.
     owner_config: Option<PathBuf>,
+    /// Public half of the seed-derived owner-approval key. Device keys are
+    /// honoured only under its signature. Never read from `data_dir`.
+    owner_approval_key: Option<ed25519_dalek::VerifyingKey>,
 }
 
 struct Inner {
@@ -830,6 +833,7 @@ impl PairingService {
             print_short_code: true,
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
             owner_config: None,
+            owner_approval_key: None,
         };
         // A grant that expired while the node was down, or an unmetered
         // pre-G1 grant, must not survive the restart on disk either.
@@ -1003,6 +1007,13 @@ impl PairingService {
             .owner_confirmations
             .get(op_id)
             .is_some_and(|c| c.expires_at > now)
+    }
+
+    /// The owner-approval public key, derived from the running identity's
+    /// seed (`NodeIdentity::owner_approval_public`).
+    pub fn with_owner_approval_key(mut self, key: ed25519_dalek::VerifyingKey) -> Self {
+        self.owner_approval_key = Some(key);
+        self
     }
 
     /// Record the absolute config path this node was started with, so the

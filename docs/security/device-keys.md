@@ -16,7 +16,11 @@ Now:
    `konsensus device approve --op <id> --config <path>`. That command prints the
    device name and a fingerprint (`XXXX-XXXX-XXXX-XXXX`) to compare with the
    app's screen, then asks for the short code the node printed on its own
-   terminal.
+   terminal. The CLI also signs the registration with the seed-derived
+   **owner-approval key**, over `client_pubkey`, `epoch`, the node and the
+   device key. The node keeps only that key's public half and re-verifies the
+   signature on every use, so a device-key record written into `data_dir`
+   authorizes nothing (`docs/protocol/ACCOUNT-LAYER.md` §4).
 2. **Per contact, one tap.** To let messages pay a contact, the app signs a
    `RelationIntent` (peer, budget, per-act maximum, window, nonce) with that
    key. Touch ID unlocks the key for that one signature. The node verifies the

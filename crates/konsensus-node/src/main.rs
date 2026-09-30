@@ -943,7 +943,9 @@ async fn cmd_start(
         )
         .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?
         // The owner command the app and console show names this exact config.
-        .with_owner_config(config_path.to_path_buf()),
+        .with_owner_config(config_path.to_path_buf())
+        // Only the public half: the owner CLI derives the private key itself.
+        .with_owner_approval_key(*node.identity().owner_approval_public()),
     );
     // Approvals are durable; only their codes lived in memory. Print fresh
     // codes for any that survived the restart instead of losing them.
