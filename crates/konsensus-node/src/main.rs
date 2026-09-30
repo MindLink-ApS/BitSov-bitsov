@@ -1097,6 +1097,7 @@ async fn cmd_start(
             Arc::clone(node.storage()),
         )),
         content_server: content_server.clone(),
+        front_door: api_state.front_door.clone(),
         routing: Arc::clone(node.routing()),
         identity: Arc::clone(node.identity()),
         plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::new(

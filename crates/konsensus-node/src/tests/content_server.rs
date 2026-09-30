@@ -363,12 +363,12 @@ fn symlink_escape_blocked() {
 fn directory_rejected_not_served() {
     let (dir, server) = setup();
 
-    // Create a subdirectory (not a file)
-    std::fs::create_dir_all(dir.path().join("subdir")).unwrap();
+    // A directory whose name passes the page-name check
+    std::fs::create_dir_all(dir.path().join("folder.md")).unwrap();
 
     let req = PageRequest {
         request_id: "dir".to_string(),
-        path: "/subdir".to_string(),
+        path: "/folder.md".to_string(),
         method: "GET".to_string(),
         accept: vec![],
     };
@@ -379,36 +379,59 @@ fn directory_rejected_not_served() {
 
 // ─── Content type tests ─────────────────────────────────────────────────
 
+/// Only flat, visible `.md` / `.txt` pages leave the porch: never remote HTML,
+/// the card or seq files that live beside the pages, hidden drafts or
+/// subdirectories (BROWSE.md §4).
 #[test]
-fn html_file_served_with_correct_type() {
+fn only_flat_visible_pages_are_served() {
     let (dir, server) = setup();
-    std::fs::write(dir.path().join("page.html"), "<h1>Hello</h1>").unwrap();
-
-    let req = PageRequest {
-        request_id: "html".to_string(),
-        path: "/page.html".to_string(),
-        method: "GET".to_string(),
-        accept: vec![],
-    };
-    let resp = server.handle_request(&req);
-    assert_eq!(resp.status, PageStatus::Ok);
-    assert_eq!(resp.content_type, "text/html");
+    std::fs::create_dir_all(dir.path().join("blog")).unwrap();
+    for (name, body) in [
+        ("page.html", "<h1>Hello</h1>"),
+        ("data.json", "{}"),
+        ("front-door.json", "{\"v\":1}"),
+        ("front-door.seq", "7\n"),
+        ("front-door.json.tmp", "{}"),
+        (".draft.md", "# Draft"),
+        ("blog/post.md", "# Post"),
+    ] {
+        std::fs::write(dir.path().join(name), body).unwrap();
+        let req = PageRequest {
+            request_id: name.to_string(),
+            path: format!("/{name}"),
+            method: "GET".to_string(),
+            accept: vec![],
+        };
+        let resp = server.handle_request(&req);
+        assert_eq!(resp.status, PageStatus::NotFound, "{name} must not be served");
+        assert!(resp.body.len() < 32, "{name} leaked content: {:?}", resp.body);
+    }
+    let manifest = server.build_manifest(0, 1_000);
+    assert!(manifest.pages.is_empty(), "{:?}", manifest.pages);
 }
 
 #[test]
-fn unknown_extension_defaults_to_plain() {
-    let (dir, server) = setup();
-    std::fs::write(dir.path().join("data.json"), "{}").unwrap();
-
-    let req = PageRequest {
-        request_id: "json".to_string(),
-        path: "/data.json".to_string(),
-        method: "GET".to_string(),
-        accept: vec![],
+fn configured_page_size_is_clamped_to_the_porch_cap() {
+    let dir = TempDir::new().unwrap();
+    let server = ContentServer::new(ContentServerConfig {
+        content_dir: dir.path().to_path_buf(),
+        max_file_size: 16 * 1024 * 1024,
+        ..ContentServerConfig::default()
+    })
+    .unwrap();
+    let cap = konsensus_core::payloads::content::MAX_PORCH_BODY_BYTES;
+    std::fs::write(dir.path().join("big.md"), "x".repeat(cap + 1)).unwrap();
+    std::fs::write(dir.path().join("fits.md"), "x".repeat(cap)).unwrap();
+    let get = |path: &str| {
+        server.handle_request(&PageRequest {
+            request_id: path.to_string(),
+            path: path.to_string(),
+            method: "GET".to_string(),
+            accept: vec![],
+        })
     };
-    let resp = server.handle_request(&req);
-    assert_eq!(resp.status, PageStatus::Ok);
-    assert_eq!(resp.content_type, "text/plain");
+    assert_eq!(get("/big.md").status, PageStatus::PayloadTooLarge);
+    assert_eq!(get("/fits.md").body.len(), cap);
 }
 
 // ─── Manifest edge case tests ───────────────────────────────────────────

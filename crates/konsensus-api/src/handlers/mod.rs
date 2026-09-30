@@ -1,6 +1,7 @@
 //! API route handlers.
 
 pub mod auth_routes;
+pub mod browse;
 pub mod calendar;
 pub mod chain;
 pub mod content;

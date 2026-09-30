@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod calendar;
+pub mod card_cache;
 pub mod contracts;
 pub mod envelope;
 pub mod error;

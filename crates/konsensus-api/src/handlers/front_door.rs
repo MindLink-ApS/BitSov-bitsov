@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use konsensus_core::card_cache::CardCache;
 use konsensus_core::front_door::{
     Avatar, FrontDoorCard, FrontDoorCv, FrontDoorError, FrontDoorFields, FrontDoorLink,
     FrontDoorMedia, FrontDoorPrices, FrontDoorProfile, FrontDoorSite, ProfileKind,
@@ -48,6 +49,8 @@ pub struct FrontDoorStore {
     pub card: Arc<Mutex<Option<FrontDoorCard>>>,
     /// Highest seq we have ever issued or salvaged; next publish is floor+1.
     pub seq_floor: Arc<Mutex<u64>>,
+    /// Other nodes' verified cards, from porch reads (BROWSE.md §5). In memory.
+    pub known: Arc<Mutex<CardCache>>,
     /// Absolute path of the card file, when a content or data dir exists.
     persist: Option<PathBuf>,
 }
@@ -127,6 +130,7 @@ impl FrontDoorStore {
         Self {
             card: Arc::new(Mutex::new(card)),
             seq_floor: Arc::new(Mutex::new(floor)),
+            known: Default::default(),
             persist,
         }
     }

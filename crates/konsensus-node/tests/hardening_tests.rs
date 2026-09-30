@@ -51,16 +51,17 @@ fn content_server_unicode_filename() {
     assert!(resp.body.contains("Unicode"));
 }
 
+/// The porch serves a flat site only (docs/protocol/BROWSE.md §4).
 #[test]
-fn content_server_deeply_nested_path() {
+fn content_server_deeply_nested_path_not_served() {
     let (server, _dir) = setup_content_server(
         vec![("a/b/c/d/e/deep.md", "# Deep\nNested content")],
         1024 * 1024,
     );
 
     let resp = server.handle_request(&make_request("/a/b/c/d/e/deep.md"));
-    assert_eq!(resp.status, PageStatus::Ok);
-    assert!(resp.body.contains("Nested content"));
+    assert_eq!(resp.status, PageStatus::NotFound);
+    assert!(server.build_manifest(850_000, 25).pages.is_empty());
 }
 
 #[test]
@@ -208,16 +209,16 @@ fn content_server_not_found_request_id_preserved() {
     assert_eq!(resp.request_id, "not-found-req");
 }
 
+/// Markdown and plain text only: no HTML is served (docs/protocol/BROWSE.md §4).
 #[test]
-fn content_server_content_type_html() {
+fn content_server_html_not_served() {
     let (server, _dir) = setup_content_server(
         vec![("page.html", "<h1>Hello</h1>")],
         1024 * 1024,
     );
 
     let resp = server.handle_request(&make_request("/page.html"));
-    assert_eq!(resp.status, PageStatus::Ok);
-    assert_eq!(resp.content_type, "text/html");
+    assert_eq!(resp.status, PageStatus::NotFound);
 }
 
 #[test]

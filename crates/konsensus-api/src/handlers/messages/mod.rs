@@ -63,6 +63,16 @@ async fn compose_observed(
     out
 }
 
+/// Compose for another handler (browse), with the route's spend authority,
+/// caps and membrane observation.
+pub(crate) async fn compose_for(
+    auth: MeteredSpend,
+    state: Arc<AppState>,
+    req: ComposeRequest,
+) -> Result<Json<ComposeResponse>, ApiError> {
+    compose_observed(auth, State(state), Json(req)).await
+}
+
 async fn send_observed(
     auth: MeteredSpend,
     State(state): State<Arc<AppState>>,
