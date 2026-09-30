@@ -202,10 +202,10 @@ impl App {
             chain_backend: "esplora".into(),
             // A dialable loopback endpoint on regtest, so a front-door card
             // can be issued and knocked on.
-            introduction: konsensus_api::handlers::introduction::IntroductionSettings {
-                network: Some("regtest".into()),
-                endpoint: transport.listen_addr().map(|a| a.to_string()),
-            },
+            introduction: konsensus_api::handlers::introduction::IntroductionSettings::fixed(
+                Some("regtest"),
+                transport.listen_addr().map(|a| a.to_string()).as_deref(),
+            ),
             front_door: Default::default(),
             sponsor: Default::default(),
             stun_port: None,

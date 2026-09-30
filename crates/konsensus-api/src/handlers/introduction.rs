@@ -1,6 +1,13 @@
 //! K1 introductions (slice 1): the node's signed door card, and dialing a
 //! node from one.
 //!
+//! **Profile cards:** [`FrontDoorCard`](konsensus_core::front_door::FrontDoorCard)
+//! via `/api/v1/front-door` is the single user-facing profile format. These
+//! `/api/v1/introduction` routes remain for the sponsor kit
+//! (`bitsov://introduce` with starter-bitcoin offers) and still-wired app host
+//! commands. Successful responses carry `Deprecation` / `Link` pointing at
+//! front-door. See `docs/v2/LEGACY-INTRO-AND-INVITE-MIGRATION.md`.
+//!
 //! **An introduction is never admission.** Issuing one stores nothing and
 //! grants nothing. Opening one dials the introduced node *unprivileged*: no
 //! whitelist entry, no persisted peer, no session, no payment. The reader then
@@ -9,12 +16,12 @@
 //! "whitelist"`) the dial is refused rather than widening the mesh.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::header;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::RngCore;
@@ -35,16 +42,119 @@ pub const CAPABILITY: &str = "introduction_v1";
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What this node may sign into an introduction. Both come from the node's
-/// own configuration; the caller supplies neither.
+/// Why no dialable peer endpoint is known (stable snake_case codes the app
+/// can match on; errors read `introduction_unavailable: <code>`).
+pub mod reason {
+    /// Wildcard listen, no `advertised_addr`, no `stun_server`.
+    pub const NO_DIALABLE_ENDPOINT: &str = "no_dialable_endpoint";
+    /// `stun_server` is set but no answer has arrived yet (boot, first try).
+    pub const STUN_PENDING: &str = "stun_pending";
+    /// The STUN server did not answer (timeout, DNS, socket error).
+    pub const STUN_UNREACHABLE: &str = "stun_unreachable";
+    /// The STUN server answered with something that is not a usable Binding Success.
+    pub const STUN_INVALID_RESPONSE: &str = "stun_invalid_response";
+    /// Mapped address family does not match the peer TCP listener family.
+    pub const STUN_FAMILY_MISMATCH: &str = "stun_family_mismatch";
+}
+
+/// Where a peer endpoint came from.
+pub mod source {
+    /// `[network] advertised_addr`, set by the owner.
+    pub const ADVERTISED: &str = "advertised";
+    /// A concrete (non-wildcard) `listen_addr`.
+    pub const LISTEN: &str = "listen";
+    /// Public IP learned from the owner's `[network] stun_server`, plus the
+    /// TCP peer port of `listen_addr`.
+    pub const STUN: &str = "stun";
+}
+
+/// The dialable peer endpoint as currently known, or why there is none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerEndpointView {
+    /// Dialable `host:port`, never the API address.
+    pub endpoint: Option<String>,
+    /// `"advertised"`, `"listen"` or `"stun"`; set with `endpoint`.
+    pub source: Option<&'static str>,
+    /// Why `endpoint` is `None` (see [`reason`]).
+    pub reason: Option<&'static str>,
+}
+
+impl PeerEndpointView {
+    /// A known endpoint.
+    pub fn found(endpoint: String, source: &'static str) -> Self {
+        Self { endpoint: Some(endpoint), source: Some(source), reason: None }
+    }
+
+    /// No endpoint, for `reason`.
+    pub fn missing(reason: &'static str) -> Self {
+        Self { endpoint: None, source: None, reason: Some(reason) }
+    }
+}
+
+/// What this node may sign into an introduction. Everything comes from the
+/// node's own configuration or its own STUN discovery; the caller supplies
+/// nothing.
 #[derive(Debug, Clone, Default)]
 pub struct IntroductionSettings {
     /// Bitcoin network the node's prices are payable on. `None` (a backend
     /// that does not state its network) means no introduction is offered.
     pub network: Option<String>,
-    /// Dialable BitSov peer endpoint (`host:port`), never the API address.
-    /// `None` when the node only knows a wildcard bind.
-    pub endpoint: Option<String>,
+    /// Endpoint fixed at boot from `advertised_addr` or a concrete
+    /// `listen_addr`. Always wins; discovery can never replace it.
+    pub configured_endpoint: Option<String>,
+    /// [`source`] of `configured_endpoint`.
+    pub configured_source: Option<&'static str>,
+    /// Live STUN discovery result, used only when nothing is configured.
+    pub discovered: Arc<RwLock<PeerEndpointView>>,
+}
+
+impl IntroductionSettings {
+    /// Settings with a fixed, explicit endpoint and no discovery.
+    pub fn fixed(network: Option<&str>, endpoint: Option<&str>) -> Self {
+        Self {
+            network: network.map(Into::into),
+            configured_endpoint: endpoint.map(Into::into),
+            configured_source: endpoint.map(|_| source::ADVERTISED),
+            discovered: Arc::default(),
+        }
+    }
+
+    /// Dialable `host:port`: the configured endpoint, else the discovered one.
+    pub fn endpoint(&self) -> Option<String> {
+        self.endpoint_view().endpoint
+    }
+
+    /// The endpoint with its source, or the reason there is none.
+    pub fn endpoint_view(&self) -> PeerEndpointView {
+        if let Some(endpoint) = &self.configured_endpoint {
+            return PeerEndpointView {
+                endpoint: Some(endpoint.clone()),
+                source: self.configured_source.or(Some(source::ADVERTISED)),
+                reason: None,
+            };
+        }
+        let mut view = self.discovered.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if view.endpoint.is_none() && view.reason.is_none() {
+            view.reason = Some(reason::NO_DIALABLE_ENDPOINT);
+        }
+        view
+    }
+
+    /// Record a discovery result. Has no effect on `configured_endpoint`.
+    pub fn set_discovered(&self, view: PeerEndpointView) {
+        *self.discovered.write().unwrap_or_else(|e| e.into_inner()) = view;
+    }
+
+    /// The endpoint, or the `unavailable_prefix: <reason>` error.
+    pub(crate) fn require_endpoint(&self, unavailable_prefix: &str) -> Result<String, ApiError> {
+        let view = self.endpoint_view();
+        view.endpoint.ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "{unavailable_prefix}: {}",
+                view.reason.unwrap_or(reason::NO_DIALABLE_ENDPOINT)
+            ))
+        })
+    }
 }
 
 /// `GET /api/v1/introduction`.
@@ -95,20 +205,35 @@ fn now_unix() -> Result<u64, ApiError> {
         .map_err(|e| ApiError::Internal(format!("system clock before UNIX_EPOCH: {e}")))
 }
 
+/// Profile-card successor: FrontDoorCard. Introduction stays for sponsor kits.
+const FRONT_DOOR_SUCCESSOR: &str = "</api/v1/front-door>; rel=\"successor-version\"";
+
+fn deprecate_profile_card<T: Serialize>(body: T) -> Response {
+    (
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::HeaderName::from_static("deprecation"), "true"),
+            (header::LINK, FRONT_DOOR_SUCCESSOR),
+        ],
+        Json(body),
+    )
+        .into_response()
+}
+
 /// `GET /api/v1/introduction` — this node's door card: its key, its peer
 /// endpoint and its current first-contact and message prices, signed by the
 /// node key, valid for ten minutes. Read scope: every field is the node's own
 /// and public by design. Pays, stores and grants nothing.
+///
+/// **Deprecated as a profile card** in favour of `GET /api/v1/front-door`; kept
+/// for sponsor offers and existing app host commands.
 async fn get_introduction(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let card = issue_card(&state).await?;
     let link = card.to_link();
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(IntroductionResponse { card, link }),
-    ))
+    Ok(deprecate_profile_card(IntroductionResponse { card, link }))
 }
 
 /// Sign a fresh card for this node (also used by the sponsor kit's offer).
@@ -119,11 +244,7 @@ pub(crate) async fn issue_card(state: &AppState) -> Result<Introduction, ApiErro
             "introduction_unavailable: this node's Lightning backend does not state a Bitcoin network".into(),
         )
     })?;
-    let endpoint = settings.endpoint.clone().ok_or_else(|| {
-        ApiError::Conflict(
-            "introduction_unavailable: no dialable peer endpoint; set [network] advertised_addr".into(),
-        )
-    })?;
+    let endpoint = settings.require_endpoint("introduction_unavailable")?;
     let chat = state
         .pricing
         .get_price_msat(konsensus_core::kind::KIND_CHAT)
@@ -169,13 +290,10 @@ async fn verify_introduction(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<VerifyIntroductionRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let card = verified_card(&state, &req.card)?;
     let link = card.to_link();
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(IntroductionResponse { card, link }),
-    ))
+    Ok(deprecate_profile_card(IntroductionResponse { card, link }))
 }
 
 /// Resolve `endpoint` once, refuse it unless every address is allowed for
@@ -225,7 +343,7 @@ async fn open_introduction(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenIntroductionRequest>,
-) -> Result<Json<OpenIntroductionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let invalid = |e: konsensus_core::introduction::IntroductionError| {
         ApiError::BadRequest(format!("introduction_invalid: {e}"))
     };
@@ -241,7 +359,7 @@ async fn open_introduction(
     }
     let pinned = pin_endpoint(&card).await?;
     match tokio::time::timeout(DIAL_TIMEOUT, state.transport.connect(&node, &pinned.to_string())).await {
-        Ok(Ok(())) => Ok(Json(OpenIntroductionResponse {
+        Ok(Ok(())) => Ok(deprecate_profile_card(OpenIntroductionResponse {
             node_id: node.to_hex(),
             dialed: pinned.to_string(),
             connected: true,

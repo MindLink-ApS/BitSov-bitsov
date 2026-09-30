@@ -9,7 +9,7 @@ const GIFT: u64 = 20_000;
 const FEE: u64 = 1_000;
 
 fn intro(port: u16) -> IntroductionSettings {
-    IntroductionSettings { network: Some("regtest".into()), endpoint: Some(format!("127.0.0.1:{port}")) }
+    IntroductionSettings::fixed(Some("regtest"), Some(&format!("127.0.0.1:{port}")))
 }
 
 /// The owner's node (sponsoring on) with a paired app holding `budget`, and a

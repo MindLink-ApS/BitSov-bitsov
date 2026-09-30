@@ -2291,13 +2291,70 @@ fn validate_allows_settlement_on_with_non_mock_backend() {
 }
 
 #[test]
+fn configured_endpoint_reports_its_source_and_blank_advertised_is_unset() {
+    let mut net = NetworkConfig { listen_addr: "0.0.0.0:9000".parse().unwrap(), ..Default::default() };
+    assert_eq!(net.configured_endpoint(), None, "wildcard alone needs discovery");
+    net.advertised_addr = Some("   ".into());
+    assert_eq!(net.configured_endpoint(), None, "a blank advertised_addr is unset");
+    net.listen_addr = "192.168.1.5:9000".parse().unwrap();
+    assert_eq!(net.configured_endpoint(), Some(("192.168.1.5:9000".into(), "listen")));
+    net.advertised_addr = Some(" node.example.org:9000 ".into());
+    assert_eq!(net.configured_endpoint(), Some(("node.example.org:9000".into(), "advertised")));
+    // A stun_server never changes the configured endpoint.
+    net.stun_server = Some("stun:stun.example.org:3478".into());
+    assert_eq!(net.configured_endpoint(), Some(("node.example.org:9000".into(), "advertised")));
+}
+
+#[test]
+fn stun_server_is_parsed_and_validated() {
+    use crate::config::parse_stun_server;
+    assert_eq!(parse_stun_server("stun:stun.example.org:3478").unwrap(), "stun.example.org:3478");
+    assert_eq!(parse_stun_server(" 203.0.113.7:3478 ").unwrap(), "203.0.113.7:3478");
+    assert_eq!(parse_stun_server("stun:[2001:db8::1]:3478").unwrap(), "[2001:db8::1]:3478");
+    for bad in [
+        "",
+        "stun:",
+        "stun:host",
+        "host:0",
+        "host:99999",
+        "host:x",
+        ":3478",
+        "bad host:3478",
+        "[nope]:3478",
+        "a/b:1",
+        "stuns:stun.example.org:5349",
+        "STUNS:stun.example.org:5349",
+        "stuns:[2001:db8::1]:3478",
+    ] {
+        assert!(parse_stun_server(bad).is_err(), "{bad:?} must be rejected");
+    }
+    let stuns_err = parse_stun_server("stuns:stun.example.org:5349").unwrap_err();
+    assert!(
+        stuns_err.contains("stuns:") && stuns_err.contains("not supported"),
+        "clear reason, got {stuns_err}"
+    );
+    let mut net = NetworkConfig::default();
+    assert_eq!(net.stun_server_addr(), Ok(None));
+    net.stun_server = Some("  ".into());
+    assert_eq!(net.stun_server_addr(), Ok(None));
+    net.stun_server = Some("stun:h.example:3478".into());
+    assert_eq!(net.stun_server_addr(), Ok(Some("h.example:3478".into())));
+    net.stun_server = Some("stuns:h.example:5349".into());
+    assert!(net.stun_server_addr().unwrap_err().contains("stuns:"));
+    net.stun_server = Some("h.example".into());
+    assert!(net.stun_server_addr().is_err());
+    let toml_net: NetworkConfig = toml::from_str("stun_server = \"stun:h.example:3478\"").unwrap();
+    assert_eq!(toml_net.stun_server.as_deref(), Some("stun:h.example:3478"));
+}
+
+#[test]
 fn introduction_endpoint_prefers_advertised_and_skips_wildcards() {
     let mut net = NetworkConfig { listen_addr: "0.0.0.0:9000".parse().unwrap(), ..Default::default() };
-    assert_eq!(net.introduction_endpoint(), None, "a wildcard bind is not dialable");
+    assert_eq!(net.configured_endpoint(), None, "a wildcard bind is not dialable");
     net.listen_addr = "192.168.1.5:9000".parse().unwrap();
-    assert_eq!(net.introduction_endpoint().as_deref(), Some("192.168.1.5:9000"));
+    assert_eq!(net.configured_endpoint().map(|e| e.0).as_deref(), Some("192.168.1.5:9000"));
     net.advertised_addr = Some(" node.example.org:9000 ".into());
-    assert_eq!(net.introduction_endpoint().as_deref(), Some("node.example.org:9000"));
+    assert_eq!(net.configured_endpoint().map(|e| e.0).as_deref(), Some("node.example.org:9000"));
     let toml_net: NetworkConfig = toml::from_str("advertised_addr = \"n.example:1\"").unwrap();
     assert_eq!(toml_net.advertised_addr.as_deref(), Some("n.example:1"));
 }

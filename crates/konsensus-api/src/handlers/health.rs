@@ -71,6 +71,17 @@ pub struct HealthResponse {
     /// node knows no reachable host (wildcard bind, loopback).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stun_url: Option<String>,
+    /// Dialable `host:port` this node signs into introductions and front-door
+    /// cards; omitted when none is known (see `peer_endpoint_reason`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_endpoint: Option<String>,
+    /// `advertised` (owner set), `listen` (concrete bind) or `stun` (discovered).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_endpoint_source: Option<String>,
+    /// Why there is no `peer_endpoint`: `no_dialable_endpoint`, `stun_pending`,
+    /// `stun_unreachable` or `stun_invalid_response`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_endpoint_reason: Option<String>,
     /// Where the seed lives: `local_seed`, `encrypted_seed`, `hosted_custody`
     /// or `remote_signer` (`docs/protocol/REMOTE-SIGNER.md` §2). Owner-only.
     pub custody_mode: crate::custody::CustodyMode,
@@ -216,6 +227,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         tokio::time::timeout(std::time::Duration::from_secs(1), state.chain.get_block_height()).await.ok().and_then(Result::ok)
     } else { None };
 
+    let peer = state.introduction.endpoint_view();
     Json(HealthResponse {
         money_ready: readiness.money_ready,
         readiness,
@@ -251,7 +263,10 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         chain_backend: state.chain_backend.clone(),
         block_height,
         stun_port: state.stun_port,
-        stun_url: stun_url(state.introduction.endpoint.as_deref(), state.stun_port),
+        stun_url: stun_url(peer.endpoint.as_deref(), state.stun_port),
+        peer_endpoint: peer.endpoint,
+        peer_endpoint_source: peer.source.map(String::from),
+        peer_endpoint_reason: peer.reason.map(String::from),
         custody_mode: state.custody_mode,
     })
 }
