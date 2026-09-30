@@ -75,6 +75,13 @@ A relation grant is the client's one budget grant, marked `recipients_only`:
   one-budget-per-client invariant stays.
 - Checks run under the pairing mutex and are persisted before any dispatch,
   on the same reservation path as every G1 debit.
+- **Each recipient's deadline is rechecked at dispatch** (`with_spend_authority`),
+  not only at reservation. A relation grant stays live until its latest
+  envelope, so without this check a payment reserved inside peer A's 60 s
+  window could dispatch after it ended, riding on peer B's 3600 s window. If
+  A's envelope is renewed by a new signature, a still-pending reservation to A
+  may dispatch in the new window. Its amount was counted in the used total
+  that the renewal builds on.
 
 An intent is refused, and nothing is written, when any of these holds:
 

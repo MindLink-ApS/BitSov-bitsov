@@ -2719,12 +2719,28 @@ impl PairingService {
         reservation: &Reservation,
         action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
+        self.with_spend_authority_at(reservation, chrono::Utc::now().timestamp(), action)
+    }
+
+    /// [`Self::with_spend_authority`] at a given clock.
+    pub(crate) fn with_spend_authority_at<T>(
+        &self,
+        reservation: &Reservation,
+        now: i64,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, BudgetRefusal> {
         let inner = self.lock();
-        let now = chrono::Utc::now().timestamp();
         let valid = self.owner_control_enabled
             && inner.file.grants.iter().any(|g| {
                 g.op_id == reservation.op_id
-                    && g.budget.as_ref().is_some_and(|b| b.pending.contains_key(&reservation.id))
+                    && g.budget.as_ref().is_some_and(|b| {
+                        // A relation grant lives until its latest envelope, so
+                        // each recipient's own deadline is rechecked here, at
+                        // dispatch: an expired peer never pays on a live one's time.
+                        b.pending
+                            .get(&reservation.id)
+                            .is_some_and(|recipients| b.envelopes_live(recipients.keys(), now))
+                    })
                     && g.client_id == reservation.client_id
                     && g.identity_fingerprint == inner.identity_fingerprint
                     && g.scopes.contains(&Scope::Spend)
