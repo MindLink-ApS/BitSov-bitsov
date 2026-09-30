@@ -46,7 +46,7 @@ async fn register_once_then_sign_per_peer_over_http() {
     let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
     let console = OwnerConsole::default();
     let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "").unwrap();
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "", &[9u8; 32]).unwrap();
     let service = Arc::new(
         PairingService::open(tmp.path(), fp.clone(), true)
             .unwrap()
@@ -159,4 +159,45 @@ async fn register_once_then_sign_per_peer_over_http() {
     assert_eq!(status, StatusCode::OK);
     let (_, gone) = call(&state, "GET", &format!("/api/v1/pair/device-key/{op2}"), None, Some(&read_token)).await;
     assert_eq!(gone["status"], "absent");
+}
+
+#[tokio::test]
+async fn a_plaintext_seed_node_says_why_touch_id_is_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = test_state();
+    let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
+    let service = Arc::new(
+        PairingService::open(tmp.path(), fp.clone(), true)
+            .unwrap()
+            .with_owner_console(Box::new(OwnerConsole::default()))
+            .without_stdout_code()
+            .with_device_authority_disabled(pairing::device::SEED_NOT_ENCRYPTED),
+    );
+    let state = Arc::new(AppState { pairing: Some(Arc::clone(&service)), data_dir: Some(tmp.path().to_path_buf()), ..(*base).clone() });
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let pubkey = hex::encode(key.verifying_key().to_bytes());
+    let outcome = service.request_pairing("desktop app", &pubkey).unwrap();
+    let challenge = std::fs::read(service.dir().join(format!("challenge-{}", outcome.pair_id))).unwrap();
+    let sig = hex::encode(key.sign(&PairingService::proof_message(&outcome.pair_id, &pubkey, &challenge)).to_bytes());
+    let client = service.confirm_pairing(&outcome.pair_id, &sig, pairing::default_pairing_scopes()).unwrap();
+    let challenge = service.issue_token_challenge(&client.client_id).unwrap();
+    let sig = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
+    let (_, tok) = call(&state, "POST", "/api/v1/pair/token",
+        Some(json!({"client_id": client.client_id, "challenge": challenge, "signature": sig})), None).await;
+    let token = tok["token"].as_str().unwrap();
+
+    // The app can tell before trying.
+    let (_, keys) = call(&state, "GET", "/api/v1/pair/device-keys", None, Some(token)).await;
+    assert_eq!(keys["device_approvals"], "seed_not_encrypted", "{keys}");
+    // And a request is refused with the same stable reason.
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let device = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let public = hex::encode(device.public_key().as_ref());
+    let proof = hex::encode(device.sign(&rng, registration_message(&fp, &client.client_id, &public).as_bytes()).unwrap().as_ref());
+    let (status, body) = call(&state, "POST", "/api/v1/pair/device-key",
+        Some(json!({"public_key": public, "name": "MacBook", "proof": proof})), Some(token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["reason"], "seed_not_encrypted", "{body}");
+    assert!(body["error"].as_str().unwrap().contains("Encrypt your recovery phrase"), "{body}");
 }

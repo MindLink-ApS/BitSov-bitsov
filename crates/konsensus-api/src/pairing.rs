@@ -217,6 +217,10 @@ pub enum PairingError {
          shows a new command"
     )]
     ConfirmationLost,
+    /// Device-key registration and relation intents are off node-wide; the
+    /// `&str` is the stable reason code (see [`device::SEED_NOT_ENCRYPTED`]).
+    #[error("{}", device::device_approvals_off_message(.0))]
+    DeviceApprovalsDisabled(&'static str),
     /// Short owner codes are off for this node run (too many wrong codes).
     #[error(
         "short approval codes are off until the node restarts (too many wrong codes were \
@@ -613,6 +617,9 @@ pub struct PairingService {
     /// Public half of the seed-derived owner-approval key. Device keys are
     /// honoured only under its signature. Never read from `data_dir`.
     owner_approval_key: Option<ed25519_dalek::VerifyingKey>,
+    /// Why device authority is off, if it is. Fail closed: off until startup
+    /// supplies an owner key derived from a protected seed.
+    device_authority_off: Option<&'static str>,
 }
 
 struct Inner {
@@ -834,6 +841,7 @@ impl PairingService {
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
             owner_config: None,
             owner_approval_key: None,
+            device_authority_off: Some(device::OWNER_KEY_UNAVAILABLE),
         };
         // A grant that expired while the node was down, or an unmetered
         // pre-G1 grant, must not survive the restart on disk either.
@@ -1013,7 +1021,21 @@ impl PairingService {
     /// seed (`NodeIdentity::owner_approval_public`).
     pub fn with_owner_approval_key(mut self, key: ed25519_dalek::VerifyingKey) -> Self {
         self.owner_approval_key = Some(key);
+        self.device_authority_off = None;
         self
+    }
+
+    /// Turn device-key registration and relation intents off node-wide, with
+    /// the reason the app shows (e.g. [`device::SEED_NOT_ENCRYPTED`]).
+    pub fn with_device_authority_disabled(mut self, reason: &'static str) -> Self {
+        self.owner_approval_key = None;
+        self.device_authority_off = Some(reason);
+        self
+    }
+
+    /// `None` when device approvals are on, else the reason code.
+    pub fn device_authority_off(&self) -> Option<&'static str> {
+        self.device_authority_off
     }
 
     /// Record the absolute config path this node was started with, so the

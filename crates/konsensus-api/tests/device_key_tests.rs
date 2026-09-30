@@ -37,7 +37,7 @@ fn fingerprint() -> String {
 }
 
 fn owner_key() -> OwnerApprovalKey {
-    OwnerApprovalKey::from_mnemonic(MNEMONIC, "").unwrap()
+    OwnerApprovalKey::from_mnemonic(MNEMONIC, "", &[9u8; 32]).unwrap()
 }
 
 /// What the owner CLI signs for a pending registration.
@@ -580,7 +580,7 @@ fn registration_needs_the_owner_key_signature_over_this_exact_tuple() {
         .unwrap();
     let code = console.owner_code(&op.op_id);
     let sign = |key: &OwnerApprovalKey, msg: String| hex::encode(key.sign(msg.as_bytes()).to_bytes());
-    let other_owner = OwnerApprovalKey::from_mnemonic(MNEMONIC, "someone else").unwrap();
+    let other_owner = OwnerApprovalKey::from_mnemonic(MNEMONIC, "", &[1u8; 32]).unwrap();
     let other_device = Device::new();
     for bad in [
         String::new(),
@@ -646,6 +646,36 @@ fn a_node_started_without_an_owner_key_honours_no_device_key() {
     let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
     assert!(matches!(
         service.apply_relation_intent(&client.client_id, client.epoch, &i, &s).unwrap_err(),
-        PairingError::NotGrantable(_)
+        PairingError::DeviceApprovalsDisabled(device::OWNER_KEY_UNAVAILABLE)
     ));
+}
+
+#[test]
+fn a_node_running_from_a_plaintext_seed_disables_device_authority_node_wide() {
+    // Codex #147 delta repro: a same-user process reads the plaintext seed,
+    // derives an owner key and writes a correctly signed device record. With
+    // the node started from a plaintext seed, nothing device-signed works.
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, _, client, device, key_id) = registered(tmp.path());
+    let service = PairingService::open(tmp.path(), fingerprint(), true)
+        .unwrap()
+        .without_stdout_code()
+        .with_owner_approval_key(owner_key().verifying_key())
+        .with_device_authority_disabled(device::SEED_NOT_ENCRYPTED);
+    assert_eq!(service.device_authority_off(), Some(device::SEED_NOT_ENCRYPTED));
+    let i = intent(&key_id, PEER, 10_000, 10_000);
+    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let err = service.apply_relation_intent(&client.client_id, client.epoch, &i, &s).unwrap_err();
+    assert!(matches!(err, PairingError::DeviceApprovalsDisabled(device::SEED_NOT_ENCRYPTED)), "{err}");
+    assert!(err.to_string().contains("Encrypt your recovery phrase to enable Touch ID approvals"), "{err}");
+    assert!(service.grant_view_for(&client.client_id).is_none());
+    // Registration is off too, before any proof is even checked.
+    let other = Device::new();
+    let err = service
+        .request_device_key(&client.client_id, &other.public_hex(), "mac", &other.proof(&client.client_id))
+        .unwrap_err();
+    assert!(matches!(err, PairingError::DeviceApprovalsDisabled(device::SEED_NOT_ENCRYPTED)), "{err}");
+    // POSITIVE CONTROL: the same state with the node started from the encrypted seed.
+    let (service, _) = owner_run(tmp.path());
+    service.apply_relation_intent(&client.client_id, client.epoch, &i, &s).unwrap();
 }

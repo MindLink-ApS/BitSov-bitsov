@@ -6,9 +6,10 @@
 //! - **secp256k1** — Bitcoin/Lightning operations
 //! - **AES-256** — at-rest storage encryption
 //! - **Ed25519 owner-approval key** — signs owner decisions (device-key
-//!   registration). The running node keeps only its public half; the owner
-//!   CLI derives the private half from the seed when it signs
-//!   (see [`OwnerApprovalKey`], `docs/protocol/ACCOUNT-LAYER.md`)
+//!   registration). Derived from the seed **and** an owner secret stretched
+//!   from the recovery-phrase password, so a copy of the seed alone (say, a
+//!   `mnemonic.txt` read before it was encrypted) does not yield it (see
+//!   [`OwnerApprovalKey`], `docs/protocol/ACCOUNT-LAYER.md`)
 //!
 //! Key derivation uses blake3's KDF with unique context strings, ensuring
 //! domain separation between key types (see ADR-001). All keys — including
@@ -62,35 +63,45 @@ pub struct NodeIdentity {
 
     // NodeId (derived from Ed25519 public key)
     node_id: NodeId,
-
-    // Owner-approval public key. The private half is never kept here.
-    owner_approval_public: Ed25519VerifyingKey,
 }
 
-/// The owner-approval key: Ed25519, derived from the seed under its own
-/// context, unlinkable to the node identity key. Held only for the moment an
-/// owner command signs, then dropped (the signing key zeroizes itself).
+/// The owner-approval key: Ed25519, derived under its own context from the
+/// seed **and** a 32-byte owner secret (the node stretches it from the
+/// recovery-phrase password with argon2id). Unlinkable to the node identity
+/// key, and not derivable from the seed alone. Held only for the moment it is
+/// derived or signs, then dropped (the signing key zeroizes itself).
 pub struct OwnerApprovalKey {
     signing: Ed25519SigningKey,
 }
 
 impl OwnerApprovalKey {
-    /// Derive from a 64-byte BIP-39 seed.
-    pub fn from_seed(seed: &[u8]) -> Result<Self, IdentityError> {
+    /// Derive from a 64-byte BIP-39 seed and the owner secret.
+    pub fn from_seed(seed: &[u8], owner_secret: &[u8; 32]) -> Result<Self, IdentityError> {
         if seed.len() != 64 {
             return Err(IdentityError::InvalidSeedLength(seed.len()));
         }
-        let mut bytes = blake3::derive_key(CTX_OWNER_APPROVAL, seed);
+        let mut hasher = blake3::Hasher::new_derive_key(CTX_OWNER_APPROVAL);
+        hasher.update(seed);
+        hasher.update(owner_secret);
+        let mut bytes: [u8; 32] = *hasher.finalize().as_bytes();
         let signing = Ed25519SigningKey::from_bytes(&bytes);
         bytes.zeroize();
         Ok(Self { signing })
     }
 
-    /// Derive from a mnemonic and BIP-39 passphrase (same inputs as the node).
-    pub fn from_mnemonic(mnemonic_str: &str, passphrase: &str) -> Result<Self, IdentityError> {
+    /// Derive from a mnemonic, BIP-39 passphrase (same inputs as the node) and
+    /// the owner secret.
+    pub fn from_mnemonic(
+        mnemonic_str: &str,
+        passphrase: &str,
+        owner_secret: &[u8; 32],
+    ) -> Result<Self, IdentityError> {
         let mnemonic = bip39::Mnemonic::parse(mnemonic_str)
             .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
-        Self::from_seed(&mnemonic.to_seed(passphrase))
+        let mut seed = mnemonic.to_seed(passphrase);
+        let key = Self::from_seed(&seed, owner_secret);
+        seed.zeroize();
+        key
     }
 
     /// The public half, as the node knows it.
@@ -110,7 +121,7 @@ const CTX_ED25519: &str = "konsensus-v2 ed25519 signing key";
 const CTX_X25519: &str = "konsensus-v2 x25519 key exchange";
 const CTX_SECP256K1: &str = "konsensus-v2 secp256k1 bitcoin key";
 const CTX_AES256: &str = "konsensus-v2 aes256 storage key";
-const CTX_OWNER_APPROVAL: &str = "konsensus-v2 ed25519 owner-approval key";
+const CTX_OWNER_APPROVAL: &str = "konsensus-v2 ed25519 owner-approval key v2 (seed+owner secret)";
 
 impl NodeIdentity {
     /// Create a new identity from a BIP-39 mnemonic phrase.
@@ -159,9 +170,6 @@ impl NodeIdentity {
         // NodeId from Ed25519 public key
         let node_id = NodeId::from_verifying_key(&ed25519_verifying);
 
-        // Owner-approval key: keep only the public half.
-        let owner_approval_public = OwnerApprovalKey::from_seed(seed)?.verifying_key();
-
         Ok(Self {
             ed25519_signing,
             ed25519_verifying,
@@ -172,7 +180,6 @@ impl NodeIdentity {
             secp_public,
             aes_key,
             node_id,
-            owner_approval_public,
         })
     }
 
@@ -225,11 +232,6 @@ impl NodeIdentity {
     /// The secp256k1 public key.
     pub fn secp_public_key(&self) -> &bitcoin::secp256k1::PublicKey {
         &self.secp_public
-    }
-
-    /// The owner-approval public key (see [`OwnerApprovalKey`]).
-    pub fn owner_approval_public(&self) -> &Ed25519VerifyingKey {
-        &self.owner_approval_public
     }
 
     /// The AES-256 key for at-rest storage encryption.
@@ -489,29 +491,33 @@ mod tests {
     }
 
     #[test]
-    fn owner_approval_key_is_domain_separated_and_public_only_on_the_node() {
+    fn owner_approval_key_needs_the_seed_and_the_owner_secret() {
         let id = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let owner = OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        // Deterministic, and the node holds exactly the owner's public half.
-        assert_eq!(id.owner_approval_public(), &owner.verifying_key());
+        let secret = [7u8; 32];
+        let owner = OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "", &secret).unwrap();
+        // Deterministic for the same seed and secret.
         assert_eq!(
-            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "").unwrap().verifying_key(),
+            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "", &secret).unwrap().verifying_key(),
             owner.verifying_key()
         );
-        // Unlinkable to the node identity key, and to every other subkey.
+        // The seed alone is not enough: another secret, another key.
+        assert_ne!(
+            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "", &[8u8; 32]).unwrap().verifying_key(),
+            owner.verifying_key()
+        );
+        // Unlinkable to the node identity key and every other subkey.
         let pk = owner.verifying_key().to_bytes();
         assert_ne!(pk, id.ed25519_verifying_key().to_bytes());
         assert_ne!(pk, *id.x25519_public().as_bytes());
         assert_ne!(pk[..], id.aes_key()[..]);
         // A different passphrase is a different owner.
         assert_ne!(
-            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "x").unwrap().verifying_key(),
+            OwnerApprovalKey::from_mnemonic(TEST_MNEMONIC, "x", &secret).unwrap().verifying_key(),
             owner.verifying_key()
         );
-        // Its signatures verify under its key, not the node's.
         let sig = owner.sign(b"approve");
         assert!(owner.verifying_key().verify_strict(b"approve", &sig).is_ok());
         assert!(id.ed25519_verifying_key().verify_strict(b"approve", &sig).is_err());
-        assert!(matches!(OwnerApprovalKey::from_seed(&[0u8; 32]), Err(IdentityError::InvalidSeedLength(32))));
+        assert!(matches!(OwnerApprovalKey::from_seed(&[0u8; 32], &secret), Err(IdentityError::InvalidSeedLength(32))));
     }
 }
