@@ -171,15 +171,39 @@ async fn send(_config_path: &Path, _req: ControlRequest) -> Result<ControlRespon
     )
 }
 
+/// Text from the control socket, made safe for a terminal. The socket is not
+/// trusted (a same-user process could replace it), so control characters
+/// (ANSI escapes included) and invisible or bidi formatting are shown
+/// escaped, never interpreted. Newlines stay.
+pub fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let invisible = matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}');
+            if (c.is_control() && c != '\n') || invisible {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// `println!` for lines that carry control-socket text: the whole line goes
+/// through [`terminal_safe`].
+macro_rules! safe_println {
+    ($($arg:tt)*) => { println!("{}", terminal_safe(&format!($($arg)*))) };
+}
+
 /// Print a response, returning an error if the node refused.
 fn report(resp: ControlResponse) -> Result<()> {
     match resp {
         ControlResponse::Ok { detail } => {
-            println!("{detail}");
+            println!("{}", terminal_safe(&detail));
             Ok(())
         }
         ControlResponse::Error { message } => {
-            anyhow::bail!("refused: {message}")
+            anyhow::bail!("refused: {}", terminal_safe(&message))
         }
         other => {
             println!("{}", serde_json::to_string_pretty(&other)?);
@@ -197,12 +221,23 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             pending_replacements,
             grants,
             front_door_grants,
+            device_keys,
+            pending_device_keys,
         } => {
+            for k in &device_keys {
+                safe_println!("DEVICE KEY {}  {:?}  client={}", k.fingerprint, k.name, k.client_id);
+            }
+            for p in pending_device_keys.iter().filter(|p| !p.lost) {
+                safe_println!(
+                    "PENDING DEVICE KEY {}  {:?}  client={}\n  approve with: konsensus device approve --op {}",
+                    p.fingerprint, p.name, p.client_id, p.op_id
+                );
+            }
             if clients.is_empty() {
-                println!("no paired clients");
+                safe_println!("no paired clients");
             }
             for c in &clients {
-                println!(
+                safe_println!(
                     "client {}  name={:?}  scopes={}  epoch={}",
                     c.client_id,
                     c.name,
@@ -211,7 +246,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                 );
             }
             for g in &grants {
-                println!(
+                safe_println!(
                     "SPEND GRANT client={}  {} of {} sats left  per-call<={} sats  \
                      expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
                     g.client_id,
@@ -223,7 +258,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                 );
             }
             for g in &front_door_grants {
-                println!(
+                safe_println!(
                     "FRONT DOOR GRANT client={}  may publish the front-door card only  \
                      expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
                     g.client_id, g.expires_at, g.client_id
@@ -231,13 +266,12 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             }
             for e in &pending_elevations {
                 let next = if e.lost {
-                    "can no longer be approved (the node restarted, or wrong codes cancelled it); \
-                     ask again from the app"
+                    "cancelled by wrong codes; ask again from the app"
                         .to_string()
                 } else {
                     format!("approve with: konsensus grant --op {}", e.op_id)
                 };
-                println!(
+                safe_println!(
                     "PENDING ELEVATION op={}  client={} ({})  scopes={}  expires_at={}\n  {next}",
                     e.op_id,
                     e.client_name,
@@ -247,7 +281,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                 );
             }
             for r in &pending_replacements {
-                println!(
+                safe_println!(
                     "PENDING IDENTITY REPLACEMENT op={}  client={} ({})  current={}  \
                      replacement={}  expires_at={}  approved={}\n  \
                      approve with: konsensus approve-replacement --op {}",
@@ -273,6 +307,7 @@ struct Described {
     label: String,
     proposed_terms: Option<GrantTerms>,
     front_door: bool,
+    device: Option<control::DeviceApprovalTuple>,
 }
 
 async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
@@ -289,13 +324,15 @@ async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
             confirmation_label,
             proposed_terms,
             front_door,
+            device,
         } => Ok(Described {
             summary,
             label: confirmation_label,
             proposed_terms,
             front_door,
+            device,
         }),
-        ControlResponse::Error { message } => anyhow::bail!("refused: {message}"),
+        ControlResponse::Error { message } => anyhow::bail!("refused: {}", terminal_safe(&message)),
         other => anyhow::bail!("unexpected control response: {other:?}"),
     }
 }
@@ -306,12 +343,12 @@ async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
 /// must be copied from the owner-run node's terminal, never this API response.
 async fn confirm_interactively(config_path: &Path, op_id: &str) -> Result<String> {
     let described = describe(config_path, op_id).await?;
-    println!("\n{}\n", described.summary);
+    println!("\n{}\n", terminal_safe(&described.summary));
     read_confirmation(&described.label)
 }
 
 fn read_confirmation(phrase: &str) -> Result<String> {
-    println!("On the owner node's console, find {phrase}.\nType its full confirmation, including CODE and the random nonce.\n");
+    safe_println!("On the owner node's console, find {phrase}.\nType its full confirmation, including CODE and the random nonce.\n");
     print!("> ");
     std::io::stdout().flush().ok();
 
@@ -418,7 +455,7 @@ pub async fn cmd_grant(config_path: &Path, op_id: &str, flags: GrantFlags) -> Re
         return grant_front_door(config_path, op_id, &flags, &described).await;
     }
     let terms = resolve_terms(&flags, described.proposed_terms.as_ref())?;
-    println!("\n{}\n", described.summary);
+    println!("\n{}\n", terminal_safe(&described.summary));
     println!(
         "YOU ARE GRANTING (the node debits every paid call before paying and refuses \
          with budget_exceeded when it runs out):\n{}\n",
@@ -471,7 +508,7 @@ async fn grant_front_door(
     described: &Described,
 ) -> Result<()> {
     let ttl_secs = front_door_ttl(flags)?;
-    println!("\n{}\n", described.summary);
+    println!("\n{}\n", terminal_safe(&described.summary));
     println!(
         "YOU ARE GRANTING: publish or update this node's front-door card, for {} minutes. \
          No spend, no other route.\n",
@@ -492,6 +529,164 @@ async fn grant_front_door(
         )
         .await?,
     )
+}
+
+/// `konsensus device approve|list|revoke`.
+pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
+    use crate::cli::DeviceCommand;
+    match command {
+        DeviceCommand::Approve { op_id, config } => {
+            // Fail closed before anything is shown or asked.
+            protected_owner_secret(&config)?;
+            let described = describe(&config, &op_id).await?;
+            let tuple = described
+                .device
+                .context("that operation is not a device-key registration")?;
+            // The socket is not trusted: nothing it wrote is printed in this
+            // flow. Every approval-critical term below is computed here, from
+            // the exact bytes that get signed.
+            let device = hex::decode(&tuple.device_public_key)
+                .ok()
+                .filter(|k| k.len() == 65 && k[0] == 0x04)
+                .context("the node described a malformed device key; nothing was signed")?;
+            let client = hex::decode(&tuple.client_pubkey)
+                .ok()
+                .filter(|k| k.len() == 32)
+                .context("the node described a malformed pairing key; nothing was signed")?;
+            use konsensus_api::pairing::device::{key_fingerprint, key_id_for};
+            println!(
+                "YOU ARE SIGNING (computed by this command, not by the node):\n  device fingerprint:  {}\n  \
+                 pairing key:         {}\n  pairing epoch:       {}\nCompare the device fingerprint with \
+                 the one the app shows. If they differ, press Enter to cancel.\n",
+                key_fingerprint(&key_id_for(&device)),
+                key_fingerprint(&key_id_for(&client)),
+                tuple.epoch
+            );
+            let Some(confirmation) = read_owner_code()? else {
+                println!("not registered");
+                return Ok(());
+            };
+            let owner_signature = sign_device_approval(&config, &tuple)?;
+            report(
+                send(
+                    &config,
+                    ControlRequest::ApproveDeviceKey { op_id, confirmation, owner_signature },
+                )
+                .await?,
+            )
+        }
+        DeviceCommand::Revoke { key_id, config } => {
+            report(send(&config, ControlRequest::RevokeDeviceKey { key_id }).await?)
+        }
+        DeviceCommand::List { config } => match send(&config, ControlRequest::Status).await? {
+            ControlResponse::Status { device_keys, pending_device_keys, .. } => {
+                if device_keys.is_empty() && pending_device_keys.is_empty() {
+                    safe_println!("no device keys");
+                }
+                for k in &device_keys {
+                    safe_println!(
+                        "DEVICE KEY {}  {:?}  client={}  registered_at={}\n  revoke with: konsensus device revoke --key {}",
+                        k.fingerprint, k.name, k.client_id, k.registered_at, k.key_id
+                    );
+                }
+                for p in &pending_device_keys {
+                    let next = if p.lost {
+                        "cancelled by wrong codes; ask again from the app".to_string()
+                    } else {
+                        format!("approve with: konsensus device approve --op {}", p.op_id)
+                    };
+                    safe_println!(
+                        "PENDING DEVICE KEY {}  {:?}  client={} ({})  expires_at={}\n  {next}",
+                        p.fingerprint, p.name, p.client_name, p.client_id, p.expires_at
+                    );
+                }
+                Ok(())
+            }
+            other => report(other),
+        },
+    }
+}
+
+/// The node's config, if its owner secret is protected from a same-user app:
+/// an encrypted recovery phrase with no plaintext copy beside it. Checked
+/// before the owner is asked anything.
+fn protected_owner_secret(config_path: &Path) -> Result<NodeConfig> {
+    let config = NodeConfig::load_before_identity_validation(config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let path = &config.identity.mnemonic_file;
+    if !crate::mnemonic_crypto::is_encrypted_path(path) {
+        anyhow::bail!(
+            "refusing to sign: the recovery phrase at {} is not encrypted, so any program running \
+             as this user could derive the owner-approval key and approve devices itself. \
+             Device approval needs an encrypted recovery phrase (a node created with \
+             `konsensus init --encrypt` or `konsensus restore --encrypt`). Nothing was signed.",
+            path.display()
+        );
+    }
+    let plaintext = path.with_extension("txt");
+    if plaintext.exists() {
+        anyhow::bail!(
+            "refusing to sign: a plaintext copy of the recovery phrase is still at {}. Remove it \
+             (after confirming your backup and that the node starts from the encrypted file). \
+             Nothing was signed.",
+            plaintext.display()
+        );
+    }
+    Ok(config)
+}
+
+/// Sign a device registration with the owner-approval key, derived here from
+/// the seed and dropped when this returns. Refuses if the node on the socket
+/// is not the identity this seed derives: the owner signs only for their node.
+///
+/// Fails closed unless the owner secret is protected from a same-user app:
+/// the recovery phrase must be encrypted (`.enc`, `konsensus init --encrypt`),
+/// no plaintext copy may sit beside it, and its password is typed at this
+/// prompt. There is no flag, environment variable or config field for it.
+fn sign_device_approval(config_path: &Path, tuple: &control::DeviceApprovalTuple) -> Result<String> {
+    sign_device_approval_with(config_path, tuple, || {
+        print!("Password for the encrypted recovery phrase: ");
+        std::io::stdout().flush().ok();
+        Ok(zeroize::Zeroizing::new(
+            rpassword::read_password().context("failed to read the password from the terminal")?,
+        ))
+    })
+}
+
+fn sign_device_approval_with(
+    config_path: &Path,
+    tuple: &control::DeviceApprovalTuple,
+    password: impl FnOnce() -> Result<zeroize::Zeroizing<String>>,
+) -> Result<String> {
+    let config = protected_owner_secret(config_path)?;
+    let path = &config.identity.mnemonic_file;
+    let password = password()?;
+    let mnemonic = crate::mnemonic_crypto::read_mnemonic(path, Some(password.as_str()))
+        .with_context(|| format!("failed to decrypt the recovery phrase at {}", path.display()))?;
+    // The BIP-39 passphrase is a derivation input shared with the node, not
+    // the protection; the protection is the encryption password above.
+    let passphrase = config.identity.passphrase.as_str();
+    let node = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, passphrase)
+        .context("failed to derive the node identity")?;
+    let fingerprint = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
+    if fingerprint != tuple.node {
+        anyhow::bail!(
+            "the node on this socket ({}) is not the identity this recovery phrase derives \
+             ({fingerprint}); nothing was signed",
+            terminal_safe(&tuple.node)
+        );
+    }
+    let secret = crate::mnemonic_crypto::owner_secret(password.as_str(), &node.node_id().to_hex())
+        .context("failed to derive the owner secret")?;
+    let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(&mnemonic, passphrase, &secret)
+        .context("failed to derive the owner-approval key")?;
+    let message = konsensus_api::pairing::device::owner_approval_message(
+        &tuple.node,
+        &tuple.client_pubkey,
+        tuple.epoch,
+        &tuple.device_public_key,
+    );
+    Ok(hex::encode(owner.sign(message.as_bytes()).to_bytes()))
 }
 
 /// `konsensus grant-revoke --client-id <id> | --all` — stop spend now.
@@ -629,7 +824,7 @@ pub fn cmd_repair_mark_initialized(config_path: &Path, confirm: bool) -> Result<
 ///
 /// Uses [`NodeConfig::save`]'s atomic durable replace so the aligned config
 /// reaches stable storage before the caller publishes `NODE_INITIALIZED`.
-fn align_config_mnemonic(config_path: &Path, mnemonic_path: &Path) -> Result<()> {
+pub(crate) fn align_config_mnemonic(config_path: &Path, mnemonic_path: &Path) -> Result<()> {
     if !config_path.try_exists()? {
         return Ok(());
     }
@@ -1294,5 +1489,76 @@ mod connection_error_tests {
             assert!(!diagnostic.contains(&format!("missing{control}dir")), "{diagnostic:?}");
             assert!(diagnostic.contains(&control.escape_debug().to_string()), "{diagnostic:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_signing_tests {
+    use super::*;
+
+    const PHRASE: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const DEVICE: &str = "04aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A node directory whose recovery phrase is encrypted with `password`
+    /// (or plaintext when `None`).
+    fn node(password: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let phrase_path = crate::mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password).unwrap();
+        let config_path = dir.path().join("konsensus.toml");
+        NodeConfig::default_for_tier(NodeTier::Light, phrase_path, dir.path()).save(&config_path).unwrap();
+        (dir, config_path)
+    }
+
+    fn tuple(node: String) -> control::DeviceApprovalTuple {
+        control::DeviceApprovalTuple { node, client_pubkey: "11".repeat(32), epoch: 3, device_public_key: DEVICE.into() }
+    }
+
+    fn fingerprint() -> String {
+        let id = konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "").unwrap();
+        konsensus_api::pairing::identity_fingerprint(&id.node_id().to_hex())
+    }
+
+    fn typed(pw: &'static str) -> impl FnOnce() -> Result<zeroize::Zeroizing<String>> {
+        move || Ok(zeroize::Zeroizing::new(pw.to_string()))
+    }
+
+    #[test]
+    fn signs_with_the_owner_key_only_behind_the_typed_password() {
+        let (_dir, config) = node(Some("correct horse"));
+        let sig = sign_device_approval_with(&config, &tuple(fingerprint()), typed("correct horse")).unwrap();
+        let message = konsensus_api::pairing::device::owner_approval_message(&fingerprint(), &"11".repeat(32), 3, DEVICE);
+        let sig = ed25519_dalek::Signature::from_slice(&hex::decode(sig).unwrap()).unwrap();
+        let id = konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "").unwrap();
+        let secret = crate::mnemonic_crypto::owner_secret("correct horse", &id.node_id().to_hex()).unwrap();
+        let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &secret).unwrap();
+        assert!(owner.verifying_key().verify_strict(message.as_bytes(), &sig).is_ok());
+        assert!(id.ed25519_verifying_key().verify_strict(message.as_bytes(), &sig).is_err());
+        // A wrong password signs nothing.
+        assert!(sign_device_approval_with(&config, &tuple(fingerprint()), typed("wrong")).is_err());
+        // Nor for a node that is not this identity.
+        let err = sign_device_approval_with(&config, &tuple("0".repeat(32)), typed("correct horse")).unwrap_err();
+        assert!(err.to_string().contains("nothing was signed"), "{err}");
+    }
+
+    #[test]
+    fn fails_closed_on_a_plaintext_phrase_without_asking_for_a_password() {
+        let (_dir, config) = node(None);
+        let asked = std::cell::Cell::new(false);
+        let err = sign_device_approval_with(&config, &tuple(fingerprint()), || {
+            asked.set(true);
+            Ok(zeroize::Zeroizing::new(String::new()))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("not encrypted"), "{err}");
+        assert!(!asked.get(), "no password prompt before the refusal");
+    }
+
+    #[test]
+    fn terminal_safe_escapes_controls_and_bidi_but_keeps_text() {
+        let raw = "fp: AAAA\x1b[8m hidden \u{202E}rev\u{200B}\nnext";
+        let safe = terminal_safe(raw);
+        assert!(!safe.contains('\x1b') && !safe.contains('\u{202E}') && !safe.contains('\u{200B}'), "{safe}");
+        assert!(safe.contains("\\u{1b}[8m") && safe.contains("\\u{202e}") && safe.contains("\nnext"), "{safe}");
     }
 }

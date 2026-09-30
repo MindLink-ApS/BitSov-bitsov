@@ -48,6 +48,8 @@ rpassword.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 zeroize.workspace = true
+# getuid (password-file owner check) and, in tests, setsid.
+libc = "0.2"
 # P8.1 D-place (A): the durable SqliteRelayStore (relay/store.rs) is colocated with
 # the trait + InMemory impl in konsensus-node, so this crate takes a direct sqlx dep
 # (already pulled transitively via konsensus-storage). Off-by-default: InMemoryRelayStore

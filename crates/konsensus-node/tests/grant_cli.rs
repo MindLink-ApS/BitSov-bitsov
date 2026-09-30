@@ -64,6 +64,7 @@ fn described(request: &ControlRequest) -> ControlResponse {
             confirmation_label: "GRANT spend TO ab12".into(),
             proposed_terms: Some(GrantTerms::new(2_000_000)),
             front_door: false,
+            device: None,
         },
         _ => ControlResponse::Ok { detail: "granted spend to client c1".into() },
     }
