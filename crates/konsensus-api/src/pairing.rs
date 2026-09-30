@@ -623,6 +623,9 @@ struct Inner {
     owner_confirmations: HashMap<String, OwnerConfirmation>,
     // Wrong grant confirmations in this run (see `OWNER_CODE_FAILURES_PER_RUN`).
     owner_code_failures: u32,
+    // Requests cancelled by wrong codes in this run, so their status reads
+    // `lost` (their durable records are deleted, so a restart cannot revive them).
+    cancelled_ops: std::collections::HashSet<String>,
     // One-time first-contact confirmations, by client id. Memory only: never
     // serialized, dropped on restart (fail closed). See `FirstContactGrant`.
     first_contact: HashMap<String, PendingFirstContact>,
@@ -819,6 +822,7 @@ impl PairingService {
                 identity_fingerprint,
                 owner_confirmations: HashMap::new(),
                 owner_code_failures: 0,
+                cancelled_ops: std::collections::HashSet::new(),
                 first_contact: HashMap::new(),
             }),
             grant_changes: tokio::sync::Notify::new(),
@@ -956,6 +960,14 @@ impl PairingService {
         );
         if left == 0 {
             inner.owner_confirmations.remove(op_id);
+            // Cancel durably: a restart must not re-issue a code for a request
+            // someone was guessing at.
+            inner.file.pending_elevations.retain(|e| e.op_id != op_id);
+            inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
+            inner.cancelled_ops.insert(op_id.to_string());
+            if let Err(e) = self.persist(&mut inner.file) {
+                tracing::warn!(error = %e, op_id, "could not persist a cancelled approval");
+            }
             warning.push_str("That request is cancelled; nothing was granted.\n");
         }
         if inner.owner_code_failures == OWNER_CODE_FAILURES_PER_RUN {
@@ -1613,6 +1625,8 @@ impl PairingService {
             .file
             .pending_device_keys
             .retain(|p| p.client_id != client_id);
+        let keys: Vec<String> = inner.file.device_keys.iter().map(|k| k.key_id.clone()).collect();
+        inner.file.registered_ops.retain(|_, k| keys.contains(k));
         self.persist(&mut inner.file)?;
         Ok(())
     }
@@ -1685,6 +1699,10 @@ impl PairingService {
             .clients
             .retain(|c| c.client_id != client_id && c.client_id != new_id);
         inner.file.clients.push(rotated.clone());
+        // Device keys were registered to the old pairing id; retire them so the
+        // same device can register again under the rotated one.
+        inner.file.device_keys.retain(|k| k.client_id != client_id);
+        inner.file.pending_device_keys.retain(|p| p.client_id != client_id);
         // Grants do not survive a key rotation: they were written against a
         // specific client id and epoch by a deliberate owner action.
         inner.file.revoke_grants(Some(client_id));
@@ -1863,6 +1881,9 @@ impl PairingService {
                 .any(|g| g.op_id == op_id && g.is_live(now))
         {
             return ElevationStatus::Granted;
+        }
+        if inner.cancelled_ops.contains(op_id) {
+            return ElevationStatus::Lost;
         }
         ElevationStatus::Absent
     }

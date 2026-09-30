@@ -222,13 +222,18 @@ impl PairingService {
         let mut op_bytes = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut op_bytes);
 
-        let mut inner = self.lock();
-        let node = inner.identity_fingerprint.clone();
+        // Verify before taking the pairing lock: a flood of bad proofs must not
+        // hold up every token check on the node.
+        let node = self.bound_fingerprint();
         verify_p256(
             &raw,
             registration_message(&node, client_id, &public_key_hex).as_bytes(),
             proof_hex,
         )?;
+        let mut inner = self.lock();
+        if inner.identity_fingerprint != node {
+            return Err(PairingError::PairingInvalid("the node identity changed; ask again".into()));
+        }
         let client = inner
             .file
             .clients
@@ -237,6 +242,20 @@ impl PairingService {
             .cloned()
             .ok_or(PairingError::UnknownClient)?;
         let key_id = key_id_for(&raw);
+        let now = chrono::Utc::now().timestamp();
+        // At most one new registration request per client every 30 s: each
+        // one prints to the owner's terminal and replaces the previous one.
+        if inner.file.pending_device_keys.iter().any(|p| {
+            p.client_id == client_id && p.expires_at - ELEVATION_TTL_SECS > now - 30
+        }) {
+            return Err(PairingError::TooManyPending);
+        }
+        // Keys retired by a rotation or epoch bump no longer block the device.
+        let live: Vec<(String, u64)> = inner.file.clients.iter().map(|c| (c.client_id.clone(), c.epoch)).collect();
+        inner
+            .file
+            .device_keys
+            .retain(|k| live.iter().any(|(c, e)| *c == k.client_id && *e == k.epoch));
         if inner.file.device_keys.iter().any(|k| k.key_id == key_id) {
             return Err(PairingError::Malformed("this device key is already registered".into()));
         }
@@ -251,7 +270,6 @@ impl PairingService {
                 "this pairing already has {MAX_DEVICE_KEYS_PER_CLIENT} device keys; revoke one first"
             )));
         }
-        let now = chrono::Utc::now().timestamp();
         let op = PendingDeviceKey {
             op_id: hex::encode(op_bytes),
             client_id: client_id.to_string(),
@@ -284,8 +302,12 @@ impl PairingService {
             .file
             .pending_device_keys
             .retain(|p| !replaced.contains(&p.op_id));
+        let before = inner.file.clone();
         inner.file.pending_device_keys.push(op.clone());
-        self.persist(&mut inner.file)?;
+        if let Err(e) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(e);
+        }
         Ok(op)
     }
 
@@ -320,6 +342,9 @@ impl PairingService {
             })
         {
             return DeviceKeyStatus::Registered;
+        }
+        if inner.cancelled_ops.contains(op_id) {
+            return DeviceKeyStatus::Lost;
         }
         DeviceKeyStatus::Absent
     }
@@ -384,11 +409,15 @@ impl PairingService {
             registered_at: now,
             epoch,
         };
+        let before = inner.file.clone();
         inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
         inner.file.device_keys.retain(|k| k.key_id != key.key_id);
         inner.file.device_keys.push(key.clone());
         inner.file.registered_ops.insert(op_id.to_string(), key.key_id.clone());
-        self.persist(&mut inner.file)?;
+        if let Err(e) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(e);
+        }
         inner.owner_confirmations.remove(op_id);
         Ok(key)
     }
@@ -513,31 +542,27 @@ impl PairingService {
             ));
         }
 
-        let mut inner = self.lock();
-        let now = chrono::Utc::now().timestamp();
-        if (now - intent.issued_at).abs() > INTENT_MAX_SKEW_SECS {
-            return Err(PairingError::Expired);
-        }
-        let current_epoch = inner
-            .file
-            .clients
-            .iter()
-            .find(|c| c.client_id == client_id)
-            .map(|c| c.epoch)
-            .ok_or(PairingError::UnknownClient)?;
-        if current_epoch != epoch {
-            return Err(PairingError::PairingInvalid("stale token epoch".into()));
-        }
-        let key = inner
-            .file
-            .device_keys
-            .iter()
-            .find(|k| k.key_id == intent.device_key_id && k.client_id == client_id && k.epoch == epoch)
-            .cloned()
-            .ok_or_else(|| PairingError::NotGrantable("unknown or revoked device key".into()))?;
-        let node = inner.identity_fingerprint.clone();
+        // Phase 1, under the lock: find the key. Phase 2, outside it: the
+        // signature check. Phase 3, under the lock again: re-check and write.
+        let (node, key) = {
+            let inner = self.lock();
+            let key = Self::intent_key(&inner, client_id, epoch, &intent.device_key_id)?;
+            (inner.identity_fingerprint.clone(), key)
+        };
         let raw = parse_public_key(&key.public_key)?;
         verify_p256(&raw, intent_message(&node, client_id, intent).as_bytes(), signature_hex)?;
+
+        let mut inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
+        if (i128::from(now) - i128::from(intent.issued_at)).abs() > i128::from(INTENT_MAX_SKEW_SECS) {
+            return Err(PairingError::Expired);
+        }
+        if inner.identity_fingerprint != node
+            || Self::intent_key(&inner, client_id, epoch, &intent.device_key_id)? != key
+        {
+            return Err(PairingError::NotGrantable("the device key changed while checking; sign again".into()));
+        }
+        let before = (inner.file.grants.clone(), inner.file.intent_nonces.clone());
 
         let nonce_key = format!("{}:{}", key.key_id, intent.nonce);
         inner
@@ -611,7 +636,11 @@ impl PairingService {
             .file
             .intent_nonces
             .insert(nonce_key, (client_id.to_string(), intent.issued_at.max(now)));
-        self.persist(&mut inner.file)?;
+        if let Err(e) = self.persist(&mut inner.file) {
+            // Never leave authority live in memory that the disk did not take.
+            (inner.file.grants, inner.file.intent_nonces) = before;
+            return Err(e);
+        }
         tracing::info!(
             client_id,
             device_key = %key.key_id,
@@ -622,6 +651,28 @@ impl PairingService {
             "device-signed relation envelope opened"
         );
         Ok(view)
+    }
+
+    /// The registered key an intent names, for this client at its current
+    /// epoch, or why not.
+    fn intent_key(inner: &Inner, client_id: &str, epoch: u64, key_id: &str) -> Result<DeviceKey, PairingError> {
+        let current = inner
+            .file
+            .clients
+            .iter()
+            .find(|c| c.client_id == client_id)
+            .map(|c| c.epoch)
+            .ok_or(PairingError::UnknownClient)?;
+        if current != epoch {
+            return Err(PairingError::PairingInvalid("stale token epoch".into()));
+        }
+        inner
+            .file
+            .device_keys
+            .iter()
+            .find(|k| k.key_id == key_id && k.client_id == client_id && k.epoch == epoch)
+            .cloned()
+            .ok_or_else(|| PairingError::NotGrantable("unknown or revoked device key".into()))
     }
 
     /// Owner-run startup: print a fresh code for every approval that
@@ -651,12 +702,14 @@ impl PairingService {
         {
             todo.push((a.op_id.clone(), super::replacement_confirmation_phrase(a), a.expires_at, None));
         }
-        for (op_id, label, expires_at, command) in todo.iter().cloned() {
+        let mut issued = 0;
+        for (op_id, label, expires_at, command) in todo {
             if Self::confirmable(&inner, &op_id) {
                 continue;
             }
             self.console_challenge(&mut inner, &op_id, &label, expires_at, command)?;
+            issued += 1;
         }
-        Ok(todo.len())
+        Ok(issued)
     }
 }

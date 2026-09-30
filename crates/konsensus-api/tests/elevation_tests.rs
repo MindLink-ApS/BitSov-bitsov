@@ -1422,10 +1422,12 @@ fn wrong_codes_cancel_the_request_without_effect() {
     let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
     for right in [code.as_str(), phrase.as_str()] {
         let err = service.grant_elevation(&op.op_id, right, terms()).unwrap_err();
-        assert!(matches!(err, PairingError::ConfirmationLost), "{err}");
+        assert!(matches!(err, PairingError::UnknownOperation), "{err}");
     }
     assert!(service.reload_from_disk().unwrap().grants.is_empty());
     assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Lost);
+    // Cancelled durably: a restart re-issues no code for it.
+    assert!(service.reload_from_disk().unwrap().pending_elevations.is_empty());
 
     // The owner saw each attempt on their own terminal.
     let text = console.text();

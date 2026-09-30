@@ -514,3 +514,42 @@ fn a_client_cancels_only_its_own_pending_request() {
         .is_err());
     assert!(service.reload_from_disk().unwrap().grants.is_empty());
 }
+
+#[test]
+fn a_rotated_pairing_can_register_the_same_device_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console, client, device, _) = registered(tmp.path());
+    let old_key = SigningKey::from_bytes(&[1; 32]);
+    let new_key = SigningKey::from_bytes(&[7; 32]);
+    let new_pub = hex::encode(new_key.verifying_key().to_bytes());
+    let msg = format!("bitsov-pair-rotate-v1:{}:{new_pub}", client.client_id);
+    let sig = hex::encode(old_key.sign(msg.as_bytes()).to_bytes());
+    let rotated = service.rotate_client_key(&client.client_id, &new_pub, &sig).unwrap();
+    assert!(service.device_keys().is_empty(), "keys of the old pairing id are retired");
+    let op = service
+        .request_device_key(&rotated.client_id, &device.public_hex(), "mac", &device.proof(&rotated.client_id))
+        .unwrap();
+    service.approve_device_key(&op.op_id, &console.owner_code(&op.op_id)).unwrap();
+}
+
+#[test]
+fn registration_requests_are_rate_limited_per_client() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _) = owner_run(tmp.path());
+    let (client, _) = pair(&service, 1);
+    let (a, b) = (Device::new(), Device::new());
+    service.request_device_key(&client.client_id, &a.public_hex(), "mac", &a.proof(&client.client_id)).unwrap();
+    let err = service
+        .request_device_key(&client.client_id, &b.public_hex(), "mac", &b.proof(&client.client_id))
+        .unwrap_err();
+    assert!(matches!(err, PairingError::TooManyPending), "{err}");
+}
+
+#[test]
+fn an_absurd_issued_at_is_refused_not_a_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _, client, device, key_id) = registered(tmp.path());
+    let i = RelationIntent { issued_at: i64::MIN, ..intent(&key_id, PEER, 1_000, 1_000) };
+    let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    assert!(matches!(service.apply_relation_intent(&client.client_id, client.epoch, &i, &s), Err(PairingError::Expired)));
+}

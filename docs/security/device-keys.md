@@ -144,3 +144,16 @@ the biometric lives on the device.
 - *Biometry changes.* The key uses `.biometryCurrentSet`: adding or removing a
   fingerprint makes it unusable, and the device must be registered again.
   This is a deliberate fail-closed choice.
+
+**Known limits, accepted for this step.**
+- The per-act maximum is checked per reservation. A send that also pays a
+  re-admission reserves in parts, so one such send can pay a peer more than
+  the per-act maximum, but never more than the peer's envelope.
+- A renewal adds its budget on top of what the peer has used, including
+  in-flight reservations. If one of those later fails, the released amount
+  stays usable in the new window. Cumulative spend never exceeds the sum of
+  the signed budgets.
+- A live relation grant gives the token the `spend` scope. Routes gated on
+  `spend` that move no value (such as the file-upload gate) accept it too.
+- Pending identity replacements also get fresh codes after a restart. As
+  before, they accept only the full console line.
