@@ -952,6 +952,33 @@ async fn cmd_start(
         None => None,
     };
 
+    // Peer endpoint for introductions and front-door cards. A configured one
+    // (advertised_addr, else a concrete listen_addr) is final. Otherwise, with
+    // an owner-set `stun_server`, learn the public IP once now (bounded, never
+    // blocks boot) and keep it fresh in the background.
+    let (configured_endpoint, configured_source) = match config.network.configured_endpoint() {
+        Some((endpoint, source)) => (Some(endpoint), Some(source)),
+        None => (None, None),
+    };
+    let introduction = konsensus_api::handlers::introduction::IntroductionSettings {
+        network: config.lightning.bitcoin_network(),
+        configured_endpoint,
+        configured_source,
+        discovered: Default::default(),
+    };
+    let stun_discovery = match (&introduction.configured_endpoint, config.network.stun_server_addr()) {
+        (None, Ok(Some(server))) => {
+            introduction.set_discovered(konsensus_api::handlers::introduction::PeerEndpointView::missing(
+                konsensus_api::handlers::introduction::reason::STUN_PENDING,
+            ));
+            let peer_port = config.network.listen_addr.port();
+            let first = stun::discover_peer_endpoint(&server, peer_port, stun::ATTEMPT_TIMEOUT).await;
+            let ok = stun::record(&introduction, first);
+            Some((server, peer_port, ok))
+        }
+        _ => None,
+    };
+
     let api_state = Arc::new(konsensus_api::AppState {
         identity: Arc::clone(node.identity()),
         pairing: Some(Arc::clone(&pairing_service)),
@@ -1003,10 +1030,7 @@ async fn cmd_start(
         lightning_backend: config.lightning.backend_name().to_string(),
         chain_backend: config.chain.backend_name().to_string(),
         gossip_validator: Some(Arc::clone(&gossip_validator)),
-        introduction: konsensus_api::handlers::introduction::IntroductionSettings {
-            network: config.lightning.bitcoin_network(),
-            endpoint: config.network.introduction_endpoint(),
-        },
+        introduction: introduction.clone(),
         front_door: konsensus_api::handlers::front_door::FrontDoorStore::load(
             if config.web.enabled {
                 Some(std::path::Path::new(&config.web.content_dir))
@@ -1024,6 +1048,10 @@ async fn cmd_start(
     // Calls: the owner's STUN binding responder, if configured.
     let stun_handle = stun_socket.map(|socket| {
         tokio::spawn(stun::serve(socket, stun::Limits::default(), node.shutdown_rx()))
+    });
+
+    let stun_discovery_handle = stun_discovery.map(|(server, peer_port, ok)| {
+        tokio::spawn(stun::refresh_loop(introduction.clone(), server, peer_port, ok, node.shutdown_rx()))
     });
 
     // ── Spawn background tasks ─────────────────────────────────────────
@@ -1413,6 +1441,7 @@ async fn cmd_start(
             if let Err(e) = whitelist_backup_handle.await { warn!(error = %e, "whitelist backup task panicked"); }
             if let Err(e) = api_handle.await { warn!(error = %e, "API server task panicked"); }
             if let Err(e) = grant_cleanup_handle.await { warn!(error = %e, "grant cleanup task panicked"); }
+            if let Some(h) = stun_discovery_handle { if let Err(e) = h.await { warn!(error = %e, "STUN discovery task panicked"); } }
             if let Some(h) = stun_handle { if let Err(e) = h.await { warn!(error = %e, "STUN responder task panicked"); } }
         },
     )

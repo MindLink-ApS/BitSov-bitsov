@@ -9,7 +9,7 @@
 //! "whitelist"`) the dial is refused rather than widening the mesh.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -35,16 +35,117 @@ pub const CAPABILITY: &str = "introduction_v1";
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What this node may sign into an introduction. Both come from the node's
-/// own configuration; the caller supplies neither.
+/// Why no dialable peer endpoint is known (stable snake_case codes the app
+/// can match on; errors read `introduction_unavailable: <code>`).
+pub mod reason {
+    /// Wildcard listen, no `advertised_addr`, no `stun_server`.
+    pub const NO_DIALABLE_ENDPOINT: &str = "no_dialable_endpoint";
+    /// `stun_server` is set but no answer has arrived yet (boot, first try).
+    pub const STUN_PENDING: &str = "stun_pending";
+    /// The STUN server did not answer (timeout, DNS, socket error).
+    pub const STUN_UNREACHABLE: &str = "stun_unreachable";
+    /// The STUN server answered with something that is not a usable Binding Success.
+    pub const STUN_INVALID_RESPONSE: &str = "stun_invalid_response";
+}
+
+/// Where a peer endpoint came from.
+pub mod source {
+    /// `[network] advertised_addr`, set by the owner.
+    pub const ADVERTISED: &str = "advertised";
+    /// A concrete (non-wildcard) `listen_addr`.
+    pub const LISTEN: &str = "listen";
+    /// Public IP learned from the owner's `[network] stun_server`, plus the
+    /// TCP peer port of `listen_addr`.
+    pub const STUN: &str = "stun";
+}
+
+/// The dialable peer endpoint as currently known, or why there is none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerEndpointView {
+    /// Dialable `host:port`, never the API address.
+    pub endpoint: Option<String>,
+    /// `"advertised"`, `"listen"` or `"stun"`; set with `endpoint`.
+    pub source: Option<&'static str>,
+    /// Why `endpoint` is `None` (see [`reason`]).
+    pub reason: Option<&'static str>,
+}
+
+impl PeerEndpointView {
+    /// A known endpoint.
+    pub fn found(endpoint: String, source: &'static str) -> Self {
+        Self { endpoint: Some(endpoint), source: Some(source), reason: None }
+    }
+
+    /// No endpoint, for `reason`.
+    pub fn missing(reason: &'static str) -> Self {
+        Self { endpoint: None, source: None, reason: Some(reason) }
+    }
+}
+
+/// What this node may sign into an introduction. Everything comes from the
+/// node's own configuration or its own STUN discovery; the caller supplies
+/// nothing.
 #[derive(Debug, Clone, Default)]
 pub struct IntroductionSettings {
     /// Bitcoin network the node's prices are payable on. `None` (a backend
     /// that does not state its network) means no introduction is offered.
     pub network: Option<String>,
-    /// Dialable BitSov peer endpoint (`host:port`), never the API address.
-    /// `None` when the node only knows a wildcard bind.
-    pub endpoint: Option<String>,
+    /// Endpoint fixed at boot from `advertised_addr` or a concrete
+    /// `listen_addr`. Always wins; discovery can never replace it.
+    pub configured_endpoint: Option<String>,
+    /// [`source`] of `configured_endpoint`.
+    pub configured_source: Option<&'static str>,
+    /// Live STUN discovery result, used only when nothing is configured.
+    pub discovered: Arc<RwLock<PeerEndpointView>>,
+}
+
+impl IntroductionSettings {
+    /// Settings with a fixed, explicit endpoint and no discovery.
+    pub fn fixed(network: Option<&str>, endpoint: Option<&str>) -> Self {
+        Self {
+            network: network.map(Into::into),
+            configured_endpoint: endpoint.map(Into::into),
+            configured_source: endpoint.map(|_| source::ADVERTISED),
+            discovered: Arc::default(),
+        }
+    }
+
+    /// Dialable `host:port`: the configured endpoint, else the discovered one.
+    pub fn endpoint(&self) -> Option<String> {
+        self.endpoint_view().endpoint
+    }
+
+    /// The endpoint with its source, or the reason there is none.
+    pub fn endpoint_view(&self) -> PeerEndpointView {
+        if let Some(endpoint) = &self.configured_endpoint {
+            return PeerEndpointView {
+                endpoint: Some(endpoint.clone()),
+                source: self.configured_source.or(Some(source::ADVERTISED)),
+                reason: None,
+            };
+        }
+        let mut view = self.discovered.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if view.endpoint.is_none() && view.reason.is_none() {
+            view.reason = Some(reason::NO_DIALABLE_ENDPOINT);
+        }
+        view
+    }
+
+    /// Record a discovery result. Has no effect on `configured_endpoint`.
+    pub fn set_discovered(&self, view: PeerEndpointView) {
+        *self.discovered.write().unwrap_or_else(|e| e.into_inner()) = view;
+    }
+
+    /// The endpoint, or the `unavailable_prefix: <reason>` error.
+    pub(crate) fn require_endpoint(&self, unavailable_prefix: &str) -> Result<String, ApiError> {
+        let view = self.endpoint_view();
+        view.endpoint.ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "{unavailable_prefix}: {}",
+                view.reason.unwrap_or(reason::NO_DIALABLE_ENDPOINT)
+            ))
+        })
+    }
 }
 
 /// `GET /api/v1/introduction`.
@@ -119,11 +220,7 @@ pub(crate) async fn issue_card(state: &AppState) -> Result<Introduction, ApiErro
             "introduction_unavailable: this node's Lightning backend does not state a Bitcoin network".into(),
         )
     })?;
-    let endpoint = settings.endpoint.clone().ok_or_else(|| {
-        ApiError::Conflict(
-            "introduction_unavailable: no dialable peer endpoint; set [network] advertised_addr".into(),
-        )
-    })?;
+    let endpoint = settings.require_endpoint("introduction_unavailable")?;
     let chat = state
         .pricing
         .get_price_msat(konsensus_core::kind::KIND_CHAT)

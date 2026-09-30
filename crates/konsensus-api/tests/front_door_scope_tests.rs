@@ -61,10 +61,7 @@ fn fixture() -> Fx {
     let service = open(tmp.path(), &fingerprint, &console, true);
     let state = Arc::new(AppState {
         pairing: Some(Arc::clone(&service)),
-        introduction: IntroductionSettings {
-            network: Some("regtest".into()),
-            endpoint: Some("127.0.0.1:9735".into()),
-        },
+        introduction: IntroductionSettings::fixed(Some("regtest"), Some("127.0.0.1:9735")),
         data_dir: Some(tmp.path().to_path_buf()),
         ..(*base).clone()
     });

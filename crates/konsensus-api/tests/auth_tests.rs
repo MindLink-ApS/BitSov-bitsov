@@ -1819,13 +1819,28 @@ async fn status_reports_stun_port_only_when_listening() {
 
     let public = Arc::new(AppState {
         stun_port: Some(3478),
-        introduction: konsensus_api::handlers::introduction::IntroductionSettings {
-            network: None,
-            endpoint: Some("node.example.org:9000".into()),
-        },
+        introduction: konsensus_api::handlers::introduction::IntroductionSettings::fixed(
+            None,
+            Some("node.example.org:9000"),
+        ),
         ..(*test_state()).clone()
     });
     assert_eq!(get(&public, "/api/v1/status", true).await["stun_url"], "stun:node.example.org:3478");
+    let status = get(&public, "/api/v1/status", true).await;
+    assert_eq!(status["peer_endpoint"], "node.example.org:9000");
+    assert_eq!(status["peer_endpoint_source"], "advertised");
+    assert!(status.get("peer_endpoint_reason").is_none());
+
+    // Discovery still pending/failed: the reason is visible to the owner.
+    let intro = konsensus_api::handlers::introduction::IntroductionSettings::default();
+    intro.set_discovered(konsensus_api::handlers::introduction::PeerEndpointView::missing("stun_unreachable"));
+    let failed = Arc::new(AppState { introduction: intro.clone(), ..(*test_state()).clone() });
+    let status = get(&failed, "/api/v1/status", true).await;
+    assert!(status.get("peer_endpoint").is_none());
+    assert_eq!(status["peer_endpoint_reason"], "stun_unreachable");
+    intro.set_discovered(konsensus_api::handlers::introduction::PeerEndpointView::found("93.184.216.34:9000".into(), "stun"));
+    let status = get(&failed, "/api/v1/status", true).await;
+    assert_eq!((status["peer_endpoint"].as_str(), status["peer_endpoint_source"].as_str()), (Some("93.184.216.34:9000"), Some("stun")));
 }
 
 #[test]

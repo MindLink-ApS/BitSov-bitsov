@@ -1,4 +1,23 @@
-//! Minimal STUN binding responder for calls across NAT (`[calls] stun_listen`).
+//! Minimal STUN binding responder for calls across NAT (`[calls] stun_listen`),
+//! and a matching binding **client** for peer-address discovery
+//! (`[network] stun_server`).
+//!
+//! # Client: discovering a dialable peer endpoint
+//!
+//! A home node usually binds `0.0.0.0:<port>` and has no `advertised_addr`, so
+//! it cannot tell anyone where to dial it. With an owner-set
+//! `[network] stun_server` the node sends one RFC 5389 Binding Request over
+//! UDP and reads the XOR-MAPPED-ADDRESS out of the Binding Success. That gives
+//! its **public IP only**. The UDP port in the reply is the NAT mapping of the
+//! throwaway STUN socket and says nothing about the TCP peer listener, so the
+//! advertised endpoint is `<mapped ip>:<listen_addr.port()>`
+//! ([`endpoint_from_mapped`]). Whether the router actually forwards that TCP
+//! port is not checked here; without a port forward (UPnP/NAT-PMP are not
+//! implemented) the endpoint is only dialable by peers that can reach it.
+//! There is no default server: nothing is sent to a third party unless the
+//! owner names one.
+//!
+//! # Responder
 //!
 //! RFC 5389 binding request → binding success response with
 //! XOR-MAPPED-ADDRESS, and nothing else: no TURN, no relay, no
@@ -24,9 +43,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use konsensus_api::handlers::introduction::{reason, source, IntroductionSettings, PeerEndpointView};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// RFC 5389 §6 magic cookie.
 pub const MAGIC_COOKIE: u32 = 0x2112_A442;
@@ -124,6 +144,206 @@ pub fn binding_success(txid: &[u8; 12], source: SocketAddr) -> Vec<u8> {
     out.extend_from_slice(&port.to_be_bytes());
     out.extend_from_slice(&addr);
     out
+}
+
+/// Why a STUN query produced no address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryError {
+    /// DNS, socket, or timeout: nothing usable came back.
+    Unreachable,
+    /// The server answered but not with a usable Binding Success.
+    InvalidResponse,
+}
+
+impl QueryError {
+    /// The stable reason code for status and API errors.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Unreachable => reason::STUN_UNREACHABLE,
+            Self::InvalidResponse => reason::STUN_INVALID_RESPONSE,
+        }
+    }
+}
+
+/// A Binding Request with no attributes.
+pub fn binding_request(txid: &[u8; 12]) -> [u8; HEADER_LEN] {
+    let mut out = [0u8; HEADER_LEN];
+    out[..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+    out[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    out[8..].copy_from_slice(txid);
+    out
+}
+
+/// Whether `buf` is a STUN message carrying `txid` (so a reply to our request,
+/// whatever it says).
+fn is_reply_to(buf: &[u8], txid: &[u8; 12]) -> bool {
+    buf.len() >= HEADER_LEN && buf[0] & 0xC0 == 0 && buf[4..8] == MAGIC_COOKIE.to_be_bytes() && buf[8..HEADER_LEN] == txid[..]
+}
+
+/// The mapped address of a Binding Success for `txid`, or `None` if the
+/// message is anything else (error class, wrong transaction, bad length, no or
+/// malformed XOR-MAPPED-ADDRESS, unusable address).
+pub fn parse_binding_success(buf: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
+    if !is_reply_to(buf, txid) || u16::from_be_bytes([buf[0], buf[1]]) != BINDING_SUCCESS {
+        return None;
+    }
+    let msg_len = usize::from(u16::from_be_bytes([buf[2], buf[3]]));
+    if msg_len % 4 != 0 || HEADER_LEN + msg_len != buf.len() {
+        return None;
+    }
+    let mut at = HEADER_LEN;
+    while buf.len() - at >= 4 {
+        let attr_type = u16::from_be_bytes([buf[at], buf[at + 1]]);
+        let attr_len = usize::from(u16::from_be_bytes([buf[at + 2], buf[at + 3]]));
+        let value = at + 4;
+        let padded = attr_len.checked_add(3)? & !3;
+        if buf.len() - value < padded {
+            return None;
+        }
+        if attr_type == XOR_MAPPED_ADDRESS {
+            return parse_xor_mapped(&buf[value..value + attr_len], txid);
+        }
+        at = value + padded;
+    }
+    None
+}
+
+fn parse_xor_mapped(v: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
+    if v.len() < 4 {
+        return None;
+    }
+    let port = u16::from_be_bytes([v[2], v[3]]) ^ (MAGIC_COOKIE >> 16) as u16;
+    let ip = match (v[1], v.len()) {
+        (0x01, 8) => {
+            let x = u32::from_be_bytes([v[4], v[5], v[6], v[7]]) ^ MAGIC_COOKIE;
+            IpAddr::V4(x.into())
+        }
+        (0x02, 20) => {
+            let mut key = [0u8; 16];
+            key[..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+            key[4..].copy_from_slice(txid);
+            let mut o = [0u8; 16];
+            for i in 0..16 {
+                o[i] = v[4 + i] ^ key[i];
+            }
+            IpAddr::V6(o.into())
+        }
+        _ => return None,
+    };
+    let ip = ip.to_canonical();
+    if ip.is_unspecified() || ip.is_multicast() {
+        return None;
+    }
+    Some(SocketAddr::new(ip, port))
+}
+
+/// Ask `server` (`host:port`, resolved now) for this host's mapped address.
+///
+/// Sends the request a few times within `timeout` (UDP may drop it). Datagrams
+/// from other hosts or for other transactions are ignored, so an off-path
+/// host cannot inject an answer without also guessing the random transaction
+/// id and the server's address.
+pub async fn query(server: &str, timeout: Duration) -> Result<SocketAddr, QueryError> {
+    const TRIES: u32 = 3;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let target = tokio::time::timeout(timeout, tokio::net::lookup_host(server))
+        .await
+        .map_err(|_| QueryError::Unreachable)?
+        .map_err(|_| QueryError::Unreachable)?
+        .next()
+        .ok_or(QueryError::Unreachable)?;
+    let bind: SocketAddr = if target.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { ([0u16; 8], 0).into() };
+    let socket = UdpSocket::bind(bind).await.map_err(|_| QueryError::Unreachable)?;
+    socket.connect(target).await.map_err(|_| QueryError::Unreachable)?;
+
+    let mut txid = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut txid);
+    let request = binding_request(&txid);
+    let per_try = timeout / TRIES;
+    let mut buf = [0u8; 1024];
+    let mut failure = QueryError::Unreachable;
+    for _ in 0..TRIES {
+        socket.send(&request).await.map_err(|_| QueryError::Unreachable)?;
+        let until = (tokio::time::Instant::now() + per_try).min(deadline);
+        // `connect` makes the kernel drop datagrams from any other source.
+        while let Ok(Ok(n)) = tokio::time::timeout_at(until, socket.recv(&mut buf)).await {
+            if !is_reply_to(&buf[..n], &txid) {
+                continue;
+            }
+            match parse_binding_success(&buf[..n], &txid) {
+                Some(mapped) => return Ok(mapped),
+                None => failure = QueryError::InvalidResponse,
+            }
+            break;
+        }
+    }
+    Err(failure)
+}
+
+/// The dialable endpoint for a STUN-mapped address: its IP with the TCP peer
+/// port (`listen_addr.port()`), never the mapped UDP port.
+pub fn endpoint_from_mapped(mapped: SocketAddr, peer_port: u16) -> String {
+    SocketAddr::new(mapped.ip(), peer_port).to_string()
+}
+
+/// One discovery attempt against `server`.
+pub async fn discover_peer_endpoint(server: &str, peer_port: u16, timeout: Duration) -> PeerEndpointView {
+    match query(server, timeout).await {
+        Ok(mapped) => PeerEndpointView::found(endpoint_from_mapped(mapped, peer_port), source::STUN),
+        Err(e) => PeerEndpointView::missing(e.reason()),
+    }
+}
+
+/// Re-check this many seconds after a success.
+const REFRESH: Duration = Duration::from_secs(10 * 60);
+const RETRY_MIN: Duration = Duration::from_secs(15);
+const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+/// Timeout of one attempt (the first, before boot, and each refresh).
+pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Record one attempt in `settings.discovered`. A failure keeps the last
+/// endpoint that worked (a blip should not drop a good address); it only
+/// records the reason while nothing has been found yet. Returns success.
+pub fn record(settings: &IntroductionSettings, attempt: PeerEndpointView) -> bool {
+    let ok = attempt.endpoint.is_some();
+    let current = settings.discovered.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if ok && current.endpoint != attempt.endpoint {
+        info!(endpoint = ?attempt.endpoint, "peer endpoint discovered via [network] stun_server");
+    }
+    if !ok {
+        warn!(reason = ?attempt.reason, "STUN peer-address discovery failed");
+        if current.endpoint.is_some() {
+            return false;
+        }
+    }
+    settings.set_discovered(attempt);
+    ok
+}
+
+/// Keep `settings.discovered` fresh until shutdown: every [`REFRESH`] after a
+/// success, with doubling backoff (15 s up to 5 min) after a failure.
+/// `last_ok` is the outcome of the boot-time attempt.
+pub async fn refresh_loop(
+    settings: IntroductionSettings,
+    server: String,
+    peer_port: u16,
+    last_ok: bool,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut backoff = RETRY_MIN;
+    let mut ok = last_ok;
+    loop {
+        let delay = if ok { REFRESH } else { backoff };
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown_rx.changed() => return,
+        }
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        ok = record(&settings, discover_peer_endpoint(&server, peer_port, ATTEMPT_TIMEOUT).await);
+        backoff = if ok { RETRY_MIN } else { (backoff * 2).min(RETRY_MAX) };
+    }
 }
 
 /// CRC-32 (ISO-HDLC), as FINGERPRINT uses (RFC 5389 §15.5).
@@ -485,6 +705,114 @@ mod tests {
         )));
         assert!(!answerable_source(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)));
         assert!(answerable_source(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3478)));
+    }
+
+    // ── client ────────────────────────────────────────────────────────
+
+    #[test]
+    fn binding_request_is_accepted_by_our_own_responder_parser() {
+        assert_eq!(parse_binding_request(&binding_request(&TXID)), Some(TXID));
+    }
+
+    #[test]
+    fn client_parses_binding_success() {
+        let v4: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        assert_eq!(parse_binding_success(&binding_success(&TXID, v4), &TXID), Some(v4));
+        let v6: SocketAddr = "[2001:db8::7]:40000".parse().unwrap();
+        assert_eq!(parse_binding_success(&binding_success(&TXID, v6), &TXID), Some(v6));
+        // RFC 5769 §2.2 vector, byte for byte.
+        let rfc = binding_success(&TXID, "192.0.2.1:32853".parse().unwrap());
+        assert_eq!(parse_binding_success(&rfc, &TXID), Some("192.0.2.1:32853".parse().unwrap()));
+        // The mapped port is the UDP mapping; the peer endpoint uses the TCP port.
+        assert_eq!(endpoint_from_mapped(v4, 9000), "203.0.113.9:9000");
+        assert_eq!(endpoint_from_mapped(v6, 9000), "[2001:db8::7]:9000");
+    }
+
+    #[test]
+    fn client_rejects_bad_replies() {
+        let good = binding_success(&TXID, "203.0.113.9:40000".parse().unwrap());
+        let mut other = TXID;
+        other[11] ^= 1;
+        assert_eq!(parse_binding_success(&good, &other), None, "wrong transaction");
+        assert_eq!(parse_binding_success(&good[..good.len() - 1], &TXID), None, "truncated");
+        assert_eq!(parse_binding_success(&[], &TXID), None);
+        let mut b = good.clone();
+        b[0..2].copy_from_slice(&0x0111u16.to_be_bytes());
+        assert_eq!(parse_binding_success(&b, &TXID), None, "error response");
+        let mut b = good.clone();
+        b[4] ^= 1;
+        assert_eq!(parse_binding_success(&b, &TXID), None, "bad cookie");
+        // No XOR-MAPPED-ADDRESS (a bare header).
+        let mut b = good[..HEADER_LEN].to_vec();
+        b[2..4].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(parse_binding_success(&b, &TXID), None);
+        // Bad family, and an unspecified address.
+        let mut b = good.clone();
+        b[25] = 0x07;
+        assert_eq!(parse_binding_success(&b, &TXID), None);
+        let zero = binding_success(&TXID, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1));
+        assert_eq!(parse_binding_success(&zero, &TXID), None);
+    }
+
+    #[tokio::test]
+    async fn client_discovers_ip_from_a_local_responder_and_uses_the_peer_port() {
+        let socket = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let server = socket.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(serve(socket, Limits::default(), rx));
+
+        let mapped = query(&server.to_string(), Duration::from_secs(2)).await.unwrap();
+        assert_eq!(mapped.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let view = discover_peer_endpoint(&server.to_string(), 9000, Duration::from_secs(2)).await;
+        assert_eq!(view, PeerEndpointView::found("127.0.0.1:9000".into(), "stun"));
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_reports_unreachable_and_invalid_responses() {
+        // A bound socket nobody reads from: no reply.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent.local_addr().unwrap().to_string();
+        assert_eq!(query(&addr, Duration::from_millis(300)).await, Err(QueryError::Unreachable));
+        let view = discover_peer_endpoint(&addr, 9000, Duration::from_millis(300)).await;
+        assert_eq!(view, PeerEndpointView::missing("stun_unreachable"));
+        assert_eq!(query("not a host:1", Duration::from_millis(300)).await, Err(QueryError::Unreachable));
+
+        // A server that answers with the right transaction id but junk.
+        let liar = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = liar.local_addr().unwrap().to_string();
+        let answer = Arc::clone(&liar);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok((n, from)) = answer.recv_from(&mut buf).await else { return };
+                if let Some(txid) = parse_binding_request(&buf[..n]) {
+                    // Binding success with no attributes.
+                    let mut reply = binding_success(&txid, from)[..HEADER_LEN].to_vec();
+                    reply[2..4].copy_from_slice(&0u16.to_be_bytes());
+                    let _ = answer.send_to(&reply, from).await;
+                }
+            }
+        });
+        assert_eq!(query(&addr, Duration::from_secs(1)).await, Err(QueryError::InvalidResponse));
+        let view = discover_peer_endpoint(&addr, 9000, Duration::from_secs(1)).await;
+        assert_eq!(view, PeerEndpointView::missing("stun_invalid_response"));
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_last_good_endpoint_and_never_touches_configured() {
+        let settings = IntroductionSettings::default();
+        assert!(!record(&settings, PeerEndpointView::missing("stun_unreachable")));
+        assert_eq!(settings.endpoint_view().reason, Some("stun_unreachable"));
+        assert!(record(&settings, PeerEndpointView::found("198.51.100.4:9000".into(), "stun")));
+        assert!(!record(&settings, PeerEndpointView::missing("stun_unreachable")));
+        assert_eq!(settings.endpoint().as_deref(), Some("198.51.100.4:9000"));
+
+        let fixed = IntroductionSettings::fixed(None, Some("node.example.org:9000"));
+        record(&fixed, PeerEndpointView::found("198.51.100.4:9000".into(), "stun"));
+        assert_eq!(fixed.endpoint().as_deref(), Some("node.example.org:9000"));
     }
 
     async fn roundtrip(client: &UdpSocket, req: &[u8]) -> Option<Vec<u8>> {
