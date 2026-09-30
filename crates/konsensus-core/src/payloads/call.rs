@@ -59,6 +59,12 @@ pub const MAX_BURNED_CALLS: u64 = 65_536;
 /// Most participants in a mesh meeting (host included). Every pair is one
 /// ordinary 1:1 call, so upload grows with each extra participant.
 pub const MAX_MEETING_PARTICIPANTS: usize = 4;
+/// Advertised by a node that accepts the `meeting` field on offers: as
+/// `Capability::Custom` in its federation Hello (peers see it in
+/// `GET /api/v1/peers` as `Custom("call_meeting_v1")`) and in its own
+/// `/status` `api_capabilities`. A node without it refuses (withdraws) a
+/// meeting offer after it was paid, so apps must not send it one.
+pub const MEETING_CAPABILITY: &str = "call_meeting_v1";
 
 /// What media an offer asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
