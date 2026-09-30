@@ -263,18 +263,6 @@ impl PeerPriceCache {
         price_msat: u64,
         block_height: u64,
     ) {
-        {
-            // Only privileged peers reach here; still bound the map (4 096
-            // answers), dropping answers older than an hour first.
-            let mut answers = self.kind_answers.write().await;
-            if answers.len() >= 4096 {
-                answers.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(3600));
-                if answers.len() >= 4096 {
-                    answers.clear();
-                }
-            }
-            answers.insert((peer_id, kind), Instant::now());
-        }
         // A call offer's price is per kind: never overwrite the category the
         // call's answers and ICE are priced at.
         let category_name = if kind == konsensus_core::kind::KIND_CALL_INVITE {
@@ -314,6 +302,22 @@ impl PeerPriceCache {
                 "created peer price entry from PriceResponse"
             );
         }
+        // Publish the fresh-answer time only now, while the price table is
+        // still write-locked (Codex delta3 #2): a reader that sees this answer
+        // reads the price under that lock afterwards, so it can never pair the
+        // new answer with the previous tariff. Lock order: entries, then answers.
+        // Only privileged peers reach here; still bound the map (4 096
+        // answers), dropping answers older than an hour first.
+        let mut answers = self.kind_answers.write().await;
+        if answers.len() >= 4096 {
+            answers.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(3600));
+            if answers.len() >= 4096 {
+                answers.clear();
+            }
+        }
+        answers.insert((peer_id, kind), Instant::now());
+        drop(answers);
+        drop(entries);
     }
 
     /// When `peer` last answered a price query for `kind` (see `kind_answers`).

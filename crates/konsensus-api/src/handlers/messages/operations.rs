@@ -465,6 +465,56 @@ pub(super) async fn compose(
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
     let id = operation_id(req.operation_id.as_deref())?;
     let _guard = lock(&state, &id).await?;
+    compose_locked(auth, state, req, references, peer, id).await
+}
+
+/// A 1:1 call signal (kinds 400-403). Its reservation is made, the operation
+/// run, and the reservation resolved all under the one per-operation lock
+/// (Codex delta3 #1), so concurrent requests for the same operation (same
+/// payload, different caps) run one after another: a refused one resolves
+/// only its own reservation before the next reserves, and can never release
+/// a reservation another request is paying under.
+pub(super) async fn compose_call(
+    auth: MeteredSpend,
+    state: Arc<AppState>,
+    mut req: ComposeRequest,
+    references: Vec<MessageId>,
+) -> Result<Json<ComposeResponse>, ApiError> {
+    let peer = NodeId::from_hex(&req.recipient)
+        .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+    // The journal's canonical key, for the reservation too (Codex delta2 #1).
+    let id = operation_id(req.operation_id.as_deref())?;
+    req.operation_id = Some(id.clone());
+    let _guard = lock(&state, &id).await?;
+    // One operation id, one request (Fable N2): an id reused for another
+    // signal is refused before any reservation. A retry of an operation that
+    // already paid is answered from the journal, without reserving.
+    let request_hash = request_digest(&peer, &req)?;
+    let journal = state.storage.get_outbox_operation(&id).await.map_err(storage)?;
+    if let Some(op) = journal.as_ref().filter(|op| op.request_hash != request_hash) {
+        return Err(mismatch(op));
+    }
+    let paid = journal.as_ref().is_some_and(|op| {
+        konsensus_core::payloads::call::settlement(Some(&op.state)) == konsensus_core::payloads::call::Settlement::Paid
+    });
+    let plaintext = req.plaintext.clone();
+    if !paid {
+        crate::calls::reserve_outgoing(state.storage.as_ref(), &peer, req.kind, &plaintext, &id, &request_hash).await?;
+    }
+    let result = compose_locked(auth, Arc::clone(&state), req, references, peer, id.clone()).await;
+    crate::calls::resolve_outgoing(state.storage.as_ref(), &peer, &plaintext, &id, &request_hash).await;
+    result
+}
+
+/// The operation itself; the caller holds its per-operation lock.
+async fn compose_locked(
+    auth: MeteredSpend,
+    state: Arc<AppState>,
+    req: ComposeRequest,
+    references: Vec<MessageId>,
+    peer: NodeId,
+    id: String,
+) -> Result<Json<ComposeResponse>, ApiError> {
     let digest = request_digest(&peer, &req)?;
     let mut op = OutboxOperation::prepared(id.clone(), peer.to_hex(), req.kind, digest.clone());
     encode(

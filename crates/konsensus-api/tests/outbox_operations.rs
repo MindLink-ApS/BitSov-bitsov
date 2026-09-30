@@ -100,10 +100,18 @@ struct Wallet {
     pause_next_status_poll: AtomicBool,
     status_poll_started: tokio::sync::Notify,
     pool: sqlx::SqlitePool,
+    /// Park the next `money_ready` until `ready_continue` (Codex delta3 probe).
+    pause_next_ready: AtomicBool,
+    ready_started: tokio::sync::Notify,
+    ready_continue: tokio::sync::Notify,
 }
 #[async_trait::async_trait]
 impl LightningProvider for Wallet {
     async fn money_ready(&self) -> bool {
+        if self.pause_next_ready.swap(false, Ordering::SeqCst) {
+            self.ready_started.notify_one();
+            self.ready_continue.notified().await;
+        }
         if self.mode.load(Ordering::SeqCst) == 6 {
             return futures::future::pending().await;
         }
@@ -217,6 +225,9 @@ impl Fixture {
             pause_next_status_poll: AtomicBool::new(false),
             status_poll_started: tokio::sync::Notify::new(),
             pool: db.pool().clone(),
+            pause_next_ready: AtomicBool::new(false),
+            ready_started: tokio::sync::Notify::new(),
+            ready_continue: tokio::sync::Notify::new(),
         });
         let mut state = common::test_state_with_lightning(wallet.clone());
         let peer = common::setup_e2ee_session(&state.session_manager).await;
@@ -1520,4 +1531,46 @@ async fn a_refused_signal_whose_cleanup_failed_stays_invisible_and_is_withdrawn(
     f.db.call_admission_release(&admitted.id).await.unwrap();
     assert!(!konsensus_api::calls::hold_incoming(f.db.as_ref(), &admitted).await.unwrap(), "stored messages are never held again");
     assert!(f.db.get_message(&admitted.id).await.unwrap().is_some());
+}
+
+/// Codex delta3 probe `same_request_cap_race`, fixed: two concurrent requests
+/// for the same operation and the same call payload, one capped below the
+/// price and one uncapped, run one after the other under the operation lock.
+/// The capped one is refused and releases only its own reservation; the
+/// uncapped one then reserves, pays once and rings, and the answer is admitted.
+#[tokio::test]
+async fn a_capped_refusal_never_releases_the_uncapped_same_request_reservation() {
+    use konsensus_core::payloads::call::Phase;
+    for _ in 0..30 {
+        let f = Fixture::new().await;
+        let answering = answer_call_prices(&f);
+        let call = format!("{:032x}", 0xca1199_u128);
+        let request = |cap: Option<u64>| {
+            Request::builder().method("POST").uri("/api/v1/messages/compose")
+                .header("authorization", common::auth_header(&f.state)).header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"operation_id": f.id, "recipient": f.peer.to_hex(), "kind": 400,
+                    "plaintext": format!(r#"{{"v":1,"call_id":"{call}","media":"audio","sdp":"v=0"}}"#),
+                    "max_total_msat": cap, "wait_ack_ms": 0}).to_string()))
+                .unwrap()
+        };
+        f.wallet.pause_next_ready.store(true, Ordering::SeqCst);
+        let (app_a, req_a) = (common::test_router(f.state.clone()), request(Some(1)));
+        let a = tokio::spawn(async move { app_a.oneshot(req_a).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(5), f.wallet.ready_started.notified()).await.unwrap();
+        let (app_b, req_b) = (common::test_router(f.state.clone()), request(None));
+        let b = tokio::spawn(async move { app_b.oneshot(req_b).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        f.wallet.ready_continue.notify_one();
+        let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(10), async { (a.await.unwrap(), b.await.unwrap()) }).await.unwrap();
+        assert_ne!(ra.status(), StatusCode::OK, "the capped request is refused");
+        let status_b = rb.status();
+        let body_b = axum::body::to_bytes(rb.into_body(), 65536).await.unwrap();
+        assert_eq!(status_b, StatusCode::OK, "{}", String::from_utf8_lossy(&body_b));
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1, "paid once");
+        let entry = f.db.call_get(&f.peer, &call).await.unwrap().expect("the paid call keeps its state");
+        assert_eq!((entry.phase, entry.pending), (Phase::Ringing, None));
+        let answer = format!(r#"{{"v":1,"call_id":"{call}","sdp":"v=0"}}"#);
+        konsensus_api::calls::admit_incoming(f.db.as_ref(), &f.peer, 401, Some(&answer)).await.unwrap();
+        answering.abort();
+    }
 }
