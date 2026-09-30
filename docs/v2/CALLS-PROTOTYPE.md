@@ -161,9 +161,17 @@ stun_listen = "0.0.0.0:3478"   # UDP; omit to keep it off (default)
 - A configured address that cannot be bound fails boot.
 - The owner-only `GET /api/v1/status` reports `stun_port` while it runs, and
   `stun_url` (`stun:host:port`) when the node has a dialable peer host
-  (`[network] advertised_addr`, not loopback or a wildcard). The public
+  (`[network] advertised_addr`, a concrete `listen_addr`, or the public IP
+  learned from `[network] stun_server`; not loopback or a wildcard). The public
   `/health` reports neither. The app may *offer* that URL as the STUN server;
   the owner confirms it, it is never switched on automatically.
+- `[network] stun_server = "stun:host:port"` (owner-set, no default) makes the
+  node query a STUN server for its public IP when `advertised_addr` is unset
+  and `listen_addr` is a wildcard. The endpoint is that IP plus the TCP
+  `listen_addr` port; `/status` shows `peer_endpoint`, `peer_endpoint_source`
+  (`advertised`/`listen`/`stun`) and, when missing, `peer_endpoint_reason`
+  (`no_dialable_endpoint`, `stun_pending`, `stun_unreachable`,
+  `stun_invalid_response`). An explicit `advertised_addr` is never replaced.
 - It helps apps that reach the node from outside its network (the owner away
   from home, or a contact). An app behind the same router as the node would
   mostly learn its local address (router hairpinning varies).

@@ -68,13 +68,9 @@ fn signed_invite_token_for(invitee_pubkey: [u8; 32]) -> String {
     signed_invite_token_for_with_nonce(invitee_pubkey, [0x22; 16])
 }
 
-/// P3-2c non-interchangeability: a canonical `BitSovInvite` (base64url JSON) must
-/// NOT be redeemable on the legacy `/api/v1/invite/redeem` route, which parses a
-/// base58 `InviteToken`. This is why the legacy route cannot be aliased/410-ed onto
-/// `/invites/accept` — an alias would 400 ~100% of legacy traffic. Deprecation is
-/// signalling only; the formats stay distinct.
+/// Legacy `/api/v1/invite/redeem` is gone (410). Canonical BitSovInvite accept is `/invites/accept`.
 #[tokio::test]
-async fn legacy_redeem_rejects_canonical_bitsov_invite() {
+async fn legacy_redeem_is_gone_even_for_canonical_bitsov_invite() {
     let state = test_state();
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -91,11 +87,10 @@ async fn legacy_redeem_rejects_canonical_bitsov_invite() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "a base64url BitSovInvite must not parse as a base58 InviteToken on the legacy redeem route"
-    );
+    assert_eq!(resp.status(), StatusCode::GONE);
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "legacy_invite_removed");
 }
 
 #[tokio::test]

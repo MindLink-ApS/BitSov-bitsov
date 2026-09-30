@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use konsensus_api::auth;
-use konsensus_api::handlers::introduction::IntroductionSettings;
+use konsensus_api::handlers::introduction::{IntroductionSettings, PeerEndpointView};
 use konsensus_api::state::AppState;
 use konsensus_core::introduction::{first_contact_prices, Introduction, IntroductionFields, Reach};
 use konsensus_core::traits::transport::{MessageTransport, TransportError};
@@ -64,7 +64,7 @@ impl MessageTransport for Recorder {
 }
 
 fn settings(endpoint: Option<&str>) -> IntroductionSettings {
-    IntroductionSettings { network: Some("regtest".into()), endpoint: endpoint.map(Into::into) }
+    IntroductionSettings::fixed(Some("regtest"), endpoint)
 }
 
 fn state_with(transport: Arc<Recorder>, intro: IntroductionSettings) -> Arc<AppState> {
@@ -136,13 +136,38 @@ async fn read_scope_gets_a_signed_card_of_this_node() {
 }
 
 #[tokio::test]
+async fn introduction_responses_point_at_front_door_as_profile_successor() {
+    let state = state_with(Arc::default(), settings(Some("node.example.org:9000")));
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/introduction")
+        .header("authorization", bearer(&state, vec![auth::Scope::Read]))
+        .body(Body::empty())
+        .unwrap();
+    let response = test_router(state).oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("deprecation").and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    assert!(
+        response
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("/api/v1/front-door")),
+        "profile successor is front-door"
+    );
+}
+
+#[tokio::test]
 async fn no_card_without_a_dialable_endpoint_or_network() {
     let state = state_with(Arc::default(), settings(None));
     let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert!(body.to_string().contains("advertised_addr"), "{body}");
+    assert!(body.to_string().contains("introduction_unavailable: no_dialable_endpoint"), "{body}");
 
-    let state = state_with(Arc::default(), IntroductionSettings { network: None, endpoint: Some("a.example:1".into()) });
+    let state = state_with(Arc::default(), IntroductionSettings::fixed(None, Some("a.example:1")));
     let (status, _, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
     assert_eq!(status, StatusCode::CONFLICT);
 }
@@ -347,4 +372,45 @@ async fn paired_read_client_can_verify_and_explicitly_open_without_a_spend_grant
     assert_eq!(transport.connects.lock().unwrap().len(), 1);
     assert!(transport.whitelisted.lock().unwrap().is_empty());
     assert!(state.storage.list_peers().await.unwrap().is_empty());
+}
+
+async fn card_endpoint_or_error(state: &Arc<AppState>) -> Result<String, String> {
+    let (status, body, _) = call(state, "GET", "/api/v1/introduction", bearer(state, vec![auth::Scope::Read]), None).await;
+    match status {
+        StatusCode::OK => Ok(body["card"]["endpoint"].as_str().unwrap().to_string()),
+        _ => Err(body.to_string()),
+    }
+}
+
+#[tokio::test]
+async fn discovered_endpoint_is_used_and_failures_carry_a_reason_code() {
+    let intro = IntroductionSettings { network: Some("regtest".into()), ..Default::default() };
+    let state = state_with(Arc::default(), intro.clone());
+    let err = card_endpoint_or_error(&state).await.unwrap_err();
+    assert!(err.contains("introduction_unavailable: no_dialable_endpoint"), "{err}");
+
+    intro.set_discovered(PeerEndpointView::missing("stun_unreachable"));
+    let err = card_endpoint_or_error(&state).await.unwrap_err();
+    assert!(err.contains("introduction_unavailable: stun_unreachable"), "{err}");
+
+    // The settings share the lock, so the running node's discovery shows up.
+    intro.set_discovered(PeerEndpointView::found("93.184.216.34:9000".into(), "stun"));
+    assert_eq!(card_endpoint_or_error(&state).await.unwrap(), "93.184.216.34:9000");
+}
+
+#[tokio::test]
+async fn a_configured_endpoint_is_never_replaced_by_discovery() {
+    let intro = IntroductionSettings::fixed(Some("regtest"), Some("node.example.org:9000"));
+    intro.set_discovered(PeerEndpointView::found("93.184.216.34:9000".into(), "stun"));
+    assert_eq!(intro.endpoint().as_deref(), Some("node.example.org:9000"));
+    let view = intro.endpoint_view();
+    assert_eq!((view.source, view.reason), (Some("advertised"), None));
+    let state = state_with(Arc::default(), intro);
+    assert_eq!(card_endpoint_or_error(&state).await.unwrap(), "node.example.org:9000");
+}
+
+#[test]
+fn endpoint_view_names_the_reason_when_nothing_is_known() {
+    let view = IntroductionSettings::default().endpoint_view();
+    assert_eq!((view.endpoint, view.source, view.reason), (None, None, Some("no_dialable_endpoint")));
 }
