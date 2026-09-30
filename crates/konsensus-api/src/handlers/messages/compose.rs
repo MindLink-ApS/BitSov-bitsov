@@ -3335,9 +3335,18 @@ pub(super) async fn compose_message(
         }));
     }
     // A room-bound chat to one member: checked before any quote or payment.
+    // A retry of a journaled operation was checked when it began and replays
+    // from its journal (a paid one must stay retryable).
     if let Some(room) = &room {
         let peer = NodeId::from_hex(&req.recipient).map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
-        crate::room_binding::check_one(state.transport.as_ref(), &sender, &peer, room).await?;
+        let journaled = match req.operation_id.as_deref() {
+            Some(id) => state.storage.get_outbox_operation(&super::operations::operation_id(Some(id))?).await
+                .map_err(|e| ApiError::Storage(e.to_string()))?.is_some(),
+            None => false,
+        };
+        if !journaled {
+            crate::room_binding::check_one(&state, &sender, &peer, room).await?;
+        }
     }
     if crate::calls::is_call_kind(req.kind) {
         // Calls: reserved before any quote or payment and resolved afterwards,

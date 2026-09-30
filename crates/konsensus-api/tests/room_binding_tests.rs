@@ -185,19 +185,47 @@ async fn a_bad_binding_is_refused_before_anything_is_paid() {
         // The room send's recipient is not the binding's room id.
         ("ffffffffffffffffffffffffffffffff", true, room_chat(&with_us, "x"), "room_binding_invalid"),
     ];
+    // Each is proven not dispatched (#115), so a client releases its reservation.
+    let refused = |status: StatusCode, body: &Value, reason: &str| {
+        assert_eq!((status, body["code"].as_str(), body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("not_dispatched"), Some(reason)), "{body}");
+    };
     for (recipient, is_room, plaintext, reason) in cases {
         let (status, body) = f.compose(recipient, is_room, &plaintext).await;
-        assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some(reason)), "{plaintext}: {body}");
+        refused(status, &body, reason);
     }
     // One member at a time (ordinary 1:1 compose): the recipient must be in
-    // the roster and advertise the binding.
+    // the roster, advertise the binding, and have an E2EE session.
     let (status, body) = f.compose(&c.to_hex(), false, &room_chat(&with_us, "x")).await;
-    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("room_recipient_not_member")), "{body}");
+    refused(status, &body, "room_recipient_not_member");
     f.transport.peer_capabilities.lock().unwrap().remove(&a);
     let (status, body) = f.compose(&a.to_hex(), false, &room_chat(&with_us, "x")).await;
-    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("room_binding_unsupported")), "{body}");
+    refused(status, &body, "room_binding_unsupported");
+    assert!(f.state.session_manager.remove_session(&b).await);
+    let (status, body) = f.compose(&b.to_hex(), false, &room_chat(&with_us, "x")).await;
+    refused(status, &body, "room_member_no_session");
     assert!(f.sent().is_empty(), "nothing sent");
     assert!(f.transport.raw_frames.lock().unwrap().is_empty(), "no invoice requested");
+}
+
+/// A 1:1 room chat is an ordinary operation: once journaled, a retry replays
+/// it from the journal even if the member's advert is gone meanwhile, so a
+/// paid chat never turns into a "not dispatched" the client would drop.
+#[tokio::test]
+async fn a_journaled_room_chat_replays_without_the_advert() {
+    let f = Fixture::new().await;
+    let a = f.members[0];
+    f.advertise(&[a]);
+    let body = json!({"recipient": a.to_hex(), "is_room": false, "kind": 0,
+        "plaintext": room_chat(&sorted(&[f.own, a]), "once"), "operation_id": "5d2c1f0e-8a4b-4c3d-9e2f-1a2b3c4d5e6f"});
+    let (status, first) = f.call("POST", "/api/v1/messages/compose", Some(body.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["amount_msat"], f.price(&a));
+    f.transport.peer_capabilities.lock().unwrap().remove(&a);
+    let (status, again) = f.call("POST", "/api/v1/messages/compose", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!((again["operation_id"].clone(), again["payment_hash"].clone()), (first["operation_id"].clone(), first["payment_hash"].clone()));
+    let ids: std::collections::HashSet<_> = f.sent().iter().map(|(_, env)| env.id).collect();
+    assert_eq!(ids.len(), 1, "one paid envelope, re-delivered at most");
 }
 
 /// Receive side: the roster must hold both the sender and this node. Plain

@@ -34,7 +34,8 @@ observers see paid 1:1 chats, not a room.
 `POST /api/v1/messages/compose` with `is_room: true`, `recipient` = the room
 id, `kind` 0 and the plaintext above. The node:
 
-1. Refuses a bad binding before any quote or payment (400, `reason` below).
+1. Refuses a bad binding before any quote or payment (400 `not_dispatched`,
+   `reason` below).
 2. For each other roster member, skips with nothing paid (`status`
    `"refused"`, `amount_msat` 0, a `code`) a member whose node does not
    advertise `room_binding_v1` (`room_binding_unsupported`: not connected, or
@@ -51,8 +52,13 @@ a failed send; resend only to the members whose outcome was not `settled`.
 
 A room chat can also go to one member as a plain 1:1 compose (`is_room`
 false, `recipient` = that member). The node checks the binding, that both
-ends are in the roster, and that the member advertises `room_binding_v1`,
-before any quote or payment.
+ends are in the roster, that the member advertises `room_binding_v1`, and
+that there is an E2EE session (a room never pays a first contact), before
+any quote or payment. Everything else is the ordinary 1:1 compose: its
+`max_total_msat`, operation id and exactly-once journal. A retry of an
+operation already journaled replays from the journal without these checks,
+so a paid chat stays retryable. This is how the app sends a room: one leg
+per member, each capped at the price the owner was shown.
 
 The app shows the cost before Send: the sum of each member's quoted price.
 
@@ -82,9 +88,11 @@ left only if you send an ordinary message saying so.
 | `room_sender_not_member` | compose (400), receive | The sender is not in the roster |
 | `room_recipient_not_member` | compose (400), receive | The recipient is not in the roster |
 | `room_binding_unsupported` | compose (400 for 1:1; per-member skip in a room) | The member's node does not advertise `room_binding_v1`; nothing paid |
-| `room_member_no_session` | compose (per-member skip) | No E2EE session with the member; nothing paid |
+| `room_member_no_session` | compose (400 for 1:1; per-member skip in a room) | No E2EE session with the member; nothing paid |
 
-On compose, the code is the error body's `reason`; on a per-member skip it is
+A compose refusal is HTTP 400 with `code: "not_dispatched"` (#115: proven
+before any payment, so a client releases its reservation) and the room code
+in `reason`; on a per-member skip it is
 the outcome's `code`; on receive, the `MessageReject` reason starts with
 `<code>:`.
 
@@ -119,8 +127,10 @@ node) is unchanged and separate from bound rooms.
   size, refusal codes, membership checks.
 - `konsensus-api` `tests/room_binding_tests.rs`: fan-out pays each member its
   own price on its own envelope; members without the advert or a session are
-  skipped with nothing paid; bad bindings are refused before anything is
-  paid; the receiver admits a binding only with both ends in the roster; the
+  skipped with nothing paid; bad bindings (and a 1:1 room chat to a member
+  without the advert or a session) are refused `not_dispatched` before
+  anything is paid; a journaled 1:1 room chat replays without re-checking;
+  the receiver admits a binding only with both ends in the roster; the
   `?room=` list; `/status` advertises `room_binding_v1`.
 - `konsensus-node` `room_binding_capability_is_advertised_in_the_form_peers_list_shows`.
 - `regtest_e2e::real_ldk_regtest_room` (apps A, B, C, D and router R on real

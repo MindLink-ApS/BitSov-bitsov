@@ -9,6 +9,7 @@ use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::NodeId;
 
 use crate::error::ApiError;
+use crate::state::AppState;
 
 /// A member's node does not list the capability; nothing was paid.
 pub const UNSUPPORTED: &str = "room_binding_unsupported";
@@ -33,8 +34,10 @@ pub fn admit_incoming(own: &NodeId, sender: &NodeId, kind: u16, plaintext: Optio
     Ok(Some(room))
 }
 
+/// A compose-side refusal, always before any quote or payment: `not_dispatched`
+/// (#115) lets a client release its reservation, `reason` names the rule.
 pub(crate) fn refused(e: RoomRefusal) -> ApiError {
-    ApiError::BadRequest(e.to_string()).with_reason(e.code())
+    ApiError::NotDispatched(e.to_string()).with_reason(e.code())
 }
 
 /// The binding of a chat we (`own`) compose, which must list us.
@@ -53,14 +56,18 @@ pub async fn advertises(transport: &dyn MessageTransport, peer: &NodeId) -> bool
 }
 
 /// A room-bound chat to one member (not a fan-out): both ends in the roster,
-/// and the member's node lists the capability. Refused before any payment.
-pub(crate) async fn check_one(transport: &dyn MessageTransport, own: &NodeId, peer: &NodeId, room: &RoomBinding) -> Result<(), ApiError> {
+/// the member's node lists the capability, and we have an E2EE session (a
+/// room never pays a first contact). Refused before any payment.
+pub(crate) async fn check_one(state: &AppState, own: &NodeId, peer: &NodeId, room: &RoomBinding) -> Result<(), ApiError> {
     room.check(own, peer).map_err(refused)?;
-    if !advertises(transport, peer).await {
-        return Err(ApiError::BadRequest(format!(
+    if !advertises(state.transport.as_ref(), peer).await {
+        return Err(ApiError::NotDispatched(format!(
             "their node does not advertise {ROOM_BINDING_CAPABILITY} (not connected, or an older node); nothing was paid"
         ))
         .with_reason(UNSUPPORTED));
+    }
+    if !state.session_manager.has_session(peer).await {
+        return Err(ApiError::NotDispatched("no E2EE session with this member; nothing was paid".into()).with_reason(NO_SESSION));
     }
     Ok(())
 }
