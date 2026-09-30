@@ -105,6 +105,20 @@ pub const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(300);
 /// How long a pending elevation request or replacement approval stays valid.
 pub const ELEVATION_TTL_SECS: i64 = 900;
 
+/// Wrong confirmations one grant request survives. The next wrong one cancels
+/// it: the request can no longer be approved and the app must ask again.
+pub const OWNER_CODE_ATTEMPTS: u8 = 3;
+
+/// Wrong grant confirmations one node run accepts in total, across every
+/// request. Past it, the short owner code stops working until restart and only
+/// the full `GRANT … CODE <nonce>` line approves. Bounds online guessing by a
+/// process that can reach the control socket and create requests at will.
+pub const OWNER_CODE_FAILURES_PER_RUN: u32 = 10;
+
+/// Alphabet of the short owner code: no 0/O or 1/I, so it reads aloud and
+/// types from a screen. 32 symbols, so a random byte maps without bias.
+const OWNER_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+
 // A spend grant's lifetime is the owner's choice, capped at
 // `spend_budget::MAX_SPEND_GRANT_TTL_SECS` (24 h). The 30-day unmetered grant
 // this replaced was a durable admission object; see `crate::spend_budget`.
@@ -183,6 +197,21 @@ pub enum PairingError {
     /// The typed confirmation did not name this operation.
     #[error("confirmation phrase did not match the pending operation")]
     ConfirmationMismatch,
+    /// A wrong owner code for a live grant request; attempts left before it
+    /// is cancelled.
+    #[error(
+        "that is not the code the node showed for this request; {0} attempt(s) left before \
+         the request is cancelled"
+    )]
+    WrongOwnerCode(u8),
+    /// Nothing can approve this request any more: its owner code was lost to
+    /// a restart, or wrong codes cancelled it.
+    #[error(
+        "this request can no longer be approved: the node restarted after it was made, or \
+         too many wrong codes were typed. Nothing was granted. Ask again from the app; it \
+         shows a new command"
+    )]
+    ConfirmationLost,
     /// The approval or request has expired.
     #[error("operation expired")]
     Expired,
@@ -552,6 +581,8 @@ pub struct PairingService {
     /// does not scribble on the harness's output.
     print_short_code: bool,
     owner_console: Mutex<Box<dyn std::io::Write + Send>>,
+    /// Absolute config path of an owner-run node, for the owner command.
+    owner_config: Option<PathBuf>,
 }
 
 struct Inner {
@@ -562,7 +593,9 @@ struct Inner {
     identity_fingerprint: String,
     // Never serialized or returned by HTTP/control status. Restart invalidates
     // pending console challenges; the owner must request a new operation.
-    owner_confirmations: HashMap<String, (blake3::Hash, i64)>,
+    owner_confirmations: HashMap<String, OwnerConfirmation>,
+    // Wrong grant confirmations in this run (see `OWNER_CODE_FAILURES_PER_RUN`).
+    owner_code_failures: u32,
     // One-time first-contact confirmations, by client id. Memory only: never
     // serialized, dropped on restart (fail closed). See `FirstContactGrant`.
     first_contact: HashMap<String, PendingFirstContact>,
@@ -596,6 +629,62 @@ struct PendingFirstContact {
     grant: crate::spend_budget::FirstContactGrant,
     epoch: u64,
     budget_op_id: String,
+}
+
+/// What the owner console showed for one pending operation. Memory only.
+struct OwnerConfirmation {
+    /// Digest of the full `<label> CODE <nonce>` line.
+    phrase: blake3::Hash,
+    /// Digest of the normalized short owner code; grant requests only.
+    code: Option<blake3::Hash>,
+    expires_at: i64,
+    /// Wrong confirmations typed for this operation.
+    failures: u8,
+}
+
+/// A fresh short owner code, `XXXX-XXXX`: 40 bits from the CSPRNG.
+fn new_owner_code() -> String {
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(9);
+    for (i, b) in bytes.iter().enumerate() {
+        if i == 4 {
+            out.push('-');
+        }
+        out.push(OWNER_CODE_ALPHABET[(*b as usize) % OWNER_CODE_ALPHABET.len()] as char);
+    }
+    out
+}
+
+/// The owner's typing, as the code is compared: case, spaces and dashes are
+/// not part of it.
+fn normalize_owner_code(typed: &str) -> String {
+    typed
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// `s` quoted for a POSIX shell only when it needs it. `None` when it holds a
+/// character no owner should be asked to paste (control or bidi formatting).
+fn shell_word(s: &str) -> Option<String> {
+    if s.is_empty()
+        || s.chars().any(|c| {
+            c.is_control()
+                || matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+        })
+    {
+        return None;
+    }
+    if s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c))
+    {
+        return Some(s.to_string());
+    }
+    Some(format!("'{}'", s.replace('\'', "'\\''")))
 }
 
 struct OwnerTerminal;
@@ -691,12 +780,14 @@ impl PairingService {
                 window_until: None,
                 identity_fingerprint,
                 owner_confirmations: HashMap::new(),
+                owner_code_failures: 0,
                 first_contact: HashMap::new(),
             }),
             grant_changes: tokio::sync::Notify::new(),
             owner_control_enabled,
             print_short_code: true,
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
+            owner_config: None,
         };
         // A grant that expired while the node was down, or an unmetered
         // pre-G1 grant, must not survive the restart on disk either.
@@ -711,12 +802,21 @@ impl PairingService {
         self
     }
 
+    /// Tell the owner, on the owner terminal only, how a pending operation is
+    /// approved, and remember digests of what it showed.
+    ///
+    /// Every operation gets the full `<label> CODE <nonce>` line. A grant
+    /// request (`short_code`) also gets a short code the owner types into
+    /// `konsensus grant`. Both reach only this console: never HTTP, the control
+    /// socket's replies, stdout/stderr (which a launching app may pipe) or a
+    /// file under `data_dir`.
     fn console_challenge(
         &self,
         inner: &mut Inner,
         op_id: &str,
         label: &str,
         expires_at: i64,
+        short_code: bool,
     ) -> Result<(), PairingError> {
         if !self.owner_control_enabled {
             return Ok(());
@@ -724,40 +824,148 @@ impl PairingService {
         let mut nonce = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
         let phrase = format!("{label} CODE {}", hex::encode(nonce));
+        let code = short_code.then(new_owner_code);
+        let mut text = format!("\nOwner approval (expires {expires_at}):\n{phrase}\n");
+        if let Some(code) = &code {
+            text.push_str(&format!(
+                "To approve, run: {}\n  and type this code when it asks: {code}\n",
+                self.owner_grant_command(op_id)
+            ));
+        }
         let mut console = self
             .owner_console
             .lock()
             .map_err(|_| PairingError::Io("owner console unavailable".into()))?;
-        console.write_all(
-            format!("\nOwner approval (expires {expires_at}):\n{phrase}\n").as_bytes(),
-        )?;
+        console.write_all(text.as_bytes())?;
         console.flush()?;
-        inner
-            .owner_confirmations
-            .retain(|_, (_, expiry)| *expiry > chrono::Utc::now().timestamp());
+        let now = chrono::Utc::now().timestamp();
+        inner.owner_confirmations.retain(|_, c| c.expires_at > now);
         inner.owner_confirmations.insert(
             op_id.to_owned(),
-            (blake3::hash(phrase.as_bytes()), expires_at),
+            OwnerConfirmation {
+                phrase: blake3::hash(phrase.as_bytes()),
+                code: code.map(|c| blake3::hash(normalize_owner_code(&c).as_bytes())),
+                expires_at,
+                failures: 0,
+            },
         );
         Ok(())
     }
 
+    /// The full console line only (identity replacement).
     fn verify_owner_confirmation(
         inner: &Inner,
         op_id: &str,
         confirmation: &str,
     ) -> Result<(), PairingError> {
-        let valid = inner
-            .owner_confirmations
-            .get(op_id)
-            .is_some_and(|(digest, expiry)| {
-                *expiry > chrono::Utc::now().timestamp()
-                    && *digest == blake3::hash(confirmation.trim().as_bytes())
-            });
+        let valid = inner.owner_confirmations.get(op_id).is_some_and(|c| {
+            c.expires_at > chrono::Utc::now().timestamp()
+                && c.phrase == blake3::hash(confirmation.trim().as_bytes())
+        });
         if valid {
             Ok(())
         } else {
             Err(PairingError::ConfirmationMismatch)
+        }
+    }
+
+    /// A grant request: the short owner code or the full console line.
+    ///
+    /// Each wrong answer is counted against the request and the node run, and
+    /// announced on the owner console. The request is cancelled after
+    /// [`OWNER_CODE_ATTEMPTS`]; past [`OWNER_CODE_FAILURES_PER_RUN`] the short
+    /// code no longer approves anything in this run. A request made before a
+    /// restart has nothing to compare against and is [`PairingError::ConfirmationLost`].
+    fn verify_grant_confirmation(
+        &self,
+        inner: &mut Inner,
+        label: &str,
+        op_id: &str,
+        confirmation: &str,
+    ) -> Result<(), PairingError> {
+        let now = chrono::Utc::now().timestamp();
+        let codes_enabled = inner.owner_code_failures < OWNER_CODE_FAILURES_PER_RUN;
+        let Some(expected) = inner
+            .owner_confirmations
+            .get_mut(op_id)
+            .filter(|c| c.expires_at > now)
+        else {
+            return Err(PairingError::ConfirmationLost);
+        };
+        let typed = confirmation.trim();
+        let phrase_ok = expected.phrase == blake3::hash(typed.as_bytes());
+        let code_ok = codes_enabled
+            && expected
+                .code
+                .is_some_and(|d| d == blake3::hash(normalize_owner_code(typed).as_bytes()));
+        if phrase_ok || code_ok {
+            return Ok(());
+        }
+        expected.failures = expected.failures.saturating_add(1);
+        let left = OWNER_CODE_ATTEMPTS.saturating_sub(expected.failures);
+        inner.owner_code_failures = inner.owner_code_failures.saturating_add(1);
+        let mut warning = format!(
+            "\nWRONG approval code for {label}. If you did not just type it, something on this \
+             computer is trying to approve this request.\n"
+        );
+        if left == 0 {
+            inner.owner_confirmations.remove(op_id);
+            warning.push_str("That request is cancelled; nothing was granted.\n");
+        }
+        if inner.owner_code_failures == OWNER_CODE_FAILURES_PER_RUN {
+            warning.push_str(
+                "Too many wrong codes: short codes are off until the node restarts. Approve with \
+                 the full GRANT ... CODE line instead.\n",
+            );
+        }
+        if let Ok(mut console) = self.owner_console.lock() {
+            let _ = console.write_all(warning.as_bytes());
+            let _ = console.flush();
+        }
+        if left == 0 {
+            Err(PairingError::ConfirmationLost)
+        } else if !codes_enabled {
+            Err(PairingError::ConfirmationMismatch)
+        } else {
+            Err(PairingError::WrongOwnerCode(left))
+        }
+    }
+
+    /// Whether the owner console still holds a live confirmation for `op_id`.
+    /// False for a request made before this node run, or cancelled by wrong
+    /// codes: nothing can approve it any more.
+    pub fn elevation_confirmable(&self, op_id: &str) -> bool {
+        let inner = self.lock();
+        Self::confirmable(&inner, op_id)
+    }
+
+    fn confirmable(inner: &Inner, op_id: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        inner
+            .owner_confirmations
+            .get(op_id)
+            .is_some_and(|c| c.expires_at > now)
+    }
+
+    /// Record the absolute config path this node was started with, so the
+    /// owner command it states names it. Owner-run startup only.
+    pub fn with_owner_config(mut self, config_path: PathBuf) -> Self {
+        self.owner_config = Some(config_path);
+        self
+    }
+
+    /// The command that approves `op_id`, as the app and the owner console
+    /// show it: `konsensus grant --op <id> --config <absolute path>`. The path
+    /// is left out when unknown or unsafe to show.
+    pub fn owner_grant_command(&self, op_id: &str) -> String {
+        let config = self
+            .owner_config
+            .as_deref()
+            .and_then(|p| p.to_str())
+            .and_then(shell_word);
+        match config {
+            Some(path) => format!("konsensus grant --op {op_id} --config {path}"),
+            None => format!("konsensus grant --op {op_id}"),
         }
     }
 
@@ -1519,6 +1727,7 @@ impl PairingService {
             &op.op_id,
             &grant_confirmation_phrase(&op),
             op.expires_at,
+            true,
         )?;
         inner.file.pending_elevations.retain(|e| e.expires_at > now);
         inner.file.pending_elevations.push(op.clone());
@@ -1570,6 +1779,9 @@ impl PairingService {
             };
             if granted {
                 return ElevationStatus::Granted;
+            }
+            if !Self::confirmable(&inner, op_id) {
+                return ElevationStatus::Lost;
             }
             return ElevationStatus::Pending;
         }
@@ -1628,7 +1840,12 @@ impl PairingService {
                     .into(),
             ));
         }
-        Self::verify_owner_confirmation(&inner, op_id, confirmation)?;
+        self.verify_grant_confirmation(
+            &mut inner,
+            &grant_confirmation_phrase(&op),
+            op_id,
+            confirmation,
+        )?;
         let client = inner
             .file
             .clients
@@ -1704,7 +1921,12 @@ impl PairingService {
                 "this request does not ask for front_door; grant it with a budget".into(),
             ));
         }
-        Self::verify_owner_confirmation(&inner, op_id, confirmation)?;
+        self.verify_grant_confirmation(
+            &mut inner,
+            &grant_confirmation_phrase(&op),
+            op_id,
+            confirmation,
+        )?;
         let client = inner
             .file
             .clients
@@ -1792,6 +2014,7 @@ impl PairingService {
             &approval.op_id,
             &replacement_confirmation_phrase(&approval),
             approval.expires_at,
+            false,
         )?;
         inner
             .file
@@ -2601,6 +2824,10 @@ pub enum ElevationStatus {
     Granted,
     /// The request window closed without an owner confirmation.
     Expired,
+    /// Still on file but no longer approvable: the node restarted after it
+    /// was made (the owner code lived in memory only) or too many wrong codes
+    /// cancelled it. The client should ask again.
+    Lost,
     /// No such operation.
     Absent,
 }

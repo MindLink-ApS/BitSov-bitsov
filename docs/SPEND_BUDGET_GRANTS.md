@@ -18,12 +18,22 @@ metered grant as an unmetered one.
    node id or Lightning pubkey to msat) and `ttl_secs` (default and maximum
    86400). A proposal the node cannot enforce is a 400, and nothing is left
    pending.
-2. The owner runs `konsensus grant --op <id> [--budget <sats>] [--for 24h]
-   [--per-call <sats>] [--recipient <key>=<sats> ...]`. Each flag overrides the
-   proposal. With neither a proposal nor `--budget`, the command refuses. The
-   CLI prints the request and the exact terms being granted, asks
-   `Grant these terms? [y/N]` (`--yes` skips only this question), then asks
-   for the confirmation code from the owner node's console, as before.
+2. The owner runs `konsensus grant --op <id> --config <path> [--budget <sats>]
+   [--for 24h] [--per-call <sats>] [--recipient <key>=<sats> ...]`. The
+   elevation response's `owner_action` states this command with the node's
+   absolute config path, and the node's terminal prints it too. Each flag
+   overrides the proposal. With neither a proposal nor `--budget`, the command
+   refuses. The CLI prints the request and the exact terms being granted, then
+   asks for the short approval code (`XXXX-XXXX`) that the node printed on its
+   own terminal when the request arrived. Typing it is the approval; an empty
+   line cancels. The full `GRANT … CODE <nonce>` line printed there is accepted
+   too. Three wrong codes cancel the request. `--yes` is accepted for older
+   scripts and has no effect. See `docs/security/pairing.md` for why this still
+   proves the owner is present.
+
+   A request made before the node restarted can no longer be approved (its
+   code lived in memory). `GET /api/v1/pair/elevation/{op_id}` then returns
+   `"status": "lost"`; the app asks again.
 3. The app re-issues its token. `GET /api/v1/pair/grant` returns the live
    grant (`budget_msat`, `used_msat`, `remaining_msat`, `per_call_max_msat`,
    `per_recipient_msat`, `used_by_recipient`, `granted_at`, `expires_at`), or

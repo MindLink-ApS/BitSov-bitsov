@@ -1324,3 +1324,279 @@ fn revoked_jwt_stays_rejected_after_rotation_into_key() {
         repaired_b.epoch
     );
 }
+
+// ─── The short owner code (one-step `konsensus grant`) ─────────────
+
+fn front_door_grants(service: &PairingService) -> usize {
+    service.reload_from_disk().unwrap().front_door_grants.len()
+}
+
+/// Every file under `dir`, as lossy text.
+fn all_files_text(dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.push_str(&all_files_text(&path));
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            out.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
+    out
+}
+
+#[test]
+fn short_owner_code_grants_spend_and_front_door() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console) = owner_run_service(tmp.path());
+    let a = pair(&service, &client_key(1), "client A");
+
+    let spend = service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    let code = console.owner_code(&spend.op_id);
+    assert_eq!(code.len(), 9, "{code}");
+    assert_eq!(&code[4..5], "-");
+
+    // The owner types it as they read it: case and dash do not matter.
+    let typed = code.replace('-', " ").to_lowercase();
+    let grant = service
+        .grant_elevation(&spend.op_id, &typed, konsensus_api::spend_budget::GrantTerms::new(1_000_000))
+        .unwrap();
+    assert_eq!(grant.client_id, a.client_id);
+    assert_eq!(service.reload_from_disk().unwrap().grants.len(), 1);
+
+    let fd = service
+        .create_elevation_request(&a.client_id, vec![Scope::FrontDoor])
+        .unwrap();
+    let code = console.owner_code(&fd.op_id);
+    service.grant_front_door(&fd.op_id, &code, 3600).unwrap();
+    assert_eq!(front_door_grants(&service), 1);
+
+    // The code approved exactly once: the request is consumed.
+    let err = service.grant_front_door(&fd.op_id, &code, 3600).unwrap_err();
+    assert!(matches!(err, PairingError::UnknownOperation), "{err}");
+}
+
+#[test]
+fn a_code_approves_only_its_own_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console) = owner_run_service(tmp.path());
+    let a = pair(&service, &client_key(1), "client A");
+    let first = service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    let second = service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    let first_code = console.owner_code(&first.op_id);
+    assert_ne!(first_code, console.owner_code(&second.op_id));
+
+    let err = service
+        .grant_elevation(&second.op_id, &first_code, konsensus_api::spend_budget::GrantTerms::new(1_000))
+        .unwrap_err();
+    assert!(matches!(err, PairingError::WrongOwnerCode(2)), "{err}");
+    assert!(service.reload_from_disk().unwrap().grants.is_empty());
+}
+
+#[test]
+fn wrong_codes_cancel_the_request_without_effect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console) = owner_run_service(tmp.path());
+    let a = pair(&service, &client_key(1), "client A");
+    let op = service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    let code = console.owner_code(&op.op_id);
+    let terms = || konsensus_api::spend_budget::GrantTerms::new(1_000_000);
+
+    for left in [2u8, 1] {
+        let err = service.grant_elevation(&op.op_id, "AAAA-AAAA", terms()).unwrap_err();
+        assert!(matches!(err, PairingError::WrongOwnerCode(l) if l == left), "{err}");
+        assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Pending);
+    }
+    let err = service.grant_elevation(&op.op_id, "AAAA-AAAA", terms()).unwrap_err();
+    assert!(matches!(err, PairingError::ConfirmationLost), "{err}");
+
+    // Cancelled: not even the right code or the full line approves it now.
+    let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
+    for right in [code.as_str(), phrase.as_str()] {
+        let err = service.grant_elevation(&op.op_id, right, terms()).unwrap_err();
+        assert!(matches!(err, PairingError::ConfirmationLost), "{err}");
+    }
+    assert!(service.reload_from_disk().unwrap().grants.is_empty());
+    assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Lost);
+
+    // The owner saw each attempt on their own terminal.
+    let text = console.text();
+    assert_eq!(text.matches("WRONG approval code").count(), 3, "{text}");
+    assert!(text.contains("That request is cancelled"), "{text}");
+}
+
+#[test]
+fn run_wide_cap_turns_short_codes_off_but_not_the_full_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console) = owner_run_service(tmp.path());
+    let a = pair(&service, &client_key(1), "client A");
+    let terms = || konsensus_api::spend_budget::GrantTerms::new(1_000);
+
+    // Spend the run's wrong-code allowance across requests the attacker makes.
+    let mut spent = 0;
+    while spent < pairing::OWNER_CODE_FAILURES_PER_RUN {
+        let op = service
+            .create_elevation_request(&a.client_id, vec![Scope::Spend])
+            .unwrap();
+        for _ in 0..pairing::OWNER_CODE_ATTEMPTS {
+            if spent == pairing::OWNER_CODE_FAILURES_PER_RUN {
+                break;
+            }
+            let _ = service.grant_elevation(&op.op_id, "AAAA-AAAA", terms());
+            spent += 1;
+        }
+    }
+    assert!(console.text().contains("short codes are off until the node restarts"));
+
+    let op = service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    let code = console.owner_code(&op.op_id);
+    let err = service.grant_elevation(&op.op_id, &code, terms()).unwrap_err();
+    assert!(matches!(err, PairingError::ConfirmationMismatch), "{err}");
+    assert!(service.reload_from_disk().unwrap().grants.is_empty());
+
+    // POSITIVE CONTROL: the full console line still approves.
+    let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
+    service.grant_elevation(&op.op_id, &phrase, terms()).unwrap();
+    assert_eq!(service.reload_from_disk().unwrap().grants.len(), 1);
+}
+
+#[test]
+fn a_request_from_before_a_restart_is_lost_not_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console) = owner_run_service(tmp.path());
+    let a = pair(&service, &client_key(1), "client A");
+    let op = service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    let code = console.owner_code(&op.op_id);
+    let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
+    assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Pending);
+    drop(service);
+
+    // Restart: the request is still on file, its codes are not.
+    let (service, _) = owner_run_service(tmp.path());
+    assert_eq!(service.reload_from_disk().unwrap().pending_elevations.len(), 1);
+    assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Lost);
+    assert_eq!(
+        serde_json::to_value(pairing::ElevationStatus::Lost).unwrap(),
+        serde_json::json!("lost")
+    );
+    for old in [code.as_str(), phrase.as_str()] {
+        let err = service
+            .grant_elevation(&op.op_id, old, konsensus_api::spend_budget::GrantTerms::new(1_000))
+            .unwrap_err();
+        assert!(matches!(err, PairingError::ConfirmationLost), "{err}");
+    }
+    assert!(service.reload_from_disk().unwrap().grants.is_empty());
+
+    // The owner CLI is told before it asks for terms or a code.
+    let ctx = ctx(&service, tmp.path());
+    match control::handle(&ctx, ControlRequest::Describe { op_id: op.op_id.clone() }) {
+        ControlResponse::Error { message } => assert!(message.contains("Ask again"), "{message}"),
+        other => panic!("a lost request must not be described as approvable: {other:?}"),
+    }
+    match control::handle(&ctx, ControlRequest::Status) {
+        ControlResponse::Status { pending_elevations, .. } => {
+            assert!(pending_elevations.iter().all(|e| e.lost), "{pending_elevations:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // POSITIVE CONTROL: asking again gives a request the owner can approve.
+    drop((ctx, service));
+    let (service, console) = owner_run_service(tmp.path());
+    let again = service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    assert_eq!(service.elevation_status(&again.op_id), pairing::ElevationStatus::Pending);
+    service
+        .grant_elevation(&again.op_id, &console.owner_code(&again.op_id), konsensus_api::spend_budget::GrantTerms::new(1_000))
+        .unwrap();
+    assert_eq!(service.elevation_status(&again.op_id), pairing::ElevationStatus::Granted);
+}
+
+#[test]
+fn the_owner_code_reaches_only_the_owner_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console) = owner_run_service(tmp.path());
+    let a = pair(&service, &client_key(1), "client A");
+    let op = service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    let code = console.owner_code(&op.op_id);
+    let bare = code.replace('-', "");
+
+    let ctx = ctx(&service, tmp.path());
+    let replies = [
+        control::handle(&ctx, ControlRequest::Status),
+        control::handle(&ctx, ControlRequest::Describe { op_id: op.op_id.clone() }),
+    ];
+    for reply in &replies {
+        let json = serde_json::to_string(reply).unwrap();
+        assert!(!json.contains(&code) && !json.contains(&bare), "{json}");
+    }
+    let on_disk = all_files_text(tmp.path());
+    assert!(!on_disk.contains(&code) && !on_disk.contains(&bare));
+}
+
+#[test]
+fn owner_command_names_the_absolute_config_quoted_for_a_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let console = OwnerConsole::default();
+    let service = PairingService::open(tmp.path(), current_fingerprint(), true)
+        .unwrap()
+        .with_owner_console(Box::new(console.clone()))
+        .without_stdout_code()
+        .with_owner_config("/Users/o'neil/My Node/konsensus.toml".into());
+    assert_eq!(
+        service.owner_grant_command("ab12"),
+        r"konsensus grant --op ab12 --config '/Users/o'\''neil/My Node/konsensus.toml'"
+    );
+    let plain = PairingService::open(tmp.path(), current_fingerprint(), true)
+        .unwrap()
+        .with_owner_config("/srv/bitsov/konsensus.toml".into());
+    assert_eq!(
+        plain.owner_grant_command("ab12"),
+        "konsensus grant --op ab12 --config /srv/bitsov/konsensus.toml"
+    );
+    // Never a path that could rewrite what the owner sees.
+    let hostile = PairingService::open(tmp.path(), current_fingerprint(), true)
+        .unwrap()
+        .with_owner_config("/tmp/a\u{202E}lmot.toml".into());
+    assert_eq!(hostile.owner_grant_command("ab12"), "konsensus grant --op ab12");
+
+    // The owner terminal prints the same command next to the code.
+    let a = pair(&service, &client_key(1), "client A");
+    let op = service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    assert!(console
+        .text()
+        .contains(&format!("To approve, run: {}", service.owner_grant_command(&op.op_id))));
+}
+
+#[test]
+fn replacement_still_requires_the_full_console_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, console) = owner_run_service(tmp.path());
+    let a = pair(&service, &client_key(1), "client A");
+    let approval = service
+        .create_replacement_request(&a.client_id, &current_fingerprint(), REPLACEMENT_MNEMONIC)
+        .unwrap();
+    // No short code is ever printed for an identity replacement.
+    assert!(!console.text().contains("type this code when it asks"));
+    let err = service
+        .approve_replacement(&approval.op_id, "AAAA-AAAA")
+        .unwrap_err();
+    assert!(matches!(err, PairingError::ConfirmationMismatch), "{err}");
+}

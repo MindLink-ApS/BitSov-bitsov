@@ -69,14 +69,36 @@ Therefore, per the operator lock:
 - OS user-presence (Touch ID, Windows Hello) would close the sidecar case
   properly. Out of scope for this step; not approximated by anything weaker.
 
-Elevation consent requires an operation-bound **256-bit random nonce** printed
-only to the owner node's controlling terminal (`/dev/tty`), never stdout,
-tracing, HTTP, socket status/description, or a file under `data_dir`. The CLI
-asks for that full confirmation. Knowing the public operation id/label or
-connecting as the same uid is insufficient. Without an owner terminal,
-elevation fails closed. Pending challenges are memory-only and lost on restart;
-the owner must request a new operation. Arbitrary access to the owner's terminal
-or process memory remains outside this tier's threat model.
+Elevation consent requires a secret printed only to the owner node's
+controlling terminal (`/dev/tty`), never stdout, tracing, HTTP, socket
+status/description, or a file under `data_dir`: an operation-bound **256-bit
+random nonce** (the full `GRANT … CODE <nonce>` line), and for grant requests
+also a **short owner code** (`XXXX-XXXX`, 40 bits from the CSPRNG) that
+`konsensus grant` asks for after printing the terms. Knowing the public
+operation id/label or connecting as the same uid is insufficient. Without an
+owner terminal, elevation fails closed. Identity replacement accepts only the
+full nonce line.
+
+The short code is shorter only because online guessing is bounded: each wrong
+confirmation is announced on the owner terminal, the third wrong one cancels
+that request, and after ten wrong ones in a node run short codes stop working
+until restart (the full line still does). A same-uid process that can create
+requests and reach the socket therefore gets at most ten guesses per node run
+against a 2^40 space.
+
+Why not "the socket peer is an interactive TTY": on the dev-node path the app
+launches the node, so it runs as the owner's uid, shares the node's controlling
+terminal, and can reach the `0600` socket. It can allocate a pseudo-terminal
+(or inject input into its own controlling terminal with `TIOCSTI`), so no
+property of the peer or its terminal separates the app from the owner. What the
+app cannot do is read the terminal's screen; the code travels only there.
+
+Pending challenges are memory-only and lost on restart. A request made before
+the restart is still on file until it expires, but `GET
+/api/v1/pair/elevation/{op_id}` reports it as `lost`, `konsensus pair-status`
+marks it, and `konsensus grant` refuses it up front; the client asks again.
+Arbitrary access to the owner's terminal or process memory remains outside this
+tier's threat model.
 
 ### Live-identity replacement binds five fields
 

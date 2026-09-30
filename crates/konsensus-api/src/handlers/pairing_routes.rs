@@ -442,7 +442,7 @@ async fn elevation_request(
         )
         .map_err(map_err)?;
     let owner_action = if svc.owner_control_enabled() {
-        format!("konsensus grant --op {}", op.op_id)
+        svc.owner_grant_command(&op.op_id)
     } else {
         "unavailable in this deployment: the node was not started in owner-run mode, so there \
          is no owner control socket. A packaged sidecar app is a read+receive client by \

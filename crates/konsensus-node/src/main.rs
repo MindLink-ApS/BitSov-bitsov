@@ -130,8 +130,8 @@ async fn main() -> Result<()> {
         Command::PairStatus { config } => {
             owner_cmd::cmd_pair_status(&config).await?;
         }
-        Command::Grant { op_id, budget, for_, per_call, recipient, yes, config, allow_liquidity_fees } => {
-            let flags = owner_cmd::GrantFlags { allow_liquidity_fees, budget_sats: budget, window: for_, per_call_sats: per_call, recipients: recipient, yes };
+        Command::Grant { op_id, budget, for_, per_call, recipient, yes: _, config, allow_liquidity_fees } => {
+            let flags = owner_cmd::GrantFlags { allow_liquidity_fees, budget_sats: budget, window: for_, per_call_sats: per_call, recipients: recipient };
             owner_cmd::cmd_grant(&config, &op_id, flags).await?;
         }
         Command::GrantRevoke { client_id, all, config } => {
@@ -938,7 +938,9 @@ async fn cmd_start(
             identity_fingerprint.clone(),
             owner_control,
         )
-        .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?,
+        .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?
+        // The owner command the app and console show names this exact config.
+        .with_owner_config(config_path.to_path_buf()),
     );
 
     // Calls: bind the owner's STUN responder before the API reports its port.
