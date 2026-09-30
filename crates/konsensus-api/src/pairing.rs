@@ -105,8 +105,8 @@ pub const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(300);
 /// How long a pending elevation request or replacement approval stays valid.
 pub const ELEVATION_TTL_SECS: i64 = 900;
 
-/// Wrong confirmations one grant request survives. The next wrong one cancels
-/// it: the request can no longer be approved and the app must ask again.
+/// Wrong confirmations per grant request. The last of them cancels it: the
+/// request can no longer be approved and the app must ask again.
 pub const OWNER_CODE_ATTEMPTS: u8 = 3;
 
 /// Wrong grant confirmations one node run accepts in total, across every
@@ -212,6 +212,12 @@ pub enum PairingError {
          shows a new command"
     )]
     ConfirmationLost,
+    /// Short owner codes are off for this node run (too many wrong codes).
+    #[error(
+        "short approval codes are off until the node restarts (too many wrong codes were \
+         typed). Type the full GRANT ... CODE line from the node's terminal instead"
+    )]
+    ShortCodesOff,
     /// The approval or request has expired.
     #[error("operation expired")]
     Expired,
@@ -666,14 +672,19 @@ fn normalize_owner_code(typed: &str) -> String {
         .collect()
 }
 
-/// `s` quoted for a POSIX shell only when it needs it. `None` when it holds a
-/// character no owner should be asked to paste (control or bidi formatting).
+/// `s` single-quoted for a shell only when it needs it. `None` when it holds a
+/// character no owner should be asked to paste (control or invisible
+/// formatting) or one that single quotes do not neutralize in every shell.
 fn shell_word(s: &str) -> Option<String> {
+    // A backslash or quote is refused, not escaped: `'\''` is POSIX-only, and
+    // fish would read `\'` inside single quotes as the end of the string.
     if s.is_empty()
         || s.chars().any(|c| {
             c.is_control()
-                || matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-                    | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+                || c == '\\'
+                || c == '\''
+                || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+                    | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
         })
     {
         return None;
@@ -684,7 +695,7 @@ fn shell_word(s: &str) -> Option<String> {
     {
         return Some(s.to_string());
     }
-    Some(format!("'{}'", s.replace('\'', "'\\''")))
+    Some(format!("'{s}'"))
 }
 
 struct OwnerTerminal;
@@ -824,11 +835,18 @@ impl PairingService {
         let mut nonce = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
         let phrase = format!("{label} CODE {}", hex::encode(nonce));
-        let code = short_code.then(new_owner_code);
+        let codes_on = inner.owner_code_failures < OWNER_CODE_FAILURES_PER_RUN;
+        let code = (short_code && codes_on).then(new_owner_code);
         let mut text = format!("\nOwner approval (expires {expires_at}):\n{phrase}\n");
         if let Some(code) = &code {
             text.push_str(&format!(
                 "To approve, run: {}\n  and type this code when it asks: {code}\n",
+                self.owner_grant_command(op_id)
+            ));
+        } else if short_code {
+            text.push_str(&format!(
+                "To approve, run: {}\n  and paste the GRANT ... CODE line above (short codes are \
+                 off until restart: too many wrong codes)\n",
                 self.owner_grant_command(op_id)
             ));
         }
@@ -925,7 +943,7 @@ impl PairingService {
         if left == 0 {
             Err(PairingError::ConfirmationLost)
         } else if !codes_enabled {
-            Err(PairingError::ConfirmationMismatch)
+            Err(PairingError::ShortCodesOff)
         } else {
             Err(PairingError::WrongOwnerCode(left))
         }

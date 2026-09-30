@@ -1440,28 +1440,42 @@ fn run_wide_cap_turns_short_codes_off_but_not_the_full_line() {
     let a = pair(&service, &client_key(1), "client A");
     let terms = || konsensus_api::spend_budget::GrantTerms::new(1_000);
 
-    // Spend the run's wrong-code allowance across requests the attacker makes.
+    // Spend the run's wrong-code allowance across spend AND front_door
+    // requests the attacker makes: one counter for both.
     let mut spent = 0;
+    let mut round = 0;
     while spent < pairing::OWNER_CODE_FAILURES_PER_RUN {
+        let scope = if round % 2 == 0 { Scope::Spend } else { Scope::FrontDoor };
+        round += 1;
         let op = service
-            .create_elevation_request(&a.client_id, vec![Scope::Spend])
+            .create_elevation_request(&a.client_id, vec![scope.clone()])
             .unwrap();
         for _ in 0..pairing::OWNER_CODE_ATTEMPTS {
             if spent == pairing::OWNER_CODE_FAILURES_PER_RUN {
                 break;
             }
-            let _ = service.grant_elevation(&op.op_id, "AAAA-AAAA", terms());
+            let err = if scope == Scope::Spend {
+                service.grant_elevation(&op.op_id, "AAAA-AAAA", terms()).unwrap_err()
+            } else {
+                service.grant_front_door(&op.op_id, "AAAA-AAAA", 600).unwrap_err()
+            };
             spent += 1;
+            // The 10th guess is still evaluated, not refused early.
+            assert!(!matches!(err, PairingError::ShortCodesOff), "guess {spent}: {err}");
         }
     }
     assert!(console.text().contains("short codes are off until the node restarts"));
 
+    // A new request prints no short code at all, and says to use the full line.
     let op = service
         .create_elevation_request(&a.client_id, vec![Scope::Spend])
         .unwrap();
-    let code = console.owner_code(&op.op_id);
-    let err = service.grant_elevation(&op.op_id, &code, terms()).unwrap_err();
-    assert!(matches!(err, PairingError::ConfirmationMismatch), "{err}");
+    let text = console.text();
+    let tail = &text[text.rfind(&op.op_id).unwrap()..];
+    assert!(!tail.contains("type this code when it asks"), "{tail}");
+    assert!(tail.contains("short codes are off"), "{tail}");
+    let err = service.grant_elevation(&op.op_id, "AAAA-AAAA", terms()).unwrap_err();
+    assert!(matches!(err, PairingError::ShortCodesOff), "{err}");
     assert!(service.reload_from_disk().unwrap().grants.is_empty());
 
     // POSITIVE CONTROL: the full console line still approves.
@@ -1557,11 +1571,19 @@ fn owner_command_names_the_absolute_config_quoted_for_a_shell() {
         .unwrap()
         .with_owner_console(Box::new(console.clone()))
         .without_stdout_code()
-        .with_owner_config("/Users/o'neil/My Node/konsensus.toml".into());
+        .with_owner_config("/Users/owner/Library/Application Support/My Node/konsensus.toml".into());
     assert_eq!(
         service.owner_grant_command("ab12"),
-        r"konsensus grant --op ab12 --config '/Users/o'\''neil/My Node/konsensus.toml'"
+        "konsensus grant --op ab12 --config '/Users/owner/Library/Application Support/My Node/konsensus.toml'"
     );
+    // Quotes and backslashes are left out rather than escaped: no escape is
+    // safe in every shell (fish reads \' inside single quotes).
+    for awkward in ["/Users/o'neil/konsensus.toml", r"/a\' ; touch /tmp/p ; \'/k.toml"] {
+        let svc = PairingService::open(tmp.path(), current_fingerprint(), true)
+            .unwrap()
+            .with_owner_config(awkward.into());
+        assert_eq!(svc.owner_grant_command("ab12"), "konsensus grant --op ab12", "{awkward}");
+    }
     let plain = PairingService::open(tmp.path(), current_fingerprint(), true)
         .unwrap()
         .with_owner_config("/srv/bitsov/konsensus.toml".into());
@@ -1599,4 +1621,28 @@ fn replacement_still_requires_the_full_console_line() {
         .approve_replacement(&approval.op_id, "AAAA-AAAA")
         .unwrap_err();
     assert!(matches!(err, PairingError::ConfirmationMismatch), "{err}");
+}
+
+#[test]
+fn an_expired_request_reads_expired_not_lost_to_the_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _) = owner_run_service(tmp.path());
+    let a = pair(&service, &client_key(1), "client A");
+    let op = service
+        .create_elevation_request(&a.client_id, vec![Scope::Spend])
+        .unwrap();
+    drop(service);
+    let (service, _) = expire_approvals_on_disk(tmp.path());
+    let ctx = ctx(&service, tmp.path());
+    match control::handle(&ctx, ControlRequest::Describe { op_id: op.op_id.clone() }) {
+        ControlResponse::Error { message } => assert!(message.contains("expired"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    match control::handle(&ctx, ControlRequest::Status) {
+        ControlResponse::Status { pending_elevations, .. } => {
+            assert!(pending_elevations.iter().all(|e| !e.lost), "{pending_elevations:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Expired);
 }
