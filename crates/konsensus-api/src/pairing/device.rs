@@ -858,11 +858,48 @@ mod tests {
             .reserve_spend(&client.client_id, client.epoch, vec![Charge { recipient: b.clone(), amount_msat: 1_000 }])
             .unwrap();
         // Second 59: both may dispatch.
-        assert!(service.with_spend_authority_at(&to_a, now + 59, || ()).is_ok());
+        assert!(service.with_spend_authority_at(&to_a, || now + 59, || ()).is_ok());
         // Second 61: A's envelope is over; B's grant time does not carry A.
-        assert!(matches!(service.with_spend_authority_at(&to_a, now + 61, || ()), Err(BudgetRefusal::NoGrant)));
-        assert!(service.with_spend_authority_at(&to_b, now + 61, || ()).is_ok());
+        assert!(matches!(service.with_spend_authority_at(&to_a, || now + 61, || ()), Err(BudgetRefusal::NoGrant)));
+        assert!(service.with_spend_authority_at(&to_b, || now + 61, || ()).is_ok());
         // And past B's deadline, B stops too.
-        assert!(matches!(service.with_spend_authority_at(&to_b, now + 3601, || ()), Err(BudgetRefusal::NoGrant)));
+        assert!(matches!(service.with_spend_authority_at(&to_b, || now + 3601, || ()), Err(BudgetRefusal::NoGrant)));
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use crate::spend_budget::{BudgetRefusal, Charge};
+
+    /// Codex #146 delta: the dispatch deadline is judged at the moment the
+    /// lock is held, not when the caller arrived. The clock runs only after
+    /// the lock is acquired (it would deadlock re-locking otherwise), and a
+    /// clock read then that is past the deadline refuses.
+    #[test]
+    fn the_dispatch_clock_is_read_under_the_pairing_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = PairingService::open(tmp.path(), "f".repeat(32), true)
+            .unwrap()
+            .with_owner_console(Box::new(std::io::sink()))
+            .without_stdout_code();
+        let reservation = crate::spend_budget::Reservation {
+            id: "r".into(),
+            client_id: "c".into(),
+            op_id: "op".into(),
+            charges: vec![Charge { recipient: "a".repeat(64), amount_msat: 1 }],
+        };
+        let held = std::cell::Cell::new(false);
+        let out = service.with_spend_authority_at(
+            &reservation,
+            || {
+                // The pairing mutex is held while the clock is read.
+                held.set(service.inner.try_lock().is_err());
+                0
+            },
+            || (),
+        );
+        assert!(held.get(), "the clock must be sampled while holding the lock");
+        assert!(matches!(out, Err(BudgetRefusal::NoGrant)));
     }
 }

@@ -2719,17 +2719,20 @@ impl PairingService {
         reservation: &Reservation,
         action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
-        self.with_spend_authority_at(reservation, chrono::Utc::now().timestamp(), action)
+        self.with_spend_authority_at(reservation, || chrono::Utc::now().timestamp(), action)
     }
 
-    /// [`Self::with_spend_authority`] at a given clock.
+    /// [`Self::with_spend_authority`] with an injected clock. The clock is read
+    /// **after** the pairing lock is held: a dispatch that waited behind
+    /// another writer must judge deadlines at the time it actually runs.
     pub(crate) fn with_spend_authority_at<T>(
         &self,
         reservation: &Reservation,
-        now: i64,
+        clock: impl FnOnce() -> i64,
         action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
         let inner = self.lock();
+        let now = clock();
         let valid = self.owner_control_enabled
             && inner.file.grants.iter().any(|g| {
                 g.op_id == reservation.op_id
