@@ -109,16 +109,32 @@ async fn metrics_handler() -> impl IntoResponse {
 
 /// Build the Axum router with all routes and middleware.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    build_router_with_local_auth(state, true)
+    let limiter = Arc::clone(&state.rate_limiter);
+    build_router_with_options(state, limiter, true, false)
 }
 
 /// Build the ordinary API behind the encrypted remote tunnel, without the
-/// loopback-only token mint.
+/// loopback-only token mint, public probes, metrics, or first-pair ceremony.
+/// Its limiter always has buckets independent from the owner-local API.
 pub fn build_remote_router(state: Arc<AppState>) -> Router {
-    build_router_with_local_auth(state, false)
+    let limiter = Arc::new(state.rate_limiter.independent());
+    build_remote_router_with_limiter(state, limiter)
 }
 
-fn build_router_with_local_auth(state: Arc<AppState>, local_auth_enabled: bool) -> Router {
+/// Build the remote router with an explicitly dedicated limiter.
+pub fn build_remote_router_with_limiter(
+    state: Arc<AppState>,
+    limiter: Arc<RateLimiter>,
+) -> Router {
+    build_router_with_options(state, limiter, false, true)
+}
+
+fn build_router_with_options(
+    state: Arc<AppState>,
+    rate_limiter: Arc<RateLimiter>,
+    local_auth_enabled: bool,
+    remote: bool,
+) -> Router {
     let cors = if state.cors_enabled {
         CorsLayer::new()
             .allow_origin(cors_allowed_origins())
@@ -134,10 +150,19 @@ fn build_router_with_local_auth(state: Arc<AppState>, local_auth_enabled: bool) 
         CorsLayer::new()
     };
 
-    let rate_limiter = Arc::clone(&state.rate_limiter);
+    let health_routes = if remote {
+        handlers::health::status_routes()
+    } else {
+        handlers::health::routes(state.operator_probes_enabled)
+    };
+    let pairing_routes = if remote {
+        handlers::pairing_routes::remote_routes(state.pairing.is_some())
+    } else {
+        handlers::pairing_routes::routes(state.pairing.is_some())
+    };
 
-    Router::new()
-        .merge(handlers::health::routes(state.operator_probes_enabled))
+    let router = Router::new()
+        .merge(health_routes)
         .merge(handlers::messages::routes())
         .merge(handlers::rooms::routes())
         .merge(handlers::peers::routes())
@@ -148,7 +173,7 @@ fn build_router_with_local_auth(state: Arc<AppState>, local_auth_enabled: bool) 
         .merge(handlers::auth_routes::routes(
             state.sensitive_identity_routes_enabled && local_auth_enabled,
         ))
-        .merge(handlers::pairing_routes::routes(state.pairing.is_some()))
+        .merge(pairing_routes)
         .merge(handlers::sessions::routes())
         .merge(handlers::files::routes())
         .merge(handlers::pricing::routes())
@@ -166,9 +191,14 @@ fn build_router_with_local_auth(state: Arc<AppState>, local_auth_enabled: bool) 
         .merge(handlers::onboarding::routes())
         .merge(handlers::organism::routes())
         .merge(handlers::gossip::routes())
-        .merge(ws::routes())
+        .merge(ws::routes());
+    let router = if remote {
+        router
+    } else {
         // Prometheus scrape endpoint — unauthenticated, restrict via network ACL.
-        .route("/metrics", get(metrics_handler))
+        router.route("/metrics", get(metrics_handler))
+    };
+    router
         .layer(middleware::from_fn_with_state(
             rate_limiter,
             rate_limit::rate_limit_middleware,

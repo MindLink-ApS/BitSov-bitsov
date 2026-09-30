@@ -55,6 +55,11 @@ impl RateLimiter {
         }
     }
 
+    /// Create an empty limiter with the same policy and a separate bucket map.
+    pub fn independent(&self) -> Self {
+        Self::with_window(self.max_requests, self.window)
+    }
+
     /// Create the dedicated limiter for mnemonic (seed) read-back.
     ///
     /// Allows at most 5 reveal attempts per 60-second window. This is

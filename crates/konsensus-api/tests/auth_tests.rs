@@ -315,6 +315,110 @@ async fn remote_router_never_mounts_local_token_mint() {
 }
 
 #[tokio::test]
+async fn remote_router_excludes_local_surfaces_but_keeps_authenticated_api() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use konsensus_api::pairing::{identity_fingerprint, PairingService};
+
+    let dir = tempfile::tempdir().unwrap();
+    let base = test_state();
+    let pairing = Arc::new(
+        PairingService::open(
+            dir.path(),
+            identity_fingerprint(&base.identity.node_id().to_hex()),
+            false,
+        )
+        .unwrap(),
+    );
+    let state = Arc::new(konsensus_api::AppState {
+        pairing: Some(pairing),
+        ..(*base).clone()
+    });
+    let app = konsensus_api::build_remote_router(state).layer(MockConnectInfo(
+        "127.0.0.1:19002"
+            .parse::<std::net::SocketAddr>()
+            .unwrap(),
+    ));
+
+    for (method, path) in [
+        ("GET", "/metrics"),
+        ("GET", "/api/v1/health"),
+        ("GET", "/api/v1/preflight"),
+        ("GET", "/livez"),
+        ("POST", "/api/v1/pair/request"),
+        ("POST", "/api/v1/auth/local"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+
+    let protected = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn remote_rate_exhaustion_does_not_consume_local_budget() {
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let base = test_state();
+    let state = Arc::new(konsensus_api::AppState {
+        rate_limiter: Arc::new(RateLimiter::new(1)),
+        ..(*base).clone()
+    });
+    let peer = MockConnectInfo(
+        "127.0.0.1:19003"
+            .parse::<std::net::SocketAddr>()
+            .unwrap(),
+    );
+    let remote = konsensus_api::build_remote_router(Arc::clone(&state)).layer(peer);
+    let local = konsensus_api::build_router(state).layer(peer);
+
+    let challenge = || {
+        Request::builder()
+            .uri("/api/v1/auth/challenge")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        remote.clone().oneshot(challenge()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        remote.oneshot(challenge()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let local_response = local
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(local_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn rate_limiter_basic() {
     let limiter = RateLimiter::new(3);
     let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();

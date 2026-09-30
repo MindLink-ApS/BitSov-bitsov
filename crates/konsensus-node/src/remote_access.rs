@@ -29,6 +29,12 @@ const HANDSHAKES_PER_IP_PER_MINUTE: u32 = 20;
 const MAX_RATE_LIMIT_IPS: usize = 2048;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const PAIRING_CODE_TTL: Duration = Duration::from_secs(5 * 60);
+
+struct ActivePairingCode {
+    value: String,
+    expires_at: tokio::time::Instant,
+}
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
@@ -73,8 +79,9 @@ pub struct RemoteAccessServer {
     identity: Arc<NodeIdentity>,
     pairing: Arc<PairingService>,
     internal_api: SocketAddr,
-    pairing_code: Arc<Mutex<Option<String>>>,
-    pair_link: Option<String>,
+    pairing_code: Arc<Mutex<Option<ActivePairingCode>>>,
+    pair_link_path: Option<std::path::PathBuf>,
+    pairing_deadline: Option<tokio::time::Instant>,
 }
 
 impl RemoteAccessServer {
@@ -97,10 +104,14 @@ impl RemoteAccessServer {
             .await
             .with_context(|| format!("could not bind remote access listener at {listen_addr}"))?;
 
-        let (pairing_code, pair_link) = if pairing.pairing_open() {
+        pairing
+            .remove_remote_access_link()
+            .context("could not remove stale remote pairing link")?;
+        let (pairing_code, pair_link_path, pairing_deadline) = if pairing.pairing_open() {
             let mut code_bytes = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut code_bytes);
             let code = URL_SAFE_NO_PAD.encode(code_bytes);
+            let expires_at = tokio::time::Instant::now() + PAIRING_CODE_TTL;
             let node_id = identity.node_id().to_hex();
             let transport_pubkey = hex::encode(identity.x25519_public().as_bytes());
             let proof = wire::transport_proof_message(&node_id, &transport_pubkey);
@@ -115,9 +126,19 @@ impl RemoteAccessServer {
             }
             .to_uri()
             .context("could not encode remote pairing link")?;
-            (Some(code), Some(link))
+            let path = pairing
+                .write_remote_access_link(&link)
+                .context("could not write protected remote pairing link")?;
+            (
+                Some(ActivePairingCode {
+                    value: code,
+                    expires_at,
+                }),
+                Some(path),
+                Some(expires_at),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         Ok(Self {
@@ -126,7 +147,8 @@ impl RemoteAccessServer {
             pairing,
             internal_api,
             pairing_code: Arc::new(Mutex::new(pairing_code)),
-            pair_link,
+            pair_link_path,
+            pairing_deadline,
         })
     }
 
@@ -134,18 +156,31 @@ impl RemoteAccessServer {
         self.listener.local_addr()
     }
 
-    pub fn pair_link(&self) -> Option<&str> {
-        self.pair_link.as_deref()
+    pub fn pair_link_path(&self) -> Option<&std::path::Path> {
+        self.pair_link_path.as_deref()
     }
 
-    pub async fn serve(self, mut shutdown: watch::Receiver<bool>) {
+    pub fn pairing_expires_in(&self) -> Option<Duration> {
+        self.pairing_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    pub async fn serve(mut self, mut shutdown: watch::Receiver<bool>) {
         let limits = Arc::new(HandshakeLimiter::new());
         let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let mut tasks = tokio::task::JoinSet::new();
 
         loop {
+            let pairing_deadline = self.pairing_deadline;
             tokio::select! {
                 _ = shutdown.changed() => break,
+                _ = wait_for_deadline(pairing_deadline) => {
+                    self.pairing_deadline = None;
+                    *self.pairing_code.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    if let Err(error) = self.pairing.remove_remote_access_link() {
+                        warn!(%error, "could not remove expired remote pairing link");
+                    }
+                }
                 accepted = self.listener.accept() => {
                     let (stream, peer_addr) = match accepted {
                         Ok(value) => value,
@@ -190,7 +225,17 @@ impl RemoteAccessServer {
         }
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+        if let Err(error) = self.pairing.remove_remote_access_link() {
+            warn!(%error, "could not remove remote pairing link during shutdown");
+        }
         info!("remote access listener stopped");
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -198,10 +243,11 @@ async fn handle_connection(
     stream: TcpStream,
     identity: Arc<NodeIdentity>,
     pairing: Arc<PairingService>,
-    pairing_code: Arc<Mutex<Option<String>>>,
+    pairing_code: Arc<Mutex<Option<ActivePairingCode>>>,
     internal_api: SocketAddr,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut authority_changes = pairing.subscribe_authority_changes();
     let (mut remote_reader, mut remote_writer) = stream.into_split();
     let handshake = async {
         let mut noise = NoiseSession::responder(identity.x25519_secret_bytes())?;
@@ -261,6 +307,7 @@ async fn handle_connection(
         wire::encode_transport(&mut noise, &response_json).map_err(anyhow::Error::msg)?;
     wire::write_frame(&mut remote_writer, &response_ciphertext).await?;
     let client = authenticated?;
+    validate_tunnel_authority(&pairing, &client, &remote_static)?;
 
     let internal = TcpStream::connect(internal_api)
         .await
@@ -286,6 +333,10 @@ async fn handle_connection(
     loop {
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
+            changed = authority_changes.changed() => {
+                changed.context("pairing authority notification channel closed")?;
+                validate_tunnel_authority(&pairing, &client, &remote_static)?;
+            }
             incoming = frame_rx.recv() => {
                 let ciphertext = match incoming {
                     Some(Ok(frame)) => frame,
@@ -297,6 +348,7 @@ async fn handle_connection(
                     &ciphertext,
                     wire::MAX_TUNNEL_PLAINTEXT,
                 ).map_err(anyhow::Error::msg)?;
+                validate_tunnel_authority(&pairing, &client, &remote_static)?;
                 internal_writer.write_all(&plaintext).await?;
                 internal_writer.flush().await?;
             }
@@ -305,6 +357,7 @@ async fn handle_connection(
                 if read == 0 {
                     return Ok(());
                 }
+                validate_tunnel_authority(&pairing, &client, &remote_static)?;
                 let ciphertext = wire::encode_transport(&mut noise, &internal_buf[..read])
                     .map_err(anyhow::Error::msg)?;
                 wire::write_frame(&mut remote_writer, &ciphertext).await?;
@@ -313,12 +366,27 @@ async fn handle_connection(
     }
 }
 
+fn validate_tunnel_authority(
+    pairing: &PairingService,
+    client: &PairedClient,
+    remote_static: &[u8; 32],
+) -> Result<()> {
+    pairing
+        .validate_remote_authority(
+            &client.client_id,
+            client.epoch,
+            remote_static,
+            &client.identity_fingerprint,
+        )
+        .map_err(anyhow::Error::from)
+}
+
 fn authenticate(
     request: &AuthRequest,
     remote_static: &[u8; 32],
     node_id: &str,
     pairing: &PairingService,
-    pairing_code: &Mutex<Option<String>>,
+    pairing_code: &Mutex<Option<ActivePairingCode>>,
 ) -> Result<PairedClient> {
     if request.v != VERSION {
         anyhow::bail!("unsupported remote auth version {}", request.v);
@@ -380,10 +448,17 @@ fn authenticate(
     }
 
     let mut code_guard = pairing_code.lock().unwrap_or_else(|e| e.into_inner());
-    let expected = code_guard
-        .as_deref()
+    let active = code_guard
+        .as_ref()
         .context("first-pairing code is unavailable or already used")?;
-    if blake3::hash(code.as_bytes()) != blake3::hash(expected.as_bytes()) {
+    if tokio::time::Instant::now() >= active.expires_at {
+        *code_guard = None;
+        pairing
+            .remove_remote_access_link()
+            .context("could not remove expired remote pairing link")?;
+        anyhow::bail!("first-pairing code expired");
+    }
+    if blake3::hash(code.as_bytes()) != blake3::hash(active.value.as_bytes()) {
         anyhow::bail!("pairing code did not match");
     }
 
@@ -391,6 +466,9 @@ fn authenticate(
         .create_verified_remote_pairing(name, pubkey_hex, remote_static)
         .map_err(anyhow::Error::from)?;
     *code_guard = None;
+    pairing
+        .remove_remote_access_link()
+        .context("could not remove consumed remote pairing link")?;
     Ok(client)
 }
 
@@ -399,6 +477,13 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
+    fn active_code(value: &str) -> Mutex<Option<ActivePairingCode>> {
+        Mutex::new(Some(ActivePairingCode {
+            value: value.to_string(),
+            expires_at: tokio::time::Instant::now() + PAIRING_CODE_TTL,
+        }))
+    }
 
     fn identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::generate().unwrap().1)
@@ -432,7 +517,7 @@ mod tests {
         let node = identity();
         let fingerprint = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
         let pairing = PairingService::open(dir.path(), fingerprint, false).unwrap();
-        let code = Mutex::new(Some("correct-code".to_string()));
+        let code = active_code("correct-code");
         let transport = [9u8; 32];
         let key = SigningKey::from_bytes(&[7u8; 32]);
 
@@ -538,6 +623,130 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn expired_pairing_code_is_rejected_cleared_and_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = identity();
+        let fingerprint = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
+        let pairing = PairingService::open(dir.path(), fingerprint, false).unwrap();
+        let link_path = pairing.write_remote_access_link("secret-link").unwrap();
+        let code = active_code("short-lived");
+        let transport = [0x31u8; 32];
+        let key = SigningKey::from_bytes(&[0x32u8; 32]);
+
+        tokio::time::advance(PAIRING_CODE_TTL).await;
+        let error = authenticate(
+            &request(&node, &transport, "short-lived", &key),
+            &transport,
+            &node.node_id().to_hex(),
+            &pairing,
+            &code,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("expired"));
+        assert!(code.lock().unwrap().is_none());
+        assert!(!link_path.exists());
+    }
+
+    #[test]
+    fn epoch_and_client_key_rotation_invalidate_captured_remote_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = identity();
+        let fingerprint = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
+        let pairing = PairingService::open(dir.path(), fingerprint, false).unwrap();
+        let code = active_code("rotate-code");
+        let transport = [0x41u8; 32];
+        let old_key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let paired = authenticate(
+            &request(&node, &transport, "rotate-code", &old_key),
+            &transport,
+            &node.node_id().to_hex(),
+            &pairing,
+            &code,
+        )
+        .unwrap();
+        let mut changes = pairing.subscribe_authority_changes();
+        pairing
+            .validate_remote_authority(
+                &paired.client_id,
+                paired.epoch,
+                &transport,
+                &paired.identity_fingerprint,
+            )
+            .unwrap();
+
+        pairing.bump_epoch(&paired.client_id).unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert!(pairing
+            .validate_remote_authority(
+                &paired.client_id,
+                paired.epoch,
+                &transport,
+                &paired.identity_fingerprint,
+            )
+            .is_err());
+        changes.borrow_and_update();
+
+        let new_key = SigningKey::from_bytes(&[0x43u8; 32]);
+        let new_pubkey = hex::encode(new_key.verifying_key().to_bytes());
+        let proof = format!("bitsov-pair-rotate-v1:{}:{}", paired.client_id, new_pubkey);
+        let rotated = pairing
+            .rotate_client_key(
+                &paired.client_id,
+                &new_pubkey,
+                &hex::encode(old_key.sign(proof.as_bytes()).to_bytes()),
+            )
+            .unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert!(rotated.remote_transport_pubkey.is_none());
+        assert!(
+            pairing.validate_remote_transport(&transport).is_err(),
+            "the old X25519 static must fail immediately after client-key rotation"
+        );
+    }
+
+    #[test]
+    fn later_repair_of_same_keys_does_not_revive_captured_tunnel() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = identity();
+        let fingerprint = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
+        let pairing = PairingService::open(dir.path(), fingerprint, false).unwrap();
+        let code = active_code("repair-code");
+        let transport = [0x61u8; 32];
+        let key = SigningKey::from_bytes(&[0x62u8; 32]);
+        let captured = authenticate(
+            &request(&node, &transport, "repair-code", &key),
+            &transport,
+            &node.node_id().to_hex(),
+            &pairing,
+            &code,
+        )
+        .unwrap();
+
+        pairing.revoke(&captured.client_id).unwrap();
+        let repaired = pairing
+            .create_verified_remote_pairing("remote test", &captured.client_pubkey, &transport)
+            .unwrap();
+        assert!(repaired.epoch > captured.epoch);
+        assert!(pairing
+            .validate_remote_authority(
+                &captured.client_id,
+                captured.epoch,
+                &transport,
+                &captured.identity_fingerprint,
+            )
+            .is_err());
+        pairing
+            .validate_remote_authority(
+                &repaired.client_id,
+                repaired.epoch,
+                &transport,
+                &repaired.identity_fingerprint,
+            )
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn pairing_link_signature_and_noise_tunnel_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -558,20 +767,45 @@ mod tests {
             }
             assert!(request.starts_with(b"GET /safe HTTP/1.1\r\n"));
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nsafe")
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nsafe")
                 .await
                 .unwrap();
+            let mut unexpected = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut unexpected))
+                .await
+                .expect("revoked tunnel should promptly close its internal connection")
+                .unwrap();
+            assert_eq!(read, 0, "request bytes were forwarded after revocation");
         });
 
         let config = RemoteAccessConfig {
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
             advertised_endpoint: Some("node.example:18443".into()),
         };
-        let server = RemoteAccessServer::bind(&config, Arc::clone(&node), pairing, internal_addr)
-            .await
-            .unwrap();
+        let server = RemoteAccessServer::bind(
+            &config,
+            Arc::clone(&node),
+            Arc::clone(&pairing),
+            internal_addr,
+        )
+        .await
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
-        let link = PairLink::from_uri(server.pair_link().unwrap()).unwrap();
+        let pair_link_path = server.pair_link_path().unwrap().to_path_buf();
+        let pair_link_uri = std::fs::read_to_string(&pair_link_path).unwrap();
+        let link = PairLink::from_uri(&pair_link_uri).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&pair_link_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         let proof = wire::transport_proof_message(&link.node_id, &link.transport_pubkey);
         let signature = ed25519_dalek::Signature::from_slice(
             &URL_SAFE_NO_PAD.decode(&link.transport_signature).unwrap(),
@@ -613,10 +847,14 @@ mod tests {
             .unwrap();
         let plaintext =
             wire::decode_transport(&mut noise, &ciphertext, wire::MAX_AUTH_PLAINTEXT).unwrap();
-        assert!(matches!(
-            serde_json::from_slice::<AuthResponse>(&plaintext).unwrap(),
-            AuthResponse::Ok { .. }
-        ));
+        let client_id = match serde_json::from_slice::<AuthResponse>(&plaintext).unwrap() {
+            AuthResponse::Ok { client_id, .. } => client_id,
+            response => panic!("unexpected auth response: {response:?}"),
+        };
+        assert!(
+            !pair_link_path.exists(),
+            "successful pairing must consume the protected link"
+        );
 
         let ciphertext =
             wire::encode_transport(&mut noise, b"GET /safe HTTP/1.1\r\nhost: node\r\n\r\n")
@@ -629,8 +867,23 @@ mod tests {
             wire::decode_transport(&mut noise, &ciphertext, wire::MAX_TUNNEL_PLAINTEXT).unwrap();
         assert!(response.ends_with(b"\r\n\r\nsafe"));
 
+        pairing.revoke(&client_id).unwrap();
+        let ciphertext = wire::encode_transport(
+            &mut noise,
+            b"GET /must-not-forward HTTP/1.1\r\nhost: node\r\n\r\n",
+        )
+        .unwrap();
+        wire::write_frame(&mut writer, &ciphertext).await.unwrap();
+        let closed = tokio::time::timeout(
+            Duration::from_secs(2),
+            wire::read_frame(&mut reader, wire::MAX_TRANSPORT_FRAME),
+        )
+        .await
+        .expect("revoked tunnel should close promptly");
+        assert!(closed.is_err(), "revoked tunnel returned another response");
+
+        internal_task.await.unwrap();
         shutdown_tx.send(true).unwrap();
         server_task.await.unwrap();
-        internal_task.await.unwrap();
     }
 }

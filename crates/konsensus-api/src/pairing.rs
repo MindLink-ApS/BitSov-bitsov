@@ -23,12 +23,10 @@
 //! load-bearing control is **read access to the data directory** — nothing
 //! secret ever travels over HTTP.
 //!
-//! The short code printed to the node's stdout is a **tripwire**, not the
-//! control (policy lock C). It is deliberately absent from every HTTP response:
-//! an app that can read the challenge file derives the same code locally, while
-//! a loopback-only caller must not be handed the thing the owner compares
-//! against. If anyone later describes the code comparison as *preventing* a
-//! pairing, that is an overclaim.
+//! The short code is never printed or logged. An app that can read the
+//! protected challenge file derives it locally; stdout contains only a safe
+//! instruction naming that file. The code remains a cross-check rather than
+//! the access control itself.
 //!
 //! # Elevation is not an HTTP capability
 //!
@@ -608,14 +606,15 @@ pub struct PairingService {
     file_path: PathBuf,
     inner: Mutex<Inner>,
     grant_changes: tokio::sync::Notify,
+    authority_changes: tokio::sync::watch::Sender<u64>,
     /// Whether the owner control socket exists in this deployment. When false,
     /// every grant-writing and approval-consuming call refuses outright
     /// (`OwnerChannelUnavailable`) — there is no debug flag, config switch or
     /// trusted-client list that widens this.
     owner_control_enabled: bool,
-    /// Whether the short code is echoed to stdout. Off in tests so a test run
-    /// does not scribble on the harness's output.
-    print_short_code: bool,
+    /// Whether a safe protected-file instruction is written to stdout. The
+    /// code/challenge itself is never printed.
+    print_pairing_instruction: bool,
     owner_console: Mutex<Box<dyn std::io::Write + Send>>,
     /// Absolute config path of an owner-run node, for the owner command.
     owner_config: Option<PathBuf>,
@@ -826,6 +825,7 @@ impl PairingService {
             Err(e) => return Err(e.into()),
         }
 
+        let (authority_changes, _) = tokio::sync::watch::channel(0);
         let service = Self {
             dir,
             file_path,
@@ -841,8 +841,9 @@ impl PairingService {
                 first_contact: HashMap::new(),
             }),
             grant_changes: tokio::sync::Notify::new(),
+            authority_changes,
             owner_control_enabled,
-            print_short_code: true,
+            print_pairing_instruction: true,
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
             owner_config: None,
             owner_approval_key: None,
@@ -1074,9 +1075,9 @@ impl PairingService {
         }
     }
 
-    /// Test/bootstrap helper: suppress the stdout tripwire print.
+    /// Test/bootstrap helper: suppress the safe stdout pairing instruction.
     pub fn without_stdout_code(mut self) -> Self {
-        self.print_short_code = false;
+        self.print_pairing_instruction = false;
         self
     }
 
@@ -1122,6 +1123,39 @@ impl PairingService {
     /// The identity this service currently binds pairings to.
     pub fn bound_fingerprint(&self) -> String {
         self.lock().identity_fingerprint.clone()
+    }
+
+    /// Subscribe to pairing-authority changes that can invalidate a live
+    /// remote-access tunnel. Receivers must revalidate their exact captured
+    /// authority after every notification.
+    pub fn subscribe_authority_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.authority_changes.subscribe()
+    }
+
+    fn notify_authority_change(&self) {
+        self.authority_changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// Store the one-shot remote pairing link under the protected pairing
+    /// directory. The link is intentionally never returned by an HTTP route or
+    /// written to stdout/journald.
+    pub fn write_remote_access_link(&self, link: &str) -> Result<PathBuf, PairingError> {
+        let path = self.dir.join("remote-access-link");
+        write_protected(&path, link.as_bytes())?;
+        fsync_dir(&self.dir)?;
+        Ok(path)
+    }
+
+    /// Remove any live or stale remote pairing link.
+    pub fn remove_remote_access_link(&self) -> Result<(), PairingError> {
+        let path = self.dir.join("remote-access-link");
+        match std::fs::remove_file(path) {
+            Ok(()) => fsync_dir(&self.dir)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1229,12 +1263,14 @@ impl PairingService {
         write_protected(&self.challenge_path(&pair_id), &challenge)?;
 
         let code = short_code(&challenge);
-        if self.print_short_code {
-            // The node's OWN stdout. In the sidecar deployment the app can read
-            // this by construction, which is why it is a cross-check and not
-            // the control (policy lock C).
-            println!("bitsov pairing code for \"{}\": {}", pair_id, code);
-            tracing::info!(pair_id = %pair_id, "pairing requested — short code printed to stdout");
+        if self.print_pairing_instruction {
+            println!(
+                "Pairing request {} is available at protected file {} (expires at {}).",
+                pair_id,
+                self.challenge_path(&pair_id).display(),
+                expires_at_unix
+            );
+            tracing::info!(pair_id = %pair_id, "pairing requested; protected challenge file written");
         }
 
         Ok(PairingRequestOutcome {
@@ -1329,6 +1365,7 @@ impl PairingService {
         inner.file.clients.retain(|c| c.client_id != client_id);
         inner.file.clients.push(record.clone());
         self.persist(&mut inner.file)?;
+        self.notify_authority_change();
         Ok(record)
     }
 
@@ -1386,6 +1423,7 @@ impl PairingService {
                 inner.file = previous;
                 return Err(error);
             }
+            self.notify_authority_change();
             return Ok(record);
         }
         let previous = inner.file.clone();
@@ -1410,6 +1448,7 @@ impl PairingService {
             inner.file = previous;
             return Err(error);
         }
+        self.notify_authority_change();
         Ok(record)
     }
 
@@ -1433,6 +1472,36 @@ impl PairingService {
             ));
         }
         Ok(record)
+    }
+
+    /// Revalidate the exact authority captured when a remote tunnel
+    /// authenticated. Matching only the transport key is insufficient: an old
+    /// tunnel must not become valid again after revocation and re-pairing.
+    pub fn validate_remote_authority(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        remote_transport_pubkey: &[u8; 32],
+        identity_fingerprint: &str,
+    ) -> Result<(), PairingError> {
+        let remote_hex = hex::encode(remote_transport_pubkey);
+        let inner = self.lock();
+        let record = inner
+            .file
+            .clients
+            .iter()
+            .find(|client| client.client_id == client_id)
+            .ok_or(PairingError::UnknownClient)?;
+        if record.epoch != epoch
+            || record.remote_transport_pubkey.as_deref() != Some(remote_hex.as_str())
+            || record.identity_fingerprint != identity_fingerprint
+            || inner.identity_fingerprint != identity_fingerprint
+        {
+            return Err(PairingError::PairingInvalid(
+                "remote tunnel authority changed".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Issue a token-issuance challenge for a paired client.
@@ -1729,6 +1798,7 @@ impl PairingService {
         // `spend` waiting for the next pairing of the same key.
         inner.file.revoke_grants(Some(client_id));
         self.persist(&mut inner.file)?;
+        self.notify_authority_change();
         Ok(epoch)
     }
 
@@ -1770,6 +1840,7 @@ impl PairingService {
         let keys: Vec<String> = inner.file.device_keys.iter().map(|k| k.key_id.clone()).collect();
         inner.file.registered_ops.retain(|_, k| keys.contains(k));
         self.persist(&mut inner.file)?;
+        self.notify_authority_change();
         Ok(())
     }
 
@@ -1822,6 +1893,9 @@ impl PairingService {
         let rotated = PairedClient {
             client_id: new_id.clone(),
             client_pubkey: new_pubkey_hex.to_ascii_lowercase(),
+            // Rotating the Ed25519 pairing identity does not authenticate a
+            // replacement Noise static. Retire the old transport binding.
+            remote_transport_pubkey: None,
             // The epoch advances on rotation: tokens minted for the old key
             // must stop working the moment the key they prove is retired.
             epoch: rotated_epoch,
@@ -1849,6 +1923,7 @@ impl PairingService {
         // specific client id and epoch by a deliberate owner action.
         inner.file.revoke_grants(Some(client_id));
         self.persist(&mut inner.file)?;
+        self.notify_authority_change();
         Ok(rotated)
     }
 
@@ -1878,6 +1953,7 @@ impl PairingService {
         inner.file.registered_ops.clear();
         inner.owner_confirmations.clear();
         self.persist(&mut inner.file)?;
+        self.notify_authority_change();
         Ok(())
     }
 

@@ -24,10 +24,18 @@ whatever credential the app can read. No design at this tier stops it. Closing
 that gap needs an OS keychain with a per-application ACL, or hardware-backed
 keys — later tiers, deliberately out of scope here.
 
-The short code printed to the node's stdout is a **tripwire**, not the control.
-In the sidecar deployment the app launches the node and owns its stdout, so it
-can read that code by construction. If anyone describes the code comparison as
-*preventing* a pairing, that is an overclaim.
+Pairing codes and full remote pairing links are never written to stdout or
+tracing, where launchd/systemd journals could retain them. Local pairing writes
+its challenge to a protected `0600` file and prints only that path and expiry.
+Remote access writes the complete one-shot `bitsov://pair/...` link to
+`<data_dir>/pairing/remote-access-link` at mode `0600`; stdout prints only the
+protected path and expiry. The app reads that file and pastes the link. The
+remote link expires after five minutes and is removed on successful pairing,
+expiry, or clean shutdown.
+
+The code is a cross-check, not the control. A sidecar app owns the data
+directory and can read it by construction; describing code comparison as
+*preventing* such an app from pairing would be an overclaim.
 
 ## Scopes
 

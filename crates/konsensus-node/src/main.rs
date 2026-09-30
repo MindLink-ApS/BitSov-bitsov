@@ -1151,14 +1151,26 @@ async fn cmd_start(
             )
             .await?;
             let public_addr = server.local_addr()?;
-            if let Some(link) = server.pair_link() {
-                // The one-time code goes only to stdout, never tracing.
-                println!("{link}");
+            if let Some(path) = server.pair_link_path() {
+                let expires_secs = server
+                    .pairing_expires_in()
+                    .map_or(0, |duration| duration.as_secs());
+                println!(
+                    "Remote pairing is available once at protected file {} (expires in {} seconds).",
+                    path.display(),
+                    expires_secs
+                );
             }
             info!(%public_addr, "remote access Noise listener started");
 
-            let remote_router = konsensus_api::build_remote_router(Arc::clone(&api_state))
-                .into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let remote_limiter = Arc::new(konsensus_api::RateLimiter::new(
+                config.api.rate_limit_rps,
+            ));
+            let remote_router = konsensus_api::build_remote_router_with_limiter(
+                Arc::clone(&api_state),
+                remote_limiter,
+            )
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
             let mut internal_shutdown = node.shutdown_rx();
             let internal_handle = tokio::spawn(async move {
                 if let Err(error) = axum::serve(internal_listener, remote_router)
