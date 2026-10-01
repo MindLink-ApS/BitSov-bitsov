@@ -154,6 +154,19 @@ pub trait Storage: Send + Sync {
         before_timestamp: Option<u64>,
     ) -> Result<Vec<UkmEnvelope>, StorageError>;
 
+    /// Messages of `kind` between this node and any node, sent or received
+    /// (node recipients only), newest first. A room thread is built from these:
+    /// its members are only known from the room binding inside each plaintext.
+    async fn get_node_messages_of_kind(
+        &self,
+        _my_node_id: &str,
+        _kind: u16,
+        _limit: u32,
+        _before_timestamp: Option<u64>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
+        Err(StorageError::Unsupported("node messages of kind".into()))
+    }
+
     /// Delete a message by ID. Returns true if a row was deleted.
     async fn delete_message(&self, id: &MessageId) -> Result<bool, StorageError>;
 

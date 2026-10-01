@@ -227,6 +227,25 @@ impl Storage for MemStorage {
         Ok(result)
     }
 
+    async fn get_node_messages_of_kind(
+        &self,
+        my_node_id: &str,
+        kind: u16,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
+        let before = before_timestamp.unwrap_or(u64::MAX);
+        let mut result: Vec<_> = self.messages.lock().unwrap().values()
+            .filter(|env| env.kind == kind && env.timestamp < before)
+            .filter(|env| matches!(&env.recipient, Recipient::Node(n) if n.to_hex() == my_node_id) || env.sender.to_hex() == my_node_id)
+            .filter(|env| matches!(env.recipient, Recipient::Node(_)))
+            .cloned()
+            .collect();
+        result.sort_by_key(|env| std::cmp::Reverse(env.timestamp));
+        result.truncate(limit as usize);
+        Ok(result)
+    }
+
     async fn delete_message(&self, id: &MessageId) -> Result<bool, StorageError> {
         Ok(self.messages.lock().unwrap().remove(&id.to_hex()).is_some())
     }
@@ -1252,6 +1271,9 @@ pub struct ConnectedStubTransport {
     pub since: Option<std::time::Instant>,
     /// Every raw control frame sent (e.g. `PriceQuery`), in order.
     pub raw_frames: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Capabilities each connected peer advertised (as `peer_info` renders
+    /// them); a peer without an entry reports no peer info.
+    pub peer_capabilities: std::sync::Mutex<HashMap<NodeId, Vec<String>>>,
 }
 
 impl ConnectedStubTransport {
@@ -1266,7 +1288,13 @@ impl ConnectedStubTransport {
             invoice_requests,
             since: Some(std::time::Instant::now()),
             raw_frames: std::sync::Mutex::new(Vec::new()),
+            peer_capabilities: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `peer` advertised `capabilities` in its Hello (e.g. `Custom("room_binding_v1")`).
+    pub fn advertise(&self, peer: NodeId, capabilities: &[&str]) {
+        self.peer_capabilities.lock().unwrap().insert(peer, capabilities.iter().map(|c| c.to_string()).collect());
     }
 
     pub fn with_invoice_responder(
@@ -1312,6 +1340,14 @@ impl MessageTransport for ConnectedStubTransport {
 
     async fn connected_since(&self, peer: &NodeId) -> Option<std::time::Instant> {
         self.since.filter(|_| self.connected.lock().unwrap().contains(peer))
+    }
+
+    async fn peer_info(&self, peer: &NodeId) -> Option<konsensus_core::traits::ConnectedPeerInfo> {
+        if !self.connected.lock().unwrap().contains(peer) {
+            return None;
+        }
+        let capabilities = self.peer_capabilities.lock().unwrap().get(peer)?.clone();
+        Some(konsensus_core::traits::ConnectedPeerInfo { tier: "T1".into(), capabilities })
     }
 
     async fn connected_peers(&self) -> Vec<NodeId> {
