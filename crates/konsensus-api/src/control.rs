@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::pairing::{
     grant_confirmation_phrase, replacement_confirmation_phrase, write_protected, PairingError,
@@ -59,7 +60,7 @@ use crate::spend_budget::{self, GrantTerms, GrantView};
 pub const SOCKET_FILE: &str = "control.sock";
 
 /// A request from the owner CLI.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlRequest {
     /// List pairings, pending elevations and pending approvals.
@@ -151,7 +152,7 @@ pub enum ControlRequest {
         /// The phrase the owner typed. Must name `op_id`.
         confirmation: String,
         /// The recovery phrase of the destination identity.
-        mnemonic: String,
+        mnemonic: Zeroizing<String>,
     },
     /// Revoke a pairing (delete it, or bump its epoch).
     Revoke {
@@ -995,6 +996,89 @@ async fn serve_connection(
     Ok(())
 }
 
+// Keep wire encoding at the transport boundary: the secret-bearing request
+// deliberately does not implement Serialize, Debug, or Clone.
+#[cfg(unix)]
+fn encode_request(req: &ControlRequest) -> Result<Zeroizing<Vec<u8>>, serde_json::Error> {
+    use serde::ser::{SerializeMap, Serializer};
+
+    let mut bytes = Zeroizing::new(Vec::new());
+    let mut serializer = serde_json::Serializer::new(&mut *bytes);
+    let mut map = serializer.serialize_map(None)?;
+    macro_rules! fields {
+        ($op:literal $(, $field:ident)* $(,)?) => {{
+            map.serialize_entry("op", $op)?;
+            $(map.serialize_entry(stringify!($field), $field)?;)*
+        }};
+    }
+    match req {
+        ControlRequest::Status => fields!("status"),
+        ControlRequest::Describe { op_id } => fields!("describe", op_id),
+        ControlRequest::Grant {
+            op_id,
+            confirmation,
+            terms,
+        } => fields!("grant", op_id, confirmation, terms),
+        ControlRequest::GrantFrontDoor {
+            op_id,
+            confirmation,
+            ttl_secs,
+        } => fields!("grant-front-door", op_id, confirmation, ttl_secs),
+        ControlRequest::ApproveFirstContact {
+            client_id,
+            grant_op_id,
+            recipient,
+            max_total_msat,
+            contact_budget_msat,
+        } => fields!(
+            "approve-first-contact",
+            client_id,
+            grant_op_id,
+            recipient,
+            max_total_msat,
+            contact_budget_msat
+        ),
+        ControlRequest::ApproveGift {
+            intro_id,
+            newcomer,
+            payment_hash,
+            gift_msat,
+            fee_max_msat,
+            code,
+        } => fields!(
+            "approve-gift",
+            intro_id,
+            newcomer,
+            payment_hash,
+            gift_msat,
+            fee_max_msat,
+            code
+        ),
+        ControlRequest::ApproveDeviceKey {
+            op_id,
+            confirmation,
+            owner_signature,
+        } => fields!("approve-device-key", op_id, confirmation, owner_signature),
+        ControlRequest::RevokeDeviceKey { key_id } => fields!("revoke-device-key", key_id),
+        ControlRequest::RevokeGrant { client_id } => fields!("revoke-grant", client_id),
+        ControlRequest::ApproveReplacement {
+            op_id,
+            confirmation,
+            mnemonic,
+        } => {
+            fields!("approve-replacement", op_id, confirmation);
+            map.serialize_entry("mnemonic", mnemonic.as_str())?;
+        }
+        ControlRequest::Revoke {
+            client_id,
+            keep_pairing,
+        } => fields!("revoke", client_id, keep_pairing),
+        ControlRequest::OpenWindow { seconds } => fields!("open-window", seconds),
+    }
+    map.end()?;
+    Ok(bytes)
+}
+
 /// Send one request to a node's control socket and read the reply.
 ///
 /// Used by the owner CLI. Connecting requires the ability to open a `0600`
@@ -1005,7 +1089,7 @@ pub async fn send(socket: &Path, req: &ControlRequest) -> std::io::Result<Contro
 
     let stream = tokio::net::UnixStream::connect(socket).await?;
     let (read_half, mut write_half) = stream.into_split();
-    let mut bytes = serde_json::to_vec(req)
+    let mut bytes = encode_request(req)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     bytes.push(b'\n');
     write_half.write_all(&bytes).await?;
@@ -1049,5 +1133,37 @@ async fn handle_local(
                 paid.intro_id, paid.state, paid.paid_msat, paid.fee_paid_msat, paid.payment_hash),
         },
         Err(e) => ControlResponse::Error { message: e.to_string() },
+    }
+}
+
+#[cfg(all(test, unix))]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn transport_encoding_preserves_all_request_variants() {
+        let fixtures = [
+            r#"{"op":"status"}"#,
+            r#"{"op":"describe","op_id":"test"}"#,
+            r#"{"op":"grant","op_id":"test","confirmation":"yes","terms":{"allow_liquidity_fees":false,"budget_msat":1000,"per_call_max_msat":100,"per_recipient_msat":{},"ttl_secs":60}}"#,
+            r#"{"op":"grant-front-door","op_id":"test","confirmation":"yes","ttl_secs":60}"#,
+            r#"{"op":"approve-first-contact","client_id":"client","grant_op_id":"grant","recipient":"recipient","max_total_msat":100,"contact_budget_msat":null}"#,
+            r#"{"op":"approve-gift","intro_id":"intro","newcomer":"node","payment_hash":"hash","gift_msat":100,"fee_max_msat":1,"code":"123456"}"#,
+            r#"{"op":"approve-device-key","op_id":"test","confirmation":"yes","owner_signature":"sig"}"#,
+            r#"{"op":"revoke-device-key","key_id":"key"}"#,
+            r#"{"op":"revoke-grant","client_id":null}"#,
+            r#"{"op":"approve-replacement","op_id":"test","confirmation":"yes","mnemonic":"abandon \" \\ \n about"}"#,
+            r#"{"op":"revoke","client_id":"client","keep_pairing":false}"#,
+            r#"{"op":"open-window","seconds":60}"#,
+        ];
+        for fixture in fixtures {
+            let request: ControlRequest = serde_json::from_str(fixture).unwrap();
+            let bytes: Zeroizing<Vec<u8>> = encode_request(&request).unwrap();
+            let round_trip: ControlRequest = serde_json::from_slice(&bytes).unwrap();
+            assert!(request == round_trip);
+            let expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 }

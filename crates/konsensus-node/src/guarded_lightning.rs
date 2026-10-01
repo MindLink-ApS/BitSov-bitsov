@@ -7,6 +7,10 @@ use konsensus_core::traits as super_traits;
 use konsensus_core::traits::lightning::*;
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "tests/balance_breakdown.rs"]
+mod tests;
+
 pub struct GuardedLightning {
     pub inner: Arc<dyn LightningProvider>,
     pub disk: Arc<DiskGuard>,
@@ -128,6 +132,10 @@ impl LightningProvider for GuardedLightning {
     }
     async fn get_balance_msat(&self) -> Result<u64, LightningError> {
         self.inner.get_balance_msat().await
+    }
+    async fn get_balance_breakdown(&self) -> Result<WalletBalanceBreakdown, LightningError> {
+        // Wallet observations remain available when disk admission blocks new work.
+        self.inner.get_balance_breakdown().await
     }
     async fn list_payments(&self, limit: u32) -> Result<Vec<PaymentDetails>, LightningError> {
         self.inner.list_payments(limit).await

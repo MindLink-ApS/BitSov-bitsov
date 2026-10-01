@@ -651,7 +651,7 @@ async fn http_restore_after_owner_approval_has_no_effect() {
             op_id: op_id.clone(),
             confirmation: console
                 .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
-            mnemonic: REPLACEMENT_MNEMONIC.into(),
+            mnemonic: zeroize::Zeroizing::new(REPLACEMENT_MNEMONIC.to_string()),
         },
     );
     assert!(

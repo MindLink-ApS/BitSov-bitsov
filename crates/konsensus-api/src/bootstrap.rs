@@ -45,6 +45,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use zeroize::Zeroizing;
+
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, Scope};
@@ -858,11 +860,11 @@ async fn pair_token(
 }
 
 /// First-run restore/create body.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirstRunRestoreBody {
     /// BIP-39 recovery phrase (12 or 24 words).
-    pub mnemonic: String,
+    pub mnemonic: Zeroizing<String>,
 }
 
 /// Terminal response from a first-run create or restore.

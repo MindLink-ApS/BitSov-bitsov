@@ -75,6 +75,37 @@ pub struct Invoice {
     pub created_at: u64,
 }
 
+/// Known wallet categories in satoshis; `None` means unknown, not zero.
+///
+/// These are estimates from the provider's last sync, not an additive accounting
+/// partition: pending sweeps may already overlap the on-chain wallet balance.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletBalanceBreakdown {
+    /// Spendable on-chain funds, after confirmation requirements and anchor reserve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onchain_spendable_sats: Option<u64>,
+    /// Total on-chain wallet funds, including unconfirmed funds and anchor reserve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onchain_total_sats: Option<u64>,
+    /// On-chain funds reserved for anchor-channel closure fees; part of onchain_total_sats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_reserve_sats: Option<u64>,
+    /// Usable channels' aggregate outbound capacity, rounded down to sats.
+    /// Excludes channel reserves and pending HTLCs; not a guaranteed routable payment
+    /// amount (route fees, per-HTLC limits, and remote liquidity still apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lightning_spendable_sats: Option<u64>,
+    /// Known closure claims awaiting confirmation/timelocks, plus all pending sweeps.
+    /// Sweep amounts are before sweep fees and may overlap on-chain wallet funds,
+    /// including spendable funds while LDK retains confirmed sweeps for reorg safety.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing_sats: Option<u64>,
+    /// Contentious, conditional HTLC, and revoked-counterparty-output claims.
+    /// These are potential claims, not guaranteed funds or spendable liquidity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contested_sats: Option<u64>,
+}
+
 /// Information about a Lightning channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInfo {
@@ -418,6 +449,12 @@ pub trait LightningProvider: Send + Sync {
 
     /// Get the node's Lightning balance in millisatoshis.
     async fn get_balance_msat(&self) -> Result<u64, LightningError>;
+
+    /// Read known wallet categories without moving funds. Providers that cannot
+    /// determine a category leave it `None`; errors must not become zero balances.
+    async fn get_balance_breakdown(&self) -> Result<WalletBalanceBreakdown, LightningError> {
+        Ok(WalletBalanceBreakdown::default())
+    }
 
     /// List recent payments (both incoming and outgoing).
     ///

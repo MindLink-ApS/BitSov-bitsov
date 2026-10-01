@@ -45,7 +45,8 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use konsensus_core::traits::lightning::{
-    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentStatus, WalletSync,
+    Invoice, LightningError, LightningProvider, PaymentDetails, PaymentStatus, WalletBalanceBreakdown,
+    WalletSync,
 };
 
 /// Tunables for [`CircuitBreakerLightning`]. Conservative defaults; an operator
@@ -356,6 +357,10 @@ impl LightningProvider for CircuitBreakerLightning {
 
     async fn get_balance_msat(&self) -> Result<u64, LightningError> {
         self.inner.get_balance_msat().await
+    }
+
+    async fn get_balance_breakdown(&self) -> Result<WalletBalanceBreakdown, LightningError> {
+        self.inner.get_balance_breakdown().await
     }
 
     async fn is_available(&self) -> bool {

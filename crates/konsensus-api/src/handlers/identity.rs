@@ -30,7 +30,7 @@ pub struct IdentityResponse {
 #[serde(deny_unknown_fields)]
 pub struct VerifyMnemonicRequest {
     /// BIP-39 mnemonic phrase (12 or 24 words, space-separated).
-    pub mnemonic: String,
+    pub mnemonic: Zeroizing<String>,
     /// Optional BIP-39 passphrase; scrubbed when the request is dropped.
     /// Required when the running node uses a non-empty passphrase.
     pub passphrase: Option<Zeroizing<String>>,

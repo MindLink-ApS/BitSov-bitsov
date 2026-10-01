@@ -19,6 +19,7 @@ mod profile_handler;
 mod relay;
 mod remote_access;
 mod session_handler;
+mod peer_exchange;
 mod stun;
 mod admission_quotes;
 mod invoice_refusals;
@@ -1345,6 +1346,9 @@ async fn cmd_start(
 
     // Session/control event handler — E2EE negotiation, pricing, invoices, peer exchange, gossip
     let session_handle = tokio::spawn(session_handler::run(session_handler::SessionHandlerDeps {
+        min_admission_cost_msat: node.gate().min_admission_cost_msat(),
+        privacy: config.privacy.clone(),
+        peer_exchange_floor: config.payment_gate.min_admission_cost_msat.unwrap_or(0),
         transport: Arc::clone(node.transport()),
         session_manager: Arc::clone(&api_state.session_manager),
         storage: Arc::clone(node.storage()),

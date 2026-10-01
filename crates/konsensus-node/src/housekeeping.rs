@@ -382,7 +382,7 @@ pub(crate) async fn run_price_refresh(
                         valid_blocks: meta.valid_blocks,
                         trust_discount: peer_discount,
                     };
-                    if let Err(e) = crate::delivery_prices::send_price_frame(&transport, storage.as_ref(), peer_id, &frame, pricing.as_ref()).await {
+                    if let Err(e) = crate::delivery_prices::send_price_frame(&transport, storage.as_ref(), peer_id, &frame, pricing.as_ref(), config.payment_gate_runtime_config().min_admission_cost_msat).await {
                         warn!(peer = %peer_id, error = %e, "failed to send updated price table");
                     }
                 }

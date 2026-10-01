@@ -41,7 +41,7 @@ use crate::scb_rotate::{rotate_scb_backup, ScbRotationConfig};
 use konsensus_core::fee_rate::validate_fee_rate_sat_per_vb;
 use konsensus_core::traits::lightning::{
     ChannelInfo, InboundPayment, Invoice, LightningError, LightningProvider, PaymentDetails,
-    PaymentDirection, PaymentStatus, WalletSync,
+    PaymentDirection, PaymentStatus, WalletBalanceBreakdown, WalletSync,
 };
 
 /// Configuration for the embedded LDK Lightning provider.
@@ -1155,11 +1155,23 @@ impl LightningProvider for LdkProvider {
     #[instrument(skip(self))]
     async fn get_balance_msat(&self) -> Result<u64, LightningError> {
         let balances = self.node.list_balances();
-        // Return Lightning balance (spendable across channels) in msat
+        // Legacy aggregate: claimable Lightning plus spendable on-chain, not
+        // spendable Lightning capacity. Preserve its value for existing clients.
         let lightning_msat = balances.total_lightning_balance_sats * 1000;
         let onchain_msat = balances.spendable_onchain_balance_sats * 1000;
 
         Ok(lightning_msat + onchain_msat)
+    }
+
+    async fn get_balance_breakdown(&self) -> Result<WalletBalanceBreakdown, LightningError> {
+        let balances = self.node.list_balances();
+        let channels = self.node.list_channels();
+        Ok(crate::balance::breakdown(
+            &balances,
+            channels
+                .iter()
+                .map(|ch| (ch.channel_id, ch.is_usable, ch.outbound_capacity_msat)),
+        ))
     }
 
     #[instrument(skip(self), fields(limit))]

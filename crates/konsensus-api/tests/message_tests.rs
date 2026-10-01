@@ -1132,7 +1132,7 @@ async fn content_manifest_with_pages() {
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(!json["pages"].as_array().unwrap().is_empty());
-    assert_eq!(json["default_price_msat"], 50);
+    assert_eq!(json["default_price_msat"], 1000);
     assert_eq!(json["block_height"], 850_000);
 }
 
@@ -1195,7 +1195,7 @@ async fn content_manifest_disabled_returns_empty() {
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["pages"].as_array().unwrap().is_empty());
-    assert_eq!(json["default_price_msat"], 0);
+    assert_eq!(json["default_price_msat"], 1000);
     assert_eq!(json["block_height"], 850_000);
 }
 
