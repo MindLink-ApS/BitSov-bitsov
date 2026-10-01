@@ -20,6 +20,10 @@ pub struct GuardedLightning {
 
 #[async_trait]
 impl LightningProvider for GuardedLightning {
+    fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
+        self.inner.chain_sync_status()
+    }
+
     fn disk_status(&self) -> Option<DiskStatus> {
         Some(self.disk.refresh())
     }

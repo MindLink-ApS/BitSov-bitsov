@@ -46,7 +46,9 @@ impl Fixture {
             )
             .fallback(move || {
                 background.fetch_add(1, Ordering::SeqCst);
-                async { StatusCode::NOT_FOUND }
+                // Nonempty body models a transport failure. An empty HTTP body is
+                // invalid data to LDK and selects its five-minute persistent retry.
+                async { (StatusCode::NOT_FOUND, "unavailable") }
             })
             .with_state(Arc::clone(&requests));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -381,6 +383,16 @@ async fn offline_boot_recovers_after_sync_without_duplicate_ldk_tasks() {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !provider.money_ready().await { tokio::time::sleep(Duration::from_millis(50)).await; }
     }).await.unwrap();
+    // A failed attempt after fresh successful syncs is diagnostic only. The
+    // original timestamp/baseline readiness predicate still admits invoices.
+    chain_live.store(false, Ordering::SeqCst);
+    let backend = started.lock().unwrap()[0].clone();
+    let sync_backend = backend.clone();
+    assert!(tokio::task::spawn_blocking(move || sync_backend.node().sync_wallets())
+        .await.unwrap().is_err());
+    assert!(backend.chain_sync_status().is_some());
+    assert!(backend.money_ready().await, "fresh prior syncs still satisfy readiness");
+    assert!(provider.money_ready().await);
     let invoice = provider.create_invoice(1000, "recovered", 60).await.unwrap();
     assert!(!invoice.bolt11.is_empty());
     for _ in 0..100 { assert!(provider.readiness().await.money_ready); }
@@ -397,4 +409,68 @@ async fn offline_boot_recovers_after_sync_without_duplicate_ldk_tasks() {
     assert!(!provider.money_ready().await);
     provider.shutdown().await.unwrap();
     server.abort();
+}
+
+#[path = "support/outbound_guard.rs"]
+mod outbound_guard;
+
+/// Every outbound DNS/connect attempt is guarded, including the vendored
+/// default Esplora host and destinations absent from this configuration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bitcoind_sync_failure_is_visible_and_never_contacts_esplora_or_fallback() {
+    let Ok(core_url) = std::env::var("BITSOV_GUARD_CORE") else {
+        let core = Fixture::new(0, false).await; // RPC POST returns 404.
+        let primary = Fixture::new(0, false).await;
+        let fallback = Fixture::new(0, false).await;
+        let guard_dir = tempfile::tempdir().unwrap();
+        outbound_guard::run(
+            "bitcoind_sync_failure_is_visible_and_never_contacts_esplora_or_fallback",
+            guard_dir.path(), &core.url, &primary.url, &fallback.url,
+        ).await;
+        assert!(core.background_requests.load(Ordering::SeqCst) > 1);
+        for explorer in [&primary, &fallback] {
+            assert_eq!(explorer.requests.load(Ordering::SeqCst), 0);
+            assert_eq!(explorer.background_requests.load(Ordering::SeqCst), 0);
+        }
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cookie = dir.path().join("cookie");
+    std::fs::write(&cookie, "user:NO_FALLBACK_SECRET").unwrap();
+    let mut cfg = config(&dir, &std::env::var("BITSOV_GUARD_PRIMARY").unwrap());
+    cfg.network = "regtest".into();
+    cfg.esplora_url_fallback = Some(std::env::var("BITSOV_GUARD_FALLBACK").unwrap());
+    cfg.bitcoind = Some(serde_json::from_value(serde_json::json!({
+        "rpc_host": "127.0.0.1",
+        "rpc_port": core_url.rsplit(':').next().unwrap().parse::<u16>().unwrap(),
+        "cookie_file": cookie,
+    })).unwrap());
+    // Regtest permits unavailable fee estimates, allowing the real background
+    // listener sync to start and fail against this disposable RPC fixture.
+    let provider = tokio::time::timeout(Duration::from_secs(20), LdkProvider::new(cfg))
+        .await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while provider.chain_sync_status().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(provider.node().status().is_running);
+    assert!(!provider.money_ready().await);
+    let failure = provider.chain_sync_status().unwrap();
+    let json = serde_json::to_value(failure).unwrap();
+    assert_eq!(json["state"], "stalled");
+    assert_eq!(json["last_error_kind"], "sync_failed");
+    assert!(json["since"].as_u64().unwrap() > 0);
+    assert!(!json.to_string().contains("NO_FALLBACK_SECRET"));
+    // Observe a new RPC attempt after the stalled diagnostic, not just startup
+    // traffic. The guard records connections from all LDK background threads.
+    let requests = outbound_guard::connection_count();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while outbound_guard::connection_count() == requests {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(provider.chain_sync_status(), Some(failure));
+    assert!(!provider.money_ready().await);
+    provider.shutdown().await.unwrap();
 }

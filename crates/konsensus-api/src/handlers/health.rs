@@ -62,6 +62,8 @@ pub struct HealthResponse {
     /// Chain backend name (e.g. "esplora", "mock").
     pub chain_backend: String,
     pub chain_view: konsensus_core::traits::chain::ChainView,
+    /// Observed LDK sync failure; null does not assert readiness.
+    pub chain_sync: Option<konsensus_core::traits::lightning::ChainSyncStatus>,
     /// Current Bitcoin block height from the chain backend (`null` if unavailable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_height: Option<u64>,
@@ -234,6 +236,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
 
     let peer = state.introduction.endpoint_view();
     let disk = state.lightning.disk_status();
+    let chain_sync = state.lightning.chain_sync_status();
     Json(HealthResponse {
         disk_low: disk.is_some_and(|s| s.disk_low),
         disk_free_bytes: disk.and_then(|s| s.disk_free_bytes),
@@ -273,6 +276,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         lightning_node_pubkey: state.lightning.get_node_pubkey().await,
         chain_backend: state.chain_backend.clone(),
         chain_view: state.chain.chain_view(),
+        chain_sync,
         block_height,
         stun_port: state.stun_port,
         stun_url: stun_url(peer.endpoint.as_deref(), state.stun_port),

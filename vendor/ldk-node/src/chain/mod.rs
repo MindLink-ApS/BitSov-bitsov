@@ -8,6 +8,8 @@
 mod bitcoind;
 mod electrum;
 mod esplora;
+pub(crate) mod sync_health;
+use sync_health::{ChainSyncFailure, SyncHealth};
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -86,6 +88,7 @@ impl WalletSyncStatus {
 
 pub(crate) struct ChainSource {
 	kind: ChainSourceKind,
+	sync_health: RwLock<SyncHealth>,
 	tx_broadcaster: Arc<Broadcaster>,
 	logger: Arc<Logger>,
 }
@@ -97,6 +100,13 @@ enum ChainSourceKind {
 }
 
 impl ChainSource {
+	pub(crate) fn sync_failure(&self) -> Option<ChainSyncFailure> {
+		match &self.kind {
+			ChainSourceKind::Bitcoind(source) => source.sync_failure(),
+			_ => self.sync_health.read().unwrap().failure(),
+		}
+	}
+
 	pub(crate) fn new_esplora(
 		server_url: String, headers: HashMap<String, String>, sync_config: EsploraSyncConfig,
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
@@ -114,7 +124,7 @@ impl ChainSource {
 			node_metrics,
 		);
 		let kind = ChainSourceKind::Esplora(esplora_chain_source);
-		(Self { kind, tx_broadcaster, logger }, None)
+		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, None)
 	}
 
 	pub(crate) fn new_electrum(
@@ -133,7 +143,7 @@ impl ChainSource {
 			node_metrics,
 		);
 		let kind = ChainSourceKind::Electrum(electrum_chain_source);
-		(Self { kind, tx_broadcaster, logger }, None)
+		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, None)
 	}
 
 	pub(crate) async fn new_bitcoind_rpc(
@@ -155,7 +165,7 @@ impl ChainSource {
 		);
 		let best_block = bitcoind_chain_source.poll_best_block().await.ok();
 		let kind = ChainSourceKind::Bitcoind(bitcoind_chain_source);
-		(Self { kind, tx_broadcaster, logger }, best_block)
+		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, best_block)
 	}
 
 	pub(crate) async fn new_bitcoind_rest(
@@ -178,7 +188,7 @@ impl ChainSource {
 		);
 		let best_block = bitcoind_chain_source.poll_best_block().await.ok();
 		let kind = ChainSourceKind::Bitcoind(bitcoind_chain_source);
-		(Self { kind, tx_broadcaster, logger }, best_block)
+		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, best_block)
 	}
 
 	pub(crate) fn start(&self, runtime: Arc<Runtime>) -> Result<(), Error> {
@@ -349,7 +359,7 @@ impl ChainSource {
 	pub(crate) async fn sync_onchain_wallet(
 		&self, onchain_wallet: Arc<Wallet>,
 	) -> Result<(), Error> {
-		match &self.kind {
+		let result = match &self.kind {
 			ChainSourceKind::Esplora(esplora_chain_source) => {
 				esplora_chain_source.sync_onchain_wallet(onchain_wallet).await
 			},
@@ -361,7 +371,9 @@ impl ChainSource {
 				// `ChainPoller`. So nothing to do here.
 				unreachable!("Onchain wallet will be synced via chain polling")
 			},
-		}
+		};
+		self.sync_health.write().unwrap().record(0, result.is_ok());
+		result
 	}
 
 	// Synchronize the Lightning wallet via transaction-based protocols (i.e., Esplora, Electrum,
@@ -370,7 +382,7 @@ impl ChainSource {
 		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
-		match &self.kind {
+		let result = match &self.kind {
 			ChainSourceKind::Esplora(esplora_chain_source) => {
 				esplora_chain_source
 					.sync_lightning_wallet(channel_manager, chain_monitor, output_sweeper)
@@ -386,7 +398,9 @@ impl ChainSource {
 				// `ChainPoller`. So nothing to do here.
 				unreachable!("Lightning wallet will be synced via chain polling")
 			},
-		}
+		};
+		self.sync_health.write().unwrap().record(1, result.is_ok());
+		result
 	}
 
 	pub(crate) async fn poll_and_update_listeners(
