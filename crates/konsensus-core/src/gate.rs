@@ -3108,6 +3108,7 @@ mod tests {
             crate::kind::KIND_WEB_MANIFEST,
             599,
             600,
+            crate::kind::KIND_PEER_EXCHANGE,
         ] {
             for (amount, quote) in [(50, None), (25, Some(25))] {
                 let mut envelope = make_signed_envelope(&identity, amount);

@@ -594,3 +594,29 @@ async fn porch_adverts_include_admission_floor() {
         );
     }
 }
+
+#[tokio::test]
+async fn peer_exchange_cache_does_not_apply_porch_or_advertised_admission_floor() {
+    let cache = PeerPriceCache::new();
+    let peer = test_node_id(1);
+    cache
+        .update(
+            peer,
+            HashMap::from([
+                ("control".into(), 1000),
+                (ADMISSION_FLOOR_KEY.into(), 2000),
+            ]),
+            1,
+            10,
+            0.5,
+        )
+        .await;
+    let kind = konsensus_core::kind::KIND_PEER_EXCHANGE;
+    assert_eq!(cache.get_discounted_peer_price(&peer, kind).await, Some(500));
+    assert_eq!(
+        cache
+            .get_fresh_discounted_peer_price(&peer, kind, 1, std::time::Duration::from_secs(60))
+            .await,
+        Some(500)
+    );
+}

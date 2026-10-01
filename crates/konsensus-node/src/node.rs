@@ -200,6 +200,10 @@ impl KonsensusNode {
                     });
                 let ldk_storage_dir = data_dir.join("ldk");
                 let ldk_config = LdkConfig {
+                    bitcoind: match &config.chain {
+                        ChainConfig::Bitcoind(rpc) => Some(rpc.clone()),
+                        _ => None,
+                    },
                     liquidity: liquidity.clone(),
                     storage_dir: ldk_storage_dir,
                     scb_backup_dir: Some(std::path::PathBuf::from(&config.backup.scb_dir)),
@@ -218,8 +222,7 @@ impl KonsensusNode {
                 info!(
                     backend = "ldk",
                     network = %network,
-                    esplora = %esplora_url,
-                    esplora_fallback = esplora_url_fallback.as_deref().unwrap_or("none"),
+                    chain_backend = config.chain.backend_name(),
                     "lightning provider (embedded)"
                 );
                 // Keep the retry seed scrubbed on drop; each attempt uses the same
@@ -268,6 +271,10 @@ impl KonsensusNode {
                     EsploraProvider::new(esplora_config)
                         .map_err(|e| anyhow::anyhow!("esplora provider: {e}"))?,
                 )
+            }
+            ChainConfig::Bitcoind(rpc) => {
+                info!(backend = "bitcoind", "chain provider (own node)");
+                Arc::new(konsensus_chain::BitcoindProvider::new(rpc.clone())?)
             }
             ChainConfig::Mock => {
                 info!(backend = "mock", "chain provider (testnet)");

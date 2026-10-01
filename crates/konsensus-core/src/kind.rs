@@ -93,6 +93,8 @@ pub const KIND_TYPING: u16 = 900;
 pub const KIND_READ_RECEIPT: u16 = 901;
 /// Presence update (online/offline/away).
 pub const KIND_PRESENCE: u16 = 902;
+/// Quoted, single-use peer exchange (owner-selected records only).
+pub const KIND_PEER_EXCHANGE: u16 = 903;
 /// Room creation.
 pub const KIND_ROOM_CREATE: u16 = 910;
 /// Room member invite.

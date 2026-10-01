@@ -154,3 +154,18 @@ fn advertised_price(kind: u16, base: u64, discount: f64, admission: u64) -> u64 
         discounted
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_exchange_offer_does_not_apply_porch_or_admission_floor() {
+        for admission in [0, 2000] {
+            assert_eq!(
+                advertised_price(konsensus_core::kind::KIND_PEER_EXCHANGE, 1000, 0.5, admission),
+                500
+            );
+        }
+    }
+}

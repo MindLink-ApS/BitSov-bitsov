@@ -252,6 +252,7 @@ pub async fn lightning(dir: &std::path::Path, chain: &Chain) -> (Arc<LdkProvider
     let addr = loopback();
     let (mnemonic, _) = NodeIdentity::generate().unwrap();
     let provider = LdkProvider::new(konsensus_lightning::LdkConfig {
+        bitcoind: None,
         storage_dir: dir.join("ldk"),
         mnemonic,
         passphrase: None,

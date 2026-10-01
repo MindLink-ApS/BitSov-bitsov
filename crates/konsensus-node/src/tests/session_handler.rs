@@ -947,51 +947,6 @@ fn make_peer_registry_with_entries(entries: Vec<(u8, &str)>) -> tokio::sync::RwL
 }
 
 #[tokio::test]
-async fn peer_exchange_request_builds_response_excluding_requester() {
-    let requester = make_peer_id(1);
-    let our_node_id = make_peer_id(99);
-    let registry = make_peer_registry_with_entries(vec![
-        (1, "127.0.0.1:9001"), // requester — should be excluded
-        (2, "5.6.7.8:9002"),
-        (3, "5.6.7.8:9003"),
-    ]);
-    let transport = make_gossip_test_transport();
-    let mut cooldown = std::collections::HashMap::new();
-
-    handle_peer_exchange_request(
-        &requester, our_node_id, &registry, &transport, &mut cooldown,
-    ).await;
-
-    // Cooldown should be recorded
-    assert!(cooldown.contains_key(&requester));
-}
-
-#[tokio::test]
-async fn peer_exchange_request_throttled_by_cooldown() {
-    let requester = make_peer_id(1);
-    let our_node_id = make_peer_id(99);
-    let registry = make_peer_registry_with_entries(vec![
-        (2, "5.6.7.8:9002"),
-    ]);
-    let transport = make_gossip_test_transport();
-    let mut cooldown = std::collections::HashMap::new();
-
-    // First request — sets cooldown
-    handle_peer_exchange_request(
-        &requester, our_node_id, &registry, &transport, &mut cooldown,
-    ).await;
-    assert!(cooldown.contains_key(&requester));
-
-    // Second request within cooldown — should be throttled (no update to timestamp)
-    let first_ts = cooldown[&requester];
-    handle_peer_exchange_request(
-        &requester, our_node_id, &registry, &transport, &mut cooldown,
-    ).await;
-    // Timestamp should NOT be updated (throttled)
-    assert_eq!(cooldown[&requester], first_ts);
-}
-
-#[tokio::test]
 async fn peer_exchange_received_adds_new_peers() {
     let sender = make_peer_id(1);
     let our_node_id = make_peer_id(99);
@@ -1508,6 +1463,8 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
     let (auto, _auto_rx) = mpsc::channel(8);
     let worker = tokio::spawn(run(SessionHandlerDeps {
         min_admission_cost_msat: 0,
+        privacy: Default::default(),
+        peer_exchange_floor: 0,
         transport: target.clone(),
         session_manager: sessions.clone(),
         storage: storage.clone(),
@@ -1824,7 +1781,7 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                 },
             ];
             for event in events {
-                let delivery = matches!(event, ControlEvent::MessageAcked { .. } | ControlEvent::MessageRejected { .. });
+                let delivery = matches!(event, ControlEvent::MessageAcked { .. } | ControlEvent::MessageRejected { .. } | ControlEvent::PeerExchangeRequested { .. });
                 assert_eq!(refuse_unpaid_control(&event, &membrane), !privileged && !delivery);
             }
         }
@@ -1835,7 +1792,7 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
         (PrePaymentReason::DeliveryBeforePayment, 0),
         (PrePaymentReason::PriceBeforePayment, 300),
         (PrePaymentReason::LightningInfoBeforePayment, 100),
-        (PrePaymentReason::PeerExchangeBeforePayment, 200),
+        (PrePaymentReason::PeerExchangeBeforePayment, 100),
         (PrePaymentReason::GossipBeforePayment, 100),
     ] {
         assert_eq!(
