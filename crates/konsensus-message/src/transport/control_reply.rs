@@ -5,6 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const REPLY_CAPACITY: usize = 8;
 const REPLY_DEADLINE: Duration = Duration::from_secs(1);
 const MAX_REPLY_BYTES: usize = 4096;
+// Only the quote-first discovery service uses larger replies. The signed,
+// hex-encoded snapshot (24 KiB decoded) plus an 8 KiB invoice fits in one Noise
+// record. The same queue capacity, write deadline and close-on-failure apply.
+const MAX_PEER_EXCHANGE_REPLY_BYTES: usize = 60_000;
 
 pub(super) struct Connection {
     state: Mutex<PeerConnection>,
@@ -94,7 +98,7 @@ impl Connection {
 }
 
 impl NoiseTransport {
-    /// Queue a small control reply without waiting for the peer's write lock or
+    /// Queue a bounded control reply without waiting for the peer's write lock or
     /// socket. Backpressure closes this connection; every write has a deadline.
     pub async fn enqueue_control_frame(
         &self,
@@ -111,7 +115,11 @@ impl NoiseTransport {
         let bytes = frame
             .to_bytes()
             .map_err(|e| TransportError::WireProtocol(e.to_string()))?;
-        if bytes.len() > MAX_REPLY_BYTES
+        let max_bytes = match frame {
+            Frame::PeerExchangeQuote { .. } | Frame::PeerExchangeResponse { .. } => MAX_PEER_EXCHANGE_REPLY_BYTES,
+            _ => MAX_REPLY_BYTES,
+        };
+        if bytes.len() > max_bytes
             || conn.closed.load(Ordering::Acquire)
             || conn.replies.try_send(bytes).is_err()
         {
