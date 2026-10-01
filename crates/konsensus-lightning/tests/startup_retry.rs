@@ -79,6 +79,7 @@ impl Drop for Fixture {
 
 fn config(dir: &tempfile::TempDir, url: &str) -> LdkConfig {
     LdkConfig {
+        bitcoind: None,
         liquidity: Default::default(),
         storage_dir: dir.path().join("ldk"),
         scb_backup_dir: None,
