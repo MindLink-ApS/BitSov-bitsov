@@ -2100,7 +2100,7 @@ esplora_url_fallback = "https://fallback.example.com"
                 Some("https://fallback.example.com".to_string())
             );
         }
-        ChainConfig::Mock => panic!("expected esplora config"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) => panic!("expected esplora config"),
     }
 }
 
@@ -2129,7 +2129,7 @@ fn issue66_existing_config_omitting_primary_keeps_its_provider() {
                 "and must not inject a third-party fallback it never chose"
             );
         }
-        ChainConfig::Mock => panic!("expected esplora"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) => panic!("expected esplora"),
     }
 
     // [lightning] backend = "ldk", esplora_url omitted -> legacy default, no fallback.
@@ -2167,7 +2167,7 @@ fn issue66_explicit_primary_is_never_overridden() {
                 "an operator running their own Esplora must not silently gain a public one"
             );
         }
-        ChainConfig::Mock => panic!("expected esplora"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) => panic!("expected esplora"),
     }
 }
 
@@ -2232,7 +2232,7 @@ api_url = "https://legacy.example.com"
             assert_eq!(api_url, "https://legacy.example.com");
             assert_eq!(esplora_url_fallback, None);
         }
-        ChainConfig::Mock => panic!("expected esplora config"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) => panic!("expected esplora config"),
     }
 }
 
@@ -2529,4 +2529,39 @@ backend = "sqlite"
 
     assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\nturn_listen = \"0.0.0.0:3478\"\n")).is_err());
     assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\nstun_listen = \"not-an-addr\"\n")).is_err());
+}
+
+#[test]
+fn bitcoind_config_accepts_file_auth_and_rejects_inline_secrets() {
+    for auth in [
+        "cookie_file = '/tmp/bitcoin.cookie'",
+        "rpc_user = 'bitsov'\nrpc_password_file = '/tmp/rpc.pass'",
+    ] {
+        let parsed: ChainConfig = toml::from_str(&format!(
+            "backend = 'bitcoind'\nrpc_host = '127.0.0.1'\nrpc_port = 18443\n{auth}"
+        )).expect("file-authenticated Bitcoin Core must be supported");
+        assert_eq!(parsed.backend_name(), "bitcoind");
+    }
+    for auth in [
+        "rpc_user = 'bitsov'\nrpc_password = 'INLINE_SECRET'",
+        "cookie = 'user:INLINE_SECRET'",
+        "rpc_url = 'http://user:INLINE_SECRET@localhost:18443'",
+    ] {
+        assert!(toml::from_str::<ChainConfig>(&format!(
+            "backend = 'bitcoind'\nrpc_host = '127.0.0.1'\nrpc_port = 18443\n{auth}"
+        )).is_err());
+    }
+}
+
+#[test]
+fn rejected_inline_rpc_secret_is_absent_from_startup_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    let mut config = NodeConfig::default_for_tier(NodeTier::Full, dir.path().join("mnemonic"), dir.path());
+    config.chain = ChainConfig::Mock;
+    let content = toml::to_string(&config).unwrap().replace("backend = \"mock\"", "backend = \"bitcoind\"\nrpc_password = \"NEVER_LOG_THIS_PASSWORD\"");
+    std::fs::write(&path, content).unwrap();
+    let error = NodeConfig::load(&path).unwrap_err();
+    assert!(!format!("{error:?}").contains("NEVER_LOG_THIS_PASSWORD"));
+    assert!(!format!("{error:#}").contains("NEVER_LOG_THIS_PASSWORD"));
 }

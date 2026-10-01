@@ -10,6 +10,7 @@ license.workspace = true
 ldk-integration-test = ["dep:electrsd"]
 
 [dependencies]
+konsensus-chain = { path = "../konsensus-chain" }
 konsensus-core = { path = "../konsensus-core" }
 tokio.workspace = true
 async-trait.workspace = true
