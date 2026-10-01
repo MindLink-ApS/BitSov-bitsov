@@ -1913,3 +1913,65 @@ async fn mexico_demo_rehearsal() {
     b.shutdown().await.unwrap();
     c.stop().unwrap();
 }
+
+/// Step 1 chain source: use only the existing Core harness, no electrs or peers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an offline BITCOIND_EXE; launches isolated regtest only"]
+async fn bitcoind_chain_source_pruned_and_full() {
+    use konsensus_chain::{BitcoindConfig, BitcoindProvider};
+    use konsensus_core::traits::chain::ChainProvider;
+    for pruned in [true, false] {
+        let mut conf = corepc_node::Conf::default();
+        conf.wallet = None;
+        conf.network = "regtest";
+        conf.p2p = corepc_node::P2P::No;
+        conf.args = vec!["-regtest", "-fallbackfee=0.0001", "-networkactive=0", "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1", "-dnsseed=0", "-discover=0"];
+        conf.args.push(if pruned { "-prune=550" } else { "-txindex=1" });
+        let bitcoin = corepc_node::Node::with_conf(std::env::var("BITCOIND_EXE").expect("offline BITCOIND_EXE"), &conf).unwrap();
+        let _: Value = bitcoin.client.call("createwallet", &[json!("chain-source")]).unwrap();
+        let address: Value = bitcoin.client.call("getnewaddress", &[]).unwrap();
+        let blocks: Value = bitcoin.client.call("generatetoaddress", &[json!(101), address]).unwrap();
+        let block: Value = bitcoin.client.call("getblock", &[blocks[100].clone()]).unwrap();
+        let txid = block["tx"][0].as_str().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut rpc = BitcoindConfig {
+            rpc_host: "127.0.0.1".into(), rpc_port: bitcoin.params.rpc_socket.port(),
+            cookie_file: Some(bitcoin.params.cookie_file.clone()), rpc_user: None, rpc_password_file: None,
+        };
+        if !pruned {
+            let cookie = std::fs::read_to_string(&bitcoin.params.cookie_file).unwrap();
+            let (user, password) = cookie.trim().split_once(':').unwrap();
+            let path = dir.path().join("rpc.pass");
+            std::fs::write(&path, password).unwrap();
+            rpc.cookie_file = None;
+            rpc.rpc_user = Some(user.into());
+            rpc.rpc_password_file = Some(path);
+        }
+        let provider = BitcoindProvider::new(rpc.clone()).unwrap();
+        assert_eq!(provider.get_block_height().await.unwrap(), 101);
+        assert_eq!(provider.get_block_header(1).await.unwrap().height, 1);
+        assert!(provider.is_synced().await);
+        assert!(provider.is_tx_confirmed(txid, 1).await.unwrap());
+        assert!(!provider.is_tx_confirmed(txid, 2).await.unwrap());
+        assert_eq!(provider.chain_view().trust_level, "trustless");
+        let ldk = LdkProvider::new(konsensus_lightning::LdkConfig {
+            bitcoind: Some(rpc), liquidity: Default::default(), storage_dir: dir.path().join("ldk"),
+            scb_backup_dir: None, scb_rotation_count: 3,
+            mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".into(),
+            passphrase: None, network: "regtest".into(),
+            // These must not even be validated/probed when Core is selected.
+            esplora_url: "disabled".into(), esplora_url_fallback: Some("disabled".into()),
+            rgs_url: None, lsp_node_id: None, lsp_address: None, lsp_token: None, listening_address: None,
+        }).await.unwrap();
+        assert!(ldk.is_available().await);
+        wait("bitcoind LDK wallet synchronization", || ldk.money_ready()).await;
+        assert_eq!(ldk.node().status().current_best_block.height, 101);
+        let address: Value = bitcoin.client.call("getnewaddress", &[]).unwrap();
+        let _: Value = bitcoin.client.call("generatetoaddress", &[json!(1), address]).unwrap();
+        wait("bitcoind LDK follows new blocks", || async {
+            ldk.node().status().current_best_block.height == 102
+        }).await;
+        assert!(provider.is_tx_confirmed(txid, 2).await.unwrap());
+        ldk.shutdown().await.unwrap();
+    }
+}
