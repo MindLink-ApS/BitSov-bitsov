@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+mod balance;
 pub mod circuit_breaker;
 pub mod recovering;
 pub use recovering::RecoveringLightning;

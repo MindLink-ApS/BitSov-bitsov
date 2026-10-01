@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use konsensus_core::fee_rate::validate_fee_rate_sat_per_vb;
-use konsensus_core::traits::lightning::LightningError;
+use konsensus_core::traits::lightning::{LightningError, WalletBalanceBreakdown};
 
 use crate::error::ApiError;
 use crate::freshness::DataFreshness;
@@ -68,8 +68,14 @@ pub struct PaymentStatusResponse {
 /// Balance response.
 #[derive(Serialize)]
 pub struct BalanceResponse {
-    /// Available balance in millisatoshis.
+    /// Legacy provider aggregate in millisatoshis, unchanged for compatibility.
+    /// LDK includes claimable Lightning funds plus spendable on-chain funds;
+    /// this is not a spendable Lightning balance.
     pub balance_msat: u64,
+    /// Known wallet categories in sats, flattened into the response. Unknown
+    /// categories are omitted; confirmed zeroes are included.
+    #[serde(flatten)]
+    pub breakdown: WalletBalanceBreakdown,
 }
 
 /// Price check response.
@@ -161,7 +167,7 @@ async fn payment_status(
     }))
 }
 
-/// `GET /api/v1/payments/balance` — get Lightning wallet balance.
+/// `GET /api/v1/payments/balance` — get wallet balance and known categories.
 ///
 /// Carries `BitSov-Data-As-Of` / `BitSov-Data-Stale` from the wallet's sync
 /// status (see [`crate::freshness`]).
@@ -178,10 +184,17 @@ async fn get_balance(
         .await
         .map_err(ApiError::from)?;
 
+    let breakdown = state
+        .lightning
+        .get_balance_breakdown()
+        .await
+        .map_err(ApiError::from)?;
+
     Ok((
         DataFreshness::from_wallet_sync(sync, read_at),
         Json(BalanceResponse {
             balance_msat: balance,
+            breakdown,
         }),
     ))
 }

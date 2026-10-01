@@ -57,6 +57,42 @@ From `LightningProvider::wallet_sync()`:
 The sync status is read *before* the balance/channel read, so the header
 never claims the figures are newer than they are.
 
+### Wallet balance breakdown (G-safety, #176)
+
+`GET /api/v1/payments/balance` requires `read` scope and now returns optional
+top-level categories alongside the unchanged `balance_msat`. This is a local
+wallet observation through the existing authenticated API, not a peer service,
+payment, or money-moving operation. It uses the same freshness headers above.
+
+| Field | Meaning for the embedded LDK provider |
+|---|---|
+| `balance_msat` | Legacy aggregate, unchanged: `(total_lightning_balance_sats + spendable_onchain_balance_sats) * 1000`. Includes Lightning claims that cannot currently be spent. Other providers retain their existing semantics. |
+| `onchain_spendable_sats` | On-chain funds LDK considers spendable after confirmation requirements and the anchor reserve. |
+| `onchain_total_sats` | Total on-chain wallet funds, including unconfirmed funds and the anchor reserve. |
+| `anchor_reserve_sats` | On-chain funds reserved for anchor-channel closing fees, already included in `onchain_total_sats`. |
+| `lightning_spendable_sats` | Sum of `outbound_capacity_msat` for `is_usable` channels, divided by 1000 and rounded down after summation. Excludes channel reserves, pending HTLCs, and inactive channels. This is outbound capacity, not a promise that a payment of that amount can route: routing fees, per-HTLC limits, and remote liquidity still apply. |
+| `closing_sats` | `ClaimableAwaitingConfirmations` (including timelocks), plus `ClaimableOnChannelClose` for channels no longer in the channel manager (for example, a force-close not yet confirmed), plus every pending sweep variant: `PendingBroadcast`, `BroadcastAwaitingConfirmation`, `AwaitingThresholdConfirmations`. An open channel with a disconnected peer is not counted as closing. |
+| `contested_sats` | Potential claims from `ContentiousClaimable`, `MaybeTimeoutClaimableHTLC`, `MaybePreimageClaimableHTLC`, and `CounterpartyRevokedOutputClaimable`. Conditional claims are not guaranteed wallet funds or spendable liquidity. |
+
+Unknown categories are **omitted**, never replaced with `0` or `null`. A known
+empty category is `0`. Providers without breakdown support (currently LND,
+LNbits, and mock) omit all six new fields. Backend failures remain errors;
+the recovery wrapper still returns `not_ready` until its backend is ready.
+
+These fields are **not an additive partition of wallet wealth**. Pending sweep
+amounts are before sweep fees and, depending on wallet sync, may already be in
+the on-chain total. LDK retains confirmed sweeps for reorg safety even when
+their proceeds are spendable. Therefore `closing_sats` describes the tracked
+closure/sweep pipeline, not an exact amount unavailable on-chain. Never add it
+to `onchain_total_sats` or subtract it from `onchain_spendable_sats`. Normal open
+channel reserves are also not a separate category here. Balances and channels
+are separate local snapshots and can change during a read; clients should use
+the freshness headers and refresh after channel transitions.
+
+Doctrine: lines 1, 3, 5, and 6 hold: the existing authenticated control-plane
+read leaves paid peer admission intact, preserves key-based authorization and
+self-custody, and exposes measured categories with their limits.
+
 ### Pricing: stale means "fell back"
 
 When the chain-aware engine cannot refresh its chain state (backend down or

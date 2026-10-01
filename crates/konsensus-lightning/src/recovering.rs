@@ -340,6 +340,10 @@ impl LightningProvider for RecoveringLightning {
         let p = self.backend()?;
         p.get_balance_msat().await
     }
+    async fn get_balance_breakdown(&self) -> Result<WalletBalanceBreakdown, LightningError> {
+        let p = self.backend()?;
+        p.get_balance_breakdown().await
+    }
     async fn list_payments(&self, limit: u32) -> Result<Vec<PaymentDetails>, LightningError> {
         let p = self.backend()?;
         p.list_payments(limit).await
