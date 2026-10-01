@@ -143,6 +143,19 @@ struct FailingLightning;
 
 #[async_trait]
 impl LightningProvider for FailingLightning {
+    async fn readiness(&self) -> konsensus_core::traits::lightning::LightningReadiness {
+        // Simulate a ready snapshot taken just before the sync failure arrives.
+        konsensus_core::traits::lightning::LightningReadiness {
+            money_ready: true, state: "ready".into(), retry_attempt: 0,
+            retry_after_secs: None, events: vec![],
+        }
+    }
+    fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
+        Some(konsensus_core::traits::lightning::ChainSyncStatus::Stalled {
+            since: 123,
+            last_error_kind: konsensus_core::traits::lightning::ChainSyncErrorKind::SyncFailed,
+        })
+    }
     async fn create_invoice(&self, a: u64, d: &str, e: u32) -> Result<Invoice, LightningError> {
         StubLightning.create_invoice(a, d, e).await
     }
@@ -687,7 +700,7 @@ async fn owner_status_reports_chain_view_without_exposing_it_on_public_health() 
         "rpc_host":"127.0.0.1", "rpc_port":1, "cookie_file":cookie
     })).unwrap();
     let cases: Vec<(Arc<dyn ChainProvider>, &str, &str)> = vec![
-        (Arc::new(konsensus_chain::BitcoindProvider::new(rpc).unwrap()), "bitcoind", "trustless"),
+        (Arc::new(konsensus_chain::BitcoindProvider::new(rpc).unwrap()), "bitcoind", "own_node"),
         (Arc::new(konsensus_chain::EsploraProvider::new(konsensus_chain::EsploraConfig::custom(
             "http://127.0.0.1:1".into(), TrustLevel::ServerTrust,
         )).unwrap()), "esplora", "third_party"),
@@ -707,4 +720,31 @@ async fn owner_status_reports_chain_view_without_exposing_it_on_public_health() 
         assert!(public.json.get("chain_view").is_none());
         assert_eq!(get(state, "/api/v1/status", false).await.status, StatusCode::UNAUTHORIZED);
     }
+}
+
+#[tokio::test]
+async fn stalled_chain_sync_is_owner_only_and_survives_unready_recovery_wrapper() {
+    let recovering = konsensus_lightning::RecoveringLightning::new(
+        || async { Ok(Arc::new(FailingLightning) as Arc<dyn LightningProvider>) },
+        Default::default(),
+    ).await.unwrap();
+    let state = with_lightning(Arc::new(recovering));
+    let response = get(state.clone(), "/api/v1/status", true).await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json["money_ready"], false);
+    assert_eq!(response.json["chain_sync"], serde_json::json!({
+        "state": "stalled", "since": 123, "last_error_kind": "sync_failed"
+    }));
+    let public = get(state.clone(), "/api/v1/health", false).await;
+    assert!(public.json.get("chain_sync").is_none());
+    assert_eq!(get(state, "/api/v1/status", false).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn status_sync_failure_overrides_an_earlier_ready_snapshot() {
+    let response = get(with_lightning(Arc::new(FailingLightning)), "/api/v1/status", true).await;
+    assert_eq!(response.json["chain_sync"]["state"], "stalled");
+    assert_eq!(response.json["money_ready"], false);
+    assert_eq!(response.json["readiness"]["money_ready"], false);
+    assert_eq!(response.json["readiness"]["state"], "synchronizing");
 }

@@ -246,6 +246,24 @@ pub enum WalletSync {
     NeverSynced,
 }
 
+/// Fixed vocabulary: never include RPC responses, credentials, URLs or paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainSyncErrorKind {
+    SyncFailed,
+}
+
+/// An observed failure, not an inference from a stale timestamp or a pruned node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ChainSyncStatus {
+    Stalled {
+        /// Unix seconds; first failure of the currently failing wallet this run.
+        since: u64,
+        last_error_kind: ChainSyncErrorKind,
+    },
+}
+
 /// A bounded, process-local transition history for status polling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadinessEvent {
@@ -270,6 +288,9 @@ pub struct LightningReadiness {
 /// Every message must have its payment verified through this interface.
 #[async_trait]
 pub trait LightningProvider: Send + Sync {
+    /// Local diagnostics only. None means no observed failure, not proof of sync.
+    fn chain_sync_status(&self) -> Option<ChainSyncStatus> { None }
+
     /// Supplied by the node's admission wrapper; bare providers have no disk policy.
     fn disk_status(&self) -> Option<DiskStatus> { None }
 

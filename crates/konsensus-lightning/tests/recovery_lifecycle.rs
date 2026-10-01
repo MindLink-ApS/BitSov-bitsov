@@ -242,3 +242,46 @@ async fn cancelled_shutdown_does_not_detach_persistence_or_report_ready() {
     assert!(!provider.money_ready().await);
     assert_eq!(provider.readiness().await.state, "stopped");
 }
+
+struct FailingSync(std::sync::atomic::AtomicBool);
+#[async_trait::async_trait]
+impl LightningProvider for FailingSync {
+    fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
+        self.0.load(Ordering::SeqCst).then_some(
+            konsensus_core::traits::lightning::ChainSyncStatus::Stalled {
+                since: 123,
+                last_error_kind: konsensus_core::traits::lightning::ChainSyncErrorKind::SyncFailed,
+            },
+        )
+    }
+    async fn money_ready(&self) -> bool { !self.0.load(Ordering::SeqCst) }
+    async fn is_available(&self) -> bool { true }
+    async fn create_invoice(&self, _: u64, _: &str, _: u32)
+        -> Result<konsensus_core::traits::lightning::Invoice, LightningError> { unreachable!() }
+    async fn pay_invoice(&self, _: &str)
+        -> Result<konsensus_core::traits::lightning::PaymentDetails, LightningError> { unreachable!() }
+    async fn get_payment_status(&self, _: &str)
+        -> Result<konsensus_core::traits::lightning::PaymentDetails, LightningError> { unreachable!() }
+    async fn get_balance_msat(&self) -> Result<u64, LightningError> { Ok(1) }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sync_failure_revokes_cached_readiness_and_money_dispatch_before_next_poll() {
+    let backend = Arc::new(FailingSync(std::sync::atomic::AtomicBool::new(false)));
+    let factory_backend = backend.clone();
+    let provider = RecoveringLightning::new(move || {
+        let backend = factory_backend.clone();
+        async { Ok(backend as Arc<dyn LightningProvider>) }
+    }, Default::default()).await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(provider.money_ready().await);
+    assert!(provider.readiness().await.money_ready);
+    backend.0.store(true, Ordering::SeqCst);
+    // No clock advance / monitor tick between a live failure and these calls.
+    assert!(!provider.money_ready().await);
+    let readiness = provider.readiness().await;
+    assert!(!readiness.money_ready);
+    assert_eq!(readiness.state, "synchronizing");
+    assert!(matches!(provider.create_invoice(1, "x", 60).await, Err(LightningError::NotReady)));
+    provider.shutdown().await.unwrap();
+}

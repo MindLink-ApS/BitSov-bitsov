@@ -41,10 +41,13 @@ use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
+use super::sync_health::{ChainSyncFailure, SyncHealth};
+
 const CHAIN_POLLING_INTERVAL_SECS: u64 = 2;
 const CHAIN_POLLING_TIMEOUT_SECS: u64 = 10;
 
 pub(super) struct BitcoindChainSource {
+	sync_health: Box<RwLock<SyncHealth>>,
 	api_client: Arc<BitcoindClient>,
 	header_cache: tokio::sync::Mutex<BoundedHeaderCache>,
 	latest_chain_tip: RwLock<Option<ValidatedBlockHeader>>,
@@ -57,6 +60,10 @@ pub(super) struct BitcoindChainSource {
 }
 
 impl BitcoindChainSource {
+	pub(super) fn sync_failure(&self) -> Option<ChainSyncFailure> {
+		self.sync_health.read().unwrap().failure()
+	}
+
 	pub(crate) fn new_rpc(
 		rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
 		fee_estimator: Arc<OnchainFeeEstimator>, kv_store: Arc<DynStore>, config: Arc<Config>,
@@ -73,6 +80,7 @@ impl BitcoindChainSource {
 		let latest_chain_tip = RwLock::new(None);
 		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
 		Self {
+			sync_health: Box::new(RwLock::new(SyncHealth::default())),
 			api_client,
 			header_cache,
 			latest_chain_tip,
@@ -105,6 +113,7 @@ impl BitcoindChainSource {
 		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
 
 		Self {
+			sync_health: Box::new(RwLock::new(SyncHealth::default())),
 			api_client,
 			header_cache,
 			latest_chain_tip,
@@ -190,6 +199,7 @@ impl BitcoindChainSource {
 			.await
 			{
 				Ok(chain_tip) => {
+					self.sync_health.write().unwrap().record(0, true);
 					{
 						log_info!(
 							self.logger,
@@ -217,6 +227,7 @@ impl BitcoindChainSource {
 				},
 
 				Err(e) => {
+					self.sync_health.write().unwrap().record(0, false);
 					log_error!(self.logger, "Failed to synchronize chain listeners: {:?}", e);
 					if e.kind() == BlockSourceErrorKind::Transient {
 						log_info!(
@@ -384,6 +395,7 @@ impl BitcoindChainSource {
 			)
 			.await;
 
+		self.sync_health.write().unwrap().record(0, res.is_ok());
 		self.wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(res);
 
 		res

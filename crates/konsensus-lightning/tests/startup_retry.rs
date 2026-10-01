@@ -46,7 +46,9 @@ impl Fixture {
             )
             .fallback(move || {
                 background.fetch_add(1, Ordering::SeqCst);
-                async { StatusCode::NOT_FOUND }
+                // Nonempty body models a transport failure. An empty HTTP body is
+                // invalid data to LDK and selects its five-minute persistent retry.
+                async { (StatusCode::NOT_FOUND, "unavailable") }
             })
             .with_state(Arc::clone(&requests));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -397,4 +399,54 @@ async fn offline_boot_recovers_after_sync_without_duplicate_ldk_tasks() {
     assert!(!provider.money_ready().await);
     provider.shutdown().await.unwrap();
     server.abort();
+}
+
+/// A failing Core must never trigger either Esplora's preflight or builder path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bitcoind_sync_failure_is_visible_and_never_contacts_esplora_or_fallback() {
+    let core = Fixture::new(0, false).await; // RPC POST returns 404.
+    let primary = Fixture::new(0, false).await;
+    let fallback = Fixture::new(0, false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cookie = dir.path().join("cookie");
+    std::fs::write(&cookie, "user:NO_FALLBACK_SECRET").unwrap();
+    let mut cfg = config(&dir, &primary.url);
+    cfg.network = "regtest".into();
+    cfg.esplora_url_fallback = Some(fallback.url.clone());
+    cfg.bitcoind = Some(serde_json::from_value(serde_json::json!({
+        "rpc_host": "127.0.0.1",
+        "rpc_port": core.url.rsplit(':').next().unwrap().parse::<u16>().unwrap(),
+        "cookie_file": cookie,
+    })).unwrap());
+    // Regtest permits unavailable fee estimates, allowing the real background
+    // listener sync to start and fail against this disposable RPC fixture.
+    let provider = tokio::time::timeout(Duration::from_secs(20), LdkProvider::new(cfg))
+        .await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while provider.chain_sync_status().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(provider.node().status().is_running);
+    assert!(!provider.money_ready().await);
+    let failure = provider.chain_sync_status().unwrap();
+    let json = serde_json::to_value(failure).unwrap();
+    assert_eq!(json["state"], "stalled");
+    assert_eq!(json["last_error_kind"], "sync_failed");
+    assert!(json["since"].as_u64().unwrap() > 0);
+    assert!(!json.to_string().contains("NO_FALLBACK_SECRET"));
+    let requests = core.background_requests.load(Ordering::SeqCst);
+    assert!(requests > 0);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while core.background_requests.load(Ordering::SeqCst) == requests {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(provider.chain_sync_status(), Some(failure));
+    assert!(!provider.money_ready().await);
+    provider.shutdown().await.unwrap();
+    for explorer in [&primary, &fallback] {
+        assert_eq!(explorer.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(explorer.background_requests.load(Ordering::SeqCst), 0);
+    }
 }

@@ -151,8 +151,8 @@ pub trait ChainProvider: Send + Sync {
 /// Trust level of the chain data source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TrustLevel {
-    /// Full local validation (Bitcoin Core)
-    Trustless,
+    /// Assumes Bitcoin Core performs full validation; not remotely proven.
+    FullValidation,
     /// Server-assisted with local verification (Electrum with headers)
     ServerAssisted,
     /// Compact block filter based (Neutrino)
@@ -164,9 +164,16 @@ pub enum TrustLevel {
 
 | Implementation | Tier | Trust Level | Notes |
 |---------------|------|-------------|-------|
-| `BitcoinCoreProvider` | T3-4 | `Trustless` | Full RPC interface to local `bitcoind` |
+| `BitcoinCoreProvider` | T3-4 | `FullValidation` | RPC access; assumes operator-controlled Bitcoin Core |
 | `ElectrumProvider` | T2 | `ServerAssisted` | Electrum protocol; verifies headers locally |
 | `NeutrinoProvider` | T1 | `FilterBased` | BIP 157/158 compact block filters |
+
+The shipped owner status field is separate from this provider-level enum:
+`chain_view.trust_level` reports `own_node` for configured Bitcoin Core and
+`third_party` for Esplora. `own_node` replaces the former `trustless` status
+value and does not prove ownership, validation or sync. App consumers should use
+`money_ready` and the `chain_sync` diagnostic for readiness; see
+[chain source status](../CHAIN-SOURCE.md#privacy-and-status).
 
 ### 2.2 LightningProvider
 

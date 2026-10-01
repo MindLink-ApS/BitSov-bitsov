@@ -116,6 +116,7 @@ pub use builder::BuildError;
 #[cfg(not(feature = "uniffi"))]
 pub use builder::NodeBuilder as Builder;
 use chain::ChainSource;
+pub use chain::sync_health::ChainSyncFailure;
 use config::{
 	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
 	NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
@@ -730,6 +731,7 @@ impl Node {
 			locked_node_metrics.latest_channel_monitor_archival_height;
 
 		NodeStatus {
+			chain_sync_failure: self.chain_source.sync_failure(),
 			is_running,
 			current_best_block,
 			latest_lightning_wallet_sync_timestamp,
@@ -1745,6 +1747,8 @@ impl Drop for Node {
 /// Represents the status of the [`Node`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeStatus {
+	/// Current process-local sync failure, cleared by a successful retry.
+	pub chain_sync_failure: Option<ChainSyncFailure>,
 	/// Indicates whether the [`Node`] is running.
 	pub is_running: bool,
 	/// The best block to which our Lightning wallet is currently synced.

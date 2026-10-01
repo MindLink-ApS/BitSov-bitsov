@@ -62,6 +62,8 @@ pub struct HealthResponse {
     /// Chain backend name (e.g. "esplora", "mock").
     pub chain_backend: String,
     pub chain_view: konsensus_core::traits::chain::ChainView,
+    /// Observed LDK sync failure; null does not assert readiness.
+    pub chain_sync: Option<konsensus_core::traits::lightning::ChainSyncStatus>,
     /// Current Bitcoin block height from the chain backend (`null` if unavailable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_height: Option<u64>,
@@ -203,7 +205,7 @@ async fn health(State(state): State<Arc<AppState>>) -> (DataFreshness, Json<Publ
 /// Includes identity, connected peer IDs, wallet balance, and LN pubkey — the
 /// fields redacted from the public `/health` endpoint.
 async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    let readiness = state.lightning.readiness().await;
+    let mut readiness = state.lightning.readiness().await;
     let connected = state.transport.connected_peers().await;
     let ln_available = state.lightning.is_available().await;
     let ln_payment_capable = state.lightning.is_payment_capable().await;
@@ -234,6 +236,13 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
 
     let peer = state.introduction.endpoint_view();
     let disk = state.lightning.disk_status();
+    // Capture once after the awaited reads: a new failure must override an
+    // earlier ready snapshot in both status readiness fields.
+    let chain_sync = state.lightning.chain_sync_status();
+    if chain_sync.is_some() && readiness.money_ready {
+        readiness.money_ready = false;
+        readiness.state = "synchronizing".into();
+    }
     Json(HealthResponse {
         disk_low: disk.is_some_and(|s| s.disk_low),
         disk_free_bytes: disk.and_then(|s| s.disk_free_bytes),
@@ -273,6 +282,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         lightning_node_pubkey: state.lightning.get_node_pubkey().await,
         chain_backend: state.chain_backend.clone(),
         chain_view: state.chain.chain_view(),
+        chain_sync,
         block_height,
         stun_port: state.stun_port,
         stun_url: stun_url(peer.endpoint.as_deref(), state.stun_port),
