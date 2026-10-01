@@ -80,7 +80,7 @@ async fn a_plaintext_recovery_phrase_is_refused_before_anything_is_asked() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not encrypted") && stderr.contains("Nothing was signed"), "{stderr}");
-    assert!(seen.is_empty(), "the socket is not even asked: {seen:?}");
+    assert!(seen.is_empty(), "the socket must not receive a request");
     assert!(!String::from_utf8_lossy(&out.stdout).contains("code>"));
 }
 
@@ -109,7 +109,7 @@ async fn socket_text_is_never_printed_and_the_terms_shown_are_computed_locally()
     assert!(stdout.contains("computed by this command"), "{stdout}");
     // With no terminal to type the password on, nothing is signed or sent.
     assert!(!out.status.success());
-    assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "{seen:?}");
+    assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "the socket must not receive an approval");
 }
 
 #[tokio::test]
@@ -118,7 +118,7 @@ async fn a_malformed_tuple_is_refused_before_signing() {
     let (out, seen) = approve(dir.path(), "0".repeat(32), "04zz").await;
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("malformed device key"));
-    assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "{seen:?}");
+    assert!(seen.iter().all(|r| !matches!(r, ControlRequest::ApproveDeviceKey { .. })), "the socket must not receive an approval");
 }
 
 /// Run the command in a new session with no controlling terminal, so a

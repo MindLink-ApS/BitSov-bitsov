@@ -16,7 +16,7 @@ x25519-dalek.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 sha2.workspace = true
-blake3.workspace = true
+blake3 = { workspace = true, features = ["zeroize"] }
 bitcoin.workspace = true
 bip39.workspace = true
 uuid.workspace = true

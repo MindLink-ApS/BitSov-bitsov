@@ -30,6 +30,8 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use zeroize::Zeroizing;
+
 use serde::{Deserialize, Serialize};
 
 use crate::audit::events;
@@ -545,7 +547,7 @@ async fn first_contact_grant(
 }
 
 /// `POST /api/v1/identity/replacement-request` body.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplacementRequestBody {
     /// The recovery phrase of the identity that would replace the live one.
@@ -556,7 +558,7 @@ pub struct ReplacementRequestBody {
     /// (`konsensus approve-replacement`), where it is re-derived and must match
     /// the fingerprint recorded here — there is no HTTP route that consumes
     /// this approval or writes identity material.
-    pub mnemonic: String,
+    pub mnemonic: Zeroizing<String>,
 }
 
 /// `POST /api/v1/identity/replacement-request` response.

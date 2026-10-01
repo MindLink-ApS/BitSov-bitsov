@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["vendor/ldk-node"]
+exclude = ["vendor/ldk-node", "vendor/x25519-dalek"]
 members = [
     "crates/konsensus-core",
     "crates/konsensus-chain",
@@ -66,8 +66,8 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 # Cryptography
-ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
-x25519-dalek = { version = "2.0", features = ["serde", "static_secrets"] }
+ed25519-dalek = { version = "2.1", features = ["serde", "rand_core", "zeroize"] }
+x25519-dalek = { version = "2.0", features = ["serde", "static_secrets", "zeroize"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
 snow = "0.9"
@@ -127,3 +127,4 @@ unicode-normalization = "0.1"
 
 [patch.crates-io]
 ldk-node = { path = "vendor/ldk-node" }
+x25519-dalek = { path = "vendor/x25519-dalek" }
