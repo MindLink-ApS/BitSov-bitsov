@@ -103,6 +103,22 @@ would let a token that cannot spend move value.
 ### identity
 `POST /identity/mnemonic` (reveal) · `/identity/restore` · `/identity/verify-mnemonic`
 
+`POST /api/v1/identity/verify-mnemonic` is available only on self-hosted nodes
+and requires `identity` scope. Its JSON request accepts `mnemonic` (a 12- or
+24-word BIP-39 phrase) and an optional string `passphrase`. Unknown fields are
+rejected. The passphrase is held in a zeroizing request value and is neither
+logged nor echoed.
+
+Success returns HTTP 200 with `{"node_id":"<derived Ed25519 public key in hex>"}`.
+The caller must compare this candidate with the expected node ID: a wrong
+passphrase derives a different identity, rather than causing a validation error.
+An omitted or null passphrase returns HTTP 400 with a clear passphrase-required
+error when the running node has a non-empty BIP-39 passphrase configured. The
+configured secret is never substituted. Without a configured passphrase,
+omission retains empty-passphrase derivation. An explicitly supplied empty
+string requests empty-passphrase derivation even on a passphrase-protected node.
+Verification does not modify the node identity.
+
 ### WebSocket
 
 `GET /ws` requires `read`, checked before the upgrade, for both the subprotocol and the

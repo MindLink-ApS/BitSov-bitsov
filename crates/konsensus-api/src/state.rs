@@ -133,6 +133,10 @@ pub struct AppState {
     /// from the router, not merely protected by auth.
     pub sensitive_identity_routes_enabled: bool,
 
+    /// Whether the running identity was derived with a non-empty BIP-39 passphrase.
+    /// Only this flag is shared with the API, never the configured secret.
+    pub has_identity_passphrase: bool,
+
     /// Broadcast channel for real-time WebSocket notifications.
     /// Messages include decrypted plaintext when E2EE session is available.
     pub ws_broadcast: broadcast::Sender<Arc<WsMessage>>,

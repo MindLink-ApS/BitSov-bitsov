@@ -48,6 +48,7 @@ async fn owner_router(identity: Arc<NodeIdentity>) -> axum::Router {
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
+        has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),

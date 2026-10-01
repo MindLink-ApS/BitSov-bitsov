@@ -1103,6 +1103,7 @@ async fn cmd_start(
             .operator_probes_enabled
             .unwrap_or(matches!(config.tier, NodeTier::Cloud)),
         sensitive_identity_routes_enabled: config.tier.is_self_hosted(),
+        has_identity_passphrase: !config.identity.passphrase.is_empty(),
         ws_broadcast: ws_tx.clone(),
         ws_delivery_broadcast: ws_delivery_tx.clone(),
         rate_limiter,
