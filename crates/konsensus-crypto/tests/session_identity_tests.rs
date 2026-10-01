@@ -246,14 +246,14 @@ fn verify_with_flipped_last_byte_signature() {
 fn jwt_secret_deterministic() {
     let id1 = NodeIdentity::from_mnemonic(MNEMONIC_A, "").unwrap();
     let id2 = NodeIdentity::from_mnemonic(MNEMONIC_A, "").unwrap();
-    assert_eq!(id1.derive_jwt_secret(), id2.derive_jwt_secret());
+    assert_eq!(&id1.derive_jwt_secret()[..], &id2.derive_jwt_secret()[..]);
 }
 
 #[test]
 fn jwt_secret_differs_between_identities() {
     let id1 = NodeIdentity::from_mnemonic(MNEMONIC_A, "").unwrap();
     let id2 = NodeIdentity::from_mnemonic(MNEMONIC_B, "").unwrap();
-    assert_ne!(id1.derive_jwt_secret(), id2.derive_jwt_secret());
+    assert_ne!(&id1.derive_jwt_secret()[..], &id2.derive_jwt_secret()[..]);
 }
 
 #[test]

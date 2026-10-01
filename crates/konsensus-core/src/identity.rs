@@ -19,7 +19,7 @@ use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::types::NodeId;
 
@@ -51,18 +51,40 @@ pub struct NodeIdentity {
     // X25519 (key exchange — Noise_XX, PQXDH)
     x25519_secret: X25519StaticSecret,
     x25519_public: X25519PublicKey,
-    /// Raw X25519 secret bytes (pre-clamped) for passing to snow/Noise.
-    x25519_secret_bytes: [u8; 32],
 
     // secp256k1 (Bitcoin/Lightning)
-    secp_secret: bitcoin::secp256k1::SecretKey,
+    secp_secret: ErasingSecpSecret,
     secp_public: bitcoin::secp256k1::PublicKey,
 
     // AES-256 key (at-rest storage encryption)
-    aes_key: [u8; 32],
+    aes_key: Zeroizing<[u8; 32]>,
 
     // NodeId (derived from Ed25519 public key)
     node_id: NodeId,
+}
+
+/// secp256k1 0.29's SecretKey is Copy and has no erasing Drop. Keep it
+/// behind a non-Copy owner as soon as construction succeeds, including on
+/// error/unwind paths. The public accessor only borrows the underlying key.
+struct ErasingSecpSecret(bitcoin::secp256k1::SecretKey);
+
+impl ErasingSecpSecret {
+    fn from_slice(bytes: &[u8]) -> Result<Self, bitcoin::secp256k1::Error> {
+        bitcoin::secp256k1::SecretKey::from_slice(bytes).map(Self)
+    }
+
+    fn erase(&mut self) {
+        // Overwrites with a valid dummy scalar; does not erase compiler copies.
+        self.0.non_secure_erase();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for ErasingSecpSecret {}
+
+impl Drop for ErasingSecpSecret {
+    fn drop(&mut self) {
+        self.erase();
+    }
 }
 
 /// The owner-approval key: Ed25519, derived under its own context from the
@@ -121,6 +143,9 @@ const CTX_OWNER_APPROVAL: &str = "konsensus-v2 ed25519 owner-approval key v2 (se
 fn mnemonic_seed(mnemonic_str: &str, passphrase: &str) -> Result<Zeroizing<[u8; 64]>, IdentityError> {
     let mnemonic = bip39::Mnemonic::parse(mnemonic_str)
         .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
+    // Offline fallback: pbkdf2 is unavailable in the workspace/cache. bip39
+    // still returns the seed by value and retains internal parsing/PBKDF2
+    // buffers we cannot erase here; wrapping only protects the owned result.
     Ok(Zeroizing::new(mnemonic.to_seed(passphrase)))
 }
 
@@ -164,15 +189,15 @@ impl NodeIdentity {
 
         // X25519 key exchange
         let x25519_bytes = derive_key(CTX_X25519, seed);
-        let x25519_secret = X25519StaticSecret::from(*x25519_bytes);
+        let x25519_secret = X25519StaticSecret::from(&*x25519_bytes);
         let x25519_public = X25519PublicKey::from(&x25519_secret);
 
         // secp256k1 (Bitcoin/Lightning)
         let secp_bytes = derive_key(CTX_SECP256K1, seed);
-        let secp_secret = bitcoin::secp256k1::SecretKey::from_slice(secp_bytes.as_ref())
+        let secp_secret = ErasingSecpSecret::from_slice(secp_bytes.as_ref())
             .map_err(|e| IdentityError::DerivationFailed(format!("secp256k1: {e}")))?;
         let secp = bitcoin::secp256k1::Secp256k1::new();
-        let secp_public = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secp_secret);
+        let secp_public = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secp_secret.0);
 
         // AES-256 key for at-rest encryption
         let aes_key = derive_key(CTX_AES256, seed);
@@ -185,10 +210,9 @@ impl NodeIdentity {
             ed25519_verifying,
             x25519_secret,
             x25519_public,
-            x25519_secret_bytes: *x25519_bytes,
             secp_secret,
             secp_public,
-            aes_key: *aes_key,
+            aes_key,
             node_id,
         })
     }
@@ -231,12 +255,12 @@ impl NodeIdentity {
 
     /// The raw X25519 secret key bytes (for Noise protocol integration).
     pub fn x25519_secret_bytes(&self) -> &[u8; 32] {
-        &self.x25519_secret_bytes
+        self.x25519_secret.as_bytes()
     }
 
     /// The secp256k1 secret key (for Bitcoin/Lightning operations).
     pub fn secp_secret_key(&self) -> &bitcoin::secp256k1::SecretKey {
-        &self.secp_secret
+        &self.secp_secret.0
     }
 
     /// The secp256k1 public key.
@@ -254,8 +278,8 @@ impl NodeIdentity {
     /// This ensures JWT tokens survive node restarts without storing a separate
     /// secret in the config file. Uses blake3 keyed hash with a domain-separated
     /// context to avoid key reuse.
-    pub fn derive_jwt_secret(&self) -> [u8; 32] {
-        blake3::derive_key("konsensus-v2 jwt signing secret", &self.aes_key)
+    pub fn derive_jwt_secret(&self) -> Zeroizing<[u8; 32]> {
+        derive_key("konsensus-v2 jwt signing secret", self.aes_key.as_ref())
     }
 
     /// Sign arbitrary data with the Ed25519 key.
@@ -275,21 +299,6 @@ impl NodeIdentity {
     }
 }
 
-/// Zeroize secret key material on drop.
-///
-/// This ensures that private keys (Ed25519, X25519, secp256k1, AES) are
-/// overwritten with zeros when the identity goes out of scope, reducing
-/// the window for memory-based key extraction attacks.
-impl Drop for NodeIdentity {
-    fn drop(&mut self) {
-        // Zeroize raw byte fields we control directly
-        self.x25519_secret_bytes.zeroize();
-        self.aes_key.zeroize();
-        // Ed25519SigningKey, X25519StaticSecret, and secp256k1::SecretKey
-        // handle their own zeroization internally via their Drop impls.
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +307,103 @@ mod tests {
         "abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon art";
+
+    #[test]
+    fn retained_private_keys_are_zeroizing() {
+        fn assert_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        let id = NodeIdentity::from_seed(&[42; 64]).unwrap();
+        let owner = OwnerApprovalKey::from_seed(&[42; 64], &[7; 32]).unwrap();
+        assert_drop(&id.ed25519_signing);
+        assert_drop(&owner.signing);
+        fn assert_zeroize<T: zeroize::Zeroize>(_: &T) {}
+        assert_zeroize(&id.x25519_secret);
+        assert!(std::mem::needs_drop::<X25519StaticSecret>());
+        assert_drop(&id.secp_secret);
+        assert_drop(&id.aes_key);
+        assert_drop(&id.derive_jwt_secret());
+    }
+
+    #[test]
+    fn x25519_borrowed_constructor_preserves_unclamped_bytes() {
+        let bytes = Zeroizing::new([0xff; 32]);
+        let secret = X25519StaticSecret::from(&*bytes);
+        assert_eq!(secret.as_bytes(), &*bytes);
+        let id = NodeIdentity::from_seed(&[42; 64]).unwrap();
+        let expected = derive_key(CTX_X25519, &[42; 64]);
+        assert_eq!(id.x25519_secret_bytes(), &*expected);
+        assert_eq!(id.x25519_secret().as_bytes(), &*expected);
+    }
+
+    #[test]
+    fn secp_holder_erases_its_key() {
+        let mut id = NodeIdentity::from_seed(&[42; 64]).unwrap();
+        assert!(std::mem::needs_drop::<ErasingSecpSecret>());
+        assert_ne!(id.secp_secret_key().as_ref(), &[1; 32]);
+        id.secp_secret.erase();
+        // secp256k1's erasure overwrites with a valid dummy scalar (ones).
+        assert_eq!(id.secp_secret_key().as_ref(), &[1; 32]);
+    }
+
+    #[test]
+    fn bip39_official_seed_vectors() {
+        // BIP-39 English vectors (also shipped in bip39 2.2.2's tests):
+        // https://github.com/trezor/python-mnemonic/blob/master/vectors.json
+        for (words, expected) in [
+            (
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04",
+            ),
+            (
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon agent",
+                "035895f2f481b1b0f01fcf8c289c794660b289981a78f8106447707fdd9666ca06da5a9a565181599b79f53b844d8a71dd9f439c52a3d7b3e8a79c906ac845fa",
+            ),
+            (
+                TEST_MNEMONIC,
+                "bda85446c68413707090a52022edd26a1c9462295029f2e60cd7c4f2bbd3097170af7a4d73245cafa9c3cca8d561a7c3de6f5d4a10be8ed2a5e608d68f92fcc8",
+            ),
+        ] {
+            let seed = mnemonic_seed(words, "TREZOR").unwrap();
+            assert_eq!(hex::encode(&seed), expected);
+            let reference = Zeroizing::new(bip39::Mnemonic::parse(words).unwrap().to_seed("TREZOR"));
+            assert_eq!(&seed[..], &reference[..]);
+            let node = NodeIdentity::from_mnemonic(words, "TREZOR").unwrap();
+            assert_eq!(node.node_id(), NodeIdentity::from_seed(reference.as_ref()).unwrap().node_id());
+            let owner = OwnerApprovalKey::from_mnemonic(words, "TREZOR", &[7; 32]).unwrap();
+            assert_eq!(owner.verifying_key(), OwnerApprovalKey::from_seed(reference.as_ref(), &[7; 32]).unwrap().verifying_key());
+        }
+    }
+
+    #[test]
+    fn bip39_normalization_and_whitespace_match() {
+        // Composed/decomposed and compatibility characters, including a
+        // passphrase longer than SHA-512's HMAC block after NFKD expansion.
+        for passphrase in [
+            "é",
+            "e\u{301}",
+            "㍍ガバヴァぱばぐゞちぢ十人十色",
+            &"é㍍".repeat(80),
+        ] {
+            let words = TEST_MNEMONIC.replace(' ', "  \t");
+            let seed = mnemonic_seed(&words, passphrase).unwrap();
+            let reference = Zeroizing::new(
+                bip39::Mnemonic::parse(TEST_MNEMONIC)
+                    .unwrap()
+                    .to_seed(passphrase),
+            );
+            assert_eq!(&seed[..], &reference[..]);
+        }
+        assert_eq!(
+            &mnemonic_seed(TEST_MNEMONIC, "é").unwrap()[..],
+            &mnemonic_seed(TEST_MNEMONIC, "e\u{301}").unwrap()[..]
+        );
+    }
+
+    #[test]
+    fn jwt_key_bytes_are_unchanged() {
+        let id = NodeIdentity::from_seed(&[42; 64]).unwrap();
+        let expected = blake3::derive_key("konsensus-v2 jwt signing secret", id.aes_key());
+        assert_eq!(&id.derive_jwt_secret()[..], expected.as_slice());
+    }
 
     #[test]
     fn mnemonic_seed_holder_is_zeroizing() {
@@ -316,7 +422,7 @@ mod tests {
             let key: Zeroizing<[u8; 32]> = derive_key(context, seed.as_ref());
             fn assert_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
             assert_drop(&key);
-            assert_eq!(*key, blake3::derive_key(context, seed.as_ref()));
+            assert_eq!(&key[..], &blake3::derive_key(context, seed.as_ref()));
         }
     }
 
@@ -356,7 +462,7 @@ mod tests {
             id1.x25519_public.as_bytes(),
             id2.x25519_public.as_bytes()
         );
-        assert_eq!(id1.secp_secret.secret_bytes(), id2.secp_secret.secret_bytes());
+        assert_eq!(id1.secp_secret_key().as_ref(), id2.secp_secret_key().as_ref());
     }
 
     #[test]
@@ -374,7 +480,7 @@ mod tests {
         // Ed25519, X25519, secp256k1, AES keys should all be different
         let ed_bytes = id.ed25519_signing.to_bytes();
         let x_bytes = id.x25519_public.as_bytes();
-        let secp_bytes = id.secp_secret.secret_bytes();
+        let secp_bytes = id.secp_secret_key().as_ref();
         let aes_bytes = id.aes_key();
 
         assert_ne!(&ed_bytes[..], &secp_bytes[..]);
@@ -517,21 +623,21 @@ mod tests {
     fn derive_jwt_secret_is_deterministic() {
         let id1 = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let id2 = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        assert_eq!(id1.derive_jwt_secret(), id2.derive_jwt_secret());
+        assert_eq!(&id1.derive_jwt_secret()[..], &id2.derive_jwt_secret()[..]);
     }
 
     #[test]
     fn derive_jwt_secret_differs_per_identity() {
         let id1 = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let id2 = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "different").unwrap();
-        assert_ne!(id1.derive_jwt_secret(), id2.derive_jwt_secret());
+        assert_ne!(&id1.derive_jwt_secret()[..], &id2.derive_jwt_secret()[..]);
     }
 
     #[test]
     fn derive_jwt_secret_is_not_aes_key() {
         let id = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         assert_ne!(
-            &id.derive_jwt_secret(),
+            &id.derive_jwt_secret()[..],
             id.aes_key(),
             "JWT secret must differ from AES key"
         );
@@ -540,7 +646,7 @@ mod tests {
     #[test]
     fn derive_jwt_secret_is_nonzero() {
         let id = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        assert_ne!(id.derive_jwt_secret(), [0u8; 32]);
+        assert_ne!(&id.derive_jwt_secret()[..], &[0u8; 32]);
     }
 
     #[test]
