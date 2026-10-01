@@ -443,29 +443,17 @@ async fn connect_peer(
     Ok(Json(serde_json::json!({ "connected": true })))
 }
 
-/// `POST /api/v1/peers/:node_id/discover` — request peer list from a connected peer.
-///
-/// Triggers a peer exchange request to the specified peer. The peer responds
-/// with its known peers, which are added to the local registry (but not
-/// auto-whitelisted — Principle 3: closed mesh).
+/// `POST /api/v1/peers/:node_id/discover` — legacy unpaid discovery is disabled.
+/// A future buyer flow must authorize a signed quote and its per-request payment.
 async fn discover_peers(
     _auth: ScopedAuth<Admin>,
-    State(state): State<Arc<AppState>>,
     Path(node_id_hex): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let node_id = NodeId::from_hex(&node_id_hex)
+    NodeId::from_hex(&node_id_hex)
         .map_err(|e| ApiError::BadRequest(format!("invalid node ID: {e}")))?;
-
-    state
-        .transport
-        .request_peer_exchange(&node_id)
-        .await
-        .map_err(|e| ApiError::Transport(e.to_string()))?;
-
-    Ok(Json(serde_json::json!({
-        "requested": true,
-        "note": "Peer exchange response will be processed asynchronously. Check GET /api/v1/peers for new entries."
-    })))
+    Err(ApiError::BadRequest(
+        "peer discovery requires a signed quote and per-request payment; this endpoint cannot authorize that purchase".into(),
+    ))
 }
 
 /// `GET /api/v1/peers/export` — export all peers as a JSON backup.

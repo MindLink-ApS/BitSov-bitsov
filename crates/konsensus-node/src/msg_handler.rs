@@ -97,6 +97,14 @@ pub(crate) async fn whitelist_then_verify(
     admission_mode: konsensus_message::ReachabilityMode,
     commit_replay: bool,
 ) -> Result<(bool, bool), konsensus_core::gate::GateRejection> {
+    // This act's quote must be authenticated before any payment is consumed.
+    // Only PeerExchangePaidRequest reaches that path; ordinary Message frames
+    // cannot spend a quote payment or turn it into a durable connection grant.
+    if envelope.kind == konsensus_core::kind::KIND_PEER_EXCHANGE {
+        return Err(konsensus_core::gate::GateRejection::InvalidEnvelope(
+            "peer exchange requires the quoted paid request carrier".into(),
+        ));
+    }
     // Snapshot the whitelist UNCONDITIONALLY (preserves the HARD-11
     // lock-release-before-await seam even in PriceOpen, where the snapshot is
     // ignored). Only the cheap Arc clone is held across the gate await.

@@ -2142,3 +2142,17 @@ async fn peers_connect_known_peer_succeeds() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn discover_peers_requires_explicit_quote_and_payment() {
+    let state = test_state();
+    let auth = auth_header(&state);
+    let app = build_router(state);
+    let req = Request::builder().method("POST")
+        .uri(format!("/api/v1/peers/{}/discover", "ee".repeat(32)))
+        .header("Authorization", &auth).body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("quote and per-request payment"));
+}

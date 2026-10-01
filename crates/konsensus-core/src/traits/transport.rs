@@ -83,11 +83,8 @@ pub trait MessageTransport: Send + Sync {
     /// List all currently connected peers.
     async fn connected_peers(&self) -> Vec<NodeId>;
 
-    /// Request peer exchange from a connected peer.
-    ///
-    /// Sends a peer exchange request to the specified peer. The peer responds
-    /// asynchronously with its known peers via a control event. Returns an
-    /// error if the peer is not connected or the transport doesn't support it.
+    /// Legacy discovery entry point. Paid exchange requires an explicit signed
+    /// quote and a per-act payment; transports must not send unpaid discovery.
     async fn request_peer_exchange(&self, peer: &NodeId) -> Result<(), TransportError> {
         let _ = peer;
         Err(TransportError::Other("peer exchange not supported by this transport".into()))
