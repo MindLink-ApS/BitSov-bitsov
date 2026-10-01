@@ -5,6 +5,11 @@ use konsensus_message::peer::PeerEntry;
 use konsensus_storage::{SqliteStorage, StorageNonceAdapter};
 use std::sync::Arc;
 
+tokio::task_local! {
+    // Scoped to one future so advancing quote time cannot affect parallel tests.
+    pub(super) static CLOCK: u64;
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     owner: Arc<NodeIdentity>,
@@ -199,6 +204,82 @@ async fn altered_expired_wrong_recipient_and_wrong_act_quotes_do_not_consume_pay
         f.redeem(&q, &e).await.is_ok(),
         "invalid attempts did not consume proof"
     );
+}
+
+#[tokio::test]
+async fn redeem_rejects_payload_not_bound_to_quote_signature() {
+    let f = Fixture::new().await;
+    let q = f.quote().await.unwrap();
+    let e = f.paid(&q).await;
+    let mut bad = e.clone();
+    bad.ciphertext[0] ^= 1;
+    // Keep the envelope valid for the gate; only its binding to the quote differs.
+    bad.id = MessageId::compute(&bad.ciphertext, &bad.nonce);
+    f.sign(&mut bad);
+
+    assert_eq!(
+        f.redeem(&q, &bad).await.unwrap_err(),
+        "quote_payment_mismatch"
+    );
+    assert!(f.redeem(&q, &e).await.is_ok(), "proof was not consumed");
+}
+
+#[tokio::test]
+async fn redeem_rejects_genuine_quote_after_expiry() {
+    let f = Fixture::new().await;
+    let q = f.quote().await.unwrap();
+    let e = f.paid(&q).await;
+
+    // Advance only the quote clock, leaving the genuine quote, its signature,
+    // settled invoice and fresh envelope untouched. No other check can mask expiry.
+    let result = CLOCK.scope(q.expires_at + 1, f.redeem(&q, &e)).await;
+    assert_eq!(result.unwrap_err(), "invalid_peer_exchange_quote");
+    assert!(f.redeem(&q, &e).await.is_ok(), "proof was not consumed");
+}
+
+#[tokio::test]
+async fn redeem_rejects_forged_signable_fields_with_original_signature() {
+    let f = Fixture::new().await;
+    let q = f.quote().await.unwrap();
+    let e = f.paid(&q).await;
+    let mut forged = q.clone();
+    // This remains inside the valid time window and changes neither the invoice
+    // nor the sealed snapshot. Only Ed25519 verification can detect the forgery.
+    forged.expires_at -= 1;
+
+    assert_eq!(
+        f.redeem(&forged, &e).await.unwrap_err(),
+        "invalid_peer_exchange_quote"
+    );
+    assert!(f.redeem(&q, &e).await.is_ok(), "proof was not consumed");
+}
+
+#[tokio::test]
+async fn redeem_rejects_valid_quote_reused_by_another_peer() {
+    let f = Fixture::new().await;
+    let q = f.quote().await.unwrap();
+    let e = f.paid(&q).await;
+    let (_, other_peer) = NodeIdentity::generate().unwrap();
+    let mut reused = e.clone();
+    // Peer B authenticates its own envelope carrying A's settled proof and the
+    // original quote signature, so neither sender nor envelope verification masks it.
+    reused.sender = *other_peer.node_id();
+    reused.signature = Signature::from_ed25519(&other_peer.sign(&reused.signable_bytes()));
+
+    assert_eq!(
+        redeem(
+            &q,
+            &reused,
+            other_peer.node_id(),
+            &f.owner,
+            &f.nonces,
+            f.receiver.as_ref(),
+        )
+        .await
+        .unwrap_err(),
+        "invalid_peer_exchange_quote"
+    );
+    assert!(f.redeem(&q, &e).await.is_ok(), "proof was not consumed");
 }
 
 #[tokio::test]

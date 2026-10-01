@@ -22,6 +22,10 @@ use konsensus_message::{
 };
 
 pub(crate) fn now() -> u64 {
+    #[cfg(test)]
+    if let Ok(now) = tests::CLOCK.try_with(|now| *now) {
+        return now;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
