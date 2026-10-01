@@ -7,3 +7,4 @@ pub mod calendar;
 pub mod call;
 pub mod content;
 pub mod discovery;
+pub mod room;

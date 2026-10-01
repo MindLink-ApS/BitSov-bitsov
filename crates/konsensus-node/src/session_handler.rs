@@ -901,8 +901,11 @@ async fn send_prekey_offer(
 /// Wire reasons are the gate's stable Display prefixes; unknown reasons stay
 /// retryable so older peers and temporary gate failures cannot burn delivery.
 fn terminal_paid_rejection(reason: &str) -> bool {
-    ["payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:"]
-        .iter().any(|prefix| reason.starts_with(prefix))
+    [
+        "payment proof already used:", "insufficient payment:", "recipient mismatch:", "invalid signature:",
+        "room_binding_invalid:", "room_sender_not_member:", "room_recipient_not_member:",
+    ]
+    .iter().any(|prefix| reason.starts_with(prefix))
 }
 
 /// Bound storage work before looking up an unprivileged confirmation. A

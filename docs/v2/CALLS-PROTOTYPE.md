@@ -138,6 +138,8 @@ a fixed roster. The offer (400) of a leg carries one optional field:
   variant, so older nodes still decode the Hello.
 - Design and open decisions: MindLink-Private
   `pm/projects/bitsov/research/MESH-MEETINGS-DESIGN.md`.
+- Rooms (chat, up to 4) follow the same pattern with a binding on ordinary
+  chat and the advert `room_binding_v1`: `docs/protocol/ROOMS.md`.
 
 ## Own STUN responder (`[calls] stun_listen`, optional)
 

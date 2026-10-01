@@ -484,6 +484,24 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
             .collect()
     }
 
+    async fn get_node_messages_of_kind(
+        &self,
+        my_node_id: &str,
+        kind: u16,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
+        let encrypted = self
+            .inner
+            .get_node_messages_of_kind(my_node_id, kind, limit, before_timestamp)
+            .await?;
+
+        encrypted
+            .iter()
+            .map(|e| self.decrypt_envelope(e))
+            .collect()
+    }
+
     async fn delete_message(&self, id: &MessageId) -> Result<bool, StorageError> {
         self.inner.delete_message(id).await
     }

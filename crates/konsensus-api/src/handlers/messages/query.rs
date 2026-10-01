@@ -7,7 +7,8 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use konsensus_core::types::{MessageId, Recipient};
+use konsensus_core::payloads::room::{RoomBinding, RoomChat};
+use konsensus_core::types::{MessageId, NodeId, Recipient};
 
 use crate::audit::events;
 use crate::auth::scoped::{ScopedAuth, Admin, Read};
@@ -31,6 +32,12 @@ pub struct ListMessagesQuery {
     /// When set, returns both sent and received messages for the conversation.
     /// Without this, only incoming messages (recipient = this node) are returned.
     pub peer: Option<String>,
+    /// Only chats bound to this room id (64 lowercase hex): the room thread,
+    /// received and sent, among the most recent [`MAX_SEARCH_SCAN`] chats
+    /// with any node. Our per-member copies of one room message are one entry,
+    /// at its newest copy's timestamp; `before` and `limit` count entries.
+    /// Not combined with `peer`.
+    pub room: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -68,9 +75,41 @@ pub struct MessageResponse {
     /// Present on KIND_REPLY (kind=2) messages; omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<String>,
+    /// The room this chat belongs to (its binding, both ends in the roster).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomBinding>,
+    /// The room message id (`msg`), the same on every member's copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_msg: Option<String>,
+    /// In a room thread (`?room=`), our own room message is one entry whose
+    /// `recipient` is the room id, `payment_amount_msat` the sum, and `id`,
+    /// `ciphertext` and `payment_hash` those of its newest copy; this lists
+    /// every member's copy, sorted by recipient.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub copies: Vec<RoomCopy>,
+}
+
+/// One member's copy of our own room message.
+#[derive(Serialize)]
+pub struct RoomCopy {
+    pub recipient: String,
+    pub id: String,
+    pub payment_amount_msat: u64,
 }
 
 impl MessageResponse {
+    /// This chat's room: its binding, if sender and recipient node are both in
+    /// the roster (a refused one is withdrawn on receive; this holds on read).
+    fn room_of(&self, plaintext: &str) -> Option<RoomChat> {
+        if self.kind != konsensus_core::kind::KIND_CHAT {
+            return None;
+        }
+        let chat = RoomChat::parse(plaintext).ok()??;
+        let (from, to) = (NodeId::from_hex(&self.sender).ok()?, NodeId::from_hex(&self.recipient).ok()?);
+        chat.room.check(&from, &to).ok()?;
+        Some(chat)
+    }
+
     pub(super) fn from_envelope(env: &konsensus_core::UkmEnvelope) -> Self {
         let recipient_str = match &env.recipient {
             Recipient::Node(id) => id.to_hex(),
@@ -88,6 +127,9 @@ impl MessageResponse {
             payment_hash: hex::encode(env.payment_proof.payment_hash),
             plaintext: None,
             references: env.references.iter().map(|r| r.to_hex()).collect(),
+            room: None,
+            room_msg: None,
+            copies: Vec::new(),
         }
     }
 
@@ -97,6 +139,10 @@ impl MessageResponse {
             match c.decrypt(&enc) {
                 Ok(bytes) => {
                     if let Ok(text) = String::from_utf8(bytes) {
+                        if let Some(chat) = self.room_of(&text) {
+                            self.room = Some(chat.room);
+                            self.room_msg = Some(chat.msg);
+                        }
                         self.plaintext = Some(text);
                     }
                 }
@@ -190,6 +236,10 @@ pub(super) async fn get_message_plaintext(
 /// Without `peer` param: returns incoming messages (recipient = this node).
 /// With `peer` param: returns both sent and received messages for that
 /// conversation, enabling full conversation history including outgoing messages.
+/// With `room` param (64 lowercase hex): the room thread, both directions:
+/// chats carrying a valid binding to that room id among the newest
+/// `MAX_SEARCH_SCAN` chats with any node, our per-member copies of one room
+/// message shown once (see [`MessageResponse::copies`]).
 ///
 /// `BitSov-Data-As-Of` is the time the message store was read for this
 /// response (the store is local and authoritative, so normally "now").
@@ -200,6 +250,16 @@ pub(super) async fn list_messages(
 ) -> Result<(DataFreshness, Json<Vec<MessageResponse>>), ApiError> {
     let my_node_hex = state.identity.node_id().to_hex();
     let store_read = DataFreshness::now();
+    let limit = clamp_limit(params.limit);
+    if let Some(room) = &params.room {
+        if !konsensus_core::payloads::room::is_room_id(room) {
+            return Err(ApiError::BadRequest("invalid room: expected a 64-char lowercase hex room id".into()));
+        }
+        if params.peer.is_some() {
+            return Err(ApiError::BadRequest("room and peer are exclusive".into()));
+        }
+        return Ok((store_read, Json(room_thread(&state, &my_node_hex, room, limit, params.before).await?)));
+    }
 
     let messages = if let Some(ref peer_id) = params.peer {
         // Validate peer_id format: either a hex node ID or a UUID room ID.
@@ -223,7 +283,7 @@ pub(super) async fn list_messages(
                 &my_node_hex,
                 peer_id,
                 is_room,
-                clamp_limit(params.limit),
+                limit,
                 params.before,
             )
             .await
@@ -232,7 +292,7 @@ pub(super) async fn list_messages(
         let recipient = Recipient::Node(*state.identity.node_id());
         state
             .storage
-            .get_messages_for_recipient(&recipient, clamp_limit(params.limit), params.before)
+            .get_messages_for_recipient(&recipient, limit, params.before)
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     };
@@ -253,6 +313,59 @@ pub(super) async fn list_messages(
     }
 
     Ok((store_read, Json(responses)))
+}
+
+/// `?room=`: the room thread, both directions, as logical entries: a received
+/// chat, or one of our room messages with every member copy (same `msg`). It
+/// is built from the newest [`MAX_SEARCH_SCAN`] chats with any node, always
+/// from the top: copies of one message can be far apart (a resend to a member
+/// that was refused), so `before` cannot be applied to single envelopes
+/// without splitting a message across pages (Codex #155 delta 1). Each entry
+/// is placed at its newest copy's timestamp, ordered newest first (ties by
+/// id); `before` and `limit` then apply to entries, so a page never repeats
+/// or splits a message.
+async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, before: Option<u64>) -> Result<Vec<MessageResponse>, ApiError> {
+    let messages = state
+        .storage
+        .get_node_messages_of_kind(me, konsensus_core::kind::KIND_CHAT, MAX_SEARCH_SCAN, None)
+        .await
+        .map_err(|e| ApiError::Storage(e.to_string()))?;
+    let Some(cipher) = state.plaintext_cipher.as_deref() else { return Ok(Vec::new()) };
+    let mut thread: Vec<MessageResponse> = Vec::new();
+    // Our room message id -> its entry in `thread`.
+    let mut sent: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for env in &messages {
+        let cached = state.storage.get_message_plaintext(&env.id).await.unwrap_or(None);
+        let mut resp = MessageResponse::from_envelope(env).with_cached_plaintext(cached, Some(cipher));
+        if resp.room.as_ref().is_none_or(|room| room.id != room_id) {
+            continue;
+        }
+        if resp.sender == me {
+            let copy = RoomCopy { recipient: resp.recipient.clone(), id: resp.id.clone(), payment_amount_msat: resp.payment_amount_msat };
+            let msg = resp.room_msg.clone().unwrap_or_default();
+            if let Some(&at) = sent.get(&msg) {
+                let entry = &mut thread[at];
+                entry.payment_amount_msat = entry.payment_amount_msat.saturating_add(copy.payment_amount_msat);
+                if resp.timestamp > entry.timestamp || (resp.timestamp == entry.timestamp && resp.id > entry.id) {
+                    // The newest copy represents the entry.
+                    (entry.id, entry.timestamp, entry.ciphertext, entry.payment_hash) = (resp.id, resp.timestamp, resp.ciphertext, resp.payment_hash);
+                }
+                entry.copies.push(copy);
+                continue;
+            }
+            resp.recipient = room_id.to_string();
+            resp.copies.push(copy);
+            sent.insert(msg, thread.len());
+        }
+        thread.push(resp);
+    }
+    thread.sort_by(|a, b| (b.timestamp, &b.id).cmp(&(a.timestamp, &a.id)));
+    thread.retain(|entry| before.is_none_or(|before| entry.timestamp < before));
+    thread.truncate(limit as usize);
+    for entry in &mut thread {
+        entry.copies.sort_by(|a, b| a.recipient.cmp(&b.recipient));
+    }
+    Ok(thread)
 }
 
 /// Maximum number of most-recent messages a single search will decrypt and scan.

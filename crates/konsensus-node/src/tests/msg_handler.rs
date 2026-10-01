@@ -2016,3 +2016,151 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     assert!(ws_rx.try_recv().is_err());
     shutdown.send(true).unwrap(); worker.await.unwrap(); source.shutdown(); target.shutdown();
 }
+
+/// Rooms (#155): every incoming chat is held (invisible to history,
+/// plaintext, duplicate ACKs) from before its paid acceptance until it is
+/// decrypted and its room binding admitted, over Noise through the real
+/// receive loop. A valid room chat and plain chat are released and reach the
+/// app; a binding whose roster lacks this node, or whose roster does not match
+/// its room id, is withdrawn and refused terminally. If the withdrawal (or
+/// the release) fails, the chat stays held and hidden, a resend is refused,
+/// and the sweep withdraws it.
+#[tokio::test]
+async fn room_chats_stay_hidden_until_their_binding_is_admitted() {
+    use konsensus_core::payloads::room::RoomBinding;
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let transport = |id| Arc::new(NoiseTransport::new(id, TransportConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        admission_mode: ReachabilityMode::PriceOpen, ..Default::default()
+    }));
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source.connect(bob.node_id(), &target.listen_addr().unwrap().to_string()).await.unwrap();
+    while !matches!(source.recv_control().await.unwrap(), ControlEvent::PeerConnected { .. }) {}
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let sessions_b = Arc::new(SessionManager::new(bob.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, mut ws_rx) = broadcast::channel(16);
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> =
+        Arc::new(konsensus_pricing::StaticPricingEngine::new(Default::default()));
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(), transport_ack: target.clone(), storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true, ..Default::default()
+        })),
+        pricing,
+        lightning: wallet.clone(), chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b, nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None, front_door: Default::default(), routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(), plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx, audit_log: audit, admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None, shutdown_rx,
+    }));
+
+    // Alice pays Bob and sends one chat.
+    let chat = |body: String| {
+        let (wallet, sessions_a, alice, bob) = (wallet.clone(), &sessions_a, alice.clone(), bob.clone());
+        async move {
+            let msat = 10_000;
+            let hash = wallet.inject_inbound_keysend(msat, None).await;
+            let payment = wallet.get_payment_status(&hash).await.unwrap();
+            let proof = PaymentProof::new(hex::decode(&hash).unwrap().try_into().unwrap(),
+                hex::decode(payment.preimage.unwrap()).unwrap().try_into().unwrap(), msat);
+            let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+                &sessions_a.encrypt(bob.node_id(), body.as_bytes()).await.unwrap());
+            let mut env = UkmEnvelopeBuilder::new(0, *alice.node_id(), Recipient::Node(*bob.node_id()), ciphertext, proof).build();
+            env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+            env
+        }
+    };
+    let outcome = |source: Arc<NoiseTransport>| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { duplicate, .. } => break Ok(duplicate),
+                    ControlEvent::MessageRejected { reason, .. } => break Err(reason),
+                    _ => {}
+                }
+            }
+        }).await.unwrap()
+    };
+    let room_chat = |room: &RoomBinding, text: &str| {
+        serde_json::json!({"v": 1, "room": room, "msg": format!("{:032x}", rand::random::<u128>()), "text": text}).to_string()
+    };
+    let outsider = NodeId::from_bytes([0xee; 32]);
+    let room = RoomBinding::create(&[*alice.node_id(), *bob.node_id(), outsider]).unwrap();
+    let hidden = |env: konsensus_core::UkmEnvelope| {
+        let db = db.clone();
+        async move {
+            assert!(db.get_message(&env.id).await.unwrap().is_none(), "stored message visible");
+            assert!(db.get_message_plaintext(&env.id).await.unwrap().is_none(), "plaintext visible");
+            assert!(!db.get_messages_for_recipient(&env.recipient, 100, None).await.unwrap().iter().any(|e| e.id == env.id), "listed");
+            assert!(!db.is_paid_envelope_accepted(&env).await.unwrap(), "would be duplicate-ACKed");
+        }
+    };
+
+    // Admitted: released before the app sees it.
+    let text = room_chat(&room, "hello room");
+    let env = chat(text.clone()).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    let got = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(got.plaintext.as_deref(), Some(text.as_str()));
+    assert!(!db.call_admission_held(&env.id).await.unwrap());
+    assert!(db.get_message(&env.id).await.unwrap().is_some());
+    let plain = chat("plain chat".into()).await;
+    source.send(bob.node_id(), &plain).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    assert!(db.get_message(&plain.id).await.unwrap().is_some(), "plain chat is released too");
+    let _ = ws_rx.recv().await;
+
+    // Refused after decryption: withdrawn, terminal, never shown.
+    let not_bob = RoomBinding::create(&[*alice.node_id(), outsider]).unwrap();
+    let mut swapped = room.clone();
+    swapped.roster = RoomBinding::create(&[*alice.node_id(), *bob.node_id(), NodeId::from_bytes([0xdd; 32])]).unwrap().roster;
+    for (text, code) in [(room_chat(&not_bob, "x"), "room_recipient_not_member:"), (room_chat(&swapped, "x"), "room_binding_invalid:")] {
+        let env = chat(text).await;
+        source.send(bob.node_id(), &env).await.unwrap();
+        let reason = outcome(source.clone()).await.unwrap_err();
+        assert!(reason.starts_with(code), "{reason}");
+        hidden(env.clone()).await;
+        source.send(bob.node_id(), &env).await.unwrap();
+        assert!(outcome(source.clone()).await.is_err(), "a resend is not re-accepted");
+        assert!(ws_rx.try_recv().is_err());
+    }
+
+    // The withdrawal fails: still held, so hidden; a resend is refused, not
+    // duplicate-ACKed; the startup sweep withdraws it.
+    sqlx::raw_sql("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END").execute(db.pool()).await.unwrap();
+    let env = chat(room_chat(&not_bob, "stuck")).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(outcome(source.clone()).await.unwrap_err().starts_with("room_recipient_not_member:"));
+    assert!(db.call_admission_held(&env.id).await.unwrap());
+    hidden(env.clone()).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("message withdrawn".into()));
+    sqlx::raw_sql("DROP TRIGGER fail_withdraw").execute(db.pool()).await.unwrap();
+    assert_eq!(konsensus_api::calls::withdraw_held(db.as_ref(), true).await.unwrap(), 1);
+    hidden(env.clone()).await;
+
+    // The release fails: an admitted chat is withheld (hidden), never ACKed.
+    sqlx::raw_sql("CREATE TRIGGER fail_release BEFORE DELETE ON call_admission_hold BEGIN SELECT RAISE(ABORT, 'disk fault'); END").execute(db.pool()).await.unwrap();
+    let env = chat(room_chat(&room, "withheld")).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("storage error".into()));
+    hidden(env.clone()).await;
+    assert!(ws_rx.try_recv().is_err());
+    sqlx::raw_sql("DROP TRIGGER fail_release").execute(db.pool()).await.unwrap();
+    shutdown.send(true).unwrap(); worker.await.unwrap(); source.shutdown(); target.shutdown();
+}

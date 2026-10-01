@@ -1152,6 +1152,42 @@ impl Storage for SqliteStorage {
             .collect()
     }
 
+    async fn get_node_messages_of_kind(
+        &self,
+        my_node_id: &str,
+        kind: u16,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
+        let before = before_timestamp.map_or(i64::MAX, |t| t.min(i64::MAX as u64) as i64);
+        let lim = limit as i64;
+        let rows = sqlx::query_as::<_, (
+            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
+            String, String,
+        )>(
+            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
+             FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND kind = ? \
+             AND recipient_type = 'node' AND (sender = ? OR recipient_id = ?) AND timestamp_ms < ? \
+             ORDER BY timestamp_ms DESC LIMIT ?",
+        )
+        .bind(i64::from(kind))
+        .bind(my_node_id)
+        .bind(my_node_id)
+        .bind(before)
+        .bind(lim)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                row_to_envelope(
+                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
+                    &r.12,
+                )
+            })
+            .collect()
+    }
+
     async fn delete_message(&self, id: &MessageId) -> Result<bool, StorageError> {
         let id_hex = id.to_hex();
         // Clean up pending deliveries first (belt-and-suspenders with FK CASCADE)
