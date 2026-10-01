@@ -168,6 +168,13 @@ impl EsploraProvider {
 
 #[async_trait]
 impl ChainProvider for EsploraProvider {
+    fn chain_view(&self) -> konsensus_core::traits::chain::ChainView {
+        konsensus_core::traits::chain::ChainView {
+            backend: "esplora", trust_level: "third_party",
+            host: reqwest::Url::parse(&self.config.api_url).ok().and_then(|url| url.host_str().map(str::to_owned)),
+        }
+    }
+
     fn trust_level(&self) -> TrustLevel {
         self.config.trust_level
     }

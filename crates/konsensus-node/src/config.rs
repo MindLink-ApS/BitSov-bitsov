@@ -123,6 +123,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub pricing: PricingConfig,
 
+    /// Private peer discovery policy; disabled unless the owner opts in.
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
+
     /// Payment gate enforcement configuration.
     #[serde(default)]
     pub payment_gate: PaymentGateConfig,
@@ -525,7 +529,10 @@ pub enum ChainConfig {
     /// For testnet, development, and offline operation.
     #[serde(rename = "mock")]
     Mock,
-    // Future: electrum, bitcoind variants
+    /// Own pruned or full Bitcoin Core; also selects LDK's chain source.
+    #[serde(rename = "bitcoind")]
+    Bitcoind(konsensus_chain::BitcoindConfig),
+    // Future: electrum variant
 }
 
 impl ChainConfig {
@@ -533,6 +540,7 @@ impl ChainConfig {
     pub fn backend_name(&self) -> &'static str {
         match self {
             Self::Esplora { .. } => "esplora",
+            Self::Bitcoind(_) => "bitcoind",
             Self::Mock => "mock",
         }
     }
@@ -1031,6 +1039,28 @@ pub struct PeerConfigEntry {
     pub auto_connect: bool,
 }
 
+/// Owner-controlled export policy. Admission never implies sharing consent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyConfig {
+    #[serde(default)]
+    pub peer_exchange: PeerExchangeMode,
+    /// Only these node IDs may be exported. Empty by default.
+    #[serde(default)]
+    pub shareable_peers: Vec<konsensus_core::types::NodeId>,
+    /// Labels require separate consent and only apply to shareable peers.
+    #[serde(default)]
+    pub share_peer_labels: Vec<konsensus_core::types::NodeId>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerExchangeMode {
+    #[default]
+    Off,
+    Paid,
+}
+
 impl NodeConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -1042,7 +1072,10 @@ impl NodeConfig {
     /// Bootstrap must inspect configured paths before requiring an identity.
     pub(crate) fn load_before_identity_validation(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let mut config: Self = toml::from_str(&content)?;
+        // TOML errors include the source line, which may contain a rejected
+        // inline password. Never attach the raw parser error to startup logs.
+        let mut config: Self = toml::from_str(&content)
+            .map_err(|_| anyhow::anyhow!("invalid node configuration; check field names, types and file-based credentials"))?;
         config.anchor_relative_backup_dir(path);
         Ok(config)
     }
@@ -1501,6 +1534,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            privacy: PrivacyConfig::default(),
             disk_free_floor_bytes: default_disk_free_floor_bytes(),
             routing_fees: Default::default(),
             tier,

@@ -61,6 +61,7 @@ pub struct HealthResponse {
     pub lightning_node_pubkey: Option<String>,
     /// Chain backend name (e.g. "esplora", "mock").
     pub chain_backend: String,
+    pub chain_view: konsensus_core::traits::chain::ChainView,
     /// Current Bitcoin block height from the chain backend (`null` if unavailable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_height: Option<u64>,
@@ -271,6 +272,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         lightning_backend: state.lightning_backend.clone(),
         lightning_node_pubkey: state.lightning.get_node_pubkey().await,
         chain_backend: state.chain_backend.clone(),
+        chain_view: state.chain.chain_view(),
         block_height,
         stun_port: state.stun_port,
         stun_url: stun_url(peer.endpoint.as_deref(), state.stun_port),

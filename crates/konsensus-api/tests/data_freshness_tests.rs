@@ -677,3 +677,34 @@ async fn unpinned_read_route_does_not_carry_the_header() {
     assert_eq!(r.as_of, None);
     assert_eq!(r.stale, None);
 }
+
+#[tokio::test]
+async fn owner_status_reports_chain_view_without_exposing_it_on_public_health() {
+    let dir = tempfile::tempdir().unwrap();
+    let cookie = dir.path().join("cookie");
+    std::fs::write(&cookie, "user:STATUS_SECRET").unwrap();
+    let rpc: konsensus_chain::BitcoindConfig = serde_json::from_value(serde_json::json!({
+        "rpc_host":"127.0.0.1", "rpc_port":1, "cookie_file":cookie
+    })).unwrap();
+    let cases: Vec<(Arc<dyn ChainProvider>, &str, &str)> = vec![
+        (Arc::new(konsensus_chain::BitcoindProvider::new(rpc).unwrap()), "bitcoind", "trustless"),
+        (Arc::new(konsensus_chain::EsploraProvider::new(konsensus_chain::EsploraConfig::custom(
+            "http://127.0.0.1:1".into(), TrustLevel::ServerTrust,
+        )).unwrap()), "esplora", "third_party"),
+    ];
+    for (chain, backend, trust) in cases {
+        let mut state = test_state();
+        let s = Arc::get_mut(&mut state).unwrap();
+        s.chain = chain;
+        s.chain_backend = backend.into();
+        let response = get(state.clone(), "/api/v1/status", true).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.json["chain_view"], serde_json::json!({
+            "backend":backend, "trust_level":trust, "host":"127.0.0.1"
+        }));
+        assert!(!response.json.to_string().contains("STATUS_SECRET"));
+        let public = get(state.clone(), "/api/v1/health", false).await;
+        assert!(public.json.get("chain_view").is_none());
+        assert_eq!(get(state, "/api/v1/status", false).await.status, StatusCode::UNAUTHORIZED);
+    }
+}

@@ -87,7 +87,7 @@ async fn one_step_grant_sends_the_typed_code_after_the_terms() {
             assert_eq!(confirmation, "k7qm-3xwd");
             assert_eq!(terms.budget_msat, 2_000_000);
         }
-        other => panic!("{other:?}"),
+        _ => panic!("expected describe followed by grant"),
     }
 }
 
@@ -98,7 +98,7 @@ async fn an_empty_line_cancels_and_sends_nothing() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("not granted"));
     assert!(
         matches!(&seen[..], [ControlRequest::Describe { .. }]),
-        "no grant may be sent: {seen:?}"
+        "no grant may be sent"
     );
 }
 
