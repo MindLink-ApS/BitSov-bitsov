@@ -15,6 +15,7 @@ mod onboarding;
 mod pending_handler;
 mod profile_handler;
 mod relay;
+mod remote_access;
 mod session_handler;
 mod stun;
 mod admission_quotes;
@@ -1149,6 +1150,62 @@ async fn cmd_start(
         custody_mode: custody_mode(&config),
     });
 
+    // Public remote access is Noise only. Decrypted bytes go to an ephemeral
+    // loopback router that deliberately omits `/api/v1/auth/local`.
+    let (remote_internal_handle, remote_access_handle) =
+        if config.remote_access.listen_addr.is_some() {
+            let internal_listener =
+                tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .await
+                    .context("failed to bind internal remote API listener")?;
+            let internal_addr = internal_listener
+                .local_addr()
+                .context("failed to read internal remote API address")?;
+            let server = remote_access::RemoteAccessServer::bind(
+                &config.remote_access,
+                Arc::clone(node.identity()),
+                Arc::clone(&pairing_service),
+                internal_addr,
+            )
+            .await?;
+            let public_addr = server.local_addr()?;
+            if let Some(path) = server.pair_link_path() {
+                let expires_secs = server
+                    .pairing_expires_in()
+                    .map_or(0, |duration| duration.as_secs());
+                println!(
+                    "Remote pairing is available once at protected file {} (expires in {} seconds).",
+                    path.display(),
+                    expires_secs
+                );
+            }
+            info!(%public_addr, "remote access Noise listener started");
+
+            let remote_limiter = Arc::new(konsensus_api::RateLimiter::new(
+                config.api.rate_limit_rps,
+            ));
+            let remote_router = konsensus_api::build_remote_router_with_limiter(
+                Arc::clone(&api_state),
+                remote_limiter,
+            )
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let mut internal_shutdown = node.shutdown_rx();
+            let internal_handle = tokio::spawn(async move {
+                if let Err(error) = axum::serve(internal_listener, remote_router)
+                    .with_graceful_shutdown(async move {
+                        let _ = internal_shutdown.changed().await;
+                    })
+                    .await
+                {
+                    error!(%error, "internal remote API listener failed");
+                }
+            });
+            let remote_handle = tokio::spawn(server.serve(node.shutdown_rx()));
+            (Some(internal_handle), Some(remote_handle))
+        } else {
+            (None, None)
+        };
+
     // Calls: the owner's STUN binding responder, if configured.
     let stun_handle = stun_socket.map(|socket| {
         tokio::spawn(stun::serve(socket, stun::Limits::default(), node.shutdown_rx()))
@@ -1554,6 +1611,8 @@ async fn cmd_start(
             if let Err(e) = grant_cleanup_handle.await { warn!(error = %e, "grant cleanup task panicked"); }
             if let Some(h) = stun_discovery_handle { if let Err(e) = h.await { warn!(error = %e, "STUN discovery task panicked"); } }
             if let Some(h) = stun_handle { if let Err(e) = h.await { warn!(error = %e, "STUN responder task panicked"); } }
+            if let Some(h) = remote_access_handle { if let Err(e) = h.await { warn!(error = %e, "remote access task panicked"); } }
+            if let Some(h) = remote_internal_handle { if let Err(e) = h.await { warn!(error = %e, "internal remote API task panicked"); } }
         },
     )
     .await;

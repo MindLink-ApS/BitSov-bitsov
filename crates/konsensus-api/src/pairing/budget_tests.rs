@@ -11,6 +11,7 @@ fn expiry_during_reservation_persistence(live_reads: usize) {
             client_id: "client".into(),
             name: "test".into(),
             client_pubkey: "00".repeat(32),
+            remote_transport_pubkey: None,
             scopes: default_pairing_scopes(),
             epoch: 1,
             identity_fingerprint: "identity".into(),
