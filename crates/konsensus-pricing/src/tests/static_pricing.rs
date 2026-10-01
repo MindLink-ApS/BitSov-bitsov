@@ -72,9 +72,9 @@ async fn realtime_signaling_price() {
 #[tokio::test]
 async fn web_content_price() {
     let e = engine();
-    assert_eq!(e.get_price_msat(KIND_PAGE_REQUEST).await.unwrap(), 50);
-    assert_eq!(e.get_price_msat(KIND_PAGE_RESPONSE).await.unwrap(), 50);
-    assert_eq!(e.get_price_msat(KIND_WEB_MANIFEST).await.unwrap(), 50);
+    assert_eq!(e.get_price_msat(KIND_PAGE_REQUEST).await.unwrap(), 1_000);
+    assert_eq!(e.get_price_msat(KIND_PAGE_RESPONSE).await.unwrap(), 1_000);
+    assert_eq!(e.get_price_msat(KIND_WEB_MANIFEST).await.unwrap(), 1_000);
 }
 
 #[tokio::test]

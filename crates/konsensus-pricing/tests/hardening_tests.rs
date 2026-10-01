@@ -64,7 +64,7 @@ fn static_config_partial_json_uses_defaults() {
     assert_eq!(config.collaboration_msat, 25);
     assert_eq!(config.realtime_signal_msat, 50);
     assert_eq!(config.app_ext_msat, 10);
-    assert_eq!(config.web_content_msat, 50);
+    assert_eq!(config.web_content_msat, 1_000);
 }
 
 #[test]
@@ -262,7 +262,7 @@ async fn build_price_table_values_match_engine() {
     assert_eq!(table["files_media"], 100);
     assert_eq!(table["control"], 1);
     assert_eq!(table["realtime_signaling"], 50);
-    assert_eq!(table["web_content"], 50);
+    assert_eq!(table["web_content"], 1_000);
 }
 
 #[tokio::test]
@@ -483,9 +483,9 @@ async fn static_engine_boundary_kinds() {
     // Boundary: kind 499 is still RealTimeSignaling
     assert_eq!(engine.get_price_msat(499).await.unwrap(), 50);
     // Boundary: kind 500 is WebContent
-    assert_eq!(engine.get_price_msat(500).await.unwrap(), 50);
+    assert_eq!(engine.get_price_msat(500).await.unwrap(), 1_000);
     // Boundary: kind 599 is still WebContent
-    assert_eq!(engine.get_price_msat(599).await.unwrap(), 50);
+    assert_eq!(engine.get_price_msat(599).await.unwrap(), 1_000);
     // Boundary: kind 600 is relay Storage (priceable, T2R3)
     assert_eq!(engine.get_price_msat(600).await.unwrap(), 100);
     // Boundary: kind 699 is the top of the Storage range
