@@ -660,7 +660,7 @@ async fn porch_card_page_price_has_one_sat_floor() {
         (Some(1), 1000),
         (Some(999), 1000),
         (Some(1000), 1000),
-        (Some(3000), 3000),
+        (Some(3000), 1000),
     ] {
         let mut request =
             json!({"display_name": "Porch", "admission_msat": 1234, "message_msat": 5678});
@@ -682,5 +682,140 @@ async fn porch_card_page_price_has_one_sat_floor() {
         let card = FrontDoorCard::parse(body["link"].as_str().unwrap()).unwrap();
         card.verify_signature().unwrap();
         assert_eq!(card.prices.page_msat, expected);
+    }
+}
+
+fn porch_pricing_state(base_price: u64, admission: u64) -> Arc<AppState> {
+    let base = state_with(settings(Some("node.example.org:9000")));
+    Arc::new(AppState {
+        pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            konsensus_pricing::StaticPricingConfig {
+                web_content_msat: base_price,
+                ..Default::default()
+            },
+        )),
+        gate: Arc::new(konsensus_core::gate::PaymentGate::with_config(
+            konsensus_core::gate::GateConfig {
+                min_admission_cost_msat: admission,
+                ..Default::default()
+            },
+        )),
+        ..(*base).clone()
+    })
+}
+
+#[tokio::test]
+async fn porch_card_uses_gate_web_content_price() {
+    for (base, admission, expected) in [(1000, 2000, 2000), (5000, 0, 5000)] {
+        let state = porch_pricing_state(base, admission);
+        let (status, body, _) = call(
+            &state,
+            "PUT",
+            "/api/v1/front-door",
+            bearer(&state, vec![auth::Scope::Admin]),
+            Some(json!({"display_name": "Porch", "page_msat": 3000})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["card"]["prices"]["page_msat"], expected);
+        let card = FrontDoorCard::parse(body["link"].as_str().unwrap()).unwrap();
+        card.verify_signature().unwrap();
+        assert_eq!(card.prices.page_msat, expected);
+    }
+}
+
+#[tokio::test]
+async fn porch_stored_card_get_reprices_and_signs() {
+    let state = porch_pricing_state(1000, 2000);
+    let mut fields: FrontDoorFields = serde_json::from_value(json!({
+        "network": "regtest", "endpoint": "node.example.org:9000",
+        "seq": 1, "issued_at": now(),
+        "prices": {"admission_msat": 1000, "message_msat": 1000,
+                   "page_msat": 500, "price_epoch": 0},
+        "profile": {"kind": "person", "display_name": "Legacy"}
+    }))
+    .unwrap();
+    for base in [1000, 5000] {
+        let state = Arc::new(AppState {
+            pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(
+                konsensus_pricing::StaticPricingConfig {
+                    web_content_msat: base,
+                    ..Default::default()
+                },
+            )),
+            ..(*state).clone()
+        });
+        fields.seq += 1;
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = FrontDoorCard::issue(&state.identity, fields.clone()).unwrap();
+        std::fs::write(
+            dir.path().join("front-door.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            front_door: konsensus_api::handlers::front_door::FrontDoorStore::load(
+                Some(dir.path()),
+                None,
+                &state.identity.node_id().to_hex(),
+            ),
+            ..(*state).clone()
+        });
+        let (status, body, _) = call(
+            &state,
+            "GET",
+            "/api/v1/front-door",
+            bearer(&state, vec![auth::Scope::Read]),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = if base == 1000 { 2000 } else { 5000 };
+        assert_eq!(body["card"]["prices"]["page_msat"], expected);
+        let card = FrontDoorCard::parse(body["link"].as_str().unwrap()).unwrap();
+        card.verify_signature().unwrap();
+        assert_eq!(card.prices.page_msat, expected);
+        assert!(card.seq > legacy.seq);
+        assert_eq!(card.issued_at, legacy.issued_at);
+        assert_eq!(card.expires_at, legacy.expires_at);
+        assert_eq!(card.profile, legacy.profile);
+        let reloaded = konsensus_api::handlers::front_door::FrontDoorStore::load(
+            Some(dir.path()),
+            None,
+            &state.identity.node_id().to_hex(),
+        );
+        assert_eq!(reloaded.card.lock().await.as_ref(), Some(&card));
+        let (_, again, _) = call(
+            &state,
+            "GET",
+            "/api/v1/front-door",
+            bearer(&state, vec![auth::Scope::Read]),
+            None,
+        )
+        .await;
+        assert_eq!(again["card"]["seq"], card.seq);
+    }
+}
+
+#[tokio::test]
+async fn porch_manifest_preview_uses_gate_price() {
+    let dir = tempfile::tempdir().unwrap();
+    for content_dir in [None, Some(dir.path().to_path_buf())] {
+        let base = porch_pricing_state(1000, 2000);
+        let state = Arc::new(AppState {
+            content_dir,
+            web_page_price_msat: Some(50),
+            ..(*base).clone()
+        });
+        let (status, body, _) = call(
+            &state,
+            "GET",
+            "/api/v1/content/manifest",
+            bearer(&state, vec![auth::Scope::Read]),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["default_price_msat"], 2000);
     }
 }

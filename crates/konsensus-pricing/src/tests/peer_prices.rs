@@ -564,3 +564,33 @@ async fn porch_adverts_apply_floor_after_discount_only_to_reads() {
         );
     }
 }
+
+#[tokio::test]
+async fn porch_adverts_include_admission_floor() {
+    let cache = PeerPriceCache::new();
+    let peer = test_node_id(1);
+    cache
+        .update(
+            peer,
+            HashMap::from([
+                ("web_content".into(), 1000),
+                ("min_admission_cost_msat".into(), 2000),
+            ]),
+            1,
+            10,
+            0.5,
+        )
+        .await;
+    for kind in [500, 501] {
+        assert_eq!(
+            cache.get_discounted_peer_price(&peer, kind).await,
+            Some(2000)
+        );
+    }
+    for kind in [502, 510, 599] {
+        assert_eq!(
+            cache.get_discounted_peer_price(&peer, kind).await,
+            Some(500)
+        );
+    }
+}

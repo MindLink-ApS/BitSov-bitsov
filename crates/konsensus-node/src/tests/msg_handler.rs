@@ -292,6 +292,7 @@ async fn decrypt_no_session_returns_none() {
         &bob,
         &transport,
         &audit,
+        &PaymentGate::new(), 0.0,
     )
     .await;
 
@@ -329,6 +330,7 @@ async fn decrypt_invalid_ratchet_message_returns_none() {
         &bob,
         &transport,
         &audit,
+        &PaymentGate::new(), 0.0,
     )
     .await;
 
@@ -369,6 +371,7 @@ async fn decrypt_valid_message_returns_plaintext_and_caches() {
         &bob,
         &transport,
         &audit,
+        &PaymentGate::new(), 0.0,
     )
     .await;
 
@@ -423,6 +426,7 @@ async fn decrypt_file_ref_stores_and_returns_label() {
         &bob,
         &transport,
         &audit,
+        &PaymentGate::new(), 0.0,
     )
     .await;
 
@@ -454,6 +458,7 @@ async fn web_manifest_no_content_server_returns_label() {
         &bob,
         &session_mgr,
         &transport,
+        &PaymentGate::new(), 0.0,
     )
     .await;
 
@@ -490,6 +495,7 @@ async fn web_manifest_with_content_server_returns_label() {
         &bob,
         &session_mgr,
         &transport,
+        &PaymentGate::new(), 0.0,
     )
     .await;
 
@@ -556,6 +562,7 @@ async fn page_request_invalid_json_returns_none() {
         &session_mgr,
         &transport,
         &audit,
+        &PaymentGate::new(),
     )
     .await;
 
@@ -584,8 +591,7 @@ async fn page_request_no_content_server_returns_label() {
     let bytes = serde_json::to_vec(&page_req).unwrap();
 
     let result = process_page_request(
-        &bytes, &sender, &envelope, &None, &Default::default(), &pricing, &bob, &session_mgr, &transport, &audit,
-    )
+        &bytes, &sender, &envelope, &None, &Default::default(), &pricing, &bob, &session_mgr, &transport, &audit, &PaymentGate::new())
     .await;
 
     assert_eq!(result, Some("[page request: /index.md]".to_string()));
@@ -622,8 +628,7 @@ async fn page_request_with_content_server_serves_page() {
     let bytes = serde_json::to_vec(&page_req).unwrap();
 
     let result = process_page_request(
-        &bytes, &sender, &envelope, &Some(cs), &Default::default(), &pricing, &bob, &session_mgr, &transport, &audit,
-    )
+        &bytes, &sender, &envelope, &Some(cs), &Default::default(), &pricing, &bob, &session_mgr, &transport, &audit, &PaymentGate::new())
     .await;
 
     assert_eq!(result, Some("[page request: /hello.md]".to_string()));
@@ -659,8 +664,7 @@ async fn page_request_nonexistent_path_returns_label() {
     let bytes = serde_json::to_vec(&page_req).unwrap();
 
     let result = process_page_request(
-        &bytes, &sender, &envelope, &Some(cs), &Default::default(), &pricing, &bob, &session_mgr, &transport, &audit,
-    )
+        &bytes, &sender, &envelope, &Some(cs), &Default::default(), &pricing, &bob, &session_mgr, &transport, &audit, &PaymentGate::new())
     .await;
 
     assert_eq!(result, Some("[page request: /nonexistent.md]".to_string()));
@@ -710,6 +714,7 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
         &bob,
         &transport,
         &audit,
+        &PaymentGate::new(), 0.0,
     )
     .await;
 
@@ -755,6 +760,7 @@ async fn decrypt_non_utf8_returns_none() {
         &bob,
         &transport,
         &audit,
+        &PaymentGate::new(), 0.0,
     )
     .await;
 
@@ -1215,7 +1221,7 @@ async fn paid_acceptance_retry_case(legacy: bool, retained: bool, price_rise: bo
         crate::delivery_prices::send_price_frame(&target, db.as_ref(), alice.node_id(), &Frame::PriceTable {
             prices: std::collections::HashMap::from([("communication".into(), 100)]),
             block_height: 1, valid_blocks: 10, trust_discount: 0.0,
-        }, &MutableDeliveryPrice(std::sync::atomic::AtomicU64::new(100))).await.unwrap();
+        }, &MutableDeliveryPrice(std::sync::atomic::AtomicU64::new(100)), 0).await.unwrap();
         assert!(matches!(source.recv_control().await.unwrap(), ControlEvent::PriceTableReceived { .. }));
     }
     let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
@@ -1418,7 +1424,7 @@ async fn category_offer_kind_transition(old_longform: u64, new_chat: u64, new_lo
     let old = konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig { chat_msat: 1000, longform_msat: old_longform, ..Default::default() });
     assert_eq!(old.get_price_msat(konsensus_core::kind::KIND_LONGFORM).await.unwrap(), old_longform);
     let frame = Frame::PriceTable { prices: konsensus_pricing::peer_prices::build_price_table(&old).await, block_height: 1, valid_blocks: 10, trust_discount: 0.0 };
-    crate::delivery_prices::send_price_frame(&payee, db.as_ref(), alice.node_id(), &frame, &old).await.unwrap();
+    crate::delivery_prices::send_price_frame(&payee, db.as_ref(), alice.node_id(), &frame, &old, 0).await.unwrap();
     assert!(matches!(payer.recv_control().await.unwrap(), konsensus_message::ControlEvent::PriceTableReceived { .. }));
     let wallet = konsensus_lightning::MockLightningProvider::new();
     let hash = wallet.inject_inbound_keysend(1000, None).await;
@@ -1443,6 +1449,7 @@ async fn discounted_kind_offer_survives_price_rise() {
             discount,
             expected,
             true,
+            0,
         )
         .await;
     }
@@ -1453,8 +1460,17 @@ async fn porch_adverts_match_durable_offer_and_gate() {
     for kind in [500, 501, 502, 510, 599] {
         for send_response in [false, true] {
             for (base, expected) in [(1000, if kind <= 501 { 1000 } else { 500 }), (3000, 1500)] {
-                discounted_kind_offer_case(kind, base, 0.5, expected, send_response).await;
+                discounted_kind_offer_case(kind, base, 0.5, expected, send_response, 0).await;
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn porch_adverts_admission_matches_offer_and_gate() {
+    for kind in [500, 501] {
+        for response in [false, true] {
+            discounted_kind_offer_case(kind, 1000, 0.5, 2000, response, 2000).await;
         }
     }
 }
@@ -1465,6 +1481,7 @@ async fn discounted_kind_offer_case(
     discount: f64,
     expected: u64,
     send_response: bool,
+    admission: u64,
 ) {
     use konsensus_core::gate::GateConfig;
     use konsensus_core::traits::pricing::PricingEngine;
@@ -1529,6 +1546,7 @@ async fn discounted_kind_offer_case(
             trust_discount: discount,
         },
         &old,
+        admission,
     )
     .await
     .unwrap();
@@ -1565,6 +1583,7 @@ async fn discounted_kind_offer_case(
                 block_height: 1,
             },
             &old,
+            admission,
         )
         .await
         .unwrap();
@@ -1625,6 +1644,7 @@ async fn discounted_kind_offer_case(
     let nonce = konsensus_storage::StorageNonceAdapter::new(db.clone());
     let gate = PaymentGate::with_config(GateConfig {
         verify_lightning_settlement: true,
+        min_admission_cost_msat: admission,
         ..Default::default()
     });
     assert!(
@@ -1744,8 +1764,7 @@ async fn kind_offer_establishes_discount_on_new_connection() {
             price_msat: 2001,
             block_height: 1,
         },
-        &pricing,
-    )
+        &pricing, 0)
     .await
     .unwrap();
     match source.recv_control().await.unwrap() {
@@ -2190,4 +2209,74 @@ async fn room_chats_stay_hidden_until_their_binding_is_admitted() {
     assert!(ws_rx.try_recv().is_err());
     sqlx::raw_sql("DROP TRIGGER fail_release").execute(db.pool()).await.unwrap();
     shutdown.send(true).unwrap(); worker.await.unwrap(); source.shutdown(); target.shutdown();
+}
+
+#[tokio::test]
+async fn porch_wire_manifest_matches_discounted_gate_price() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = ContentServer::new(crate::content_server::ContentServerConfig {
+        content_dir: dir.path().to_path_buf(),
+        max_file_size: 4096,
+        cache_seconds: 60,
+        site_name: "Porch".into(),
+    })
+    .unwrap();
+    let gate = PaymentGate::with_config(konsensus_core::gate::GateConfig {
+        min_admission_cost_msat: 2000,
+        ..Default::default()
+    });
+    for (base, expected) in [(1000, 2000), (5000, 2500)] {
+        let pricing =
+            konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
+                web_content_msat: base,
+                ..Default::default()
+            });
+        let manifest = priced_manifest(&content, 1, &pricing, &gate, 0.5)
+            .await
+            .unwrap();
+        assert_eq!(manifest.default_price_msat, expected);
+    }
+}
+
+#[tokio::test]
+async fn porch_card_repricing_failure_returns_correlated_error() {
+    use konsensus_core::front_door::{FrontDoorCard, FrontDoorFields};
+    let bob = bob_identity();
+    let dir = tempfile::tempdir().unwrap();
+    let store = konsensus_api::handlers::front_door::FrontDoorStore::load(
+        Some(dir.path()),
+        None,
+        &bob.node_id().to_hex(),
+    );
+    let fields: FrontDoorFields = serde_json::from_value(serde_json::json!({
+        "network": "regtest", "endpoint": "node.example.org:9000",
+        "seq": 1, "issued_at": 1000,
+        "prices": {"admission_msat": 1000, "message_msat": 1000,
+                   "page_msat": 500, "price_epoch": 0},
+        "profile": {"kind": "person", "display_name": "Legacy"}
+    }))
+    .unwrap();
+    *store.card.lock().await = Some(FrontDoorCard::issue(&bob, fields).unwrap());
+    // A directory at the atomic temporary-file path makes saving fail on any OS.
+    std::fs::create_dir(dir.path().join("front-door.json.tmp")).unwrap();
+    let pricing = konsensus_pricing::StaticPricingEngine::new(Default::default());
+    let response = priced_card_response(
+        "paid-request",
+        &store,
+        &bob,
+        &pricing,
+        &PaymentGate::new(),
+        1001,
+    )
+    .await;
+    assert_eq!(response.request_id, "paid-request");
+    assert_eq!(
+        response.status,
+        konsensus_core::payloads::content::PageStatus::InternalError
+    );
+    assert_eq!(response.cache_seconds, 0);
+    assert!(
+        !response.body.contains("page_msat"),
+        "never serve the stale price"
+    );
 }

@@ -1,12 +1,12 @@
 //! Durable recipient offers for paid messages waiting in a sender's outbox.
 use konsensus_core::{
-    gate::porch_read_floor_msat,
+    gate::{porch_read_floor_msat, price_with_floor_msat},
     kind::{KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE},
     traits::transport::TransportError,
     NodeId,
 };
 use konsensus_message::{Frame, NoiseTransport};
-use konsensus_pricing::peer_prices::apply_trust_discount;
+use konsensus_pricing::peer_prices::{apply_trust_discount, ADMISSION_FLOOR_KEY};
 use konsensus_storage::Storage;
 
 /// Persist before publishing: a crash cannot erase a price already offered.
@@ -18,10 +18,16 @@ pub(crate) async fn send_price_frame(
     peer: &NodeId,
     frame: &Frame,
     pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
+    min_admission_cost_msat: u64,
 ) -> Result<(), TransportError> {
+    let mut advertised = frame.clone();
+    if let Frame::PriceTable { prices, .. } = &mut advertised {
+        prices.insert(ADMISSION_FLOOR_KEY.into(), min_admission_cost_msat);
+    }
+    let frame = &advertised;
     // A fresh connection has no known advertised discount. Establish one with
     // a full table before a kind response; the sender may retain an old cache.
-    let initial_table = match frame {
+    let mut initial_table = match frame {
         Frame::PriceTable { .. } => frame.clone(),
         Frame::PriceResponse { block_height, .. } => Frame::PriceTable {
             prices: konsensus_pricing::peer_prices::build_price_table(pricing).await,
@@ -31,6 +37,9 @@ pub(crate) async fn send_price_frame(
         },
         _ => return Err(TransportError::Other("expected a price frame".into())),
     };
+    if let Frame::PriceTable { prices, .. } = &mut initial_table {
+        prices.insert(ADMISSION_FLOOR_KEY.into(), min_admission_cost_msat);
+    }
     let initial_table = &initial_table;
     transport
         .send_price_frame_with(
@@ -50,22 +59,31 @@ pub(crate) async fn send_price_frame(
                     prices: categories, ..
                 }) = table
                 {
-                    prices.extend(categories.iter().map(|(category, price)| {
-                        let floor = category
-                            .strip_prefix("kind:")
-                            .and_then(|kind| kind.parse::<u16>().ok())
-                            .map(porch_read_floor_msat)
-                            .unwrap_or(0);
-                        (
-                            // Per-kind entries (`kind:400`) keep their scope.
-                            if category.starts_with("kind:") {
-                                category.clone()
-                            } else {
-                                format!("category:{category}")
-                            },
-                            apply_trust_discount(*price, discount).max(floor),
-                        )
-                    }));
+                    prices.extend(
+                        categories
+                            .iter()
+                            .filter(|(category, _)| category.as_str() != ADMISSION_FLOOR_KEY)
+                            .map(|(category, price)| {
+                                let kind = category
+                                    .strip_prefix("kind:")
+                                    .and_then(|kind| kind.parse::<u16>().ok())
+                                    .unwrap_or(0);
+                                (
+                                    // Per-kind entries (`kind:400`) keep their scope.
+                                    if category.starts_with("kind:") {
+                                        category.clone()
+                                    } else {
+                                        format!("category:{category}")
+                                    },
+                                    advertised_price(
+                                        kind,
+                                        *price,
+                                        discount,
+                                        min_admission_cost_msat,
+                                    ),
+                                )
+                            }),
+                    );
                     let mut excluded = pricing.category_price_overrides().ok_or_else(|| {
                         TransportError::Other(
                             "pricing engine cannot bind category offer applicability".into(),
@@ -80,8 +98,12 @@ pub(crate) async fn send_price_frame(
                             if let Some(base) = categories.get("web_content") {
                                 prices.push((
                                     key,
-                                    apply_trust_discount(*base, discount)
-                                        .max(porch_read_floor_msat(kind)),
+                                    advertised_price(
+                                        kind,
+                                        *base,
+                                        discount,
+                                        min_admission_cost_msat,
+                                    ),
                                 ));
                             }
                         }
@@ -102,8 +124,7 @@ pub(crate) async fn send_price_frame(
                     // stores that same final price.
                     prices.push((
                         format!("kind:{kind}"),
-                        apply_trust_discount(*price_msat, discount)
-                            .max(porch_read_floor_msat(*kind)),
+                        advertised_price(*kind, *price_msat, discount, min_admission_cost_msat),
                     ));
                 }
                 let now = std::time::SystemTime::now()
@@ -123,4 +144,13 @@ pub(crate) async fn send_price_frame(
             },
         )
         .await
+}
+
+fn advertised_price(kind: u16, base: u64, discount: f64, admission: u64) -> u64 {
+    let discounted = apply_trust_discount(base, discount);
+    if porch_read_floor_msat(kind) > 0 {
+        price_with_floor_msat(kind, discounted, admission)
+    } else {
+        discounted
+    }
 }

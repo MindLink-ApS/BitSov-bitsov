@@ -465,7 +465,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         // sender above — no second wallet weight lookup.
                                         trust_discount,
                                     };
-                                    if let Err(e) = crate::delivery_prices::send_price_frame(&transport_for_ack, storage_for_recv.as_ref(), &sender, &price_frame, pricing_for_recv.as_ref()).await {
+                                    if let Err(e) = crate::delivery_prices::send_price_frame(&transport_for_ack, storage_for_recv.as_ref(), &sender, &price_frame, pricing_for_recv.as_ref(), gate_for_recv.min_admission_cost_msat()).await {
                                         warn!(peer = %sender, error = %e, "failed to send corrective price table");
                                     } else {
                                         info!(peer = %sender, "sent corrective price table after payment mismatch");
@@ -560,6 +560,8 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             &identity_for_recv,
                             &transport_for_ack,
                             &audit_for_recv,
+                            &gate_for_recv,
+                            trust_discount,
                         ).await;
 
                         // 1:1 calls: the gate made this envelope paid and single-use;
@@ -688,6 +690,8 @@ async fn decrypt_and_process(
     identity: &Arc<NodeIdentity>,
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
+    gate: &PaymentGate,
+    trust_discount: f64,
 ) -> Option<String> {
     if !session_mgr.has_session(sender).await {
         debug!(sender = %sender, "no E2EE session, cannot decrypt");
@@ -779,6 +783,8 @@ async fn decrypt_and_process(
             identity,
             session_mgr,
             transport,
+            gate,
+            trust_discount,
         )
         .await
     } else if envelope.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
@@ -793,6 +799,7 @@ async fn decrypt_and_process(
             session_mgr,
             transport,
             audit,
+            gate,
         )
         .await
     } else if konsensus_message::wire::is_realtime_signal(envelope.kind) {
@@ -1021,6 +1028,8 @@ async fn process_web_manifest(
     identity: &Arc<NodeIdentity>,
     session_mgr: &SessionManager,
     transport: &Arc<NoiseTransport>,
+    gate: &PaymentGate,
+    trust_discount: f64,
 ) -> Option<String> {
     let Some(cs) = content_server else {
         debug!(sender = %sender, "manifest request received but content server disabled");
@@ -1028,11 +1037,7 @@ async fn process_web_manifest(
     };
 
     let block_height = chain.get_block_height().await.unwrap_or(0);
-    let default_price = pricing
-        .get_price_msat(konsensus_core::kind::KIND_PAGE_RESPONSE)
-        .await
-        .unwrap_or(1_000);
-    let manifest = cs.build_manifest(block_height, default_price);
+    let manifest = priced_manifest(cs, block_height, pricing.as_ref(), gate, trust_discount).await?;
     info!(sender = %sender, pages = manifest.pages.len(), "served web manifest");
 
     if session_mgr.can_send(sender).await {
@@ -1059,11 +1064,12 @@ async fn process_page_request(
     envelope: &konsensus_core::UkmEnvelope,
     content_server: &Option<Arc<ContentServer>>,
     front_door: &konsensus_api::handlers::front_door::FrontDoorStore,
-    _pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
+    pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     identity: &Arc<NodeIdentity>,
     session_mgr: &SessionManager,
     transport: &Arc<NoiseTransport>,
     audit: &Arc<AuditLog>,
+    gate: &PaymentGate,
 ) -> Option<String> {
     let page_req: konsensus_core::payloads::content::PageRequest =
         match serde_json::from_slice(bytes) {
@@ -1079,8 +1085,9 @@ async fn process_page_request(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let card = front_door.card.lock().await.clone();
-        crate::content_server::card_response(page_req.request_id.clone(), card.as_ref(), now)
+        priced_card_response(
+            &page_req.request_id, front_door, identity, pricing.as_ref(), gate, now,
+        ).await
     } else if let Some(cs) = content_server {
         cs.handle_request(&page_req)
     } else {
@@ -1176,6 +1183,45 @@ async fn send_encrypted_response<T: serde::Serialize>(
 
     if let Err(e) = transport.send(peer_id, &resp_envelope).await {
         warn!(peer = %peer_id, error = %e, "failed to send response envelope");
+    }
+}
+
+async fn priced_manifest(
+    content: &ContentServer,
+    block_height: u64,
+    pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
+    gate: &PaymentGate,
+    trust_discount: f64,
+) -> Option<konsensus_core::payloads::content::WebManifest> {
+    let kind = konsensus_core::kind::KIND_PAGE_RESPONSE;
+    let base = pricing.get_price_msat(kind).await.ok()?;
+    let discounted = konsensus_pricing::peer_prices::apply_trust_discount(base, trust_discount);
+    Some(content.build_manifest(block_height, gate.price_with_floor_msat(kind, discounted)))
+}
+
+async fn priced_card_response(
+    request_id: &str,
+    front_door: &konsensus_api::handlers::front_door::FrontDoorStore,
+    identity: &NodeIdentity,
+    pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
+    gate: &PaymentGate,
+    now: u64,
+) -> konsensus_core::payloads::content::PageResponse {
+    match front_door.priced_card(identity, pricing, gate).await {
+        Ok(card) => crate::content_server::card_response(request_id.into(), card.as_ref(), now),
+        Err(error) => {
+            warn!(%error, "could not derive porch card price");
+            konsensus_core::payloads::content::PageResponse {
+                request_id: request_id.into(),
+                status: konsensus_core::payloads::content::PageStatus::InternalError,
+                content_type: String::new(),
+                body: "Card temporarily unavailable".into(),
+                cache_seconds: 0,
+                is_complete: true,
+                chunk_index: 0,
+                total_chunks: 1,
+            }
+        }
     }
 }
 

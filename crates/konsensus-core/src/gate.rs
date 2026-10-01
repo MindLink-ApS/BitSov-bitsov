@@ -29,6 +29,11 @@ use crate::types::{MessageId, NodeId, Nonce, Recipient};
 /// Maximum lifetime of a recipient-issued delivery price offer.
 pub const DELIVERY_PRICE_WINDOW_SECS: u64 = 3600;
 
+/// Resolve the final price after discount, for both acceptance and adverts.
+pub fn price_with_floor_msat(kind: u16, discounted: u64, min_admission_cost_msat: u64) -> u64 {
+    discounted.max(min_admission_cost_msat.max(porch_read_floor_msat(kind)))
+}
+
 /// Non-discountable porch-read minimum, shared by the gate and price adverts.
 /// Other kinds retain their existing pricing (no additional floor).
 pub fn porch_read_floor_msat(kind: u16) -> u64 {
@@ -530,7 +535,7 @@ impl PaymentGate {
                 let settled = self.verify_settlement(envelope, ln, 1, our_node_id).await?;
                 let quoted = receipts.delivery_price_floor(envelope, settled.timestamp, now_ms / 1000).await
                     .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
-                let Some(required) = quoted.map(|price| price.max(1).max(self.price_floor_msat(envelope.kind))) else { return Err(rejection); };
+                let Some(required) = quoted.map(|price| self.price_with_floor_msat(envelope.kind, price.max(1))) else { return Err(rejection); };
                 if envelope.payment_proof.amount_msat < required || settled.amount_msat < required { return Err(rejection); }
                 settlement_checked = true;
                 required
@@ -648,8 +653,13 @@ impl PaymentGate {
     }
 
     /// Absolute floors apply to both current prices and earlier delivery quotes.
-    fn price_floor_msat(&self, kind: u16) -> u64 {
-        self.config.min_admission_cost_msat.max(porch_read_floor_msat(kind))
+    pub fn price_with_floor_msat(&self, kind: u16, discounted: u64) -> u64 {
+        price_with_floor_msat(kind, discounted, self.config.min_admission_cost_msat)
+    }
+
+    /// Admission floor carried in peer price tables without a trust discount.
+    pub fn min_admission_cost_msat(&self) -> u64 {
+        self.config.min_admission_cost_msat
     }
 
     /// Verify the payment amount meets the required price.
@@ -720,7 +730,7 @@ impl PaymentGate {
         // resolved `required_msat` is returned to and re-enforced by the
         // settlement layer, the floor binds the settled amount too — a sender
         // cannot under-claim below cost and pass settlement in isolation.
-        let required_msat = discounted_msat.max(self.price_floor_msat(envelope.kind));
+        let required_msat = self.price_with_floor_msat(envelope.kind, discounted_msat);
 
         if required_msat > discounted_msat {
             debug!(
@@ -3006,6 +3016,50 @@ mod tests {
                     } else {
                         assert!(result.is_ok(), "kind={kind}, amount={amount}: {result:?}");
                     }
+                }
+            }
+        }
+    }
+
+
+    #[tokio::test]
+    async fn porch_quoted_fallback_enforces_admission_floor() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let gate = PaymentGate::with_config(GateConfig {
+            min_admission_cost_msat: 2000,
+            verify_lightning_settlement: true,
+            ..Default::default()
+        });
+        let recipient = NodeId::from_bytes([2; 32]);
+        let pricing = MockPricing { price_msat: 6000 };
+        for kind in [KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE] {
+            for amount in [1000, 1999, 2000] {
+                let mut envelope = make_signed_envelope(&identity, amount);
+                envelope.kind = kind;
+                envelope.signature =
+                    crate::types::Signature::from_ed25519(&identity.sign(&envelope.signable_bytes()));
+                let mut nonces = MockNonceStore::new();
+                nonces.quoted_price_msat = Some(500);
+                let result = gate
+                    .verify(
+                        &envelope,
+                        &nonces,
+                        &pricing,
+                        None,
+                        Some(&MockLightning::settled(amount)),
+                        0.5,
+                        Some(&recipient),
+                    )
+                    .await;
+                if amount < 2000 {
+                    assert!(
+                        matches!(result, Err(GateRejection::InsufficientPayment {
+                        required_msat: 3000, paid_msat
+                    }) if paid_msat == amount),
+                        "{result:?}"
+                    );
+                } else {
+                    assert!(result.is_ok(), "{result:?}");
                 }
             }
         }

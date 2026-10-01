@@ -56,6 +56,53 @@ pub struct FrontDoorStore {
 }
 
 impl FrontDoorStore {
+    /// Re-derive a published card from the gate tariff, including cards saved by
+    /// older versions. Persist and re-sign only when the price changes; reads
+    /// neither renew the expiry nor change the owner's profile.
+    pub async fn priced_card(
+        &self,
+        identity: &konsensus_core::identity::NodeIdentity,
+        pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
+        gate: &konsensus_core::gate::PaymentGate,
+    ) -> Result<Option<FrontDoorCard>, ApiError> {
+        let price = porch_page_price(pricing, gate).await?;
+        let mut store = self.card.lock().await;
+        let Some(card) = store.as_ref() else {
+            return Ok(None);
+        };
+        if card.prices.page_msat == price {
+            return Ok(Some(card.clone()));
+        }
+        let mut floor = self.seq_floor.lock().await;
+        let seq = card
+            .seq
+            .max(*floor)
+            .checked_add(1)
+            .ok_or_else(|| ApiError::Conflict("front-door sequence exhausted".into()))?;
+        let mut prices = card.prices.clone();
+        prices.page_msat = price;
+        let updated = FrontDoorCard::issue(
+            identity,
+            FrontDoorFields {
+                network: card.network.clone(),
+                endpoint: card.endpoint.clone(),
+                seq,
+                issued_at: card.issued_at,
+                prices,
+                profile: card.profile.clone(),
+                cv: card.cv.clone(),
+                media: card.media.clone(),
+                site: card.site.clone(),
+                links: card.links.clone(),
+            },
+        )
+        .map_err(map_err)?;
+        self.save(&updated)?;
+        *floor = seq;
+        *store = Some(updated.clone());
+        Ok(Some(updated))
+    }
+
     /// Resolve `content_dir/front-door.json`, else `data_dir/pages/front-door.json`.
     pub fn persist_path(content_dir: Option<&Path>, data_dir: Option<&Path>) -> Option<PathBuf> {
         if let Some(dir) = content_dir {
@@ -300,6 +347,7 @@ pub struct UpsertFrontDoorRequest {
     #[serde(default)]
     pub message_msat: Option<u64>,
     #[serde(default)]
+    /// Accepted for compatibility; published page prices are derived from web_content.
     pub page_msat: Option<u64>,
     #[serde(default)]
     pub cv: Option<FrontDoorCv>,
@@ -367,9 +415,10 @@ async fn get_front_door(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let guard = state.front_door.card.lock().await;
-    let card = guard
-        .clone()
+    let card = state
+        .front_door
+        .priced_card(&state.identity, state.pricing.as_ref(), &state.gate)
+        .await?
         .ok_or_else(|| ApiError::NotFound("front_door_missing: publish one first".into()))?;
     let body = response_for(card, state.introduction.network.as_deref(), now_unix()?)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)))
@@ -397,6 +446,7 @@ async fn put_front_door(
         .await
         .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
     let (default_admission, default_message) = first_contact_prices(chat);
+    let page_msat = porch_page_price(state.pricing.as_ref(), &state.gate).await?;
     let height = state.chain.get_block_height().await.unwrap_or(0);
 
     let mut store = state.front_door.card.lock().await;
@@ -419,9 +469,7 @@ async fn put_front_door(
             prices: FrontDoorPrices {
                 admission_msat: req.admission_msat.unwrap_or(default_admission),
                 message_msat: req.message_msat.unwrap_or(default_message),
-                page_msat: req.page_msat.unwrap_or(1_000).max(
-                    konsensus_core::gate::porch_read_floor_msat(konsensus_core::kind::KIND_PAGE_REQUEST),
-                ),
+                page_msat,
                 price_epoch: height / 2016,
             },
             profile: FrontDoorProfile {
@@ -579,4 +627,17 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/api/v1/front-door/verify", post(verify_front_door))
         .route("/api/v1/front-door/open", post(open_front_door))
+}
+
+/// Public cards and previews have no peer trust discount.
+pub async fn porch_page_price(
+    pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
+    gate: &konsensus_core::gate::PaymentGate,
+) -> Result<u64, ApiError> {
+    let kind = konsensus_core::kind::KIND_PAGE_REQUEST;
+    let base = pricing
+        .get_price_msat(kind)
+        .await
+        .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
+    Ok(gate.price_with_floor_msat(kind, base))
 }
