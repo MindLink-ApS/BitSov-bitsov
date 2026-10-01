@@ -2062,7 +2062,7 @@ async fn room_chats_stay_hidden_until_their_binding_is_admitted() {
         lightning: wallet.clone(), chain: Arc::new(konsensus_chain::MockChainProvider::new()),
         peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
         session_manager: sessions_b, nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
-        content_server: None, routing: Arc::new(RoutingTable::new(Default::default())),
+        content_server: None, front_door: Default::default(), routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(), plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         ws_tx, audit_log: audit, admission_mode: ReachabilityMode::PriceOpen,
         relay_engine: None, shutdown_rx,
