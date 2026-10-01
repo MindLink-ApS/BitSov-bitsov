@@ -10,7 +10,10 @@
 //! - [`EsploraProvider`] — HTTP REST API (Esplora/mempool.space compatible)
 //! - Neutrino (BIP 157/158) — planned
 //! - Electrum — planned
-//! - Bitcoin Core RPC — planned
+//! - [`BitcoindProvider`] — own Bitcoin Core RPC (pruned or full)
+
+pub mod bitcoind;
+pub use bitcoind::{BitcoindConfig, BitcoindProvider};
 
 pub mod esplora;
 pub mod mock;
