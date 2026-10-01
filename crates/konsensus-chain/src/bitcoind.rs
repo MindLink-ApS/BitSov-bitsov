@@ -209,7 +209,7 @@ impl ChainProvider for BitcoindProvider {
     fn chain_view(&self) -> ChainView {
         ChainView {
             backend: "bitcoind",
-            trust_level: "trustless",
+            trust_level: "own_node",
             host: Some(self.config.rpc_host.clone()),
         }
     }

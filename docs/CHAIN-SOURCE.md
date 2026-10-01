@@ -2,8 +2,8 @@
 
 BitSov can use your own Bitcoin Core (pruned or full) for both embedded LDK
 Lightning and chain height, headers, fees and transaction confirmation. MindLink
-does not run a default chain server. This is step 1 of the chain-source work:
-existing Esplora configurations and fresh `init` defaults remain unchanged;
+does not run a default chain server. Existing Esplora configurations and fresh
+`init` defaults remain unchanged;
 onboarding selection, Neutrino and Electrum are later steps.
 
 ## Own Bitcoin Core
@@ -64,13 +64,34 @@ node with `txindex=1`. There is no fallback to a public explorer.
 Authenticated `GET /api/v1/status` includes:
 
 ```json
-{"chain_view":{"backend":"bitcoind","trust_level":"trustless","host":"127.0.0.1"}}
+{"chain_view":{"backend":"bitcoind","trust_level":"own_node","host":"127.0.0.1"}}
 ```
 
-“Trustless” describes validation by your own Core, including pruned Core; it is
-not a connectivity or sync guarantee. The separate height/readiness fields report
-availability. If you point RPC at someone else's Core, you are trusting that
-operator; this setting assumes you control the node.
+`own_node` means you configured Bitcoin Core and is an assumption that you control
+it. BitSov does not prove that Core validates blocks, that you own it, or that it
+is connected or synchronized. If you point RPC at someone else's Core, you trust
+that operator. The separate height/readiness fields report availability.
+
+**Status compatibility:** `chain_view.trust_level` was renamed from `trustless`
+to `own_node`. App clients matching this value must update; `third_party` is
+unchanged.
+
+LDK wallet sync failures appear in owner status, including during initial sync:
+
+```json
+{"chain_sync":{"state":"stalled","since":1790899200,"last_error_kind":"sync_failed"},"money_ready":false}
+```
+
+`since` is Unix seconds at the first failed attempt for the currently failing
+wallet in this process. Retries preserve it, and a successful sync clears that
+wallet's failure. A failure of either wallet keeps the diagnostic stalled. This
+diagnostic does not gate money operations: `money_ready` retains its running,
+post-startup wallet sync and timestamp freshness checks. `sync_failed` is a fixed,
+non-secret kind: it does not diagnose pruning versus an unreachable RPC. No remote error text, credentials or paths
+are returned. Restore required block history or RPC access and let LDK retry.
+`chain_sync: null` means no observed wallet sync failure (or a backend without
+this diagnostic), **not** proof of synchronization. Use `money_ready` for money
+readiness. Diagnostics reset on restart; existing freshness checks still apply.
 
 Esplora remains supported and reports `backend: "esplora"`,
 `trust_level: "third_party"`, and the selected provider's hostname. A public

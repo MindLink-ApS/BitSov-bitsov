@@ -243,6 +243,10 @@ impl CircuitBreakerLightning {
 
 #[async_trait]
 impl LightningProvider for CircuitBreakerLightning {
+    fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
+        self.inner.chain_sync_status()
+    }
+
     fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy { self.inner.routing_fee_policy() }
     async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, cap: u64) -> Result<PaymentDetails, LightningError> {
         self.inner.keysend_with_fee_limit(dest, amount, memo, cap).await

@@ -988,6 +988,15 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
+    fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
+        self.node.status().chain_sync_failure.map(|failure| {
+            konsensus_core::traits::lightning::ChainSyncStatus::Stalled {
+                since: failure.since,
+                last_error_kind: konsensus_core::traits::lightning::ChainSyncErrorKind::SyncFailed,
+            }
+        })
+    }
+
     async fn money_ready(&self) -> bool {
         let status = self.node.status();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();

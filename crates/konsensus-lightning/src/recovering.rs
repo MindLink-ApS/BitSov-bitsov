@@ -191,6 +191,11 @@ impl Drop for RecoveringLightning {
 
 #[async_trait]
 impl LightningProvider for RecoveringLightning {
+    fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
+        // Diagnostics must bypass backend(), which deliberately gates money work.
+        self.state.read().unwrap().backend.as_ref().and_then(|p| p.chain_sync_status())
+    }
+
     async fn readiness(&self) -> LightningReadiness {
         self.state.read().unwrap().readiness.clone()
     }

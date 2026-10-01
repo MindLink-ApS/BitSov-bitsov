@@ -111,3 +111,14 @@ opening newer retained state; it cannot detect restoring the whole directory
 It is not permission to restore stale LDK state. Preserve the latest state and
 follow [the recovery guidance](v2/RECOVERY.md); recovery commands themselves are
 not gated by the disk admission floor.
+
+## Chain-view status compatibility (#158)
+
+Owner `GET /api/v1/status` now returns `chain_view.trust_level: "own_node"`
+for Bitcoin Core, replacing `"trustless"`. Update app comparisons to the new
+value. It describes configured ownership, not proven validation or readiness;
+Esplora remains `"third_party"`.
+
+The new nullable `chain_sync` reports observed LDK wallet failures with
+`state: "stalled"`, `since` (Unix seconds), and the fixed kind
+`last_error_kind: "sync_failed"`. See [chain source status](CHAIN-SOURCE.md#privacy-and-status).

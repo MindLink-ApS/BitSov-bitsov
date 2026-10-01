@@ -35,3 +35,24 @@ the original gross.
 The regression invokes the production handler and uses LDK's existing in-memory
 test channel managers to deliver multipart HTLCs. No node is started, no socket
 is bound, and no real wallet or funds are used.
+
+## Observed wallet sync health
+
+`chain/sync_health.rs` records process-local success/failure observations in two
+wallet slots. The first failure time survives retries; success clears only the
+corresponding slot, and the oldest outstanding failure is exposed as
+`NodeStatus.chain_sync_failure`. Bitcoind's combined listener synchronization and
+polling use one slot; Esplora/Electrum record onchain and Lightning wallet results
+separately. Remote error strings, credentials, URLs and paths are not retained.
+
+The existing sync results are recorded and returned unchanged. Channel manager,
+chain monitor, sweeper, broadcast and persistence behavior is unchanged. The
+BitSov adapter exposes this only as the owner `/status` `chain_sync` diagnostic;
+it does not change `money_ready`, payment dispatch or wallet freshness semantics.
+
+    cargo test --offline --manifest-path vendor/ldk-node/Cargo.toml --locked --lib sync_health
+
+The unit regression checks retry timestamps, independent wallet failures and
+clearing on success. Workspace regressions cover owner-only status, unchanged
+readiness/dispatch after failure, and failed Core synchronization with an isolated
+process network guard permitting only the disposable RPC fixture.
