@@ -71,6 +71,21 @@ pub struct HealthResponse {
     /// node knows no reachable host (wildcard bind, loopback).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stun_url: Option<String>,
+    /// Dialable `host:port` this node signs into introductions and front-door
+    /// cards; omitted when none is known (see `peer_endpoint_reason`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_endpoint: Option<String>,
+    /// `advertised` (owner set), `listen` (concrete bind) or `stun` (discovered).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_endpoint_source: Option<String>,
+    /// Why there is no `peer_endpoint`: `no_dialable_endpoint`, `stun_pending`,
+    /// `stun_unreachable` or `stun_invalid_response`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_endpoint_reason: Option<String>,
+    /// Where the seed lives: `local_seed`, `encrypted_seed`, `hosted_custody`,
+    /// `money_signer` or `remote_signer` (`docs/protocol/REMOTE-SIGNER.md` §2).
+    /// Owner-only.
+    pub custody_mode: crate::custody::CustodyMode,
 }
 
 /// `stun:host:port` for the STUN responder at the host of the node's
@@ -213,6 +228,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         tokio::time::timeout(std::time::Duration::from_secs(1), state.chain.get_block_height()).await.ok().and_then(Result::ok)
     } else { None };
 
+    let peer = state.introduction.endpoint_view();
     Json(HealthResponse {
         money_ready: readiness.money_ready,
         readiness,
@@ -249,7 +265,11 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         chain_backend: state.chain_backend.clone(),
         block_height,
         stun_port: state.stun_port,
-        stun_url: stun_url(state.introduction.endpoint.as_deref(), state.stun_port),
+        stun_url: stun_url(peer.endpoint.as_deref(), state.stun_port),
+        peer_endpoint: peer.endpoint,
+        peer_endpoint_source: peer.source.map(String::from),
+        peer_endpoint_reason: peer.reason.map(String::from),
+        custody_mode: state.custody_mode,
     })
 }
 
@@ -281,9 +301,7 @@ async fn preflight(State(state): State<Arc<AppState>>) -> Json<PreflightResponse
 /// `/api/v1/health` is unauthenticated (public, redacted); `/api/v1/status` is
 /// owner-only (behind `ScopedAuth<Read>`).
 pub fn routes(operator_probes_enabled: bool) -> Router<Arc<AppState>> {
-    let router = Router::new()
-        .route("/api/v1/health", get(health))
-        .route("/api/v1/status", get(status));
+    let router = status_routes().route("/api/v1/health", get(health));
     if operator_probes_enabled {
         router
             .route("/api/v1/preflight", get(preflight))
@@ -291,4 +309,10 @@ pub fn routes(operator_probes_enabled: bool) -> Router<Arc<AppState>> {
     } else {
         router
     }
+}
+
+/// Authenticated status only, for the encrypted remote API. Public/operator
+/// liveness endpoints belong exclusively to the owner's local listener.
+pub fn status_routes() -> Router<Arc<AppState>> {
+    Router::new().route("/api/v1/status", get(status))
 }

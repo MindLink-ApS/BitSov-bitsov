@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 thread_local! {
     /// When set, the next [`NodeConfig::save`] fails after the atomic rename
     /// and before the parent-directory fsync, simulating a sync failure.
-    static FAIL_CONFIG_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_CONFIG_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Arm a one-shot failure of the config parent-directory sync in [`NodeConfig::save`].
@@ -30,7 +30,8 @@ pub(crate) fn fail_next_config_dir_sync() {
 /// User-facing onboarding tier.
 ///
 /// This determines the default configuration and UI presentation.
-/// - **Cloud/Relay**: paired remote access with user-held keys
+/// - **Cloud/Relay**: paired remote access; until a remote signer exists the
+///   node holds its seed, so it reports `hosted_custody` (REMOTE-SIGNER.md)
 /// - **Light**: local node with user-selected Lightning
 /// - **Full**: fully sovereign node with own Lightning (maximum sovereignty)
 ///
@@ -41,6 +42,8 @@ pub(crate) fn fail_next_config_dir_sync() {
 pub enum NodeTier {
     /// Relay-compatible remote access mode.
     /// The operator may provide reachability but must not hold user keys.
+    /// Until a remote signer exists it does, so the node reports
+    /// `hosted_custody` (`docs/protocol/REMOTE-SIGNER.md`).
     Cloud,
     /// Local node with hosted Lightning.
     /// Your keys, your data, hosted wallet.
@@ -80,7 +83,7 @@ impl NodeTier {
     /// Short human-readable description of the tier.
     pub fn description(self) -> &'static str {
         match self {
-            Self::Cloud => "Cloud/Relay — paired remote access, user-held keys",
+            Self::Cloud => "Cloud/Relay — paired remote access, hosted custody (the server holds the seed)",
             Self::Light => "Light Node — your device, user-selected Lightning",
             Self::Full => "Full Node — fully sovereign",
         }
@@ -130,6 +133,10 @@ pub struct NodeConfig {
     /// HTTP/WebSocket API configuration.
     #[serde(default)]
     pub api: ApiConfig,
+
+    /// Noise-protected remote API tunnel. Closed unless `listen_addr` is set.
+    #[serde(default)]
+    pub remote_access: RemoteAccessConfig,
 
     /// Sovereign browser / web content server configuration.
     #[serde(default)]
@@ -220,6 +227,12 @@ pub struct IdentityConfig {
     /// This is NOT the encryption password — it changes the derived keys.
     #[serde(default)]
     pub passphrase: String,
+
+    /// The machine this node runs on is operated for the owner (a cloud VM),
+    /// so whoever runs it can spend. The node then reports `hosted_custody`
+    /// (`docs/protocol/REMOTE-SIGNER.md` §6). The Cloud tier implies it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hosted: bool,
 }
 
 /// Network configuration — listen address and sovereignty tier.
@@ -239,18 +252,82 @@ pub struct NetworkConfig {
     /// bind such as `0.0.0.0:9000`. Never the API address.
     #[serde(default)]
     pub advertised_addr: Option<String>,
+
+    /// Owner-chosen STUN server (`stun:host:port` or `host:port`, UDP) used to
+    /// learn this node's public IP when `advertised_addr` is unset and
+    /// `listen_addr` is a wildcard bind. There is no default and no third-party
+    /// fallback; it may be another node's `[calls] stun_listen`. Never
+    /// overrides `advertised_addr`. See [`crate::stun`] for what is (and is
+    /// not) discovered.
+    #[serde(default)]
+    pub stun_server: Option<String>,
 }
 
 impl NetworkConfig {
-    /// The peer endpoint an introduction may name: `advertised_addr`, else
-    /// `listen_addr` unless it is a wildcard bind.
-    pub fn introduction_endpoint(&self) -> Option<String> {
+    /// The peer endpoint fixed by configuration, without any network access:
+    /// `advertised_addr` (trimmed, non-empty), else `listen_addr` unless it is
+    /// a wildcard bind, with where it came from. Never consults (or is changed
+    /// by) STUN discovery.
+    pub fn configured_endpoint(&self) -> Option<(String, &'static str)> {
+        use konsensus_api::handlers::introduction::source;
         self.advertised_addr
             .as_ref()
             .map(|a| a.trim().to_string())
             .filter(|a| !a.is_empty())
-            .or_else(|| (!self.listen_addr.ip().is_unspecified()).then(|| self.listen_addr.to_string()))
+            .map(|a| (a, source::ADVERTISED))
+            .or_else(|| {
+                (!self.listen_addr.ip().is_unspecified()).then(|| (self.listen_addr.to_string(), source::LISTEN))
+            })
     }
+
+    /// The validated `host:port` of `stun_server`, if the owner set one.
+    pub fn stun_server_addr(&self) -> Result<Option<String>, String> {
+        match self.stun_server.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => parse_stun_server(raw).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Parse `[network] stun_server`: `stun:host:port` or plain `host:port`
+/// (IPv6 in brackets). Returns `host:port` for resolution at query time, so a
+/// DNS name is looked up afresh on every refresh.
+///
+/// `stuns:` is rejected until TLS STUN with server-identity verification is
+/// supported — accepting it would silently downgrade to cleartext UDP.
+pub fn parse_stun_server(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("stuns:") {
+        return Err(format!(
+            "[network] stun_server {raw:?}: stuns: (TLS STUN) is not supported yet; use stun:host:port until server identity verification is available"
+        ));
+    }
+    let rest = if lower.starts_with("stun:") {
+        &raw["stun:".len()..]
+    } else {
+        raw
+    };
+    let (host, port) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| format!("[network] stun_server {raw:?} must be host:port"))?;
+    let port: u16 = port
+        .parse()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| format!("[network] stun_server {raw:?} has an invalid port"))?;
+    let host_ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => {
+            !host.is_empty()
+                && host.len() <= 253
+                && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        }
+    };
+    if !host_ok {
+        return Err(format!("[network] stun_server {raw:?} has an invalid host"));
+    }
+    Ok(format!("{host}:{port}"))
 }
 
 impl Default for NetworkConfig {
@@ -259,6 +336,7 @@ impl Default for NetworkConfig {
             listen_addr: default_listen_addr(),
             tier: SovereigntyTier::T1,
             advertised_addr: None,
+            stun_server: None,
         }
     }
 }
@@ -860,6 +938,16 @@ impl Default for ApiConfig {
     }
 }
 
+/// Public Noise listener for remote app access.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAccessConfig {
+    #[serde(default)]
+    pub listen_addr: Option<SocketAddr>,
+    #[serde(default)]
+    pub advertised_endpoint: Option<String>,
+}
+
 /// Sovereign browser / web content server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -997,6 +1085,7 @@ impl NodeConfig {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         self.validate_routing_fee_backend()?;
         self.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?;
+        self.network.stun_server_addr().map_err(|e| anyhow::anyhow!(e))?;
         // Check mnemonic file exists and is readable
         if !self.identity.mnemonic_file.exists() {
             anyhow::bail!(
@@ -1025,15 +1114,48 @@ impl NodeConfig {
         }
 
         // Check P2P and API ports don't collide
-        if self.network.listen_addr.port() == self.api.listen_addr.port()
-            && (self.network.listen_addr.ip().is_unspecified()
-                || self.api.listen_addr.ip().is_unspecified()
-                || self.network.listen_addr.ip() == self.api.listen_addr.ip())
-        {
+        if tcp_addrs_collide(self.network.listen_addr, self.api.listen_addr) {
             anyhow::bail!(
                 "P2P listen address ({}) and API listen address ({}) use the same port",
                 self.network.listen_addr,
                 self.api.listen_addr
+            );
+        }
+
+        if let Some(remote_addr) = self.remote_access.listen_addr {
+            if !self.api.listen_addr.ip().is_loopback() {
+                anyhow::bail!(
+                    "[api].listen_addr must be loopback when [remote_access] is enabled; \
+                     plaintext HTTP may not be exposed remotely"
+                );
+            }
+            let endpoint = self
+                .remote_access
+                .advertised_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[remote_access].advertised_endpoint is required when listen_addr is set"
+                    )
+                })?;
+            validate_remote_endpoint(endpoint).map_err(anyhow::Error::msg)?;
+            for (label, other) in [
+                ("P2P", self.network.listen_addr),
+                ("API", self.api.listen_addr),
+            ] {
+                if tcp_addrs_collide(remote_addr, other) {
+                    anyhow::bail!(
+                        "remote access listen address ({remote_addr}) and {label} listen address \
+                         ({other}) use the same TCP port"
+                    );
+                }
+            }
+        } else if self.remote_access.advertised_endpoint.is_some() {
+            anyhow::bail!(
+                "[remote_access].advertised_endpoint requires listen_addr; omit both to keep \
+                 remote access closed"
             );
         }
 
@@ -1079,6 +1201,14 @@ impl NodeConfig {
                         self.network.listen_addr,
                         ln_socket
                     );
+                }
+                if let Some(remote_addr) = self.remote_access.listen_addr {
+                    if tcp_addrs_collide(remote_addr, ln_socket) {
+                        anyhow::bail!(
+                            "remote access listen address ({remote_addr}) and Lightning listening \
+                             address ({ln_socket}) use the same TCP port"
+                        );
+                    }
                 }
             }
         }
@@ -1237,13 +1367,20 @@ impl NodeConfig {
     /// Atomically replace `path` with `bytes`, fsyncing the file and its
     /// parent directory. Failures propagate so callers can refuse to publish a
     /// success marker against a non-durable config.
-    fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    /// The temporary file [`Self::write_atomic`] writes (and removes) next to
+    /// `path`. Anything that must not be clobbered by a config save (the
+    /// recovery phrase in `seed encrypt`) is checked against it.
+    pub(crate) fn write_atomic_temp(path: &Path) -> PathBuf {
+        path.with_extension("toml.tmp")
+    }
+
+        fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
         // Sibling temp in the same directory so rename is atomic on the volume.
-        let tmp = path.with_extension("toml.tmp");
+        let tmp = Self::write_atomic_temp(path);
         let _ = std::fs::remove_file(&tmp);
 
         konsensus_api::pairing::write_protected(&tmp, bytes).map_err(|e| {
@@ -1359,11 +1496,13 @@ impl NodeConfig {
             identity: IdentityConfig {
                 mnemonic_file,
                 passphrase: String::new(),
+                hosted: false,
             },
             network: NetworkConfig {
                 listen_addr: default_listen_addr(),
                 tier: network_tier,
                 advertised_addr: None,
+                stun_server: None,
             },
             lightning,
             chain,
@@ -1382,6 +1521,7 @@ impl NodeConfig {
                 operator_probes_enabled: Some(matches!(tier, NodeTier::Cloud)),
                 ..ApiConfig::default()
             },
+            remote_access: RemoteAccessConfig::default(),
             web: WebConfig::default(),
             // Boundary invariant (PUB-1): no bootstrap peers are compiled into
             // the binary. Embedding live node IDs/IPs here would publish the
@@ -1422,6 +1562,45 @@ fn default_listen_addr() -> SocketAddr {
 
 fn default_api_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 3141))
+}
+
+fn tcp_addrs_collide(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() == b.port() && (a.ip().is_unspecified() || b.ip().is_unspecified() || a.ip() == b.ip())
+}
+
+fn validate_remote_endpoint(endpoint: &str) -> Result<(), String> {
+    if endpoint.bytes().any(|b| b.is_ascii_whitespace()) || endpoint.contains("://") {
+        return Err(format!(
+            "[remote_access].advertised_endpoint {endpoint:?} must be a bare host:port"
+        ));
+    }
+    let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
+        format!("[remote_access].advertised_endpoint {endpoint:?} must be host:port")
+    })?;
+    let valid_host = if host.starts_with('[') && host.ends_with(']') {
+        host[1..host.len() - 1]
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
+    } else {
+        host.parse::<std::net::Ipv4Addr>().is_ok()
+            || (host.len() <= 253
+                && host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                }))
+    };
+    let valid_port = port.parse::<u16>().is_ok_and(|port| port != 0);
+    if !valid_host || !valid_port {
+        return Err(format!(
+            "[remote_access].advertised_endpoint {endpoint:?} must be a valid host:port"
+        ));
+    }
+    Ok(())
 }
 
 /// DESERIALIZATION default — frozen. An existing `[chain]` stanza that omits

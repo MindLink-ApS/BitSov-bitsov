@@ -15,6 +15,7 @@ mod onboarding;
 mod pending_handler;
 mod profile_handler;
 mod relay;
+mod remote_access;
 mod session_handler;
 mod stun;
 mod admission_quotes;
@@ -25,6 +26,8 @@ mod scb_restore;
 mod whitelist_cmd;
 #[path = "cli/owner.rs"]
 mod owner_cmd;
+#[path = "cli/seed.rs"]
+mod seed_cmd;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,17 +124,36 @@ async fn main() -> Result<()> {
         Command::Init { dir, non_interactive, tier, encrypt } => {
             cmd_init(&dir, non_interactive, tier.as_deref(), encrypt)?;
         }
-        Command::Start { config, password, admission_mode, owner_control } => {
-            cmd_start(&config, password.as_deref(), admission_mode.as_deref(), owner_control).await?;
+        Command::Start { config, password, password_file, admission_mode, owner_control } => {
+            let from_file = match &password_file {
+                Some(path) => {
+                    eprintln!(
+                        "WARNING: reading the recovery-phrase password from {}. Any program running as \
+                         this user can read that file, so the seed is protected from other OS users \
+                         only. Prompting at start is the stronger setting.",
+                        path.display()
+                    );
+                    Some(seed_cmd::read_password_file(path)?)
+                }
+                None => None,
+            };
+            let password = password.as_deref().or(from_file.as_deref().map(|p| p.as_str()));
+            cmd_start(&config, password, admission_mode.as_deref(), owner_control).await?;
         }
         Command::Approve { command } => {
             owner_cmd::cmd_approve(command).await?;
         }
+        Command::Seed { command: cli::SeedCommand::Encrypt { config } } => {
+            seed_cmd::cmd_seed_encrypt(&config)?;
+        }
+        Command::Device { command } => {
+            owner_cmd::cmd_device(command).await?;
+        }
         Command::PairStatus { config } => {
             owner_cmd::cmd_pair_status(&config).await?;
         }
-        Command::Grant { op_id, budget, for_, per_call, recipient, yes, config, allow_liquidity_fees } => {
-            let flags = owner_cmd::GrantFlags { allow_liquidity_fees, budget_sats: budget, window: for_, per_call_sats: per_call, recipients: recipient, yes };
+        Command::Grant { op_id, budget, for_, per_call, recipient, yes: _, config, allow_liquidity_fees } => {
+            let flags = owner_cmd::GrantFlags { allow_liquidity_fees, budget_sats: budget, window: for_, per_call_sats: per_call, recipients: recipient };
             owner_cmd::cmd_grant(&config, &op_id, flags).await?;
         }
         Command::GrantRevoke { client_id, all, config } => {
@@ -305,7 +327,7 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
 
     match tier {
         NodeTier::Cloud => {
-            println!("Cloud/Relay mode: starts with mock backends and user-held keys.");
+            println!("Cloud/Relay mode: starts with mock backends. Hosted custody: this machine holds the seed.");
             println!("Next steps:");
             println!("  1. Run: konsensus start -c {}", config_path.display());
             println!("  2. Pair with a relay or configure a user-controlled Lightning provider.");
@@ -468,7 +490,7 @@ fn prompt_tier_selection() -> Result<crate::config::NodeTier> {
     println!("How do you want to run BitSov?");
     println!();
     println!("  [1] Cloud/Relay — Paired remote access.");
-    println!("                    Your keys stay yours; relay support is optional.");
+    println!("                    Hosted custody: the server holds the seed.");
     println!();
     println!("  [2] Light    — Your device, user-selected Lightning.");
     println!("                 Your keys, your data. Recommended for most users.");
@@ -667,6 +689,51 @@ fn sign_auth_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) 
     Ok(hex::encode(signature.to_bytes()))
 }
 
+/// The owner-approval public key, or why device approvals stay off.
+///
+/// Only an encrypted recovery phrase, with no plaintext copy beside it, whose
+/// password was typed at this start, yields a key: then a same-user program
+/// holding the files (or an old plaintext copy) cannot derive it, because the
+/// key also needs the password (see `mnemonic_crypto::owner_secret`).
+fn owner_approval_key(
+    config: &NodeConfig,
+    password: Option<&str>,
+    password_typed: bool,
+    node_id_hex: &str,
+) -> std::result::Result<ed25519_dalek::VerifyingKey, &'static str> {
+    use konsensus_api::pairing::device::{OWNER_KEY_UNAVAILABLE, SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
+    let path = &config.identity.mnemonic_file;
+    if !mnemonic_crypto::is_encrypted_path(path) || path.with_extension("txt").exists() {
+        return Err(SEED_NOT_ENCRYPTED);
+    }
+    if !password_typed {
+        return Err(SEED_PASSWORD_NOT_TYPED);
+    }
+    let password = password.ok_or(OWNER_KEY_UNAVAILABLE)?;
+    let mnemonic = mnemonic_crypto::read_mnemonic(path, Some(password)).map_err(|_| OWNER_KEY_UNAVAILABLE)?;
+    let secret = mnemonic_crypto::owner_secret(password, node_id_hex).map_err(|_| OWNER_KEY_UNAVAILABLE)?;
+    konsensus_core::OwnerApprovalKey::from_mnemonic(&mnemonic, &config.identity.passphrase, &secret)
+        .map(|k| k.verifying_key())
+        .map_err(|_| OWNER_KEY_UNAVAILABLE)
+}
+
+/// Where this node's seed lives, for the owner's badge
+/// (`docs/protocol/REMOTE-SIGNER.md` §2). A hosted node holding its seed is
+/// `hosted_custody` even when the seed is encrypted: it decrypts into the
+/// operator's memory. Nothing here yields `remote_signer` or `money_signer`;
+/// no signer exists (REMOTE-SIGNER.md §2 gate).
+fn custody_mode(config: &NodeConfig) -> konsensus_api::custody::CustodyMode {
+    use konsensus_api::custody::CustodyMode;
+    let path = &config.identity.mnemonic_file;
+    if config.identity.hosted || matches!(config.tier, NodeTier::Cloud) {
+        CustodyMode::HostedCustody
+    } else if mnemonic_crypto::is_encrypted_path(path) && !path.with_extension("txt").exists() {
+        CustodyMode::EncryptedSeed
+    } else {
+        CustodyMode::LocalSeed
+    }
+}
+
 /// `konsensus start` — boot the node.
 async fn cmd_start(
     config_path: &Path,
@@ -674,6 +741,8 @@ async fn cmd_start(
     admission_mode: Option<&str>,
     owner_control: bool,
 ) -> Result<()> {
+    // A password given by flag or file was not typed here; see owner_approval_key.
+    let password_typed = password.is_none();
     // Relative configs must become absolute before any parent()/data_dir use.
     let config_path = owner_cmd::absolute_config_path(config_path)?;
     let config_path = config_path.as_path();
@@ -932,14 +1001,48 @@ async fn cmd_start(
     // trusted-client list that widens it.
     let identity_fingerprint =
         konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
-    let pairing_service = Arc::new(
-        konsensus_api::pairing::PairingService::open(
+    // Device approvals (Touch ID) need an owner key a same-user program cannot
+    // derive: from an encrypted seed whose password was typed at this start.
+    // Otherwise they are off node-wide, with the reason the app shows.
+    let device_authority = owner_approval_key(
+        &config,
+        mnemonic_password.as_deref(),
+        password_typed,
+        &node.identity().node_id().to_hex(),
+    );
+    let pairing_service = Arc::new({
+        let service = konsensus_api::pairing::PairingService::open(
             &data_dir,
             identity_fingerprint.clone(),
             owner_control,
         )
-        .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?,
-    );
+        .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?
+        // The owner command the app and console show names this exact config.
+        .with_owner_config(config_path.to_path_buf());
+        match device_authority {
+            Ok(key) => {
+                info!("device approvals (Touch ID) enabled: owner key from the encrypted seed");
+                service.with_owner_approval_key(key)
+            }
+            Err(reason) => {
+                warn!(
+                    reason,
+                    "device approvals (Touch ID) are OFF: {}",
+                    konsensus_api::pairing::device::device_approvals_off_message(reason)
+                );
+                service.with_device_authority_disabled(reason)
+            }
+        }
+    });
+    // Approvals are durable; only their codes lived in memory. Print fresh
+    // codes for any that survived the restart instead of losing them.
+    if owner_control {
+        match pairing_service.reissue_owner_challenges() {
+            Ok(0) => {}
+            Ok(n) => info!(pending = n, "re-issued owner approval codes after restart"),
+            Err(e) => warn!(error = %e, "could not re-issue owner approval codes"),
+        }
+    }
 
     // Calls: bind the owner's STUN responder before the API reports its port.
     // A configured address that cannot be bound fails boot, like the P2P port.
@@ -950,6 +1053,34 @@ async fn cmd_start(
                 .map_err(|e| anyhow::anyhow!("[calls] stun_listen {addr} could not be bound: {e}"))?,
         ),
         None => None,
+    };
+
+    // Peer endpoint for introductions and front-door cards. A configured one
+    // (advertised_addr, else a concrete listen_addr) is final. Otherwise, with
+    // an owner-set `stun_server`, learn the public IP once now (bounded, never
+    // blocks boot) and keep it fresh in the background.
+    let (configured_endpoint, configured_source) = match config.network.configured_endpoint() {
+        Some((endpoint, source)) => (Some(endpoint), Some(source)),
+        None => (None, None),
+    };
+    let introduction = konsensus_api::handlers::introduction::IntroductionSettings {
+        network: config.lightning.bitcoin_network(),
+        configured_endpoint,
+        configured_source,
+        discovered: Default::default(),
+    };
+    let stun_discovery = match (&introduction.configured_endpoint, config.network.stun_server_addr()) {
+        (None, Ok(Some(server))) => {
+            introduction.set_discovered(konsensus_api::handlers::introduction::PeerEndpointView::missing(
+                konsensus_api::handlers::introduction::reason::STUN_PENDING,
+            ));
+            let peer_port = config.network.listen_addr.port();
+            let family = stun::ListenerFamily::of(config.network.listen_addr);
+            let first = stun::discover_peer_endpoint(&server, peer_port, stun::ATTEMPT_TIMEOUT, family).await;
+            let ok = stun::record(&introduction, first);
+            Some((server, peer_port, family, ok))
+        }
+        _ => None,
     };
 
     let api_state = Arc::new(konsensus_api::AppState {
@@ -1003,10 +1134,7 @@ async fn cmd_start(
         lightning_backend: config.lightning.backend_name().to_string(),
         chain_backend: config.chain.backend_name().to_string(),
         gossip_validator: Some(Arc::clone(&gossip_validator)),
-        introduction: konsensus_api::handlers::introduction::IntroductionSettings {
-            network: config.lightning.bitcoin_network(),
-            endpoint: config.network.introduction_endpoint(),
-        },
+        introduction: introduction.clone(),
         front_door: konsensus_api::handlers::front_door::FrontDoorStore::load(
             if config.web.enabled {
                 Some(std::path::Path::new(&config.web.content_dir))
@@ -1019,11 +1147,79 @@ async fn cmd_start(
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
         stun_port: stun_socket.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()),
+        custody_mode: custody_mode(&config),
     });
+
+    // Public remote access is Noise only. Decrypted bytes go to an ephemeral
+    // loopback router that deliberately omits `/api/v1/auth/local`.
+    let (remote_internal_handle, remote_access_handle) =
+        if config.remote_access.listen_addr.is_some() {
+            let internal_listener =
+                tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .await
+                    .context("failed to bind internal remote API listener")?;
+            let internal_addr = internal_listener
+                .local_addr()
+                .context("failed to read internal remote API address")?;
+            let server = remote_access::RemoteAccessServer::bind(
+                &config.remote_access,
+                Arc::clone(node.identity()),
+                Arc::clone(&pairing_service),
+                internal_addr,
+            )
+            .await?;
+            let public_addr = server.local_addr()?;
+            if let Some(path) = server.pair_link_path() {
+                let expires_secs = server
+                    .pairing_expires_in()
+                    .map_or(0, |duration| duration.as_secs());
+                println!(
+                    "Remote pairing is available once at protected file {} (expires in {} seconds).",
+                    path.display(),
+                    expires_secs
+                );
+            }
+            info!(%public_addr, "remote access Noise listener started");
+
+            let remote_limiter = Arc::new(konsensus_api::RateLimiter::new(
+                config.api.rate_limit_rps,
+            ));
+            let remote_router = konsensus_api::build_remote_router_with_limiter(
+                Arc::clone(&api_state),
+                remote_limiter,
+            )
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let mut internal_shutdown = node.shutdown_rx();
+            let internal_handle = tokio::spawn(async move {
+                if let Err(error) = axum::serve(internal_listener, remote_router)
+                    .with_graceful_shutdown(async move {
+                        let _ = internal_shutdown.changed().await;
+                    })
+                    .await
+                {
+                    error!(%error, "internal remote API listener failed");
+                }
+            });
+            let remote_handle = tokio::spawn(server.serve(node.shutdown_rx()));
+            (Some(internal_handle), Some(remote_handle))
+        } else {
+            (None, None)
+        };
 
     // Calls: the owner's STUN binding responder, if configured.
     let stun_handle = stun_socket.map(|socket| {
         tokio::spawn(stun::serve(socket, stun::Limits::default(), node.shutdown_rx()))
+    });
+
+    let stun_discovery_handle = stun_discovery.map(|(server, peer_port, family, ok)| {
+        tokio::spawn(stun::refresh_loop(
+            introduction.clone(),
+            server,
+            peer_port,
+            family,
+            ok,
+            node.shutdown_rx(),
+        ))
     });
 
     // ── Spawn background tasks ─────────────────────────────────────────
@@ -1414,7 +1610,10 @@ async fn cmd_start(
             if let Err(e) = whitelist_backup_handle.await { warn!(error = %e, "whitelist backup task panicked"); }
             if let Err(e) = api_handle.await { warn!(error = %e, "API server task panicked"); }
             if let Err(e) = grant_cleanup_handle.await { warn!(error = %e, "grant cleanup task panicked"); }
+            if let Some(h) = stun_discovery_handle { if let Err(e) = h.await { warn!(error = %e, "STUN discovery task panicked"); } }
             if let Some(h) = stun_handle { if let Err(e) = h.await { warn!(error = %e, "STUN responder task panicked"); } }
+            if let Some(h) = remote_access_handle { if let Err(e) = h.await { warn!(error = %e, "remote access task panicked"); } }
+            if let Some(h) = remote_internal_handle { if let Err(e) = h.await { warn!(error = %e, "internal remote API task panicked"); } }
         },
     )
     .await;
@@ -1757,6 +1956,130 @@ mod whitelist_replay_tests {
 #[cfg(test)]
 #[path = "tests/main_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod owner_key_startup_tests {
+    use super::*;
+    use konsensus_api::pairing::device::{SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
+
+    const PHRASE: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn config(password: Option<&str>) -> (tempfile::TempDir, NodeConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password).unwrap();
+        let config = NodeConfig::default_for_tier(crate::config::NodeTier::Light, path, dir.path());
+        (dir, config)
+    }
+
+    fn node_id() -> String {
+        konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "").unwrap().node_id().to_hex()
+    }
+
+    #[test]
+    fn device_approvals_stay_off_unless_the_seed_is_encrypted_and_the_password_typed() {
+        // Plaintext seed: off, whatever the password.
+        let (_d, plain) = config(None);
+        assert_eq!(owner_approval_key(&plain, None, true, &node_id()).unwrap_err(), SEED_NOT_ENCRYPTED);
+        // Encrypted, but a plaintext copy is still beside it: off.
+        let (dir, enc) = config(Some("correct horse"));
+        std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
+        assert_eq!(owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap_err(), SEED_NOT_ENCRYPTED);
+        std::fs::remove_file(dir.path().join("mnemonic.txt")).unwrap();
+        // Encrypted, password from a flag or file: off.
+        assert_eq!(owner_approval_key(&enc, Some("correct horse"), false, &node_id()).unwrap_err(), SEED_PASSWORD_NOT_TYPED);
+        // Encrypted and typed: on, and it is exactly the key the owner CLI signs with.
+        let node_key = owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap();
+        let secret = mnemonic_crypto::owner_secret("correct horse", &node_id()).unwrap();
+        let cli_key = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &secret).unwrap().verifying_key();
+        assert_eq!(node_key, cli_key);
+        // A wrong password yields no key at all.
+        assert!(owner_approval_key(&enc, Some("wrong"), true, &node_id()).is_err());
+    }
+
+    #[test]
+    fn an_old_plaintext_copy_of_the_seed_does_not_yield_the_owner_key() {
+        // Whoever copied mnemonic.txt before `seed encrypt` has the seed but not
+        // the password; the owner key needs both.
+        let (_d, enc) = config(Some("correct horse"));
+        let node_key = owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap();
+        for guess in [[0u8; 32], [1u8; 32]] {
+            let from_seed_only = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &guess).unwrap();
+            assert_ne!(from_seed_only.verifying_key(), node_key);
+        }
+        let other_password = mnemonic_crypto::owner_secret("another password", &node_id()).unwrap();
+        assert_ne!(
+            konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &other_password).unwrap().verifying_key(),
+            node_key
+        );
+    }
+}
+
+#[cfg(test)]
+mod custody_mode_tests {
+    use super::*;
+    use konsensus_api::custody::CustodyMode;
+
+    const PHRASE: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn config(password: Option<&str>, tier: NodeTier) -> (tempfile::TempDir, NodeConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password).unwrap();
+        let config = NodeConfig::default_for_tier(tier, path, dir.path());
+        (dir, config)
+    }
+
+    #[test]
+    fn the_seed_on_disk_decides_local_or_encrypted() {
+        let (_d, plain) = config(None, NodeTier::Light);
+        assert_eq!(custody_mode(&plain), CustodyMode::LocalSeed);
+        let (dir, enc) = config(Some("correct horse"), NodeTier::Full);
+        assert_eq!(custody_mode(&enc), CustodyMode::EncryptedSeed);
+        // A plaintext copy beside the .enc is still a plaintext seed.
+        std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
+        assert_eq!(custody_mode(&enc), CustodyMode::LocalSeed);
+    }
+
+    #[test]
+    fn a_hosted_node_is_hosted_custody_even_with_an_encrypted_seed() {
+        let (_d, mut enc) = config(Some("correct horse"), NodeTier::Light);
+        enc.identity.hosted = true;
+        assert_eq!(custody_mode(&enc), CustodyMode::HostedCustody);
+        let (_d, cloud) = config(Some("correct horse"), NodeTier::Cloud);
+        assert_eq!(custody_mode(&cloud), CustodyMode::HostedCustody);
+        let (_d, cloud_plain) = config(None, NodeTier::Cloud);
+        assert_eq!(custody_mode(&cloud_plain), CustodyMode::HostedCustody);
+    }
+
+    #[test]
+    fn no_config_claims_a_remote_signer() {
+        for tier in [NodeTier::Cloud, NodeTier::Light, NodeTier::Full] {
+            for password in [None, Some("correct horse")] {
+                for hosted in [false, true] {
+                    let (_d, mut c) = config(password, tier);
+                    c.identity.hosted = hosted;
+                    assert_ne!(custody_mode(&c), CustodyMode::RemoteSigner);
+                    assert_ne!(custody_mode(&c), CustodyMode::MoneySigner);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_is_read_from_the_identity_section_and_omitted_when_false() {
+        let (_d, c) = config(None, NodeTier::Light);
+        let text = toml::to_string(&c).unwrap();
+        assert!(!text.contains("hosted"), "a default config does not mention hosted");
+        let hosted: NodeConfig = toml::from_str(&text.replace(
+            "[identity]\n",
+            "[identity]\nhosted = true\n",
+        ))
+        .unwrap();
+        assert!(hosted.identity.hosted);
+        assert_eq!(custody_mode(&hosted), CustodyMode::HostedCustody);
+    }
+}
 
 #[cfg(all(test, feature = "regtest-e2e"))]
 #[path = "tests/regtest_e2e.rs"]

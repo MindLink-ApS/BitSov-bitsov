@@ -295,6 +295,130 @@ async fn local_auth_rejects_non_localhost() {
 }
 
 #[tokio::test]
+async fn remote_router_never_mounts_local_token_mint() {
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let app = konsensus_api::build_remote_router(test_state())
+        .layer(MockConnectInfo(
+            "127.0.0.1:19001"
+                .parse::<std::net::SocketAddr>()
+                .unwrap(),
+        ));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/auth/local")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn remote_router_excludes_local_surfaces_but_keeps_authenticated_api() {
+    use axum::extract::connect_info::MockConnectInfo;
+    use konsensus_api::pairing::{identity_fingerprint, PairingService};
+
+    let dir = tempfile::tempdir().unwrap();
+    let base = test_state();
+    let pairing = Arc::new(
+        PairingService::open(
+            dir.path(),
+            identity_fingerprint(&base.identity.node_id().to_hex()),
+            false,
+        )
+        .unwrap(),
+    );
+    let state = Arc::new(konsensus_api::AppState {
+        pairing: Some(pairing),
+        ..(*base).clone()
+    });
+    let app = konsensus_api::build_remote_router(state).layer(MockConnectInfo(
+        "127.0.0.1:19002"
+            .parse::<std::net::SocketAddr>()
+            .unwrap(),
+    ));
+
+    for (method, path) in [
+        ("GET", "/metrics"),
+        ("GET", "/api/v1/health"),
+        ("GET", "/api/v1/preflight"),
+        ("GET", "/livez"),
+        ("POST", "/api/v1/pair/request"),
+        ("POST", "/api/v1/auth/local"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+
+    let protected = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn remote_rate_exhaustion_does_not_consume_local_budget() {
+    use axum::extract::connect_info::MockConnectInfo;
+
+    let base = test_state();
+    let state = Arc::new(konsensus_api::AppState {
+        rate_limiter: Arc::new(RateLimiter::new(1)),
+        ..(*base).clone()
+    });
+    let peer = MockConnectInfo(
+        "127.0.0.1:19003"
+            .parse::<std::net::SocketAddr>()
+            .unwrap(),
+    );
+    let remote = konsensus_api::build_remote_router(Arc::clone(&state)).layer(peer);
+    let local = konsensus_api::build_router(state).layer(peer);
+
+    let challenge = || {
+        Request::builder()
+            .uri("/api/v1/auth/challenge")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        remote.clone().oneshot(challenge()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        remote.oneshot(challenge()).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let local_response = local
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(local_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn rate_limiter_basic() {
     let limiter = RateLimiter::new(3);
     let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
@@ -1819,13 +1943,28 @@ async fn status_reports_stun_port_only_when_listening() {
 
     let public = Arc::new(AppState {
         stun_port: Some(3478),
-        introduction: konsensus_api::handlers::introduction::IntroductionSettings {
-            network: None,
-            endpoint: Some("node.example.org:9000".into()),
-        },
+        introduction: konsensus_api::handlers::introduction::IntroductionSettings::fixed(
+            None,
+            Some("node.example.org:9000"),
+        ),
         ..(*test_state()).clone()
     });
     assert_eq!(get(&public, "/api/v1/status", true).await["stun_url"], "stun:node.example.org:3478");
+    let status = get(&public, "/api/v1/status", true).await;
+    assert_eq!(status["peer_endpoint"], "node.example.org:9000");
+    assert_eq!(status["peer_endpoint_source"], "advertised");
+    assert!(status.get("peer_endpoint_reason").is_none());
+
+    // Discovery still pending/failed: the reason is visible to the owner.
+    let intro = konsensus_api::handlers::introduction::IntroductionSettings::default();
+    intro.set_discovered(konsensus_api::handlers::introduction::PeerEndpointView::missing("stun_unreachable"));
+    let failed = Arc::new(AppState { introduction: intro.clone(), ..(*test_state()).clone() });
+    let status = get(&failed, "/api/v1/status", true).await;
+    assert!(status.get("peer_endpoint").is_none());
+    assert_eq!(status["peer_endpoint_reason"], "stun_unreachable");
+    intro.set_discovered(konsensus_api::handlers::introduction::PeerEndpointView::found("93.184.216.34:9000".into(), "stun"));
+    let status = get(&failed, "/api/v1/status", true).await;
+    assert_eq!((status["peer_endpoint"].as_str(), status["peer_endpoint_source"].as_str()), (Some("93.184.216.34:9000"), Some("stun")));
 }
 
 #[test]
@@ -1839,4 +1978,31 @@ fn stun_url_uses_the_dialable_host_only() {
     }
     assert_eq!(stun_url(None, Some(3478)), None);
     assert_eq!(stun_url(Some("203.0.113.5:9000"), None), None);
+}
+
+/// `custody_mode` (REMOTE-SIGNER.md §2) is owner-only: the owner's `/status`
+/// reports it, the public `/health` never does.
+#[tokio::test]
+async fn status_reports_custody_mode_to_the_owner_only() {
+    use konsensus_api::custody::CustodyMode;
+    async fn get(state: &Arc<AppState>, uri: &str, auth: bool) -> serde_json::Value {
+        let mut req = Request::builder().uri(uri);
+        if auth {
+            req = req.header("authorization", auth_header(state));
+        }
+        let resp = build_router(Arc::clone(state)).oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap()).unwrap()
+    }
+    for (mode, wire) in [
+        (CustodyMode::LocalSeed, "local_seed"),
+        (CustodyMode::EncryptedSeed, "encrypted_seed"),
+        (CustodyMode::HostedCustody, "hosted_custody"),
+        (CustodyMode::MoneySigner, "money_signer"),
+        (CustodyMode::RemoteSigner, "remote_signer"),
+    ] {
+        let state = Arc::new(AppState { custody_mode: mode, ..(*test_state()).clone() });
+        assert_eq!(get(&state, "/api/v1/status", true).await["custody_mode"], wire);
+        assert!(get(&state, "/api/v1/health", false).await.get("custody_mode").is_none());
+    }
 }

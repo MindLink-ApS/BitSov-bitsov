@@ -20,6 +20,7 @@ pub mod messages;
 pub mod onboarding;
 pub mod organism;
 pub mod pairing_routes;
+pub mod device_routes;
 pub mod payments;
 pub mod peers;
 pub mod pricing;

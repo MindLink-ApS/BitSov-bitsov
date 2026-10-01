@@ -2,7 +2,9 @@
 //!
 //! # What is deliberately absent
 //!
-//! Budget elevation is not writable over HTTP. First-contact approval is an
+//! Budget elevation is not writable over HTTP (a registered device key's
+//! signed relation intent is the one exception; see
+//! [`super::device_routes`]). First-contact approval is an
 //! owner-authenticated exception bound to an already approved budget; paired
 //! tokens cannot invoke it. The app
 //! may **create a pending request** and **read its status**; that separation is
@@ -78,8 +80,8 @@ pub struct PairRequestBody {
 /// `POST /api/v1/pair/request` response.
 ///
 /// Note what is **not** here: the challenge, and the short code derived from
-/// it. The code is printed to the node's own stdout as a tripwire; handing it
-/// to the caller would hand it to exactly the attacker the ceremony excludes.
+/// it. The code is derived only from the protected challenge file and is never
+/// printed or logged.
 #[derive(Debug, Serialize)]
 pub struct PairRequestResponse {
     /// Ceremony id.
@@ -442,7 +444,7 @@ async fn elevation_request(
         )
         .map_err(map_err)?;
     let owner_action = if svc.owner_control_enabled() {
-        format!("konsensus grant --op {}", op.op_id)
+        svc.owner_grant_command(&op.op_id)
     } else {
         "unavailable in this deployment: the node was not started in owner-run mode, so there \
          is no owner control socket. A packaged sidecar app is a read+receive client by \
@@ -620,8 +622,11 @@ async fn replacement_request(
 /// When it does not, these paths are **absent** rather than mounted and
 /// failing — the same discipline the sensitive identity routes already use.
 ///
-/// Every route here is either the ceremony, a read, or the creation of a
-/// pending request. None of them writes a grant or consumes an approval.
+/// Every route here is either the ceremony, a read, the creation or
+/// withdrawal of a pending request, or (merged from
+/// [`super::device_routes`]) a relation intent that writes spend authority
+/// only under a registered device key's signature. None of them writes an
+/// owner console grant or consumes an owner approval.
 pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
     if !pairing_enabled {
         return Router::new();
@@ -636,13 +641,30 @@ pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
         .route("/api/v1/pair/rotate", post(rotate_pairing))
         .route("/api/v1/pair/window", post(open_window))
         .route("/api/v1/pair/elevation-request", post(elevation_request))
-        .route("/api/v1/pair/elevation/:op_id", get(elevation_status))
+        .route(
+            "/api/v1/pair/elevation/:op_id",
+            get(elevation_status).delete(super::device_routes::cancel_elevation),
+        )
         .route("/api/v1/pair/grant", get(own_grant))
         .route("/api/v1/pair/first-contact-grant", post(first_contact_grant))
         .route(
             "/api/v1/identity/replacement-request",
             post(replacement_request),
         )
+        .merge(super::device_routes::routes())
+}
+
+/// Pairing routes needed by a client that has already authenticated its Noise
+/// transport. The remote listener performs first pairing itself, so the
+/// file-challenge ceremony and owner-management routes are not exposed here.
+pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
+    if !pairing_enabled {
+        return Router::new();
+    }
+    Router::new()
+        .route("/api/v1/pair/challenge", get(pair_challenge))
+        .route("/api/v1/pair/token", post(pair_token))
+        .route("/api/v1/pair/rotate", post(rotate_pairing))
 }
 
 #[cfg(test)]
@@ -661,6 +683,7 @@ mod tests {
             format!("{}_elevation", "grant"),
             format!("{}_replacement", "approve"),
             format!("{}_replacement_approval", "consume"),
+            format!("{}_device_key", "approve"),
         ] {
             assert!(
                 !src.contains(&forbidden),

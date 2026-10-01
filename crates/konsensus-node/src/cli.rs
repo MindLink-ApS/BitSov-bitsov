@@ -45,8 +45,15 @@ pub enum Command {
         /// Password to decrypt an encrypted mnemonic file (`.enc`).
         /// If the mnemonic file has `.enc` extension and no password is
         /// provided, the node will prompt interactively.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "password_file")]
         password: Option<String>,
+
+        /// Read that password from a file instead of prompting. Opt-in: only a
+        /// regular file readable by its owner alone (chmod 600) is accepted.
+        /// Any program running as you can read it, including a paired app, so
+        /// it protects the seed from other OS users only.
+        #[arg(long)]
+        password_file: Option<PathBuf>,
 
         /// Override admission mode for this run: `whitelist` (default) or `price-open`.
         /// Operator-selectable price-admission mode; this is NOT an open network.
@@ -141,6 +148,21 @@ pub enum Command {
         command: ApprovalCommand,
     },
 
+    /// The recovery phrase file: encrypt a plaintext one in place.
+    Seed {
+        #[command(subcommand)]
+        command: SeedCommand,
+    },
+
+    /// Paired device keys: approve one once, list, or revoke.
+    ///
+    /// A device key lets the paired app open per-contact spend envelopes by
+    /// signing them on the device (Touch ID), instead of `konsensus grant`.
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
+
     /// Static channel backup (SCB) operations.
     Scb {
         #[command(subcommand)]
@@ -168,7 +190,9 @@ pub enum Command {
     /// The owner channel. The requesting app can create the pending request and
     /// read its status over HTTP; only this command can write the grant. One
     /// command per budget window: `konsensus grant --op <id> --budget 2000
-    /// --for 24h`. A summary is printed before you confirm. A request for
+    /// --for 24h`. It prints the terms, then asks for the short approval code
+    /// the node printed on its own terminal; typing it is the approval. A
+    /// request for
     /// `front_door` (publish the front-door card only) takes no budget:
     /// `konsensus grant --op <id> [--for 1h]`.
     Grant {
@@ -195,9 +219,9 @@ pub enum Command {
         #[arg(long)]
         recipient: Vec<String>,
 
-        /// Skip the "grant these terms?" question. The console confirmation
-        /// code is still required.
-        #[arg(long)]
+        /// Accepted for older scripts; has no effect. There is no separate
+        /// yes/no question: typing the console code is the confirmation.
+        #[arg(long, hide = true)]
         yes: bool,
 
         /// Path to the configuration file.
@@ -380,6 +404,50 @@ pub enum WhitelistCommand {
 #[cfg(test)]
 #[path = "tests/cli.rs"]
 mod tests;
+
+/// Owner commands for the recovery-phrase file.
+#[derive(Subcommand)]
+pub enum SeedCommand {
+    /// Encrypt a plaintext recovery phrase (mnemonic.txt) in place. Stop the
+    /// node first. Asks for a new password twice, writes the `.enc`, checks it
+    /// decrypts to the same node identity, points the config at it, and only
+    /// then overwrites and removes the plaintext file.
+    Encrypt {
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+}
+
+/// Owner commands for paired device keys.
+#[derive(Subcommand)]
+pub enum DeviceCommand {
+    /// Register a device key the app asked for. Prints the device and its
+    /// fingerprint, then asks for the code the node printed.
+    Approve {
+        /// Pending registration id (the app shows the command).
+        #[arg(long = "op")]
+        op_id: String,
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+    /// List registered and pending device keys.
+    List {
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+    /// Retire a device key now; its spend envelopes end with it.
+    Revoke {
+        /// Key id (see `konsensus device list`).
+        #[arg(long = "key")]
+        key_id: String,
+        /// Path to the configuration file.
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+}
 
 /// Complete owner-reviewed tuples; no field is inferred from paired-app state.
 #[derive(Subcommand)]

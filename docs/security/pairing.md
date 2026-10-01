@@ -24,10 +24,18 @@ whatever credential the app can read. No design at this tier stops it. Closing
 that gap needs an OS keychain with a per-application ACL, or hardware-backed
 keys — later tiers, deliberately out of scope here.
 
-The short code printed to the node's stdout is a **tripwire**, not the control.
-In the sidecar deployment the app launches the node and owns its stdout, so it
-can read that code by construction. If anyone describes the code comparison as
-*preventing* a pairing, that is an overclaim.
+Pairing codes and full remote pairing links are never written to stdout or
+tracing, where launchd/systemd journals could retain them. Local pairing writes
+its challenge to a protected `0600` file and prints only that path and expiry.
+Remote access writes the complete one-shot `bitsov://pair/...` link to
+`<data_dir>/pairing/remote-access-link` at mode `0600`; stdout prints only the
+protected path and expiry. The app reads that file and pastes the link. The
+remote link expires after five minutes and is removed on successful pairing,
+expiry, or clean shutdown.
+
+The code is a cross-check, not the control. A sidecar app owns the data
+directory and can read it by construction; describing code comparison as
+*preventing* such an app from pairing would be an overclaim.
 
 ## Scopes
 
@@ -69,14 +77,39 @@ Therefore, per the operator lock:
 - OS user-presence (Touch ID, Windows Hello) would close the sidecar case
   properly. Out of scope for this step; not approximated by anything weaker.
 
-Elevation consent requires an operation-bound **256-bit random nonce** printed
-only to the owner node's controlling terminal (`/dev/tty`), never stdout,
-tracing, HTTP, socket status/description, or a file under `data_dir`. The CLI
-asks for that full confirmation. Knowing the public operation id/label or
-connecting as the same uid is insufficient. Without an owner terminal,
-elevation fails closed. Pending challenges are memory-only and lost on restart;
-the owner must request a new operation. Arbitrary access to the owner's terminal
-or process memory remains outside this tier's threat model.
+Elevation consent requires a secret printed only to the owner node's
+controlling terminal (`/dev/tty`), never stdout, tracing, HTTP, socket
+status/description, or a file under `data_dir`: an operation-bound **256-bit
+random nonce** (the full `GRANT … CODE <nonce>` line), and for grant requests
+also a **short owner code** (`XXXX-XXXX`, 40 bits from the CSPRNG) that
+`konsensus grant` asks for after printing the terms. Knowing the public
+operation id/label or connecting as the same uid is insufficient. Without an
+owner terminal, elevation fails closed. Identity replacement accepts only the
+full nonce line.
+
+The short code is shorter only because online guessing is bounded: each wrong
+confirmation is announced on the owner terminal, the third wrong one cancels
+that request, and after ten wrong ones in a node run short codes stop working
+until restart (the full line still does). A same-uid process that can create
+requests and reach the socket therefore gets at most ten guesses per node run
+against a 2^40 space.
+
+Why not "the socket peer is an interactive TTY": on the dev-node path the app
+launches the node, so it runs as the owner's uid, shares the node's controlling
+terminal, and can reach the `0600` socket. It can allocate a pseudo-terminal
+(or inject input into its own controlling terminal with `TIOCSTI`), so no
+property of the peer or its terminal separates the app from the owner. What the
+app cannot do is read the terminal's screen; the code travels only there.
+
+Codes are memory-only; the pending records are durable. When an owner-run node
+starts, it prints fresh codes for every approval that survived the restart, so
+the request stays `pending` and old codes stop working. A request cancelled by
+wrong codes reads `lost` from `GET /api/v1/pair/elevation/{op_id}`,
+`konsensus pair-status` marks it, and `konsensus grant` refuses it up front;
+the client asks again. See `device-keys.md` for Touch ID device keys, which
+replace the console code for per-contact spend.
+Arbitrary access to the owner's terminal or process memory remains outside this
+tier's threat model.
 
 ### Live-identity replacement binds five fields
 

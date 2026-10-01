@@ -74,6 +74,17 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<[u8; 32], MnemonicCryptoEr
     Ok(key)
 }
 
+/// The owner secret behind the owner-approval key: argon2id (the same cost as
+/// the file encryption) over the recovery-phrase password, salted per node.
+/// A copy of the seed without this password does not yield the owner key.
+pub fn owner_secret(password: &str, node_id_hex: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, MnemonicCryptoError> {
+    let salt = blake3::keyed_hash(
+        blake3::hash(b"bitsov-owner-approval-salt-v1").as_bytes(),
+        node_id_hex.as_bytes(),
+    );
+    Ok(zeroize::Zeroizing::new(derive_key(password.as_bytes(), &salt.as_bytes()[..16])?))
+}
+
 /// Encrypt a mnemonic phrase with a password.
 ///
 /// Returns the encrypted bytes in the `.enc` format (version + salt + nonce + ciphertext).

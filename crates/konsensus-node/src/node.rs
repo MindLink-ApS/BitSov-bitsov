@@ -551,8 +551,8 @@ impl KonsensusNode {
 /// PaymentGate whitelist (P3-2).
 ///
 /// The storage `peers` table is the single durable whitelist authority. Peers
-/// admitted at runtime — invite acceptances (`/invites/accept`,
-/// `/invite/redeem`) and REST `/peers` adds — persist there, so they must be
+/// admitted at runtime — invite acceptances (`/invites/accept`) and REST
+/// `/peers` adds — persist there, so they must be
 /// loaded into the registry at boot or they silently drop off the gate
 /// whitelist on restart. `config.peers` take precedence (they carry real
 /// addresses and `auto_connect`), so an existing entry is never clobbered.

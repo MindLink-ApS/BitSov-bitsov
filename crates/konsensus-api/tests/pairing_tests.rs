@@ -47,6 +47,39 @@ fn state_with_pairing(
     (state, service, console)
 }
 
+#[test]
+fn rotating_client_key_clears_remote_transport_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, service, _) = state_with_pairing(dir.path(), false);
+    let old_key = SigningKey::from_bytes(&[0x51; 32]);
+    let old_pubkey = hex::encode(old_key.verifying_key().to_bytes());
+    let transport = [0x52; 32];
+    let paired = service
+        .create_verified_remote_pairing("remote", &old_pubkey, &transport)
+        .unwrap();
+    assert_eq!(
+        service
+            .validate_remote_transport(&transport)
+            .unwrap()
+            .client_id,
+        paired.client_id
+    );
+
+    let new_key = SigningKey::from_bytes(&[0x53; 32]);
+    let new_pubkey = hex::encode(new_key.verifying_key().to_bytes());
+    let proof = format!("bitsov-pair-rotate-v1:{}:{}", paired.client_id, new_pubkey);
+    let rotated = service
+        .rotate_client_key(
+            &paired.client_id,
+            &new_pubkey,
+            &hex::encode(old_key.sign(proof.as_bytes()).to_bytes()),
+        )
+        .unwrap();
+
+    assert!(rotated.remote_transport_pubkey.is_none());
+    assert!(service.validate_remote_transport(&transport).is_err());
+}
+
 async fn post(
     app: &axum::Router,
     uri: &str,

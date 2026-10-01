@@ -23,6 +23,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
         identity: IdentityConfig {
             mnemonic_file: mnemonic_path,
             passphrase: String::new(),
+            hosted: false,
         },
         network: NetworkConfig::default(),
         lightning: LightningConfig::Mock {
@@ -38,6 +39,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
         },
         backup: BackupConfig::default(),
         api: ApiConfig::default(),
+        remote_access: Default::default(),
         web: WebConfig::default(),
         peers: Vec::new(),
         admission_mode: konsensus_message::ReachabilityMode::Whitelist,
@@ -57,6 +59,7 @@ fn snapshot_config(storage: StorageConfig) -> NodeConfig {
         identity: IdentityConfig {
             mnemonic_file: PathBuf::from("/tmp/m.txt"),
             passphrase: String::new(),
+            hosted: false,
         },
         network: NetworkConfig::default(),
         lightning: LightningConfig::Mock {
@@ -68,6 +71,7 @@ fn snapshot_config(storage: StorageConfig) -> NodeConfig {
         storage,
         backup: BackupConfig::default(),
         api: ApiConfig::default(),
+        remote_access: Default::default(),
         web: WebConfig::default(),
         peers: Vec::new(),
         admission_mode: konsensus_message::ReachabilityMode::Whitelist,

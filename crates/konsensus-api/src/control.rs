@@ -117,6 +117,21 @@ pub enum ControlRequest {
         /// Six-digit code compared with the newcomer.
         code: String,
     },
+    /// Register a device key the owner reviewed (fingerprint shown by the
+    /// app and by the node). The typed code is the owner's approval.
+    ApproveDeviceKey {
+        /// Pending registration id.
+        op_id: String,
+        /// The code (or full line) the owner typed.
+        confirmation: String,
+        /// The owner-approval key's signature over the device tuple, hex.
+        owner_signature: String,
+    },
+    /// Retire a device key; its relation envelopes end with it.
+    RevokeDeviceKey {
+        /// Key id.
+        key_id: String,
+    },
     /// Revoke spend grants now — one client's, or every client's.
     RevokeGrant {
         /// Client whose grant to revoke; `None` revokes all.
@@ -171,6 +186,12 @@ pub enum ControlResponse {
         /// Live `front_door` grants.
         #[serde(default)]
         front_door_grants: Vec<FrontDoorGrantSummary>,
+        /// Registered device keys.
+        #[serde(default)]
+        device_keys: Vec<DeviceKeySummary>,
+        /// Device keys awaiting the owner.
+        #[serde(default)]
+        pending_device_keys: Vec<PendingDeviceKeySummary>,
     },
     /// A rendered pending operation and public label, never its secret nonce.
     Describe {
@@ -185,6 +206,10 @@ pub enum ControlResponse {
         /// The request asks for `front_door` (no budget), not `spend`.
         #[serde(default)]
         front_door: bool,
+        /// A device-key registration: the exact tuple the owner-approval key
+        /// signs. The CLI checks `node` against the identity it derives.
+        #[serde(default)]
+        device: Option<DeviceApprovalTuple>,
     },
     /// The operation succeeded.
     Ok {
@@ -211,6 +236,54 @@ pub struct ClientSummary {
     pub epoch: u64,
 }
 
+/// What the owner-approval key signs for one device registration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceApprovalTuple {
+    /// Node identity fingerprint.
+    pub node: String,
+    /// The pairing's client public key.
+    pub client_pubkey: String,
+    /// The pairing epoch.
+    pub epoch: u64,
+    /// The device's P-256 public key, hex.
+    pub device_public_key: String,
+}
+
+/// A registered device key as rendered to the owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceKeySummary {
+    /// Key id.
+    pub key_id: String,
+    /// Short fingerprint.
+    pub fingerprint: String,
+    /// Client it belongs to.
+    pub client_id: String,
+    /// Device name.
+    pub name: String,
+    /// Unix seconds it was approved.
+    pub registered_at: i64,
+}
+
+/// A device key awaiting the owner, as rendered to the owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingDeviceKeySummary {
+    /// Operation id.
+    pub op_id: String,
+    /// Short fingerprint to compare with the app's screen.
+    pub fingerprint: String,
+    /// Requesting client.
+    pub client_id: String,
+    /// Requesting client's name.
+    pub client_name: String,
+    /// Device name.
+    pub name: String,
+    /// Unix seconds after which it can no longer be approved.
+    pub expires_at: i64,
+    /// Cancelled by wrong codes.
+    #[serde(default)]
+    pub lost: bool,
+}
+
 /// A live `front_door` grant as rendered to the owner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FrontDoorGrantSummary {
@@ -235,6 +308,10 @@ pub struct PendingSummary {
     pub scopes: Vec<String>,
     /// Unix seconds after which it can no longer be confirmed.
     pub expires_at: i64,
+    /// Made before this node run (or cancelled by wrong codes): nothing can
+    /// approve it any more, and the app must ask again.
+    #[serde(default)]
+    pub lost: bool,
 }
 
 /// A pending replacement approval as rendered to the owner.
@@ -344,6 +421,8 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                         client_name: e.client_name.clone(),
                         scopes: e.scopes.iter().map(|s| s.as_str().to_string()).collect(),
                         expires_at: e.expires_at,
+                        lost: e.expires_at > chrono::Utc::now().timestamp()
+                            && !service.elevation_confirmable(&e.op_id),
                     })
                     .collect(),
                 pending_replacements: file
@@ -369,6 +448,31 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                         op_id: g.op_id,
                         client_id: g.client_id,
                         expires_at: g.expires_at,
+                    })
+                    .collect(),
+                device_keys: service
+                    .device_keys()
+                    .into_iter()
+                    .map(|k| DeviceKeySummary {
+                        fingerprint: crate::pairing::device::key_fingerprint(&k.key_id),
+                        key_id: k.key_id,
+                        client_id: k.client_id,
+                        name: k.name,
+                        registered_at: k.registered_at,
+                    })
+                    .collect(),
+                pending_device_keys: service
+                    .pending_device_keys()
+                    .into_iter()
+                    .filter(|p| p.expires_at > chrono::Utc::now().timestamp())
+                    .map(|p| PendingDeviceKeySummary {
+                        lost: !service.elevation_confirmable(&p.op_id),
+                        fingerprint: crate::pairing::device::key_fingerprint(&p.key_id),
+                        op_id: p.op_id,
+                        client_id: p.client_id,
+                        client_name: p.client_name,
+                        name: p.name,
+                        expires_at: p.expires_at,
                     })
                     .collect(),
             }
@@ -432,6 +536,30 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
         },
         ControlRequest::ApproveGift { .. } => ControlResponse::Error {
             message: "gift approval requires the running node's sponsor service".into(),
+        },
+        ControlRequest::ApproveDeviceKey { op_id, confirmation, owner_signature } => {
+            match service.approve_device_key(&op_id, &confirmation, &owner_signature) {
+                Ok(k) => ControlResponse::Ok {
+                    detail: format!(
+                        "registered device key {} ({:?}) for client {}. The app can now open \
+                         per-contact spend envelopes with Touch ID; each one is a signature the \
+                         node checks. Revoke any time with: konsensus device revoke --key {}",
+                        crate::pairing::device::key_fingerprint(&k.key_id),
+                        k.name,
+                        k.client_id,
+                        k.key_id
+                    ),
+                },
+                Err(e) => error(e),
+            }
+        }
+        ControlRequest::RevokeDeviceKey { key_id } => match service.revoke_device_key(&key_id, None) {
+            Ok(()) => ControlResponse::Ok {
+                detail: format!(
+                    "revoked device key {key_id}; its client's relation envelopes stop on the next request"
+                ),
+            },
+            Err(e) => error(e),
         },
         ControlRequest::RevokeGrant { client_id } => {
             match service.revoke_grants(client_id.as_deref()) {
@@ -580,6 +708,16 @@ fn error(e: PairingError) -> ControlResponse {
 
 fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
     let file = service.snapshot();
+    // Say so before the owner reads terms and types a code that cannot work.
+    let now = chrono::Utc::now().timestamp();
+    if let Some(op) = file.pending_elevations.iter().find(|e| e.op_id == op_id) {
+        if op.expires_at <= now {
+            return error(PairingError::Expired);
+        }
+        if !service.elevation_confirmable(op_id) {
+            return error(PairingError::ConfirmationLost);
+        }
+    }
     if let Some(op) = file
         .pending_elevations
         .iter()
@@ -599,6 +737,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             summary,
             proposed_terms: None,
             front_door: true,
+            device: None,
         };
     }
     if let Some(op) = file.pending_elevations.iter().find(|e| e.op_id == op_id) {
@@ -630,6 +769,50 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             summary,
             proposed_terms: op.proposed_terms.clone(),
             front_door: false,
+            device: None,
+        };
+    }
+    if let Some(p) = file.pending_device_keys.iter().find(|p| p.op_id == op_id) {
+        if p.expires_at <= now {
+            return error(PairingError::Expired);
+        }
+        if !service.elevation_confirmable(op_id) {
+            return error(PairingError::ConfirmationLost);
+        }
+        let summary = format!(
+            "DEVICE KEY REGISTRATION\n  operation:    {}\n  client:       {} ({})\n  device:       \
+             {:?}\n  fingerprint:  {}\n  expires at:   {}\n\nCompare the fingerprint with the \
+             one the app shows. Approving lets that device open per-contact spend envelopes \
+             on this node by signing them (Touch ID on the device, for each one), without \
+             coming back to this terminal. Each envelope is capped per contact, per act and \
+             in time, and the node checks every signature. Revoke with: konsensus device \
+             revoke --key {}.",
+            p.op_id,
+            p.client_name,
+            p.client_id,
+            p.name,
+            crate::pairing::device::key_fingerprint(&p.key_id),
+            p.expires_at,
+            p.key_id
+        );
+        return ControlResponse::Describe {
+            confirmation_label: crate::pairing::device_confirmation_phrase(p),
+            summary,
+            proposed_terms: None,
+            front_door: false,
+            device: Some(DeviceApprovalTuple {
+                node: service.bound_fingerprint(),
+                // The pairing's key now, not at request time: the signature must
+                // match the pairing the node will check it against.
+                client_pubkey: file
+                    .clients
+                    .iter()
+                    .find(|c| c.client_id == p.client_id)
+                    .map(|c| c.client_pubkey.clone())
+                    .unwrap_or_default(),
+                epoch: p.epoch,
+                device_public_key: p.public_key.clone(),
+            }),
         };
     }
     if let Some(a) = file.replacement_approvals.iter().find(|a| a.op_id == op_id) {
@@ -654,6 +837,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             summary,
             proposed_terms: None,
             front_door: false,
+            device: None,
         };
     }
     ControlResponse::Error {

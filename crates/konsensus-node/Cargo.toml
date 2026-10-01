@@ -24,6 +24,7 @@ konsensus-storage = { path = "../konsensus-storage" }
 konsensus-api = { path = "../konsensus-api" }
 konsensus-routing = { path = "../konsensus-routing" }
 konsensus-gossip = { path = "../konsensus-gossip" }
+axum.workspace = true
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true
@@ -40,6 +41,7 @@ async-trait.workspace = true
 base64.workspace = true
 blake3.workspace = true
 ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
 aes-gcm.workspace = true
 argon2.workspace = true
 uuid.workspace = true
@@ -48,6 +50,8 @@ rpassword.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 zeroize.workspace = true
+# getuid (password-file owner check) and, in tests, setsid.
+libc = "0.2"
 # P8.1 D-place (A): the durable SqliteRelayStore (relay/store.rs) is colocated with
 # the trait + InMemory impl in konsensus-node, so this crate takes a direct sqlx dep
 # (already pulled transitively via konsensus-storage). Off-by-default: InMemoryRelayStore
@@ -61,7 +65,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "te
 async-trait.workspace = true
 tempfile = "3"
 ldk-node.workspace = true
-axum.workspace = true
 tower = { workspace = true, features = ["util"] }
 bitcoin.workspace = true
 lightning-invoice.workspace = true

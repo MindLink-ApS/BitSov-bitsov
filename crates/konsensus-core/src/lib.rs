@@ -33,7 +33,7 @@ pub use contracts::{
 pub use envelope::{UkmEnvelope, UkmEnvelopeBuilder};
 pub use error::CoreError;
 pub use federation::SignedMessage;
-pub use identity::{IdentityError, NodeIdentity};
+pub use identity::{IdentityError, NodeIdentity, OwnerApprovalKey};
 pub use kind::KindCategory;
 pub use types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, RoomId, Signature};
 

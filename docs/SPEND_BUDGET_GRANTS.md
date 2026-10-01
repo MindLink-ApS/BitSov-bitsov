@@ -18,12 +18,27 @@ metered grant as an unmetered one.
    node id or Lightning pubkey to msat) and `ttl_secs` (default and maximum
    86400). A proposal the node cannot enforce is a 400, and nothing is left
    pending.
-2. The owner runs `konsensus grant --op <id> [--budget <sats>] [--for 24h]
-   [--per-call <sats>] [--recipient <key>=<sats> ...]`. Each flag overrides the
-   proposal. With neither a proposal nor `--budget`, the command refuses. The
-   CLI prints the request and the exact terms being granted, asks
-   `Grant these terms? [y/N]` (`--yes` skips only this question), then asks
-   for the confirmation code from the owner node's console, as before.
+2. The owner runs `konsensus grant --op <id> --config <path> [--budget <sats>]
+   [--for 24h] [--per-call <sats>] [--recipient <key>=<sats> ...]`. The
+   elevation response's `owner_action` states this command with the node's
+   absolute config path, and the node's terminal prints it too. Each flag
+   overrides the proposal. With neither a proposal nor `--budget`, the command
+   refuses. The CLI prints the request and the exact terms being granted, then
+   asks for the short approval code (`XXXX-XXXX`) that the node printed on its
+   own terminal when the request arrived. Typing it is the approval; an empty
+   line cancels. The full `GRANT … CODE <nonce>` line printed there is accepted
+   too. Three wrong codes cancel the request. `--yes` is accepted for older
+   scripts and has no effect. See `docs/security/pairing.md` for why this still
+   proves the owner is present.
+
+   A node restart prints fresh codes for pending requests (old ones stop
+   working). A request cancelled by wrong codes returns `"status": "lost"`
+   from `GET /api/v1/pair/elevation/{op_id}`; the app asks again. A paired
+   client may withdraw its own request with `DELETE` on that path.
+
+   With a registered device key the app skips this step entirely: it signs a
+   per-contact `RelationIntent` with Touch ID (`docs/security/device-keys.md`).
+   This console path stays as the recovery fallback.
 3. The app re-issues its token. `GET /api/v1/pair/grant` returns the live
    grant (`budget_msat`, `used_msat`, `remaining_msat`, `per_call_max_msat`,
    `per_recipient_msat`, `used_by_recipient`, `granted_at`, `expires_at`), or

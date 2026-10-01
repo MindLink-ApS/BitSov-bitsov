@@ -23,12 +23,10 @@
 //! load-bearing control is **read access to the data directory** — nothing
 //! secret ever travels over HTTP.
 //!
-//! The short code printed to the node's stdout is a **tripwire**, not the
-//! control (policy lock C). It is deliberately absent from every HTTP response:
-//! an app that can read the challenge file derives the same code locally, while
-//! a loopback-only caller must not be handed the thing the owner compares
-//! against. If anyone later describes the code comparison as *preventing* a
-//! pairing, that is an overclaim.
+//! The short code is never printed or logged. An app that can read the
+//! protected challenge file derives it locally; stdout contains only a safe
+//! instruction naming that file. The code remains a cross-check rather than
+//! the access control itself.
 //!
 //! # Elevation is not an HTTP capability
 //!
@@ -58,6 +56,11 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, Scope, TokenError};
+
+pub mod device;
+pub use device::{
+    DeviceKey, DeviceKeyStatus, PendingDeviceKey, RelationIntent, device_confirmation_phrase,
+};
 use crate::spend_budget::{
     BudgetRefusal, Charge, GrantBudget, GrantTerms, GrantView, Reservation,
     MAX_SPEND_GRANT_TTL_SECS,
@@ -104,6 +107,20 @@ pub const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(300);
 
 /// How long a pending elevation request or replacement approval stays valid.
 pub const ELEVATION_TTL_SECS: i64 = 900;
+
+/// Wrong confirmations per grant request. The last of them cancels it: the
+/// request can no longer be approved and the app must ask again.
+pub const OWNER_CODE_ATTEMPTS: u8 = 3;
+
+/// Wrong grant confirmations one node run accepts in total, across every
+/// request. Past it, the short owner code stops working until restart and only
+/// the full `GRANT … CODE <nonce>` line approves. Bounds online guessing by a
+/// process that can reach the control socket and create requests at will.
+pub const OWNER_CODE_FAILURES_PER_RUN: u32 = 10;
+
+/// Alphabet of the short owner code: no 0/O or 1/I, so it reads aloud and
+/// types from a screen. 32 symbols, so a random byte maps without bias.
+const OWNER_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 
 // A spend grant's lifetime is the owner's choice, capped at
 // `spend_budget::MAX_SPEND_GRANT_TTL_SECS` (24 h). The 30-day unmetered grant
@@ -183,6 +200,31 @@ pub enum PairingError {
     /// The typed confirmation did not name this operation.
     #[error("confirmation phrase did not match the pending operation")]
     ConfirmationMismatch,
+    /// A wrong owner code for a live grant request; attempts left before it
+    /// is cancelled.
+    #[error(
+        "that is not the code the node showed for this request; {0} attempt(s) left before \
+         the request is cancelled"
+    )]
+    WrongOwnerCode(u8),
+    /// Nothing can approve this request any more: its owner code was lost to
+    /// a restart, or wrong codes cancelled it.
+    #[error(
+        "this request can no longer be approved: the node restarted after it was made, or \
+         too many wrong codes were typed. Nothing was granted. Ask again from the app; it \
+         shows a new command"
+    )]
+    ConfirmationLost,
+    /// Device-key registration and relation intents are off node-wide; the
+    /// `&str` is the stable reason code (see [`device::SEED_NOT_ENCRYPTED`]).
+    #[error("{}", device::device_approvals_off_message(.0))]
+    DeviceApprovalsDisabled(&'static str),
+    /// Short owner codes are off for this node run (too many wrong codes).
+    #[error(
+        "short approval codes are off until the node restarts (too many wrong codes were \
+         typed). Type the full GRANT ... CODE line from the node's terminal instead"
+    )]
+    ShortCodesOff,
     /// The approval or request has expired.
     #[error("operation expired")]
     Expired,
@@ -224,6 +266,9 @@ pub struct PairedClient {
     pub name: String,
     /// Ed25519 public key (hex).
     pub client_pubkey: String,
+    /// Optional X25519 static public key used by remote-access Noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_transport_pubkey: Option<String>,
     /// Scopes this pairing carries.
     pub scopes: Vec<Scope>,
     /// Revocation epoch. Bumping it invalidates every outstanding token for
@@ -380,6 +425,19 @@ pub struct PairingFile {
     /// recreate an earlier `(client_id, epoch)` and resurrect a revoked JWT.
     #[serde(default)]
     pub last_epoch: BTreeMap<String, u64>,
+    /// Owner-approved device keys (see [`device`]).
+    #[serde(default)]
+    pub device_keys: Vec<DeviceKey>,
+    /// Device keys awaiting the owner's one-time approval.
+    #[serde(default)]
+    pub pending_device_keys: Vec<PendingDeviceKey>,
+    /// Registration op id → key id, so the client can read "registered".
+    #[serde(default)]
+    pub registered_ops: BTreeMap<String, String>,
+    /// Used relation-intent nonces (`key_id:nonce` → client, issued_at), kept
+    /// an hour for replay refusal and the per-client rate limit.
+    #[serde(default)]
+    pub intent_nonces: BTreeMap<String, (String, i64)>,
 }
 
 impl PairingFile {
@@ -420,7 +478,12 @@ impl PairingFile {
 ///
 /// 2 (G1): grants carry a budget. A pre-G1 node must refuse this file rather
 /// than read a metered grant as an unmetered one.
-pub const PAIRING_FILE_VERSION: u32 = 2;
+///
+/// 3 (device keys): device keys and relation grants. A version-2 node must not
+/// read a relation grant as an unrestricted budget, so it refuses the file.
+///
+/// 4 (remote access): pairings may bind an X25519 transport public key.
+pub const PAIRING_FILE_VERSION: u32 = 4;
 
 /// A pending pairing request. Held in memory; the challenge itself lives in the
 /// protected file under `data_dir`, which is the actual control.
@@ -543,15 +606,24 @@ pub struct PairingService {
     file_path: PathBuf,
     inner: Mutex<Inner>,
     grant_changes: tokio::sync::Notify,
+    authority_changes: tokio::sync::watch::Sender<u64>,
     /// Whether the owner control socket exists in this deployment. When false,
     /// every grant-writing and approval-consuming call refuses outright
     /// (`OwnerChannelUnavailable`) — there is no debug flag, config switch or
     /// trusted-client list that widens this.
     owner_control_enabled: bool,
-    /// Whether the short code is echoed to stdout. Off in tests so a test run
-    /// does not scribble on the harness's output.
-    print_short_code: bool,
+    /// Whether a safe protected-file instruction is written to stdout. The
+    /// code/challenge itself is never printed.
+    print_pairing_instruction: bool,
     owner_console: Mutex<Box<dyn std::io::Write + Send>>,
+    /// Absolute config path of an owner-run node, for the owner command.
+    owner_config: Option<PathBuf>,
+    /// Public half of the seed-derived owner-approval key. Device keys are
+    /// honoured only under its signature. Never read from `data_dir`.
+    owner_approval_key: Option<ed25519_dalek::VerifyingKey>,
+    /// Why device authority is off, if it is. Fail closed: off until startup
+    /// supplies an owner key derived from a protected seed.
+    device_authority_off: Option<&'static str>,
 }
 
 struct Inner {
@@ -562,7 +634,12 @@ struct Inner {
     identity_fingerprint: String,
     // Never serialized or returned by HTTP/control status. Restart invalidates
     // pending console challenges; the owner must request a new operation.
-    owner_confirmations: HashMap<String, (blake3::Hash, i64)>,
+    owner_confirmations: HashMap<String, OwnerConfirmation>,
+    // Wrong grant confirmations in this run (see `OWNER_CODE_FAILURES_PER_RUN`).
+    owner_code_failures: u32,
+    // Requests cancelled by wrong codes in this run, so their status reads
+    // `lost` (their durable records are deleted, so a restart cannot revive them).
+    cancelled_ops: std::collections::HashSet<String>,
     // One-time first-contact confirmations, by client id. Memory only: never
     // serialized, dropped on restart (fail closed). See `FirstContactGrant`.
     first_contact: HashMap<String, PendingFirstContact>,
@@ -596,6 +673,73 @@ struct PendingFirstContact {
     grant: crate::spend_budget::FirstContactGrant,
     epoch: u64,
     budget_op_id: String,
+}
+
+/// What the owner console showed for one pending operation. Memory only.
+struct OwnerConfirmation {
+    /// Digest of the full `<label> CODE <nonce>` line.
+    phrase: blake3::Hash,
+    /// Digest of the normalized short owner code; grant requests only.
+    code: Option<blake3::Hash>,
+    expires_at: i64,
+    /// Wrong confirmations typed for this operation.
+    failures: u8,
+}
+
+/// A fresh short owner code, `XXXX-XXXX`: 40 bits from the CSPRNG.
+fn new_owner_code() -> String {
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(9);
+    for (i, b) in bytes.iter().enumerate() {
+        if i == 4 {
+            out.push('-');
+        }
+        out.push(OWNER_CODE_ALPHABET[(*b as usize) % OWNER_CODE_ALPHABET.len()] as char);
+    }
+    out
+}
+
+/// The owner's typing, as the code is compared: case, spaces and dashes are
+/// not part of it.
+fn normalize_owner_code(typed: &str) -> String {
+    typed
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Invisible formatting characters that could hide or reorder what an owner
+/// reads (bidi controls, zero-width characters, soft hyphen and the like).
+fn invisible_format(c: char) -> bool {
+    matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+        | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// `s` single-quoted for a shell only when it needs it. `None` when it holds a
+/// character no owner should be asked to paste (control or invisible
+/// formatting) or one that single quotes do not neutralize in every shell.
+fn shell_word(s: &str) -> Option<String> {
+    // A backslash or quote is refused, not escaped: `'\''` is POSIX-only, and
+    // fish would read `\'` inside single quotes as the end of the string.
+    if s.is_empty()
+        || s.chars().any(|c| {
+            c.is_control()
+                || c == '\\'
+                || c == '\''
+                || invisible_format(c)
+        })
+    {
+        return None;
+    }
+    if s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c))
+    {
+        return Some(s.to_string());
+    }
+    Some(format!("'{s}'"))
 }
 
 struct OwnerTerminal;
@@ -681,6 +825,7 @@ impl PairingService {
             Err(e) => return Err(e.into()),
         }
 
+        let (authority_changes, _) = tokio::sync::watch::channel(0);
         let service = Self {
             dir,
             file_path,
@@ -691,12 +836,18 @@ impl PairingService {
                 window_until: None,
                 identity_fingerprint,
                 owner_confirmations: HashMap::new(),
+                owner_code_failures: 0,
+                cancelled_ops: std::collections::HashSet::new(),
                 first_contact: HashMap::new(),
             }),
             grant_changes: tokio::sync::Notify::new(),
+            authority_changes,
             owner_control_enabled,
-            print_short_code: true,
+            print_pairing_instruction: true,
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
+            owner_config: None,
+            owner_approval_key: None,
+            device_authority_off: Some(device::OWNER_KEY_UNAVAILABLE),
         };
         // A grant that expired while the node was down, or an unmetered
         // pre-G1 grant, must not survive the restart on disk either.
@@ -711,49 +862,74 @@ impl PairingService {
         self
     }
 
+    /// Tell the owner, on the owner terminal only, how a pending operation is
+    /// approved, and remember digests of what it showed.
+    ///
+    /// Every operation gets the full `<label> CODE <nonce>` line. A grant
+    /// request (`short_code`) also gets a short code the owner types into
+    /// `konsensus grant`. Both reach only this console: never HTTP, the control
+    /// socket's replies, stdout/stderr (which a launching app may pipe) or a
+    /// file under `data_dir`.
     fn console_challenge(
         &self,
         inner: &mut Inner,
         op_id: &str,
         label: &str,
         expires_at: i64,
+        command: Option<String>,
     ) -> Result<(), PairingError> {
+        let short_code = command.is_some();
         if !self.owner_control_enabled {
             return Ok(());
         }
         let mut nonce = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
         let phrase = format!("{label} CODE {}", hex::encode(nonce));
+        let codes_on = inner.owner_code_failures < OWNER_CODE_FAILURES_PER_RUN;
+        let code = (short_code && codes_on).then(new_owner_code);
+        let mut text = format!("\nOwner approval (expires {expires_at}):\n{phrase}\n");
+        if let Some(code) = &code {
+            text.push_str(&format!(
+                "To approve, run: {}\n  and type this code when it asks: {code}\n",
+                command.as_deref().unwrap_or_default()
+            ));
+        } else if let Some(command) = &command {
+            text.push_str(&format!(
+                "To approve, run: {command}\n  and paste the {} ... CODE line above (short codes \
+                 are off until restart: too many wrong codes)\n",
+                label.split(' ').next().unwrap_or("GRANT")
+            ));
+        }
         let mut console = self
             .owner_console
             .lock()
             .map_err(|_| PairingError::Io("owner console unavailable".into()))?;
-        console.write_all(
-            format!("\nOwner approval (expires {expires_at}):\n{phrase}\n").as_bytes(),
-        )?;
+        console.write_all(text.as_bytes())?;
         console.flush()?;
-        inner
-            .owner_confirmations
-            .retain(|_, (_, expiry)| *expiry > chrono::Utc::now().timestamp());
+        let now = chrono::Utc::now().timestamp();
+        inner.owner_confirmations.retain(|_, c| c.expires_at > now);
         inner.owner_confirmations.insert(
             op_id.to_owned(),
-            (blake3::hash(phrase.as_bytes()), expires_at),
+            OwnerConfirmation {
+                phrase: blake3::hash(phrase.as_bytes()),
+                code: code.map(|c| blake3::hash(normalize_owner_code(&c).as_bytes())),
+                expires_at,
+                failures: 0,
+            },
         );
         Ok(())
     }
 
+    /// The full console line only (identity replacement).
     fn verify_owner_confirmation(
         inner: &Inner,
         op_id: &str,
         confirmation: &str,
     ) -> Result<(), PairingError> {
-        let valid = inner
-            .owner_confirmations
-            .get(op_id)
-            .is_some_and(|(digest, expiry)| {
-                *expiry > chrono::Utc::now().timestamp()
-                    && *digest == blake3::hash(confirmation.trim().as_bytes())
-            });
+        let valid = inner.owner_confirmations.get(op_id).is_some_and(|c| {
+            c.expires_at > chrono::Utc::now().timestamp()
+                && c.phrase == blake3::hash(confirmation.trim().as_bytes())
+        });
         if valid {
             Ok(())
         } else {
@@ -761,9 +937,147 @@ impl PairingService {
         }
     }
 
-    /// Test/bootstrap helper: suppress the stdout tripwire print.
+    /// A grant request: the short owner code or the full console line.
+    ///
+    /// Each wrong answer is counted against the request and the node run, and
+    /// announced on the owner console. The request is cancelled after
+    /// [`OWNER_CODE_ATTEMPTS`]; past [`OWNER_CODE_FAILURES_PER_RUN`] the short
+    /// code no longer approves anything in this run. A request made before a
+    /// restart has nothing to compare against and is [`PairingError::ConfirmationLost`].
+    fn verify_grant_confirmation(
+        &self,
+        inner: &mut Inner,
+        label: &str,
+        op_id: &str,
+        confirmation: &str,
+    ) -> Result<(), PairingError> {
+        let now = chrono::Utc::now().timestamp();
+        let codes_enabled = inner.owner_code_failures < OWNER_CODE_FAILURES_PER_RUN;
+        let Some(expected) = inner
+            .owner_confirmations
+            .get_mut(op_id)
+            .filter(|c| c.expires_at > now)
+        else {
+            return Err(PairingError::ConfirmationLost);
+        };
+        let typed = confirmation.trim();
+        let phrase_ok = expected.phrase == blake3::hash(typed.as_bytes());
+        let code_ok = codes_enabled
+            && expected
+                .code
+                .is_some_and(|d| d == blake3::hash(normalize_owner_code(typed).as_bytes()));
+        if phrase_ok || code_ok {
+            return Ok(());
+        }
+        expected.failures = expected.failures.saturating_add(1);
+        let left = OWNER_CODE_ATTEMPTS.saturating_sub(expected.failures);
+        inner.owner_code_failures = inner.owner_code_failures.saturating_add(1);
+        let mut warning = format!(
+            "\nWRONG approval code for {label}. If you did not just type it, something on this \
+             computer is trying to approve this request.\n"
+        );
+        if left == 0 {
+            inner.owner_confirmations.remove(op_id);
+            // Cancel durably: a restart must not re-issue a code for a request
+            // someone was guessing at.
+            inner.file.pending_elevations.retain(|e| e.op_id != op_id);
+            inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
+            inner.cancelled_ops.insert(op_id.to_string());
+            if let Err(e) = self.persist(&mut inner.file) {
+                tracing::warn!(error = %e, op_id, "could not persist a cancelled approval");
+            }
+            warning.push_str("That request is cancelled; nothing was granted.\n");
+        }
+        if inner.owner_code_failures == OWNER_CODE_FAILURES_PER_RUN {
+            warning.push_str(
+                "Too many wrong codes: short codes are off until the node restarts. Approve with \
+                 the full GRANT ... CODE line instead.\n",
+            );
+        }
+        if let Ok(mut console) = self.owner_console.lock() {
+            let _ = console.write_all(warning.as_bytes());
+            let _ = console.flush();
+        }
+        if left == 0 {
+            Err(PairingError::ConfirmationLost)
+        } else if !codes_enabled {
+            Err(PairingError::ShortCodesOff)
+        } else {
+            Err(PairingError::WrongOwnerCode(left))
+        }
+    }
+
+    /// Whether the owner console still holds a live confirmation for `op_id`.
+    /// False for a request made before this node run, or cancelled by wrong
+    /// codes: nothing can approve it any more.
+    pub fn elevation_confirmable(&self, op_id: &str) -> bool {
+        let inner = self.lock();
+        Self::confirmable(&inner, op_id)
+    }
+
+    fn confirmable(inner: &Inner, op_id: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        inner
+            .owner_confirmations
+            .get(op_id)
+            .is_some_and(|c| c.expires_at > now)
+    }
+
+    /// The owner-approval public key, derived from the running identity's
+    /// seed (`NodeIdentity::owner_approval_public`).
+    pub fn with_owner_approval_key(mut self, key: ed25519_dalek::VerifyingKey) -> Self {
+        self.owner_approval_key = Some(key);
+        self.device_authority_off = None;
+        self
+    }
+
+    /// Turn device-key registration and relation intents off node-wide, with
+    /// the reason the app shows (e.g. [`device::SEED_NOT_ENCRYPTED`]).
+    pub fn with_device_authority_disabled(mut self, reason: &'static str) -> Self {
+        self.owner_approval_key = None;
+        self.device_authority_off = Some(reason);
+        self
+    }
+
+    /// `None` when device approvals are on, else the reason code.
+    pub fn device_authority_off(&self) -> Option<&'static str> {
+        self.device_authority_off
+    }
+
+    /// Record the absolute config path this node was started with, so the
+    /// owner command it states names it. Owner-run startup only.
+    pub fn with_owner_config(mut self, config_path: PathBuf) -> Self {
+        self.owner_config = Some(config_path);
+        self
+    }
+
+    /// The command that approves `op_id`, as the app and the owner console
+    /// show it: `konsensus grant --op <id> --config <absolute path>`. The path
+    /// is left out when unknown or unsafe to show.
+    pub fn owner_grant_command(&self, op_id: &str) -> String {
+        self.owner_command("grant", op_id)
+    }
+
+    /// `konsensus device approve --op <id> --config <path>`, likewise.
+    pub fn owner_device_command(&self, op_id: &str) -> String {
+        self.owner_command("device approve", op_id)
+    }
+
+    fn owner_command(&self, verb: &str, op_id: &str) -> String {
+        let config = self
+            .owner_config
+            .as_deref()
+            .and_then(|p| p.to_str())
+            .and_then(shell_word);
+        match config {
+            Some(path) => format!("konsensus {verb} --op {op_id} --config {path}"),
+            None => format!("konsensus {verb} --op {op_id}"),
+        }
+    }
+
+    /// Test/bootstrap helper: suppress the safe stdout pairing instruction.
     pub fn without_stdout_code(mut self) -> Self {
-        self.print_short_code = false;
+        self.print_pairing_instruction = false;
         self
     }
 
@@ -809,6 +1123,39 @@ impl PairingService {
     /// The identity this service currently binds pairings to.
     pub fn bound_fingerprint(&self) -> String {
         self.lock().identity_fingerprint.clone()
+    }
+
+    /// Subscribe to pairing-authority changes that can invalidate a live
+    /// remote-access tunnel. Receivers must revalidate their exact captured
+    /// authority after every notification.
+    pub fn subscribe_authority_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.authority_changes.subscribe()
+    }
+
+    fn notify_authority_change(&self) {
+        self.authority_changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// Store the one-shot remote pairing link under the protected pairing
+    /// directory. The link is intentionally never returned by an HTTP route or
+    /// written to stdout/journald.
+    pub fn write_remote_access_link(&self, link: &str) -> Result<PathBuf, PairingError> {
+        let path = self.dir.join("remote-access-link");
+        write_protected(&path, link.as_bytes())?;
+        fsync_dir(&self.dir)?;
+        Ok(path)
+    }
+
+    /// Remove any live or stale remote pairing link.
+    pub fn remove_remote_access_link(&self) -> Result<(), PairingError> {
+        let path = self.dir.join("remote-access-link");
+        match std::fs::remove_file(path) {
+            Ok(()) => fsync_dir(&self.dir)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -916,12 +1263,14 @@ impl PairingService {
         write_protected(&self.challenge_path(&pair_id), &challenge)?;
 
         let code = short_code(&challenge);
-        if self.print_short_code {
-            // The node's OWN stdout. In the sidecar deployment the app can read
-            // this by construction, which is why it is a cross-check and not
-            // the control (policy lock C).
-            println!("bitsov pairing code for \"{}\": {}", pair_id, code);
-            tracing::info!(pair_id = %pair_id, "pairing requested — short code printed to stdout");
+        if self.print_pairing_instruction {
+            println!(
+                "Pairing request {} is available at protected file {} (expires at {}).",
+                pair_id,
+                self.challenge_path(&pair_id).display(),
+                expires_at_unix
+            );
+            tracing::info!(pair_id = %pair_id, "pairing requested; protected challenge file written");
         }
 
         Ok(PairingRequestOutcome {
@@ -1006,6 +1355,7 @@ impl PairingService {
             client_id: client_id.clone(),
             name: pending.name.clone(),
             client_pubkey: pending.client_pubkey.clone(),
+            remote_transport_pubkey: None,
             scopes,
             epoch,
             identity_fingerprint: fingerprint,
@@ -1015,7 +1365,143 @@ impl PairingService {
         inner.file.clients.retain(|c| c.client_id != client_id);
         inner.file.clients.push(record.clone());
         self.persist(&mut inner.file)?;
+        self.notify_authority_change();
         Ok(record)
+    }
+
+    /// Atomically create a normal read+receive pairing after the remote
+    /// listener has verified its memory-only code and Ed25519 proof.
+    pub fn create_verified_remote_pairing(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        remote_transport_pubkey: &[u8; 32],
+    ) -> Result<PairedClient, PairingError> {
+        let normalized_pubkey = client_pubkey_hex.to_ascii_lowercase();
+        parse_pubkey(&normalized_pubkey)?;
+        let remote_hex = hex::encode(remote_transport_pubkey);
+        let client_id = client_id_from_pubkey(&normalized_pubkey);
+        let now = chrono::Utc::now().timestamp();
+
+        let mut inner = self.lock();
+        if !Self::open_inner(&inner) {
+            return Err(PairingError::Closed);
+        }
+        if inner.file.clients.iter().any(|client| {
+            client.remote_transport_pubkey.as_deref() == Some(remote_hex.as_str())
+                && client.client_id != client_id
+        }) {
+            return Err(PairingError::Closed);
+        }
+        let fingerprint = inner.identity_fingerprint.clone();
+        if fingerprint.is_empty() {
+            return Err(PairingError::PairingInvalid(
+                "remote access requires a live node identity".into(),
+            ));
+        }
+        if let Some(index) = inner
+            .file
+            .clients
+            .iter()
+            .position(|client| client.client_id == client_id)
+        {
+            let existing = &inner.file.clients[index];
+            if existing.identity_fingerprint != fingerprint {
+                return Err(PairingError::PairingInvalid(
+                    "identity fingerprint changed".into(),
+                ));
+            }
+            match existing.remote_transport_pubkey.as_deref() {
+                Some(bound) if bound == remote_hex => return Ok(existing.clone()),
+                Some(_) => return Err(PairingError::Closed),
+                None => {}
+            }
+            let previous = inner.file.clone();
+            inner.file.clients[index].remote_transport_pubkey = Some(remote_hex);
+            let record = inner.file.clients[index].clone();
+            if let Err(error) = self.persist(&mut inner.file) {
+                inner.file = previous;
+                return Err(error);
+            }
+            self.notify_authority_change();
+            return Ok(record);
+        }
+        let previous = inner.file.clone();
+        let epoch = {
+            let entry = inner.file.last_epoch.entry(client_id.clone()).or_insert(0);
+            *entry = entry.checked_add(1).ok_or(PairingError::Closed)?;
+            *entry
+        };
+        let record = PairedClient {
+            client_id: client_id.clone(),
+            name: sanitize_name(name),
+            client_pubkey: normalized_pubkey,
+            remote_transport_pubkey: Some(remote_hex),
+            scopes: vec![Scope::Read, Scope::Receive],
+            epoch,
+            identity_fingerprint: fingerprint,
+            created_at: now,
+            last_seen: None,
+        };
+        inner.file.clients.push(record.clone());
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = previous;
+            return Err(error);
+        }
+        self.notify_authority_change();
+        Ok(record)
+    }
+
+    /// Resolve a live pairing by the X25519 static authenticated by Noise_XX.
+    pub fn validate_remote_transport(
+        &self,
+        remote_transport_pubkey: &[u8; 32],
+    ) -> Result<PairedClient, PairingError> {
+        let remote_hex = hex::encode(remote_transport_pubkey);
+        let inner = self.lock();
+        let record = inner
+            .file
+            .clients
+            .iter()
+            .find(|client| client.remote_transport_pubkey.as_deref() == Some(remote_hex.as_str()))
+            .cloned()
+            .ok_or(PairingError::UnknownClient)?;
+        if record.identity_fingerprint != inner.identity_fingerprint {
+            return Err(PairingError::PairingInvalid(
+                "identity fingerprint changed".into(),
+            ));
+        }
+        Ok(record)
+    }
+
+    /// Revalidate the exact authority captured when a remote tunnel
+    /// authenticated. Matching only the transport key is insufficient: an old
+    /// tunnel must not become valid again after revocation and re-pairing.
+    pub fn validate_remote_authority(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        remote_transport_pubkey: &[u8; 32],
+        identity_fingerprint: &str,
+    ) -> Result<(), PairingError> {
+        let remote_hex = hex::encode(remote_transport_pubkey);
+        let inner = self.lock();
+        let record = inner
+            .file
+            .clients
+            .iter()
+            .find(|client| client.client_id == client_id)
+            .ok_or(PairingError::UnknownClient)?;
+        if record.epoch != epoch
+            || record.remote_transport_pubkey.as_deref() != Some(remote_hex.as_str())
+            || record.identity_fingerprint != identity_fingerprint
+            || inner.identity_fingerprint != identity_fingerprint
+        {
+            return Err(PairingError::PairingInvalid(
+                "remote tunnel authority changed".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Issue a token-issuance challenge for a paired client.
@@ -1312,6 +1798,7 @@ impl PairingService {
         // `spend` waiting for the next pairing of the same key.
         inner.file.revoke_grants(Some(client_id));
         self.persist(&mut inner.file)?;
+        self.notify_authority_change();
         Ok(epoch)
     }
 
@@ -1345,7 +1832,15 @@ impl PairingService {
             .file
             .replacement_approvals
             .retain(|a| a.client_id != client_id);
+        inner.file.device_keys.retain(|k| k.client_id != client_id);
+        inner
+            .file
+            .pending_device_keys
+            .retain(|p| p.client_id != client_id);
+        let keys: Vec<String> = inner.file.device_keys.iter().map(|k| k.key_id.clone()).collect();
+        inner.file.registered_ops.retain(|_, k| keys.contains(k));
         self.persist(&mut inner.file)?;
+        self.notify_authority_change();
         Ok(())
     }
 
@@ -1398,6 +1893,9 @@ impl PairingService {
         let rotated = PairedClient {
             client_id: new_id.clone(),
             client_pubkey: new_pubkey_hex.to_ascii_lowercase(),
+            // Rotating the Ed25519 pairing identity does not authenticate a
+            // replacement Noise static. Retire the old transport binding.
+            remote_transport_pubkey: None,
             // The epoch advances on rotation: tokens minted for the old key
             // must stop working the moment the key they prove is retired.
             epoch: rotated_epoch,
@@ -1417,10 +1915,15 @@ impl PairingService {
             .clients
             .retain(|c| c.client_id != client_id && c.client_id != new_id);
         inner.file.clients.push(rotated.clone());
+        // Device keys were registered to the old pairing id; retire them so the
+        // same device can register again under the rotated one.
+        inner.file.device_keys.retain(|k| k.client_id != client_id);
+        inner.file.pending_device_keys.retain(|p| p.client_id != client_id);
         // Grants do not survive a key rotation: they were written against a
         // specific client id and epoch by a deliberate owner action.
         inner.file.revoke_grants(Some(client_id));
         self.persist(&mut inner.file)?;
+        self.notify_authority_change();
         Ok(rotated)
     }
 
@@ -1444,8 +1947,13 @@ impl PairingService {
         inner.file.revoke_grants(None);
         inner.file.pending_elevations.clear();
         inner.file.replacement_approvals.clear();
+        // Device keys signed for the old identity's pairings; start over.
+        inner.file.device_keys.clear();
+        inner.file.pending_device_keys.clear();
+        inner.file.registered_ops.clear();
         inner.owner_confirmations.clear();
         self.persist(&mut inner.file)?;
+        self.notify_authority_change();
         Ok(())
     }
 
@@ -1519,6 +2027,7 @@ impl PairingService {
             &op.op_id,
             &grant_confirmation_phrase(&op),
             op.expires_at,
+            Some(self.owner_grant_command(&op.op_id)),
         )?;
         inner.file.pending_elevations.retain(|e| e.expires_at > now);
         inner.file.pending_elevations.push(op.clone());
@@ -1571,6 +2080,9 @@ impl PairingService {
             if granted {
                 return ElevationStatus::Granted;
             }
+            if !Self::confirmable(&inner, op_id) {
+                return ElevationStatus::Lost;
+            }
             return ElevationStatus::Pending;
         }
         // The pending record is consumed when the owner writes the grant, so a
@@ -1587,6 +2099,9 @@ impl PairingService {
                 .any(|g| g.op_id == op_id && g.is_live(now))
         {
             return ElevationStatus::Granted;
+        }
+        if inner.cancelled_ops.contains(op_id) {
+            return ElevationStatus::Lost;
         }
         ElevationStatus::Absent
     }
@@ -1628,7 +2143,12 @@ impl PairingService {
                     .into(),
             ));
         }
-        Self::verify_owner_confirmation(&inner, op_id, confirmation)?;
+        self.verify_grant_confirmation(
+            &mut inner,
+            &grant_confirmation_phrase(&op),
+            op_id,
+            confirmation,
+        )?;
         let client = inner
             .file
             .clients
@@ -1704,7 +2224,12 @@ impl PairingService {
                 "this request does not ask for front_door; grant it with a budget".into(),
             ));
         }
-        Self::verify_owner_confirmation(&inner, op_id, confirmation)?;
+        self.verify_grant_confirmation(
+            &mut inner,
+            &grant_confirmation_phrase(&op),
+            op_id,
+            confirmation,
+        )?;
         let client = inner
             .file
             .clients
@@ -1792,6 +2317,7 @@ impl PairingService {
             &approval.op_id,
             &replacement_confirmation_phrase(&approval),
             approval.expires_at,
+            None,
         )?;
         inner
             .file
@@ -2025,7 +2551,7 @@ impl PairingService {
         if budget.pending.len() >= 1024 {
             return Err(BudgetRefusal::Ledger("too many unresolved reservations".into()));
         }
-        budget.reserve(&charges)?;
+        budget.reserve_at(&charges, now)?;
         let mut recipients = std::collections::BTreeMap::new();
         for charge in &charges {
             *recipients.entry(charge.recipient.clone()).or_insert(0u64) += charge.amount_msat;
@@ -2312,7 +2838,7 @@ impl PairingService {
         let before = inner.file.grants[grant_idx].budget.clone();
         if message_top_up > 0 {
             let budget = inner.file.grants[grant_idx].budget.as_mut().ok_or(BudgetRefusal::NoGrant)?;
-            if let Err(e) = budget.reserve(&[Charge { recipient: recipient.clone(), amount_msat: message_top_up }]) {
+            if let Err(e) = budget.reserve_at(&[Charge { recipient: recipient.clone(), amount_msat: message_top_up }], chrono::Utc::now().timestamp()) {
                 inner.file.grants[grant_idx].budget = before;
                 return Err(e);
             }
@@ -2400,12 +2926,31 @@ impl PairingService {
         reservation: &Reservation,
         action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
+        self.with_spend_authority_at(reservation, || chrono::Utc::now().timestamp(), action)
+    }
+
+    /// [`Self::with_spend_authority`] with an injected clock. The clock is read
+    /// **after** the pairing lock is held: a dispatch that waited behind
+    /// another writer must judge deadlines at the time it actually runs.
+    pub(crate) fn with_spend_authority_at<T>(
+        &self,
+        reservation: &Reservation,
+        clock: impl FnOnce() -> i64,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, BudgetRefusal> {
         let inner = self.lock();
-        let now = chrono::Utc::now().timestamp();
+        let now = clock();
         let valid = self.owner_control_enabled
             && inner.file.grants.iter().any(|g| {
                 g.op_id == reservation.op_id
-                    && g.budget.as_ref().is_some_and(|b| b.pending.contains_key(&reservation.id))
+                    && g.budget.as_ref().is_some_and(|b| {
+                        // A relation grant lives until its latest envelope, so
+                        // each recipient's own deadline is rechecked here, at
+                        // dispatch: an expired peer never pays on a live one's time.
+                        b.pending
+                            .get(&reservation.id)
+                            .is_some_and(|recipients| b.envelopes_live(recipients.keys(), now))
+                    })
                     && g.client_id == reservation.client_id
                     && g.identity_fingerprint == inner.identity_fingerprint
                     && g.scopes.contains(&Scope::Spend)
@@ -2601,6 +3146,10 @@ pub enum ElevationStatus {
     Granted,
     /// The request window closed without an owner confirmation.
     Expired,
+    /// Still on file but no longer approvable: the node restarted after it
+    /// was made (the owner code lived in memory only) or too many wrong codes
+    /// cancelled it. The client should ask again.
+    Lost,
     /// No such operation.
     Absent,
 }
@@ -2619,6 +3168,9 @@ fn grant_view(g: &SpendGrant) -> Option<GrantView> {
         per_call_max_msat: b.per_call_max_msat,
         per_recipient_msat: b.per_recipient_msat.clone(),
         used_by_recipient: b.used_by_recipient.clone(),
+        recipients_only: b.recipients_only,
+        per_act_max_by_recipient: b.per_act_max_by_recipient.clone(),
+        recipient_expires_at: b.recipient_expires_at.clone(),
     })
 }
 
