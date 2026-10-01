@@ -31,12 +31,15 @@ pub struct IdentityResponse {
 pub struct VerifyMnemonicRequest {
     /// BIP-39 mnemonic phrase (12 or 24 words, space-separated).
     pub mnemonic: String,
+    /// Optional BIP-39 passphrase; scrubbed when the request is dropped.
+    /// Required when the running node uses a non-empty passphrase.
+    pub passphrase: Option<Zeroizing<String>>,
 }
 
 /// Response from mnemonic verification.
 #[derive(Serialize)]
 pub struct VerifyMnemonicResponse {
-    /// The node ID (Ed25519 public key, hex) that this mnemonic would produce.
+    /// The node ID (Ed25519 public key, hex) this mnemonic and passphrase produce.
     pub node_id: String,
 }
 
@@ -78,6 +81,8 @@ async fn get_identity(
 /// Used by the recovery wizard to let the user confirm which identity a mnemonic
 /// would produce before committing to a restore. This is a stateless operation —
 /// it does not modify any node state.
+/// A missing passphrase is refused if the running node uses one. The configured
+/// secret is never substituted: the caller must supply the recovery material.
 ///
 /// Gated behind `ScopedAuth<Identity>` (L7b): the companion `restore_identity` endpoint
 /// already requires auth, so the wizard always runs from an authenticated
@@ -85,10 +90,17 @@ async fn get_identity(
 /// otherwise use to enumerate node IDs from candidate mnemonics.
 async fn verify_mnemonic(
     _auth: ScopedAuth<Identity>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<VerifyMnemonicRequest>,
 ) -> Result<Json<VerifyMnemonicResponse>, ApiError> {
+    if req.passphrase.is_none() && state.has_identity_passphrase {
+        return Err(ApiError::BadRequest(
+            "BIP-39 passphrase is required because this node has one configured".into(),
+        ));
+    }
     validate_mnemonic_word_count(&req.mnemonic)?;
-    let identity = konsensus_core::NodeIdentity::from_mnemonic(&req.mnemonic, "")
+    let passphrase = req.passphrase.as_ref().map_or("", |value| value.as_str());
+    let identity = konsensus_core::NodeIdentity::from_mnemonic(&req.mnemonic, passphrase)
         .map_err(|e| ApiError::BadRequest(format!("invalid mnemonic: {e}")))?;
 
     Ok(Json(VerifyMnemonicResponse {

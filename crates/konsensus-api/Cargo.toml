@@ -39,7 +39,7 @@ ring = "0.17"
 base64.workspace = true
 lightning-invoice.workspace = true
 futures.workspace = true
-zeroize.workspace = true
+zeroize = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 sqlx.workspace = true

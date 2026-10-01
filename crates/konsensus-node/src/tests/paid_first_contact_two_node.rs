@@ -481,6 +481,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
+        has_identity_passphrase: false,
         ws_broadcast: ws_broadcast.clone(),
         ws_delivery_broadcast: ws_delivery_tx.clone(),
         rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),
