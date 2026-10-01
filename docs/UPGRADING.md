@@ -3,9 +3,10 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 production data directory without re-running `konsensus init`.
 
-**rc8:** the items below are in `v0.3.0-rc8` (and current `main`). Read this before
-swapping a long-lived data directory onto the new binary. Fresh `konsensus init`
-installs are unaffected.
+**rc8:** the items below are in `v0.3.0-rc8` (and current `main` through #154). Read
+this before swapping a long-lived data directory onto the new binary. Fresh
+`konsensus init` installs are unaffected. For VMs, also read **VM / multi-host
+upgrade rules** and **Encrypted seed / custody** below.
 
 ## MSRV (Rust 1.88+)
 
@@ -120,3 +121,44 @@ stun_listen = "0.0.0.0:3478"   # UDP; omit to keep it off (default)
   use host candidates only (same network / VPN). TURN is unsupported.
 
 See [`docs/v2/CALLS-PROTOTYPE.md`](v2/CALLS-PROTOTYPE.md).
+
+## VM / multi-host upgrade rules (rc8)
+
+These rules apply when replacing the binary on a long-lived data directory (Mac pilot
+or hosted VMs). They are operational constraints, not a claim that a particular
+upgrade script is safe.
+
+1. **Rollback window.** Restoring the old data directory after the new binary has
+   started LDK and published Lightning state can get a channel **punished (funds
+   lost)**. Rollback of the data dir (and any restored `migrations.old`) is only
+   allowed **before the first LDK start on the new binary**. After that, roll
+   forward only.
+2. **No seed copy.** Do not write an extra mnemonic copy during upgrade. Leave the
+   existing seed path alone (plaintext or encrypted).
+3. **One VM at a time.** Upgrade hosts sequentially so calls, meetings, and front
+   door are not split across mixed builds longer than necessary. Aim for the Mac
+   pilot and each VM to end on the same build.
+
+Migrations **020–028** apply at first open on the new binary (rc7 ends at **019**).
+Confirm the live schema before upgrade; never run the old binary against the new
+SQL after migrations have applied.
+
+## Encrypted seed, `--password-file`, and custody labeling
+
+Seed encrypt and `--password-file` shipped in #153 (via #150). Custody labeling and
+the remote-signer design note shipped in #154.
+
+- Interactive `konsensus start` can prompt for the seed password. A **systemd** unit
+  cannot type into that prompt. For an encrypted seed under systemd, use the opt-in
+  `--password-file <path>` (regular file, mode `0600`, owner-only, **no symlink**).
+  Starting this way leaves Touch ID approvals off (`seed_password_not_typed`).
+- A password file is readable by any process running as that user (including a paired
+  app). It protects against **other OS users**, not same-user compromise.
+- An encrypted seed on a VM the operator controls is **not** self-custody of a
+  different kind: the node decrypts the seed into that machine's memory. Label it
+  honestly via `[identity] hosted = true` (or cloud tier) so owner `/status`
+  reports `custody_mode: hosted_custody`. Prefer that over implying the VM is a
+  remote signer.
+- `remote_signer` in `/status` is **reserved**. No config in this release produces
+  it; see [`docs/protocol/REMOTE-SIGNER.md`](protocol/REMOTE-SIGNER.md) for the
+  design only.
