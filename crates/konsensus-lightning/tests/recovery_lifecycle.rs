@@ -254,10 +254,12 @@ impl LightningProvider for FailingSync {
             },
         )
     }
-    async fn money_ready(&self) -> bool { !self.0.load(Ordering::SeqCst) }
+    async fn money_ready(&self) -> bool { true }
     async fn is_available(&self) -> bool { true }
-    async fn create_invoice(&self, _: u64, _: &str, _: u32)
-        -> Result<konsensus_core::traits::lightning::Invoice, LightningError> { unreachable!() }
+    async fn create_invoice(&self, amount: u64, description: &str, expiry: u32)
+        -> Result<konsensus_core::traits::lightning::Invoice, LightningError> {
+        MockLightningProvider::new().create_invoice(amount, description, expiry).await
+    }
     async fn pay_invoice(&self, _: &str)
         -> Result<konsensus_core::traits::lightning::PaymentDetails, LightningError> { unreachable!() }
     async fn get_payment_status(&self, _: &str)
@@ -266,7 +268,7 @@ impl LightningProvider for FailingSync {
 }
 
 #[tokio::test(start_paused = true)]
-async fn sync_failure_revokes_cached_readiness_and_money_dispatch_before_next_poll() {
+async fn sync_failure_is_diagnostic_only_before_and_after_next_poll() {
     let backend = Arc::new(FailingSync(std::sync::atomic::AtomicBool::new(false)));
     let factory_backend = backend.clone();
     let provider = RecoveringLightning::new(move || {
@@ -278,10 +280,19 @@ async fn sync_failure_revokes_cached_readiness_and_money_dispatch_before_next_po
     assert!(provider.readiness().await.money_ready);
     backend.0.store(true, Ordering::SeqCst);
     // No clock advance / monitor tick between a live failure and these calls.
-    assert!(!provider.money_ready().await);
-    let readiness = provider.readiness().await;
-    assert!(!readiness.money_ready);
-    assert_eq!(readiness.state, "synchronizing");
-    assert!(matches!(provider.create_invoice(1, "x", 60).await, Err(LightningError::NotReady)));
+    for _ in 0..2 {
+        assert!(provider.chain_sync_status().is_some());
+        assert!(provider.money_ready().await);
+        let readiness = provider.readiness().await;
+        assert!(readiness.money_ready);
+        assert_eq!(readiness.state, "ready");
+        assert_eq!(readiness.events.last().unwrap().state, "ready");
+        assert!(readiness.events.last().unwrap().money_ready);
+        assert!(provider.is_payment_capable().await);
+        assert_eq!(provider.wallet_sync().await, konsensus_core::traits::lightning::WalletSync::Live);
+        assert!(provider.create_invoice(1, "x", 60).await.is_ok());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+    }
     provider.shutdown().await.unwrap();
 }

@@ -84,9 +84,10 @@ LDK wallet sync failures appear in owner status, including during initial sync:
 
 `since` is Unix seconds at the first failed attempt for the currently failing
 wallet in this process. Retries preserve it, and a successful sync clears that
-wallet's failure. A failure of either wallet keeps the status stalled and money
-operations unready. `sync_failed` is a fixed, non-secret kind: it does not diagnose
-pruning versus an unreachable RPC. No remote error text, credentials or paths
+wallet's failure. A failure of either wallet keeps the diagnostic stalled. This
+diagnostic does not gate money operations: `money_ready` retains its running,
+post-startup wallet sync and timestamp freshness checks. `sync_failed` is a fixed,
+non-secret kind: it does not diagnose pruning versus an unreachable RPC. No remote error text, credentials or paths
 are returned. Restore required block history or RPC access and let LDK retry.
 `chain_sync: null` means no observed wallet sync failure (or a backend without
 this diagnostic), **not** proof of synchronization. Use `money_ready` for money

@@ -175,8 +175,7 @@ impl RecoveringLightning {
 
     fn backend(&self) -> Result<Arc<dyn LightningProvider>, LightningError> {
         let state = self.state.read().unwrap();
-        if *self.stop.borrow() || !state.readiness.money_ready
-            || state.backend.as_ref().is_some_and(|p| p.chain_sync_status().is_some()) {
+        if *self.stop.borrow() || !state.readiness.money_ready {
             return Err(LightningError::NotReady);
         }
         state.backend.clone().ok_or(LightningError::NotReady)
@@ -198,18 +197,10 @@ impl LightningProvider for RecoveringLightning {
     }
 
     async fn readiness(&self) -> LightningReadiness {
-        let state = self.state.read().unwrap();
-        let mut readiness = state.readiness.clone();
-        // The monitor's cache can lag an observed failure by one poll interval.
-        if readiness.money_ready
-            && state.backend.as_ref().is_some_and(|p| p.chain_sync_status().is_some()) {
-            readiness.money_ready = false;
-            readiness.state = "synchronizing".into();
-        }
-        readiness
+        self.state.read().unwrap().readiness.clone()
     }
     async fn money_ready(&self) -> bool {
-        self.backend().is_ok()
+        !*self.stop.borrow() && self.state.read().unwrap().readiness.money_ready
     }
     async fn is_available(&self) -> bool {
         self.money_ready().await

@@ -147,7 +147,9 @@ impl LightningProvider for FailingLightning {
         // Simulate a ready snapshot taken just before the sync failure arrives.
         konsensus_core::traits::lightning::LightningReadiness {
             money_ready: true, state: "ready".into(), retry_attempt: 0,
-            retry_after_secs: None, events: vec![],
+            retry_after_secs: None, events: vec![konsensus_core::traits::lightning::ReadinessEvent {
+                state: "ready".into(), timestamp: 123, sequence: 1, money_ready: true,
+            }],
         }
     }
     fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
@@ -741,10 +743,12 @@ async fn stalled_chain_sync_is_owner_only_and_survives_unready_recovery_wrapper(
 }
 
 #[tokio::test]
-async fn status_sync_failure_overrides_an_earlier_ready_snapshot() {
+async fn status_sync_failure_preserves_readiness_and_event_history() {
     let response = get(with_lightning(Arc::new(FailingLightning)), "/api/v1/status", true).await;
     assert_eq!(response.json["chain_sync"]["state"], "stalled");
-    assert_eq!(response.json["money_ready"], false);
-    assert_eq!(response.json["readiness"]["money_ready"], false);
-    assert_eq!(response.json["readiness"]["state"], "synchronizing");
+    assert_eq!(response.json["money_ready"], true);
+    assert_eq!(response.json["readiness"]["money_ready"], true);
+    assert_eq!(response.json["readiness"]["state"], "ready");
+    assert_eq!(response.json["readiness"]["events"][0]["state"], "ready");
+    assert_eq!(response.json["readiness"]["events"][0]["money_ready"], true);
 }

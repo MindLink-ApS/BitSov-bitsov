@@ -1005,7 +1005,6 @@ impl LightningProvider for LdkProvider {
         let fresh = |timestamp: Option<u64>, max_age: u64| timestamp.is_some_and(|t|
             now.saturating_sub(t) <= max_age);
         status.is_running
-            && status.chain_sync_failure.is_none()
             && status.latest_lightning_wallet_sync_timestamp != self.sync_baseline.0
             && status.latest_onchain_wallet_sync_timestamp != self.sync_baseline.1
             && fresh(status.latest_fee_rate_cache_update_timestamp, 1200)

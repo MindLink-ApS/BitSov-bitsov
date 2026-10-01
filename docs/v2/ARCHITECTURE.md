@@ -172,7 +172,7 @@ The shipped owner status field is separate from this provider-level enum:
 `chain_view.trust_level` reports `own_node` for configured Bitcoin Core and
 `third_party` for Esplora. `own_node` replaces the former `trustless` status
 value and does not prove ownership, validation or sync. App consumers should use
-`money_ready` and the `chain_sync` diagnostic for readiness; see
+`money_ready` for readiness and `chain_sync` for observed sync failures; see
 [chain source status](../CHAIN-SOURCE.md#privacy-and-status).
 
 ### 2.2 LightningProvider
