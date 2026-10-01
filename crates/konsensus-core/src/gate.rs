@@ -521,7 +521,7 @@ impl PaymentGate {
                 let settled = self.verify_settlement(envelope, ln, 1, our_node_id).await?;
                 let quoted = receipts.delivery_price_floor(envelope, settled.timestamp, now_ms / 1000).await
                     .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
-                let Some(required) = quoted.map(|price| price.max(1).max(self.config.min_admission_cost_msat)) else { return Err(rejection); };
+                let Some(required) = quoted.map(|price| price.max(1).max(self.price_floor_msat(envelope.kind))) else { return Err(rejection); };
                 if envelope.payment_proof.amount_msat < required || settled.amount_msat < required { return Err(rejection); }
                 settlement_checked = true;
                 required
@@ -638,11 +638,21 @@ impl PaymentGate {
         Ok(true)
     }
 
+    /// Absolute floors apply to both current prices and earlier delivery quotes.
+    fn price_floor_msat(&self, kind: u16) -> u64 {
+        let porch_floor = match kind {
+            crate::kind::KIND_PAGE_REQUEST | crate::kind::KIND_PAGE_RESPONSE => 1_000,
+            _ => 0,
+        };
+        self.config.min_admission_cost_msat.max(porch_floor)
+    }
+
     /// Verify the payment amount meets the required price.
     ///
     /// Applies plasticity trust discount: `required = base * (1 - discount)`.
     /// Discount is clamped to \[0.0, 0.5\] and the minimum price is 1 msat
-    /// (payment gate is fail-closed: zero = bypass).
+    /// (payment gate is fail-closed: zero = bypass). Porch reads (500/501)
+    /// require at least 1,000 msat after discount (BROWSE.md §3).
     ///
     /// On success, returns the resolved `required_msat` (after discount) so the
     /// caller can thread the same price floor into the settlement layer
@@ -699,12 +709,13 @@ impl PaymentGate {
         // Applied AFTER the plasticity discount so a trusted peer's discount can
         // never undercut what it costs to serve them — the floor is an absolute
         // minimum, not a discountable base. Defaults to 0, in which case this
-        // `.max()` is a no-op and pricing is byte-identical to pre-#4 behaviour.
+        // cost floor is a no-op. Porch reads (500/501) additionally have the
+        // non-discountable 1,000 msat protocol floor (BROWSE.md §3).
         // Fail-closed direction: can only RAISE the required amount. Because the
         // resolved `required_msat` is returned to and re-enforced by the
         // settlement layer, the floor binds the settled amount too — a sender
         // cannot under-claim below cost and pass settlement in isolation.
-        let required_msat = discounted_msat.max(self.config.min_admission_cost_msat);
+        let required_msat = discounted_msat.max(self.price_floor_msat(envelope.kind));
 
         if required_msat > discounted_msat {
             debug!(
@@ -712,7 +723,7 @@ impl PaymentGate {
                 cost_floor_msat = self.config.min_admission_cost_msat,
                 required_msat,
                 kind = envelope.kind,
-                "cost floor applied: resolved price raised to marginal-cost floor"
+                "price floor applied: resolved price raised to admission or porch floor"
             );
         }
 
@@ -902,6 +913,7 @@ mod tests {
     // ── Mock NonceStore ────────────────────────────────────────────────
 
     struct MockNonceStore {
+        quoted_price_msat: Option<u64>,
         seen: Mutex<HashSet<[u8; 24]>>,
         seen_payment_hashes: Mutex<HashSet<[u8; 32]>>,
         outstanding_web: Mutex<std::collections::HashMap<[u8; 32], crate::web_reply::OutstandingWebRequest>>,
@@ -910,6 +922,7 @@ mod tests {
     impl MockNonceStore {
         fn new() -> Self {
             Self {
+                quoted_price_msat: None,
                 seen: Mutex::new(HashSet::new()),
                 seen_payment_hashes: Mutex::new(HashSet::new()),
                 outstanding_web: Mutex::new(std::collections::HashMap::new()),
@@ -919,6 +932,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NonceStore for MockNonceStore {
+        async fn delivery_price_floor(
+            &self,
+            _envelope: &UkmEnvelope,
+            _paid_at: u64,
+            _now: u64,
+        ) -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.quoted_price_msat)
+        }
+
     async fn check_and_store_paid(
         &self, nonce: &crate::Nonce, payment_hash: &[u8; 32],
         _sender: &crate::NodeId, _message_id: &crate::MessageId,
@@ -2898,6 +2920,158 @@ mod tests {
             result.is_ok(),
             "recent message should be accepted, got: {result:?}"
         );
+    }
+
+    /// Removing the post-discount porch floor must reject these regressions.
+    #[tokio::test]
+    async fn porch_read_floor_applies_after_discount_and_preserves_higher_prices() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        for kind in [KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE] {
+            for (base, discount, cost_floor, expected) in [
+                (1_000, 0.5, 0, 1_000),
+                (1_999, 0.5, 0, 1_000),
+                (3_000, 0.5, 0, 1_500),
+                (1, 0.0, 0, 1_000),
+                (1_000, 0.5, 2_000, 2_000),
+            ] {
+                let gate = PaymentGate::with_config(GateConfig {
+                    min_admission_cost_msat: cost_floor,
+                    ..Default::default()
+                });
+                let pricing = MockPricing { price_msat: base };
+                let mut envelope = make_signed_envelope(&identity, expected);
+                envelope.kind = kind;
+                assert_eq!(
+                    gate.verify_price(&envelope, &pricing, discount)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+                envelope.payment_proof.amount_msat = expected - 1;
+                assert!(matches!(
+                    gate.verify_price(&envelope, &pricing, discount).await,
+                    Err(GateRejection::InsufficientPayment { required_msat, paid_msat })
+                        if required_msat == expected && paid_msat == expected - 1
+                ));
+            }
+        }
+    }
+
+    /// Exercise real gate validation with settled incoming payments and old quotes.
+    #[tokio::test]
+    async fn discounted_porch_reads_require_one_sat_settled_even_with_old_quote() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let recipient = NodeId::from_bytes([2u8; 32]);
+        let gate = PaymentGate::with_config(GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        });
+        let pricing = MockPricing { price_msat: 1_000 };
+        for kind in [KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE] {
+            for quoted_price_msat in [None, Some(500)] {
+                for amount in [500, 999, 1_000, 1_001] {
+                    let mut envelope = make_signed_envelope(&identity, amount);
+                    envelope.kind = kind;
+                    envelope.signature = crate::types::Signature::from_ed25519(
+                        &identity.sign(&envelope.signable_bytes()),
+                    );
+                    let mut nonces = MockNonceStore::new();
+                    nonces.quoted_price_msat = quoted_price_msat;
+                    let lightning = MockLightning::settled(amount);
+                    let result = gate
+                        .verify(
+                            &envelope,
+                            &nonces,
+                            &pricing,
+                            None,
+                            Some(&lightning),
+                            0.5,
+                            Some(&recipient),
+                        )
+                        .await;
+                    if amount < 1_000 {
+                        assert!(
+                            matches!(result,
+                                Err(GateRejection::InsufficientPayment {
+                                    required_msat: 1_000, paid_msat,
+                                }) if paid_msat == amount
+                            ),
+                            "kind={kind}, quote={quoted_price_msat:?}, amount={amount}: {result:?}"
+                        );
+                    } else {
+                        assert!(result.is_ok(), "kind={kind}, amount={amount}: {result:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn porch_read_resolved_floor_binds_settlement_independently() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let gate = PaymentGate::new();
+        let pricing = MockPricing { price_msat: 1_000 };
+        for kind in [KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE] {
+            let mut envelope = make_signed_envelope(&identity, 1_000);
+            envelope.kind = kind;
+            let required = gate.verify_price(&envelope, &pricing, 0.5).await.unwrap();
+            // An internally consistent sub-sat settlement must still fail on
+            // the resolved floor, independently of the envelope's claim.
+            envelope.payment_proof.amount_msat = 999;
+            let result = gate
+                .verify_settlement(&envelope, &MockLightning::settled(999), required, None)
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(GateRejection::InsufficientPayment {
+                        required_msat: 1_000,
+                        paid_msat: 999,
+                    })
+                ),
+                "kind={kind}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn porch_read_floor_leaves_other_kinds_and_quotes_unchanged() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let pricing = MockPricing { price_msat: 100 };
+        let gate = PaymentGate::with_config(GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        });
+        for kind in [
+            KIND_CHAT,
+            499,
+            502,
+            crate::kind::KIND_WEB_MANIFEST,
+            599,
+            600,
+        ] {
+            for (amount, quote) in [(50, None), (25, Some(25))] {
+                let mut envelope = make_signed_envelope(&identity, amount);
+                envelope.kind = kind;
+                envelope.signature = crate::types::Signature::from_ed25519(
+                    &identity.sign(&envelope.signable_bytes()),
+                );
+                let mut nonces = MockNonceStore::new();
+                nonces.quoted_price_msat = quote;
+                let result = gate
+                    .verify(
+                        &envelope,
+                        &nonces,
+                        &pricing,
+                        None,
+                        Some(&MockLightning::settled(amount)),
+                        0.5,
+                        None,
+                    )
+                    .await;
+                assert!(result.is_ok(), "kind={kind}, amount={amount}: {result:?}");
+            }
+        }
     }
 
     // ── Cost floor (doorway hardening #4) ──────────────────────────────
