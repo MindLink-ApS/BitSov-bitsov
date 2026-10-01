@@ -1024,6 +1024,40 @@ fn validate_zero_pricing_rejected() {
 }
 
 #[test]
+fn validate_web_content_below_one_sat_rejected() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.peers.clear();
+    for amount in [999, 500, 1, 0] {
+        config.pricing.web_content_msat = amount;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("pricing.web_content_msat") && err.contains("1000"),
+            "amount={amount}: {err}"
+        );
+    }
+}
+
+#[test]
+fn validate_web_content_at_or_above_one_sat_accepts_other_subsat_prices() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.peers.clear();
+    config.pricing.chat_msat = 1;
+    config.pricing.control_msat = 1;
+    for amount in [1_000, 1_001, 2_000] {
+        config.pricing.web_content_msat = amount;
+        config.validate().unwrap();
+    }
+}
+
+#[test]
 fn validate_zero_backup_rotation_rejected() {
     let mut config = NodeConfig::default_for_tier(
         NodeTier::Light,
