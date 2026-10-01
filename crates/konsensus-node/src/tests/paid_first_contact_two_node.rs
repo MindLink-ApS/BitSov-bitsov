@@ -538,6 +538,8 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
     let (auto_channel_tx, auto_rx) = mpsc::channel(64);
     std::mem::forget((pending_rx, auto_rx));
     tokio::spawn(run_session_handler(SessionHandlerDeps {
+        privacy: Default::default(),
+        peer_exchange_floor: 0,
         transport: Arc::clone(&transport),
         session_manager: Arc::clone(&sessions),
         storage: Arc::clone(&storage),
@@ -1599,3 +1601,22 @@ async fn p2_replacement_after_classification_readmits_once_and_delivers() {
 
 #[path = "browse_two_node.rs"]
 mod browse_two_node;
+
+/// #162: a settled chat promotes this connection, but buys no discovery act.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_exchange_payment_promoted_sender_still_requires_own_quote_and_payment() {
+    let mut net = pair(Shape::CardOnly, Order::PayerLower, Wallet::Plain, Wallet::Plain).await;
+    let (payer, payee) = (net.payer.id, net.payee.id);
+    let (status, body) = net.payer.compose(&payee, "promote only for chat").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    net.payee.delivered_once("promote only for chat").await;
+    assert!(net.payee.privileged(&payer).await);
+    let before = net.payee.refused();
+    let paid = net.payer.paid_out().await;
+    net.payer.transport.send_frame(&payee, &Frame::PeerExchangeRequest).await.unwrap();
+    wait_until("promoted sender's unpaid discovery refused", Duration::from_secs(5), || async {
+        refused_delta(&before, &net.payee.refused(), PrePaymentReason::PeerExchangeBeforePayment) == 1
+    }).await;
+    assert_eq!(net.payer.paid_out().await, paid);
+    net.stop();
+}

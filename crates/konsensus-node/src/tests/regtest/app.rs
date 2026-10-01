@@ -231,6 +231,8 @@ impl App {
         let (auto_channel_tx, _auto_channel_rx) = tokio::sync::mpsc::channel(64);
         let session = tokio::spawn(crate::session_handler::run(
             crate::session_handler::SessionHandlerDeps {
+        privacy: Default::default(),
+        peer_exchange_floor: 0,
                 transport: transport.clone(),
                 session_manager: sessions.clone(),
                 storage: state.storage.clone(),

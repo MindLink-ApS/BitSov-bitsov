@@ -645,7 +645,7 @@ fn wrong_replacement_identity_no_effect() {
             op_id: op_id.clone(),
             confirmation: console
                 .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
-            mnemonic: CURRENT_MNEMONIC.into(),
+            mnemonic: zeroize::Zeroizing::new(CURRENT_MNEMONIC.to_string()),
         },
     );
     assert!(
@@ -663,7 +663,7 @@ fn wrong_replacement_identity_no_effect() {
             op_id,
             confirmation: console
                 .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
-            mnemonic: REPLACEMENT_MNEMONIC.into(),
+            mnemonic: zeroize::Zeroizing::new(REPLACEMENT_MNEMONIC.to_string()),
         },
     );
     assert!(matches!(ok, ControlResponse::Ok { .. }), "{ok:?}");
@@ -727,7 +727,7 @@ fn replacement_uses_configured_identity_path() {
             op_id,
             confirmation: console
                 .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
-            mnemonic: REPLACEMENT_MNEMONIC.into(),
+            mnemonic: zeroize::Zeroizing::new(REPLACEMENT_MNEMONIC.to_string()),
         },
     );
     assert!(
@@ -756,7 +756,7 @@ fn encrypted_replacement_refuses_without_consuming_approval() {
             op_id,
             confirmation: console
                 .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
-            mnemonic: REPLACEMENT_MNEMONIC.into(),
+            mnemonic: zeroize::Zeroizing::new(REPLACEMENT_MNEMONIC.to_string()),
         },
     );
     assert!(matches!(response, ControlResponse::Error { .. }));
@@ -984,7 +984,7 @@ fn replacement_refuses_retained_state_before_approval_or_identity_write() {
                 op_id,
                 confirmation: console
                     .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
-                mnemonic: REPLACEMENT_MNEMONIC.into(),
+                mnemonic: zeroize::Zeroizing::new(REPLACEMENT_MNEMONIC.to_string()),
             },
         );
         assert!(
@@ -1037,7 +1037,7 @@ async fn replacement_refusal_preserves_decryptable_history() {
             op_id,
             confirmation: console
                 .confirmation(&pairing::replacement_confirmation_phrase(&approval)),
-            mnemonic: REPLACEMENT_MNEMONIC.into(),
+            mnemonic: zeroize::Zeroizing::new(REPLACEMENT_MNEMONIC.to_string()),
         },
     );
     assert!(matches!(response, ControlResponse::Error { .. }));
