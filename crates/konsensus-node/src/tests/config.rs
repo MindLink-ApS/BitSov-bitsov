@@ -21,6 +21,9 @@ backend = "esplora"
 backend = "sqlite"
 "#;
     let config: NodeConfig = toml::from_str(toml).unwrap();
+    assert_eq!(config.disk_free_floor_bytes, 2147483648);
+    let override_config: NodeConfig = toml::from_str(&format!("disk_free_floor_bytes = 4096\n{toml}")).unwrap();
+    assert_eq!(override_config.disk_free_floor_bytes, 4096);
     assert_eq!(
         config.identity.mnemonic_file,
         PathBuf::from("/var/konsensus/mnemonic.txt")
@@ -1018,6 +1021,40 @@ fn validate_zero_pricing_rejected() {
     config.pricing.chat_msat = 0;
     let err = config.validate().unwrap_err();
     assert!(err.to_string().contains("pricing"), "got: {err}");
+}
+
+#[test]
+fn validate_web_content_below_one_sat_rejected() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.peers.clear();
+    for amount in [999, 500, 1, 0] {
+        config.pricing.web_content_msat = amount;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("pricing.web_content_msat") && err.contains("1000"),
+            "amount={amount}: {err}"
+        );
+    }
+}
+
+#[test]
+fn validate_web_content_at_or_above_one_sat_accepts_other_subsat_prices() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.peers.clear();
+    config.pricing.chat_msat = 1;
+    config.pricing.control_msat = 1;
+    for amount in [1_000, 1_001, 2_000] {
+        config.pricing.web_content_msat = amount;
+        config.validate().unwrap();
+    }
 }
 
 #[test]

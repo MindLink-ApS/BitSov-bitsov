@@ -126,6 +126,9 @@ pub(crate) const EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS: u64 = 5;
 ///
 /// [`Node`]: crate::Node
 pub struct Config {
+    /// Optional local disk admission check. False rejects unpaid incoming HTLCs
+    /// and new inbound channels, without affecting settlement recovery or closes.
+    pub work_admission: Option<WorkAdmissionCheck>,
 	/// The path where the underlying LDK and BDK persist their data.
 	pub storage_dir_path: String,
 	/// The used Bitcoin network.
@@ -186,9 +189,22 @@ pub struct Config {
 	pub route_parameters: Option<RouteParametersConfig>,
 }
 
+/// Host-local admission callback. Must be quick, synchronous and non-panicking.
+#[derive(Clone)]
+pub struct WorkAdmissionCheck(std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+impl WorkAdmissionCheck {
+    /// Construct a check run before an incoming payment or channel is accepted.
+    pub fn new(check: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) -> Self { Self(check) }
+    pub(crate) fn allowed(&self) -> bool { (self.0)() }
+}
+impl fmt::Debug for WorkAdmissionCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("WorkAdmissionCheck") }
+}
+
 impl Default for Config {
 	fn default() -> Self {
 		Self {
+			work_admission: None,
 			storage_dir_path: DEFAULT_STORAGE_DIR_PATH.to_string(),
 			network: DEFAULT_NETWORK,
 			listening_addresses: None,

@@ -2165,6 +2165,7 @@ dependencies = [
  "clap",
  "corepc-node",
  "ed25519-dalek",
+ "futures",
  "hex",
  "konsensus-api",
  "konsensus-chain",

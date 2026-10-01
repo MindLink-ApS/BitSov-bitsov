@@ -144,6 +144,15 @@ pub struct InboundPayment {
     pub binding_tlv: Option<Vec<u8>>,
 }
 
+/// Node-local admission health, independent of Lightning readiness.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DiskStatus {
+    pub disk_low: bool,
+    /// None means the filesystem probe failed; new work is refused.
+    pub disk_free_bytes: Option<u64>,
+    pub disk_free_floor_bytes: u64,
+}
+
 /// Errors from Lightning operations.
 #[derive(Debug, Error)]
 pub enum LightningError {
@@ -261,6 +270,9 @@ pub struct LightningReadiness {
 /// Every message must have its payment verified through this interface.
 #[async_trait]
 pub trait LightningProvider: Send + Sync {
+    /// Supplied by the node's admission wrapper; bare providers have no disk policy.
+    fn disk_status(&self) -> Option<DiskStatus> { None }
+
     /// Safe to perform money operations, distinct from sufficient liquidity.
     async fn money_ready(&self) -> bool { self.is_available().await }
 

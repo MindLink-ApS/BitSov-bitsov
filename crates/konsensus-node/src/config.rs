@@ -94,6 +94,10 @@ impl NodeTier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    /// Refuse new paid work below this many available bytes beside the mnemonic/LDK state.
+    #[serde(default = "default_disk_free_floor_bytes")]
+    pub disk_free_floor_bytes: u64,
+
     /// Ordinary Lightning routing fees; sponsor gifts use their separately approved cap.
     #[serde(default)]
     pub routing_fees: konsensus_core::traits::lightning::RoutingFeePolicy,
@@ -1272,10 +1276,16 @@ impl NodeConfig {
             || self.pricing.realtime_signal_msat == 0
             || self.pricing.call_msat == 0
             || self.pricing.app_ext_msat == 0
-            || self.pricing.web_content_msat == 0
         {
             anyhow::bail!(
                 "all pricing values must be > 0 (Principle 2: payment gate is fail-closed)"
+            );
+        }
+
+        // BROWSE.md §3: porch reads cost at least 1 sat before any answer.
+        if self.pricing.web_content_msat < 1_000 {
+            anyhow::bail!(
+                "pricing.web_content_msat must be at least 1000 msat (1 sat): porch read floor (BROWSE.md §3)"
             );
         }
 
@@ -1518,6 +1528,7 @@ impl NodeConfig {
 
         Self {
             privacy: PrivacyConfig::default(),
+            disk_free_floor_bytes: default_disk_free_floor_bytes(),
             routing_fees: Default::default(),
             tier,
             identity: IdentityConfig {
@@ -1795,3 +1806,5 @@ impl SponsorConfig {
         )
     }
 }
+
+fn default_disk_free_floor_bytes() -> u64 { 2 * 1024 * 1024 * 1024 }

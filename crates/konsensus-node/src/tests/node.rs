@@ -19,6 +19,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
     .unwrap();
     NodeConfig {
         privacy: Default::default(),
+        disk_free_floor_bytes: 0,
         routing_fees: Default::default(),
         tier: NodeTier::Light,
         identity: IdentityConfig {
@@ -56,6 +57,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
 fn snapshot_config(storage: StorageConfig) -> NodeConfig {
     NodeConfig {
         privacy: Default::default(),
+        disk_free_floor_bytes: 0,
         routing_fees: Default::default(),
         tier: NodeTier::Light,
         identity: IdentityConfig {
@@ -114,7 +116,7 @@ async fn from_config_with_encrypted_storage() {
 async fn from_config_missing_mnemonic_fails() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
-    config.identity.mnemonic_file = PathBuf::from("/nonexistent/mnemonic.txt");
+    config.identity.mnemonic_file = dir.path().join("missing_mnemonic.txt");
     let err = KonsensusNode::from_config(config, None)
         .await
         .err()
@@ -221,9 +223,11 @@ async fn from_config_deterministic_identity() {
     let config1 = test_config(dir.path());
     let config2 = test_config(dir.path());
     let node1 = KonsensusNode::from_config(config1, None).await.unwrap();
+    let first_id = node1.node_id().to_hex();
+    drop(node1); // A retained directory may have only one live state owner.
     let node2 = KonsensusNode::from_config(config2, None).await.unwrap();
     assert_eq!(
-        node1.node_id().to_hex(),
+        first_id,
         node2.node_id().to_hex(),
         "same mnemonic should produce same identity"
     );
@@ -237,9 +241,11 @@ async fn from_config_different_passphrase_different_identity() {
     config1.identity.passphrase = "alpha".to_string();
     config2.identity.passphrase = "beta".to_string();
     let node1 = KonsensusNode::from_config(config1, None).await.unwrap();
+    let first_id = node1.node_id().to_hex();
+    drop(node1); // A retained directory may have only one live state owner.
     let node2 = KonsensusNode::from_config(config2, None).await.unwrap();
     assert_ne!(
-        node1.node_id().to_hex(),
+        first_id,
         node2.node_id().to_hex(),
         "different passphrases should produce different identities"
     );
@@ -484,4 +490,97 @@ async fn offline_fee_barrier_preserves_local_identity_and_storage() {
     let error = node.lightning().create_invoice(1000, "offline", 60).await.unwrap_err();
     assert!(error.to_string().contains("not_ready"), "{error}");
     node.lightning().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn disk_guard_refuses_new_work_but_preserves_reads_closes_and_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.disk_free_floor_bytes = u64::MAX;
+    let node = KonsensusNode::from_config(config, None).await.unwrap();
+    let ln = node.lightning();
+    assert!(ln.disk_status().unwrap().disk_low);
+    assert!(ln.disk_status().unwrap().disk_free_bytes.is_some());
+    assert!(ln
+        .create_invoice(1000, "new work", 60)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("disk_low"));
+    assert!(ln
+        .pay_invoice("invalid invoice")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("disk_low"));
+    assert!(ln
+        .open_channel("peer", "address", 10000, false, None)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("disk_low"));
+    let refused = [
+        ln.create_stateless_invoice(1000, "quote", 60)
+            .await
+            .unwrap_err(),
+        ln.create_hodl_invoice("hash", 1000, "hold", 60)
+            .await
+            .unwrap_err(),
+        ln.pay_invoice_with_fee_limit("invoice", 1000)
+            .await
+            .unwrap_err(),
+        ln.keysend("peer", 1000, None).await.unwrap_err(),
+        ln.keysend_with_fee_limit("peer", 1000, None, 1000)
+            .await
+            .unwrap_err(),
+        ln.keysend_with_binding("peer", 1000, &[1])
+            .await
+            .unwrap_err(),
+        ln.quote_liquidity("owner", 1000, 1000).await.unwrap_err(),
+        ln.accept_liquidity("owner", "quote").await.unwrap_err(),
+    ];
+    for error in refused {
+        assert!(error.to_string().contains("disk_low"));
+    }
+    assert_eq!(ln.get_balance_msat().await.unwrap(), 100_000_000_000);
+    assert!(ln.list_channels().await.is_ok());
+    // Mock does not support closes; its own error proves the disk guard allows dispatch.
+    let close = ln
+        .close_channel("channel", false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!close.contains("disk_low"));
+    assert!(ln.shutdown().await.is_ok());
+    node.shutdown();
+}
+
+#[tokio::test]
+async fn newer_generation_refused_before_database_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    crate::safety::ensure_generation(dir.path(), u64::MAX).unwrap();
+    let err = KonsensusNode::from_config(config, None)
+        .await
+        .err()
+        .expect("must refuse");
+    assert!(err.to_string().contains("state_generation_newer"));
+    assert!(!dir.path().join("konsensus.db").exists());
+}
+
+#[tokio::test]
+async fn state_lease_outlives_cloned_lightning_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = KonsensusNode::from_config(test_config(dir.path()), None)
+        .await
+        .unwrap();
+    let lightning = node.lightning().clone();
+    drop(node);
+    assert!(crate::safety::ensure_generation(dir.path(), 2)
+        .unwrap_err()
+        .to_string()
+        .contains("state_generation_busy"));
+    lightning.shutdown().await.unwrap();
+    drop(lightning);
+    crate::safety::ensure_generation(dir.path(), 2).unwrap();
 }

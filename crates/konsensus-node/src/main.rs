@@ -11,6 +11,8 @@ mod mnemonic_crypto;
 mod msg_handler;
 mod delivery_prices;
 mod node;
+mod safety;
+mod guarded_lightning;
 mod onboarding;
 mod pending_handler;
 mod profile_handler;

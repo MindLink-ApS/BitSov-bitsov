@@ -567,6 +567,7 @@ fn is_admission_refusal(e: &ApiError) -> bool {
 fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
     match refusal.as_deref() {
         Some(invoice_refusal::ADMISSION_REQUIRED) => admission_refusal(peer_id),
+        Some("disk_low") => ApiError::NotDispatched("disk_low".into()),
         Some(reason) => ApiError::Lightning(format!(
             "Recipient refused the invoice request: {reason}"
         )),
@@ -775,6 +776,9 @@ async fn try_keysend(
     {
         Ok(details) => details,
         Err(LightningError::NotReady) => return Err(ApiError::NotReady),
+        Err(LightningError::PaymentNotDispatched(reason)) if reason == "disk_low" => {
+            return Err(ApiError::NotDispatched(reason));
+        }
         Err(LightningError::PaymentNotDispatched(reason)) => {
             tracing::warn!(peer = %peer_id, %reason, "keysend rejected before dispatch");
             return Ok(KeysendOutcome::NotDispatched);
@@ -1978,7 +1982,9 @@ async fn request_admission_invoice(
         })?
         .map_err(|_| ApiError::Lightning("target could not create an admission invoice".into()))?
         .map_err(|error| {
-            if error.recipient == *peer_id && error.reason == "stateless_quote_unsupported" {
+            if error.recipient == *peer_id && error.reason == "disk_low" {
+                ApiError::NotDispatched("disk_low".into())
+            } else if error.recipient == *peer_id && error.reason == "stateless_quote_unsupported" {
                 ApiError::StatelessQuoteUnsupported
             } else if error.recipient == *peer_id
                 && error.reason == invoice_refusal::ADMISSION_RATE_LIMITED
@@ -4877,5 +4883,16 @@ mod reviewer_same_connection_ttl {
         assert_eq!(ledger.settled_coverage(&peer, Some(settled_at), false, replacement), SettledCoverage::Covered);
         assert_eq!(ledger.settled_coverage(&peer, Some(replacement), false, replacement), SettledCoverage::Consumed);
         assert_eq!(ledger.settled_coverage(&peer, Some(replacement), false, replacement), SettledCoverage::NoRecord);
+    }
+}
+
+#[cfg(test)]
+mod disk_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn recipient_disk_refusal_keeps_machine_reason() {
+        let error = invoice_refused(&NodeId::from_bytes([9; 32]), Some("disk_low".into()));
+        assert!(matches!(error, ApiError::NotDispatched(ref reason) if reason == "disk_low"));
     }
 }

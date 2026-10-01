@@ -1181,6 +1181,12 @@ async fn handle_invoice_requested_gated(
     last_admission_refusal: &mut crate::invoice_refusals::RefusalLimits,
 ) {
     use konsensus_core::admission_quote;
+    if lightning.disk_status().is_some_and(|s| s.disk_low) {
+        if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+            send_invoice_refusal(transport, peer_id, request_id, "disk_low").await;
+        }
+        return;
+    }
     if purpose == admission_quote::PURPOSE {
         let unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1231,6 +1237,12 @@ async fn handle_invoice_requested_gated(
             lightning.create_stateless_invoice(admission, &description, expiry),
         )
         .await;
+        if matches!(&invoice, Ok(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(reason))) if reason == "disk_low") {
+            if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                send_invoice_refusal(transport, peer_id, request_id, "disk_low").await;
+            }
+            return;
+        }
         if matches!(&invoice, Ok(Err(konsensus_core::traits::lightning::LightningError::StatelessQuoteUnsupported))) {
             let refusal = Frame::InvoiceError {
                 request_id: request_id.into(),
@@ -1335,7 +1347,10 @@ async fn handle_invoice_requested(
             if !refusals.permit(source_ip, tokio::time::Instant::now()) { return; }
             let error_frame = Frame::InvoiceError {
                 request_id: request_id.to_string(),
-                reason: format!("invoice creation failed: {e}"),
+                reason: match e {
+                    konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(reason) if reason == "disk_low" => reason,
+                    e => format!("invoice creation failed: {e}"),
+                },
             };
             if let Err(send_err) = transport.enqueue_control_frame(peer_id, &error_frame).await {
                 warn!(peer = %peer_id, %request_id, error = %send_err, "failed to send invoice error frame");
