@@ -699,6 +699,16 @@ pub(super) fn spawn_reader_task(
                         warn!(peer = %peer_id, error = %e, "failed to send PriceResponseReceived control event");
                     }
                 }
+                frame @ (Frame::PeerExchangeQuoteRequest
+                    | Frame::PeerExchangeQuote { .. }
+                    | Frame::PeerExchangePaidRequest { .. }
+                    | Frame::PeerExchangeRefused { .. }) => {
+                    if let Err(e) = control_tx.send(ControlEvent::PeerExchangeAct {
+                        peer_id, frame: Box::new(frame),
+                    }).await {
+                        warn!(peer = %peer_id, error = %e, "failed to route peer exchange act");
+                    }
+                }
                 Frame::PeerExchangeRequest => {
                     debug!(peer = %peer_id, "received peer exchange request");
                     if let Err(e) = control_tx

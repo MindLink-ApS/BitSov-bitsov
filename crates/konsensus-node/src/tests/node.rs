@@ -18,6 +18,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
     )
     .unwrap();
     NodeConfig {
+        privacy: Default::default(),
         routing_fees: Default::default(),
         tier: NodeTier::Light,
         identity: IdentityConfig {
@@ -54,6 +55,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
 /// Helper: create a config struct for snapshot tests (no temp dir needed).
 fn snapshot_config(storage: StorageConfig) -> NodeConfig {
     NodeConfig {
+        privacy: Default::default(),
         routing_fees: Default::default(),
         tier: NodeTier::Light,
         identity: IdentityConfig {

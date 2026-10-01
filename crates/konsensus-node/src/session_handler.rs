@@ -38,6 +38,8 @@ use crate::onboarding::funding_poll;
 
 /// All dependencies needed by the session/control event handler task.
 pub(crate) struct SessionHandlerDeps {
+    pub privacy: crate::config::PrivacyConfig,
+    pub peer_exchange_floor: u64,
     pub transport: Arc<NoiseTransport>,
     pub session_manager: Arc<SessionManager>,
     pub storage: Arc<dyn konsensus_storage::Storage>,
@@ -111,7 +113,7 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
         | PriceResponseReceived { privileged, .. } => {
             (privileged, PrePaymentReason::PriceBeforePayment)
         }
-        PeerExchangeRequested { privileged, .. } | PeerExchangeReceived { privileged, .. } => {
+        PeerExchangeReceived { privileged, .. } => {
             (privileged, PrePaymentReason::PeerExchangeBeforePayment)
         }
         LightningInfoReceived { privileged, .. } => {
@@ -132,6 +134,8 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
 /// Runs the session/control event handler loop.
 pub(crate) async fn run(deps: SessionHandlerDeps) {
     let SessionHandlerDeps {
+        privacy,
+        peer_exchange_floor,
         transport,
         session_manager,
         storage,
@@ -167,6 +171,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
     let mut delivery_budget = DeliveryConfirmationBudget::default();
+    let mut exchange_quotes = std::collections::HashMap::<NodeId, tokio::time::Instant>::new();
+    let exchange_nonces = konsensus_storage::StorageNonceAdapter::new(storage.clone());
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
     // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
     // from the other two eager limiters on purpose; see `eager_offers` in the
@@ -313,14 +319,41 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         }
                     }
 
-                    ControlEvent::PeerExchangeRequested { peer_id, privileged } => {
-                        if !privileged {
-                            continue;
-                        }
-                        handle_peer_exchange_request(
-                            &peer_id, our_node_id, &peer_registry, &transport,
-                            &mut last_peer_exchange,
-                        ).await;
+                    ControlEvent::PeerExchangeRequested { peer_id, .. } => {
+                        audit_log.membrane().pre_payment_refused(PrePaymentReason::PeerExchangeBeforePayment);
+                        handle_peer_exchange_request(&peer_id, &transport).await;
+                    }
+                    ControlEvent::PeerExchangeAct { peer_id, frame } => {
+                        let response = match *frame {
+                            Frame::PeerExchangeQuoteRequest => {
+                                let now = tokio::time::Instant::now();
+                                exchange_quotes.retain(|_, issued| now.duration_since(*issued) < PEER_EXCHANGE_COOLDOWN);
+                                if exchange_quotes.contains_key(&peer_id) || exchange_quotes.len() >= 256 {
+                                    Frame::PeerExchangeRefused { reason: "quote_rate_limited".into() }
+                                } else {
+                                    exchange_quotes.insert(peer_id, now);
+                                    match crate::peer_exchange::issue_quote(&privacy, &peer_registry,
+                                        peer_id, &identity, pricing.as_ref(), peer_exchange_floor, lightning.as_ref()).await {
+                                        Ok(quote) => Frame::PeerExchangeQuote { quote: Box::new(quote) },
+                                        Err(reason) => Frame::PeerExchangeRefused { reason },
+                                    }
+                                }
+                            }
+                            Frame::PeerExchangePaidRequest { quote, envelope } => {
+                                match crate::peer_exchange::redeem(&quote, &envelope, &peer_id,
+                                    &identity, &exchange_nonces, lightning.as_ref()).await {
+                                    Ok(peers) => Frame::PeerExchangeResponse { peers },
+                                    Err(reason) => Frame::PeerExchangeRefused { reason },
+                                }
+                            }
+                            // The node never auto-buys discovery. A caller requesting
+                            // a quote must explicitly authorize its own payment.
+                            _ => continue,
+                        };
+                        // The bounded writer allows these larger replies and closes
+                        // this connection on a partial write/deadline, preserving
+                        // Noise framing and nonce synchronization.
+                        let _ = transport.enqueue_control_frame(&peer_id, &response).await;
                     }
 
                     ControlEvent::PeerExchangeReceived { peer_id, peers, privileged } => {
@@ -588,11 +621,6 @@ async fn handle_peer_connected(
     }
 
     send_lightning_info(peer_id, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
-
-    // Request peer's known peers for mesh discovery.
-    if let Err(e) = transport.send_frame(peer_id, &Frame::PeerExchangeRequest).await {
-        warn!(peer = %peer_id, error = %e, "failed to send peer exchange request");
-    }
 
     // Send our KIND_PROFILE (103) so the peer can display our identity.
     // Mock backends only: a real backend never sends a mock payment proof.
@@ -1388,52 +1416,10 @@ async fn handle_invoice_response(
     }
 }
 
-async fn handle_peer_exchange_request(
-    peer_id: &NodeId,
-    our_node_id: NodeId,
-    peer_registry: &tokio::sync::RwLock<PeerRegistry>,
-    transport: &Arc<NoiseTransport>,
-    last_peer_exchange: &mut std::collections::HashMap<NodeId, tokio::time::Instant>,
-) {
-    if let Some(last) = last_peer_exchange.get(peer_id) {
-        if last.elapsed() < PEER_EXCHANGE_COOLDOWN {
-            warn!(
-                peer = %peer_id,
-                "peer exchange throttled (cooldown {}s)",
-                PEER_EXCHANGE_COOLDOWN.as_secs()
-            );
-            return;
-        }
-    }
-    last_peer_exchange.insert(*peer_id, tokio::time::Instant::now());
-    info!(peer = %peer_id, "peer requested peer exchange");
-
-    let registry = peer_registry.read().await;
-    let entries: Vec<konsensus_message::wire::PeerExchangeEntry> = registry
-        .all()
-        .iter()
-        .filter(|p| p.node_id != *peer_id)
-        .take(50)
-        .map(|p| konsensus_message::wire::PeerExchangeEntry {
-            node_id: p.node_id,
-            addr: p.addr,
-            label: p.label.clone(),
-            tier: konsensus_message::wire::SovereigntyTier::T1,
-        })
-        .collect();
-    let count = entries.len();
-    drop(registry);
-
-    if let Err(e) = transport.send_frame(
-        peer_id,
-        &Frame::PeerExchangeResponse { peers: entries },
-    ).await {
-        warn!(peer = %peer_id, error = %e, "failed to send peer exchange response");
-    } else {
-        info!(peer = %peer_id, count, "sent peer exchange response");
-    }
-
-    let _ = our_node_id;
+async fn handle_peer_exchange_request(peer_id: &NodeId, transport: &Arc<NoiseTransport>) {
+    let _ = transport.enqueue_control_frame(peer_id, &Frame::PeerExchangeRefused {
+        reason: "peer_exchange_requires_quote_and_payment".into(),
+    }).await;
 }
 
 async fn handle_peer_exchange_received(

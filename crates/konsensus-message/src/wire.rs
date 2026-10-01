@@ -182,6 +182,28 @@ pub fn is_realtime_signal(kind: u16) -> bool {
 mod bounded {
     use super::*;
 
+    pub fn snapshot_serialize<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn snapshot_deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = limited_string::<D, 49152>(deserializer)?;
+        hex::decode(encoded).map_err(de::Error::custom)
+    }
+
+    pub fn limited_string<'de, D: Deserializer<'de>, const MAX: usize>(deserializer: D) -> Result<String, D::Error> {
+        struct StringVisitor<const MAX: usize>;
+        impl<const MAX: usize> Visitor<'_> for StringVisitor<MAX> {
+            type Value = String;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "string of at most {MAX} bytes") }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+                if value.len() > MAX { return Err(E::custom("string exceeds byte cap")); }
+                Ok(value.to_owned())
+            }
+        }
+        deserializer.deserialize_str(StringVisitor::<MAX>)
+    }
+
     /// Deserialize a `Vec<u8>` whose element count must not exceed `MAX`.
     ///
     /// The visitor counts as it pushes; the `(MAX + 1)`-th element aborts the
@@ -885,17 +907,21 @@ pub enum Frame {
         block_height: u64,
     },
 
-    /// Peer exchange request — ask a connected peer for its known peers.
-    ///
-    /// This enables mesh discovery: a new node connects to bootstrap peers
-    /// and asks them for other nodes to connect to. The responder decides
-    /// which peers to share based on its own policy (e.g., only peers that
-    /// opted in to discovery, or only certain tiers).
-    ///
-    /// **Principle 3 compliance:** Receiving peer entries does NOT auto-whitelist
-    /// them. The requesting node still must explicitly add peers to its whitelist
-    /// before accepting connections from them.
+    /// Legacy unpaid request, retained for decode compatibility. Always refused:
+    /// connection privilege never authorizes registry export.
     PeerExchangeRequest,
+
+    /// Ask for a short-lived signed price before paying for discovery.
+    PeerExchangeQuoteRequest,
+    /// Recipient's binding price and sealed response snapshot; no peers in clear.
+    PeerExchangeQuote { quote: Box<PeerExchangeQuote> },
+    /// A fresh UKM proof for precisely this quote (kind 903).
+    PeerExchangePaidRequest { quote: Box<PeerExchangeQuote>, envelope: Box<UkmEnvelope> },
+    /// Explicit refusal. Quote refusals occur before an invoice/payment exists.
+    PeerExchangeRefused {
+        #[serde(deserialize_with = "bounded::limited_string::<_, 1024>")]
+        reason: String,
+    },
 
     /// Peer exchange response — list of known peer entries.
     ///
@@ -962,6 +988,43 @@ pub enum Frame {
     /// Valid gossip kinds: `KIND_WEB_MANIFEST` (510), `KIND_PAGE_RESPONSE` (501).
     /// Other kinds are rejected.
     Gossip(Box<UkmEnvelope>),
+}
+
+/// Signed offer for one paid exchange. The response snapshot is encrypted to
+/// the issuer, so requesting a quote cannot disclose its address book.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerExchangeQuote {
+    /// Node selling the act.
+    pub recipient: NodeId,
+    /// Only this requester may redeem the quote.
+    pub requester: NodeId,
+    /// Unix seconds; exclusive deadline for redemption.
+    pub expires_at: u64,
+    /// Exact principal, frozen until expiry.
+    pub amount_msat: u64,
+    /// Opaque AES-GCM snapshot, at most 50 bounded peer records.
+    #[serde(serialize_with = "bounded::snapshot_serialize", deserialize_with = "bounded::snapshot_deserialize")]
+    pub snapshot: Vec<u8>,
+    /// Stateless invoice; its description commits to the sealed snapshot.
+    #[serde(deserialize_with = "bounded::limited_string::<_, 8192>")]
+    pub bolt11: String,
+    /// Node signature over all preceding fields, with protocol domain separation.
+    pub signature: konsensus_core::types::Signature,
+}
+
+impl PeerExchangeQuote {
+    /// Canonical, domain-separated bytes covered by the node signature.
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut out = b"bitsov:peer-exchange-quote:v1:".to_vec();
+        out.extend_from_slice(self.recipient.as_bytes());
+        out.extend_from_slice(self.requester.as_bytes());
+        out.extend_from_slice(&self.expires_at.to_be_bytes());
+        out.extend_from_slice(&self.amount_msat.to_be_bytes());
+        out.extend_from_slice(&(self.snapshot.len() as u64).to_be_bytes());
+        out.extend_from_slice(&self.snapshot);
+        out.extend_from_slice(self.bolt11.as_bytes());
+        out
+    }
 }
 
 /// A peer entry shared during peer exchange.

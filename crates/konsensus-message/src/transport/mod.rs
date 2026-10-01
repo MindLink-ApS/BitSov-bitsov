@@ -208,6 +208,9 @@ pub enum ControlEvent {
         privileged: bool,
     },
 
+    /// Quote negotiation and paid redemption have their own per-act gate.
+    PeerExchangeAct { peer_id: NodeId, frame: Box<Frame> },
+
     /// Peer shared their known peer list.
     ///
     /// These entries are suggestions only — the node operator or application
@@ -960,7 +963,8 @@ impl MessageTransport for NoiseTransport {
     }
 
     async fn request_peer_exchange(&self, peer: &NodeId) -> Result<(), TransportError> {
-        self.send_frame(peer, &Frame::PeerExchangeRequest).await
+        let _ = peer;
+        Err(TransportError::Other("peer exchange requires a signed quote and per-request payment".into()))
     }
 
     async fn send_raw_frame(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), TransportError> {

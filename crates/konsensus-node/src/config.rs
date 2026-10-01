@@ -119,6 +119,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub pricing: PricingConfig,
 
+    /// Private peer discovery policy; disabled unless the owner opts in.
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
+
     /// Payment gate enforcement configuration.
     #[serde(default)]
     pub payment_gate: PaymentGateConfig,
@@ -1027,6 +1031,28 @@ pub struct PeerConfigEntry {
     pub auto_connect: bool,
 }
 
+/// Owner-controlled export policy. Admission never implies sharing consent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyConfig {
+    #[serde(default)]
+    pub peer_exchange: PeerExchangeMode,
+    /// Only these node IDs may be exported. Empty by default.
+    #[serde(default)]
+    pub shareable_peers: Vec<konsensus_core::types::NodeId>,
+    /// Labels require separate consent and only apply to shareable peers.
+    #[serde(default)]
+    pub share_peer_labels: Vec<konsensus_core::types::NodeId>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerExchangeMode {
+    #[default]
+    Off,
+    Paid,
+}
+
 impl NodeConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -1491,6 +1517,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            privacy: PrivacyConfig::default(),
             routing_fees: Default::default(),
             tier,
             identity: IdentityConfig {
