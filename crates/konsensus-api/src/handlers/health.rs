@@ -301,9 +301,7 @@ async fn preflight(State(state): State<Arc<AppState>>) -> Json<PreflightResponse
 /// `/api/v1/health` is unauthenticated (public, redacted); `/api/v1/status` is
 /// owner-only (behind `ScopedAuth<Read>`).
 pub fn routes(operator_probes_enabled: bool) -> Router<Arc<AppState>> {
-    let router = Router::new()
-        .route("/api/v1/health", get(health))
-        .route("/api/v1/status", get(status));
+    let router = status_routes().route("/api/v1/health", get(health));
     if operator_probes_enabled {
         router
             .route("/api/v1/preflight", get(preflight))
@@ -311,4 +309,10 @@ pub fn routes(operator_probes_enabled: bool) -> Router<Arc<AppState>> {
     } else {
         router
     }
+}
+
+/// Authenticated status only, for the encrypted remote API. Public/operator
+/// liveness endpoints belong exclusively to the owner's local listener.
+pub fn status_routes() -> Router<Arc<AppState>> {
+    Router::new().route("/api/v1/status", get(status))
 }

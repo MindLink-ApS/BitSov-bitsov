@@ -80,8 +80,8 @@ pub struct PairRequestBody {
 /// `POST /api/v1/pair/request` response.
 ///
 /// Note what is **not** here: the challenge, and the short code derived from
-/// it. The code is printed to the node's own stdout as a tripwire; handing it
-/// to the caller would hand it to exactly the attacker the ceremony excludes.
+/// it. The code is derived only from the protected challenge file and is never
+/// printed or logged.
 #[derive(Debug, Serialize)]
 pub struct PairRequestResponse {
     /// Ceremony id.
@@ -652,6 +652,19 @@ pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
             post(replacement_request),
         )
         .merge(super::device_routes::routes())
+}
+
+/// Pairing routes needed by a client that has already authenticated its Noise
+/// transport. The remote listener performs first pairing itself, so the
+/// file-challenge ceremony and owner-management routes are not exposed here.
+pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
+    if !pairing_enabled {
+        return Router::new();
+    }
+    Router::new()
+        .route("/api/v1/pair/challenge", get(pair_challenge))
+        .route("/api/v1/pair/token", post(pair_token))
+        .route("/api/v1/pair/rotate", post(rotate_pairing))
 }
 
 #[cfg(test)]

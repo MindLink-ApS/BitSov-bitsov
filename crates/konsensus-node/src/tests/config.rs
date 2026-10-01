@@ -55,6 +55,70 @@ backend = "sqlite"
         !config.relay.enabled,
         "omitted relay config must be disabled (off-by-default)"
     );
+    assert!(config.remote_access.listen_addr.is_none());
+}
+
+#[test]
+fn remote_access_requires_loopback_plaintext_api_and_advertised_endpoint() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.remote_access.listen_addr = Some("0.0.0.0:18443".parse().unwrap());
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("advertised_endpoint"), "{error}");
+
+    config.remote_access.advertised_endpoint = Some("node.example:18443".into());
+    config.api.listen_addr = "0.0.0.0:18080".parse().unwrap();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("must be loopback"), "{error}");
+}
+
+#[test]
+fn remote_access_rejects_tcp_port_collisions() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.remote_access.listen_addr =
+        Some(format!("0.0.0.0:{}", config.network.listen_addr.port()).parse().unwrap());
+    config.remote_access.advertised_endpoint = Some("node.example:18443".into());
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("same TCP port"), "{error}");
+}
+
+#[test]
+fn remote_access_endpoint_uses_the_apps_host_grammar() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.remote_access.listen_addr = Some("0.0.0.0:18443".parse().unwrap());
+
+    for endpoint in [
+        "bad_name.example:18443",
+        "-bad.example:18443",
+        "bad-.example:18443",
+        "bad..example:18443",
+    ] {
+        config.remote_access.advertised_endpoint = Some(endpoint.into());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("valid host:port"), "{endpoint}: {error}");
+    }
+
+    for endpoint in [
+        "node.example:18443",
+        "203.0.113.8:18443",
+        "[2001:db8::8]:18443",
+    ] {
+        config.remote_access.advertised_endpoint = Some(endpoint.into());
+        config.validate().unwrap_or_else(|error| {
+            panic!("{endpoint} should match the app host grammar: {error}")
+        });
+    }
 }
 
 #[test]
