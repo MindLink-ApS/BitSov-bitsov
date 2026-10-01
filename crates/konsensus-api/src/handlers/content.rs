@@ -372,13 +372,16 @@ async fn get_manifest(
     _user: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ManifestResponse>, ApiError> {
+    let default_price_msat = super::front_door::porch_page_price(
+        state.pricing.as_ref(), &state.gate,
+    ).await?;
     let content_dir = match &state.content_dir {
         Some(dir) => dir,
         None => {
             return Ok(Json(ManifestResponse {
                 site_name: "BitSov Node".to_string(),
                 pages: Vec::new(),
-                default_price_msat: 0,
+                default_price_msat,
                 free_paths: Vec::new(),
                 block_height: state.chain.get_block_height().await.unwrap_or(0),
             }));
@@ -431,11 +434,6 @@ async fn get_manifest(
     }
 
     pages.sort_by(|a, b| a.path.cmp(&b.path));
-
-    // Default price from web config or fallback to 50 msat
-    let default_price_msat = state
-        .web_page_price_msat
-        .unwrap_or(50);
 
     let block_height = state.chain.get_block_height().await.unwrap_or(0);
 
