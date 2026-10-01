@@ -712,7 +712,7 @@ pub async fn cmd_approve_replacement(
     mnemonic: Option<&str>,
 ) -> Result<()> {
     let confirmation = confirm_interactively(config_path, op_id).await?;
-    let phrase = match mnemonic {
+    let phrase = zeroize::Zeroizing::new(match mnemonic {
         Some(m) => m.to_string(),
         None => {
             println!(
@@ -721,14 +721,14 @@ pub async fn cmd_approve_replacement(
             );
             rpassword::read_password().context("failed to read the recovery phrase")?
         }
-    };
+    });
     report(
         send(
             config_path,
             ControlRequest::ApproveReplacement {
                 op_id: op_id.to_string(),
                 confirmation,
-                mnemonic: phrase.trim().to_string(),
+                mnemonic: zeroize::Zeroizing::new(phrase.trim().to_string()),
             },
         )
         .await?,
