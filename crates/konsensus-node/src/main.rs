@@ -327,7 +327,7 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
 
     match tier {
         NodeTier::Cloud => {
-            println!("Cloud/Relay mode: starts with mock backends and user-held keys.");
+            println!("Cloud/Relay mode: starts with mock backends. Hosted custody: this machine holds the seed.");
             println!("Next steps:");
             println!("  1. Run: konsensus start -c {}", config_path.display());
             println!("  2. Pair with a relay or configure a user-controlled Lightning provider.");
@@ -490,7 +490,7 @@ fn prompt_tier_selection() -> Result<crate::config::NodeTier> {
     println!("How do you want to run BitSov?");
     println!();
     println!("  [1] Cloud/Relay — Paired remote access.");
-    println!("                    Your keys stay yours; relay support is optional.");
+    println!("                    Hosted custody: the server holds the seed.");
     println!();
     println!("  [2] Light    — Your device, user-selected Lightning.");
     println!("                 Your keys, your data. Recommended for most users.");
@@ -715,6 +715,23 @@ fn owner_approval_key(
     konsensus_core::OwnerApprovalKey::from_mnemonic(&mnemonic, &config.identity.passphrase, &secret)
         .map(|k| k.verifying_key())
         .map_err(|_| OWNER_KEY_UNAVAILABLE)
+}
+
+/// Where this node's seed lives, for the owner's badge
+/// (`docs/protocol/REMOTE-SIGNER.md` §2). A hosted node holding its seed is
+/// `hosted_custody` even when the seed is encrypted: it decrypts into the
+/// operator's memory. Nothing here yields `remote_signer` or `money_signer`;
+/// no signer exists (REMOTE-SIGNER.md §2 gate).
+fn custody_mode(config: &NodeConfig) -> konsensus_api::custody::CustodyMode {
+    use konsensus_api::custody::CustodyMode;
+    let path = &config.identity.mnemonic_file;
+    if config.identity.hosted || matches!(config.tier, NodeTier::Cloud) {
+        CustodyMode::HostedCustody
+    } else if mnemonic_crypto::is_encrypted_path(path) && !path.with_extension("txt").exists() {
+        CustodyMode::EncryptedSeed
+    } else {
+        CustodyMode::LocalSeed
+    }
 }
 
 /// `konsensus start` — boot the node.
@@ -1130,6 +1147,7 @@ async fn cmd_start(
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
         stun_port: stun_socket.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()),
+        custody_mode: custody_mode(&config),
     });
 
     // Public remote access is Noise only. Decrypted bytes go to an ephemeral
@@ -1993,6 +2011,72 @@ mod owner_key_startup_tests {
             konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &other_password).unwrap().verifying_key(),
             node_key
         );
+    }
+}
+
+#[cfg(test)]
+mod custody_mode_tests {
+    use super::*;
+    use konsensus_api::custody::CustodyMode;
+
+    const PHRASE: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn config(password: Option<&str>, tier: NodeTier) -> (tempfile::TempDir, NodeConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password).unwrap();
+        let config = NodeConfig::default_for_tier(tier, path, dir.path());
+        (dir, config)
+    }
+
+    #[test]
+    fn the_seed_on_disk_decides_local_or_encrypted() {
+        let (_d, plain) = config(None, NodeTier::Light);
+        assert_eq!(custody_mode(&plain), CustodyMode::LocalSeed);
+        let (dir, enc) = config(Some("correct horse"), NodeTier::Full);
+        assert_eq!(custody_mode(&enc), CustodyMode::EncryptedSeed);
+        // A plaintext copy beside the .enc is still a plaintext seed.
+        std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
+        assert_eq!(custody_mode(&enc), CustodyMode::LocalSeed);
+    }
+
+    #[test]
+    fn a_hosted_node_is_hosted_custody_even_with_an_encrypted_seed() {
+        let (_d, mut enc) = config(Some("correct horse"), NodeTier::Light);
+        enc.identity.hosted = true;
+        assert_eq!(custody_mode(&enc), CustodyMode::HostedCustody);
+        let (_d, cloud) = config(Some("correct horse"), NodeTier::Cloud);
+        assert_eq!(custody_mode(&cloud), CustodyMode::HostedCustody);
+        let (_d, cloud_plain) = config(None, NodeTier::Cloud);
+        assert_eq!(custody_mode(&cloud_plain), CustodyMode::HostedCustody);
+    }
+
+    #[test]
+    fn no_config_claims_a_remote_signer() {
+        for tier in [NodeTier::Cloud, NodeTier::Light, NodeTier::Full] {
+            for password in [None, Some("correct horse")] {
+                for hosted in [false, true] {
+                    let (_d, mut c) = config(password, tier);
+                    c.identity.hosted = hosted;
+                    assert_ne!(custody_mode(&c), CustodyMode::RemoteSigner);
+                    assert_ne!(custody_mode(&c), CustodyMode::MoneySigner);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_is_read_from_the_identity_section_and_omitted_when_false() {
+        let (_d, c) = config(None, NodeTier::Light);
+        let text = toml::to_string(&c).unwrap();
+        assert!(!text.contains("hosted"), "a default config does not mention hosted");
+        let hosted: NodeConfig = toml::from_str(&text.replace(
+            "[identity]\n",
+            "[identity]\nhosted = true\n",
+        ))
+        .unwrap();
+        assert!(hosted.identity.hosted);
+        assert_eq!(custody_mode(&hosted), CustodyMode::HostedCustody);
     }
 }
 
