@@ -6,26 +6,70 @@
 //!
 //! # Security
 //! - Path traversal is rejected (no `..`, symlinks outside root)
-//! - Max file size is enforced (default 4 MiB)
+//! - Only flat, visible `.md` / `.txt` pages are served (BROWSE.md §4): never
+//!   subdirectories, hidden files, `front-door.seq` or other extensions
+//! - Max file size is enforced and never above the porch body cap (256 KiB)
 //! - Only regular files are served
 //! - Content type is inferred from extension, not trusted from the requester
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
 
+use konsensus_core::front_door::FrontDoorCard;
 use konsensus_core::payloads::content::{
-    ManifestPage, PageRequest, PageResponse, PageStatus, WebManifest,
+    is_site_page, ManifestPage, PageRequest, PageResponse, PageStatus, WebManifest,
+    MAX_PORCH_BODY_BYTES,
 };
 
-/// Default maximum file size: 4 MiB.
-const DEFAULT_MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
+/// Default and largest file size served: the porch body cap.
+const DEFAULT_MAX_FILE_SIZE: u64 = MAX_PORCH_BODY_BYTES as u64;
 
 /// Maximum number of pages returned in manifest listings.
 ///
 /// Prevents memory exhaustion and I/O amplification if the content directory
 /// contains a very large number of files.
 const MAX_MANIFEST_PAGES: usize = 1_000;
+
+/// Title extraction is metadata, not a second unbounded page read.
+const MAX_TITLE_SCAN_BYTES: usize = 8 * 1024;
+const MAX_TITLE_BYTES: usize = 512;
+
+/// Porch reply for a path this node has nothing at. A paid read still gets an
+/// answer (BROWSE.md §4).
+pub fn not_found(request_id: String) -> PageResponse {
+    PageResponse {
+        request_id,
+        status: PageStatus::NotFound,
+        content_type: String::new(),
+        body: "Not found".to_string(),
+        cache_seconds: 0,
+        is_complete: true,
+        chunk_index: 0,
+        total_chunks: 1,
+    }
+}
+
+/// Porch reply for [`PORCH_CARD_PATH`]: the owner's published card, cacheable
+/// until it expires, or `NotFound` when none is published.
+///
+/// [`PORCH_CARD_PATH`]: konsensus_core::payloads::content::PORCH_CARD_PATH
+pub fn card_response(request_id: String, card: Option<&FrontDoorCard>, now_unix: u64) -> PageResponse {
+    let Some((card, body)) = card.and_then(|c| serde_json::to_string(c).ok().map(|b| (c, b))) else {
+        return not_found(request_id);
+    };
+    PageResponse {
+        request_id,
+        status: PageStatus::Ok,
+        content_type: "application/json".to_string(),
+        body,
+        cache_seconds: card.expires_at.saturating_sub(now_unix),
+        is_complete: true,
+        chunk_index: 0,
+        total_chunks: 1,
+    }
+}
 
 /// Configuration for the content server.
 #[derive(Debug, Clone)]
@@ -65,12 +109,14 @@ pub struct ContentServer {
 impl ContentServer {
     /// Create a new content server with the given configuration.
     ///
-    /// The content directory is created if it doesn't exist.
-    pub fn new(config: ContentServerConfig) -> std::io::Result<Self> {
+    /// The content directory is created if it doesn't exist. A configured
+    /// `max_file_size` above the porch body cap is lowered to it.
+    pub fn new(mut config: ContentServerConfig) -> std::io::Result<Self> {
         // Ensure content directory exists
         if !config.content_dir.exists() {
             std::fs::create_dir_all(&config.content_dir)?;
         }
+        config.max_file_size = config.max_file_size.min(DEFAULT_MAX_FILE_SIZE);
         Ok(Self { config })
     }
 
@@ -96,6 +142,10 @@ impl ContentServer {
                 chunk_index: 0,
                 total_chunks: 1,
             };
+        }
+
+        if !is_site_page(&request.path) {
+            return not_found(request_id);
         }
 
         // Resolve path to filesystem
@@ -213,11 +263,11 @@ impl ContentServer {
     /// Scans the content directory for markdown files and returns a manifest
     /// with their paths, titles (extracted from H1 headings), and sizes.
     pub fn build_manifest(&self, block_height: u64, default_price_msat: u64) -> WebManifest {
-        let mut pages = Vec::new();
+        let mut candidates = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(&self.config.content_dir) {
             for entry in entries.flatten() {
-                if pages.len() >= MAX_MANIFEST_PAGES {
+                if candidates.len() >= MAX_MANIFEST_PAGES {
                     warn!(
                         limit = MAX_MANIFEST_PAGES,
                         "manifest page listing truncated at limit"
@@ -225,40 +275,73 @@ impl ContentServer {
                     break;
                 }
 
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension() {
-                        if ext == "md" || ext == "txt" {
-                            let filename = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            let web_path = format!("/{filename}");
-
-                            let title = self.extract_title(&path).unwrap_or_else(|| filename.clone());
-
-                            pages.push(ManifestPage {
-                                path: web_path,
-                                title,
-                                description: String::new(),
-                                price_msat: None,
-                            });
-                        }
-                    }
+                let filename = entry.file_name().to_string_lossy().to_string();
+                let web_path = format!("/{filename}");
+                if !is_site_page(&web_path) {
+                    continue;
                 }
+                // Apply the exact canonical-containment and regular-file policy
+                // used by page reads. DirectoryEntry::is_file follows symlinks
+                // and by itself can expose an H1 from outside the public root.
+                let Ok(path) = self.resolve_path(&web_path) else {
+                    continue;
+                };
+                let Ok(metadata) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                if !metadata.is_file() || metadata.len() > self.config.max_file_size {
+                    continue;
+                }
+
+                let title = self
+                    .extract_title(&path)
+                    .unwrap_or_else(|| truncate_utf8(&filename, MAX_TITLE_BYTES));
+                candidates.push(ManifestPage {
+                    path: web_path,
+                    title,
+                    description: String::new(),
+                    price_msat: None,
+                });
             }
         }
 
         // Sort by path for deterministic output
-        pages.sort_by(|a, b| a.path.cmp(&b.path));
+        candidates.sort_by(|a, b| a.path.cmp(&b.path));
 
-        WebManifest {
-            site_name: self.config.site_name.clone(),
-            pages,
+        let mut manifest = WebManifest {
+            site_name: truncate_utf8(&self.config.site_name, MAX_TITLE_BYTES),
+            pages: Vec::new(),
             default_price_msat,
             free_paths: Vec::new(),
             block_height,
+        };
+        let mut serialized_len = serde_json::to_vec(&manifest)
+            .map(|bytes| bytes.len())
+            .unwrap_or(MAX_PORCH_BODY_BYTES);
+        for page in candidates {
+            let page_len = match serde_json::to_vec(&page) {
+                Ok(bytes) => bytes.len(),
+                Err(error) => {
+                    warn!(%error, "manifest page serialization failed");
+                    continue;
+                }
+            };
+            let separator_len = usize::from(!manifest.pages.is_empty());
+            if serialized_len
+                .saturating_add(separator_len)
+                .saturating_add(page_len)
+                > MAX_PORCH_BODY_BYTES
+            {
+                warn!(
+                    limit = MAX_PORCH_BODY_BYTES,
+                    "manifest byte listing truncated at porch body limit"
+                );
+                break;
+            }
+            serialized_len += separator_len + page_len;
+            manifest.pages.push(page);
         }
+        manifest
     }
 
     /// Validate a request path for traversal attacks.
@@ -356,17 +439,23 @@ impl ContentServer {
 
     /// Extract the H1 title from a markdown file.
     fn extract_title(&self, path: &Path) -> Option<String> {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "failed to read file for title extraction");
                 return None;
             }
         };
+        let mut bytes = Vec::with_capacity(MAX_TITLE_SCAN_BYTES);
+        if let Err(e) = file.take(MAX_TITLE_SCAN_BYTES as u64).read_to_end(&mut bytes) {
+            warn!(path = %path.display(), error = %e, "failed to scan file for title extraction");
+            return None;
+        }
+        let content = String::from_utf8_lossy(&bytes);
         for line in content.lines() {
             let trimmed = line.trim();
             if let Some(title) = trimmed.strip_prefix("# ") {
-                return Some(title.trim().to_string());
+                return Some(truncate_utf8(title.trim(), MAX_TITLE_BYTES));
             }
         }
         None
@@ -376,11 +465,20 @@ impl ContentServer {
     fn content_type_for_path(&self, path: &Path) -> String {
         match path.extension().and_then(|e| e.to_str()) {
             Some("md") => "text/markdown".to_string(),
-            Some("txt") => "text/plain".to_string(),
-            Some("html") | Some("htm") => "text/html".to_string(),
             _ => "text/plain".to_string(),
         }
     }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 #[cfg(test)]

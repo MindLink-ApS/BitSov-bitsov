@@ -40,6 +40,9 @@ pub(crate) struct MsgHandlerDeps {
     pub session_manager: Arc<SessionManager>,
     pub nonce_adapter: Arc<konsensus_storage::StorageNonceAdapter<dyn konsensus_storage::Storage>>,
     pub content_server: Option<Arc<ContentServer>>,
+    /// The owner's published card, answered at `/front-door.json` whether or
+    /// not `[web]` is enabled: publishing it is consent to share it.
+    pub front_door: konsensus_api::handlers::front_door::FrontDoorStore,
     pub routing: Arc<RoutingTable>,
     pub identity: Arc<NodeIdentity>,
     pub plaintext_cipher: Arc<PlaintextCacheCipher>,
@@ -213,6 +216,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
         session_manager: session_mgr_for_recv,
         nonce_adapter,
         content_server: content_server_for_recv,
+        front_door: front_door_for_recv,
         routing: routing_for_recv,
         identity: identity_for_recv,
         plaintext_cipher,
@@ -325,6 +329,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         if gate_result.is_ok() && !is_relay_control {
                             use konsensus_storage::PaidAcceptance;
                             match storage_for_recv.accept_paid_envelope(&envelope).await {
+                                // A web reply the gate accepted is bound to OUR paid
+                                // request: the sender paid nothing, so it is no admission.
+                                Ok(PaidAcceptance::Accepted) if konsensus_core::is_web_service_reply(&envelope) => {}
                                 Ok(PaidAcceptance::Accepted) => {
                                     audit_for_recv.membrane().admitted(&envelope, gate_result.as_ref().expect("validated").0);
                                 }
@@ -485,10 +492,14 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // Only the connection just promoted by this payment is
                         // offered to, never an unpaid peer, and the offer is
                         // rate-limited (`EagerOfferLimiter`).
+                        //
+                        // A web reply bound to our paid request promotes nothing:
+                        // we paid, the replying node did not (BROWSE.md §4).
                         if matches!(
                             admission_mode_for_recv,
                             konsensus_message::ReachabilityMode::PriceOpen
-                        ) {
+                        ) && !konsensus_core::is_web_service_reply(&envelope)
+                        {
                             if let Some(promoted) = transport_for_recv.promote_to_privileged_at(&sender).await {
                                 offer_prekey_after_promotion(
                                     &transport_for_ack,
@@ -543,6 +554,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             &plaintext_cipher,
                             &storage_for_recv,
                             &content_server_for_recv,
+                            &front_door_for_recv,
                             &chain_for_recv,
                             &pricing_for_recv,
                             &identity_for_recv,
@@ -670,6 +682,7 @@ async fn decrypt_and_process(
     plaintext_cipher: &PlaintextCacheCipher,
     storage: &Arc<dyn konsensus_storage::Storage>,
     content_server: &Option<Arc<ContentServer>>,
+    front_door: &konsensus_api::handlers::front_door::FrontDoorStore,
     chain: &Arc<dyn ChainProvider>,
     pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     identity: &Arc<NodeIdentity>,
@@ -774,6 +787,7 @@ async fn decrypt_and_process(
             sender,
             envelope,
             content_server,
+            front_door,
             pricing,
             identity,
             session_mgr,
@@ -1017,7 +1031,7 @@ async fn process_web_manifest(
     let default_price = pricing
         .get_price_msat(konsensus_core::kind::KIND_PAGE_RESPONSE)
         .await
-        .unwrap_or(50);
+        .unwrap_or(1_000);
     let manifest = cs.build_manifest(block_height, default_price);
     info!(sender = %sender, pages = manifest.pages.len(), "served web manifest");
 
@@ -1044,6 +1058,7 @@ async fn process_page_request(
     sender: &konsensus_core::types::NodeId,
     envelope: &konsensus_core::UkmEnvelope,
     content_server: &Option<Arc<ContentServer>>,
+    front_door: &konsensus_api::handlers::front_door::FrontDoorStore,
     _pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     identity: &Arc<NodeIdentity>,
     session_mgr: &SessionManager,
@@ -1059,12 +1074,19 @@ async fn process_page_request(
             }
         };
 
-    let Some(cs) = content_server else {
+    let response = if page_req.path == konsensus_core::payloads::content::PORCH_CARD_PATH {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let card = front_door.card.lock().await.clone();
+        crate::content_server::card_response(page_req.request_id.clone(), card.as_ref(), now)
+    } else if let Some(cs) = content_server {
+        cs.handle_request(&page_req)
+    } else {
         debug!(sender = %sender, "page request received but content server disabled");
-        return Some(format!("[page request: {}]", page_req.path));
+        crate::content_server::not_found(page_req.request_id.clone())
     };
-
-    let response = cs.handle_request(&page_req);
     info!(
         sender = %sender,
         path = %page_req.path,
@@ -1117,6 +1139,17 @@ async fn send_encrypted_response<T: serde::Serialize>(
             return;
         }
     };
+    if kind == konsensus_core::kind::KIND_WEB_MANIFEST
+        && json_bytes.len() > konsensus_core::payloads::content::MAX_PORCH_BODY_BYTES
+    {
+        warn!(
+            peer = %peer_id,
+            size = json_bytes.len(),
+            limit = konsensus_core::payloads::content::MAX_PORCH_BODY_BYTES,
+            "refusing oversized manifest response"
+        );
+        return;
+    }
 
     let ratchet_msg = match session_mgr.encrypt(peer_id, &json_bytes).await {
         Ok(msg) => msg,

@@ -15,6 +15,42 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Advertised by a node that answers porch reads (docs/protocol/BROWSE.md): as
+/// `Capability::Custom` in its federation Hello (peers see it in
+/// `GET /api/v1/peers` as `Custom("porch_read_v1")`) and in its own `/status`
+/// `api_capabilities`, where it also means `POST /api/v1/browse/fetch` exists.
+/// An older node leaves a paid `/front-door.json` read unanswered, so apps must
+/// not send it one.
+pub const PORCH_READ_CAPABILITY: &str = "porch_read_v1";
+
+/// Porch path of the owner's published front-door card (BROWSE.md §4).
+pub const PORCH_CARD_PATH: &str = "/front-door.json";
+
+/// Largest reply body one porch read returns (BROWSE.md §6).
+pub const MAX_PORCH_BODY_BYTES: usize = 256 * 1024;
+
+/// Longest porch request path, leading `/` included.
+pub const MAX_PORCH_PATH_LEN: usize = 128;
+
+/// A site page on the porch: `/` plus one flat, visible `.md` or `.txt` name —
+/// the same shape the owner's page API writes. No subdirectories, no hidden
+/// files, no other extensions.
+pub fn is_site_page(path: &str) -> bool {
+    let Some(name) = path.strip_prefix('/') else {
+        return false;
+    };
+    path.len() <= MAX_PORCH_PATH_LEN
+        && !name.starts_with('.')
+        && (name.ends_with(".md") || name.ends_with(".txt"))
+        && !name.contains("..")
+        && !name.chars().any(|c| matches!(c, '/' | '\\' | '%') || c.is_control())
+}
+
+/// Every path a porch answers with content: the card, or a site page.
+pub fn is_porch_path(path: &str) -> bool {
+    path == PORCH_CARD_PATH || is_site_page(path)
+}
+
 /// A browser request for content at a specific path on a peer's node.
 ///
 /// Sent as `KIND_PAGE_REQUEST` (500). The requester includes a unique
@@ -144,9 +180,8 @@ pub struct WebManifest {
     /// Default price per page in millisatoshis.
     pub default_price_msat: u64,
 
-    /// Paths that are free to access (no payment required for the content
-    /// itself — the request envelope still requires payment through the
-    /// payment gate).
+    /// Always empty: there are no free reads (BROWSE.md §3). Kept for wire
+    /// compatibility; requesters ignore it.
     #[serde(default)]
     pub free_paths: Vec<String>,
 
@@ -288,6 +323,22 @@ mod tests {
         assert_eq!(not_found, "\"NotFound\"");
         let forbidden = serde_json::to_string(&PageStatus::Forbidden).unwrap();
         assert_eq!(forbidden, "\"Forbidden\"");
+    }
+
+    #[test]
+    fn porch_paths_are_the_card_and_flat_visible_pages() {
+        for ok in ["/front-door.json", "/index.md", "/cv.txt", "/my notes.md"] {
+            assert!(is_porch_path(ok), "{ok}");
+        }
+        for bad in [
+            "", "/", "index.md", "/.md", "/.draft.md", "/blog/post.md", "/../x.md",
+            "/a..b.md", "/x%2e.md", "/a\\b.md", "/a\0.md", "/page.html",
+            "/front-door.seq", "/front-door.json.tmp", "/cards/abc.json",
+        ] {
+            assert!(!is_porch_path(bad), "{bad:?}");
+        }
+        let long = format!("/{}.md", "a".repeat(MAX_PORCH_PATH_LEN));
+        assert!(!is_site_page(&long));
     }
 
     #[test]

@@ -63,6 +63,46 @@ async fn compose_observed(
     out
 }
 
+async fn compose_with_policy_observed(
+    auth: MeteredSpend,
+    state: Arc<AppState>,
+    req: ComposeRequest,
+    policy: compose::ComposePolicy,
+) -> Result<Json<ComposeResponse>, ApiError> {
+    let (recipient, kind, cap) = (
+        crate::membrane::parse_recipient(&req.recipient, req.is_room),
+        req.kind,
+        req.max_total_msat,
+    );
+    let out = compose::compose_message_with_policy(auth, Arc::clone(&state), req, policy).await;
+    if let Err(e) = &out {
+        state
+            .audit_log
+            .membrane()
+            .outbound_refused(e, recipient.as_ref(), Some(kind), cap);
+    }
+    out
+}
+
+/// Compose for another handler (browse), with the route's spend authority,
+/// caps and membrane observation.
+pub(crate) async fn compose_for(
+    auth: MeteredSpend,
+    state: Arc<AppState>,
+    req: ComposeRequest,
+) -> Result<Json<ComposeResponse>, ApiError> {
+    compose_with_policy_observed(
+        auth,
+        state,
+        req,
+        compose::ComposePolicy {
+            allow_initial_admission: false,
+            allow_readmission: false,
+        },
+    )
+    .await
+}
+
 async fn send_observed(
     auth: MeteredSpend,
     State(state): State<Arc<AppState>>,

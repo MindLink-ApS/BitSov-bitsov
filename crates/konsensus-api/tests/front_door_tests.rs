@@ -402,6 +402,15 @@ async fn status_advertises_call_meeting_v1() {
     assert!(body["api_capabilities"].as_array().unwrap().iter().any(|c| c == "call_meeting_v1"), "{body}");
 }
 
+/// Browse (docs/protocol/BROWSE.md): the paid porch read is advertised.
+#[tokio::test]
+async fn status_advertises_porch_read_v1() {
+    let state = state_with(settings(None));
+    let (status, body, _) = call(&state, "GET", "/api/v1/status", auth_header(&state), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["api_capabilities"].as_array().unwrap().iter().any(|c| c == "porch_read_v1"), "{body}");
+}
+
 #[tokio::test]
 async fn open_refuses_own_card_and_needs_local_consent() {
     let state = state_with(settings(Some("node.example.org:9000")));

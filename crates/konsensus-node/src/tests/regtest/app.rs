@@ -272,6 +272,7 @@ impl App {
                     state.storage.clone(),
                 )),
                 content_server: None,
+                front_door: state.front_door.clone(),
                 routing: state.routing.clone(),
                 identity: identity.clone(),
                 plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::new(

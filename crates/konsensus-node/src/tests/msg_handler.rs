@@ -286,6 +286,7 @@ async fn decrypt_no_session_returns_none() {
         &plaintext_cipher,
         &storage,
         &None,
+        &Default::default(),
         &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
         &(Arc::new(konsensus_pricing::StaticPricingEngine::new(Default::default())) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
         &bob,
@@ -322,6 +323,7 @@ async fn decrypt_invalid_ratchet_message_returns_none() {
         &plaintext_cipher,
         &storage,
         &None,
+        &Default::default(),
         &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
         &(Arc::new(konsensus_pricing::StaticPricingEngine::new(Default::default())) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
         &bob,
@@ -361,6 +363,7 @@ async fn decrypt_valid_message_returns_plaintext_and_caches() {
         &plaintext_cipher,
         &storage_dyn,
         &None,
+        &Default::default(),
         &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
         &(Arc::new(konsensus_pricing::StaticPricingEngine::new(Default::default())) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
         &bob,
@@ -414,6 +417,7 @@ async fn decrypt_file_ref_stores_and_returns_label() {
         &plaintext_cipher,
         &storage_dyn,
         &None,
+        &Default::default(),
         &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
         &(Arc::new(konsensus_pricing::StaticPricingEngine::new(Default::default())) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
         &bob,
@@ -546,6 +550,7 @@ async fn page_request_invalid_json_returns_none() {
         &sender,
         &envelope,
         &None,
+        &Default::default(),
         &pricing,
         &bob,
         &session_mgr,
@@ -579,7 +584,7 @@ async fn page_request_no_content_server_returns_label() {
     let bytes = serde_json::to_vec(&page_req).unwrap();
 
     let result = process_page_request(
-        &bytes, &sender, &envelope, &None, &pricing, &bob, &session_mgr, &transport, &audit,
+        &bytes, &sender, &envelope, &None, &Default::default(), &pricing, &bob, &session_mgr, &transport, &audit,
     )
     .await;
 
@@ -617,7 +622,7 @@ async fn page_request_with_content_server_serves_page() {
     let bytes = serde_json::to_vec(&page_req).unwrap();
 
     let result = process_page_request(
-        &bytes, &sender, &envelope, &Some(cs), &pricing, &bob, &session_mgr, &transport, &audit,
+        &bytes, &sender, &envelope, &Some(cs), &Default::default(), &pricing, &bob, &session_mgr, &transport, &audit,
     )
     .await;
 
@@ -654,7 +659,7 @@ async fn page_request_nonexistent_path_returns_label() {
     let bytes = serde_json::to_vec(&page_req).unwrap();
 
     let result = process_page_request(
-        &bytes, &sender, &envelope, &Some(cs), &pricing, &bob, &session_mgr, &transport, &audit,
+        &bytes, &sender, &envelope, &Some(cs), &Default::default(), &pricing, &bob, &session_mgr, &transport, &audit,
     )
     .await;
 
@@ -699,6 +704,7 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
         &plaintext_cipher,
         &storage,
         &None,
+        &Default::default(),
         &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
         &(Arc::new(konsensus_pricing::StaticPricingEngine::new(Default::default())) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
         &bob,
@@ -743,6 +749,7 @@ async fn decrypt_non_utf8_returns_none() {
         &plaintext_cipher,
         &storage,
         &None,
+        &Default::default(),
         &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
         &(Arc::new(konsensus_pricing::StaticPricingEngine::new(Default::default())) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
         &bob,
@@ -968,7 +975,7 @@ async fn rejected_envelope_disclosures(privileged: bool) {
         chain: Arc::new(konsensus_chain::MockChainProvider::new()),
         peer_registry: registry.clone(), session_manager: sessions.clone(),
         nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage.clone())),
-        content_server: None, routing: Arc::new(RoutingTable::new(Default::default())),
+        content_server: None, front_door: Default::default(), routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(), plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         ws_tx, audit_log: Arc::new(AuditLog::open(&audit_path).unwrap()),
         admission_mode: ReachabilityMode::PriceOpen, relay_engine: None, shutdown_rx,
@@ -1236,7 +1243,7 @@ async fn paid_acceptance_retry_case(legacy: bool, retained: bool, price_rise: bo
         lightning: wallet, chain: Arc::new(konsensus_chain::MockChainProvider::new()),
         peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
         session_manager: sessions_b, nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
-        content_server: None, routing: Arc::new(RoutingTable::new(Default::default())),
+        content_server: None, front_door: Default::default(), routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(), plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         ws_tx, audit_log: audit.clone(), admission_mode: ReachabilityMode::PriceOpen,
         relay_engine: None, shutdown_rx,
@@ -1914,7 +1921,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         lightning: wallet.clone(), chain: Arc::new(konsensus_chain::MockChainProvider::new()),
         peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
         session_manager: sessions_b, nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
-        content_server: None, routing: Arc::new(RoutingTable::new(Default::default())),
+        content_server: None, front_door: Default::default(), routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(), plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         ws_tx, audit_log: audit, admission_mode: ReachabilityMode::PriceOpen,
         relay_engine: None, shutdown_rx,

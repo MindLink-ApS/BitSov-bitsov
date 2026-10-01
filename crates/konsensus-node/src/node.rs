@@ -594,12 +594,14 @@ pub(crate) fn default_advertised_capabilities(relay_enabled: bool) -> Vec<Capabi
     // Mesh meetings: peers' apps ring this node with a meeting leg only when
     // they see this advert (older nodes withdraw such a leg after payment).
     // Rooms: likewise, peers send room-bound chat only to nodes that list
-    // `room_binding_v1`. `Custom` is an existing variant, so older nodes still
-    // decode the Hello.
+    // `room_binding_v1`. Porch reads: peers' apps offer a paid read only to a
+    // node that answers it. `Custom` is an existing variant, so older nodes
+    // still decode the Hello.
     let mut caps = vec![
         Capability::X3dh,
         Capability::Custom(konsensus_core::payloads::call::MEETING_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY.to_string()),
+        Capability::Custom(konsensus_core::payloads::content::PORCH_READ_CAPABILITY.to_string()),
     ];
     if relay_enabled {
         caps.push(Capability::Relay);
@@ -642,6 +644,13 @@ mod relay_capability_tests {
         let room = Capability::Custom("room_binding_v1".into());
         assert!(caps.contains(&room));
         assert_eq!(format!("{room:?}"), r#"Custom("room_binding_v1")"#);
+    }
+
+    #[test]
+    fn porch_read_capability_is_advertised_in_the_form_peers_list_shows() {
+        let porch = Capability::Custom("porch_read_v1".into());
+        assert!(default_advertised_capabilities(false).contains(&porch));
+        assert_eq!(format!("{porch:?}"), r#"Custom("porch_read_v1")"#);
     }
 
     #[test]

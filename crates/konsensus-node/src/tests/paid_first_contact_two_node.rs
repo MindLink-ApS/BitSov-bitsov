@@ -232,6 +232,7 @@ struct PauseAfterMark {
     armed: std::sync::atomic::AtomicBool,
     armed_query: std::sync::atomic::AtomicBool,
     armed_eager: std::sync::atomic::AtomicBool,
+    armed_page_send: std::sync::atomic::AtomicBool,
     proof_sent: std::sync::atomic::AtomicBool,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -252,6 +253,9 @@ impl PauseAfterMark {
     fn arm_before_eager_offer(&self) {
         self.proof_sent.store(false, std::sync::atomic::Ordering::SeqCst);
         self.armed_eager.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn arm_before_page_send(&self) {
+        self.armed_page_send.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     async fn hold_eager(&self) {
         if self.proof_sent.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -283,6 +287,9 @@ struct Hooked {
 #[async_trait::async_trait]
 impl MessageTransport for Hooked {
     async fn send(&self, peer: &NodeId, envelope: &konsensus_core::UkmEnvelope) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        if envelope.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
+            self.pause.hold(&self.pause.armed_page_send).await;
+        }
         self.inner.send(peer, envelope).await
     }
     async fn recv(&self) -> Result<konsensus_core::UkmEnvelope, konsensus_core::traits::transport::TransportError> {
@@ -369,6 +376,7 @@ struct Node {
     peer_ln_pubkeys: Arc<tokio::sync::Mutex<HashMap<NodeId, String>>>,
     router: axum::Router,
     auth: String,
+    front_door: konsensus_api::handlers::front_door::FrontDoorStore,
     delivered: mpsc::UnboundedReceiver<String>,
     shutdown: watch::Sender<bool>,
     data_dir: PathBuf,
@@ -441,6 +449,15 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
     let peer_ln_pubkeys = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let (shutdown, shutdown_rx) = watch::channel(false);
     let pause = Arc::new(PauseAfterMark::default());
+    // Porch: the published card and `data_dir/pages` (browse_two_node).
+    let front_door = konsensus_api::handlers::front_door::FrontDoorStore::default();
+    let content_server = Arc::new(
+        crate::content_server::ContentServer::new(crate::content_server::ContentServerConfig {
+            content_dir: data_dir.join("pages"),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
     // As a node on a real backend: the gate checks settlement with the wallet,
     // so an unpaid envelope (e.g. the peer's mock-priced profile) promotes nothing.
     let gate = Arc::new(konsensus_core::PaymentGate::with_config(konsensus_core::gate::GateConfig {
@@ -484,7 +501,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         lightning_backend: "shared_mock".into(),
         chain_backend: "mock".into(),
         introduction: Default::default(),
-        front_door: Default::default(),
+        front_door: front_door.clone(),
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
@@ -503,7 +520,8 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         peer_registry: Arc::clone(&registry),
         session_manager: Arc::clone(&sessions),
         nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(Arc::clone(&storage))),
-        content_server: None,
+        content_server: Some(content_server),
+        front_door: front_door.clone(),
         routing: Arc::clone(&routing),
         identity: Arc::clone(&identity),
         plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::new(identity.aes_key())),
@@ -577,6 +595,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         peer_ln_pubkeys,
         router,
         auth: format!("Bearer {token}"),
+        front_door,
         delivered,
         shutdown,
         data_dir,
@@ -1576,3 +1595,6 @@ async fn p2_replacement_after_classification_readmits_once_and_delivers() {
     );
     net.stop();
 }
+
+#[path = "browse_two_node.rs"]
+mod browse_two_node;

@@ -41,6 +41,7 @@ pub struct StaticPricingConfig {
     pub app_ext_msat: u64,
     /// Price for web content messages (kinds 500-599) in millisatoshis.
     /// Used by the sovereign browser — page requests, responses, manifests.
+    /// Default 1 sat: the porch read floor (BROWSE.md §3).
     #[serde(default = "default_web_content_msat")]
     pub web_content_msat: u64,
     /// Price for relay storage control kinds (600-699) in millisatoshis.
@@ -67,7 +68,7 @@ fn default_app_ext_msat() -> u64 {
 }
 
 fn default_web_content_msat() -> u64 {
-    50
+    1_000
 }
 
 fn default_relay_storage_msat() -> u64 {
@@ -86,7 +87,7 @@ impl Default for StaticPricingConfig {
             realtime_signal_msat: 50,
             call_msat: default_call_msat(),
             app_ext_msat: 10,
-            web_content_msat: 50,
+            web_content_msat: default_web_content_msat(),
             relay_storage_msat: 100,
         }
     }
