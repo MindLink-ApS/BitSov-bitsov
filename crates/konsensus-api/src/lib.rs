@@ -188,6 +188,7 @@ fn build_router_with_options(
         .merge(handlers::invites::routes())
         .merge(handlers::introduction::routes())
         .merge(handlers::front_door::routes())
+        .merge(handlers::browse::routes())
         .merge(handlers::sponsor::routes())
         .merge(handlers::onboarding::routes())
         .merge(handlers::organism::routes())

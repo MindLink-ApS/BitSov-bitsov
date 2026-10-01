@@ -961,7 +961,8 @@ pub struct WebConfig {
     #[serde(default = "default_content_dir")]
     pub content_dir: String,
 
-    /// Maximum file size to serve, in bytes. Default: 4 MiB.
+    /// Maximum file size to serve, in bytes. Default and ceiling: 256 KiB,
+    /// the porch reply cap (BROWSE.md §6).
     #[serde(default = "default_max_page_size")]
     pub max_page_size: u64,
 
@@ -973,7 +974,7 @@ pub struct WebConfig {
     #[serde(default = "default_site_name")]
     pub site_name: String,
 
-    /// Default price per page in millisatoshi. Default: 50 msat.
+    /// Default price per page in millisatoshi. Default: 1,000 msat (1 sat).
     #[serde(default = "default_page_price_msat")]
     pub page_price_msat: u64,
 }
@@ -996,7 +997,7 @@ fn default_content_dir() -> String {
 }
 
 fn default_max_page_size() -> u64 {
-    4 * 1024 * 1024
+    konsensus_core::payloads::content::MAX_PORCH_BODY_BYTES as u64
 }
 
 fn default_page_cache_secs() -> u64 {
@@ -1008,7 +1009,7 @@ fn default_site_name() -> String {
 }
 
 fn default_page_price_msat() -> u64 {
-    50
+    1_000
 }
 
 /// A peer entry in the config file.
@@ -1710,7 +1711,7 @@ fn default_app_ext_msat() -> u64 {
     10
 }
 fn default_web_content_msat() -> u64 {
-    50
+    1_000
 }
 
 #[cfg(test)]

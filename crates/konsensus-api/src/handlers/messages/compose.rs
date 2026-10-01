@@ -64,6 +64,21 @@ pub struct ComposeRequest {
     pub references: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ComposePolicy {
+    pub allow_initial_admission: bool,
+    pub allow_readmission: bool,
+}
+
+impl Default for ComposePolicy {
+    fn default() -> Self {
+        Self {
+            allow_initial_admission: true,
+            allow_readmission: true,
+        }
+    }
+}
+
 /// Response after composing and sending a message.
 #[derive(Serialize)]
 pub struct ComposeResponse {
@@ -421,6 +436,9 @@ pub(crate) struct Readmission {
     caller_cap: Option<u64>,
     /// Single-recipient compose already holds the per-peer admission lock.
     lock_held: bool,
+    /// Refuse a reconnect instead of buying admission again. Used by Browse:
+    /// opening the porch is an explicit Knock, never a side effect of a read.
+    forbidden: bool,
     /// Admission paid again during this send, msat.
     paid_msat: std::sync::atomic::AtomicU64,
     fee_ceiling_msat: std::sync::atomic::AtomicU64,
@@ -471,28 +489,32 @@ pub(crate) async fn create_metered_payment_proof(
     // The payment gate accepts overpayment, so this is safe.
     let payment_amount_msat = price_msat.max(MIN_INVOICE_AMOUNT_MSAT);
 
-    // Try keysend first — eliminates the invoice round-trip.
+    // Try keysend first — eliminates the invoice round-trip. A caller that
+    // forbids re-admission must ask the recipient for an invoice so its live
+    // connection gate can refuse before any payment is dispatched.
     let peer_ln_pubkey = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
-    if let Some(ln_pubkey) = peer_ln_pubkey {
-        match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit).await {
-            Ok(KeysendOutcome::Settled(proof)) => return Ok(proof),
-            Ok(KeysendOutcome::NotDispatched) => {
-                tracing::warn!(
-                    peer = %peer_id,
-                    "keysend unavailable (not dispatched) — falling back to invoice-request flow"
-                );
-                // Safe to fall through: no HTLC was dispatched.
-            }
-            Err(e) => {
-                // No proof of non-dispatch: the payment may already have
-                // settled. Surface the unresolved/terminal error without a
-                // second payment path.
-                tracing::warn!(
-                    peer = %peer_id,
-                    error = %e,
-                    "keysend outcome does not permit fallback (double-pay guard)"
-                );
-                return Err(e);
+    if !readmission.forbidden {
+        if let Some(ln_pubkey) = peer_ln_pubkey {
+            match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit).await {
+                Ok(KeysendOutcome::Settled(proof)) => return Ok(proof),
+                Ok(KeysendOutcome::NotDispatched) => {
+                    tracing::warn!(
+                        peer = %peer_id,
+                        "keysend unavailable (not dispatched) — falling back to invoice-request flow"
+                    );
+                    // Safe to fall through: no HTLC was dispatched.
+                }
+                Err(e) => {
+                    // No proof of non-dispatch: the payment may already have
+                    // settled. Surface the unresolved/terminal error without a
+                    // second payment path.
+                    tracing::warn!(
+                        peer = %peer_id,
+                        error = %e,
+                        "keysend outcome does not permit fallback (double-pay guard)"
+                    );
+                    return Err(e);
+                }
             }
         }
     }
@@ -580,6 +602,12 @@ async fn readmit_then_pay(
     charge: &mut FirstContactCharge,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     let peer_key = peer_id.to_hex();
+    if readmission.forbidden {
+        return Err(ApiError::PriceCapExceeded(format!(
+            "{peer_id} requires admission again on this connection; Browse never pays \
+             admission implicitly. Knock again before reading."
+        )).with_reason(READMISSION_REQUIRED));
+    }
     // Capped non-chat (rooms/files/kind != chat) uses Some(0). Refuse before any
     // quote so we do not spend the payee's per-source admission window.
     let message_all_in = amount_msat
@@ -3054,6 +3082,15 @@ pub(super) async fn compose_message(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ComposeRequest>,
 ) -> Result<Json<ComposeResponse>, ApiError> {
+    compose_message_with_policy(auth, state, req, ComposePolicy::default()).await
+}
+
+pub(super) async fn compose_message_with_policy(
+    auth: MeteredSpend,
+    state: Arc<AppState>,
+    req: ComposeRequest,
+    policy: ComposePolicy,
+) -> Result<Json<ComposeResponse>, ApiError> {
     // Validate plaintext size
     if req.plaintext.is_empty() {
         return Err(ApiError::BadRequest("message plaintext is empty".into()));
@@ -3281,13 +3318,14 @@ pub(super) async fn compose_message(
         // settlement (compose_peer).
         super::operations::compose_call(auth, state, req, references).await
     } else {
-        super::operations::compose(auth, state, req, references).await
+        super::operations::compose(auth, state, req, references, policy).await
     }
 }
 
 pub(super) async fn compose_peer(
     auth: MeteredSpend, state: Arc<AppState>, req: ComposeRequest,
     references: Vec<MessageId>, operation: super::operations::Operation,
+    policy: ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
     let sender = *state.identity.node_id();
         // ── Peer compose: existing single-recipient path ──
@@ -3307,6 +3345,13 @@ pub(super) async fn compose_peer(
             cap = Some(cap.map_or(recipient_cap, |total| total.min(recipient_cap)));
         }
         let first_contact = !state.session_manager.has_session(&peer_id).await;
+        if first_contact && !policy.allow_initial_admission {
+            return Err(ApiError::Conflict(
+                "porch_knock_first: no E2EE session with this node; Knock (paid first contact) \
+                 before reading its porch"
+                    .into(),
+            ).with_reason("porch_knock_first"));
+        }
         if crate::calls::is_call_kind(req.kind) {
             // A call never pays first-contact admission: without an E2EE
             // session the contact is new, and first contact is a chat message
@@ -3467,12 +3512,18 @@ pub(super) async fn compose_peer(
         admission.current_dispatch = true;
         // Quoted capped re-admission is priced only for single-recipient chat.
         // Other kinds keep Some(0) refuse-before-quote when a cap is present.
-        let readmission_cap = if req.kind == konsensus_core::kind::KIND_CHAT {
+        let readmission_cap = if !policy.allow_readmission {
+            Some(0)
+        } else if req.kind == konsensus_core::kind::KIND_CHAT {
             cap
         } else {
             cap.map(|_| 0)
         };
-        let readmission = Readmission { lock_held: true, ..Readmission::for_cap(readmission_cap) };
+        let readmission = Readmission {
+            lock_held: true,
+            forbidden: !policy.allow_readmission,
+            ..Readmission::for_cap(readmission_cap)
+        };
         let (payment_hash, preimage_bytes, amount_msat) =
             create_metered_payment_proof(&state, price_msat, &peer_id, &debit, &readmission, Some(req.kind), &mut admission).await?;
         admission.message_settled = amount_msat;

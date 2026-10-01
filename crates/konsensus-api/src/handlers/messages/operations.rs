@@ -460,12 +460,13 @@ pub(super) async fn compose(
     state: Arc<AppState>,
     req: ComposeRequest,
     references: Vec<MessageId>,
+    policy: super::compose::ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
     let peer = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
     let id = operation_id(req.operation_id.as_deref())?;
     let _guard = lock(&state, &id).await?;
-    compose_locked(auth, state, req, references, peer, id).await
+    compose_locked(auth, state, req, references, peer, id, policy).await
 }
 
 /// A 1:1 call signal (kinds 400-403). Its reservation is made, the operation
@@ -501,7 +502,15 @@ pub(super) async fn compose_call(
     if !paid {
         crate::calls::reserve_outgoing(state.storage.as_ref(), state.identity.node_id(), &peer, req.kind, &plaintext, &id, &request_hash).await?;
     }
-    let result = compose_locked(auth, Arc::clone(&state), req, references, peer, id.clone()).await;
+    let result = compose_locked(
+        auth,
+        Arc::clone(&state),
+        req,
+        references,
+        peer,
+        id.clone(),
+        super::compose::ComposePolicy::default(),
+    ).await;
     crate::calls::resolve_outgoing(state.storage.as_ref(), &peer, &plaintext, &id, &request_hash).await;
     result
 }
@@ -514,6 +523,7 @@ async fn compose_locked(
     references: Vec<MessageId>,
     peer: NodeId,
     id: String,
+    policy: super::compose::ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
     let digest = request_digest(&peer, &req)?;
     let mut op = OutboxOperation::prepared(id.clone(), peer.to_hex(), req.kind, digest.clone());
@@ -606,7 +616,7 @@ async fn compose_locked(
     };
     let wait = req.wait_ack_ms;
     let result =
-        super::compose::compose_peer(auth, state.clone(), req, references, operation.clone()).await;
+        super::compose::compose_peer(auth, state.clone(), req, references, operation.clone(), policy).await;
     match result {
         Ok(result) => wait_response(&state, &id, wait, result.0.delivered).await,
         Err(error) => {
