@@ -19,7 +19,7 @@ use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::types::NodeId;
 
@@ -80,12 +80,11 @@ impl OwnerApprovalKey {
         if seed.len() != 64 {
             return Err(IdentityError::InvalidSeedLength(seed.len()));
         }
-        let mut hasher = blake3::Hasher::new_derive_key(CTX_OWNER_APPROVAL);
+        let mut hasher = Zeroizing::new(blake3::Hasher::new_derive_key(CTX_OWNER_APPROVAL));
         hasher.update(seed);
         hasher.update(owner_secret);
-        let mut bytes: [u8; 32] = *hasher.finalize().as_bytes();
+        let bytes = finish_key_derivation(&hasher);
         let signing = Ed25519SigningKey::from_bytes(&bytes);
-        bytes.zeroize();
         Ok(Self { signing })
     }
 
@@ -96,12 +95,8 @@ impl OwnerApprovalKey {
         passphrase: &str,
         owner_secret: &[u8; 32],
     ) -> Result<Self, IdentityError> {
-        let mnemonic = bip39::Mnemonic::parse(mnemonic_str)
-            .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
-        let mut seed = mnemonic.to_seed(passphrase);
-        let key = Self::from_seed(&seed, owner_secret);
-        seed.zeroize();
-        key
+        let seed = mnemonic_seed(mnemonic_str, passphrase)?;
+        Self::from_seed(seed.as_ref(), owner_secret)
     }
 
     /// The public half, as the node knows it.
@@ -123,6 +118,25 @@ const CTX_SECP256K1: &str = "konsensus-v2 secp256k1 bitcoin key";
 const CTX_AES256: &str = "konsensus-v2 aes256 storage key";
 const CTX_OWNER_APPROVAL: &str = "konsensus-v2 ed25519 owner-approval key v2 (seed+owner secret)";
 
+fn mnemonic_seed(mnemonic_str: &str, passphrase: &str) -> Result<Zeroizing<[u8; 64]>, IdentityError> {
+    let mnemonic = bip39::Mnemonic::parse(mnemonic_str)
+        .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
+    Ok(Zeroizing::new(mnemonic.to_seed(passphrase)))
+}
+
+fn finish_key_derivation(hasher: &blake3::Hasher) -> Zeroizing<[u8; 32]> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    let mut output = Zeroizing::new(hasher.finalize_xof());
+    output.fill(bytes.as_mut());
+    bytes
+}
+
+fn derive_key(context: &str, seed: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut hasher = Zeroizing::new(blake3::Hasher::new_derive_key(context));
+    hasher.update(seed);
+    finish_key_derivation(&hasher)
+}
+
 impl NodeIdentity {
     /// Create a new identity from a BIP-39 mnemonic phrase.
     ///
@@ -130,11 +144,8 @@ impl NodeIdentity {
     /// All keys are derived deterministically — the same mnemonic + passphrase
     /// always produces the same identity.
     pub fn from_mnemonic(mnemonic_str: &str, passphrase: &str) -> Result<Self, IdentityError> {
-        let mnemonic = bip39::Mnemonic::parse(mnemonic_str)
-            .map_err(|e| IdentityError::InvalidMnemonic(e.to_string()))?;
-
-        let seed = mnemonic.to_seed(passphrase);
-        Self::from_seed(&seed)
+        let seed = mnemonic_seed(mnemonic_str, passphrase)?;
+        Self::from_seed(seed.as_ref())
     }
 
     /// Create a new identity from a raw 64-byte seed.
@@ -147,25 +158,24 @@ impl NodeIdentity {
         }
 
         // Ed25519 signing key
-        let ed25519_bytes = blake3::derive_key(CTX_ED25519, seed);
+        let ed25519_bytes = derive_key(CTX_ED25519, seed);
         let ed25519_signing = Ed25519SigningKey::from_bytes(&ed25519_bytes);
         let ed25519_verifying = ed25519_signing.verifying_key();
 
         // X25519 key exchange
-        let x25519_bytes = blake3::derive_key(CTX_X25519, seed);
-        let x25519_secret = X25519StaticSecret::from(x25519_bytes);
+        let x25519_bytes = derive_key(CTX_X25519, seed);
+        let x25519_secret = X25519StaticSecret::from(*x25519_bytes);
         let x25519_public = X25519PublicKey::from(&x25519_secret);
-        let x25519_secret_bytes = x25519_bytes;
 
         // secp256k1 (Bitcoin/Lightning)
-        let secp_bytes = blake3::derive_key(CTX_SECP256K1, seed);
-        let secp_secret = bitcoin::secp256k1::SecretKey::from_slice(&secp_bytes)
+        let secp_bytes = derive_key(CTX_SECP256K1, seed);
+        let secp_secret = bitcoin::secp256k1::SecretKey::from_slice(secp_bytes.as_ref())
             .map_err(|e| IdentityError::DerivationFailed(format!("secp256k1: {e}")))?;
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let secp_public = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secp_secret);
 
         // AES-256 key for at-rest encryption
-        let aes_key = blake3::derive_key(CTX_AES256, seed);
+        let aes_key = derive_key(CTX_AES256, seed);
 
         // NodeId from Ed25519 public key
         let node_id = NodeId::from_verifying_key(&ed25519_verifying);
@@ -175,10 +185,10 @@ impl NodeIdentity {
             ed25519_verifying,
             x25519_secret,
             x25519_public,
-            x25519_secret_bytes,
+            x25519_secret_bytes: *x25519_bytes,
             secp_secret,
             secp_public,
-            aes_key,
+            aes_key: *aes_key,
             node_id,
         })
     }
@@ -288,6 +298,49 @@ mod tests {
         "abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon art";
+
+    #[test]
+    fn mnemonic_seed_holder_is_zeroizing() {
+        let seed: zeroize::Zeroizing<[u8; 64]> = mnemonic_seed(TEST_MNEMONIC, "secret").unwrap();
+        fn assert_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        assert_drop(&seed);
+        let from_seed = NodeIdentity::from_seed(seed.as_ref()).unwrap();
+        let from_words = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "secret").unwrap();
+        assert_eq!(from_seed.node_id(), from_words.node_id());
+    }
+
+    #[test]
+    fn derived_key_holders_are_zeroizing_and_compatible() {
+        let seed = mnemonic_seed(TEST_MNEMONIC, "secret").unwrap();
+        for context in [CTX_ED25519, CTX_X25519, CTX_SECP256K1, CTX_AES256] {
+            let key: Zeroizing<[u8; 32]> = derive_key(context, seed.as_ref());
+            fn assert_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+            assert_drop(&key);
+            assert_eq!(*key, blake3::derive_key(context, seed.as_ref()));
+        }
+    }
+
+    #[test]
+    fn mnemonic_identity_matches_pre_zeroizing_vectors() {
+        let words = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        for (passphrase, node_id, owner_key) in [
+            (
+                "",
+                "47657a4344334f384d60152794f0db00a11136196c47bc849c68dea56c1358a8",
+                "18c49f5c1792a82abaaf206205bf0c3b91ac3f3f5b0683036b365251f6ffad6a",
+            ),
+            (
+                "TREZOR",
+                "1553e3bdab5702319e68fc40951e563d0c7e60a9eaba3c7fffe0923b1bc994a6",
+                "f4b911ec9a66c89fa758d76105df184917a7b990627b81f4537f3929bf89bf36",
+            ),
+        ] {
+            let identity = NodeIdentity::from_mnemonic(words, passphrase).unwrap();
+            assert_eq!(identity.node_id().to_hex(), node_id);
+            let owner = OwnerApprovalKey::from_mnemonic(words, passphrase, &[7u8; 32]).unwrap();
+            assert_eq!(hex::encode(owner.verifying_key().to_bytes()), owner_key);
+        }
+    }
 
     #[test]
     fn from_mnemonic_deterministic() {
