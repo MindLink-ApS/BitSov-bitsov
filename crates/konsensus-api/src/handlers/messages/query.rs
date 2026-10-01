@@ -34,7 +34,8 @@ pub struct ListMessagesQuery {
     pub peer: Option<String>,
     /// Only chats bound to this room id (64 lowercase hex): the room thread,
     /// received and sent, among the most recent [`MAX_SEARCH_SCAN`] chats
-    /// with any node. Our per-member copies of one room message are one entry.
+    /// with any node. Our per-member copies of one room message are one entry,
+    /// at its newest copy's timestamp; `before` and `limit` count entries.
     /// Not combined with `peer`.
     pub room: Option<String>,
 }
@@ -314,11 +315,19 @@ pub(super) async fn list_messages(
     Ok((store_read, Json(responses)))
 }
 
-/// `?room=`: the newest `limit` entries of the room thread, both directions.
+/// `?room=`: the room thread, both directions, as logical entries: a received
+/// chat, or one of our room messages with every member copy (same `msg`). It
+/// is built from the newest [`MAX_SEARCH_SCAN`] chats with any node, always
+/// from the top: copies of one message can be far apart (a resend to a member
+/// that was refused), so `before` cannot be applied to single envelopes
+/// without splitting a message across pages (Codex #155 delta 1). Each entry
+/// is placed at its newest copy's timestamp, ordered newest first (ties by
+/// id); `before` and `limit` then apply to entries, so a page never repeats
+/// or splits a message.
 async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, before: Option<u64>) -> Result<Vec<MessageResponse>, ApiError> {
     let messages = state
         .storage
-        .get_node_messages_of_kind(me, konsensus_core::kind::KIND_CHAT, MAX_SEARCH_SCAN, before)
+        .get_node_messages_of_kind(me, konsensus_core::kind::KIND_CHAT, MAX_SEARCH_SCAN, None)
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
     let Some(cipher) = state.plaintext_cipher.as_deref() else { return Ok(Vec::new()) };
@@ -337,20 +346,22 @@ async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, befo
             if let Some(&at) = sent.get(&msg) {
                 let entry = &mut thread[at];
                 entry.payment_amount_msat = entry.payment_amount_msat.saturating_add(copy.payment_amount_msat);
+                if resp.timestamp > entry.timestamp || (resp.timestamp == entry.timestamp && resp.id > entry.id) {
+                    // The newest copy represents the entry.
+                    (entry.id, entry.timestamp, entry.ciphertext, entry.payment_hash) = (resp.id, resp.timestamp, resp.ciphertext, resp.payment_hash);
+                }
                 entry.copies.push(copy);
-                continue;
-            }
-            if thread.len() >= limit as usize {
                 continue;
             }
             resp.recipient = room_id.to_string();
             resp.copies.push(copy);
             sent.insert(msg, thread.len());
-        } else if thread.len() >= limit as usize {
-            continue;
         }
         thread.push(resp);
     }
+    thread.sort_by(|a, b| (b.timestamp, &b.id).cmp(&(a.timestamp, &a.id)));
+    thread.retain(|entry| before.is_none_or(|before| entry.timestamp < before));
+    thread.truncate(limit as usize);
     for entry in &mut thread {
         entry.copies.sort_by(|a, b| a.recipient.cmp(&b.recipient));
     }

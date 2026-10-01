@@ -134,8 +134,13 @@ received, those bound to that room. The sender's per-member copies of one
 message (same `msg`) are one entry: `recipient` is the room id,
 `payment_amount_msat` the sum, `copies` lists each member's copy
 (`recipient`, `id`, `payment_amount_msat`), and `id`, `ciphertext` and
-`payment_hash` are those of the newest copy. `limit` counts entries. `room`
-cannot be combined with `peer`. The roster shown is the one in the binding.
+`payment_hash` are those of the newest copy. Each entry sits at its newest
+copy's `timestamp` (newest first, ties by `id`), and `before` and `limit`
+apply to entries, never to single copies: page with `before` = the last
+entry's `timestamp`, and a message is never split or repeated across pages,
+even when a copy was resent much later. The window is always the newest
+1,000 chats (a copy older than that is not counted). `room` cannot be
+combined with `peer`. The roster shown is the one in the binding.
 Ordering is per-sender order plus timestamps; there is no history backfill.
 
 **Leaving is local:** stop sending and hide the room. Others see that you
@@ -202,7 +207,10 @@ node) is unchanged and separate from bound rooms.
   before any quote; a paid journaled one replays without re-checking; the
   receiver admits a binding only with both ends in the roster and a matching
   id; the `?room=` thread lists both directions, our copies once (also on
-  SQLite after a real fan-out); `/status` advertises `room_binding_v1`.
+  SQLite after a real fan-out), and pages by whole messages on SQLite (copies
+  at staggered times and a late resend, with received chats in between: no
+  repeat, no split, exact copy sets and sums); `/status` advertises
+  `room_binding_v1`.
 - `konsensus-node` `msg_handler::tests::room_chats_stay_hidden_until_their_binding_is_admitted`
   (real receive loop over Noise, SQLite): a valid room chat and a plain chat
   are released and reach the app; a roster without the receiver and a

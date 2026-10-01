@@ -371,6 +371,75 @@ async fn a_sent_room_message_is_in_the_thread_once_on_sqlite() {
     assert!(thread.iter().any(|m| m["sender"] == others[1].to_hex()));
 }
 
+/// Codex #155 delta 1: the thread pages by whole messages. Our message's
+/// copies are at 2000 and 3000 with a late resend (same `msg`) at 4000, and
+/// received chats sit at 1000, 2500 and 3500. Paging with `limit=1` and
+/// `before` = the last entry's timestamp yields each entry once: our message
+/// first (at 4000, all three copies, the full sum), then 3500, 2500, 1000,
+/// then nothing. No page repeats it or shows a partial copy set.
+#[tokio::test]
+async fn the_room_thread_pages_by_whole_messages() {
+    let mut f = Fixture::new().await;
+    Arc::get_mut(&mut f.state).unwrap().storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let (a, b, c) = (f.members[0], f.members[1], f.members[2]);
+    let r = room(&[f.own, a, b, c]);
+    let ours = msg();
+    let at = |sender: NodeId, recipient: NodeId, plaintext: String, ts: u64, n: u8| {
+        let state = Arc::clone(&f.state);
+        async move {
+            let mut env = UkmEnvelopeBuilder::new(0, sender, Recipient::Node(recipient), b"ct".to_vec(), PaymentProof::new([n; 32], [n; 32], 1_000)).build();
+            env.timestamp = ts;
+            state.storage.store_message(&env).await.unwrap();
+            state.storage.store_message_plaintext(&env.id, &test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap()).await.unwrap();
+        }
+    };
+    let sent = || chat_with(serde_json::to_value(&r).unwrap(), &ours, "ours");
+    at(a, f.own, room_chat(&r, "at 1000"), 1_000, 1).await;
+    at(f.own, a, sent(), 2_000, 2).await;
+    at(b, f.own, room_chat(&r, "at 2500"), 2_500, 3).await;
+    at(f.own, b, sent(), 3_000, 4).await;
+    at(c, f.own, room_chat(&r, "at 3500"), 3_500, 5).await;
+    at(f.own, c, sent(), 4_000, 6).await;
+    // Noise: another room and plain chat, interleaved.
+    at(f.own, a, room_chat(&room(&[f.own, a]), "other room"), 2_200, 7).await;
+    at(a, f.own, "plain".into(), 3_200, 8).await;
+
+    let text = |m: &Value| serde_json::from_str::<Value>(m["plaintext"].as_str().unwrap()).unwrap()["text"].as_str().unwrap().to_string();
+    let mut before: Option<u64> = None;
+    let mut pages = Vec::new();
+    loop {
+        let uri = match before {
+            Some(ts) => format!("/api/v1/messages?room={}&limit=1&before={ts}", r.id),
+            None => format!("/api/v1/messages?room={}&limit=1", r.id),
+        };
+        let (status, page) = f.call("GET", &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let page = page.as_array().unwrap().clone();
+        let Some(entry) = page.first() else { break };
+        assert_eq!(page.len(), 1);
+        before = Some(entry["timestamp"].as_u64().unwrap());
+        pages.push(entry.clone());
+        assert!(pages.len() <= 4, "repeats: {pages:?}");
+    }
+    let order: Vec<(String, u64)> = pages.iter().map(|m| (text(m), m["timestamp"].as_u64().unwrap())).collect();
+    assert_eq!(order, [("ours".into(), 4_000), ("at 3500".into(), 3_500), ("at 2500".into(), 2_500), ("at 1000".into(), 1_000)]);
+    let first = &pages[0];
+    assert_eq!((first["recipient"].as_str(), first["room_msg"].as_str(), first["payment_amount_msat"].as_u64()), (Some(r.id.as_str()), Some(ours.as_str()), Some(3_000)), "{first}");
+    let mut members = vec![a.to_hex(), b.to_hex(), c.to_hex()];
+    members.sort();
+    let copies: Vec<&str> = first["copies"].as_array().unwrap().iter().map(|c| c["recipient"].as_str().unwrap()).collect();
+    assert_eq!(copies, members, "{first}");
+    assert!(pages[1..].iter().all(|m| m["room_msg"] != ours && m.get("copies").is_none()), "{pages:?}");
+
+    // One page of everything: the same four entries, in the same order.
+    let (_, all) = f.call("GET", &format!("/api/v1/messages?room={}", r.id), None).await;
+    let all: Vec<(String, u64)> = all.as_array().unwrap().iter().map(|m| (text(m), m["timestamp"].as_u64().unwrap())).collect();
+    assert_eq!(all, order);
+    // A cursor between two copies never yields the older copies on their own.
+    let (_, mid) = f.call("GET", &format!("/api/v1/messages?room={}&before=3001", r.id), None).await;
+    assert!(mid.as_array().unwrap().iter().all(|m| m["sender"] != f.own.to_hex()), "{mid}");
+}
+
 /// Codex #155 probe `room_one_member_without_session_must_not_pay_first_contact`:
 /// a 1:1 room chat to a connected member that advertises the binding but has
 /// no E2EE session is refused before any quote; the real (shared mock)
