@@ -79,6 +79,15 @@ empty category is `0`. Providers without breakdown support (currently LND,
 LNbits, and mock) omit all six new fields. Backend failures remain errors;
 the recovery wrapper still returns `not_ready` until its backend is ready.
 
+The live embedded API stack is `GuardedLightning -> RecoveringLightning ->
+LdkProvider`. Both wrappers forward the breakdown read, including when the disk
+guard refuses new money-moving work. `CircuitBreakerLightning` also forwards
+the read; the node uses that wrapper separately for inbound settlement
+verification. The node regression tests in
+`crates/konsensus-node/src/tests/balance_breakdown.rs` exercise the authenticated
+API through the live API stack and through all three wrappers, including low
+disk conditions.
+
 These fields are **not an additive partition of wallet wealth**. Pending sweep
 amounts are before sweep fees and, depending on wallet sync, may already be in
 the on-chain total. LDK retains confirmed sweeps for reorg safety even when
@@ -88,6 +97,15 @@ to `onchain_total_sats` or subtract it from `onchain_spendable_sats`. Normal ope
 channel reserves are also not a separate category here. Balances and channels
 are separate local snapshots and can change during a read; clients should use
 the freshness headers and refresh after channel transitions.
+
+In particular, `lightning_spendable_sats + closing_sats + contested_sats +
+onchain_spendable_sats` need not equal `balance_msat / 1000`. Usable outbound
+capacity differs from LDK's claimable balance; claims in listed but unusable
+channels are not spendable or closing. The contested category includes
+conditional HTLC claims that LDK excludes from its legacy aggregate, and the
+closing category includes pending sweeps that are absent from the aggregate's
+Lightning component. These categories cannot reconcile the legacy total or
+establish a separate total wealth figure.
 
 Doctrine: lines 1, 3, 5, and 6 hold: the existing authenticated control-plane
 read leaves paid peer admission intact, preserves key-based authorization and
