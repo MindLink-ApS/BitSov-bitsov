@@ -30,6 +30,9 @@ use tracing::{debug, warn};
 /// This incentivizes reliable behavior: successful deliveries increase weight, earning discounts.
 pub const MAX_TRUST_DISCOUNT: f64 = 0.5;
 
+/// Non-discountable recipient gate metadata carried alongside category prices.
+pub const ADMISSION_FLOOR_KEY: &str = "min_admission_cost_msat";
+
 /// A cached price table from a peer.
 #[derive(Debug, Clone)]
 pub struct PeerPriceEntry {
@@ -68,11 +71,21 @@ impl PeerPriceEntry {
     /// Look up the discounted price for a specific message kind.
     ///
     /// Applies the peer's trust discount to the base price:
-    /// `discounted = base * (1 - trust_discount)`.
+    /// `discounted = base * (1 - trust_discount)`, then the gate's porch-read floor.
     /// Returns `None` if the kind's category isn't in the peer's table.
     pub fn get_discounted_price_for_kind(&self, kind: u16) -> Option<u64> {
-        self.get_price_for_kind(kind)
-            .map(|base| apply_trust_discount(base, self.trust_discount))
+        self.get_price_for_kind(kind).map(|base| {
+            let discounted = apply_trust_discount(base, self.trust_discount);
+            if konsensus_core::gate::porch_read_floor_msat(kind) > 0 {
+                konsensus_core::gate::price_with_floor_msat(
+                    kind,
+                    discounted,
+                    self.prices.get(ADMISSION_FLOOR_KEY).copied().unwrap_or(0),
+                )
+            } else {
+                discounted
+            }
+        })
     }
 
     /// Check whether this price table is stale relative to a given block height.

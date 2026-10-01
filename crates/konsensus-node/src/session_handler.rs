@@ -46,6 +46,7 @@ pub(crate) struct SessionHandlerDeps {
     pub our_node_id: NodeId,
     pub identity: Arc<NodeIdentity>,
     pub audit_log: Arc<AuditLog>,
+    pub min_admission_cost_msat: u64,
     pub pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     pub chain: Arc<dyn ChainProvider>,
     pub peer_prices: Arc<PeerPriceCache>,
@@ -143,6 +144,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         identity,
         audit_log,
         pricing,
+        min_admission_cost_msat,
         chain,
         peer_prices,
         peer_registry,
@@ -224,6 +226,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             &ws_delivery_tx,
                             our_node_id,
                             mock_lightning,
+                            min_admission_cost_msat,
                         ).await;
                     }
 
@@ -288,7 +291,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         if !privileged {
                             continue;
                         }
-                        handle_price_query(&peer_id, kind, &pricing, &chain, &transport, storage.as_ref()).await;
+                        handle_price_query(&peer_id, kind, &pricing, &chain, &transport, storage.as_ref(), min_admission_cost_msat).await;
                     }
 
                     ControlEvent::PriceResponseReceived { peer_id, kind, price_msat, block_height, privileged } => {
@@ -570,6 +573,7 @@ async fn handle_peer_connected(
     ws_delivery_tx: &broadcast::Sender<Arc<WsDeliveryStatus>>,
     our_node_id: NodeId,
     mock_lightning: bool,
+    min_admission_cost_msat: u64,
 ) {
     info!(peer = %peer_id, "peer connected, sending prekey offer + price table");
 
@@ -616,7 +620,7 @@ async fn handle_peer_connected(
         valid_blocks: meta.valid_blocks,
         trust_discount: peer_discount,
     };
-    if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage.as_ref(), peer_id, &price_frame, pricing.as_ref()).await {
+    if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage.as_ref(), peer_id, &price_frame, pricing.as_ref(), min_admission_cost_msat).await {
         warn!(peer = %peer_id, error = %e, "failed to send price table");
     }
 
@@ -1095,6 +1099,7 @@ async fn handle_price_query(
     chain: &Arc<dyn ChainProvider>,
     transport: &Arc<NoiseTransport>,
     storage: &dyn konsensus_storage::Storage,
+    min_admission_cost_msat: u64,
 ) {
     match pricing.get_price_msat(kind).await {
         Ok(price_msat) => {
@@ -1106,7 +1111,7 @@ async fn handle_price_query(
                 }
             };
             let frame = Frame::PriceResponse { kind, price_msat, block_height };
-            if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage, peer_id, &frame, pricing.as_ref()).await {
+            if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage, peer_id, &frame, pricing.as_ref(), min_admission_cost_msat).await {
                 warn!(peer = %peer_id, error = %e, "failed to send price response");
             }
         }

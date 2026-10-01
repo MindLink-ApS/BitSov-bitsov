@@ -1305,7 +1305,7 @@ async fn price_query_responds_with_price() {
     );
 
     // Should not panic — sends PriceResponse (fails silently since no peer connected)
-    handle_price_query(&peer_id, 100, &pricing, &chain, &transport, &konsensus_storage::SqliteStorage::in_memory().await.unwrap()).await;
+    handle_price_query(&peer_id, 100, &pricing, &chain, &transport, &konsensus_storage::SqliteStorage::in_memory().await.unwrap(), 0).await;
     // No panic = success
 }
 
@@ -1342,7 +1342,7 @@ async fn price_query_skips_response_when_chain_unavailable() {
     let chain: Arc<dyn ChainProvider> = Arc::new(FailingChain);
 
     // Should not panic — skips response due to chain failure
-    handle_price_query(&peer_id, 100, &pricing, &chain, &transport, &konsensus_storage::SqliteStorage::in_memory().await.unwrap()).await;
+    handle_price_query(&peer_id, 100, &pricing, &chain, &transport, &konsensus_storage::SqliteStorage::in_memory().await.unwrap(), 0).await;
     // No panic = success (handler returns early with warning)
 }
 
@@ -1462,6 +1462,7 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
     let (pending, _pending_rx) = mpsc::channel(8);
     let (auto, _auto_rx) = mpsc::channel(8);
     let worker = tokio::spawn(run(SessionHandlerDeps {
+        min_admission_cost_msat: 0,
         privacy: Default::default(),
         peer_exchange_floor: 0,
         transport: target.clone(),
