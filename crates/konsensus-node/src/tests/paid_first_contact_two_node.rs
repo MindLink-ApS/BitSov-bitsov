@@ -538,6 +538,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
     let (auto_channel_tx, auto_rx) = mpsc::channel(64);
     std::mem::forget((pending_rx, auto_rx));
     tokio::spawn(run_session_handler(SessionHandlerDeps {
+        min_admission_cost_msat: 0,
         privacy: Default::default(),
         peer_exchange_floor: 0,
         transport: Arc::clone(&transport),
