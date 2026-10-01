@@ -8,8 +8,9 @@ deliberately differs.
 **Raised by:** bitsov-app F4 broker staleness (app PR #36). App side:
 `src-tauri/src/jarvis/broker/freshness.rs`, `docs/ASSISTANT_LOCAL_BROKER.md`
 § Freshness.
-**App pin at time of writing:** `v0.3.0-rc7` (`958e399`). No tag or pin bump
-is part of this spec's PR.
+**App pin at time of writing:** `v0.3.0-rc7` (`958e399`). The behaviour described
+here landed on `main` in #78 and ships in the prepared `v0.3.0-rc8` cut; no tag
+or app re-pin is performed by this spec's original PR.
 
 ## Problem
 
