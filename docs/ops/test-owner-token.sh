@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Safety: tests must never use 3141; it may belong to the owner's live pilot.
 # Regression tests for docs/ops/owner-token.sh (sourced usage).
 #
 # Covers:
@@ -15,6 +16,24 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/owner-token.sh"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
+# Ask the OS for unused loopback ports, then close the sockets before probing.
+TEST_PORTS="$(python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET) as ipv4, socket.socket(socket.AF_INET6) as ipv6:
+    ipv4.bind(("127.0.0.1", 0))
+    ipv6.bind(("::1", 0))
+    print(ipv4.getsockname()[1], ipv6.getsockname()[1])
+PY
+)"
+read -r PORT_V4 PORT_V6 <<<"$TEST_PORTS"
+if [[ ! "$PORT_V4" =~ ^[0-9]+$ || ! "$PORT_V6" =~ ^[0-9]+$ \
+      || "$PORT_V4" == 3141 || "$PORT_V6" == 3141 ]]; then
+  echo "owner-token tests: invalid test ports" >&2
+  exit 1
+fi
+TEST_API_BASE="http://127.0.0.1:$PORT_V4"
+
 PASS=0
 FAIL=0
 
@@ -23,8 +42,9 @@ bad() { FAIL=$((FAIL + 1)); echo "not ok - $*" >&2; }
 
 # --- 1) Error path: missing env must not leave set -e/-u and must not kill ---
 probe="$(
-  bash --norc -c '
+  BITSOV_API_BASE="$TEST_API_BASE" bash --norc -c '
     set +eu
+    unset KONSENSUS_CONFIG KONSENSUS_MNEMONIC
     before=$-
     # shellcheck disable=SC1090
     source "'"$SCRIPT"'"
@@ -62,6 +82,8 @@ url_probe() {
     BITSOV_API_BASE="$base" KONSENSUS_MNEMONIC=/dev/null \
       bash --norc -c '
         set +eu
+        # Keep URL validation real, but never connect even if a port is reused.
+        curl() { return 7; }
         # shellcheck disable=SC1090
         source "'"$SCRIPT"'"
         echo rc=$?
@@ -83,18 +105,18 @@ url_probe() {
   fi
 }
 
-url_probe 'http://127.0.0.1:3141@evil.example/' reject
-url_probe 'http://127.0.0.1:3141@evil.example' reject
-url_probe 'http://localhost:3141' reject
-url_probe 'http://evil.example:3141' reject
-url_probe 'http://127.0.0.1:3141/extra' reject
-url_probe 'http://127.0.0.1:3141?x=1' reject
-url_probe 'http://127.0.0.1:3141' accept
-url_probe 'http://127.0.0.1:3141/' accept
-url_probe 'http://127.0.0.1:3141/api/v1' accept
-url_probe 'http://127.0.0.1:3141/api/v1/' accept
-url_probe 'http://[::1]:3141' accept
-url_probe 'http://[::1]:3141/api/v1' accept
+url_probe "$TEST_API_BASE@evil.example/" reject
+url_probe "$TEST_API_BASE@evil.example" reject
+url_probe "http://localhost:$PORT_V4" reject
+url_probe "http://evil.example:$PORT_V4" reject
+url_probe "$TEST_API_BASE/extra" reject
+url_probe "$TEST_API_BASE?x=1" reject
+url_probe "$TEST_API_BASE" accept
+url_probe "$TEST_API_BASE/" accept
+url_probe "$TEST_API_BASE/api/v1" accept
+url_probe "$TEST_API_BASE/api/v1/" accept
+url_probe "http://[::1]:$PORT_V6" accept
+url_probe "http://[::1]:$PORT_V6/api/v1" accept
 
 # --- 3) Success path: options unchanged, token not exported ---
 WORK="$(mktemp -d /tmp/owner-token-test.XXXX)"
@@ -126,7 +148,7 @@ chmod +x "$WORK/curl" "$WORK/konsensus"
 
 success="$(
   PATH="$WORK:$PATH" \
-  BITSOV_API_BASE='http://127.0.0.1:3141' \
+  BITSOV_API_BASE="$TEST_API_BASE" \
   KONSENSUS_MNEMONIC="$WORK/unused-mnemonic.txt" \
   KONSENSUS_BIN="$WORK/konsensus" \
   bash --norc -c '
@@ -168,7 +190,7 @@ fi
 # --- 4) xtrace restore: with set -x, token must not appear in traces ---
 xtrace_out="$(
   PATH="$WORK:$PATH" \
-  BITSOV_API_BASE='http://127.0.0.1:3141' \
+  BITSOV_API_BASE="$TEST_API_BASE" \
   KONSENSUS_MNEMONIC="$WORK/unused-mnemonic.txt" \
   KONSENSUS_BIN="$WORK/konsensus" \
   bash --norc -c '
