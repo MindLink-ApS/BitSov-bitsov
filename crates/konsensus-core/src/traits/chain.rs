@@ -74,12 +74,25 @@ pub struct FeeEstimate {
     pub sat_per_vbyte: f64,
 }
 
+/// Owner-visible chain source and its validation model. No URLs or credentials.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainView {
+    pub backend: &'static str,
+    pub trust_level: &'static str,
+    pub host: Option<String>,
+}
+
 /// Abstraction over Bitcoin chain data sources.
 ///
 /// Provides block data, fee estimates, and transaction verification.
 /// Implementations vary by sovereignty tier.
 #[async_trait]
 pub trait ChainProvider: Send + Sync {
+    /// Honest default for test/external providers that do not identify themselves.
+    fn chain_view(&self) -> ChainView {
+        ChainView { backend: "unknown", trust_level: "unknown", host: None }
+    }
+
     /// The trust level of this chain data source.
     fn trust_level(&self) -> TrustLevel;
 

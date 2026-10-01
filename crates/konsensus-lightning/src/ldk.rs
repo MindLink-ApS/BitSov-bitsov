@@ -47,6 +47,8 @@ use konsensus_core::traits::lightning::{
 /// Configuration for the embedded LDK Lightning provider.
 #[derive(Debug, Clone)]
 pub struct LdkConfig {
+    /// Own Bitcoin Core overrides Esplora, including probes and fallback.
+    pub bitcoind: Option<konsensus_chain::BitcoindConfig>,
     /// Explicit LSPS2 provider registry (off by default).
     pub liquidity: LiquidityConfig,
     /// Path to store LDK state (channel monitors, network graph, scorer, etc.).
@@ -267,6 +269,7 @@ pub struct LdkProvider {
     /// post-broadcast verification (L0f). Same endpoint LDK itself
     /// uses for chain sync, so verification reflects what LDK saw.
     esplora_url: String,
+    bitcoind: Option<konsensus_chain::BitcoindProvider>,
     /// L0g (2026-04-30): set to `true` to signal the dedicated event
     /// drainer task to exit. Set during graceful shutdown BEFORE
     /// `node.stop()` so the drainer doesn't try to call into a stopped
@@ -408,10 +411,14 @@ impl LdkProvider {
         let ldk_seed = Zeroizing::new(derive_ldk_entropy(&*bip39_seed));
 
         let network = parse_network(&config.network)?;
-        validate_startup_url("esplora_url", &config.esplora_url)?;
-        if let Some(url) = &config.esplora_url_fallback {
-            validate_startup_url("esplora_url_fallback", url)?;
+        if config.bitcoind.is_none() {
+            validate_startup_url("esplora_url", &config.esplora_url)?;
+            if let Some(url) = &config.esplora_url_fallback {
+                validate_startup_url("esplora_url_fallback", url)?;
+            }
         }
+        let bitcoind = config.bitcoind.clone().map(konsensus_chain::BitcoindProvider::new)
+            .transpose().map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
         if let Some(url) = &config.rgs_url {
             validate_startup_url("rgs_url", url)?;
         }
@@ -487,18 +494,22 @@ impl LdkProvider {
         // Validate all local settings before the first network request. The budget
         // includes preflight; only the two Esplora fee-barrier errors are retried.
         let started = Instant::now();
-        let chosen_esplora_url =
-            select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref())
-                .await;
-        let (node, chosen_esplora_url, baseline) =
-            start_esplora_with_retry(builder, &config, chosen_esplora_url, started).await?;
-
-        info!(
-            network = %config.network,
-            esplora = %chosen_esplora_url,
-            lsp = config.lsp_node_id.as_deref().unwrap_or("none"),
-            "LDK embedded Lightning node started"
-        );
+        let (node, chosen_esplora_url, baseline) = if let Some(rpc) = &config.bitcoind {
+            let (user, password) = rpc.credentials()
+                .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
+            builder.set_chain_source_bitcoind_rpc(
+                rpc.rpc_host.clone(), rpc.rpc_port, user.to_string(), password.to_string(),
+            );
+            let node = builder.build().map_err(startup_build_error)?;
+            let baseline = node.status();
+            node.start().map_err(|_| LightningError::ChainSourceUnavailable { network: config.network.clone(), service: "bitcoind".into(), attempts: 1, elapsed_ms: started.elapsed().as_millis() as u64, cause: "Bitcoin Core RPC startup failed".into() })?;
+            tokio::task::yield_now().await;
+            (node, String::new(), baseline)
+        } else {
+            let chosen = select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref()).await;
+            start_esplora_with_retry(builder, &config, chosen, started).await?
+        };
+        info!(network = %config.network, chain_backend = if bitcoind.is_some() { "bitcoind" } else { "esplora" }, "LDK embedded Lightning node started");
 
         let node = Arc::new(node);
         let drainer_shutdown = Arc::new(AtomicBool::new(false));
@@ -544,6 +555,7 @@ impl LdkProvider {
             node,
             payment_capable: AtomicBool::new(true),
             esplora_url: chosen_esplora_url,
+            bitcoind,
             drainer_shutdown,
             inbound_tx,
             outgoing_tx,
@@ -574,6 +586,7 @@ impl LdkProvider {
             // BroadcastUnconfirmed (which is acceptable for tests). Real
             // callers go through `new()` and get a populated URL.
             esplora_url: String::new(),
+            bitcoind: None,
             // Pre-set to `true` so any consumer wrapping a from_node-constructed
             // provider sees the drainer as already-shutdown.
             drainer_shutdown: Arc::new(AtomicBool::new(true)),
@@ -1398,22 +1411,23 @@ impl LightningProvider for LdkProvider {
             .map_err(|e| LightningError::Backend(format!("send_onchain failed: {e}")))?;
         tracing::info!(txid = %txid, amount_sats, address, "on-chain send initiated");
 
-        // L0f (2026-04-30): verify the broadcast actually propagated to
-        // the network. LDK has been observed to return a txid from
-        // send_to_address WITHOUT the tx ever hitting the mempool. Query the
-        // Esplora endpoint configured on this provider for the txid; if
-        // it isn't visible within 10 seconds, surface
-        // `LightningError::BroadcastUnconfirmed { txid }` so the API
-        // layer can translate to HTTP 202 (caller polls until confirmed
-        // or replaces the tx). This is BEST-EFFORT verification — a
-        // transient Esplora outage will produce a false BroadcastUnconfirmed,
-        // but the txid is preserved in the error so the caller can
-        // double-check on mempool.space directly.
+        // Verify asynchronous broadcast against the selected chain backend.
+        // A timeout preserves the txid in BroadcastUnconfirmed; never consult
+        // Esplora when the operator selected Bitcoin Core.
         let txid_str = txid.to_string();
         let verify_deadline = std::time::Duration::from_secs(10);
         match tokio::time::timeout(
             verify_deadline,
-            esplora_tx_visible(&self.esplora_url, &txid_str),
+            async {
+                if let Some(rpc) = &self.bitcoind {
+                    loop {
+                        if rpc.tx_visible(&txid_str).await.map_err(|e| e.to_string())? { return Ok(true); }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                } else {
+                    esplora_tx_visible(&self.esplora_url, &txid_str).await
+                }
+            },
         )
         .await
         {

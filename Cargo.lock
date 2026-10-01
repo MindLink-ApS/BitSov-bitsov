@@ -1999,9 +1999,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -2105,6 +2107,7 @@ dependencies = [
  "electrsd",
  "futures",
  "hex",
+ "konsensus-chain",
  "konsensus-core",
  "konsensus-crypto",
  "konsensus-storage",

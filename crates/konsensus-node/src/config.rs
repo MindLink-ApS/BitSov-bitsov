@@ -525,7 +525,10 @@ pub enum ChainConfig {
     /// For testnet, development, and offline operation.
     #[serde(rename = "mock")]
     Mock,
-    // Future: electrum, bitcoind variants
+    /// Own pruned or full Bitcoin Core; also selects LDK's chain source.
+    #[serde(rename = "bitcoind")]
+    Bitcoind(konsensus_chain::BitcoindConfig),
+    // Future: electrum variant
 }
 
 impl ChainConfig {
@@ -533,6 +536,7 @@ impl ChainConfig {
     pub fn backend_name(&self) -> &'static str {
         match self {
             Self::Esplora { .. } => "esplora",
+            Self::Bitcoind(_) => "bitcoind",
             Self::Mock => "mock",
         }
     }
@@ -1042,7 +1046,10 @@ impl NodeConfig {
     /// Bootstrap must inspect configured paths before requiring an identity.
     pub(crate) fn load_before_identity_validation(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let mut config: Self = toml::from_str(&content)?;
+        // TOML errors include the source line, which may contain a rejected
+        // inline password. Never attach the raw parser error to startup logs.
+        let mut config: Self = toml::from_str(&content)
+            .map_err(|_| anyhow::anyhow!("invalid node configuration; check field names, types and file-based credentials"))?;
         config.anchor_relative_backup_dir(path);
         Ok(config)
     }
