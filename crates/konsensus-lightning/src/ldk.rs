@@ -374,7 +374,15 @@ impl LdkProvider {
     /// deterministically derived from the same mnemonic as the BitSov
     /// identity, but on a separate derivation domain — recovering the
     /// mnemonic recovers both the node identity and the Lightning wallet.
-    pub async fn new(mut config: LdkConfig) -> Result<Self, LightningError> {
+    pub async fn new(config: LdkConfig) -> Result<Self, LightningError> {
+        Self::new_with_work_admission(config, None).await
+    }
+
+    /// Node-local disk policy, checked before inbound settlement and channel acceptance.
+    pub async fn new_with_work_admission(
+        mut config: LdkConfig,
+        admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Result<Self, LightningError> {
         // Move the plaintext seed phrase out of `config` into a `Zeroizing`
         // wrapper so the inbound `String` copy is scrubbed from memory when
         // this function returns (HARD-9), regardless of which branch we take.
@@ -422,7 +430,10 @@ impl LdkProvider {
             LDK_KDF_CONTEXT,
         );
 
-        let mut builder = LdkBuilder::new();
+        let mut builder = LdkBuilder::from_config(ldk_node::config::Config {
+            work_admission: admission.map(ldk_node::config::WorkAdmissionCheck::new),
+            ..Default::default()
+        });
         builder.set_network(network);
         builder.set_entropy_seed_bytes(*ldk_seed);
         builder.set_storage_dir_path(

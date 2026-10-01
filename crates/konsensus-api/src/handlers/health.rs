@@ -22,6 +22,9 @@ use crate::state::AppState;
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
+    pub disk_low: bool,
+    pub disk_free_bytes: Option<u64>,
+    pub disk_free_floor_bytes: Option<u64>,
     pub money_ready: bool,
     pub readiness: konsensus_core::traits::lightning::LightningReadiness,
     pub api_capabilities: Vec<&'static str>,
@@ -229,7 +232,11 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
     } else { None };
 
     let peer = state.introduction.endpoint_view();
+    let disk = state.lightning.disk_status();
     Json(HealthResponse {
+        disk_low: disk.is_some_and(|s| s.disk_low),
+        disk_free_bytes: disk.and_then(|s| s.disk_free_bytes),
+        disk_free_floor_bytes: disk.map(|s| s.disk_free_floor_bytes),
         money_ready: readiness.money_ready,
         readiness,
         api_capabilities: vec![

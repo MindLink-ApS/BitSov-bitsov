@@ -21,6 +21,9 @@ backend = "esplora"
 backend = "sqlite"
 "#;
     let config: NodeConfig = toml::from_str(toml).unwrap();
+    assert_eq!(config.disk_free_floor_bytes, 2147483648);
+    let override_config: NodeConfig = toml::from_str(&format!("disk_free_floor_bytes = 4096\n{toml}")).unwrap();
+    assert_eq!(override_config.disk_free_floor_bytes, 4096);
     assert_eq!(
         config.identity.mnemonic_file,
         PathBuf::from("/var/konsensus/mnemonic.txt")

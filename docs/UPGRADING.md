@@ -52,3 +52,62 @@ version embedded in the binary. The error names the directory and the missing ve
 
 After fixing the migrations source, restart the node. The node applies any pending schema
 migrations itself on first open before serving traffic.
+
+## Disk admission floor
+
+The top-level `konsensus.toml` setting `disk_free_floor_bytes` defaults to
+**2147483648 bytes (2 GiB)**. Put it before any `[section]` header:
+
+```toml
+disk_free_floor_bytes = 2147483648
+```
+
+The node probes available space (excluding filesystem blocks reserved for root)
+on the directory containing its configured mnemonic and `ldk/` state at startup,
+every five seconds while running, and before new invoice/payment/channel dispatch.
+Below the floor, or if probing fails, new work is refused with `disk_low`; the
+owner-only `/api/v1/status` reports `disk_low`, `disk_free_bytes` (null on probe
+failure), and `disk_free_floor_bytes`. HTTP refusals use 503 and code `disk_low`.
+The refusal occurs before dispatch: no payment is sent or invoice issued by that
+refused operation. Work already paid for, status and other reads, channel closes,
+settlement reconciliation, recovery and shutdown remain available. Admission
+resumes automatically when space is at least the floor. A value of zero disables
+the reserve, but probe failures still refuse new work.
+
+This is a reserve, not a guarantee against filesystem exhaustion: other processes
+and already admitted work can consume it. It checks the local state filesystem;
+separately mounted SQLite/backup paths and external LND storage require their own
+operator monitoring. Embedded LDK also checks the same floor before claiming incoming HTLCs or
+accepting new inbound channels, including invoices issued before space dropped.
+A refused HTLC is failed without revealing the preimage. Already claimed payments
+continue through persistence/recovery. It does not make a remote Lightning server
+stop accepting payments or channels; its own storage/admission policy remains
+that server's responsibility.
+
+## State generation and rollback safety
+
+Before opening SQLite or constructing LDK, startup durably writes
+`STATE_GENERATION` beside the configured mnemonic (the same parent as `ldk/`).
+The marker uses format `bitsov-state-v1:<generation>`; this release introduces
+binary/state compatibility generation **1**. Future incompatible migrations or
+LDK persistence changes must increment `STATE_GENERATION` in the binary before
+state is opened. Publication uses a temporary file, file fsync, atomic rename,
+and directory fsync. A process lease (`STATE_GENERATION.lock`) prevents concurrent
+nodes from changing generation while another node owns this state.
+
+An older guard-aware binary refuses a higher generation with
+`state_generation_newer`; malformed or unreadable markers also refuse startup.
+Keep the newer binary with its current data directory. Do not delete or lower
+the marker to force a downgrade. Existing installations without a marker adopt
+the current generation on first guarded startup. Binaries released before this
+guard cannot enforce it.
+
+**Never roll back a live data directory after the first LDK start.** Restoring a
+pre-upgrade directory, VM snapshot, or old channel-state backup can broadcast a
+revoked commitment and get a channel punished, losing funds. This applies even
+when the binary's generation has not changed. The marker detects an older binary
+opening newer retained state; it cannot detect restoring the whole directory
+(including the marker) to an older snapshot, or establish channel-state freshness.
+It is not permission to restore stale LDK state. Preserve the latest state and
+follow [the recovery guidance](v2/RECOVERY.md); recovery commands themselves are
+not gated by the disk admission floor.
