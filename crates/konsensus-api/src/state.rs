@@ -261,6 +261,10 @@ pub struct AppState {
     /// UDP port of this node's STUN binding responder (`[calls] stun_listen`),
     /// reported to the owner in `/status`. `None`: not running (default).
     pub stun_port: Option<u16>,
+
+    /// Where the seed lives, reported to the owner in `/status`
+    /// (`docs/protocol/REMOTE-SIGNER.md` §2).
+    pub custody_mode: crate::custody::CustodyMode,
 }
 
 /// Authenticated terminal result of an invoice request.
