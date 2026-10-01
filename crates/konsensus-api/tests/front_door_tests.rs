@@ -650,3 +650,37 @@ async fn verify_fails_closed_without_network() {
     );
     assert!(body.to_string().contains("Bitcoin network"), "{body}");
 }
+
+#[tokio::test]
+async fn porch_card_page_price_has_one_sat_floor() {
+    let state = state_with(settings(Some("node.example.org:9000")));
+    for (requested, expected) in [
+        (None, 1000),
+        (Some(0), 1000),
+        (Some(1), 1000),
+        (Some(999), 1000),
+        (Some(1000), 1000),
+        (Some(3000), 3000),
+    ] {
+        let mut request =
+            json!({"display_name": "Porch", "admission_msat": 1234, "message_msat": 5678});
+        if let Some(price) = requested {
+            request["page_msat"] = json!(price);
+        }
+        let (status, body, _) = call(
+            &state,
+            "PUT",
+            "/api/v1/front-door",
+            bearer(&state, vec![auth::Scope::Admin]),
+            Some(request),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["card"]["prices"]["page_msat"], expected);
+        assert_eq!(body["card"]["prices"]["admission_msat"], 1234);
+        assert_eq!(body["card"]["prices"]["message_msat"], 5678);
+        let card = FrontDoorCard::parse(body["link"].as_str().unwrap()).unwrap();
+        card.verify_signature().unwrap();
+        assert_eq!(card.prices.page_msat, expected);
+    }
+}

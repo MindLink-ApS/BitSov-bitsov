@@ -29,6 +29,15 @@ use crate::types::{MessageId, NodeId, Nonce, Recipient};
 /// Maximum lifetime of a recipient-issued delivery price offer.
 pub const DELIVERY_PRICE_WINDOW_SECS: u64 = 3600;
 
+/// Non-discountable porch-read minimum, shared by the gate and price adverts.
+/// Other kinds retain their existing pricing (no additional floor).
+pub fn porch_read_floor_msat(kind: u16) -> u64 {
+    match kind {
+        crate::kind::KIND_PAGE_REQUEST | crate::kind::KIND_PAGE_RESPONSE => 1_000,
+        _ => 0,
+    }
+}
+
 /// Why the gate rejected a message.
 ///
 /// Every variant is a hard rejection — the message MUST NOT be accepted.
@@ -640,11 +649,7 @@ impl PaymentGate {
 
     /// Absolute floors apply to both current prices and earlier delivery quotes.
     fn price_floor_msat(&self, kind: u16) -> u64 {
-        let porch_floor = match kind {
-            crate::kind::KIND_PAGE_REQUEST | crate::kind::KIND_PAGE_RESPONSE => 1_000,
-            _ => 0,
-        };
-        self.config.min_admission_cost_msat.max(porch_floor)
+        self.config.min_admission_cost_msat.max(porch_read_floor_msat(kind))
     }
 
     /// Verify the payment amount meets the required price.

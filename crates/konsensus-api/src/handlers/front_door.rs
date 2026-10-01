@@ -419,7 +419,9 @@ async fn put_front_door(
             prices: FrontDoorPrices {
                 admission_msat: req.admission_msat.unwrap_or(default_admission),
                 message_msat: req.message_msat.unwrap_or(default_message),
-                page_msat: req.page_msat.unwrap_or(1_000),
+                page_msat: req.page_msat.unwrap_or(1_000).max(
+                    konsensus_core::gate::porch_read_floor_msat(konsensus_core::kind::KIND_PAGE_REQUEST),
+                ),
                 price_epoch: height / 2016,
             },
             profile: FrontDoorProfile {

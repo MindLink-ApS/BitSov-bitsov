@@ -1437,13 +1437,36 @@ async fn category_offer_kind_transition(old_longform: u64, new_chat: u64, new_lo
 #[tokio::test]
 async fn discounted_kind_offer_survives_price_rise() {
     for (raw_price, discount, expected) in [(2000, 0.5, 1000), (2001, 0.25, 1501)] {
-        discounted_kind_offer_case(raw_price, discount, expected).await;
+        discounted_kind_offer_case(
+            konsensus_core::kind::KIND_LONGFORM,
+            raw_price,
+            discount,
+            expected,
+            true,
+        )
+        .await;
     }
 }
 
-async fn discounted_kind_offer_case(raw_price: u64, discount: f64, expected: u64) {
+#[tokio::test]
+async fn porch_adverts_match_durable_offer_and_gate() {
+    for kind in [500, 501, 502, 510, 599] {
+        for send_response in [false, true] {
+            for (base, expected) in [(1000, if kind <= 501 { 1000 } else { 500 }), (3000, 1500)] {
+                discounted_kind_offer_case(kind, base, 0.5, expected, send_response).await;
+            }
+        }
+    }
+}
+
+async fn discounted_kind_offer_case(
+    kind: u16,
+    raw_price: u64,
+    discount: f64,
+    expected: u64,
+    send_response: bool,
+) {
     use konsensus_core::gate::GateConfig;
-    use konsensus_core::kind::KIND_LONGFORM;
     use konsensus_core::traits::pricing::PricingEngine;
     use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
 
@@ -1490,6 +1513,7 @@ async fn discounted_kind_offer_case(raw_price: u64, discount: f64, expected: u64
     let old = konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
         chat_msat: 1000,
         longform_msat: raw_price,
+        web_content_msat: raw_price,
         ..Default::default()
     });
     let prices = konsensus_pricing::peer_prices::build_price_table(&old).await;
@@ -1529,43 +1553,45 @@ async fn discounted_kind_offer_case(raw_price: u64, discount: f64, expected: u64
         }
         event => panic!("unexpected event: {event:?}"),
     }
-    let raw_kind_price = old.get_price_msat(KIND_LONGFORM).await.unwrap();
-    crate::delivery_prices::send_price_frame(
-        &target,
-        db.as_ref(),
-        alice.node_id(),
-        &Frame::PriceResponse {
-            kind: KIND_LONGFORM,
-            price_msat: raw_kind_price,
-            block_height: 1,
-        },
-        &old,
-    )
-    .await
-    .unwrap();
-    match source.recv_control().await.unwrap() {
-        ControlEvent::PriceResponseReceived {
-            peer_id,
-            kind,
-            price_msat,
-            block_height,
-            privileged,
-        } => {
-            assert!(
+    if send_response {
+        let raw_kind_price = old.get_price_msat(kind).await.unwrap();
+        crate::delivery_prices::send_price_frame(
+            &target,
+            db.as_ref(),
+            alice.node_id(),
+            &Frame::PriceResponse {
+                kind,
+                price_msat: raw_kind_price,
+                block_height: 1,
+            },
+            &old,
+        )
+        .await
+        .unwrap();
+        match source.recv_control().await.unwrap() {
+            ControlEvent::PriceResponseReceived {
+                peer_id,
+                kind,
+                price_msat,
+                block_height,
                 privileged,
-                "production session handler must accept this price response"
-            );
-            assert_eq!(price_msat, raw_price, "wire price stays undiscounted");
-            cache
-                .update_kind_price(peer_id, kind, price_msat, block_height)
-                .await;
+            } => {
+                assert!(
+                    privileged,
+                    "production session handler must accept this price response"
+                );
+                assert_eq!(price_msat, raw_price, "wire price stays undiscounted");
+                cache
+                    .update_kind_price(peer_id, kind, price_msat, block_height)
+                    .await;
+            }
+            event => panic!("unexpected event: {event:?}"),
         }
-        event => panic!("unexpected event: {event:?}"),
     }
     let offered = cache
         .get_fresh_discounted_peer_price(
             bob.node_id(),
-            KIND_LONGFORM,
+            kind,
             1,
             std::time::Duration::from_secs(3600),
         )
@@ -1588,7 +1614,7 @@ async fn discounted_kind_offer_case(raw_price: u64, discount: f64, expected: u64
         offered,
     );
     let mut env = UkmEnvelopeBuilder::new(
-        KIND_LONGFORM,
+        kind,
         *alice.node_id(),
         Recipient::Node(*bob.node_id()),
         vec![1],
@@ -1630,6 +1656,7 @@ async fn discounted_kind_offer_case(raw_price: u64, discount: f64, expected: u64
     let new = konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
         chat_msat: 1000,
         longform_msat: 4000,
+        web_content_msat: 4000,
         ..Default::default()
     });
     let recorded = db

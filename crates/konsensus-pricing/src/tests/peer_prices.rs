@@ -510,3 +510,57 @@ fn compute_discount_normal_weights() {
     assert_eq!(compute_trust_discount(1.0), MAX_TRUST_DISCOUNT);
     assert_eq!(compute_trust_discount(0.5), MAX_TRUST_DISCOUNT * 0.5);
 }
+
+#[tokio::test]
+async fn porch_adverts_apply_floor_after_discount_only_to_reads() {
+    let cache = PeerPriceCache::new();
+    let peer = test_node_id(1);
+    for (base, discount, expected) in [
+        (1, 0.0, 1000),
+        (1000, 0.5, 1000),
+        (1999, 0.5, 1000),
+        (3000, 0.5, 1500),
+    ] {
+        cache
+            .update(
+                peer,
+                HashMap::from([("web_content".into(), base)]),
+                1,
+                10,
+                discount,
+            )
+            .await;
+        for kind in [500, 501] {
+            assert_eq!(
+                cache.get_discounted_peer_price(&peer, kind).await,
+                Some(expected)
+            );
+            assert_eq!(
+                cache
+                    .get_fresh_discounted_peer_price(
+                        &peer,
+                        kind,
+                        1,
+                        std::time::Duration::from_secs(60)
+                    )
+                    .await,
+                Some(expected)
+            );
+        }
+    }
+    cache
+        .update(
+            peer,
+            HashMap::from([("web_content".into(), 1000)]),
+            1,
+            10,
+            0.5,
+        )
+        .await;
+    for kind in [502, 510, 599] {
+        assert_eq!(
+            cache.get_discounted_peer_price(&peer, kind).await,
+            Some(500)
+        );
+    }
+}

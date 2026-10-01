@@ -1,6 +1,12 @@
 //! Durable recipient offers for paid messages waiting in a sender's outbox.
-use konsensus_core::{traits::transport::TransportError, NodeId};
+use konsensus_core::{
+    gate::porch_read_floor_msat,
+    kind::{KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE},
+    traits::transport::TransportError,
+    NodeId,
+};
 use konsensus_message::{Frame, NoiseTransport};
+use konsensus_pricing::peer_prices::apply_trust_discount;
 use konsensus_storage::Storage;
 
 /// Persist before publishing: a crash cannot erase a price already offered.
@@ -45,17 +51,45 @@ pub(crate) async fn send_price_frame(
                 }) = table
                 {
                     prices.extend(categories.iter().map(|(category, price)| {
+                        let floor = category
+                            .strip_prefix("kind:")
+                            .and_then(|kind| kind.parse::<u16>().ok())
+                            .map(porch_read_floor_msat)
+                            .unwrap_or(0);
                         (
                             // Per-kind entries (`kind:400`) keep their scope.
-                            if category.starts_with("kind:") { category.clone() } else { format!("category:{category}") },
-                            konsensus_pricing::peer_prices::apply_trust_discount(*price, discount),
+                            if category.starts_with("kind:") {
+                                category.clone()
+                            } else {
+                                format!("category:{category}")
+                            },
+                            apply_trust_discount(*price, discount).max(floor),
                         )
                     }));
-                    pricing.category_price_overrides().ok_or_else(|| {
+                    let mut excluded = pricing.category_price_overrides().ok_or_else(|| {
                         TransportError::Other(
                             "pricing engine cannot bind category offer applicability".into(),
                         )
-                    })?
+                    })?;
+                    // The rest of web_content retains its discounted price. Bind
+                    // porch reads separately, excluding them from the cheaper
+                    // category quote (the store resolves the minimum offer).
+                    for kind in [KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE] {
+                        let key = format!("kind:{kind}");
+                        if !categories.contains_key(&key) && !excluded.contains(&kind) {
+                            if let Some(base) = categories.get("web_content") {
+                                prices.push((
+                                    key,
+                                    apply_trust_discount(*base, discount)
+                                        .max(porch_read_floor_msat(kind)),
+                                ));
+                            }
+                        }
+                        if !excluded.contains(&kind) {
+                            excluded.push(kind);
+                        }
+                    }
+                    excluded
                 } else {
                     Vec::new()
                 };
@@ -64,10 +98,12 @@ pub(crate) async fn send_price_frame(
                 } = frame
                 {
                     // Keep the wire price raw: PeerPriceCache retains the table discount
-                    // and applies it once. Only the durable offer stores the final price.
+                    // and applies it once, then the porch floor. The durable offer
+                    // stores that same final price.
                     prices.push((
                         format!("kind:{kind}"),
-                        konsensus_pricing::peer_prices::apply_trust_discount(*price_msat, discount),
+                        apply_trust_discount(*price_msat, discount)
+                            .max(porch_read_floor_msat(*kind)),
                     ));
                 }
                 let now = std::time::SystemTime::now()
