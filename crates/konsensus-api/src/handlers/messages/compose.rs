@@ -3366,6 +3366,12 @@ pub(super) async fn compose_peer(
         // ── Peer compose: existing single-recipient path ──
         let peer_id = NodeId::from_hex(&req.recipient)
             .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+        // A room-bound chat is checked again here, before any quote: a
+        // journaled retry that found nothing paid re-enters this path.
+        let room = crate::room_binding::outgoing(&sender, req.kind, &req.plaintext)?;
+        if let Some(room) = &room {
+            crate::room_binding::check_one(&state, &sender, &peer_id, room).await?;
+        }
         let _admission_guard = acquire_peer_admission_lock(&peer_id).await.ok_or_else(||
             ApiError::Internal("too many concurrent peer sends".into()))?;
         reconcile_admission_budget(&state, &peer_id, None).await?;
@@ -3380,6 +3386,11 @@ pub(super) async fn compose_peer(
             cap = Some(cap.map_or(recipient_cap, |total| total.min(recipient_cap)));
         }
         let first_contact = !state.session_manager.has_session(&peer_id).await;
+        // A room never pays a first contact, even if the session went away
+        // since the check above.
+        if first_contact && room.is_some() {
+            return Err(crate::room_binding::no_session());
+        }
         if crate::calls::is_call_kind(req.kind) {
             // A call never pays first-contact admission: without an E2EE
             // session the contact is new, and first contact is a chat message

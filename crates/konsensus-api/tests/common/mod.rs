@@ -227,6 +227,25 @@ impl Storage for MemStorage {
         Ok(result)
     }
 
+    async fn get_node_messages_of_kind(
+        &self,
+        my_node_id: &str,
+        kind: u16,
+        limit: u32,
+        before_timestamp: Option<u64>,
+    ) -> Result<Vec<UkmEnvelope>, StorageError> {
+        let before = before_timestamp.unwrap_or(u64::MAX);
+        let mut result: Vec<_> = self.messages.lock().unwrap().values()
+            .filter(|env| env.kind == kind && env.timestamp < before)
+            .filter(|env| matches!(&env.recipient, Recipient::Node(n) if n.to_hex() == my_node_id) || env.sender.to_hex() == my_node_id)
+            .filter(|env| matches!(env.recipient, Recipient::Node(_)))
+            .cloned()
+            .collect();
+        result.sort_by_key(|env| std::cmp::Reverse(env.timestamp));
+        result.truncate(limit as usize);
+        Ok(result)
+    }
+
     async fn delete_message(&self, id: &MessageId) -> Result<bool, StorageError> {
         Ok(self.messages.lock().unwrap().remove(&id.to_hex()).is_some())
     }

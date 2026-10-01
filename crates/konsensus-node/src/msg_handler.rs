@@ -300,17 +300,21 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             continue;
                         }
 
-                        // A call signal is held (invisible to history, resync and
-                        // duplicate ACKs) from before its paid acceptance until its
-                        // admission is final; a hold that outlives this handler is
-                        // withdrawn by the startup/periodic sweep (Codex delta2 #4).
+                        // A call signal, and a chat (a candidate room chat: its
+                        // binding is only visible after decryption), is held
+                        // (invisible to history, plaintext, resync and duplicate
+                        // ACKs) from before its paid acceptance until its admission
+                        // is final; a hold that outlives this handler is withdrawn
+                        // by the startup/periodic sweep (Codex delta2 #4, #155).
+                        let held_kind = konsensus_api::calls::is_call_kind(envelope.kind)
+                            || konsensus_api::room_binding::is_candidate(envelope.kind);
                         let mut call_hold = false;
-                        if gate_result.is_ok() && !is_relay_control && konsensus_api::calls::is_call_kind(envelope.kind) {
+                        if gate_result.is_ok() && !is_relay_control && held_kind {
                             match konsensus_api::calls::hold_incoming(storage_for_recv.as_ref(), &envelope).await {
                                 Ok(placed) => call_hold = placed,
                                 Err(e) => {
-                                    // Fail closed: unheld, a refused signal could stay visible.
-                                    error!(msg_id = %msg_id, error = %e, "call signal not held; not accepted");
+                                    // Fail closed: unheld, a refused message could stay visible.
+                                    error!(msg_id = %msg_id, error = %e, "incoming message not held; not accepted");
                                     let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
                                     let _ = transport_for_ack.send_frame(&sender, &reject).await;
                                     continue;
@@ -325,12 +329,13 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     audit_for_recv.membrane().admitted(&envelope, gate_result.as_ref().expect("validated").0);
                                 }
                                 Ok(PaidAcceptance::AlreadyAccepted) => {
-                                    // A call signal still held was never admitted: never
-                                    // acknowledge it as delivered.
-                                    if konsensus_api::calls::is_call_kind(envelope.kind)
+                                    // A call signal or chat still held was never admitted:
+                                    // never acknowledge it as delivered.
+                                    if held_kind
                                         && storage_for_recv.call_admission_held(&msg_id).await.unwrap_or(true)
                                     {
-                                        let reject = Frame::MessageReject { id: msg_id, reason: "call signal withdrawn".into() };
+                                        let reason = if konsensus_api::calls::is_call_kind(envelope.kind) { "call signal withdrawn" } else { "message withdrawn" };
+                                        let reject = Frame::MessageReject { id: msg_id, reason: reason.into() };
                                         let _ = transport_for_ack.send_frame(&sender, &reject).await;
                                         continue;
                                     }
@@ -590,13 +595,26 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             }
                         }
 
-                        // Rooms: a room-bound chat whose roster lacks the sender or
-                        // this node is refused like a call signal: withdrawn (the
-                        // payment hash and nonce stay burned) and never shown.
-                        if let Err(refusal) = konsensus_api::room_binding::admit_incoming(identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()) {
+                        // Rooms: a held chat is checked after decryption. A bound
+                        // chat whose binding is invalid or whose roster lacks the
+                        // sender or this node is refused like a call signal:
+                        // withdrawn (the payment hash and nonce stay burned) and
+                        // never shown; if the withdrawal fails it stays held until
+                        // the sweep. Anything else is released before the app sees
+                        // it; if that write fails it stays held: fail closed.
+                        let room = konsensus_api::room_binding::admit_incoming(identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref());
+                        if room.is_ok() && call_hold && konsensus_api::room_binding::is_candidate(envelope.kind) {
+                            if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
+                                error!(msg_id = %msg_id, error = %e, "admitted chat could not be released; withheld");
+                                let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                continue;
+                            }
+                        }
+                        if let Err(refusal) = room {
                             warn!(sender = %sender, reason = %refusal, "room chat refused; not forwarded");
                             if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
-                                error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused room chat");
+                                error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused room chat; it stays held until the sweep");
                             }
                             audit_for_recv.record(
                                 konsensus_api::audit::events::MESSAGE_REJECTED,

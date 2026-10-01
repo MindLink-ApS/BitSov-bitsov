@@ -1,7 +1,10 @@
 //! Rooms MVP on this node: the optional room binding on chat
 //! ([`konsensus_core::payloads::room`]). Checked on compose, before any quote
-//! or payment, and on receive, after the payment gate (a refused chat is
-//! withdrawn like a refused call signal). The node keeps no room state.
+//! or payment, and on receive, after the payment gate and decryption: every
+//! incoming chat is held (invisible to history, plaintext, resync and
+//! duplicate ACKs) from before its paid acceptance until this check passes,
+//! and a refused one is withdrawn like a refused call signal. The node keeps
+//! no room state.
 
 use konsensus_core::kind::KIND_CHAT;
 use konsensus_core::payloads::room::{RoomBinding, RoomChat, RoomRefusal, ROOM_BINDING_CAPABILITY};
@@ -15,6 +18,12 @@ use crate::state::AppState;
 pub const UNSUPPORTED: &str = "room_binding_unsupported";
 /// A member without an E2EE session was skipped; nothing was paid.
 pub const NO_SESSION: &str = "room_member_no_session";
+
+/// Whether an incoming message of `kind` may carry a binding, so it is held
+/// (invisible) from its paid acceptance until [`admit_incoming`] passes.
+pub fn is_candidate(kind: u16) -> bool {
+    kind == KIND_CHAT
+}
 
 /// The binding a chat carries, if any. Other kinds never carry one.
 pub fn binding(kind: u16, plaintext: &str) -> Result<Option<RoomBinding>, RoomRefusal> {
@@ -67,7 +76,12 @@ pub(crate) async fn check_one(state: &AppState, own: &NodeId, peer: &NodeId, roo
         .with_reason(UNSUPPORTED));
     }
     if !state.session_manager.has_session(peer).await {
-        return Err(ApiError::NotDispatched("no E2EE session with this member; nothing was paid".into()).with_reason(NO_SESSION));
+        return Err(no_session());
     }
     Ok(())
+}
+
+/// No E2EE session with the member: a room never pays a first contact.
+pub(crate) fn no_session() -> ApiError {
+    ApiError::NotDispatched("no E2EE session with this member; nothing was paid".into()).with_reason(NO_SESSION)
 }

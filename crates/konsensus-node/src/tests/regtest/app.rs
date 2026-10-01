@@ -192,7 +192,8 @@ impl App {
             web_page_price_msat: None,
             peer_prices: Arc::new(konsensus_pricing::PeerPriceCache::new()),
             routing: Arc::new(konsensus_routing::RoutingTable::with_defaults()),
-            plaintext_cipher: None,
+            // As in main.rs: the API reads the plaintext cache the receive loop writes.
+            plaintext_cipher: Some(Arc::new(konsensus_crypto::PlaintextCacheCipher::new(identity.aes_key()))),
             send_timestamps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             invoice_requests: Arc::clone(&invoice_requests),
             // The admission journal lives here, so a stale settled admission is on disk.

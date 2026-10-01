@@ -1013,13 +1013,16 @@ async fn real_ldk_regtest_meeting() {
 
 /// Rooms MVP over real LDK on regtest. Topology: apps A (sender), B, C, D,
 /// each with one channel to the routing node R. A room is ordinary chat
-/// (kind 0) carrying a room binding {id, roster}; A pays each other member
-/// through the room fan-out: B, C and D each get their own envelope and are
-/// paid their chat price (2,001 msat) plus R's fee on the hop to them.
-/// Refusals, msat-exact: A's own node refuses a roster without A and a 1:1
-/// room chat to a non-member before paying; a member whose node does not
-/// advertise `room_binding_v1` is skipped and paid nothing; and A refuses
-/// (withdraws, never shows) a paid room chat from B whose roster lacks B.
+/// (kind 0) carrying a room binding {id, roster, salt}, the id committing to
+/// the roster; A pays each other member through the room fan-out: B, C and D
+/// each get their own envelope and are paid their chat price (2,001 msat)
+/// plus R's fee on the hop to them. B replies with one 1:1 room leg, and A's
+/// room thread shows both directions, A's three copies as one entry.
+/// Refusals, msat-exact: A's own node refuses a roster without A, a 1:1 room
+/// chat to a non-member and the room id with a swapped roster before paying;
+/// a member whose node does not advertise `room_binding_v1` is skipped and
+/// paid nothing; and A refuses (withdraws, never shows) paid room chats from
+/// B whose roster lacks B or whose roster does not match the room id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local Bitcoin Core and electrs; scripts/regress/regtest_e2e.sh"]
 async fn real_ldk_regtest_room() {
@@ -1086,20 +1089,14 @@ async fn real_ldk_regtest_room() {
         let info = alice.transport.peer_info(&peer).await.expect("connected");
         assert!(info.capabilities.iter().any(|c| c == r#"Custom("room_binding_v1")"#), "{:?}", info.capabilities);
     }
-    let roster_of = |ids: &[konsensus_core::NodeId]| {
-        let mut roster: Vec<String> = ids.iter().map(|id| id.to_hex()).collect();
-        roster.sort();
-        roster
+    use konsensus_core::payloads::room::RoomBinding;
+    let room_of = |ids: &[konsensus_core::NodeId]| RoomBinding::create(ids).unwrap();
+    let room_chat = |room: &RoomBinding, text: &str| {
+        json!({"v": 1, "room": room, "msg": format!("{:032x}", rand::random::<u128>()), "text": text}).to_string()
     };
-    let room = format!("{:032x}", rand::random::<u128>());
-    let room_chat = |roster: &[String], text: &str| json!({"v": 1, "room": {"id": room, "roster": roster}, "text": text}).to_string();
-    let send_room = |plaintext: String| {
-        let alice = &alice;
-        let room = room.clone();
-        async move {
-            alice.post("/api/v1/messages/compose", json!({"recipient": room, "is_room": true, "kind": 0, "plaintext": plaintext}), false).await
-        }
-    };
+    async fn send_room(alice: &app::App, room: &RoomBinding, plaintext: String) -> (StatusCode, Value) {
+        alice.post("/api/v1/messages/compose", json!({"recipient": room.id, "is_room": true, "kind": 0, "plaintext": plaintext}), false).await
+    }
     let pays = |n: &Arc<LdkProvider>| {
         let n = n.clone();
         async move { n.list_payments(500).await.unwrap().len() }
@@ -1110,22 +1107,29 @@ async fn real_ldk_regtest_room() {
     let a_pays0 = pays(&a).await;
 
     // Refused by A's own node before any quote or payment.
-    let (status, body) = send_room(room_chat(&roster_of(&[b_id, c_id, d_id]), "not mine")).await;
+    let full = room_of(&[a_id, b_id, c_id, d_id]);
+    let not_mine = room_of(&[b_id, c_id, d_id]);
+    let (status, body) = send_room(&alice, &not_mine, room_chat(&not_mine, "not mine")).await;
     assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("room_sender_not_member")), "{body}");
     let (status, body) = alice
-        .post("/api/v1/messages/compose", json!({"recipient": d_id.to_hex(), "kind": 0, "plaintext": room_chat(&roster_of(&[a_id, b_id, c_id]), "not yours")}), false)
+        .post("/api/v1/messages/compose", json!({"recipient": d_id.to_hex(), "kind": 0, "plaintext": room_chat(&room_of(&[a_id, b_id, c_id]), "not yours")}), false)
         .await;
     assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("room_recipient_not_member")), "{body}");
+    // The room id of [A, B, C, D] with D swapped for an outsider.
+    let outsider = NodeIdentity::generate().unwrap().1;
+    let mut swapped = full.clone();
+    swapped.roster = room_of(&[a_id, b_id, c_id, *outsider.node_id()]).roster;
+    let (status, body) = send_room(&alice, &full, room_chat(&swapped, "swapped")).await;
+    assert_eq!((status, body["reason"].as_str()), (StatusCode::BAD_REQUEST, Some("room_binding_invalid")), "{body}");
     assert_eq!((pays(&a).await, alice.used()), (a_pays0, a_used0), "nothing paid");
-    steps.pass("roster without A, and a 1:1 room chat to a non-member: refused by A's node, nothing paid");
+    steps.pass("roster without A, a 1:1 room chat to a non-member, a swapped roster: refused by A's node, nothing paid");
 
     // Fan-out to 3 members: each paid once, on its own envelope.
-    let full = roster_of(&[a_id, b_id, c_id, d_id]);
     let text = room_chat(&full, "hello room");
     for app in [&mut bob, &mut carol, &mut dave] {
         app.received = app.state.ws_broadcast.subscribe();
     }
-    let (status, body) = send_room(text.clone()).await;
+    let (status, body) = send_room(&alice, &full, text.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["amount_msat"], 3 * chat_msat, "{body}");
     let outcomes = body["member_outcomes"].as_array().unwrap();
@@ -1141,12 +1145,35 @@ async fn real_ldk_regtest_room() {
     }
     steps.pass("A -> {B, C, D}: 3 paid envelopes, 2001 msat each, all delivered");
 
+    // B answers the room on its 1:1 leg to A (how the app sends: one leg per
+    // member). A's room thread holds both directions, A's copies as one entry.
+    let b_used_reply = bob.used();
+    let reply_text = room_chat(&full, "hello from b");
+    let reply = bob.compose(&mut alice, &reply_text).await;
+    assert_eq!(reply["amount_msat"], chat_msat, "{reply}");
+    let reply_paid = bob.used() - b_used_reply;
+    let (status, thread) = alice.get(&format!("/api/v1/messages?room={}", full.id), true).await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    let thread = thread.as_array().unwrap();
+    assert_eq!(thread.len(), 2, "{thread:?}");
+    let ours = thread.iter().find(|m| m["sender"] == a_id.to_hex()).expect("A's own room message");
+    assert_eq!((ours["recipient"].as_str(), ours["payment_amount_msat"].as_u64()), (Some(full.id.as_str()), Some(3 * chat_msat)), "{ours}");
+    let copies: Vec<&str> = ours["copies"].as_array().unwrap().iter().map(|c| c["recipient"].as_str().unwrap()).collect();
+    let mut members = vec![b_id.to_hex(), c_id.to_hex(), d_id.to_hex()];
+    members.sort();
+    assert_eq!(copies, members, "{ours}");
+    let theirs = thread.iter().find(|m| m["sender"] == b_id.to_hex()).expect("B's room reply");
+    assert_eq!(theirs["plaintext"].as_str(), Some(reply_text.as_str()));
+    assert_eq!(theirs["room"]["id"].as_str(), Some(full.id.as_str()));
+    steps.pass("B's 1:1 room leg (2001 msat) reaches A; A's thread: B's reply + A's 3 copies as one");
+
     // A member whose node does not advertise room_binding_v1 (here: a node
     // A is not connected to) is skipped before any quote, paid nothing.
     let absent = NodeIdentity::generate().unwrap().1;
-    let partial = room_chat(&roster_of(&[a_id, b_id, *absent.node_id()]), "partial");
+    let partial_room = room_of(&[a_id, b_id, *absent.node_id()]);
+    let partial = room_chat(&partial_room, "partial");
     bob.received = bob.state.ws_broadcast.subscribe();
-    let (status, body) = send_room(partial.clone()).await;
+    let (status, body) = send_room(&alice, &partial_room, partial.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["amount_msat"], chat_msat, "{body}");
     let skipped = body["member_outcomes"].as_array().unwrap().iter().find(|o| o["recipient"] == absent.node_id().to_hex()).unwrap().clone();
@@ -1154,57 +1181,66 @@ async fn real_ldk_regtest_room() {
     assert_eq!(recv_from(&mut bob, &a_id, 0).await.plaintext.as_deref(), Some(partial.as_str()));
     steps.pass("unsupported member skipped (0 msat); B paid 2001 msat");
 
-    // Receive side: B pays A for a room chat whose roster lacks B (only a
-    // modified node would send one; B's own compose refuses it). A's gate
-    // admits the payment, then A refuses the binding: withdrawn, never shown.
+    // Receive side: B pays A for room chats only a modified node would send
+    // (B's own compose refuses them). A's gate admits each payment, then A
+    // refuses the binding: withdrawn, never shown, terminal for B.
     let price = bob_reply["amount_msat"].as_u64().unwrap();
     assert_eq!(price, chat_msat);
-    let rogue = json!({"v": 1, "room": {"id": room, "roster": roster_of(&[a_id, c_id, d_id])}, "text": "let me in"}).to_string();
-    let invoice = a.create_invoice(price, "rogue room chat", 600).await.unwrap();
-    b.pay_invoice_with_fee_limit(&invoice.bolt11, hop_fee(to_a, price)).await.unwrap();
-    settle(&b, &invoice.payment_hash).await;
-    let preimage = b.get_payment_status(&invoice.payment_hash).await.unwrap().preimage.expect("preimage");
     let hex32 = |s: &str| <[u8; 32]>::try_from(hex::decode(s).unwrap()).unwrap();
-    let ratchet = bob.state.session_manager.encrypt(&a_id, rogue.as_bytes()).await.unwrap();
-    let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
-        0,
-        b_id,
-        konsensus_core::Recipient::Node(a_id),
-        konsensus_crypto::ratchet_message_to_bytes(&ratchet),
-        konsensus_core::PaymentProof::new(hex32(&invoice.payment_hash), hex32(&preimage), price),
-    )
-    .build();
-    envelope.signature = konsensus_core::Signature::from_ed25519(&bob.state.identity.sign(&envelope.signable_bytes()));
-    bob.state.storage.store_message(&envelope).await.unwrap();
-    bob.state.storage.prepare_delivery(&envelope.id, &a_id).await.unwrap();
-    let mut b_delivery = bob.state.ws_delivery_broadcast.subscribe();
-    alice.received = alice.state.ws_broadcast.subscribe();
-    bob.transport.send(&a_id, &envelope).await.unwrap();
-    let status = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let s = b_delivery.recv().await.unwrap();
-            if s.message_id == envelope.id.to_hex() {
-                return s;
+    let mut swapped_in = full.clone();
+    swapped_in.roster = room_of(&[a_id, b_id, c_id, *outsider.node_id()]).roster;
+    for (rogue, code) in [
+        (room_chat(&room_of(&[a_id, c_id, d_id]), "let me in"), "room_sender_not_member:"),
+        (room_chat(&swapped_in, "new roster, same room"), "room_binding_invalid:"),
+    ] {
+        let invoice = a.create_invoice(price, "rogue room chat", 600).await.unwrap();
+        b.pay_invoice_with_fee_limit(&invoice.bolt11, hop_fee(to_a, price)).await.unwrap();
+        settle(&b, &invoice.payment_hash).await;
+        let preimage = b.get_payment_status(&invoice.payment_hash).await.unwrap().preimage.expect("preimage");
+        let ratchet = bob.state.session_manager.encrypt(&a_id, rogue.as_bytes()).await.unwrap();
+        let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
+            0,
+            b_id,
+            konsensus_core::Recipient::Node(a_id),
+            konsensus_crypto::ratchet_message_to_bytes(&ratchet),
+            konsensus_core::PaymentProof::new(hex32(&invoice.payment_hash), hex32(&preimage), price),
+        )
+        .build();
+        envelope.signature = konsensus_core::Signature::from_ed25519(&bob.state.identity.sign(&envelope.signable_bytes()));
+        bob.state.storage.store_message(&envelope).await.unwrap();
+        bob.state.storage.prepare_delivery(&envelope.id, &a_id).await.unwrap();
+        let mut b_delivery = bob.state.ws_delivery_broadcast.subscribe();
+        alice.received = alice.state.ws_broadcast.subscribe();
+        bob.transport.send(&a_id, &envelope).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let s = b_delivery.recv().await.unwrap();
+                if s.message_id == envelope.id.to_hex() {
+                    return s;
+                }
             }
+        })
+        .await
+        .expect("A answered the rogue room chat");
+        assert_eq!(status.status, "failed_paid", "terminal: {status:?}");
+        assert!(status.reason.as_deref().unwrap_or_default().starts_with(code), "{status:?}");
+        assert!(alice.state.storage.get_message(&envelope.id).await.unwrap().is_none(), "withdrawn on A");
+        while let Ok(m) = alice.received.try_recv() {
+            assert_ne!(m.envelope.id, envelope.id, "the refused room chat reached A's app");
         }
-    })
-    .await
-    .expect("A answered the rogue room chat");
-    assert_eq!(status.status, "failed_paid", "terminal: {status:?}");
-    assert!(status.reason.as_deref().unwrap_or_default().starts_with("room_sender_not_member:"), "{status:?}");
-    assert!(alice.state.storage.get_message(&envelope.id).await.unwrap().is_none(), "withdrawn on A");
-    while let Ok(m) = alice.received.try_recv() {
-        assert_ne!(m.envelope.id, envelope.id, "the refused room chat reached A's app");
+        let (_, listed) = alice.get("/api/v1/messages?limit=1000", true).await;
+        assert!(listed.as_array().unwrap().iter().all(|m| m["id"] != envelope.id.to_hex()), "listed on A");
     }
-    steps.pass("A refused B's paid room chat without B in the roster (room_sender_not_member), withdrawn");
+    steps.pass("A refused B's paid room chats (roster without B; swapped roster under the room id), withdrawn");
 
     // msat-exact, between the snapshots:
-    //   A paid 3 fan-out legs + 1 partial leg; B paid A once (refused).
+    //   A paid 3 fan-out legs + 1 partial leg; B paid A its room reply and
+    //   two refused rogue chats.
     let f = hop_fee;
     let a_paid = chat_msat + f(to_b, chat_msat) + chat_msat + f(to_c, chat_msat) + chat_msat + f(to_d, chat_msat) + chat_msat + f(to_b, chat_msat);
-    let b_paid = price + f(to_a, price);
-    let (a_got, b_got, c_got, d_got) = (price, 2 * chat_msat, chat_msat, chat_msat);
-    let r_earned = (a_paid - 4 * chat_msat) + (b_paid - price);
+    let b_paid = 3 * (price + f(to_a, price));
+    let (a_got, b_got, c_got, d_got) = (3 * price, 2 * chat_msat, chat_msat, chat_msat);
+    let r_earned = (a_paid - 4 * chat_msat) + (b_paid - 3 * price);
     wait("exact channel deltas after the room", || async {
         capacity(a.node()) == caps0[0] - a_paid + a_got
             && capacity(b.node()) == caps0[1] - b_paid + b_got
@@ -1214,7 +1250,8 @@ async fn real_ldk_regtest_room() {
     })
     .await;
     assert_eq!(alice.used() - a_used0, a_paid, "A budget = principals + actual fees");
-    assert_eq!(bob.used(), b_used0, "B's rogue payment bypassed its app budget");
+    assert_eq!(reply_paid, price + f(to_a, price), "B's reply leg: price + actual fee");
+    assert_eq!(bob.used() - b_used0, reply_paid, "B's rogue payments bypassed its app budget");
     println!(
         "ROOM RECONCILED: A paid {a_paid} got {a_got}; B paid {b_paid} got {b_got}; C got {c_got}; D got {d_got}; R earned {r_earned} msat"
     );
