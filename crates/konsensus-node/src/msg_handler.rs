@@ -1101,6 +1101,17 @@ async fn send_encrypted_response<T: serde::Serialize>(
             return;
         }
     };
+    if kind == konsensus_core::kind::KIND_WEB_MANIFEST
+        && json_bytes.len() > konsensus_core::payloads::content::MAX_PORCH_BODY_BYTES
+    {
+        warn!(
+            peer = %peer_id,
+            size = json_bytes.len(),
+            limit = konsensus_core::payloads::content::MAX_PORCH_BODY_BYTES,
+            "refusing oversized manifest response"
+        );
+        return;
+    }
 
     let ratchet_msg = match session_mgr.encrypt(peer_id, &json_bytes).await {
         Ok(msg) => msg,

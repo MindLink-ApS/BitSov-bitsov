@@ -106,7 +106,11 @@ impl InFlight {
 
     fn claim(ours: NodeId, peer: NodeId) -> Option<Self> {
         let mut set = Self::set().lock().unwrap_or_else(|e| e.into_inner());
-        set.insert((ours, peer)).then_some(Self((ours, peer)))
+        if set.insert((ours, peer)) {
+            Some(Self((ours, peer)))
+        } else {
+            None
+        }
     }
 }
 

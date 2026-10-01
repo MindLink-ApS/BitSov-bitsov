@@ -156,3 +156,83 @@ async fn porch_read_without_a_session_pays_nothing() {
     assert!(net.payer.held_cards().await["cards"].as_array().unwrap().is_empty());
     net.stop();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_porch_read_returns_busy_without_deadlocking_the_slot() {
+    let mut net = pair(Shape::CardOnly, Order::PayerLower, Wallet::Plain, Wallet::Plain).await;
+    let owner = net.payee.id;
+    let (status, body) = net.payer.compose(&owner, "hello").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    net.payee.delivered_once("hello").await;
+    *net.payee.front_door.card.lock().await = Some(card(&net.payee, 1));
+    let paid_before = net.payer.paid_out().await;
+
+    // Hold the first read after payment, while it still owns the in-flight slot.
+    net.payer.pause.arm_before_page_send();
+    let first = net.payer.browse(&owner, PORCH_CARD_PATH);
+    let second = async {
+        net.payer.pause.reached().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            net.payer.browse(&owner, PORCH_CARD_PATH),
+        )
+        .await;
+        let paid_after_busy = net.payer.paid_out().await;
+        net.payer.pause.release();
+        (
+            result.expect("busy Browse request must return promptly"),
+            paid_after_busy,
+        )
+    };
+    let ((first_status, first_body), ((busy_status, busy_body), paid_after_busy)) =
+        tokio::join!(first, second);
+
+    assert_eq!(busy_status, StatusCode::CONFLICT, "{busy_body}");
+    assert_eq!(busy_body["reason"], "porch_busy");
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+    let mut expected = paid_before.clone();
+    expected.push(PAGE_MSAT);
+    assert_eq!(
+        sorted(paid_after_busy),
+        sorted(expected.clone()),
+        "the busy request must not add a payment"
+    );
+    assert_eq!(sorted(net.payer.paid_out().await), sorted(expected.clone()));
+
+    // Dropping the successful request's guard frees the slot for the next read.
+    let (later_status, later_body) = net.payer.browse(&owner, PORCH_CARD_PATH).await;
+    assert_eq!(later_status, StatusCode::OK, "{later_body}");
+    expected.push(PAGE_MSAT);
+    assert_eq!(sorted(net.payer.paid_out().await), sorted(expected));
+    net.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_requires_explicit_knock_before_browse_and_pays_nothing() {
+    let mut net = pair(Shape::CardOnly, Order::PayerLower, Wallet::Plain, Wallet::Plain).await;
+    let owner = net.payee.id;
+    let (status, body) = net.payer.compose(&owner, "hello").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    net.payee.delivered_once("hello").await;
+    assert!(net.payer.sessions.has_session(&owner).await);
+    assert!(net.payer.paid_on_connection(&owner).await);
+    let paid_before = net.payer.paid_out().await;
+    let received_before = net.payee.received_in().await;
+
+    net.flap().await;
+    assert!(
+        net.payer.sessions.has_session(&owner).await,
+        "reconnect should preserve the E2EE session"
+    );
+    assert!(
+        !net.payer.paid_on_connection(&owner).await,
+        "replacement connection must start without admission"
+    );
+
+    let (status, body) = net.payer.browse(&owner, PORCH_CARD_PATH).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "readmission_required");
+    assert_eq!(net.payer.paid_out().await, paid_before);
+    assert_eq!(net.payee.received_in().await, received_before);
+    net.stop();
+}

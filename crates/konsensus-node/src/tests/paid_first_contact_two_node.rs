@@ -232,6 +232,7 @@ struct PauseAfterMark {
     armed: std::sync::atomic::AtomicBool,
     armed_query: std::sync::atomic::AtomicBool,
     armed_eager: std::sync::atomic::AtomicBool,
+    armed_page_send: std::sync::atomic::AtomicBool,
     proof_sent: std::sync::atomic::AtomicBool,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -252,6 +253,9 @@ impl PauseAfterMark {
     fn arm_before_eager_offer(&self) {
         self.proof_sent.store(false, std::sync::atomic::Ordering::SeqCst);
         self.armed_eager.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn arm_before_page_send(&self) {
+        self.armed_page_send.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     async fn hold_eager(&self) {
         if self.proof_sent.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -283,6 +287,9 @@ struct Hooked {
 #[async_trait::async_trait]
 impl MessageTransport for Hooked {
     async fn send(&self, peer: &NodeId, envelope: &konsensus_core::UkmEnvelope) -> Result<(), konsensus_core::traits::transport::TransportError> {
+        if envelope.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
+            self.pause.hold(&self.pause.armed_page_send).await;
+        }
         self.inner.send(peer, envelope).await
     }
     async fn recv(&self) -> Result<konsensus_core::UkmEnvelope, konsensus_core::traits::transport::TransportError> {

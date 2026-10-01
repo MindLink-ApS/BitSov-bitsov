@@ -176,6 +176,49 @@ fn manifest_extracts_h1_title() {
     assert_eq!(manifest.pages[0].title, "My Great Post");
 }
 
+#[cfg(unix)]
+#[test]
+fn manifest_does_not_read_title_through_symlink_outside_public_root() {
+    let (dir, server) = setup();
+    let private = TempDir::new().unwrap();
+    let secret = "# PRIVATE H1 MUST NOT LEAK\n\nprivate";
+    let secret_path = private.path().join("secret.md");
+    std::fs::write(&secret_path, secret).unwrap();
+    std::os::unix::fs::symlink(&secret_path, dir.path().join("escape.md")).unwrap();
+
+    let manifest = server.build_manifest(0, 50);
+    let encoded = serde_json::to_string(&manifest).unwrap();
+    assert!(
+        manifest.pages.iter().all(|page| page.path != "/escape.md"),
+        "outside-root symlink was listed"
+    );
+    assert!(!encoded.contains("PRIVATE H1 MUST NOT LEAK"));
+}
+
+#[test]
+fn manifest_caps_an_oversized_h1_and_serialized_reply() {
+    let dir = TempDir::new().unwrap();
+    let server = ContentServer::new(ContentServerConfig {
+        content_dir: dir.path().to_path_buf(),
+        max_file_size: konsensus_core::payloads::content::MAX_PORCH_BODY_BYTES as u64,
+        ..ContentServerConfig::default()
+    })
+    .unwrap();
+    let body = format!(
+        "# {}",
+        "x".repeat(konsensus_core::payloads::content::MAX_PORCH_BODY_BYTES - 2)
+    );
+    std::fs::write(dir.path().join("large-title.md"), body).unwrap();
+
+    let manifest = server.build_manifest(0, 50);
+    assert_eq!(manifest.pages.len(), 1);
+    assert!(manifest.pages[0].title.len() <= MAX_TITLE_BYTES);
+    assert!(
+        serde_json::to_vec(&manifest).unwrap().len()
+            <= konsensus_core::payloads::content::MAX_PORCH_BODY_BYTES
+    );
+}
+
 #[test]
 fn text_file_served_as_plain() {
     let (dir, server) = setup();
