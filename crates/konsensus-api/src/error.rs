@@ -139,6 +139,12 @@ impl ApiError {
             return (status, body);
         }
         if let Self::NotDispatched(reason) = self {
+            if reason == "disk_low" {
+                return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                    "error": "Insufficient free disk space for new paid work or channel opens",
+                    "code": "disk_low", "retry_allowed": true
+                }));
+            }
             return (StatusCode::BAD_REQUEST, serde_json::json!({
                 "error": reason, "code": "not_dispatched"
             }));
@@ -282,6 +288,16 @@ mod tests {
             assert_eq!(body["error"], "announce_unavailable");
             assert_eq!(body["max_routing_fee_msat"], ceiling);
         }
+    }
+
+    #[tokio::test]
+    async fn disk_refusal_is_retryable_and_preserves_non_dispatch() {
+        let (status, body) = error_body(ApiError::from(
+            konsensus_core::traits::lightning::LightningError::PaymentNotDispatched("disk_low".into()),
+        )).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "disk_low");
+        assert_eq!(body["retry_allowed"], true);
     }
 
     #[tokio::test]

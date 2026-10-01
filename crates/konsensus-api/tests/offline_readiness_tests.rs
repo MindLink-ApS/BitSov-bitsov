@@ -12,6 +12,9 @@ use tower::ServiceExt;
 struct Offline;
 #[async_trait]
 impl LightningProvider for Offline {
+    fn disk_status(&self) -> Option<DiskStatus> {
+        Some(DiskStatus { disk_low: true, disk_free_bytes: Some(123), disk_free_floor_bytes: 2147483648 })
+    }
     async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
         panic!("offline invoice dispatched")
     }
@@ -116,6 +119,9 @@ async fn offline_status_keeps_identity_and_reports_unknown_wallet() {
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["node_id"], expected);
+    assert_eq!(body["disk_low"], true);
+    assert_eq!(body["disk_free_bytes"], 123);
+    assert_eq!(body["disk_free_floor_bytes"], 2147483648_u64);
     assert_eq!(body["money_ready"], false);
     assert!(body["lightning_balance_msat"].is_null());
 }

@@ -94,6 +94,10 @@ impl NodeTier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    /// Refuse new paid work below this many available bytes beside the mnemonic/LDK state.
+    #[serde(default = "default_disk_free_floor_bytes")]
+    pub disk_free_floor_bytes: u64,
+
     /// Ordinary Lightning routing fees; sponsor gifts use their separately approved cap.
     #[serde(default)]
     pub routing_fees: konsensus_core::traits::lightning::RoutingFeePolicy,
@@ -1491,6 +1495,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            disk_free_floor_bytes: default_disk_free_floor_bytes(),
             routing_fees: Default::default(),
             tier,
             identity: IdentityConfig {
@@ -1768,3 +1773,5 @@ impl SponsorConfig {
         )
     }
 }
+
+fn default_disk_free_floor_bytes() -> u64 { 2 * 1024 * 1024 * 1024 }

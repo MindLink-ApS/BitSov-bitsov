@@ -37,6 +37,8 @@ pub struct KonsensusNode {
     /// The node's cryptographic identity.
     identity: Arc<NodeIdentity>,
 
+    disk: Arc<crate::safety::DiskGuard>,
+
     /// The full configuration.
     config: NodeConfig,
 
@@ -67,6 +69,9 @@ pub struct KonsensusNode {
     /// Shutdown signal.
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+
+    // Drop last, after all state owners; prevent concurrent binary generations.
+    _state_guard: Arc<std::fs::File>,
 }
 
 impl KonsensusNode {
@@ -76,6 +81,11 @@ impl KonsensusNode {
     /// backend selections. The node is not started yet — call [`Self::start`] next.
     pub async fn from_config(config: NodeConfig, mnemonic_password: Option<&str>) -> Result<Self> {
         config.validate_routing_fee_backend()?;
+        // Same directory as the embedded LDK state. Check before opening either store.
+        let data_dir = config.identity.mnemonic_file.parent()
+            .filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        let state_guard = Arc::new(crate::safety::ensure_generation(data_dir, crate::safety::STATE_GENERATION)?);
+        let disk = Arc::new(crate::safety::DiskGuard::new(data_dir.to_path_buf(), config.disk_free_floor_bytes));
         // ── 1. Load identity ────────────────────────────────────────────
         let mnemonic = crate::mnemonic_crypto::read_mnemonic(
             &config.identity.mnemonic_file,
@@ -218,18 +228,32 @@ impl KonsensusNode {
                 let mnemonic = zeroize::Zeroizing::new(std::mem::take(&mut ldk_config.mnemonic));
                 let passphrase = zeroize::Zeroizing::new(ldk_config.passphrase.take().unwrap_or_default());
                 let policy = config.routing_fees;
+                let admission_disk = disk.clone();
+                let admission_lease = state_guard.clone();
+                let admission: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                    // LDK's event handler and asynchronous shutdown retain this
+                    // callback after a cancelled construction or dropped node.
+                    let _lease = &admission_lease;
+                    !admission_disk.refresh().disk_low
+                });
                 Arc::new(konsensus_lightning::RecoveringLightning::new(move || {
                     let mut attempt = ldk_config.clone();
                     attempt.mnemonic = mnemonic.to_string();
                     attempt.passphrase = Some(passphrase.to_string());
+                    let admission = admission.clone();
                     async move {
-                        LdkProvider::new(attempt).await.map(|provider|
+                        LdkProvider::new_with_work_admission(attempt, Some(admission)).await.map(|provider|
                             Arc::new(provider.with_routing_fee_policy(policy)) as Arc<dyn LightningProvider>)
                     }
                 }, policy).await.map_err(|e| anyhow::anyhow!("ldk provider: {e}"))?)
             }
         };
 
+        let lightning: Arc<dyn LightningProvider> = Arc::new(crate::guarded_lightning::GuardedLightning {
+            inner: lightning,
+            disk: disk.clone(),
+            _state_guard: state_guard.clone(),
+        });
         info!("lightning provider initialized");
 
         // ── 4. Initialize Chain provider ────────────────────────────────
@@ -361,6 +385,8 @@ impl KonsensusNode {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Ok(Self {
+            _state_guard: state_guard,
+            disk,
             identity,
             config,
             storage,
@@ -406,6 +432,8 @@ impl KonsensusNode {
             );
             self.transport.start_supervisor(supervised);
         }
+
+        tokio::spawn(self.disk.clone().monitor(self.shutdown_rx()));
 
         // Start routing table maintenance (periodic decay + pruning)
         self.routing.spawn_maintenance();

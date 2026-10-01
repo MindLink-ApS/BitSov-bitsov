@@ -643,6 +643,13 @@ where
 				counterparty_skimmed_fee_msat,
 				..
 			} => {
+                // Refuse BEFORE releasing a preimage; no settlement on disk refusal.
+                // Claimed/replayed settlements use PaymentClaimed and remain recoverable.
+                if self.config.work_admission.as_ref().is_some_and(|check| !check.allowed()) {
+                    log_info!(self.logger, "disk_low: refusing unpaid incoming HTLC");
+                    self.channel_manager.fail_htlc_backwards(&payment_hash);
+                    return Ok(());
+                }
 				let payment_id = PaymentId(payment_hash.0);
 				if let Some(info) = self.payment_store.get(&payment_id) {
 					if info.direction == PaymentDirection::Outbound {
@@ -1192,6 +1199,16 @@ where
 				is_announced,
 				params: _,
 			} => {
+                if self.config.work_admission.as_ref().is_some_and(|check| !check.allowed()) {
+                    log_info!(self.logger, "disk_low: refusing inbound channel");
+                    // No funding transaction exists for this unaccepted request.
+                    if let Err(error) = self.channel_manager.force_close_broadcasting_latest_txn(
+                        &temporary_channel_id, &counterparty_node_id, "disk_low".into(),
+                    ) {
+                        log_error!(self.logger, "Failed to reject inbound channel: {:?}", error);
+                    }
+                    return Ok(());
+                }
 				if is_announced {
 					if let Err(err) = may_announce_channel(&*self.config) {
 						log_error!(self.logger, "Rejecting inbound announced channel from peer {} due to missing configuration: {}", counterparty_node_id, err);
@@ -1976,7 +1993,12 @@ mod bitsov_stateless_tests {
     #[tokio::test]
     async fn stateless_settlement_persists_and_duplicate_cannot_erase_receipt() {
         let dir = tempfile::tempdir().unwrap();
-        let mut builder = crate::Builder::new();
+        let accept_work = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let check = accept_work.clone();
+        let mut builder = crate::Builder::from_config(crate::Config {
+            work_admission: Some(crate::config::WorkAdmissionCheck::new(Arc::new(move || check.load(std::sync::atomic::Ordering::SeqCst)))),
+            ..Default::default()
+        });
         let claim_log = Arc::new(ClaimLog::default());
         builder.set_custom_logger(claim_log.clone());
         builder.set_network(bitcoin::Network::Regtest);
@@ -2040,6 +2062,14 @@ mod bitsov_stateless_tests {
                 }), counterparty_skimmed_fee_msat: 0, payment_id: Some(PaymentId(hash.0)),
             }
         };
+        // Disk pressure must refuse before releasing a preimage or creating a receipt.
+        accept_work.store(false, std::sync::atomic::Ordering::SeqCst);
+        claim_log.0.lock().unwrap().clear();
+        handler.handle_event(claimable(&quote, Some(metadata.clone()))).await.unwrap();
+        assert!(!claim_log.0.lock().unwrap().iter().any(|line| line.starts_with("Received payment from payment hash")));
+        assert!(node.list_payments().is_empty());
+        assert!(claim_log.0.lock().unwrap().iter().any(|line| line.contains("disk_low")));
+        accept_work.store(true, std::sync::atomic::Ordering::SeqCst);
         let expired = node.bolt11_payment().receive_stateless(2000,
             &lightning_invoice::Bolt11InvoiceDescription::Direct(lightning_invoice::Description::new("expired".into()).unwrap()), 0).unwrap();
         let mut tampered = metadata.clone(); tampered[11] ^= 1;
