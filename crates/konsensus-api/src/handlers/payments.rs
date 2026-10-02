@@ -19,6 +19,23 @@ use crate::error::ApiError;
 use crate::freshness::DataFreshness;
 use crate::state::AppState;
 
+/// Reporting only: LDK's converted PaymentDetails carry the actual routing fee.
+/// Never infer settlement from a fee, a preimage, or the authorized ceiling.
+pub(crate) fn fee_paid_msat(
+    backend: &str,
+    details: &konsensus_core::traits::lightning::PaymentDetails,
+) -> Option<u64> {
+    use konsensus_core::traits::lightning::{PaymentDirection, PaymentStatus};
+    if backend == "ldk"
+        && details.status == PaymentStatus::Settled
+        && details.direction == PaymentDirection::Outgoing
+    {
+        details.fee_msat
+    } else {
+        None
+    }
+}
+
 /// Request to create a Lightning invoice.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +70,9 @@ pub struct InvoiceResponse {
 /// Payment status response.
 #[derive(Serialize)]
 pub struct PaymentStatusResponse {
+    /// Actual settled outgoing LDK routing fee; omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_paid_msat: Option<u64>,
     /// Payment hash (hex).
     pub payment_hash: String,
     /// Status: "pending", "settled", "failed", "expired".
@@ -159,6 +179,7 @@ async fn payment_status(
     let liquidity = state.lightning.liquidity_receipt(&hash).await
         .map_err(ApiError::from)?;
     Ok(Json(PaymentStatusResponse {
+        fee_paid_msat: fee_paid_msat(&state.lightning_backend, &details),
         liquidity,
         payment_hash: details.payment_hash,
         status: format!("{:?}", details.status),
@@ -213,6 +234,9 @@ pub struct PayInvoiceRequest {
 #[derive(Serialize)]
 pub struct PayInvoiceResponse {
     pub max_routing_fee_msat: u64,
+    /// Actual settled LDK routing fee, including a proven zero; never the ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_paid_msat: Option<u64>,
     /// Payment hash (hex).
     pub payment_hash: String,
     /// Amount paid in millisatoshis.
@@ -275,6 +299,7 @@ async fn pay_invoice(
     if matches!(details.status, konsensus_core::traits::lightning::PaymentStatus::Failed | konsensus_core::traits::lightning::PaymentStatus::Expired) {
         return Err(ApiError::Lightning("invoice payment failed before settlement".into()).with_routing_fee(max_routing_fee_msat));
     }
+    let fee_paid_msat = fee_paid_msat(&state.lightning_backend, &details);
     let preimage = details.preimage.unwrap_or_else(|| {
         tracing::warn!(payment_hash = %details.payment_hash, "payment succeeded but no preimage returned");
         String::new()
@@ -282,6 +307,7 @@ async fn pay_invoice(
 
     Ok(Json(PayInvoiceResponse {
         max_routing_fee_msat,
+        fee_paid_msat,
         payment_hash: details.payment_hash,
         amount_msat: details.amount_msat,
         preimage,
@@ -307,6 +333,9 @@ pub struct KeysendRequest {
 #[derive(Serialize)]
 pub struct KeysendResponse {
     pub max_routing_fee_msat: u64,
+    /// Actual settled LDK routing fee; omitted while pending or unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_paid_msat: Option<u64>,
     /// Payment hash (hex).
     pub payment_hash: String,
     /// Amount paid in millisatoshis.
@@ -386,10 +415,12 @@ async fn keysend(
     }
     let details = paid.map_err(|e| ApiError::from(e).with_routing_fee(max_routing_fee_msat))?;
 
+    let fee_paid_msat = fee_paid_msat(&state.lightning_backend, &details);
     let preimage = details.preimage.unwrap_or_default();
 
     Ok(Json(KeysendResponse {
         max_routing_fee_msat,
+        fee_paid_msat,
         payment_hash: details.payment_hash,
         amount_msat: details.amount_msat,
         preimage,
@@ -796,4 +827,29 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/v1/payments/open-channel", post(open_channel))
         .route("/api/v1/payments/close-channel", post(close_channel))
         .route("/api/v1/payments/:hash", get(payment_status))
+}
+
+#[cfg(test)]
+mod actual_fee_tests {
+    use super::*;
+    use konsensus_core::traits::lightning::{PaymentDetails, PaymentDirection, PaymentStatus};
+
+    #[test]
+    fn fee_reporting_never_infers_settlement_or_zero() {
+        let mut details = PaymentDetails {
+            payment_hash: "ab".repeat(32), preimage: Some("cd".repeat(32)), amount_msat: 1000,
+            status: PaymentStatus::Settled, direction: PaymentDirection::Outgoing,
+            timestamp: 0, memo: None, fee_msat: None,
+        };
+        assert_eq!(fee_paid_msat("ldk", &details), None);
+        details.fee_msat = Some(0);
+        assert_eq!(fee_paid_msat("ldk", &details), Some(0));
+        for status in [PaymentStatus::Pending, PaymentStatus::InFlight, PaymentStatus::Failed, PaymentStatus::Expired] {
+            details.status = status;
+            assert_eq!(fee_paid_msat("ldk", &details), None);
+        }
+        details.status = PaymentStatus::Settled;
+        details.direction = PaymentDirection::Incoming;
+        assert_eq!(fee_paid_msat("ldk", &details), None);
+    }
 }

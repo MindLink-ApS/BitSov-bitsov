@@ -36,10 +36,22 @@ struct Recovery {
     dispatched: bool,
     expected_msat: u64,
     settlement: Option<PaymentDetails>,
+    /// Provenance of the stored message fee; legacy/backend-switched records are unknown.
+    #[serde(default)]
+    ldk_fee_evidence: bool,
     reservation: Option<Reservation>,
     fee_ceiling_msat: u64,
     admission_msat: u64,
     admission_fee_msat: Option<u64>,
+    /// Reporting only; independent of per-attempt budget fee reconciliation.
+    #[serde(default)]
+    admission_fee_paid_msat: Option<u64>,
+    /// Reporting only; old records with re-admission have unknown fees.
+    #[serde(default)]
+    readmission_fee_paid_msat: Option<u64>,
+    /// Retained receipt after recovery evidence is compacted.
+    #[serde(default)]
+    compacted_fee_paid_msat: Option<u64>,
     #[serde(default)]
     admission_pending: bool,
     #[serde(default)]
@@ -227,10 +239,14 @@ impl Operation {
         }
         if data.admission_pending {
             if data.admission_is_readmission {
+                let prior = if op.readmission_msat == 0 { Some(0) } else { data.readmission_fee_paid_msat };
+                data.readmission_fee_paid_msat = prior.and_then(|a| crate::handlers::payments::fee_paid_msat(&self.state.lightning_backend, details).and_then(|b| a.checked_add(b)));
                 op.readmission_msat = op
                     .readmission_msat
                     .saturating_add(details.amount_msat as i64);
             } else {
+                let prior = if data.admission_msat == 0 { Some(0) } else { data.admission_fee_paid_msat };
+                data.admission_fee_paid_msat = prior.and_then(|a| crate::handlers::payments::fee_paid_msat(&self.state.lightning_backend, details).and_then(|b| a.checked_add(b)));
                 data.admission_msat = data.admission_msat.saturating_add(details.amount_msat);
                 data.budget_admission_msat = data
                     .budget_admission_msat
@@ -266,6 +282,7 @@ impl Operation {
             data.admission_msat = admission_msat;
             data.budget_admission_msat = admission_msat;
             data.admission_fee_msat = None; // absent historical evidence is never a zero fee
+            data.admission_fee_paid_msat = None;
         }
         if let Some(attempt) = super::admission_journal::load(
             &self.state,
@@ -346,6 +363,7 @@ impl Operation {
         if details.payment_hash.is_empty() {
             details.payment_hash = op.payment_hash.clone().unwrap_or_default();
         }
+        data.ldk_fee_evidence = self.state.lightning_backend == "ldk";
         data.settlement = Some(details);
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await
@@ -410,7 +428,21 @@ async fn materialize(
     Ok(())
 }
 
-fn response(op: &OutboxOperation, delivered: bool) -> Result<ComposeResponse, ApiError> {
+/// Sum only proven component fees. This is independent of budget reconciliation.
+fn reported_fee_paid_msat(backend: &str, op: &OutboxOperation, data: &Recovery) -> Option<u64> {
+    if backend != "ldk" || !data.ldk_fee_evidence || data.admission_pending { return None; }
+    if op.recovery_compacted { return data.compacted_fee_paid_msat; }
+    let details = data.settlement.as_ref()?;
+    if !settlement_matches(op, data, details)
+        || u64::try_from(op.settled_msat).ok() != Some(details.amount_msat)
+    { return None; }
+    let message_fee = crate::handlers::payments::fee_paid_msat(backend, details)?;
+    let admission_fee = if data.admission_msat > 0 { data.admission_fee_paid_msat? } else { 0 };
+    let readmission_fee = if op.readmission_msat > 0 { data.readmission_fee_paid_msat? } else { 0 };
+    message_fee.checked_add(admission_fee)?.checked_add(readmission_fee)
+}
+
+fn response(backend: &str, op: &OutboxOperation, delivered: bool) -> Result<ComposeResponse, ApiError> {
     let data = recovery(op)?;
     Ok(ComposeResponse {
         operation_id: Some(op.operation_id.clone()),
@@ -422,6 +454,7 @@ fn response(op: &OutboxOperation, delivered: bool) -> Result<ComposeResponse, Ap
             "prepared" | "released" | "paid" | "sent" | "rejected_retryable"
         ),
         max_routing_fee_msat: data.fee_ceiling_msat,
+        fee_paid_msat: reported_fee_paid_msat(backend, op, &data),
         member_outcomes: None,
         message_id: op.message_id.clone().unwrap_or_default(),
         delivered,
@@ -575,7 +608,7 @@ async fn compose_locked(
         // delta2 #3). Never a release here: an unpaid one is paid again below.
         crate::calls::settle_operation(state.storage.as_ref(), &op, false).await;
         match op.state.as_str() {
-            "acked" => return Ok(Json(response(&op, true)?)),
+            "acked" => return Ok(Json(response(&state.lightning_backend, &op, true)?)),
             "paid" | "sent" | "rejected_retryable" => {
                 let delivered = resend(&state, &op).await?;
                 return wait_response(&state, &id, req.wait_ack_ms, delivered).await;
@@ -735,7 +768,7 @@ async fn wait_response(
             )
             || tokio::time::Instant::now() >= deadline
         {
-            return Ok(Json(response(&op, delivered)?));
+            return Ok(Json(response(&state.lightning_backend, &op, delivered)?));
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -758,6 +791,7 @@ pub(super) async fn get_operation(
         .map_err(storage)?
         .ok_or_else(|| ApiError::NotFound("operation not found".into()))?;
     Ok(Json(response(
+        &state.lightning_backend,
         &op,
         op.last_sent_at.is_some() || op.state == "acked",
     )?))
@@ -844,8 +878,16 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
                 };
                 let admission_reservation = data.admission_reservation.clone();
                 if data.admission_is_readmission {
+                    if principal > 0 {
+                        let prior = if op.readmission_msat == 0 { Some(0) } else { data.readmission_fee_paid_msat };
+                        data.readmission_fee_paid_msat = prior.and_then(|a| crate::handlers::payments::fee_paid_msat(&state.lightning_backend, &details).and_then(|b| a.checked_add(b)));
+                    }
                     op.readmission_msat = op.readmission_msat.saturating_add(principal as i64);
                 } else {
+                    if principal > 0 {
+                        let prior = if data.admission_msat == 0 { Some(0) } else { data.admission_fee_paid_msat };
+                        data.admission_fee_paid_msat = prior.and_then(|a| crate::handlers::payments::fee_paid_msat(&state.lightning_backend, &details).and_then(|b| a.checked_add(b)));
+                    }
                     data.admission_msat = data.admission_msat.saturating_add(principal);
                     data.budget_admission_msat = data.budget_admission_msat.saturating_add(principal);
                     data.admission_fee_msat = data.admission_fee_msat.and_then(|prior| fee.and_then(|f| prior.checked_add(f)));
@@ -901,6 +943,7 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
         recover_budget(state, op).await?;
         return Ok(());
     }
+    let mut ldk_fee_evidence = data.ldk_fee_evidence;
     let details = match &data.settlement {
         Some(p)
             if matches!(p.status, PaymentStatus::Failed | PaymentStatus::Expired)
@@ -909,7 +952,10 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
             Some(p.clone())
         }
         _ => match &op.payment_hash {
-            Some(hash) => state.lightning.get_payment_status(hash).await.ok(),
+            Some(hash) => {
+                ldk_fee_evidence = state.lightning_backend == "ldk";
+                state.lightning.get_payment_status(hash).await.ok()
+            },
             None => None,
         },
     };
@@ -947,6 +993,7 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
         }
         PaymentStatus::Settled => {
             op.settled_msat = i64::try_from(details.amount_msat).map_err(storage)?;
+            data.ldk_fee_evidence = ldk_fee_evidence;
             data.settlement = Some(details.clone());
             queue_message_resolution(&mut data, details.amount_msat, details.fee_msat);
             let Some(preimage) = settlement_preimage(&details) else {
@@ -1291,7 +1338,10 @@ async fn compact_terminal_operations(
             if op.accounting_pending {
                 return save(state, &mut op).await;
             }
+            let compacted_fee_paid_msat = reported_fee_paid_msat(&state.lightning_backend, &op, &data);
             let receipt = Recovery {
+                ldk_fee_evidence: data.ldk_fee_evidence,
+                compacted_fee_paid_msat,
                 caller: data.caller,
                 fee_ceiling_msat: data.fee_ceiling_msat,
                 admission_msat: data.admission_msat,
@@ -1466,4 +1516,102 @@ fn incomplete_settled_recovery(op: &OutboxOperation) -> bool {
         Some("settled payment has no valid proof")
             | Some("settled payment missing encrypted draft")
     )
+}
+
+#[cfg(test)]
+mod actual_fee_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn receipt(fee: Option<u64>) -> (OutboxOperation, Recovery) {
+        let mut op = OutboxOperation::prepared("fee-test".into(), "peer".into(), 1, "request".into());
+        op.payment_hash = Some("ab".repeat(32));
+        op.settled_msat = 1000;
+        op.state = "paid".into();
+        let data = Recovery {
+            expected_msat: 1000,
+            ldk_fee_evidence: true,
+            settlement: Some(PaymentDetails {
+                payment_hash: "ab".repeat(32), preimage: Some("cd".repeat(32)),
+                amount_msat: 1000, status: PaymentStatus::Settled,
+                direction: PaymentDirection::Outgoing, timestamp: 0, memo: None, fee_msat: fee,
+            }),
+            fee_ceiling_msat: 5000,
+            ..Default::default()
+        };
+        (op, data)
+    }
+
+    fn wire(backend: &str, mut op: OutboxOperation, data: Recovery) -> Value {
+        encode(&mut op, &data).unwrap();
+        serde_json::to_value(response(backend, &op, false).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn aggregate_fee_requires_all_settled_components_and_preserves_zero() {
+        for fee in [0, 400] {
+            let (op, data) = receipt(Some(fee));
+            let result = wire("ldk", op, data);
+            assert_eq!(result["fee_paid_msat"], fee);
+            assert_eq!(result["max_routing_fee_msat"], 5000);
+            assert_eq!(result["amount_msat"], 1000);
+        }
+        let (mut op, mut data) = receipt(Some(400));
+        data.admission_msat = 2000;
+        data.admission_fee_paid_msat = Some(30);
+        op.readmission_msat = 3000;
+        data.readmission_fee_paid_msat = Some(20);
+        // A retry resets budgeting fees, but must retain all reporting evidence.
+        data.admission_fee_msat = Some(0);
+        assert_eq!(wire("ldk", op.clone(), data.clone())["fee_paid_msat"], 450);
+        data.readmission_fee_paid_msat = None;
+        assert!(wire("ldk", op.clone(), data.clone()).get("fee_paid_msat").is_none());
+        op.readmission_msat = 0;
+        data.admission_fee_paid_msat = None;
+        assert!(wire("ldk", op.clone(), data.clone()).get("fee_paid_msat").is_none());
+        data.admission_fee_paid_msat = Some(u64::MAX);
+        assert!(wire("ldk", op, data).get("fee_paid_msat").is_none());
+    }
+
+    #[test]
+    fn unknown_pending_or_mismatched_evidence_omits_fee_and_preserves_existing_result() {
+        let (op, data) = receipt(None);
+        let old_result = json!({"operation_id":"fee-test", "state":"paid", "accepted":false,
+            "payment_hash":"ab".repeat(32), "retry_allowed":true, "max_routing_fee_msat":5000,
+            "message_id":"", "delivered":false, "amount_msat":1000});
+        assert_eq!(wire("ldk", op, data), old_result);
+        let (mut checkpoint, data) = receipt(Some(400));
+        checkpoint.settled_msat = 0;
+        assert!(wire("ldk", checkpoint, data).get("fee_paid_msat").is_none());
+        for status in [PaymentStatus::Pending, PaymentStatus::InFlight, PaymentStatus::Failed, PaymentStatus::Expired] {
+            let (op, mut data) = receipt(Some(0));
+            data.settlement.as_mut().unwrap().status = status;
+            assert!(wire("ldk", op, data).get("fee_paid_msat").is_none());
+        }
+        for mutation in 0..5 {
+            let (op, mut data) = receipt(Some(400));
+            match mutation {
+                0 => data.settlement.as_mut().unwrap().direction = PaymentDirection::Incoming,
+                1 => data.settlement.as_mut().unwrap().payment_hash = "ef".repeat(32),
+                2 => data.settlement.as_mut().unwrap().amount_msat = 2000,
+                3 => data.admission_pending = true,
+                _ => data.ldk_fee_evidence = false,
+            }
+            assert!(wire("ldk", op, data).get("fee_paid_msat").is_none());
+        }
+        for backend in ["lnd", "lnbits", "mock"] {
+            let (op, data) = receipt(Some(400));
+            assert!(wire(backend, op, data).get("fee_paid_msat").is_none());
+        }
+    }
+
+    #[test]
+    fn compacted_receipt_preserves_known_fee_but_legacy_receipts_stay_unknown() {
+        let (mut op, data) = receipt(Some(400));
+        let fee = reported_fee_paid_msat("ldk", &op, &data);
+        op.recovery_compacted = true;
+        let compacted = Recovery { ldk_fee_evidence: true, compacted_fee_paid_msat: fee, fee_ceiling_msat: 5000, ..Default::default() };
+        assert_eq!(wire("ldk", op.clone(), compacted)["fee_paid_msat"], 400);
+        assert!(wire("ldk", op, Recovery::default()).get("fee_paid_msat").is_none());
+    }
 }

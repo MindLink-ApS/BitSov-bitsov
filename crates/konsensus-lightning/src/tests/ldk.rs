@@ -1023,3 +1023,26 @@ fn channel_fee_announcement_preflight_never_calls_ldk_when_unavailable() {
             if reason.contains("announce_unavailable")));
     }
 }
+
+/// API reports must preserve the distinction between a direct-channel zero
+/// and missing LDK evidence. Both invoice and keysend use this conversion.
+#[test]
+fn actual_fee_conversion_preserves_zero_and_unknown() {
+    use ldk_node::lightning::ln::channelmanager::PaymentId;
+    use ldk_node::lightning_types::payment::{PaymentHash, PaymentPreimage};
+    for fee in [Some(0), Some(400), None] {
+        let details = ldk_node::payment::PaymentDetails {
+            id: PaymentId([1; 32]),
+            kind: LdkPaymentKind::Spontaneous {
+                hash: PaymentHash([2; 32]), preimage: Some(PaymentPreimage([3; 32])),
+            },
+            amount_msat: Some(1000), fee_paid_msat: fee,
+            direction: ldk_node::payment::PaymentDirection::Outbound,
+            status: LdkPaymentStatus::Succeeded, latest_update_timestamp: 0,
+        };
+        let result = convert_payment_details(&details);
+        assert_eq!(result.fee_msat, fee);
+        assert_eq!(result.amount_msat, 1000);
+        assert_eq!(result.status, PaymentStatus::Settled);
+    }
+}
