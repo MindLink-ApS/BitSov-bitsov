@@ -23,6 +23,7 @@ type Route = (&'static str, &'static str, &'static str); // method, uri, body
 
 /// Moving value. Must be refused a loopback token.
 const SPEND_ROUTES: &[Route] = &[
+    ("POST", "/api/v1/payments/release-local-spend", r#"{"txid":"abababababababababababababababababababababababababababababababab"}"#),
     ("POST", "/api/v1/payments/pay", r#"{"invoice":"lnbc1"}"#),
     ("POST", "/api/v1/payments/keysend", r#"{"node_id":"ab","amount_msat":1000}"#),
     ("POST", "/api/v1/payments/send-onchain", r#"{"address":"bc1q","amount_sat":1000}"#),

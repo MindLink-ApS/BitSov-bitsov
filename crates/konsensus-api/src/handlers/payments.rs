@@ -687,9 +687,9 @@ async fn open_channel(
         validate_fee_rate_sat_per_vb(rate)
             .map_err(|e| ApiError::NotDispatched(e.to_string()))?;
     }
-    let channel_id = state
+    let result = state
         .lightning
-        .open_channel(
+        .open_channel_with_status(
             &req.peer_pubkey,
             &req.peer_addr,
             req.amount_sats,
@@ -700,10 +700,34 @@ async fn open_channel(
         .map_err(ApiError::from)?;
 
     Ok(Json(serde_json::json!({
-        "channel_id": channel_id,
+        "channel_id": result.channel_id,
+        "funding_txid": result.funding_txid,
         "peer_pubkey": req.peer_pubkey,
         "amount_sats": req.amount_sats,
-        "status": "opening"
+        "status": result.status
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseLocalSpendRequest {
+    pub txid: String,
+}
+
+async fn release_local_spend(
+    State(state): State<Arc<AppState>>,
+    // ScopedAuth<Spend> explicitly rejects pairing-bound tokens.
+    _owner: ScopedAuth<Spend>,
+    Json(req): Json<ReleaseLocalSpendRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.txid.len() != 64 || !req.txid.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest("txid must be 32 bytes of hex".into()));
+    }
+    state.lightning.release_local_spend(&req.txid).await.map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({
+        "txid": req.txid,
+        "status": "released",
+        "warning": "The signed transaction may still propagate; inspect the transaction and channel before spending released inputs."
     })))
 }
 
@@ -825,6 +849,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/v1/payments/funding-address", get(get_funding_address))
         .route("/api/v1/payments/send-onchain", post(send_onchain))
         .route("/api/v1/payments/open-channel", post(open_channel))
+        .route("/api/v1/payments/release-local-spend", post(release_local_spend))
         .route("/api/v1/payments/close-channel", post(close_channel))
         .route("/api/v1/payments/:hash", get(payment_status))
 }

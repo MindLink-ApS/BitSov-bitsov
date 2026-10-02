@@ -106,6 +106,34 @@ pub struct WalletBalanceBreakdown {
     pub contested_sats: Option<u64>,
 }
 
+/// Funding visibility is independent of whether channel negotiation was accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelOpenStatus {
+    Opening,
+    PendingVisibility,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelOpenResult {
+    pub channel_id: String,
+    pub funding_txid: Option<String>,
+    pub status: ChannelOpenStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LocalSpendDiagnostics {
+    pub unreadable_rows: u64,
+    pub reservations: Vec<LocalSpendReservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalSpendReservation {
+    pub txid: String,
+    pub created_at: u64,
+    pub last_seen_at: Option<u64>,
+}
+
 /// Information about a Lightning channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInfo {
@@ -743,6 +771,24 @@ pub trait LightningProvider: Send + Sync {
         Err(LightningError::PaymentNotDispatched(
             "open_channel not supported by this provider".into(),
         ))
+    }
+
+    /// Detailed result for callers that need to distinguish funding visibility.
+    async fn open_channel_with_status(
+        &self, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
+        announce: bool, fee_rate_sat_per_vb: Option<f32>,
+    ) -> Result<ChannelOpenResult, LightningError> {
+        let channel_id = self.open_channel(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb).await?;
+        Ok(ChannelOpenResult { channel_id, funding_txid: None, status: ChannelOpenStatus::Opening })
+    }
+
+    fn local_spend_diagnostics(&self) -> LocalSpendDiagnostics {
+        LocalSpendDiagnostics::default()
+    }
+
+    /// Explicit abandonment, exposed only to an authenticated owner.
+    async fn release_local_spend(&self, _txid: &str) -> Result<(), LightningError> {
+        Err(LightningError::Backend("local spend release not supported".into()))
     }
 
     /// Close a Lightning channel by user channel ID.

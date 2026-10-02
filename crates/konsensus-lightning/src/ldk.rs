@@ -575,7 +575,7 @@ impl LdkProvider {
         let liquidity = config.liquidity.selected()?.map(|p| LiquidityClient::new(
             p.node_id.clone(), Arc::new(LdkJitBackend(Arc::clone(&node))),
         ));
-        Ok(Self {
+        let provider = Self {
             sync_baseline: (baseline.latest_lightning_wallet_sync_timestamp, baseline.latest_onchain_wallet_sync_timestamp),
             routing_fee_policy: Default::default(),
             liquidity,
@@ -589,7 +589,13 @@ impl LdkProvider {
             drainer_shutdown,
             inbound_tx,
             outgoing_tx,
-        })
+        };
+        // Reconcile durable reservations against the selected chain source on
+        // startup, then retry periodically. Source failure never unlocks coins.
+        let mut cursor = None;
+        crate::onchain::reconcile_local_spends(&provider.node, &provider.chain_visibility(), &mut cursor).await;
+        provider.spawn_reservation_reconciler(cursor);
+        Ok(provider)
     }
 
     /// Create an LdkProvider from an already-started LDK node (for testing).
@@ -633,6 +639,19 @@ impl LdkProvider {
             bitcoind: self.bitcoind.clone(),
             electrum: self.electrum.clone(),
         }
+    }
+
+    fn spawn_reservation_reconciler(&self, mut cursor: Option<ldk_node::bitcoin::Txid>) {
+        let node = self.node.clone();
+        let chain = self.chain_visibility();
+        let shutdown = self.drainer_shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                if shutdown.load(Ordering::Relaxed) { break; }
+                crate::onchain::reconcile_local_spends(&node, &chain, &mut cursor).await;
+            }
+        });
     }
 
     /// L0g (2026-04-30): the LDK event drainer.
@@ -1501,6 +1520,17 @@ impl LightningProvider for LdkProvider {
         announce: bool,
         fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
+        Ok(self.open_channel_with_status(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb).await?.channel_id)
+    }
+
+    async fn open_channel_with_status(
+        &self,
+        peer_pubkey: &str,
+        peer_addr: &str,
+        amount_sats: u64,
+        announce: bool,
+        fee_rate_sat_per_vb: Option<f32>,
+    ) -> Result<konsensus_core::traits::lightning::ChannelOpenResult, LightningError> {
         let node = self.node.clone();
         let chain = self.chain_visibility();
         let peer_pubkey = peer_pubkey.to_owned();
@@ -1525,11 +1555,33 @@ impl LightningProvider for LdkProvider {
                 let visible = chain.tx_visible(id.clone()).await?;
                 if visible {
                     let txid = id.parse().map_err(|e| format!("invalid funding txid: {e}"))?;
-                    node.transaction_broadcast_verified(txid).map_err(|e| e.to_string())?;
+                    if let Err(error) = node.transaction_broadcast_verified(txid) {
+                        tracing::warn!(%txid, %error, "funding visible but reservation persistence failed");
+                    }
                 }
                 Ok(visible)
                 }
             }).await
+        }).await
+    }
+
+    fn local_spend_diagnostics(&self) -> konsensus_core::traits::lightning::LocalSpendDiagnostics {
+        use konsensus_core::traits::lightning::{LocalSpendDiagnostics, LocalSpendReservation};
+        LocalSpendDiagnostics {
+            unreadable_rows: self.node.local_spend_unreadable_rows(),
+            reservations: self.node.local_spend_reservations().into_iter().map(|r| LocalSpendReservation {
+                txid: r.txid.to_string(), created_at: r.created_at, last_seen_at: r.last_seen_at,
+            }).collect(),
+        }
+    }
+
+    async fn release_local_spend(&self, txid: &str) -> Result<(), LightningError> {
+        let txid = txid.parse().map_err(|_| LightningError::Backend("invalid reservation txid".into()))?;
+        let node = self.node.clone();
+        self.onchain_operations.run(async move {
+            tokio::task::spawn_blocking(move || node.release_local_spend(txid)).await
+                .map_err(|e| LightningError::Backend(e.to_string()))?
+                .map_err(|e| LightningError::Backend(e.to_string()))
         }).await
     }
 

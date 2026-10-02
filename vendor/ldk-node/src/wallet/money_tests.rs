@@ -434,3 +434,204 @@ fn manual_broadcast_outpoint_discard_releases_inputs_and_is_idempotent() {
 	let next = funding(&node.wallet, 4);
 	assert_eq!(next.input[0].previous_output, first.input[0].previous_output);
 }
+
+#[test]
+fn malformed_reservation_does_not_prevent_restart() {
+	let dir = tempfile::tempdir().unwrap();
+	let first = node(dir.path());
+	let store = first.wallet.persister.lock().unwrap().kv_store.clone();
+	lightning::util::persist::KVStoreSync::write(
+		&*store,
+		"bitsov_local_spends",
+		"",
+		"bad-row",
+		vec![9],
+	)
+	.unwrap();
+	drop(first);
+	let restarted = node(dir.path());
+	assert_eq!(restarted.local_spend_unreadable_rows(), 1);
+}
+
+#[test]
+fn failed_bdk_persist_does_not_pin_prebroadcast_funding() {
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	// An uninitialized BDK persister fails writes, while the reservation store
+	// remains writable. This reproduces KV success followed by BDK failure.
+	let store = node.wallet.persister.lock().unwrap().kv_store.clone();
+	let replacement = KVStoreWalletPersister::new(store.clone(), node.logger.clone());
+	let original = std::mem::replace(&mut *node.wallet.persister.lock().unwrap(), replacement);
+	assert!(small_funding(&node.wallet).is_err());
+	assert!(
+		lightning::util::persist::KVStoreSync::list(&*store, "bitsov_local_spends", "")
+			.unwrap()
+			.is_empty()
+	);
+	*node.wallet.persister.lock().unwrap() = original;
+	let first = funding(&node.wallet, 2);
+	let second = funding(&node.wallet, 3);
+	assert_distinct_inputs(&first, &second);
+}
+
+fn send(wallet: &Wallet) -> Txid {
+	let address = wallet.get_new_address().unwrap();
+	wallet
+		.send_to_address(
+			&address,
+			OnchainSendAmount::ExactRetainingReserve {
+				amount_sats: 80_000,
+				cur_anchor_reserve_sats: 0,
+			},
+			Some(FeeRate::from_sat_per_vb(2).unwrap()),
+		)
+		.unwrap()
+}
+
+// Age the durable record, not the wall clock. Restart must use stored times.
+fn age_reservation(node: &crate::Node, txid: Txid, at: u64, last_seen: Option<u64>) {
+	use lightning::util::persist::KVStoreSync;
+	let store = node.wallet.persister.lock().unwrap().kv_store.clone();
+	let mut bytes =
+		KVStoreSync::read(&*store, "bitsov_local_spends", "", &txid.to_string()).unwrap();
+	bytes[3..11].copy_from_slice(&at.to_le_bytes());
+	bytes[11..19].copy_from_slice(&last_seen.unwrap_or(0).to_le_bytes());
+	KVStoreSync::write(&*store, "bitsov_local_spends", "", &txid.to_string(), bytes).unwrap();
+	*node.wallet.local_spends.lock().unwrap() = local_spends::LocalSpends::load(store).unwrap();
+}
+
+#[test]
+fn stranded_send_released_after_window_and_restart_reconciliation() {
+	for restart in [false, true] {
+		let dir = tempfile::tempdir().unwrap();
+		let mut node = node(dir.path());
+		fund(&node.wallet);
+		let txid = send(&node.wallet);
+		let _other = funding(&node.wallet, 3);
+		let now = local_spends::now();
+		age_reservation(&node, txid, now - 86_401, None);
+		if restart {
+			drop(node);
+			node = self::node(dir.path());
+		}
+		// A mere restart/old age is insufficient: an actual successful absence
+		// lookup is required, so source outages cannot unlock uncertain spends.
+		assert!(small_funding(&node.wallet).is_err());
+		node.reconcile_local_spend(txid, false).unwrap();
+		assert!(node
+			.local_spend_reservations()
+			.iter()
+			.all(|r| r.txid != txid));
+		let next = funding(&node.wallet, 4);
+		assert!(next.input.iter().all(|i| i.previous_output.txid != txid));
+		drop(node);
+		assert!(self::node(dir.path())
+			.local_spend_reservations()
+			.iter()
+			.all(|r| r.txid != txid));
+	}
+}
+
+#[test]
+fn recent_sighting_extends_window_and_absence_before_window_retains_inputs() {
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	let txid = send(&node.wallet);
+	let now = local_spends::now();
+	age_reservation(&node, txid, now - 172_800, Some(now - 60));
+	node.reconcile_local_spend(txid, false).unwrap();
+	assert!(node
+		.local_spend_reservations()
+		.iter()
+		.any(|r| r.txid == txid));
+	node.reconcile_local_spend(txid, true).unwrap();
+	assert!(
+		node.local_spend_reservations()
+			.iter()
+			.find(|r| r.txid == txid)
+			.unwrap()
+			.last_seen_at
+			.unwrap() >= now
+	);
+}
+
+#[test]
+fn owner_release_recycles_only_requested_reservation_and_survives_restart() {
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	let first = funding(&node.wallet, 2);
+	let second = funding(&node.wallet, 3);
+	node.release_local_spend(first.compute_txid()).unwrap();
+	node.release_local_spend(first.compute_txid()).unwrap();
+	drop(node);
+	let node = self::node(dir.path());
+	assert_eq!(node.local_spend_reservations().len(), 1);
+	assert_eq!(
+		node.local_spend_reservations()[0].txid,
+		second.compute_txid()
+	);
+	assert_eq!(
+		funding(&node.wallet, 4).input[0].previous_output,
+		first.input[0].previous_output
+	);
+}
+
+#[test]
+fn legacy_reservation_age_is_migrated_once_and_confirmation_removes_record() {
+	use lightning::util::persist::KVStoreSync;
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	let tx = funding(&node.wallet, 2);
+	let store = node.wallet.persister.lock().unwrap().kv_store.clone();
+	let mut legacy = vec![0, 0];
+	legacy.extend(bitcoin::consensus::serialize(&tx));
+	KVStoreSync::write(
+		&*store,
+		"bitsov_local_spends",
+		"",
+		&tx.compute_txid().to_string(),
+		legacy,
+	)
+	.unwrap();
+	drop(node);
+	let node = self::node(dir.path());
+	let created = node.local_spend_reservations()[0].created_at;
+	assert!(created > 0);
+	drop(node);
+	let node = self::node(dir.path());
+	assert_eq!(node.local_spend_reservations()[0].created_at, created);
+	let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+	block.header.prev_blockhash = node.wallet.current_best_block().block_hash;
+	block.txdata = vec![tx];
+	node.wallet.block_connected(&block, 2);
+	assert!(node.local_spend_reservations().is_empty());
+}
+
+#[test]
+fn owner_release_keeps_retry_record_if_bdk_eviction_persist_fails() {
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	let first = funding(&node.wallet, 2);
+	funding(&node.wallet, 3);
+	let store = node.wallet.persister.lock().unwrap().kv_store.clone();
+	*node.wallet.persister.lock().unwrap() =
+		KVStoreWalletPersister::new(store, node.logger.clone());
+	assert!(node.release_local_spend(first.compute_txid()).is_err());
+	drop(node);
+	let node = self::node(dir.path());
+	assert!(node
+		.local_spend_reservations()
+		.iter()
+		.any(|r| r.txid == first.compute_txid()));
+	assert!(small_funding(&node.wallet).is_err());
+	node.release_local_spend(first.compute_txid()).unwrap();
+	assert_eq!(
+		funding(&node.wallet, 4).input[0].previous_output,
+		first.input[0].previous_output
+	);
+}

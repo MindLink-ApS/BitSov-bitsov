@@ -617,6 +617,8 @@ where
 						}
 					},
 					Err(err) => {
+						// create_funding_transaction abandons its reservation before
+						// returning a persistence error: no tx has reached LDK yet.
 						log_error!(self.logger, "Failed to create funding transaction: {}", err);
 						self.channel_manager
 							.force_close_broadcasting_latest_txn(

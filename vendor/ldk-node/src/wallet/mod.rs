@@ -44,7 +44,10 @@ use lightning::sign::{
 };
 use lightning::util::message_signing;
 use lightning_invoice::RawBolt11Invoice;
+use lightning::log_warn;
 use persist::KVStoreWalletPersister;
+pub use local_spends::LocalSpendReservation;
+pub(crate) use local_spends::now as reservation_time;
 
 use crate::config::Config;
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
@@ -89,6 +92,9 @@ impl Wallet {
 		logger: Arc<Logger>,
 	) -> Result<Self, Error> {
 		let local_spends = local_spends::LocalSpends::load(Arc::clone(&wallet_persister.kv_store))?;
+		if local_spends.unreadable_rows > 0 {
+			log_warn!(logger, "Skipped {} malformed/unreadable local spend rows; inspect reservation diagnostics", local_spends.unreadable_rows);
+		}
 		let inner = Mutex::new(wallet);
 		let persister = Mutex::new(wallet_persister);
 		Ok(Self {
@@ -321,12 +327,27 @@ impl Wallet {
 			.duration_since(std::time::UNIX_EPOCH)
 			.map_err(|_| Error::WalletOperationFailed)?
 			.as_secs();
-		self.local_spends.lock().unwrap().record(tx, bump)?;
-		wallet.apply_unconfirmed_txs([(tx.clone(), now)]);
-		wallet.persist(&mut self.persister.lock().unwrap()).map_err(|e| {
-			log_error!(self.logger, "Failed to persist outgoing transaction: {}", e);
-			Error::PersistenceFailed
-		})?;
+		let result = (|| {
+			self.local_spends.lock().unwrap().record(tx, bump)?;
+			wallet.apply_unconfirmed_txs([(tx.clone(), now)]);
+			wallet.persist(&mut self.persister.lock().unwrap()).map_err(|e| {
+				log_error!(self.logger, "Failed to persist outgoing transaction: {}", e);
+				Error::PersistenceFailed
+			})?;
+			Ok(())
+		})();
+		if let Err(error) = result {
+			// No transaction has escaped to LDK/the broadcaster. Roll back even
+			// if BDK persistence is still broken; never leave the KV owner pinned.
+			if let Err(cleanup) = self.abandon_funding_inner(wallet, tx) {
+				log_error!(self.logger, "Pre-broadcast cleanup persistence failed: {}", cleanup);
+				// This tx has never escaped to LDK/the broadcaster. Unlike an
+				// ordinary owner/expiry release, remove its KV owner even if
+				// the BDK rollback could not be persisted yet.
+				self.local_spends.lock().unwrap().abandon(tx.compute_txid())?;
+			}
+			return Err(error);
+		}
 		Ok(())
 	}
 
@@ -363,20 +384,56 @@ impl Wallet {
 		Ok(())
 	}
 
-	/// Only for LDK's definitive pre-broadcast rejection / DiscardFunding event.
-	/// Chain-source absence alone must NEVER release local input ownership.
-	pub(crate) fn abandon_funding(&self, tx: &Transaction) -> Result<(), Error> {
+	pub(crate) fn local_spend_reservations(&self) -> Vec<LocalSpendReservation> {
+		self.local_spends.lock().unwrap().reservations()
+	}
+
+	pub(crate) fn local_spend_unreadable_rows(&self) -> u64 {
+		self.local_spends.lock().unwrap().unreadable_rows
+	}
+
+	/// Called only after a successful source lookup reports absence. Errors
+	/// must not be passed as absence. The age check and eviction share the wallet lock.
+	pub(crate) fn reconcile_absent_spend(&self, txid: Txid, at: u64) -> Result<bool, Error> {
 		let mut wallet = self.inner.lock().unwrap();
-		let now = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map_err(|_| Error::WalletOperationFailed)?
-			.as_secs()
-			.saturating_add(1);
+		self.reconcile_confirmed_spends(&wallet)?;
+		let tx = {
+			let local = self.local_spends.lock().unwrap();
+			if !local.expired(txid, at) { return Ok(false); }
+			local.transaction(txid)
+		};
+		if let Some(tx) = tx {
+			self.abandon_funding_inner(&mut wallet, &tx)?;
+			log_warn!(self.logger, "Released local spend {} after bounded chain-source absence; transaction may still propagate", txid);
+			return Ok(true);
+		}
+		Ok(false)
+	}
+
+	/// Owner-directed abandonment. The caller must hold the operation gate and
+	/// authenticate the owner; an old signed transaction may still propagate.
+	pub(crate) fn release_local_spend(&self, txid: Txid) -> Result<(), Error> {
+		let mut wallet = self.inner.lock().unwrap();
+		let tx = self.local_spends.lock().unwrap().transaction(txid);
+		if let Some(tx) = tx {
+			self.abandon_funding_inner(&mut wallet, &tx)?;
+			log_warn!(self.logger, "Owner released local spend {}; transaction may still propagate", txid);
+		}
+		Ok(())
+	}
+
+	pub(crate) fn abandon_funding(&self, tx: &Transaction) -> Result<(), Error> {
+		self.abandon_funding_inner(&mut self.inner.lock().unwrap(), tx)
+	}
+
+	fn abandon_funding_inner(&self, wallet: &mut PersistedWallet<KVStoreWalletPersister>, tx: &Transaction) -> Result<(), Error> {
+		let now = local_spends::now().saturating_add(1);
 		wallet.cancel_tx(tx);
 		wallet.apply_evicted_txs([(tx.compute_txid(), now)]);
-		wallet
-			.persist(&mut self.persister.lock().unwrap())
+		wallet.persist(&mut self.persister.lock().unwrap())
 			.map_err(|_| Error::PersistenceFailed)?;
+		// Retain durable retry ownership if eviction cannot be persisted. A
+		// restart must still be able to reconcile an already-broadcast spend.
 		self.local_spends.lock().unwrap().abandon(tx.compute_txid())
 	}
 

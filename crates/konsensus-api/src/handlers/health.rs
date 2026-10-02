@@ -22,6 +22,7 @@ use crate::state::AppState;
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
+    pub local_spends: konsensus_core::traits::lightning::LocalSpendDiagnostics,
     /// Failed row reads since startup (repeat scans count again).
     pub storage_unreadable_rows: u64,
     /// Warning latched after a list has >=50% unreadable rows; clears on restart.
@@ -243,6 +244,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
     let chain_sync = state.lightning.chain_sync_status();
     let storage_health = state.storage.storage_read_health();
     Json(HealthResponse {
+        local_spends: state.lightning.local_spend_diagnostics(),
         storage_unreadable_rows: storage_health.storage_unreadable_rows,
         storage_key_mismatch: storage_health.storage_key_mismatch,
         disk_low: disk.is_some_and(|s| s.disk_low),

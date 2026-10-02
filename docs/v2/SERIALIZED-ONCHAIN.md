@@ -16,10 +16,13 @@ LDK regenerates unresolved bump events on restart.
 
 An open waits up to 60 seconds for the funding outpoint, then up to 10 seconds for
 the configured Bitcoin Core, Electrum, or Esplora source to report the transaction.
-It returns the same channel ID on success. Missing funding, source failure, and
-unseen transactions produce an error with channel/transaction context. These are
-uncertain outcomes, not proof that no transaction was dispatched. No automatic
-force-close or retry is added. Cooperative close waits for LDK to remove the
+It returns the same channel ID on success. The detailed API returns `opening`
+when the funding tx is visible, or successful `pending_visibility` with the
+channel ID and funding txid after the visibility window. Lookup errors are retried
+through the whole window and do not imply broadcast rejection. A reservation
+persistence failure after a positive sighting is logged without misreporting the
+open as failed. Missing funding still reports an uncertain handshake outcome;
+no automatic force-close or retry is added. Cooperative close waits for LDK to remove the
 channel, with a 60-second bound; a timeout reports uncertainty.
 
 ## Wallet invariant
@@ -32,11 +35,37 @@ that is not yet in its mempool; eviction must not release its reserved inputs.
 Unverified change is also excluded until source visibility or confirmation.
 
 Records live in the node's existing KV store under `bitsov_local_spends`, keyed by
-txid. Corrupt/unreadable records fail wallet startup. Definitive LDK funding
-rejection or `DiscardFunding` evicts the prepared parent and releases its inputs.
-Mempool absence and verification timeout alone never release ownership. A
-confirmed conflicting replacement releases the superseded transaction's unused
-inputs. Both transaction-based sync and Core's block listener update this state.
+txid. Version 2 records creation and last-source-sighting Unix times; legacy rows
+receive a durable migration timestamp once. Malformed/unreadable rows are skipped
+with a warning and counted at `/api/v1/status` under `local_spends.unreadable_rows`;
+active reservation txids and timestamps are listed there too. A failure to list
+the namespace or persist a migration remains a storage error.
+
+Definitive LDK funding rejection or `DiscardFunding` evicts the prepared parent
+and releases its inputs. A pre-broadcast persistence failure runs abandonment
+before returning, including KV cleanup even if BDK persistence is still broken.
+Confirmation removes the reservation; a confirmed conflicting replacement also
+releases the superseded transaction's unused inputs. Both transaction-based sync
+and Core's block listener update this state.
+
+The adapter queries the configured chain source at startup and every minute.
+Each pass has a total 10-second budget, releases the gate between reservations,
+and resumes after the last attempted txid so a stalled row cannot starve others.
+Successful absence releases a reservation only after 24 hours since creation or
+the last successful sighting, whichever is later. A recent eviction, lookup
+failure, or verification timeout alone cannot unlock coins. BDK eviction is
+persisted before ordinary release so abandoned change cannot be selected after
+restart. Eviction persistence failure retains the reservation for owner/reconcile
+retry; pre-broadcast construction rollback is the exception because no signed
+transaction escaped. Source errors retain the record for a subsequent retry.
+
+`POST /api/v1/payments/release-local-spend` accepts `{ "txid": "<64 hex>" }` and
+requires the owner's spend token. The existing `ScopedAuth<Spend>` extractor
+rejects pairing-bound tokens, including budget grants. Recovery is available
+without `money_ready`; it serializes with opens/sends/bumps. Release is specific
+and idempotent. Its response warns that the signed transaction may still propagate;
+the owner must inspect channel/transaction state before spending released inputs.
+Bounded absence likewise does not prove a transaction can never return.
 
 Close fee bumps still use LDK's selector and fee/weight calculations. Its candidate
 view prefers free inputs and inputs belonging to the same persisted claim,
@@ -52,7 +81,9 @@ unstarted nodes: concurrent funding, send/funding ordering, eviction and restart
 unverified change, definitive abandonment, close fee inputs, stale selection,
 claim-specific selection after restart, RBF fallback, direct Core confirmation,
 and confirmed replacement cleanup. Async tests cover cancellation-safe gating,
-node independence, bounded funding failure, and the unchanged successful result.
+node independence, bounded funding failure, retried lookup errors, pending
+visibility success, and the unchanged channel ID. HTTP tests cover the successful
+pending response, owner release, pairing refusal, and status diagnostics.
 
 HTTP-fixture and live-node suites require sockets and are excluded from this job's
 no-network run. Standalone vendored clippy has pre-existing failures (254 on the

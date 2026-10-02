@@ -2,7 +2,7 @@
 
 use std::{future::Future, sync::Arc, time::Duration};
 
-use konsensus_core::traits::lightning::LightningError;
+use konsensus_core::traits::lightning::{ChannelOpenResult, ChannelOpenStatus, LightningError};
 use tokio::sync::Mutex;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -59,6 +59,58 @@ impl ChainVisibility {
     }
 }
 
+/// The same reconciliation runs at startup and periodically. An affirmative
+/// not-found result is required; transport/index lookup errors retain ownership.
+pub(crate) async fn reconcile_local_spends(
+    node: &Arc<ldk_node::Node>,
+    chain: &ChainVisibility,
+    resume_after: &mut Option<ldk_node::bitcoin::Txid>,
+) {
+    reconcile_local_spends_with(node, |id| chain.tx_visible(id), resume_after).await;
+}
+
+async fn reconcile_local_spends_with<F, Fut>(
+    node: &Arc<ldk_node::Node>,
+    mut visible: F,
+    resume_after: &mut Option<ldk_node::bitcoin::Txid>,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    // One total budget, including gate acquisition, bounds startup/recovery.
+    // Yield the gate between rows so an owner release or urgent bump can run.
+    let mut reservations = node.local_spend_reservations();
+    reservations.sort_by_key(|r| r.txid);
+    if let Some(last) = resume_after {
+        let next = reservations.partition_point(|r| r.txid <= *last);
+        reservations.rotate_left(next);
+    }
+    let pass = async {
+        for reservation in reservations {
+            let _guard = node.onchain_operation_lock().lock_owned().await;
+            let txid = reservation.txid;
+            // Advance before querying: one hung source lookup cannot starve
+            // every later reservation across all subsequent bounded passes.
+            *resume_after = Some(txid);
+            match visible(txid.to_string()).await {
+                Ok(visible) => {
+                    if let Err(error) = node.reconcile_local_spend(txid, visible) {
+                        tracing::warn!(%txid, %error, "local spend reconciliation persistence failed");
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(%txid, "local spend lookup unavailable; reservation retained")
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(BROADCAST_TIMEOUT, pass).await.is_err() {
+        tracing::warn!(
+            "local spend reconciliation budget exhausted; remaining reservations retained"
+        );
+    }
+}
+
 pub(crate) async fn verify_broadcast<F, Fut>(
     txid: &str,
     mut visible: F,
@@ -69,7 +121,7 @@ where
 {
     let result = tokio::time::timeout(BROADCAST_TIMEOUT, async {
         loop {
-            if visible(txid.to_owned()).await? {
+            if matches!(visible(txid.to_owned()).await, Ok(true)) {
                 return Ok::<(), String>(());
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -88,7 +140,7 @@ pub(crate) async fn finish_channel_open<F, V, Fut>(
     channel_id: String,
     mut funding_txid: F,
     visible: V,
-) -> Result<String, LightningError>
+) -> Result<ChannelOpenResult, LightningError>
 where
     F: FnMut() -> Result<Option<String>, LightningError>,
     V: FnMut(String) -> Fut,
@@ -104,10 +156,15 @@ where
     }).await.map_err(|_| LightningError::Backend(format!(
         "channel {channel_id}: funding transaction unavailable after 60s; outcome uncertain; inspect channel before retrying"
     )))??;
-    verify_broadcast(&txid, visible).await.map_err(|_| LightningError::Backend(format!(
-        "channel {channel_id}: funding transaction {txid} not verified by chain source within 10s; may propagate later; inspect channel before retrying"
-    )))?;
-    Ok(channel_id)
+    let status = match verify_broadcast(&txid, visible).await {
+        Ok(()) => ChannelOpenStatus::Opening,
+        Err(_) => ChannelOpenStatus::PendingVisibility,
+    };
+    Ok(ChannelOpenResult {
+        channel_id,
+        funding_txid: Some(txid),
+        status,
+    })
 }
 
 /// Cooperative close negotiates asynchronously; hold the shared gate until LDK
@@ -201,23 +258,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn failed_broadcast_surfaces_error_with_channel_and_txid() {
-        for visible in [Ok(false), Err("broadcast rejected".to_string())] {
-            let error = finish_channel_open(
+    async fn slow_or_unavailable_visibility_returns_pending_with_channel_and_txid() {
+        for visible in [Ok(false), Err("lookup unavailable".to_string())] {
+            let result = finish_channel_open(
                 "UserChannelId(7)".into(),
                 || Ok(Some("funding-tx".into())),
                 |_| std::future::ready(visible.clone()),
             )
             .await
-            .unwrap_err();
-            let message = error.to_string();
-            assert!(message.contains("UserChannelId(7)"));
-            assert!(message.contains("funding-tx"));
-            assert!(
-                !matches!(error, LightningError::PaymentNotDispatched(_)),
-                "an unseen transaction may propagate later; do not authorize retry/refund"
-            );
+            .unwrap();
+            assert_eq!(result.channel_id, "UserChannelId(7)");
+            assert_eq!(result.funding_txid.as_deref(), Some("funding-tx"));
+            assert_eq!(result.status, ChannelOpenStatus::PendingVisibility);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lookup_error_is_retried_until_visible() {
+        let mut attempts = 0;
+        verify_broadcast("funding-tx", |_| {
+            attempts += 1;
+            std::future::ready(if attempts == 1 {
+                Err("temporary lookup failure".into())
+            } else {
+                Ok(true)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -250,8 +319,87 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result, "UserChannelId(7)");
+        assert_eq!(result.channel_id, "UserChannelId(7)");
+        assert_eq!(result.status, ChannelOpenStatus::Opening);
         assert_eq!(funding_polls, 2);
         assert_eq!(visibility_polls, 2);
+    }
+    fn restarted_reservations() -> (tempfile::TempDir, Arc<ldk_node::Node>) {
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, Amount, ScriptBuf, Transaction, TxIn, TxOut,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = ldk_node::Builder::new();
+        builder.set_network(bitcoin::Network::Regtest);
+        builder.set_entropy_seed_bytes([73; 64]);
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+        drop(builder.build_with_fs_store().unwrap());
+        let rows = dir.path().join("fs_store/bitsov_local_spends");
+        std::fs::create_dir_all(&rows).unwrap();
+        for amount in [100, 200, 300] {
+            let tx = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn::default()],
+                output: vec![TxOut {
+                    value: Amount::from_sat(amount),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            };
+            let mut row = vec![2, 0, 0];
+            row.extend(1_u64.to_le_bytes());
+            row.extend(0_u64.to_le_bytes());
+            row.extend(bitcoin::consensus::serialize(&tx));
+            std::fs::write(rows.join(tx.compute_txid().to_string()), row).unwrap();
+        }
+        std::fs::write(rows.join("malformed"), [9]).unwrap();
+        (dir, Arc::new(builder.build_with_fs_store().unwrap()))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_reconciliation_retains_on_lookup_error_then_releases_absent_rows() {
+        let (_dir, node) = restarted_reservations();
+        let provider = crate::ldk::LdkProvider::from_node(node.clone());
+        use konsensus_core::traits::lightning::LightningProvider;
+        assert_eq!(provider.local_spend_diagnostics().unreadable_rows, 1);
+        let mut cursor = None;
+        reconcile_local_spends_with(
+            &node,
+            |_| std::future::ready(Err("lookup failed".into())),
+            &mut cursor,
+        )
+        .await;
+        assert_eq!(node.local_spend_reservations().len(), 3);
+        reconcile_local_spends_with(&node, |_| std::future::ready(Ok(false)), &mut cursor).await;
+        assert!(node.local_spend_reservations().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_has_total_budget_releases_gate_and_resumes_after_hung_row() {
+        let (_dir, node) = restarted_reservations();
+        let mut cursor = None;
+        let started = tokio::time::Instant::now();
+        reconcile_local_spends_with(
+            &node,
+            |_| std::future::pending::<Result<bool, String>>(),
+            &mut cursor,
+        )
+        .await;
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert!(node.onchain_operation_lock().try_lock().is_ok());
+        assert_eq!(node.local_spend_reservations().len(), 3);
+        let hung = cursor.unwrap();
+        let mut first_lookup = None;
+        reconcile_local_spends_with(
+            &node,
+            |id| {
+                first_lookup.get_or_insert(id);
+                std::future::ready(Ok(false))
+            },
+            &mut cursor,
+        )
+        .await;
+        assert_ne!(first_lookup.unwrap(), hung.to_string());
+        assert!(node.local_spend_reservations().is_empty());
     }
 }
