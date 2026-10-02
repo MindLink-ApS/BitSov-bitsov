@@ -402,7 +402,7 @@ impl PairingService {
         {
             return DeviceKeyStatus::Registered;
         }
-        if inner.cancelled_ops.contains(op_id) {
+        if inner.cancelled_ops.get(op_id).is_some_and(|owner| owner == client_id) {
             return DeviceKeyStatus::Lost;
         }
         DeviceKeyStatus::Absent

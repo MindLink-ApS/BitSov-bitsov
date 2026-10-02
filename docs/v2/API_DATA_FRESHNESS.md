@@ -66,26 +66,31 @@ payment, or money-moving operation. It uses the same freshness headers above.
 
 | Field | Meaning for the embedded LDK provider |
 |---|---|
-| `balance_msat` | Legacy aggregate: `(filtered_total_lightning_balance_sats + spendable_onchain_balance_sats) * 1000`, excluding removed-channel claims without confirmed funding. Includes Lightning claims that cannot currently be spent. Other providers retain their existing semantics. |
+| `balance_msat` | Legacy aggregate: `(filtered_total_lightning_balance_sats + spendable_onchain_balance_sats) * 1000`, excluding removed-channel claims only when their funding is proven absent. Includes Lightning claims that cannot currently be spent. Other providers retain their existing semantics. |
 | `onchain_spendable_sats` | On-chain funds LDK considers spendable after confirmation requirements and the anchor reserve. |
 | `onchain_total_sats` | Total on-chain wallet funds, including unconfirmed funds and the anchor reserve. |
 | `anchor_reserve_sats` | On-chain funds reserved for anchor-channel closing fees, already included in `onchain_total_sats`. |
 | `lightning_spendable_sats` | Sum of `outbound_capacity_msat` for `is_usable` channels, divided by 1000 and rounded down after summation. Excludes channel reserves, pending HTLCs, and inactive channels. This is outbound capacity, not a promise that a payment of that amount can route: routing fees, per-HTLC limits, and remote liquidity still apply. |
-| `closing_sats` | `ClaimableAwaitingConfirmations` (including timelocks), plus `ClaimableOnChannelClose` for channels no longer in the channel manager (for example, a force-close not yet confirmed), **only when its funding transaction is confirmed**, plus every pending sweep variant: `PendingBroadcast`, `BroadcastAwaitingConfirmation`, `AwaitingThresholdConfirmations`. An open channel with a disconnected peer is not counted as closing. |
+| `closing_sats` | `ClaimableAwaitingConfirmations` (including timelocks), plus `ClaimableOnChannelClose` for channels no longer in the channel manager (for example, a force-close not yet confirmed), including present but unconfirmed funding; excluded only when funding is proven absent, plus every pending sweep variant: `PendingBroadcast`, `BroadcastAwaitingConfirmation`, `AwaitingThresholdConfirmations`. An open channel with a disconnected peer is not counted as closing. |
 | `contested_sats` | Potential claims from `ContentiousClaimable`, `MaybeTimeoutClaimableHTLC`, `MaybePreimageClaimableHTLC`, and `CounterpartyRevokedOutputClaimable`. Conditional claims are not guaranteed wallet funds or spendable liquidity. |
 
 A force-close can leave a monitor even though its funding transaction was never
 broadcast. A removed channel's `ClaimableOnChannelClose` is not itself proof of
-on-chain value. Before including it, the provider verifies the monitor's funding
-txid against the configured chain source: at least one funding confirmation is
-required. Unconfirmed funding (including mempool-only funding) and an explicit
-not-found response contribute neither `closing_sats` nor the Lightning component
-of `balance_msat`. The monitor stays intact for recovery. Open channels, claims
+on-chain value. The provider checks the monitor's funding txid against the
+configured chain source. Confirmed and present-but-unconfirmed (including
+mempool-only and zero-confirmation) funding contribute to both `closing_sats`
+and the Lightning component of `balance_msat`. A claim is excluded only when
+absence is proven: Esplora returns HTTP 404 for that funding txid, or Core returns
+`getrawtransaction` not-found with an independent `getmempoolentry` miss and a
+synced `txindex` covering a fully synced chain tip, followed by a raw-transaction
+recheck and confirmation that the tip hash has not changed. A missing, catching-up, or lagging index cannot prove absence. Electrum
+has no supported proof of absence: `-5` can mean propagation delay and fails the
+read, as do other lookup errors. The monitor stays intact for recovery. Open channels, claims
 backed by confirmed closing transactions, and pending sweeps keep their existing
 semantics. With pending splice candidates, the displayed claim and its fee
 follow the same candidate as LDK's aggregate estimate (latest candidate before
 a splice confirms, otherwise the confirmed candidate). That estimate is not
-proof that the replacement funding has confirmed. Using the same candidate
+proof that the replacement funding is present. Using the same candidate
 ensures excluding a claim removes its exact aggregate contribution.
 
 This verification adds chain reads only when removed-channel claims exist; it
@@ -93,11 +98,11 @@ uses the selected Core, Electrum or Esplora backend without fallback. Each balan
 observation waits at most ten seconds for funding checks. At most one Electrum
 verification worker runs at a time; an already-blocking RPC may finish after the
 read times out, retaining its concurrency permit until completion. Backend errors, malformed
-responses, timeouts, or inconclusive Core historical lookups fail the read rather
+responses, timeouts, or inconclusive funding lookups fail the read rather
 than presenting an unknown balance as zero. Core without a usable transaction
-index may be unable to verify old funding outside its retained-block search.
+index can retain a present transaction but cannot exclude a missing one.
 Funding is rechecked on each read, including after reorgs; there is no permanent
-"confirmed" cache. The wallet amounts still come from the local sync snapshot,
+"present" cache. The wallet amounts still come from the local sync snapshot,
 so fresh funding evidence does not make the underlying wallet snapshot newer.
 
 Unknown categories are **omitted**, never replaced with `0` or `null`. A known

@@ -117,7 +117,13 @@ An already paired remote client can use these Noise-tunnel HTTP routes with
 exactly the same JWT, live pairing binding and `read` scope checks as loopback:
 
 - `POST /api/v1/pair/elevation-request` proposes an owner-approved budget.
-- `GET /api/v1/pair/elevation/{op_id}` reads request status.
+  Each client may have at most four unexpired pending elevation requests
+  (`MAX_PENDING_ELEVATIONS_PER_CLIENT`), across scope kinds and both routers.
+  Additional requests return HTTP 429 without writing a proposal or printing an
+  owner challenge. Cancellation, grant, or the 15-minute expiry frees a slot;
+  another client's pending requests do not consume that client's allowance.
+- `GET /api/v1/pair/elevation/{op_id}` reads only the requesting client's status.
+  Another client's operation and an unknown operation both return `UnknownOperation` (HTTP 404).
 - `DELETE /api/v1/pair/elevation/{op_id}` withdraws the caller's own request.
 - `GET /api/v1/pair/grant` reads the caller's own grant (or `null`).
 

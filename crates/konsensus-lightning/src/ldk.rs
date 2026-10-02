@@ -317,17 +317,15 @@ impl LdkProvider {
         crate::balance::verify_closed_funding(&mut balances, &open, |channel_id| async move {
             let funding = self.node.channel_funding_outpoint(channel_id)
                 .ok_or_else(|| LightningError::Backend("channel funding monitor unavailable".into()))?;
-            self.funding_confirmed(&funding.txid.to_string()).await
+            self.funding_present(&funding.txid.to_string()).await
         }).await?;
         Ok(balances)
     }
 
-    async fn funding_confirmed(&self, txid: &str) -> Result<bool, LightningError> {
-        use konsensus_core::traits::chain::{ChainError, ChainProvider};
+    async fn funding_present(&self, txid: &str) -> Result<bool, LightningError> {
         let result = if let Some(rpc) = &self.bitcoind {
-            // Core also searches retained blocks when txindex is unavailable.
-            // An inconclusive/pruned historical lookup stays an error.
-            rpc.is_tx_confirmed(txid, 1).await
+            // Absence requires independent mempool and synced txindex evidence.
+            rpc.funding_present(txid).await
         } else if let Some(server) = &self.electrum {
             // A cancelled spawn_blocking lookup keeps running. Keep its permit
             // in an owned task until it finishes, so repeated timed-out reads
@@ -339,8 +337,7 @@ impl LdkProvider {
             let txid = txid.to_owned();
             tokio::spawn(async move {
                 let _permit = permit;
-                if !server.tx_visible(&txid).await? { return Ok(false); }
-                server.is_tx_confirmed(&txid, 1).await
+                server.funding_present(&txid).await
             }).await.map_err(|_| LightningError::Backend("funding verification worker failed".into()))?
         } else {
             let response = reqwest::Client::new()
@@ -354,9 +351,8 @@ impl LdkProvider {
             return crate::balance::decode_funding_status(status, &body);
         };
         match result {
-            Ok(confirmed) => Ok(confirmed),
-            Err(ChainError::TxNotFound(_)) => Ok(false),
-            Err(error) => Err(LightningError::Backend(format!("funding confirmation unavailable: {error}"))),
+            Ok(present) => Ok(present),
+            Err(error) => Err(LightningError::Backend(format!("funding presence unavailable: {error}"))),
         }
     }
 

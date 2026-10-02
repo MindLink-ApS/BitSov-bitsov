@@ -107,6 +107,8 @@ pub const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(300);
 
 /// How long a pending elevation request or replacement approval stays valid.
 pub const ELEVATION_TTL_SECS: i64 = 900;
+/// Bound durable pending proposals and owner-console prompts per paired client.
+pub const MAX_PENDING_ELEVATIONS_PER_CLIENT: usize = 4;
 
 /// Wrong confirmations per grant request. The last of them cancels it: the
 /// request can no longer be approved and the app must ask again.
@@ -639,7 +641,7 @@ struct Inner {
     owner_code_failures: u32,
     // Requests cancelled by wrong codes in this run, so their status reads
     // `lost` (their durable records are deleted, so a restart cannot revive them).
-    cancelled_ops: std::collections::HashSet<String>,
+    cancelled_ops: std::collections::HashMap<String, String>,
     // One-time first-contact confirmations, by client id. Memory only: never
     // serialized, dropped on restart (fail closed). See `FirstContactGrant`.
     first_contact: HashMap<String, PendingFirstContact>,
@@ -837,7 +839,7 @@ impl PairingService {
                 identity_fingerprint,
                 owner_confirmations: HashMap::new(),
                 owner_code_failures: 0,
-                cancelled_ops: std::collections::HashSet::new(),
+                cancelled_ops: std::collections::HashMap::new(),
                 first_contact: HashMap::new(),
             }),
             grant_changes: tokio::sync::Notify::new(),
@@ -980,9 +982,15 @@ impl PairingService {
             inner.owner_confirmations.remove(op_id);
             // Cancel durably: a restart must not re-issue a code for a request
             // someone was guessing at.
+            let client_id = inner.file.pending_elevations.iter()
+                .find(|e| e.op_id == op_id).map(|e| e.client_id.clone())
+                .or_else(|| inner.file.pending_device_keys.iter()
+                    .find(|p| p.op_id == op_id).map(|p| p.client_id.clone()));
             inner.file.pending_elevations.retain(|e| e.op_id != op_id);
             inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
-            inner.cancelled_ops.insert(op_id.to_string());
+            if let Some(client_id) = client_id {
+                inner.cancelled_ops.insert(op_id.to_string(), client_id);
+            }
             if let Err(e) = self.persist(&mut inner.file) {
                 tracing::warn!(error = %e, op_id, "could not persist a cancelled approval");
             }
@@ -2013,6 +2021,14 @@ impl PairingService {
             .find(|c| c.client_id == client_id)
             .cloned()
             .ok_or(PairingError::UnknownClient)?;
+        // Hold the same lock through check and insertion so concurrent requests
+        // cannot exceed the cap. Expired proposals do not consume a slot.
+        if inner.file.pending_elevations.iter()
+            .filter(|e| e.client_id == client_id && e.expires_at > now).count()
+            >= MAX_PENDING_ELEVATIONS_PER_CLIENT
+        {
+            return Err(PairingError::TooManyPending);
+        }
         let op = PendingElevation {
             op_id: hex::encode(op_bytes),
             client_id: client_id.to_string(),
@@ -2035,16 +2051,23 @@ impl PairingService {
         Ok(op)
     }
 
-    /// Read the status of a pending elevation. A read, never a consumption.
+    /// Read this client's elevation status. Other clients and unknown IDs receive
+    /// the same UnknownOperation refusal. A read, never a consumption.
     ///
     /// On a sidecar a grant is never in effect (see `effective_scopes`), so it
     /// is never reported as granted either: the status must not claim an
     /// authority the token will not carry.
-    pub fn elevation_status(&self, op_id: &str) -> ElevationStatus {
+    pub fn elevation_status(&self, client_id: &str, op_id: &str) -> Result<ElevationStatus, PairingError> {
         let inner = self.lock();
+        let owned = inner.file.pending_elevations.iter()
+            .any(|e| e.op_id == op_id && e.client_id == client_id)
+            || inner.file.grants.iter().any(|g| g.op_id == op_id && g.client_id == client_id)
+            || inner.file.front_door_grants.iter().any(|g| g.op_id == op_id && g.client_id == client_id)
+            || inner.cancelled_ops.get(op_id).is_some_and(|owner| owner == client_id);
+        if !owned { return Err(PairingError::UnknownOperation); }
         let now = chrono::Utc::now().timestamp();
         if !self.owner_control_enabled {
-            return match inner
+            return Ok(match inner
                 .file
                 .pending_elevations
                 .iter()
@@ -2053,7 +2076,7 @@ impl PairingService {
                 Some(op) if op.expires_at <= now => ElevationStatus::Expired,
                 Some(_) => ElevationStatus::Pending,
                 None => ElevationStatus::Absent,
-            };
+            });
         }
         if let Some(op) = inner
             .file
@@ -2062,7 +2085,7 @@ impl PairingService {
             .find(|e| e.op_id == op_id)
         {
             if op.expires_at <= now {
-                return ElevationStatus::Expired;
+                return Ok(ElevationStatus::Expired);
             }
             let granted = if op.scopes.contains(&Scope::FrontDoor) {
                 inner
@@ -2078,12 +2101,12 @@ impl PairingService {
                     .any(|g| g.client_id == op.client_id && g.is_live(now))
             };
             if granted {
-                return ElevationStatus::Granted;
+                return Ok(ElevationStatus::Granted);
             }
             if !Self::confirmable(&inner, op_id) {
-                return ElevationStatus::Lost;
+                return Ok(ElevationStatus::Lost);
             }
-            return ElevationStatus::Pending;
+            return Ok(ElevationStatus::Pending);
         }
         // The pending record is consumed when the owner writes the grant, so a
         // granted operation is found by the `op_id` recorded on the grant.
@@ -2098,12 +2121,12 @@ impl PairingService {
                 .iter()
                 .any(|g| g.op_id == op_id && g.is_live(now))
         {
-            return ElevationStatus::Granted;
+            return Ok(ElevationStatus::Granted);
         }
-        if inner.cancelled_ops.contains(op_id) {
-            return ElevationStatus::Lost;
+        if inner.cancelled_ops.contains_key(op_id) {
+            return Ok(ElevationStatus::Lost);
         }
-        ElevationStatus::Absent
+        Ok(ElevationStatus::Absent)
     }
 
     /// Write a budget-scoped spend grant. **Owner CLI only.**

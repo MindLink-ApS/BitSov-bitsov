@@ -463,11 +463,14 @@ async fn elevation_request(
 
 /// `GET /api/v1/pair/elevation/{op_id}` — read status. A read, never a write.
 async fn elevation_status(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let status = service(&state)?.elevation_status(&op_id);
+    let binding = auth.pairing.as_ref().ok_or_else(|| {
+        ApiError::Forbidden("only a paired client can read an elevation request".into())
+    })?;
+    let status = service(&state)?.elevation_status(&binding.client_id, &op_id).map_err(map_err)?;
     Ok(Json(serde_json::json!({
         "op_id": op_id,
         "status": status,

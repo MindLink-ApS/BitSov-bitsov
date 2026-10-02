@@ -156,8 +156,8 @@ handlers and authorization as loopback:
 
 | Method | Path | Effect |
 |---|---|---|
-| POST | `/api/v1/pair/elevation-request` | Ask for elevation; never grant it |
-| GET | `/api/v1/pair/elevation/{op_id}` | Read pending-operation status |
+| POST | `/api/v1/pair/elevation-request` | Ask for elevation; at most four unexpired pending requests per client; never grant it |
+| GET | `/api/v1/pair/elevation/{op_id}` | Read only the caller's operation status; other clients' IDs return the same 404 as unknown IDs |
 | DELETE | `/api/v1/pair/elevation/{op_id}` | Cancel the caller's own pending request |
 | GET | `/api/v1/pair/grant` | Read the caller's own live grant, or `null` |
 
