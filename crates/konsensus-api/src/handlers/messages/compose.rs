@@ -89,6 +89,9 @@ pub struct ComposeResponse {
     pub retry_allowed: bool,
     /// Sum of approved routing ceilings for this call.
     pub max_routing_fee_msat: u64,
+    /// Actual aggregate LDK routing fee; omitted unless every component is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_paid_msat: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub member_outcomes: Option<Vec<MemberPaymentOutcome>>,
     /// The message ID assigned to this envelope.
@@ -445,9 +448,14 @@ pub(crate) struct Readmission {
     /// Admission paid again during this send, msat.
     paid_msat: std::sync::atomic::AtomicU64,
     fee_ceiling_msat: std::sync::atomic::AtomicU64,
+    /// Reporting only: Some(total) once every paid re-admission fee is known.
+    fee_paid_msat: std::sync::Mutex<Option<u64>>,
 }
 
 impl Readmission {
+    fn fee_paid_msat(&self) -> Option<u64> {
+        if self.paid_msat().is_none() { Some(0) } else { *self.fee_paid_msat.lock().unwrap_or_else(|e| e.into_inner()) }
+    }
     pub(crate) fn fee_ceiling_msat(&self) -> u64 {
         self.fee_ceiling_msat.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -683,7 +691,10 @@ async fn readmit_then_pay(
             }
         }
         if attempt.settled_msat > 0 {
-            readmission.paid_msat.fetch_add(attempt.settled_msat, std::sync::atomic::Ordering::Relaxed);
+            let mut fees = readmission.fee_paid_msat.lock().unwrap_or_else(|e| e.into_inner());
+            let prior_paid = readmission.paid_msat.fetch_add(attempt.settled_msat, std::sync::atomic::Ordering::Relaxed);
+            let prior_fee = if prior_paid == 0 { Some(0) } else { *fees };
+            *fees = prior_fee.and_then(|a| readmit.reserved.as_ref().and_then(Debit::recorded_fee_paid_msat).and_then(|b| a.checked_add(b)));
         }
         charge.readmission_msat = charge.readmission_msat.saturating_add(attempt.settled_msat);
         charge.include_attempt(attempt);
@@ -3243,6 +3254,7 @@ pub(super) async fn compose_message_with_policy(
         if prices.is_empty() && !skipped.is_empty() {
             return Ok(Json(ComposeResponse {
                 operation_id: None, state: "untracked".into(), accepted: false, payment_hash: None, retry_allowed: false,
+                fee_paid_msat: None,
                 max_routing_fee_msat: 0, member_outcomes: Some(skipped), message_id: String::new(),
                 delivered: false, amount_msat: 0, readmission_msat: None,
             }));
@@ -3369,6 +3381,9 @@ pub(super) async fn compose_message_with_policy(
         }
         return Ok(Json(ComposeResponse {
             operation_id: None, state: "untracked".into(), accepted: false, payment_hash: None, retry_allowed: false,
+            fee_paid_msat: if state.lightning_backend == "ldk" && receipts.iter().all(|r| r.status != "unknown") {
+                debit.recorded_fee_paid_msat().and_then(|fee| readmission.fee_paid_msat().and_then(|r| fee.checked_add(r)))
+            } else { None },
             max_routing_fee_msat: max_routing_fee_msat.saturating_add(readmission.fee_ceiling_msat()),
             member_outcomes: Some(receipts),
             message_id,
@@ -3708,6 +3723,8 @@ pub(super) async fn compose_peer(
         Ok(Json(ComposeResponse {
             operation_id: Some(operation.id.clone()), state: "sent".into(), accepted: false,
             payment_hash: Some(hex::encode(payment_hash)), retry_allowed: true,
+            // The public operation response derives fees from durable settlement evidence.
+            fee_paid_msat: None,
             max_routing_fee_msat: debit.fee_limit(&state, admission.message_authorized.unwrap_or(price_msat)).saturating_add(admission.fee_ceiling_msat),
             member_outcomes: None,
             message_id: envelope.id.to_hex(),

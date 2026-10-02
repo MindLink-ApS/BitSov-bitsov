@@ -48,6 +48,26 @@ and payment proofs still describe principal, so fees are never presented as
 value received by the peer. The ceiling is an authorization, not a prediction
 of the route's actual fee. Stable cap and budget refusal codes are preserved.
 
+`POST /api/v1/payments/pay`, `POST /api/v1/payments/keysend`, and
+`GET /api/v1/payments/:hash` also return optional `fee_paid_msat`: the actual
+outgoing routing fee from a **settled LDK** payment's `PaymentDetails` (populated
+by LDK's `PaymentSuccessful` event). A known direct-channel fee is `0`.
+Pending/in-flight payments, missing fee evidence, and LND/LNbits/mock backends
+omit the field entirely; absence does not mean zero. The existing payment-list
+`fee_msat` field is unchanged.
+
+`POST /api/v1/messages/compose` and `GET /api/v1/messages/operations/:id`
+return the same optional `fee_paid_msat`, summed over the message and any
+admission/re-admission represented by the result. Room sends sum recipients'
+fees. The aggregate is omitted if any payment is unresolved, any component fee
+is unknown, or the sum overflows. Durable operation retries retain known fees
+without paying again; historical records lacking evidence omit them.
+`amount_msat`, `readmission_msat`, payment proofs, and
+`max_routing_fee_msat` keep their existing meanings. The new field is routing
+fees only: add it once to the reported settled principal (including any separate
+`readmission_msat`) when displaying a proven total. Never substitute the ceiling
+for the actual fee or display a pending result as paid.
+
 The 5,000-msat floor allows several forwarding hops with base fees around one
 sat each, while the 10,000-msat absolute maximum limits ordinary fee exposure.
 This is a routing allowance, not a promise that a route exists. A small message

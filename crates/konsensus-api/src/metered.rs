@@ -242,6 +242,13 @@ impl Debit {
         *previous = previous.and_then(|total| details.fee_msat.and_then(|fee| total.checked_add(fee)));
     }
 
+    /// Reporting only. No recorded payments, unknown fees, or overflow are not zero.
+    pub(crate) fn recorded_fee_paid_msat(&self) -> Option<u64> {
+        let fees = self.fees.lock().unwrap_or_else(|e| e.into_inner());
+        if fees.is_empty() { return None; }
+        fees.values().try_fold(0u64, |sum, fee| sum.checked_add((*fee)?))
+    }
+
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
         Self { operation: None, max_routing_fee_msat: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
