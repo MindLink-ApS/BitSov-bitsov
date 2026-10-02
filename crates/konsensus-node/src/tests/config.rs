@@ -2583,6 +2583,25 @@ fn electrum_config_accepts_explicit_servers_and_operator() {
 }
 
 #[test]
+fn electrum_config_rejects_onion_servers_without_a_proxy_setting() {
+    for scheme in ["tcp", "ssl"] {
+        for host in ["server.onion", "SERVER.ONION", "server.OnIoN"] {
+            let url = format!("{scheme}://{host}:50001");
+            let error = toml::from_str::<ChainConfig>(&format!(
+                "backend = 'electrum'\nserver_url = '{url}'"
+            ))
+            .expect_err(&format!("accepted {url}"));
+            assert!(
+                error.to_string().contains(
+                    "Tor/.onion Electrum servers are not supported yet: no proxy setting"
+                ),
+                "{url}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn electrum_config_rejects_missing_invalid_or_fallback_settings() {
     for fields in [
         "",

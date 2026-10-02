@@ -83,13 +83,13 @@ Keep Lightning's `network` aligned with the Electrum server's Bitcoin network.
 
 Plain `tcp://` is permitted only for `localhost`, loopback IPs, RFC1918 private
 IPv4 addresses, IPv6 unique-local addresses (including private/loopback IPv4
-mapped into IPv6), and `.onion` names. LAN hostnames such as `umbrel.local` require
+mapped into IPv6). LAN hostnames such as `umbrel.local` require
 `ssl://`; use a private IP literal for plaintext LAN access. Public addresses and
 other hostnames require `ssl://`, which verifies the server certificate and
 hostname. A self-signed certificate is not automatically trusted. Plain LAN TCP
-is not encrypted and can be observed or altered on that network. `.onion`
-acceptance does **not** configure Tor: this integration adds no SOCKS proxy or
-Tor routing; provide working external transport or a loopback tunnel yourself.
+is not encrypted and can be observed or altered on that network. Tor/`.onion`
+Electrum servers are unsupported until a proxy setting exists; `.onion` hosts
+are rejected at configuration validation for both `ssl://` and `tcp://`.
 For TLS to an IPv6 server, use a DNS hostname: the pinned Electrum client's TLS
 parser does not support IPv6 literals, so `ssl://[IPv6]:port` is rejected at
 startup. Private and loopback IPv6 literals remain supported with `tcp://`.

@@ -90,6 +90,9 @@ impl ElectrumConfig {
             }
             raw_host
         };
+        if host.to_ascii_lowercase().ends_with(".onion") {
+            return Err("Tor/.onion Electrum servers are not supported yet: no proxy setting");
+        }
         let local = match host.parse::<IpAddr>() {
             Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
             Ok(IpAddr::V6(ip)) => {
@@ -99,13 +102,10 @@ impl ElectrumConfig {
                         .to_ipv4_mapped()
                         .is_some_and(|ip| ip.is_loopback() || ip.is_private())
             }
-            Err(_) => {
-                host.eq_ignore_ascii_case("localhost")
-                    || host.to_ascii_lowercase().ends_with(".onion")
-            }
+            Err(_) => host.eq_ignore_ascii_case("localhost"),
         };
         if scheme == "tcp" && !local {
-            return Err("electrum tcp requires loopback, a private LAN IP, or .onion; use ssl for other hosts");
+            return Err("electrum tcp requires loopback or a private LAN IP; use ssl for other hosts");
         }
         Ok(host)
     }
