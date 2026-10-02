@@ -2,7 +2,7 @@
 mod common;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use konsensus_api::state::AppState;
 use konsensus_core::{kind::KIND_CHAT, NodeId, PaymentProof, Recipient, UkmEnvelopeBuilder};
 use konsensus_storage::{EncryptedStorage, FileRecord, Peer, Room, SqliteStorage, Storage};
@@ -15,7 +15,7 @@ async fn call(
     uri: &str,
     payload: Option<Value>,
     authorized: bool,
-) -> (StatusCode, Value) {
+) -> (StatusCode, HeaderMap, Value) {
     let mut req = Request::builder().uri(uri);
     if authorized {
         req = req.header("authorization", common::auth_header(state));
@@ -33,10 +33,15 @@ async fn call(
         .await
         .unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let body = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    (
+        status,
+        headers,
+        serde_json::from_slice(&body).unwrap_or(Value::Null),
+    )
 }
 
 #[tokio::test]
@@ -77,24 +82,25 @@ async fn lists_report_partial_reads_and_owner_status_warns_without_public_disclo
         format!("/api/v1/messages?peer={}", sender.to_hex()),
         "/api/v1/messages/search?q=searchable".into(),
     ] {
-        let (status, body) = call(&state, &uri, None, true).await;
+        let (status, headers, body) = call(&state, &uri, None, true).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(body["messages"][0]["id"], good.id.to_hex());
-        assert_eq!(body["unreadable_count"], 1);
-        assert_eq!(body["storage_key_mismatch"], true);
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["id"], good.id.to_hex());
+        assert_eq!(headers["X-BitSov-Unreadable-Count"], "1");
+        assert_eq!(headers["X-BitSov-Storage-Key-Mismatch"], "true");
     }
     // Counts describe the scanned rows, even if room filtering returns none.
-    let (_, room) = call(
+    let (_, headers, room) = call(
         &state,
         &format!("/api/v1/messages?room={}", "ab".repeat(32)),
         None,
         true,
     )
     .await;
-    assert_eq!(room["messages"], json!([]));
-    assert_eq!(room["unreadable_count"], 1);
-    let (status, discovery) = call(
+    assert_eq!(room, json!([]));
+    assert_eq!(headers["X-BitSov-Unreadable-Count"], "1");
+    assert_eq!(headers["X-BitSov-Storage-Key-Mismatch"], "true");
+    let (status, headers, discovery) = call(
         &state,
         "/api/v1/messages/resync",
         Some(json!({"phase":"discover", "peer_id":sender.to_hex(), "from_ms":0, "to_ms":100})),
@@ -102,24 +108,33 @@ async fn lists_report_partial_reads_and_owner_status_warns_without_public_disclo
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(discovery["unreadable_count"], 1);
-    assert_eq!(discovery["total_count"], 1);
-    let (_, all_bad) = call(&state, "/api/v1/messages?limit=1", None, true).await;
-    assert_eq!(all_bad["messages"], json!([]));
-    assert_eq!(all_bad["unreadable_count"], 1);
-    assert_eq!(all_bad["storage_key_mismatch"], true);
-    let (_, healthy) = call(&state, "/api/v1/messages?before=20", None, true).await;
-    assert_eq!(healthy["unreadable_count"], 0);
-    assert_eq!(healthy["storage_key_mismatch"], false);
-    let (status, _) = call(&state, &format!("/api/v1/messages/{}", bad.id), None, true).await;
+    assert_eq!(headers["X-BitSov-Unreadable-Count"], "1");
+    assert_eq!(headers["X-BitSov-Storage-Key-Mismatch"], "true");
+    assert_eq!(
+        discovery,
+        json!({
+            "phase": "discover", "peer_id": sender.to_hex(),
+            "messages": [{"id": good.id.to_hex(), "kind": KIND_CHAT, "timestamp": 10,
+                "estimated_fee_msat": 5, "plaintext_available": true}],
+            "total_count": 1, "estimated_total_msat": 5, "from_ms": 0, "to_ms": 100
+        })
+    );
+    let (_, headers, all_bad) = call(&state, "/api/v1/messages?limit=1", None, true).await;
+    assert_eq!(all_bad, json!([]));
+    assert_eq!(headers["X-BitSov-Unreadable-Count"], "1");
+    assert_eq!(headers["X-BitSov-Storage-Key-Mismatch"], "true");
+    let (_, headers, healthy) = call(&state, "/api/v1/messages?before=20", None, true).await;
+    assert_eq!(healthy.as_array().unwrap().len(), 1);
+    assert_no_diagnostics(&headers);
+    let (status, _, _) = call(&state, &format!("/api/v1/messages/{}", bad.id), None, true).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    let (_, status) = call(&state, "/api/v1/status", None, true).await;
+    let (_, _, status) = call(&state, "/api/v1/status", None, true).await;
     assert_eq!(status["storage_unreadable_rows"], 6);
     assert_eq!(status["storage_key_mismatch"], true);
-    let (_, public) = call(&state, "/api/v1/health", None, false).await;
+    let (_, _, public) = call(&state, "/api/v1/health", None, false).await;
     assert!(public.get("storage_unreadable_rows").is_none());
     assert!(public.get("storage_key_mismatch").is_none());
-    let (status, _) = call(&state, "/api/v1/status", None, false).await;
+    let (status, _, _) = call(&state, "/api/v1/status", None, false).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(
         store
@@ -134,22 +149,23 @@ async fn lists_report_partial_reads_and_owner_status_warns_without_public_disclo
 }
 
 #[tokio::test]
-async fn metadata_list_responses_disclose_unreadable_rows_and_zero() {
+async fn metadata_lists_keep_arrays_and_only_send_headers_for_unreadable_rows() {
     let store = Arc::new(EncryptedStorage::new(
         SqliteStorage::in_memory().await.unwrap(),
         &[7; 32],
     ));
-    let state = common::test_state_with_storage(store.clone());
-    for (uri, key) in [
-        ("/api/v1/rooms", "rooms"),
-        ("/api/v1/files", "files"),
-        ("/api/v1/peers", "peers"),
+    let state = common::test_state_with_storage_and_cipher(store.clone());
+    for uri in [
+        "/api/v1/rooms",
+        "/api/v1/files",
+        "/api/v1/peers",
+        "/api/v1/messages",
+        "/api/v1/messages/search?q=searchable",
     ] {
-        let (status, body) = call(&state, uri, None, true).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body[key], json!([]));
-        assert_eq!(body["unreadable_count"], 0);
-        assert_eq!(body["storage_key_mismatch"], false);
+        let (status, headers, body) = call(&state, uri, None, true).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body, json!([]));
+        assert_no_diagnostics(&headers);
     }
     let owner = *state.identity.node_id();
     store
@@ -191,18 +207,88 @@ async fn metadata_list_responses_disclose_unreadable_rows_and_zero() {
         })
         .await
         .unwrap();
-    for (uri, key, count) in [
-        ("/api/v1/rooms", "rooms", 1),
-        ("/api/v1/files", "files", 1),
-        ("/api/v1/peers", "peers", 0),
+    for (uri, count) in [
+        ("/api/v1/rooms", 1),
+        ("/api/v1/files", 1),
+        ("/api/v1/peers", 0),
     ] {
-        let (status, body) = call(&state, uri, None, true).await;
+        let (status, headers, body) = call(&state, uri, None, true).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body[key].as_array().unwrap().len(), count);
-        assert_eq!(body["unreadable_count"], 1);
-        assert_eq!(body["storage_key_mismatch"], true);
+        assert_eq!(body.as_array().unwrap().len(), count);
+        assert_eq!(headers["X-BitSov-Unreadable-Count"], "1");
+        assert_eq!(headers["X-BitSov-Storage-Key-Mismatch"], "true");
     }
     store.inner().pool().close().await;
-    let (status, _) = call(&state, "/api/v1/messages", None, true).await;
+    let (status, _, _) = call(&state, "/api/v1/messages", None, true).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+fn assert_no_diagnostics(headers: &HeaderMap) {
+    assert!(!headers.contains_key("X-BitSov-Unreadable-Count"));
+    assert!(!headers.contains_key("X-BitSov-Storage-Key-Mismatch"));
+}
+
+#[tokio::test]
+async fn below_threshold_sends_count_without_mismatch_and_resync_keeps_original_objects() {
+    let store = Arc::new(EncryptedStorage::new(
+        SqliteStorage::in_memory().await.unwrap(),
+        &[7; 32],
+    ));
+    let state = common::test_state_with_storage(store.clone());
+    let owner = *state.identity.node_id();
+    for name in ["good one", "good two"] {
+        store
+            .create_room(&Room::new(name.into(), owner))
+            .await
+            .unwrap();
+    }
+    store
+        .inner()
+        .create_room(&Room::new("bad".into(), owner))
+        .await
+        .unwrap();
+    let (status, headers, rooms) = call(&state, "/api/v1/rooms", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rooms.as_array().unwrap().len(), 2);
+    assert_eq!(headers["X-BitSov-Unreadable-Count"], "1");
+    assert!(!headers.contains_key("X-BitSov-Storage-Key-Mismatch"));
+
+    let peer = NodeId::from_bytes([3; 32]).to_hex();
+    for uri in [
+        format!("/api/v1/messages?peer={peer}"),
+        format!("/api/v1/messages?room={}", "ab".repeat(32)),
+    ] {
+        let (status, headers, body) = call(&state, &uri, None, true).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body, json!([]));
+        assert_no_diagnostics(&headers);
+    }
+    let (status, headers, body) = call(
+        &state,
+        "/api/v1/messages/resync",
+        Some(json!({"phase":"discover", "peer_id":peer, "from_ms":0, "to_ms":100})),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_diagnostics(&headers);
+    assert_eq!(
+        body,
+        json!({"phase":"discover", "peer_id":peer, "messages":[],
+        "total_count":0, "estimated_total_msat":0, "from_ms":0, "to_ms":100})
+    );
+    let (status, headers, body) = call(
+        &state,
+        "/api/v1/messages/resync",
+        Some(json!({"phase":"fulfill", "peer_id":peer, "message_ids":["aa".repeat(32)]})),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_diagnostics(&headers);
+    assert_eq!(
+        body,
+        json!({"phase":"fulfill", "resynced_count":0,
+        "failed_count":1, "plaintext_count":0, "total_msat":0})
+    );
 }

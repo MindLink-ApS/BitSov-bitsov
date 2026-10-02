@@ -29,6 +29,7 @@ use crate::audit::events;
 use crate::error::ApiError;
 use crate::handlers::messages::create_metered_payment_proof;
 use crate::state::AppState;
+use crate::handlers::list_diagnostics::ListDiagnostics;
 
 /// Maximum file size: 4 MiB (fits within 16 MiB wire frame with overhead).
 const MAX_FILE_SIZE: usize = crate::file_staging::MAX_FILE_BYTES;
@@ -340,7 +341,7 @@ async fn list_files(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListFilesQuery>,
-) -> Result<Json<FilesResponse>, ApiError> {
+) -> Result<(ListDiagnostics, Json<Vec<FileResponse>>), ApiError> {
     let rows = state
         .storage
         .list_files_with_diagnostics(params.limit.min(MAX_FILE_LIST_LIMIT))
@@ -352,7 +353,7 @@ async fn list_files(
     files.extend(state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).list(&state, &auth));
     files.sort_by(|a,b| b.created_at.cmp(&a.created_at));
     files.truncate(params.limit.min(MAX_FILE_LIST_LIMIT) as usize);
-    Ok(Json(FilesResponse { files: files.into_iter().map(FileResponse::from).collect(), diagnostics }))
+    Ok((diagnostics, Json(files.into_iter().map(FileResponse::from).collect())))
 }
 
 /// `DELETE /api/v1/files/:id` — delete a file.
@@ -619,11 +620,4 @@ mod tests {
         assert!(validate_filename("my file (1).txt").is_ok());
         assert!(validate_filename("image.png").is_ok());
     }
-}
-
-#[derive(Serialize)]
-pub struct FilesResponse {
-    pub files: Vec<FileResponse>,
-    #[serde(flatten)]
-    pub diagnostics: crate::handlers::list_diagnostics::ListDiagnostics,
 }

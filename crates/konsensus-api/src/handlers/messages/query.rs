@@ -15,6 +15,7 @@ use crate::auth::scoped::{ScopedAuth, Admin, Read};
 use crate::error::ApiError;
 use crate::freshness::DataFreshness;
 use crate::state::AppState;
+use crate::handlers::list_diagnostics::ListDiagnostics;
 
 /// Maximum allowed limit for list queries.
 pub(super) const MAX_LIST_LIMIT: u32 = 1000;
@@ -247,7 +248,7 @@ pub(super) async fn list_messages(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListMessagesQuery>,
-) -> Result<(DataFreshness, Json<MessagesResponse>), ApiError> {
+) -> Result<(DataFreshness, ListDiagnostics, Json<Vec<MessageResponse>>), ApiError> {
     let my_node_hex = state.identity.node_id().to_hex();
     let store_read = DataFreshness::now();
     let limit = clamp_limit(params.limit);
@@ -258,7 +259,8 @@ pub(super) async fn list_messages(
         if params.peer.is_some() {
             return Err(ApiError::BadRequest("room and peer are exclusive".into()));
         }
-        return Ok((store_read, Json(room_thread(&state, &my_node_hex, room, limit, params.before).await?)));
+        let (diagnostics, messages) = room_thread(&state, &my_node_hex, room, limit, params.before).await?;
+        return Ok((store_read, diagnostics, Json(messages)));
     }
 
     let messages = if let Some(ref peer_id) = params.peer {
@@ -313,7 +315,7 @@ pub(super) async fn list_messages(
         responses.push(resp);
     }
 
-    Ok((store_read, Json(MessagesResponse { messages: responses, diagnostics })))
+    Ok((store_read, diagnostics, Json(responses)))
 }
 
 /// `?room=`: the room thread, both directions, as logical entries: a received
@@ -325,14 +327,14 @@ pub(super) async fn list_messages(
 /// is placed at its newest copy's timestamp, ordered newest first (ties by
 /// id); `before` and `limit` then apply to entries, so a page never repeats
 /// or splits a message.
-async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, before: Option<u64>) -> Result<MessagesResponse, ApiError> {
+async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, before: Option<u64>) -> Result<(ListDiagnostics, Vec<MessageResponse>), ApiError> {
     let messages = state
         .storage
         .get_node_messages_of_kind_with_diagnostics(me, konsensus_core::kind::KIND_CHAT, MAX_SEARCH_SCAN, None)
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
     let diagnostics = (&messages).into();
-    let Some(cipher) = state.plaintext_cipher.as_deref() else { return Ok(MessagesResponse { messages: Vec::new(), diagnostics }) };
+    let Some(cipher) = state.plaintext_cipher.as_deref() else { return Ok((diagnostics, Vec::new())) };
     let mut thread: Vec<MessageResponse> = Vec::new();
     // Our room message id -> its entry in `thread`.
     let mut sent: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -367,7 +369,7 @@ async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, befo
     for entry in &mut thread {
         entry.copies.sort_by(|a, b| a.recipient.cmp(&b.recipient));
     }
-    Ok(MessagesResponse { messages: thread, diagnostics })
+    Ok((diagnostics, thread))
 }
 
 /// Maximum number of most-recent messages a single search will decrypt and scan.
@@ -439,7 +441,7 @@ pub(super) async fn search_messages(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchMessagesQuery>,
-) -> Result<Json<MessagesResponse<SearchResult>>, ApiError> {
+) -> Result<(ListDiagnostics, Json<Vec<SearchResult>>), ApiError> {
     let needle = params.q.trim();
     if needle.is_empty() {
         return Err(ApiError::BadRequest("search query 'q' must not be empty".into()));
@@ -516,7 +518,7 @@ pub(super) async fn search_messages(
         }
     }
 
-    Ok(Json(MessagesResponse { messages: results, diagnostics }))
+    Ok((diagnostics, Json(results)))
 }
 
 /// `DELETE /api/v1/messages/:id` — delete a message.
@@ -586,11 +588,4 @@ mod search_snippet_tests {
         let _ = search_snippet(text, "café", 2);
         let _ = search_snippet("日本語のメッセージ test 検索", "test", 2);
     }
-}
-
-#[derive(Serialize)]
-pub struct MessagesResponse<T = MessageResponse> {
-    pub messages: Vec<T>,
-    #[serde(flatten)]
-    pub diagnostics: crate::handlers::list_diagnostics::ListDiagnostics,
 }

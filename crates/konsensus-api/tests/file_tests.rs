@@ -32,7 +32,7 @@ async fn files_list_empty() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["files"].as_array().unwrap().is_empty());
+    assert!(json.as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

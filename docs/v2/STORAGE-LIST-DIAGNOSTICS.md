@@ -5,29 +5,46 @@ readable rows in query order and never delete, rewrite, or re-encrypt stored row
 Database/query failures still return errors. Single-item reads remain strict:
 an existing unreadable item returns an error, not a 404.
 
-## API response change
+## Backward-compatible API diagnostics
 
+Response bodies retain their original JSON shapes. No client migration is needed:
+the shipped bitsov-app continues to read lists as bare arrays, unchanged.
 `storage_list_diagnostics_v1` in owner `/api/v1/status.api_capabilities` advertises
-these list response envelopes. Clients must use the named array below instead of
-treating the entire response as an array:
+the optional response headers and owner status diagnostics.
 
-| Route | Array field |
+| Route | Unchanged response body |
 | --- | --- |
-| `GET /api/v1/messages` (including `peer` and `room` filters) | `messages` |
-| `GET /api/v1/messages/search` | `messages` |
-| `GET /api/v1/rooms` | `rooms` |
-| `GET /api/v1/files` | `files` |
-| `GET /api/v1/peers` | `peers` |
+| `GET /api/v1/messages` (including `peer` conversations and `room` filters) | Bare array |
+| `GET /api/v1/messages/search` | Bare array |
+| `GET /api/v1/rooms` | Bare array |
+| `GET /api/v1/files` | Bare array |
+| `GET /api/v1/peers` | Bare array |
+| `POST /api/v1/messages/resync` (discover) | Existing discovery object |
+| `POST /api/v1/messages/resync` (fulfill) | Existing fulfillment object |
 
-Each response also includes `unreadable_count` and `storage_key_mismatch`:
+Successful list reads and resync discovery expose per-scan diagnostics in headers:
 
-```json
-{"messages": [], "unreadable_count": 2, "storage_key_mismatch": true}
+- `X-BitSov-Unreadable-Count: <count>` appears only when the count is greater than 0.
+- `X-BitSov-Storage-Key-Mismatch: true` appears only when the scan sets the warning.
+
+For example, an all-unreadable message list can return:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-BitSov-Unreadable-Count: 2
+X-BitSov-Storage-Key-Mismatch: true
+
+[]
 ```
 
-Both fields are always present, including `0` and `false` on a healthy/empty
-scan. Resync discovery adds the same fields to its existing object. Outbox list
-methods have the same diagnostics in storage; there is no outbox list HTTP route.
+Healthy/empty scans omit both headers. A scan below the mismatch threshold sends
+only the unreadable count. Neither diagnostic is added to JSON bodies, including
+resync discovery; fulfillment does not scan a list and sends neither header.
+Like the data freshness headers, these are read by the app's host-side broker;
+they are not added to `Access-Control-Expose-Headers` for webview JavaScript.
+Outbox list methods have the same diagnostics in storage; there is no outbox list
+HTTP route.
 Unreadable outbox operations are excluded from recovery and compaction, and stay
 on disk unchanged. Whitelist backup/export collection remains strict: unreadable
 peers refuse collection before an existing complete backup can be replaced. No payment or retry is attempted for an omitted operation.
@@ -41,7 +58,7 @@ not only items matching the final filter. No extra page is fetched automatically
 Peer responses retain live registry/transport data, and additionally scan stored
 peers to disclose unreadable persisted rows; that scan does not refresh the registry.
 
-`storage_key_mismatch: true` warns that at least 50% of the scanned rows failed
+`X-BitSov-Storage-Key-Mismatch: true` warns that at least 50% of the scanned rows failed
 (and at least one failed). It means **possible wrong key/passphrase or corrupt
 rows**, not proof that the key is wrong. An empty scan does not trigger it.
 

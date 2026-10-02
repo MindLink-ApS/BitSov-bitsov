@@ -314,7 +314,7 @@ async fn the_room_thread_lists_both_directions_our_copies_once() {
 
     let (status, body) = f.call("GET", &format!("/api/v1/messages?room={}", r.id), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let entries = body["messages"].as_array().unwrap();
+    let entries = body.as_array().unwrap();
     let text = |m: &Value| serde_json::from_str::<Value>(m["plaintext"].as_str().unwrap()).unwrap()["text"].as_str().unwrap().to_string();
     let mut texts: Vec<String> = entries.iter().map(text).collect();
     texts.sort();
@@ -332,10 +332,10 @@ async fn the_room_thread_lists_both_directions_our_copies_once() {
     assert_eq!(entries.iter().find(|m| text(m) == "retry to a").unwrap()["copies"].as_array().unwrap().len(), 1);
     assert!(entries.iter().filter(|m| m["sender"] != f.own.to_hex()).all(|m| m.get("copies").is_none()));
     let (_, limited) = f.call("GET", &format!("/api/v1/messages?room={}&limit=1", r.id), None).await;
-    assert_eq!(limited["messages"].as_array().unwrap().len(), 1, "limit counts entries, not copies");
+    assert_eq!(limited.as_array().unwrap().len(), 1, "limit counts entries, not copies");
 
     let (_, all) = f.call("GET", "/api/v1/messages", None).await;
-    let plain = all["messages"].as_array().unwrap().iter().find(|m| m["plaintext"] == "plain 1:1").unwrap();
+    let plain = all.as_array().unwrap().iter().find(|m| m["plaintext"] == "plain 1:1").unwrap();
     assert!(plain.get("room").is_none(), "ordinary chat has no room: {plain}");
     for bad in ["not-a-room", "0123456789abcdef0123456789abcdef"] {
         let (status, _) = f.call("GET", &format!("/api/v1/messages?room={bad}"), None).await;
@@ -363,7 +363,7 @@ async fn a_sent_room_message_is_in_the_thread_once_on_sqlite() {
     f.state.storage.store_message_plaintext(&reply.id, &test_plaintext_cipher().encrypt(room_chat(&r, "reply").as_bytes()).unwrap()).await.unwrap();
     let (status, thread) = f.call("GET", &format!("/api/v1/messages?room={}", r.id), None).await;
     assert_eq!(status, StatusCode::OK, "{thread}");
-    let thread = thread["messages"].as_array().unwrap();
+    let thread = thread.as_array().unwrap();
     assert_eq!(thread.len(), 2, "{thread:?}");
     let ours = thread.iter().find(|m| m["sender"] == f.own.to_hex()).expect("our sent room message");
     assert_eq!(ours["copies"].as_array().unwrap().len(), 3, "{ours}");
@@ -414,7 +414,7 @@ async fn the_room_thread_pages_by_whole_messages() {
         };
         let (status, page) = f.call("GET", &uri, None).await;
         assert_eq!(status, StatusCode::OK, "{page}");
-        let page = page["messages"].as_array().unwrap().clone();
+        let page = page.as_array().unwrap().clone();
         let Some(entry) = page.first() else { break };
         assert_eq!(page.len(), 1);
         before = Some(entry["timestamp"].as_u64().unwrap());
@@ -433,11 +433,11 @@ async fn the_room_thread_pages_by_whole_messages() {
 
     // One page of everything: the same four entries, in the same order.
     let (_, all) = f.call("GET", &format!("/api/v1/messages?room={}", r.id), None).await;
-    let all: Vec<(String, u64)> = all["messages"].as_array().unwrap().iter().map(|m| (text(m), m["timestamp"].as_u64().unwrap())).collect();
+    let all: Vec<(String, u64)> = all.as_array().unwrap().iter().map(|m| (text(m), m["timestamp"].as_u64().unwrap())).collect();
     assert_eq!(all, order);
     // A cursor between two copies never yields the older copies on their own.
     let (_, mid) = f.call("GET", &format!("/api/v1/messages?room={}&before=3001", r.id), None).await;
-    assert!(mid["messages"].as_array().unwrap().iter().all(|m| m["sender"] != f.own.to_hex()), "{mid}");
+    assert!(mid.as_array().unwrap().iter().all(|m| m["sender"] != f.own.to_hex()), "{mid}");
 }
 
 /// Codex #155 probe `room_one_member_without_session_must_not_pay_first_contact`:

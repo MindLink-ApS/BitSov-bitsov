@@ -438,8 +438,7 @@ async fn peers_is_as_of_the_registry_read() {
     let r = get(test_state(), "/api/v1/peers", true).await;
 
     assert_eq!(r.status, StatusCode::OK);
-    assert!(r.json["peers"].is_array());
-    assert_eq!(r.json["unreadable_count"], 0);
+    assert!(r.json.is_array(), "body shape unchanged: bare array");
     assert!(parse_as_of(r.as_of.as_deref().unwrap()) >= before);
     assert_eq!(r.stale, None);
 }
@@ -461,20 +460,19 @@ async fn messages_is_as_of_the_store_read() {
     let r = get(test_state(), "/api/v1/messages", true).await;
 
     assert_eq!(r.status, StatusCode::OK);
-    assert_eq!(r.json["messages"], serde_json::json!([]));
-    assert_eq!(r.json["unreadable_count"], 0);
+    assert_eq!(r.json, serde_json::json!([]));
     assert!(parse_as_of(r.as_of.as_deref().unwrap()) >= before);
     assert_eq!(r.stale, None);
 }
 
 #[tokio::test]
-async fn messages_with_stored_message_includes_diagnostics() {
+async fn messages_with_stored_message_keeps_body_shape() {
     let state = test_state();
     store_test_envelope(&state).await;
     let r = get(state, "/api/v1/messages", true).await;
 
     assert_eq!(r.status, StatusCode::OK);
-    assert_eq!(r.json["messages"].as_array().expect("messages array").len(), 1);
+    assert_eq!(r.json.as_array().expect("bare array").len(), 1);
     parse_as_of(r.as_of.as_deref().unwrap());
     assert_eq!(r.stale, None);
 }

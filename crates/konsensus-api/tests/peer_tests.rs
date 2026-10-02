@@ -25,7 +25,7 @@ async fn peers_list_empty() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["peers"].as_array().unwrap().is_empty());
+    assert!(json.as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -76,7 +76,7 @@ async fn peers_add_and_remove() {
     let resp = app.oneshot(req).await.unwrap();
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["peers"].as_array().unwrap().len(), 1);
+    assert_eq!(json.as_array().unwrap().len(), 1);
 
     // Get specific peer
     let app = build_router(Arc::clone(&state));
@@ -112,7 +112,7 @@ async fn peers_add_and_remove() {
     let resp = app.oneshot(req).await.unwrap();
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["peers"].as_array().unwrap().is_empty());
+    assert!(json.as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -235,7 +235,7 @@ async fn peers_export_import() {
     let resp = app.oneshot(req).await.unwrap();
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(list["peers"].as_array().unwrap().is_empty());
+    assert!(list.as_array().unwrap().is_empty());
 
     // Import the backup
     let app = build_router(Arc::clone(&state));
@@ -271,7 +271,7 @@ async fn peers_export_import() {
     let resp = app.oneshot(req).await.unwrap();
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(list["peers"].as_array().unwrap().len(), 2);
+    assert_eq!(list.as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -2081,7 +2081,7 @@ async fn peers_remove_and_verify_empty() {
     let resp = app.oneshot(req).await.unwrap();
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["peers"].as_array().unwrap().is_empty());
+    assert!(json.as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
