@@ -372,7 +372,13 @@ async fn list_files(
         .unwrap_or_else(|| konsensus_storage::ListCursor { timestamp: file.created_at.clone(), id: file.id.clone() });
     let mut files = rows.items;
     let staged = state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).list(&state, &auth);
-    files.extend(staged.into_iter().filter(|file| cursor.as_ref().is_none_or(|at| compare_file_positions(&position(file), at).is_lt())));
+    // The next request excludes the raw boundary. Include staged files at or
+    // above it now, and defer older uploads to the source window containing them.
+    files.extend(staged.into_iter().filter(|file| {
+        let at = position(file);
+        cursor.as_ref().is_none_or(|cursor| compare_file_positions(&at, cursor).is_lt())
+            && diagnostics.continuation.as_ref().is_none_or(|raw| !compare_file_positions(&at, raw).is_lt())
+    }));
     files.sort_by(|a, b| compare_file_positions(&position(b), &position(a)));
     let limit = params.limit.min(MAX_FILE_LIST_LIMIT) as usize;
     files.truncate(limit);

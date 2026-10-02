@@ -403,6 +403,91 @@ async fn staged_files_do_not_skip_readable_rows_at_the_scan_boundary() {
 }
 
 #[tokio::test]
+async fn bounded_file_pages_return_every_readable_and_staged_file_exactly_once() {
+    use konsensus_api::auth::{AuthUser, Scope};
+    use std::collections::BTreeSet;
+
+    for tied in [false, true] {
+        let store = Arc::new(EncryptedStorage::new(
+            SqliteStorage::in_memory().await.unwrap(),
+            &[7; 32],
+        ));
+        let state = common::test_state_with_storage(store.clone());
+        let auth = AuthUser {
+            node_id: state.identity.node_id().to_hex(),
+            scopes: Scope::all(),
+            pairing: None,
+        };
+        let timestamp = |n| {
+            let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+            (base + chrono::Duration::seconds(if tied { 0 } else { n }))
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let file = |id: String, n| FileRecord {
+            id,
+            filename: "name".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 0,
+            blake3_hash: "hash".into(),
+            sender: auth.node_id.clone(),
+            message_id: None,
+            data: vec![],
+            created_at: timestamp(n),
+        };
+        let mut expected = BTreeSet::new();
+        for n in 1..=65 {
+            // IDs on both sides of stage-* exercise the timestamp tie-breaker.
+            let record = file(format!("{}-{n:02}", if n % 2 == 0 { "z" } else { "a" }), n);
+            if [1, 22, 43, 65].contains(&n) {
+                store.store_file(&record).await.unwrap();
+                expected.insert(record.id.clone());
+            } else {
+                store.inner().store_file(&record).await.unwrap();
+            }
+            sqlx::query("UPDATE files SET created_at = ? WHERE id = ?")
+                .bind(&record.created_at)
+                .bind(&record.id)
+                .execute(store.inner().pool()).await.unwrap();
+        }
+        for n in [0, 2, 21, 22, 23, 42, 43, 44, 64, 65, 66] {
+            let record = file(format!("stage-{n:02}"), n);
+            expected.insert(record.id.clone());
+            state.file_staging.lock().unwrap().insert(&state, &auth, record).unwrap();
+        }
+
+        // Exercise full, short and empty bounded pages, including changing limits.
+        for limits in [&[1][..], &[2][..], &[3, 1, 2][..]] {
+            let mut seen = BTreeSet::new();
+            let mut cursor = String::new();
+            let mut bounded_pages = 0;
+            for page in 0..100 {
+                let limit = limits[page % limits.len()];
+                let uri = format!("/api/v1/files?limit={limit}{cursor}");
+                let (status, headers, body) = call(&state, &uri, None, true).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                for item in body.as_array().unwrap() {
+                    let id = item["id"].as_str().unwrap().to_owned();
+                    assert!(seen.insert(id.clone()), "duplicate {id}: tied={tied}, {uri}");
+                }
+                if headers.contains_key("X-BitSov-Oldest-Scanned-Id") {
+                    bounded_pages += 1;
+                }
+                let Some(before) = headers.get("X-BitSov-Next-Before") else {
+                    break;
+                };
+                cursor = format!("&before={}&before_id={}",
+                    before.to_str().unwrap().replace('+', "%2B"),
+                    headers["X-BitSov-Next-Before-Id"].to_str().unwrap());
+                assert!(page < 99, "pagination did not terminate");
+            }
+            assert!(bounded_pages > 0, "fixture must reach the raw scan bound");
+            assert_eq!(seen, expected, "lost files: tied={tied}, limits={limits:?}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn search_continuation_preserves_matches_not_yet_returned() {
     let store = Arc::new(EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]));
     let state = common::test_state_with_storage_and_cipher(store.clone());
@@ -435,10 +520,12 @@ async fn room_source_checkpoints_are_separate_from_logical_pages() {
     let peers = [NodeId::from_bytes([3; 32]), NodeId::from_bytes([4; 32])];
     let room = RoomBinding::create(&[owner, peers[0], peers[1]]).unwrap();
     let plaintext = json!({"v":1, "room":room, "msg":"ab".repeat(16), "text":"copies across chunks"}).to_string();
+    let mut expected_copies = std::collections::BTreeSet::new();
     for n in 1u64..=5002 {
         let env = UkmEnvelopeBuilder::new(KIND_CHAT, owner, Recipient::Node(if n == 1 { peers[0] } else { peers[1] }),
             n.to_le_bytes().to_vec(), PaymentProof::new([1; 32], [2; 32], 10)).timestamp(n).build();
         if n == 1 || n == 5002 {
+            expected_copies.insert(env.id.to_hex());
             store.store_message(&env).await.unwrap();
             store.store_message_plaintext(&env.id, &common::test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap()).await.unwrap();
         } else { store.inner().store_message(&env).await.unwrap(); }
@@ -460,4 +547,14 @@ async fn room_source_checkpoints_are_separate_from_logical_pages() {
     assert_eq!(older[0]["room_msg"], first[0]["room_msg"]);
     assert_ne!(older[0]["copies"][0]["id"], first[0]["copies"][0]["id"]);
     assert!(!headers.contains_key("X-BitSov-Oldest-Scanned-Timestamp"));
+    // A logical room_msg can span chunks, but each source copy appears once.
+    let mut seen_copies = std::collections::BTreeSet::new();
+    for page in [&first, &older] {
+        for entry in page.as_array().unwrap() {
+            for copy in entry["copies"].as_array().unwrap() {
+                assert!(seen_copies.insert(copy["id"].as_str().unwrap().to_owned()));
+            }
+        }
+    }
+    assert_eq!(seen_copies, expected_copies);
 }
