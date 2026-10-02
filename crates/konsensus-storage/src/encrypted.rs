@@ -46,6 +46,7 @@ use crate::traits::Storage;
 pub struct EncryptedStorage<S: Storage> {
     inner: S,
     cipher: Aes256Gcm,
+    read_health: std::sync::Mutex<crate::StorageReadHealth>,
     /// Per-peer locks serialising `upsert_peer`'s read-decrypt-merge-encrypt-write
     /// sequence. The merge that preserves `invite_ref` / `whitelist_source` cannot
     /// be pushed into the inner SQL UPSERT because the metadata is an opaque
@@ -64,6 +65,7 @@ impl<S: Storage> EncryptedStorage<S> {
         Self {
             inner,
             cipher,
+            read_health: std::sync::Mutex::new(crate::StorageReadHealth::default()),
             peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -340,6 +342,41 @@ impl<S: Storage> EncryptedStorage<S> {
         serde_json::to_string(&encrypted).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
+    /// Only the row identifier is logged: never error text, content, or keys.
+    fn decrypt_list<T>(
+        &self,
+        rows: Vec<T>,
+        decrypt: impl Fn(&T) -> Result<T, StorageError>,
+        row_id: impl Fn(&T) -> String,
+    ) -> crate::StorageList<T> {
+        let mut result = crate::StorageList::readable(Vec::with_capacity(rows.len()));
+        for row in rows {
+            match decrypt(&row) {
+                Ok(item) => result.items.push(item),
+                Err(_) => {
+                    tracing::warn!(row_id = %row_id(&row), "at-rest decrypt failed (storage key mismatch or corrupt row)");
+                    result.unreadable_count += 1;
+                }
+            }
+        }
+        let mut health = self.read_health.lock().unwrap_or_else(|e| e.into_inner());
+        health.storage_unreadable_rows = health.storage_unreadable_rows.saturating_add(result.unreadable_count);
+        if result.storage_key_mismatch() && !health.storage_key_mismatch {
+            health.storage_key_mismatch = true;
+            tracing::error!("storage_key_mismatch: at least half of a storage list could not be read");
+        }
+        result
+    }
+
+    fn decrypt_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<crate::OutboxOperation, StorageError> {
+        let mut op = op.clone();
+        // Empty recovery is valid for existing compacted tombstones.
+        if !op.recovery.is_empty() {
+            op.recovery = self.decrypt(&op.recovery)?;
+        }
+        Ok(op)
+    }
+
     /// Get a reference to the inner storage.
     pub fn inner(&self) -> &S {
         &self.inner
@@ -348,6 +385,10 @@ impl<S: Storage> EncryptedStorage<S> {
 
 #[async_trait]
 impl<S: Storage> Storage for EncryptedStorage<S> {
+    fn storage_read_health(&self) -> crate::StorageReadHealth {
+        *self.read_health.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     async fn record_outbox_sent(&self, id: &MessageId, peer: &NodeId) -> Result<(), StorageError> {
         self.inner.record_outbox_sent(id, peer).await
     }
@@ -373,21 +414,30 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         Ok(op)
     }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        let mut ops = self.inner.list_recoverable_operations().await?;
-        for op in &mut ops { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
-        Ok(ops)
+        Ok(self.list_recoverable_operations_with_diagnostics().await?.items)
+    }
+
+    async fn list_recoverable_operations_with_diagnostics(&self) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+        let rows = self.inner.list_recoverable_operations().await?;
+        Ok(self.decrypt_list(rows, |row| self.decrypt_outbox_operation(row), |row| row.operation_id.to_string()))
     }
 
     async fn list_failed_prepared_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        let mut ops = self.inner.list_failed_prepared_operations().await?;
-        for op in &mut ops { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
-        Ok(ops)
+        Ok(self.list_failed_prepared_operations_with_diagnostics().await?.items)
+    }
+
+    async fn list_failed_prepared_operations_with_diagnostics(&self) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+        let rows = self.inner.list_failed_prepared_operations().await?;
+        Ok(self.decrypt_list(rows, |row| self.decrypt_outbox_operation(row), |row| row.operation_id.to_string()))
     }
 
     async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        let mut ops = self.inner.list_compactable_operations(before_ms, limit).await?;
-        for op in &mut ops { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
-        Ok(ops)
+        Ok(self.list_compactable_operations_with_diagnostics(before_ms, limit).await?.items)
+    }
+
+    async fn list_compactable_operations_with_diagnostics(&self, before_ms: i64, limit: u32) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+        let rows = self.inner.list_compactable_operations(before_ms, limit).await?;
+        Ok(self.decrypt_list(rows, |row| self.decrypt_outbox_operation(row), |row| row.operation_id.to_string()))
     }
 
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
@@ -454,15 +504,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         limit: u32,
         before_timestamp: Option<u64>,
     ) -> Result<Vec<UkmEnvelope>, StorageError> {
-        let encrypted = self
-            .inner
-            .get_messages_for_recipient(recipient, limit, before_timestamp)
-            .await?;
+        Ok(self.get_messages_for_recipient_with_diagnostics(recipient, limit, before_timestamp).await?.items)
+    }
 
-        encrypted
-            .iter()
-            .map(|e| self.decrypt_envelope(e))
-            .collect()
+    async fn get_messages_for_recipient_with_diagnostics(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        let rows = self.inner.get_messages_for_recipient(recipient, limit, before_timestamp).await?;
+        Ok(self.decrypt_list(rows, |row| self.decrypt_envelope(row), |row| row.id.to_string()))
     }
 
     async fn get_conversation_messages(
@@ -473,15 +520,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         limit: u32,
         before_timestamp: Option<u64>,
     ) -> Result<Vec<UkmEnvelope>, StorageError> {
-        let encrypted = self
-            .inner
-            .get_conversation_messages(my_node_id, peer_or_room_id, is_room, limit, before_timestamp)
-            .await?;
+        Ok(self.get_conversation_messages_with_diagnostics(my_node_id, peer_or_room_id, is_room, limit, before_timestamp).await?.items)
+    }
 
-        encrypted
-            .iter()
-            .map(|e| self.decrypt_envelope(e))
-            .collect()
+    async fn get_conversation_messages_with_diagnostics(&self, my_node_id: &str, peer_or_room_id: &str, is_room: bool, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        let rows = self.inner.get_conversation_messages(my_node_id, peer_or_room_id, is_room, limit, before_timestamp).await?;
+        Ok(self.decrypt_list(rows, |row| self.decrypt_envelope(row), |row| row.id.to_string()))
     }
 
     async fn get_node_messages_of_kind(
@@ -491,15 +535,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         limit: u32,
         before_timestamp: Option<u64>,
     ) -> Result<Vec<UkmEnvelope>, StorageError> {
-        let encrypted = self
-            .inner
-            .get_node_messages_of_kind(my_node_id, kind, limit, before_timestamp)
-            .await?;
+        Ok(self.get_node_messages_of_kind_with_diagnostics(my_node_id, kind, limit, before_timestamp).await?.items)
+    }
 
-        encrypted
-            .iter()
-            .map(|e| self.decrypt_envelope(e))
-            .collect()
+    async fn get_node_messages_of_kind_with_diagnostics(&self, my_node_id: &str, kind: u16, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        let rows = self.inner.get_node_messages_of_kind(my_node_id, kind, limit, before_timestamp).await?;
+        Ok(self.decrypt_list(rows, |row| self.decrypt_envelope(row), |row| row.id.to_string()))
     }
 
     async fn delete_message(&self, id: &MessageId) -> Result<bool, StorageError> {
@@ -534,8 +575,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
 
     async fn list_rooms(&self) -> Result<Vec<Room>, StorageError> {
-        let encrypted = self.inner.list_rooms().await?;
-        encrypted.iter().map(|r| self.decrypt_room(r)).collect()
+        Ok(self.list_rooms_with_diagnostics().await?.items)
+    }
+
+    async fn list_rooms_with_diagnostics(&self) -> Result<crate::StorageList<Room>, StorageError> {
+        let rows = self.inner.list_rooms().await?;
+        Ok(self.decrypt_list(rows, |row| self.decrypt_room(row), |row| row.id.to_string()))
     }
 
     async fn delete_room(&self, id: &RoomId) -> Result<bool, StorageError> {
@@ -591,8 +636,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
 
     async fn list_peers(&self) -> Result<Vec<Peer>, StorageError> {
-        let encrypted = self.inner.list_peers().await?;
-        encrypted.iter().map(|p| self.decrypt_peer(p)).collect()
+        Ok(self.list_peers_with_diagnostics().await?.items)
+    }
+
+    async fn list_peers_with_diagnostics(&self) -> Result<crate::StorageList<Peer>, StorageError> {
+        let rows = self.inner.list_peers().await?;
+        Ok(self.decrypt_list(rows, |row| self.decrypt_peer(row), |row| row.node_id.to_string()))
     }
 
     async fn delete_peer(&self, id: &NodeId) -> Result<bool, StorageError> {
@@ -793,11 +842,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
 
     async fn list_files(&self, limit: u32) -> Result<Vec<FileMetadata>, StorageError> {
-        let encrypted = self.inner.list_files(limit).await?;
-        encrypted
-            .iter()
-            .map(|m| self.decrypt_file_metadata(m))
-            .collect()
+        Ok(self.list_files_with_diagnostics(limit).await?.items)
+    }
+
+    async fn list_files_with_diagnostics(&self, limit: u32) -> Result<crate::StorageList<FileMetadata>, StorageError> {
+        let rows = self.inner.list_files(limit).await?;
+        Ok(self.decrypt_list(rows, |row| self.decrypt_file_metadata(row), |row| row.id.to_string()))
     }
 
     async fn delete_file(&self, id: &str) -> Result<bool, StorageError> {

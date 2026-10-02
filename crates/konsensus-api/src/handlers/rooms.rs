@@ -120,15 +120,16 @@ async fn create_room(
 async fn list_rooms(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<RoomResponse>>, ApiError> {
+) -> Result<Json<RoomsResponse>, ApiError> {
     let rooms = state
         .storage
-        .list_rooms()
+        .list_rooms_with_diagnostics()
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
-    let responses: Vec<_> = rooms.iter().map(RoomResponse::from).collect();
-    Ok(Json(responses))
+    let diagnostics = (&rooms).into();
+    let responses: Vec<_> = rooms.items.iter().map(RoomResponse::from).collect();
+    Ok(Json(RoomsResponse { rooms: responses, diagnostics }))
 }
 
 /// `GET /api/v1/rooms/:id` — get a room.
@@ -265,4 +266,11 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/v1/rooms/:id/members/:node_id",
             axum::routing::delete(remove_member),
         )
+}
+
+#[derive(Serialize)]
+pub struct RoomsResponse {
+    pub rooms: Vec<RoomResponse>,
+    #[serde(flatten)]
+    pub diagnostics: crate::handlers::list_diagnostics::ListDiagnostics,
 }

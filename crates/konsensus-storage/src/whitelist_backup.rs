@@ -53,14 +53,20 @@ impl WhitelistBackup {
     /// table yields an empty list rather than failing the whole backup (the
     /// `peers` rows are the load-bearing whitelist authority).
     pub async fn collect(storage: &dyn Storage, now_unix: u64) -> Result<Self, StorageError> {
-        let peers = storage.list_peers().await?;
+        let peers = storage.list_peers_with_diagnostics().await?;
+        // A partial UI list is useful; a partial replacement backup is data loss.
+        if peers.unreadable_count != 0 {
+            return Err(StorageError::Encryption(
+                "cannot back up whitelist: unreadable peer rows".into(),
+            ));
+        }
         let accepted_invites = storage
             .list_active_accepted_invites(now_unix)
             .await
             .unwrap_or_default();
         Ok(Self {
             version: BACKUP_VERSION,
-            peers,
+            peers: peers.items,
             accepted_invites,
         })
     }

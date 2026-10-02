@@ -35,6 +35,8 @@ pub struct ResyncEntry {
 
 #[derive(Serialize)]
 pub struct ResyncDiscoverResponse {
+    #[serde(flatten)]
+    pub diagnostics: crate::handlers::list_diagnostics::ListDiagnostics,
     pub phase: &'static str,
     pub peer_id: String,
     pub messages: Vec<ResyncEntry>,
@@ -87,11 +89,12 @@ async fn discover(
     let my_node_hex = state.identity.node_id().to_hex();
     let envelopes = state
         .storage
-        .get_conversation_messages(&my_node_hex, &peer_id, false, MAX_DISCOVERY_LIMIT, Some(to_ms.saturating_add(1)))
+        .get_conversation_messages_with_diagnostics(&my_node_hex, &peer_id, false, MAX_DISCOVERY_LIMIT, Some(to_ms.saturating_add(1)))
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
-    let in_window: Vec<_> = envelopes.into_iter().filter(|env| env.timestamp >= from_ms).collect();
+    let diagnostics = (&envelopes).into();
+    let in_window: Vec<_> = envelopes.items.into_iter().filter(|env| env.timestamp >= from_ms).collect();
 
     let mut entries = Vec::with_capacity(in_window.len());
     let mut estimated_total: u64 = 0;
@@ -115,7 +118,7 @@ async fn discover(
         Some(serde_json::json!({"action":"resync_discover","peer_id":peer_id,"from_ms":from_ms,"to_ms":to_ms,"found":total_count})));
     tracing::info!(peer = %peer_id, from_ms, to_ms, found = total_count, estimated_msat = estimated_total, "resync discovery complete");
 
-    Ok(ResyncDiscoverResponse { phase: "discover", peer_id, messages: entries, total_count, estimated_total_msat: estimated_total, from_ms, to_ms })
+    Ok(ResyncDiscoverResponse { diagnostics, phase: "discover", peer_id, messages: entries, total_count, estimated_total_msat: estimated_total, from_ms, to_ms })
 }
 
 async fn fulfill(

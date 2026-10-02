@@ -247,7 +247,7 @@ pub(super) async fn list_messages(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListMessagesQuery>,
-) -> Result<(DataFreshness, Json<Vec<MessageResponse>>), ApiError> {
+) -> Result<(DataFreshness, Json<MessagesResponse>), ApiError> {
     let my_node_hex = state.identity.node_id().to_hex();
     let store_read = DataFreshness::now();
     let limit = clamp_limit(params.limit);
@@ -279,7 +279,7 @@ pub(super) async fn list_messages(
         };
         state
             .storage
-            .get_conversation_messages(
+            .get_conversation_messages_with_diagnostics(
                 &my_node_hex,
                 peer_id,
                 is_room,
@@ -292,14 +292,15 @@ pub(super) async fn list_messages(
         let recipient = Recipient::Node(*state.identity.node_id());
         state
             .storage
-            .get_messages_for_recipient(&recipient, limit, params.before)
+            .get_messages_for_recipient_with_diagnostics(&recipient, limit, params.before)
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     };
 
+    let diagnostics = (&messages).into();
     let cipher = state.plaintext_cipher.as_deref();
-    let mut responses = Vec::with_capacity(messages.len());
-    for env in &messages {
+    let mut responses = Vec::with_capacity(messages.items.len());
+    for env in &messages.items {
         let mut resp = MessageResponse::from_envelope(env);
         if cipher.is_some() {
             let cached = state
@@ -312,7 +313,7 @@ pub(super) async fn list_messages(
         responses.push(resp);
     }
 
-    Ok((store_read, Json(responses)))
+    Ok((store_read, Json(MessagesResponse { messages: responses, diagnostics })))
 }
 
 /// `?room=`: the room thread, both directions, as logical entries: a received
@@ -324,17 +325,18 @@ pub(super) async fn list_messages(
 /// is placed at its newest copy's timestamp, ordered newest first (ties by
 /// id); `before` and `limit` then apply to entries, so a page never repeats
 /// or splits a message.
-async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, before: Option<u64>) -> Result<Vec<MessageResponse>, ApiError> {
+async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, before: Option<u64>) -> Result<MessagesResponse, ApiError> {
     let messages = state
         .storage
-        .get_node_messages_of_kind(me, konsensus_core::kind::KIND_CHAT, MAX_SEARCH_SCAN, None)
+        .get_node_messages_of_kind_with_diagnostics(me, konsensus_core::kind::KIND_CHAT, MAX_SEARCH_SCAN, None)
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
-    let Some(cipher) = state.plaintext_cipher.as_deref() else { return Ok(Vec::new()) };
+    let diagnostics = (&messages).into();
+    let Some(cipher) = state.plaintext_cipher.as_deref() else { return Ok(MessagesResponse { messages: Vec::new(), diagnostics }) };
     let mut thread: Vec<MessageResponse> = Vec::new();
     // Our room message id -> its entry in `thread`.
     let mut sent: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for env in &messages {
+    for env in &messages.items {
         let cached = state.storage.get_message_plaintext(&env.id).await.unwrap_or(None);
         let mut resp = MessageResponse::from_envelope(env).with_cached_plaintext(cached, Some(cipher));
         if resp.room.as_ref().is_none_or(|room| room.id != room_id) {
@@ -365,7 +367,7 @@ async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, befo
     for entry in &mut thread {
         entry.copies.sort_by(|a, b| a.recipient.cmp(&b.recipient));
     }
-    Ok(thread)
+    Ok(MessagesResponse { messages: thread, diagnostics })
 }
 
 /// Maximum number of most-recent messages a single search will decrypt and scan.
@@ -437,7 +439,7 @@ pub(super) async fn search_messages(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchMessagesQuery>,
-) -> Result<Json<Vec<SearchResult>>, ApiError> {
+) -> Result<Json<MessagesResponse<SearchResult>>, ApiError> {
     let needle = params.q.trim();
     if needle.is_empty() {
         return Err(ApiError::BadRequest("search query 'q' must not be empty".into()));
@@ -466,21 +468,22 @@ pub(super) async fn search_messages(
         };
         state
             .storage
-            .get_conversation_messages(&my_node_hex, peer_id, is_room, MAX_SEARCH_SCAN, None)
+            .get_conversation_messages_with_diagnostics(&my_node_hex, peer_id, is_room, MAX_SEARCH_SCAN, None)
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     } else {
         let recipient = Recipient::Node(*state.identity.node_id());
         state
             .storage
-            .get_messages_for_recipient(&recipient, MAX_SEARCH_SCAN, None)
+            .get_messages_for_recipient_with_diagnostics(&recipient, MAX_SEARCH_SCAN, None)
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     };
 
     let limit = clamp_limit(params.limit) as usize;
+    let diagnostics = (&messages).into();
     let mut results = Vec::new();
-    for env in &messages {
+    for env in &messages.items {
         if results.len() >= limit {
             break;
         }
@@ -513,7 +516,7 @@ pub(super) async fn search_messages(
         }
     }
 
-    Ok(Json(results))
+    Ok(Json(MessagesResponse { messages: results, diagnostics }))
 }
 
 /// `DELETE /api/v1/messages/:id` — delete a message.
@@ -583,4 +586,11 @@ mod search_snippet_tests {
         let _ = search_snippet(text, "café", 2);
         let _ = search_snippet("日本語のメッセージ test 検索", "test", 2);
     }
+}
+
+#[derive(Serialize)]
+pub struct MessagesResponse<T = MessageResponse> {
+    pub messages: Vec<T>,
+    #[serde(flatten)]
+    pub diagnostics: crate::handlers::list_diagnostics::ListDiagnostics,
 }

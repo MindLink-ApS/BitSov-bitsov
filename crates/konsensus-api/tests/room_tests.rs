@@ -64,7 +64,7 @@ async fn rooms_crud() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json.as_array().unwrap().len(), 1);
+    assert_eq!(json["rooms"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -585,7 +585,7 @@ async fn room_full_lifecycle() {
     let resp = app.oneshot(req).await.unwrap();
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(list.as_array().unwrap().iter().any(|r| r["name"] == "lifecycle-room"));
+    assert!(list["rooms"].as_array().unwrap().iter().any(|r| r["name"] == "lifecycle-room"));
 
     // 4. Add a member
     let peer_id = "aa".repeat(32);

@@ -40,7 +40,7 @@ async fn messages_list_empty() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json.as_array().unwrap().is_empty());
+    assert!(json["messages"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -474,7 +474,7 @@ async fn list_messages_returns_stored() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json.as_array().unwrap().len(), 1);
+    assert_eq!(json["messages"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -498,7 +498,7 @@ async fn list_messages_with_limit() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json.as_array().unwrap().len(), 1);
+    assert_eq!(json["messages"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -647,7 +647,7 @@ async fn search_finds_message_by_decrypted_plaintext() {
 
     let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let arr = json.as_array().unwrap();
+    let arr = json["messages"].as_array().unwrap();
     assert_eq!(arr.len(), 1, "exactly one match expected: {json}");
     assert_eq!(arr[0]["id"].as_str().unwrap(), match_id);
     assert!(
@@ -1748,7 +1748,7 @@ async fn list_messages_with_peer_filter() {
 
     let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let arr = json.as_array().unwrap();
+    let arr = json["messages"].as_array().unwrap();
     assert!(!arr.is_empty(), "conversation should contain the sent message");
 }
 
@@ -1802,7 +1802,7 @@ async fn list_messages_with_room_uuid_filter() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json.as_array().unwrap().len(), 0);
+    assert_eq!(json["messages"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -3227,7 +3227,7 @@ async fn messages_peer_query_returns_empty_list() {
 
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(json.as_array().unwrap().is_empty());
+    assert!(json["messages"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

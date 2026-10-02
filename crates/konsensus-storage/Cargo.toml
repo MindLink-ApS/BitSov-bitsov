@@ -26,3 +26,4 @@ blake3.workspace = true
 ed25519-dalek.workspace = true
 mockall.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true

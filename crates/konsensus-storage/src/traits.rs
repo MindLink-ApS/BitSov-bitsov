@@ -22,6 +22,56 @@ pub enum PaidAcceptance { Accepted, AlreadyAccepted, NonceReused, PaymentReused 
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// Local at-rest read diagnostics, never exposed by public health.
+    fn storage_read_health(&self) -> crate::StorageReadHealth {
+        crate::StorageReadHealth::default()
+    }
+
+    /// This scan's readable rows and exact unreadable count. Database errors stay errors.
+    async fn get_messages_for_recipient_with_diagnostics(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        Ok(crate::StorageList::readable(self.get_messages_for_recipient(recipient, limit, before_timestamp).await?))
+    }
+
+    /// This scan's readable rows and exact unreadable count. Database errors stay errors.
+    async fn get_conversation_messages_with_diagnostics(&self, my_node_id: &str, peer_or_room_id: &str, is_room: bool, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        Ok(crate::StorageList::readable(self.get_conversation_messages(my_node_id, peer_or_room_id, is_room, limit, before_timestamp).await?))
+    }
+
+    /// This scan's readable rows and exact unreadable count. Database errors stay errors.
+    async fn get_node_messages_of_kind_with_diagnostics(&self, my_node_id: &str, kind: u16, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        Ok(crate::StorageList::readable(self.get_node_messages_of_kind(my_node_id, kind, limit, before_timestamp).await?))
+    }
+
+    /// This scan's readable rows and exact unreadable count. Database errors stay errors.
+    async fn list_rooms_with_diagnostics(&self) -> Result<crate::StorageList<Room>, StorageError> {
+        Ok(crate::StorageList::readable(self.list_rooms().await?))
+    }
+
+    /// This scan's readable rows and exact unreadable count. Database errors stay errors.
+    async fn list_peers_with_diagnostics(&self) -> Result<crate::StorageList<Peer>, StorageError> {
+        Ok(crate::StorageList::readable(self.list_peers().await?))
+    }
+
+    /// This scan's readable rows and exact unreadable count. Database errors stay errors.
+    async fn list_files_with_diagnostics(&self, limit: u32) -> Result<crate::StorageList<FileMetadata>, StorageError> {
+        Ok(crate::StorageList::readable(self.list_files(limit).await?))
+    }
+
+    /// This scan's readable rows and exact unreadable count. Database errors stay errors.
+    async fn list_recoverable_operations_with_diagnostics(&self) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+        Ok(crate::StorageList::readable(self.list_recoverable_operations().await?))
+    }
+
+    /// This scan's readable rows and exact unreadable count. Database errors stay errors.
+    async fn list_failed_prepared_operations_with_diagnostics(&self) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+        Ok(crate::StorageList::readable(self.list_failed_prepared_operations().await?))
+    }
+
+    /// This scan's readable rows and exact unreadable count. Database errors stay errors.
+    async fn list_compactable_operations_with_diagnostics(&self, before_ms: i64, limit: u32) -> Result<crate::StorageList<crate::OutboxOperation>, StorageError> {
+        Ok(crate::StorageList::readable(self.list_compactable_operations(before_ms, limit).await?))
+    }
+
     /// Record transport write success without regressing an immediate ACK/reject.
     async fn record_outbox_sent(&self, _id: &MessageId, _peer: &NodeId) -> Result<(), StorageError> { Ok(()) }
 

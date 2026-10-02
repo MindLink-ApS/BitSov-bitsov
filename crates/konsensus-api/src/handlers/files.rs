@@ -340,17 +340,19 @@ async fn list_files(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListFilesQuery>,
-) -> Result<Json<Vec<FileResponse>>, ApiError> {
-    let mut files = state
+) -> Result<Json<FilesResponse>, ApiError> {
+    let rows = state
         .storage
-        .list_files(params.limit.min(MAX_FILE_LIST_LIMIT))
+        .list_files_with_diagnostics(params.limit.min(MAX_FILE_LIST_LIMIT))
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
+    let diagnostics = (&rows).into();
+    let mut files = rows.items;
     files.extend(state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).list(&state, &auth));
     files.sort_by(|a,b| b.created_at.cmp(&a.created_at));
     files.truncate(params.limit.min(MAX_FILE_LIST_LIMIT) as usize);
-    Ok(Json(files.into_iter().map(FileResponse::from).collect()))
+    Ok(Json(FilesResponse { files: files.into_iter().map(FileResponse::from).collect(), diagnostics }))
 }
 
 /// `DELETE /api/v1/files/:id` — delete a file.
@@ -617,4 +619,11 @@ mod tests {
         assert!(validate_filename("my file (1).txt").is_ok());
         assert!(validate_filename("image.png").is_ok());
     }
+}
+
+#[derive(Serialize)]
+pub struct FilesResponse {
+    pub files: Vec<FileResponse>,
+    #[serde(flatten)]
+    pub diagnostics: crate::handlers::list_diagnostics::ListDiagnostics,
 }
