@@ -21,7 +21,7 @@ const MAX_DISCOVERY_LIMIT: u32 = 1000;
 #[derive(Deserialize)]
 #[serde(tag = "phase", rename_all = "lowercase")]
 pub enum ResyncRequest {
-    Discover { peer_id: String, from_ms: u64, to_ms: u64 },
+    Discover { peer_id: String, from_ms: u64, to_ms: u64, before: Option<u64>, before_id: Option<String> },
     Fulfill  { peer_id: String, message_ids: Vec<String> },
 }
 
@@ -60,8 +60,8 @@ pub(super) async fn resync_messages(
     Json(req): Json<ResyncRequest>,
 ) -> Result<(ListDiagnostics, Json<serde_json::Value>), ApiError> {
     match req {
-        ResyncRequest::Discover { peer_id, from_ms, to_ms } => {
-            let (diagnostics, r) = discover(&state, peer_id, from_ms, to_ms).await?;
+        ResyncRequest::Discover { peer_id, from_ms, to_ms, before, before_id } => {
+            let (diagnostics, r) = discover(&state, peer_id, from_ms, to_ms, before, before_id).await?;
             Ok((diagnostics, Json(serde_json::to_value(r)
                 .map_err(|e| ApiError::Internal(format!("serialization error: {e}")))?)))
         }
@@ -78,6 +78,8 @@ async fn discover(
     peer_id: String,
     from_ms: u64,
     to_ms: u64,
+    before: Option<u64>,
+    before_id: Option<String>,
 ) -> Result<(ListDiagnostics, ResyncDiscoverResponse), ApiError> {
     if from_ms > to_ms {
         return Err(ApiError::BadRequest("from_ms must be <= to_ms".into()));
@@ -85,10 +87,16 @@ async fn discover(
     NodeId::from_hex(&peer_id)
         .map_err(|e| ApiError::BadRequest(format!("invalid peer_id: {e}")))?;
 
+    let cursor = crate::handlers::list_diagnostics::message_cursor(before, before_id.as_deref())?;
+    let upper = to_ms.saturating_add(1);
+    let upper = if cursor.is_some() { upper } else { before.map_or(upper, |b| b.min(upper)) };
     let my_node_hex = state.identity.node_id().to_hex();
     let envelopes = state
         .storage
-        .get_conversation_messages_with_diagnostics(&my_node_hex, &peer_id, false, MAX_DISCOVERY_LIMIT, Some(to_ms.saturating_add(1)))
+        .message_page_with_diagnostics(
+            &konsensus_storage::MessageListQuery::Conversation { me: &my_node_hex, peer: &peer_id, is_room: false },
+            MAX_DISCOVERY_LIMIT, Some(upper), cursor.as_ref(),
+        )
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 

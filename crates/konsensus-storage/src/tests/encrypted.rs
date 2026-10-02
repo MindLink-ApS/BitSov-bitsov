@@ -1340,11 +1340,11 @@ async fn unreadable_counts_thresholds_concurrency_and_database_errors() {
     for timestamp in [10, 20] {
         store.store_message(&make("readable", timestamp)).await.unwrap();
     }
-    // Below half, exactly half, all bad, and empty are distinct boundary cases.
+    // Refilled pages count only the raw rows actually scanned.
     for (limit, before, good, unreadable, mismatch) in [
         (3, None, 2, 1, false),
-        (2, None, 1, 1, true),
-        (1, None, 0, 1, true),
+        (2, None, 2, 1, false),
+        (1, None, 1, 1, true),
         (0, None, 0, 0, false),
         (3, Some(30), 2, 0, false),
     ] {
@@ -1447,4 +1447,91 @@ async fn unreadable_peers_refuse_incomplete_backup() {
     assert!(crate::WhitelistBackup::collect(&store, 0).await.is_err(), "partial list must not become a replacement backup");
     let wrong_key_store = EncryptedStorage::new(store.inner, &[8; 32]);
     assert!(crate::WhitelistBackup::collect(&wrong_key_store, 0).await.is_err(), "wrong-key empty list must not become a replacement backup");
+}
+
+#[tokio::test]
+async fn refill_preserves_tied_messages_across_all_scopes() {
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let sender = NodeId::from_bytes([1; 32]);
+    let node = NodeId::from_bytes([2; 32]);
+    let recipient = Recipient::Node(node);
+    let mut messages: Vec<_> = (0u64..14).map(|n| {
+        UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, n.to_le_bytes().to_vec(), make_proof())
+            .timestamp(20).build()
+    }).collect();
+    messages.sort_by_key(|m| std::cmp::Reverse(m.id.to_hex()));
+    for (i, message) in messages.iter().enumerate() {
+        if i == 0 || i == 13 { store.store_message(message).await.unwrap(); }
+        else { store.inner().store_message(message).await.unwrap(); }
+    }
+    let me = node.to_hex();
+    let peer = sender.to_hex();
+    for scope in [
+        crate::MessageListQuery::Recipient(&recipient),
+        crate::MessageListQuery::Conversation { me: &me, peer: &peer, is_room: false },
+        crate::MessageListQuery::NodeKind { me: &me, kind: KIND_CHAT },
+    ] {
+        let page = store.message_page_with_diagnostics(&scope, 2, None, None).await.unwrap();
+        assert_eq!(page.items.iter().map(|m| m.id).collect::<Vec<_>>(), vec![messages[0].id, messages[13].id]);
+        assert_eq!(page.unreadable_count, 12);
+        assert!(page.continuation.is_none());
+        let after_first = crate::ListCursor { timestamp: 20, id: messages[0].id.to_hex() };
+        let capped = store.message_page_with_diagnostics(&scope, 1, None, Some(&after_first)).await.unwrap();
+        assert!(capped.items.is_empty());
+        assert_eq!(capped.unreadable_count, 10);
+        let at = capped.continuation.unwrap();
+        assert_eq!(at.timestamp, "20");
+        assert_eq!(at.id, messages[10].id.to_hex());
+        let resume = crate::ListCursor { timestamp: 20, id: at.id };
+        let rest = store.message_page_with_diagnostics(&scope, 1, None, Some(&resume)).await.unwrap();
+        assert_eq!(rest.items[0].id, messages[13].id);
+        assert_eq!(rest.unreadable_count, 2);
+        assert!(rest.continuation.is_none());
+    }
+    assert_eq!(store.inner().get_messages_for_recipient(&recipient, 100, None).await.unwrap().len(), 14);
+}
+
+#[tokio::test]
+async fn file_refill_bounds_and_continues_with_equal_created_at() {
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    for n in 1..=14 {
+        let file = FileRecord {
+            id: format!("{n:02}"), filename: "name".into(), mime_type: "text/plain".into(),
+            size_bytes: 0, blake3_hash: "hash".into(), sender: NodeId::from_bytes([1; 32]).to_hex(),
+            message_id: None, data: vec![], created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        if n == 1 || n == 14 { store.store_file(&file).await.unwrap(); }
+        else { store.inner().store_file(&file).await.unwrap(); }
+    }
+    sqlx::query("UPDATE files SET created_at = '2026-01-01T00:00:00Z'").execute(store.inner().pool()).await.unwrap();
+    let rows = store.list_files_with_diagnostics(2).await.unwrap();
+    assert_eq!(rows.items.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), vec!["14", "01"]);
+    assert_eq!(rows.unreadable_count, 12);
+    let after_first = crate::ListCursor { timestamp: "2026-01-01T00:00:00Z".into(), id: "14".into() };
+    let capped = store.file_page_with_diagnostics(1, Some(&after_first)).await.unwrap();
+    assert!(capped.items.is_empty());
+    assert_eq!(capped.unreadable_count, 10);
+    let at = capped.continuation.unwrap();
+    assert_eq!(at.id, "04");
+    let rest = store.file_page_with_diagnostics(1, Some(&at)).await.unwrap();
+    assert_eq!(rest.items[0].id, "01");
+    assert_eq!(rest.unreadable_count, 2);
+    assert!(rest.continuation.is_none());
+    assert!(store.list_files_with_diagnostics(0).await.unwrap().items.is_empty());
+    assert_eq!(store.inner().list_files(100).await.unwrap().len(), 14);
+}
+
+#[tokio::test]
+async fn staged_file_cursor_within_a_millisecond_does_not_skip_stored_files() {
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let file = FileRecord {
+        id: "z".into(), filename: "name".into(), mime_type: "text/plain".into(),
+        size_bytes: 0, blake3_hash: "hash".into(), sender: NodeId::from_bytes([1; 32]).to_hex(),
+        message_id: None, data: vec![], created_at: String::new(),
+    };
+    store.store_file(&file).await.unwrap();
+    sqlx::query("UPDATE files SET created_at = '2026-01-01T00:00:00.123Z'").execute(store.inner().pool()).await.unwrap();
+    let cursor = crate::ListCursor { timestamp: "2026-01-01T00:00:00.123456+00:00".into(), id: "stage-a".into() };
+    let page = store.file_page_with_diagnostics(1, Some(&cursor)).await.unwrap();
+    assert_eq!(page.items[0].id, "z");
 }

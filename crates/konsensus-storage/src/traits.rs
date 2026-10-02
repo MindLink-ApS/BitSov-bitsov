@@ -27,6 +27,35 @@ pub trait Storage: Send + Sync {
         crate::StorageReadHealth::default()
     }
 
+    /// Raw bounded keyset read. Backends must preserve timestamp/id ordering.
+    async fn message_page(&self, query: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<Vec<UkmEnvelope>, StorageError> {
+        if cursor.is_some() { return Err(StorageError::Unsupported("message keyset pagination".into())); }
+        match query {
+            crate::MessageListQuery::Recipient(recipient) => self.get_messages_for_recipient(recipient, limit, before).await,
+            crate::MessageListQuery::Conversation { me, peer, is_room } => self.get_conversation_messages(me, peer, *is_room, limit, before).await,
+            crate::MessageListQuery::NodeKind { me, kind } => self.get_node_messages_of_kind(me, *kind, limit, before).await,
+        }
+    }
+
+    async fn message_page_with_diagnostics(&self, query: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        Ok(crate::StorageList::readable(self.message_page(query, limit, before, cursor).await?))
+    }
+
+    async fn file_page(&self, limit: u32, cursor: Option<&crate::ListCursor<String>>) -> Result<Vec<crate::FileListRow>, StorageError> {
+        if cursor.is_some() { return Err(StorageError::Unsupported("file keyset pagination".into())); }
+        Ok(self.list_files(limit).await?.into_iter().map(Into::into).collect())
+    }
+
+    async fn file_page_with_diagnostics(&self, limit: u32, cursor: Option<&crate::ListCursor<String>>) -> Result<crate::StorageList<FileMetadata>, StorageError> {
+        let rows = self.file_page(limit, cursor).await?;
+        let mut result = crate::StorageList::readable(Vec::with_capacity(rows.len()));
+        for row in rows {
+            result.readable_cursors.push(row.cursor);
+            result.items.push(row.metadata);
+        }
+        Ok(result)
+    }
+
     /// This scan's readable rows and exact unreadable count. Database errors stay errors.
     async fn get_messages_for_recipient_with_diagnostics(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
         Ok(crate::StorageList::readable(self.get_messages_for_recipient(recipient, limit, before_timestamp).await?))

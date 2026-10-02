@@ -274,4 +274,4 @@ pub mod outbox;
 pub use outbox::OutboxOperation;
 
 pub mod list;
-pub use list::{StorageList, StorageReadHealth};
+pub use list::{FileListRow, ListCursor, MessageListQuery, MAX_LIST_SCAN, StorageList, StorageReadHealth};

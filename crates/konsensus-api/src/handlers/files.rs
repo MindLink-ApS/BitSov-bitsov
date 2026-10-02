@@ -144,6 +144,9 @@ pub struct ListFilesQuery {
     /// Maximum number of files to return (capped at 1000).
     #[serde(default = "default_file_limit")]
     pub limit: u32,
+    /// Resume using the timestamp/ID returned in scan continuation headers.
+    pub before: Option<String>,
+    pub before_id: Option<String>,
 }
 
 fn default_file_limit() -> u32 {
@@ -315,6 +318,14 @@ async fn load_file(
         .ok_or_else(|| ApiError::NotFound(format!("file {id} not found")))
 }
 
+/// Stored and staged timestamps can have different fractional precision.
+fn compare_file_positions(a: &konsensus_storage::ListCursor<String>, b: &konsensus_storage::ListCursor<String>) -> std::cmp::Ordering {
+    match (chrono::DateTime::parse_from_rfc3339(&a.timestamp), chrono::DateTime::parse_from_rfc3339(&b.timestamp)) {
+        (Ok(a_time), Ok(b_time)) => (a_time, &a.id).cmp(&(b_time, &b.id)),
+        _ => (&a.timestamp, &a.id).cmp(&(&b.timestamp, &b.id)),
+    }
+}
+
 /// `GET /api/v1/files/:id` — download a file (metadata + data).
 async fn download_file(
     auth: ScopedAuth<Read>,
@@ -342,17 +353,39 @@ async fn list_files(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListFilesQuery>,
 ) -> Result<(ListDiagnostics, Json<Vec<FileResponse>>), ApiError> {
+    if params.before_id.is_some() && params.before.is_none() {
+        return Err(ApiError::BadRequest("before_id requires before".into()));
+    }
+    let cursor = params.before.map(|timestamp| konsensus_storage::ListCursor {
+        timestamp, id: params.before_id.unwrap_or_default(),
+    });
     let rows = state
         .storage
-        .list_files_with_diagnostics(params.limit.min(MAX_FILE_LIST_LIMIT))
+        .file_page_with_diagnostics(params.limit.min(MAX_FILE_LIST_LIMIT), cursor.as_ref())
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
-    let diagnostics = (&rows).into();
+    let mut diagnostics = ListDiagnostics::from(&rows);
+    let positions: std::collections::HashMap<_, _> = rows.readable_cursors.into_iter()
+        .map(|at| (at.id.clone(), at)).collect();
+    let position = |file: &konsensus_storage::FileMetadata| positions.get(&file.id).cloned()
+        .unwrap_or_else(|| konsensus_storage::ListCursor { timestamp: file.created_at.clone(), id: file.id.clone() });
     let mut files = rows.items;
-    files.extend(state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).list(&state, &auth));
-    files.sort_by(|a,b| b.created_at.cmp(&a.created_at));
-    files.truncate(params.limit.min(MAX_FILE_LIST_LIMIT) as usize);
+    let staged = state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).list(&state, &auth);
+    files.extend(staged.into_iter().filter(|file| cursor.as_ref().is_none_or(|at| compare_file_positions(&position(file), at).is_lt())));
+    files.sort_by(|a, b| compare_file_positions(&position(b), &position(a)));
+    let limit = params.limit.min(MAX_FILE_LIST_LIMIT) as usize;
+    files.truncate(limit);
+    // Public PostgreSQL metadata is rounded; full pages need the precise cursor
+    // too. Never advance beyond a raw scan boundary over unscanned DB files.
+    if limit > 0 && files.len() == limit {
+        if let Some(last) = files.last() {
+            let at = position(last);
+            if diagnostics.next_before.as_ref().is_none_or(|raw| compare_file_positions(&at, raw).is_gt()) {
+                diagnostics.next_before = Some(at);
+            }
+        }
+    }
     Ok((diagnostics, Json(files.into_iter().map(FileResponse::from).collect())))
 }
 
@@ -589,6 +622,18 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn precise_file_positions_order_submillisecond_rows_before_id_ties() {
+        let cursor = |timestamp: &str, id: &str| konsensus_storage::ListCursor { timestamp: timestamp.into(), id: id.into() };
+        let mut positions = [
+            cursor("2026-01-01T00:00:00.123100Z", "b"),
+            cursor("2026-01-01T00:00:00.123900Z", "a"),
+            cursor("2026-01-01T00:00:00.12395+00:00", "stage-c"),
+        ];
+        positions.sort_by(|a, b| super::compare_file_positions(b, a));
+        assert_eq!(positions.map(|at| at.id), ["stage-c", "a", "b"]);
+    }
+
     use super::*;
 
     #[test]

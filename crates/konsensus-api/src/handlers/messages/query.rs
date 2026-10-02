@@ -1,5 +1,7 @@
 //! Message query and management endpoints — list, get, get plaintext, and delete.
 
+use konsensus_storage::MessageListQuery;
+use crate::handlers::list_diagnostics::message_cursor;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -28,6 +30,10 @@ pub struct ListMessagesQuery {
     pub limit: u32,
     /// Return messages before this timestamp (ms since epoch).
     pub before: Option<u64>,
+    pub before_id: Option<String>,
+    /// Raw scan continuation for room threads, independent of logical `before`.
+    pub scan_before: Option<u64>,
+    pub scan_before_id: Option<String>,
     /// Filter to a specific conversation (peer node ID or room UUID).
     ///
     /// When set, returns both sent and received messages for the conversation.
@@ -252,6 +258,9 @@ pub(super) async fn list_messages(
     let my_node_hex = state.identity.node_id().to_hex();
     let store_read = DataFreshness::now();
     let limit = clamp_limit(params.limit);
+    let cursor = message_cursor(params.before, params.before_id.as_deref())?;
+    let scan_cursor = message_cursor(params.scan_before, params.scan_before_id.as_deref())?;
+    let before = if cursor.is_some() { None } else { params.before };
     if let Some(room) = &params.room {
         if !konsensus_core::payloads::room::is_room_id(room) {
             return Err(ApiError::BadRequest("invalid room: expected a 64-char lowercase hex room id".into()));
@@ -259,7 +268,7 @@ pub(super) async fn list_messages(
         if params.peer.is_some() {
             return Err(ApiError::BadRequest("room and peer are exclusive".into()));
         }
-        let (diagnostics, messages) = room_thread(&state, &my_node_hex, room, limit, params.before).await?;
+        let (diagnostics, messages) = room_thread(&state, &my_node_hex, room, limit, params.before, params.scan_before, scan_cursor.as_ref()).await?;
         return Ok((store_read, diagnostics, Json(messages)));
     }
 
@@ -281,12 +290,9 @@ pub(super) async fn list_messages(
         };
         state
             .storage
-            .get_conversation_messages_with_diagnostics(
-                &my_node_hex,
-                peer_id,
-                is_room,
-                limit,
-                params.before,
+            .message_page_with_diagnostics(
+                &MessageListQuery::Conversation { me: &my_node_hex, peer: peer_id, is_room },
+                limit, before, cursor.as_ref(),
             )
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
@@ -294,7 +300,7 @@ pub(super) async fn list_messages(
         let recipient = Recipient::Node(*state.identity.node_id());
         state
             .storage
-            .get_messages_for_recipient_with_diagnostics(&recipient, limit, params.before)
+            .message_page_with_diagnostics(&MessageListQuery::Recipient(&recipient), limit, before, cursor.as_ref())
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     };
@@ -327,13 +333,15 @@ pub(super) async fn list_messages(
 /// is placed at its newest copy's timestamp, ordered newest first (ties by
 /// id); `before` and `limit` then apply to entries, so a page never repeats
 /// or splits a message.
-async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, before: Option<u64>) -> Result<(ListDiagnostics, Vec<MessageResponse>), ApiError> {
+async fn room_thread(state: &AppState, me: &str, room_id: &str, limit: u32, before: Option<u64>, scan_before: Option<u64>, cursor: Option<&konsensus_storage::ListCursor<u64>>) -> Result<(ListDiagnostics, Vec<MessageResponse>), ApiError> {
     let messages = state
         .storage
-        .get_node_messages_of_kind_with_diagnostics(me, konsensus_core::kind::KIND_CHAT, MAX_SEARCH_SCAN, None)
+        .message_page_with_diagnostics(&MessageListQuery::NodeKind { me, kind: konsensus_core::kind::KIND_CHAT }, MAX_SEARCH_SCAN, if cursor.is_some() { None } else { scan_before }, cursor)
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
-    let diagnostics = (&messages).into();
+    let mut diagnostics = ListDiagnostics::from(&messages);
+    // Room source checkpoints use scan_before, never the logical before cursor.
+    diagnostics.next_before = None;
     let Some(cipher) = state.plaintext_cipher.as_deref() else { return Ok((diagnostics, Vec::new())) };
     let mut thread: Vec<MessageResponse> = Vec::new();
     // Our room message id -> its entry in `thread`.
@@ -387,6 +395,8 @@ pub struct SearchMessagesQuery {
     /// Restrict the search to one conversation (peer node ID hex or room UUID).
     /// Without it, searches this node's received messages.
     pub peer: Option<String>,
+    pub before: Option<u64>,
+    pub before_id: Option<String>,
 }
 
 /// A single search hit — message metadata plus a plaintext snippet around the match.
@@ -453,6 +463,8 @@ pub(super) async fn search_messages(
     })?;
 
     let my_node_hex = state.identity.node_id().to_hex();
+    let cursor = message_cursor(params.before, params.before_id.as_deref())?;
+    let before = if cursor.is_some() { None } else { params.before };
 
     // Load the most-recent messages to scan (bounded). Mirrors list_messages.
     let messages = if let Some(ref peer_id) = params.peer {
@@ -470,23 +482,26 @@ pub(super) async fn search_messages(
         };
         state
             .storage
-            .get_conversation_messages_with_diagnostics(&my_node_hex, peer_id, is_room, MAX_SEARCH_SCAN, None)
+            .message_page_with_diagnostics(&MessageListQuery::Conversation { me: &my_node_hex, peer: peer_id, is_room }, MAX_SEARCH_SCAN, before, cursor.as_ref())
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     } else {
         let recipient = Recipient::Node(*state.identity.node_id());
         state
             .storage
-            .get_messages_for_recipient_with_diagnostics(&recipient, MAX_SEARCH_SCAN, None)
+            .message_page_with_diagnostics(&MessageListQuery::Recipient(&recipient), MAX_SEARCH_SCAN, before, cursor.as_ref())
             .await
             .map_err(|e| ApiError::Storage(e.to_string()))?
     };
 
     let limit = clamp_limit(params.limit) as usize;
-    let diagnostics = (&messages).into();
+    let mut diagnostics = ListDiagnostics::from(&messages);
     let mut results = Vec::new();
     for env in &messages.items {
         if results.len() >= limit {
+            diagnostics.next_before = results.last().map(|last: &SearchResult| konsensus_storage::ListCursor {
+                timestamp: last.timestamp.to_string(), id: last.id.clone(),
+            });
             break;
         }
         let encrypted = match state.storage.get_message_plaintext(&env.id).await {

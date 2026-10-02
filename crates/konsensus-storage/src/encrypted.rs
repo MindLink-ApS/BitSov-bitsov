@@ -359,13 +359,66 @@ impl<S: Storage> EncryptedStorage<S> {
                 }
             }
         }
+        self.record_list_health(&result);
+        result
+    }
+
+    fn record_list_health<T>(&self, result: &crate::StorageList<T>) {
         let mut health = self.read_health.lock().unwrap_or_else(|e| e.into_inner());
         health.storage_unreadable_rows = health.storage_unreadable_rows.saturating_add(result.unreadable_count);
         if result.storage_key_mismatch() && !health.storage_key_mismatch {
             health.storage_key_mismatch = true;
             tracing::error!("storage_key_mismatch: at least half of a storage list could not be read");
         }
-        result
+    }
+
+    /// Refill in bounded raw batches, stopping at the last processed row.
+    /// Cursor advances over *all* rows, including decryption failures and ties.
+    async fn refill<R, T, C, F, Fut>(
+        &self,
+        limit: u32,
+        mut cursor: Option<crate::ListCursor<C>>,
+        fetch: F,
+        position: impl Fn(&R) -> crate::ListCursor<C>,
+        decrypt: impl Fn(&R) -> Result<T, StorageError>,
+    ) -> Result<crate::StorageList<T>, StorageError>
+    where
+        C: ToString,
+        F: Fn(u32, Option<crate::ListCursor<C>>) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<R>, StorageError>>,
+    {
+        let budget = crate::list::scan_budget(limit);
+        let mut scanned = 0;
+        let mut result = crate::StorageList::readable(Vec::new());
+        while result.items.len() < limit as usize && scanned < budget {
+            let batch_limit = limit.min(budget - scanned);
+            let rows = fetch(batch_limit, cursor.take()).await?;
+            let exhausted = rows.len() < batch_limit as usize;
+            for row in rows {
+                let at = position(&row);
+                match decrypt(&row) {
+                    Ok(item) => {
+                        result.readable_cursors.push(crate::ListCursor { timestamp: at.timestamp.to_string(), id: at.id.clone() });
+                        result.items.push(item);
+                    }
+                    Err(_) => {
+                        tracing::warn!(row_id = %at.id, "at-rest decrypt failed (storage key mismatch or corrupt row)");
+                        result.unreadable_count += 1;
+                    }
+                }
+                cursor = Some(at);
+                scanned += 1;
+                if result.items.len() == limit as usize { break; }
+            }
+            if exhausted { break; }
+            if scanned == budget && result.items.len() < limit as usize {
+                result.continuation = cursor.as_ref().map(|at| crate::ListCursor {
+                    timestamp: at.timestamp.to_string(), id: at.id.clone(),
+                });
+            }
+        }
+        self.record_list_health(&result);
+        Ok(result)
     }
 
     fn decrypt_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<crate::OutboxOperation, StorageError> {
@@ -498,6 +551,31 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         }
     }
 
+    async fn message_page(&self, query: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<Vec<UkmEnvelope>, StorageError> {
+        Ok(self.message_page_with_diagnostics(query, limit, before, cursor).await?.items)
+    }
+
+    async fn message_page_with_diagnostics(&self, query: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
+        self.refill(limit, cursor.cloned(),
+            |batch, at| async move { self.inner.message_page(query, batch, before, at.as_ref()).await },
+            |row: &UkmEnvelope| crate::ListCursor { timestamp: row.timestamp, id: row.id.to_hex() },
+            |row| self.decrypt_envelope(row),
+        ).await
+    }
+
+    async fn file_page(&self, limit: u32, cursor: Option<&crate::ListCursor<String>>) -> Result<Vec<crate::FileListRow>, StorageError> {
+        let rows = self.file_page_with_diagnostics(limit, cursor).await?;
+        Ok(rows.items.into_iter().zip(rows.readable_cursors).map(|(metadata, cursor)| crate::FileListRow { metadata, cursor }).collect())
+    }
+
+    async fn file_page_with_diagnostics(&self, limit: u32, cursor: Option<&crate::ListCursor<String>>) -> Result<crate::StorageList<FileMetadata>, StorageError> {
+        self.refill(limit, cursor.cloned(),
+            |batch, at| async move { self.inner.file_page(batch, at.as_ref()).await },
+            |row: &crate::FileListRow| row.cursor.clone(),
+            |row| self.decrypt_file_metadata(&row.metadata),
+        ).await
+    }
+
     async fn get_messages_for_recipient(
         &self,
         recipient: &Recipient,
@@ -508,8 +586,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
 
     async fn get_messages_for_recipient_with_diagnostics(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        let rows = self.inner.get_messages_for_recipient(recipient, limit, before_timestamp).await?;
-        Ok(self.decrypt_list(rows, |row| self.decrypt_envelope(row), |row| row.id.to_string()))
+        self.message_page_with_diagnostics(&crate::MessageListQuery::Recipient(recipient), limit, before_timestamp, None).await
     }
 
     async fn get_conversation_messages(
@@ -524,8 +601,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
 
     async fn get_conversation_messages_with_diagnostics(&self, my_node_id: &str, peer_or_room_id: &str, is_room: bool, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        let rows = self.inner.get_conversation_messages(my_node_id, peer_or_room_id, is_room, limit, before_timestamp).await?;
-        Ok(self.decrypt_list(rows, |row| self.decrypt_envelope(row), |row| row.id.to_string()))
+        self.message_page_with_diagnostics(&crate::MessageListQuery::Conversation { me: my_node_id, peer: peer_or_room_id, is_room }, limit, before_timestamp, None).await
     }
 
     async fn get_node_messages_of_kind(
@@ -539,8 +615,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
 
     async fn get_node_messages_of_kind_with_diagnostics(&self, my_node_id: &str, kind: u16, limit: u32, before_timestamp: Option<u64>) -> Result<crate::StorageList<UkmEnvelope>, StorageError> {
-        let rows = self.inner.get_node_messages_of_kind(my_node_id, kind, limit, before_timestamp).await?;
-        Ok(self.decrypt_list(rows, |row| self.decrypt_envelope(row), |row| row.id.to_string()))
+        self.message_page_with_diagnostics(&crate::MessageListQuery::NodeKind { me: my_node_id, kind }, limit, before_timestamp, None).await
     }
 
     async fn delete_message(&self, id: &MessageId) -> Result<bool, StorageError> {
@@ -846,8 +921,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
 
     async fn list_files_with_diagnostics(&self, limit: u32) -> Result<crate::StorageList<FileMetadata>, StorageError> {
-        let rows = self.inner.list_files(limit).await?;
-        Ok(self.decrypt_list(rows, |row| self.decrypt_file_metadata(row), |row| row.id.to_string()))
+        self.file_page_with_diagnostics(limit, None).await
     }
 
     async fn delete_file(&self, id: &str) -> Result<bool, StorageError> {
