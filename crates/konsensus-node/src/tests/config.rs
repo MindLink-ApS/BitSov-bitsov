@@ -2100,7 +2100,7 @@ esplora_url_fallback = "https://fallback.example.com"
                 Some("https://fallback.example.com".to_string())
             );
         }
-        ChainConfig::Mock | ChainConfig::Bitcoind(_) => panic!("expected esplora config"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => panic!("expected esplora config"),
     }
 }
 
@@ -2129,7 +2129,7 @@ fn issue66_existing_config_omitting_primary_keeps_its_provider() {
                 "and must not inject a third-party fallback it never chose"
             );
         }
-        ChainConfig::Mock | ChainConfig::Bitcoind(_) => panic!("expected esplora"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => panic!("expected esplora"),
     }
 
     // [lightning] backend = "ldk", esplora_url omitted -> legacy default, no fallback.
@@ -2167,7 +2167,7 @@ fn issue66_explicit_primary_is_never_overridden() {
                 "an operator running their own Esplora must not silently gain a public one"
             );
         }
-        ChainConfig::Mock | ChainConfig::Bitcoind(_) => panic!("expected esplora"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => panic!("expected esplora"),
     }
 }
 
@@ -2232,7 +2232,7 @@ api_url = "https://legacy.example.com"
             assert_eq!(api_url, "https://legacy.example.com");
             assert_eq!(esplora_url_fallback, None);
         }
-        ChainConfig::Mock | ChainConfig::Bitcoind(_) => panic!("expected esplora config"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => panic!("expected esplora config"),
     }
 }
 
@@ -2564,4 +2564,42 @@ fn rejected_inline_rpc_secret_is_absent_from_startup_errors() {
     let error = NodeConfig::load(&path).unwrap_err();
     assert!(!format!("{error:?}").contains("NEVER_LOG_THIS_PASSWORD"));
     assert!(!format!("{error:#}").contains("NEVER_LOG_THIS_PASSWORD"));
+}
+
+#[test]
+fn electrum_config_accepts_explicit_servers_and_operator() {
+    for (url, operator) in [
+        ("tcp://127.0.0.1:50001", ""),
+        ("tcp://192.168.1.2:50001", "operator = 'own'"),
+        ("tcp://[::1]:50001", ""),
+        ("ssl://electrum.example:50002", "operator = 'third_party'"),
+    ] {
+        let parsed: ChainConfig = toml::from_str(&format!(
+            "backend = 'electrum'\nserver_url = '{url}'\n{operator}"
+        ))
+        .unwrap();
+        assert_eq!(parsed.backend_name(), "electrum");
+    }
+}
+
+#[test]
+fn electrum_config_rejects_missing_invalid_or_fallback_settings() {
+    for fields in [
+        "",
+        "server_url = ''",
+        "server_url = 'tcp://8.8.8.8:50001'",
+        "server_url = 'tcp://electrum.example:50001'",
+        "server_url = 'http://127.0.0.1:50001'",
+        "server_url = 'ssl://user:secret@electrum.example:50002'",
+        "server_url = 'ssl://electrum.example:0'",
+        "server_url = 'ssl://electrum.example'",
+        "server_url = 'ssl://electrum.example:50002/path'",
+        "server_url = 'ssl://electrum.example:50002'\noperator = 'trusted'",
+        "server_url = 'tcp://127.0.0.1:50001'\nesplora_url_fallback = 'https://example.invalid'",
+    ] {
+        assert!(
+            toml::from_str::<ChainConfig>(&format!("backend = 'electrum'\n{fields}")).is_err(),
+            "accepted {fields}"
+        );
+    }
 }

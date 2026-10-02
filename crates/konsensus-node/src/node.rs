@@ -200,6 +200,10 @@ impl KonsensusNode {
                     });
                 let ldk_storage_dir = data_dir.join("ldk");
                 let ldk_config = LdkConfig {
+                    electrum: match &config.chain {
+                        ChainConfig::Electrum(server) => Some(server.clone()),
+                        _ => None,
+                    },
                     bitcoind: match &config.chain {
                         ChainConfig::Bitcoind(rpc) => Some(rpc.clone()),
                         _ => None,
@@ -275,6 +279,10 @@ impl KonsensusNode {
             ChainConfig::Bitcoind(rpc) => {
                 info!(backend = "bitcoind", "chain provider (own node)");
                 Arc::new(konsensus_chain::BitcoindProvider::new(rpc.clone())?)
+            }
+            ChainConfig::Electrum(server) => {
+                info!(backend = "electrum", "chain provider (server-trusting)");
+                Arc::new(konsensus_chain::ElectrumProvider::new(server.clone())?)
             }
             ChainConfig::Mock => {
                 info!(backend = "mock", "chain provider (testnet)");

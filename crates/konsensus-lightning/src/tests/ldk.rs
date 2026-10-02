@@ -85,6 +85,7 @@ fn convert_direction_mapping() {
 #[test]
 fn ldk_config_construction() {
     let config = LdkConfig {
+        electrum: None,
         bitcoind: None,
         liquidity: Default::default(),
         storage_dir: PathBuf::from("/tmp/ldk_test"),
@@ -177,6 +178,7 @@ fn ldk_entropy_is_64_bytes() {
 #[tokio::test]
 async fn invalid_mnemonic_errors() {
     let config = LdkConfig {
+        electrum: None,
         bitcoind: None,
         liquidity: Default::default(),
         storage_dir: PathBuf::from("/tmp/ldk_test"),

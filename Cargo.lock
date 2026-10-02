@@ -1992,6 +1992,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bitcoin",
+ "electrum-client",
  "hex",
  "konsensus-core",
  "mockall",

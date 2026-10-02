@@ -532,7 +532,9 @@ pub enum ChainConfig {
     /// Own pruned or full Bitcoin Core; also selects LDK's chain source.
     #[serde(rename = "bitcoind")]
     Bitcoind(konsensus_chain::BitcoindConfig),
-    // Future: electrum variant
+    /// Explicit Electrum server; also selects LDK's chain source.
+    #[serde(rename = "electrum")]
+    Electrum(konsensus_chain::ElectrumConfig),
 }
 
 impl ChainConfig {
@@ -541,6 +543,7 @@ impl ChainConfig {
         match self {
             Self::Esplora { .. } => "esplora",
             Self::Bitcoind(_) => "bitcoind",
+            Self::Electrum(_) => "electrum",
             Self::Mock => "mock",
         }
     }

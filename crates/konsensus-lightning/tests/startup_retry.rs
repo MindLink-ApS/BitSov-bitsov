@@ -81,6 +81,7 @@ impl Drop for Fixture {
 
 fn config(dir: &tempfile::TempDir, url: &str) -> LdkConfig {
     LdkConfig {
+        electrum: None,
         bitcoind: None,
         liquidity: Default::default(),
         storage_dir: dir.path().join("ldk"),
@@ -473,4 +474,156 @@ async fn bitcoind_sync_failure_is_visible_and_never_contacts_esplora_or_fallback
     assert_eq!(provider.chain_sync_status(), Some(failure));
     assert!(!provider.money_ready().await);
     provider.shutdown().await.unwrap();
+}
+
+#[path = "../../konsensus-chain/tests/support/electrum_fixture.rs"]
+mod electrum_fixture;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn electrum_sync_failure_is_visible_and_never_contacts_esplora_or_fallback() {
+    let Ok(endpoint) = std::env::var("BITSOV_GUARD_ENDPOINT") else {
+        let electrum =
+            electrum_fixture::Fixture::new(|request| match request["method"].as_str().unwrap() {
+                "server.version" => serde_json::json!({"result":["bitsov-fixture", "1.4"]}),
+                "blockchain.estimatefee" => serde_json::json!({"result":0.00002}),
+                _ => serde_json::json!({"error":{"code":-1,"message":"ELECTRUM_REMOTE_SECRET"}}),
+            })
+            .await;
+        let primary = Fixture::new(0, false).await;
+        let fallback = Fixture::new(0, false).await;
+        let guard_dir = tempfile::tempdir().unwrap();
+        outbound_guard::run(
+            "electrum_sync_failure_is_visible_and_never_contacts_esplora_or_fallback",
+            guard_dir.path(),
+            &electrum.url,
+            &primary.url,
+            &fallback.url,
+        )
+        .await;
+        let requests = electrum.requests.lock().unwrap();
+        assert!(requests
+            .iter()
+            .any(|r| r["method"] == "blockchain.estimatefee"));
+        assert!(requests
+            .iter()
+            .any(|r| r["method"] == "blockchain.headers.subscribe"));
+        for explorer in [&primary, &fallback] {
+            assert_eq!(explorer.requests.load(Ordering::SeqCst), 0);
+            assert_eq!(explorer.background_requests.load(Ordering::SeqCst), 0);
+        }
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(&dir, &std::env::var("BITSOV_GUARD_PRIMARY").unwrap());
+    cfg.network = "regtest".into();
+    cfg.esplora_url_fallback = Some(std::env::var("BITSOV_GUARD_FALLBACK").unwrap());
+    cfg.electrum =
+        Some(serde_json::from_value(serde_json::json!({"server_url":endpoint})).unwrap());
+    let provider = tokio::time::timeout(Duration::from_secs(20), LdkProvider::new(cfg.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while provider.chain_sync_status().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(provider.node().status().is_running);
+    assert!(!provider.money_ready().await);
+    let failure = provider.chain_sync_status().unwrap();
+    let json = serde_json::to_value(failure).unwrap();
+    assert_eq!(json["state"], "stalled");
+    assert_eq!(json["last_error_kind"], "sync_failed");
+    assert!(json["since"].as_u64().unwrap() > 0);
+    assert!(!json.to_string().contains("ELECTRUM_REMOTE_SECRET"));
+    // Explicit retry exercises both wallets and preserves the first-failure time.
+    let _ = provider.node().sync_wallets();
+    assert_eq!(provider.chain_sync_status(), Some(failure));
+    assert!(!provider.money_ready().await);
+    provider.shutdown().await.unwrap();
+    drop(provider);
+
+    // Invalid programmatic configs fail closed before any network or fallback.
+    cfg.electrum.as_mut().unwrap().server_url.clear();
+    assert!(matches!(
+        LdkProvider::new(cfg).await,
+        Err(LightningError::InvalidStartupConfig(_))
+    ));
+}
+
+/// A selected Electrum that fails its startup fee barrier must not fall back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn electrum_startup_failure_never_contacts_esplora_or_fallback() {
+    let Ok(endpoint) = std::env::var("BITSOV_GUARD_ENDPOINT") else {
+        let electrum = electrum_fixture::Fixture::new(|request| {
+            if request["method"] == "server.version" {
+                serde_json::json!({"result":["bitsov-fixture", "1.4"]})
+            } else {
+                serde_json::json!({"error":{"code":-1,"message":"ELECTRUM_REMOTE_SECRET"}})
+            }
+        })
+        .await;
+        let primary = Fixture::new(0, false).await;
+        let fallback = Fixture::new(0, false).await;
+        let guard_dir = tempfile::tempdir().unwrap();
+        outbound_guard::run(
+            "electrum_startup_failure_never_contacts_esplora_or_fallback",
+            guard_dir.path(),
+            &electrum.url,
+            &primary.url,
+            &fallback.url,
+        )
+        .await;
+        assert!(electrum
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["method"] == "blockchain.estimatefee"));
+        for explorer in [&primary, &fallback] {
+            assert_eq!(explorer.requests.load(Ordering::SeqCst), 0);
+            assert_eq!(explorer.background_requests.load(Ordering::SeqCst), 0);
+        }
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    // Bitcoin's strict fee barrier, but every connection goes to the fake TCP
+    // server: this is not a mainnet node and no chain or funds are involved.
+    let mut cfg = config(&dir, &std::env::var("BITSOV_GUARD_PRIMARY").unwrap());
+    cfg.esplora_url_fallback = Some(std::env::var("BITSOV_GUARD_FALLBACK").unwrap());
+    cfg.electrum =
+        Some(serde_json::from_value(serde_json::json!({"server_url":endpoint})).unwrap());
+    let error = tokio::time::timeout(Duration::from_secs(20), LdkProvider::new(cfg.clone()))
+        .await
+        .unwrap()
+        .unwrap_err();
+    match error {
+        LightningError::ChainSourceUnavailable {
+            service,
+            cause,
+            attempts,
+            ..
+        } => {
+            assert_eq!(service, "electrum");
+            assert_eq!(attempts, 1);
+            assert!(!cause.contains("ELECTRUM_REMOTE_SECRET"));
+        }
+        other => panic!("unexpected startup error: {other}"),
+    }
+    // Ambiguous programmatic selection must fail validation, even when one
+    // backend would otherwise work. No credentials file is read in this case.
+    cfg.bitcoind = Some(
+        serde_json::from_value(serde_json::json!({
+            "rpc_host":"127.0.0.1", "rpc_port":1, "cookie_file":"unused-cookie",
+        }))
+        .unwrap(),
+    );
+    let before = outbound_guard::connection_count();
+    assert!(matches!(
+        LdkProvider::new(cfg).await,
+        Err(LightningError::InvalidStartupConfig(_))
+    ));
+    assert_eq!(outbound_guard::connection_count(), before);
 }
