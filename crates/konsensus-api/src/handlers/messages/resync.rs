@@ -13,6 +13,7 @@ use konsensus_core::types::{MessageId, NodeId};
 use crate::audit::events;
 use crate::error::ApiError;
 use crate::state::AppState;
+use crate::handlers::list_diagnostics::ListDiagnostics;
 
 const MAX_FULFILL_IDS: usize = 500;
 const MAX_DISCOVERY_LIMIT: u32 = 1000;
@@ -20,7 +21,7 @@ const MAX_DISCOVERY_LIMIT: u32 = 1000;
 #[derive(Deserialize)]
 #[serde(tag = "phase", rename_all = "lowercase")]
 pub enum ResyncRequest {
-    Discover { peer_id: String, from_ms: u64, to_ms: u64 },
+    Discover { peer_id: String, from_ms: u64, to_ms: u64, before: Option<u64>, before_id: Option<String> },
     Fulfill  { peer_id: String, message_ids: Vec<String> },
 }
 
@@ -57,17 +58,17 @@ pub(super) async fn resync_messages(
     _auth: ScopedAuth<Admin>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ResyncRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<(ListDiagnostics, Json<serde_json::Value>), ApiError> {
     match req {
-        ResyncRequest::Discover { peer_id, from_ms, to_ms } => {
-            let r = discover(&state, peer_id, from_ms, to_ms).await?;
-            Ok(Json(serde_json::to_value(r)
-                .map_err(|e| ApiError::Internal(format!("serialization error: {e}")))?))
+        ResyncRequest::Discover { peer_id, from_ms, to_ms, before, before_id } => {
+            let (diagnostics, r) = discover(&state, peer_id, from_ms, to_ms, before, before_id).await?;
+            Ok((diagnostics, Json(serde_json::to_value(r)
+                .map_err(|e| ApiError::Internal(format!("serialization error: {e}")))?)))
         }
         ResyncRequest::Fulfill { peer_id, message_ids } => {
             let r = fulfill(&state, peer_id, message_ids).await?;
-            Ok(Json(serde_json::to_value(r)
-                .map_err(|e| ApiError::Internal(format!("serialization error: {e}")))?))
+            Ok((ListDiagnostics::default(), Json(serde_json::to_value(r)
+                .map_err(|e| ApiError::Internal(format!("serialization error: {e}")))?)))
         }
     }
 }
@@ -77,21 +78,30 @@ async fn discover(
     peer_id: String,
     from_ms: u64,
     to_ms: u64,
-) -> Result<ResyncDiscoverResponse, ApiError> {
+    before: Option<u64>,
+    before_id: Option<String>,
+) -> Result<(ListDiagnostics, ResyncDiscoverResponse), ApiError> {
     if from_ms > to_ms {
         return Err(ApiError::BadRequest("from_ms must be <= to_ms".into()));
     }
     NodeId::from_hex(&peer_id)
         .map_err(|e| ApiError::BadRequest(format!("invalid peer_id: {e}")))?;
 
+    let cursor = crate::handlers::list_diagnostics::message_cursor(before, before_id.as_deref())?;
+    let upper = to_ms.saturating_add(1);
+    let upper = if cursor.is_some() { upper } else { before.map_or(upper, |b| b.min(upper)) };
     let my_node_hex = state.identity.node_id().to_hex();
     let envelopes = state
         .storage
-        .get_conversation_messages(&my_node_hex, &peer_id, false, MAX_DISCOVERY_LIMIT, Some(to_ms.saturating_add(1)))
+        .message_page_with_diagnostics(
+            &konsensus_storage::MessageListQuery::Conversation { me: &my_node_hex, peer: &peer_id, is_room: false },
+            MAX_DISCOVERY_LIMIT, Some(upper), cursor.as_ref(),
+        )
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
-    let in_window: Vec<_> = envelopes.into_iter().filter(|env| env.timestamp >= from_ms).collect();
+    let diagnostics = (&envelopes).into();
+    let in_window: Vec<_> = envelopes.items.into_iter().filter(|env| env.timestamp >= from_ms).collect();
 
     let mut entries = Vec::with_capacity(in_window.len());
     let mut estimated_total: u64 = 0;
@@ -115,7 +125,7 @@ async fn discover(
         Some(serde_json::json!({"action":"resync_discover","peer_id":peer_id,"from_ms":from_ms,"to_ms":to_ms,"found":total_count})));
     tracing::info!(peer = %peer_id, from_ms, to_ms, found = total_count, estimated_msat = estimated_total, "resync discovery complete");
 
-    Ok(ResyncDiscoverResponse { phase: "discover", peer_id, messages: entries, total_count, estimated_total_msat: estimated_total, from_ms, to_ms })
+    Ok((diagnostics, ResyncDiscoverResponse { phase: "discover", peer_id, messages: entries, total_count, estimated_total_msat: estimated_total, from_ms, to_ms }))
 }
 
 async fn fulfill(

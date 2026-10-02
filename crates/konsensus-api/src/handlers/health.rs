@@ -22,6 +22,10 @@ use crate::state::AppState;
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
+    /// Failed row reads since startup (repeat scans count again).
+    pub storage_unreadable_rows: u64,
+    /// Warning latched after a list has >=50% unreadable rows; clears on restart.
+    pub storage_key_mismatch: bool,
     pub disk_low: bool,
     pub disk_free_bytes: Option<u64>,
     pub disk_free_floor_bytes: Option<u64>,
@@ -237,13 +241,17 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
     let peer = state.introduction.endpoint_view();
     let disk = state.lightning.disk_status();
     let chain_sync = state.lightning.chain_sync_status();
+    let storage_health = state.storage.storage_read_health();
     Json(HealthResponse {
+        storage_unreadable_rows: storage_health.storage_unreadable_rows,
+        storage_key_mismatch: storage_health.storage_key_mismatch,
         disk_low: disk.is_some_and(|s| s.disk_low),
         disk_free_bytes: disk.and_then(|s| s.disk_free_bytes),
         disk_free_floor_bytes: disk.map(|s| s.disk_free_floor_bytes),
         money_ready: readiness.money_ready,
         readiness,
         api_capabilities: vec![
+            "storage_list_diagnostics_v1",
             "offline_readiness_v1",
             "message_operations_v1",
             super::messages::caps::CAPABILITY,

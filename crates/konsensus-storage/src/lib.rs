@@ -272,3 +272,6 @@ impl<S: Storage + ?Sized> konsensus_core::gate::NonceStore for StorageNonceAdapt
 
 pub mod outbox;
 pub use outbox::OutboxOperation;
+
+pub mod list;
+pub use list::{FileListRow, ListCursor, MessageListQuery, MAX_LIST_SCAN, StorageList, StorageReadHealth};

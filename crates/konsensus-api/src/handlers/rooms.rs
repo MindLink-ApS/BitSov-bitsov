@@ -14,6 +14,7 @@ use konsensus_storage::Room;
 use crate::audit::events;
 use crate::error::ApiError;
 use crate::state::AppState;
+use crate::handlers::list_diagnostics::ListDiagnostics;
 
 /// Request to create a room.
 #[derive(Deserialize)]
@@ -120,15 +121,16 @@ async fn create_room(
 async fn list_rooms(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<RoomResponse>>, ApiError> {
+) -> Result<(ListDiagnostics, Json<Vec<RoomResponse>>), ApiError> {
     let rooms = state
         .storage
-        .list_rooms()
+        .list_rooms_with_diagnostics()
         .await
         .map_err(|e| ApiError::Storage(e.to_string()))?;
 
-    let responses: Vec<_> = rooms.iter().map(RoomResponse::from).collect();
-    Ok(Json(responses))
+    let diagnostics = (&rooms).into();
+    let responses: Vec<_> = rooms.items.iter().map(RoomResponse::from).collect();
+    Ok((diagnostics, Json(responses)))
 }
 
 /// `GET /api/v1/rooms/:id` — get a room.

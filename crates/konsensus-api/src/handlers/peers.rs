@@ -15,6 +15,7 @@ use crate::audit::events;
 use crate::error::ApiError;
 use crate::freshness::DataFreshness;
 use crate::state::AppState;
+use crate::handlers::list_diagnostics::ListDiagnostics;
 
 /// Maximum length for peer labels (bytes).
 const MAX_PEER_LABEL_LEN: usize = 256;
@@ -151,8 +152,12 @@ fn peer_response(
 async fn list_peers(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
-) -> (DataFreshness, Json<Vec<PeerResponse>>) {
+) -> Result<(DataFreshness, ListDiagnostics, Json<Vec<PeerResponse>>), ApiError> {
     let read_at = DataFreshness::now();
+    // Registry owns live connection data; scan storage to disclose unreadable persisted peers.
+    let stored = state.storage.list_peers_with_diagnostics().await
+        .map_err(|e| ApiError::Storage(e.to_string()))?;
+    let diagnostics = (&stored).into();
     let registry = state.peer_registry.read().await;
     let connected = state.transport.connected_peers().await;
     let local_id = state.identity.node_id();
@@ -168,7 +173,7 @@ async fn list_peers(
         peers.push(peer_response(entry, is_connected, local_id, info));
     }
 
-    (read_at, Json(peers))
+    Ok((read_at, diagnostics, Json(peers)))
 }
 
 /// `GET /api/v1/peers/connected` — list currently connected peers.

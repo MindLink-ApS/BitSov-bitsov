@@ -1057,135 +1057,54 @@ impl Storage for SqliteStorage {
         }
     }
 
-    async fn get_messages_for_recipient(
-        &self,
-        recipient: &Recipient,
-        limit: u32,
-        before_timestamp: Option<u64>,
-    ) -> Result<Vec<UkmEnvelope>, StorageError> {
-        let (rtype, rid) = recipient_to_parts(recipient);
-        let before = before_timestamp.map_or(i64::MAX, |t| t.min(i64::MAX as u64) as i64);
-        let lim = limit as i64;
-
-        let rows = sqlx::query_as::<_, (
-            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
-            String, String,
-        )>(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-             FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND recipient_type = ? AND recipient_id = ? AND timestamp_ms < ? \
-             ORDER BY timestamp_ms DESC LIMIT ?",
-        )
-        .bind(rtype)
-        .bind(&rid)
-        .bind(before)
-        .bind(lim)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|r| {
-                row_to_envelope(
-                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
-                )
-            })
-            .collect()
+    async fn get_messages_for_recipient(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {
+        self.message_page(&crate::MessageListQuery::Recipient(recipient), limit, before_timestamp, None).await
     }
 
-    async fn get_conversation_messages(
-        &self,
-        my_node_id: &str,
-        peer_or_room_id: &str,
-        is_room: bool,
-        limit: u32,
-        before_timestamp: Option<u64>,
-    ) -> Result<Vec<UkmEnvelope>, StorageError> {
-        let before = before_timestamp.map_or(i64::MAX, |t| t.min(i64::MAX as u64) as i64);
-        let lim = limit as i64;
-
-        let rows = if is_room {
-            sqlx::query_as::<_, (
-                String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
-                String, String,
-            )>(
-                "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-                 ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-                 FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND recipient_type = 'room' AND recipient_id = ? AND timestamp_ms < ? \
-                 ORDER BY timestamp_ms DESC LIMIT ?",
-            )
-            .bind(peer_or_room_id)
-            .bind(before)
-            .bind(lim)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, (
-                String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
-                String, String,
-            )>(
-                "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-                 ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-                 FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND (\
-                   (sender = ? AND recipient_type = 'node' AND recipient_id = ?) \
-                   OR (sender = ? AND recipient_type = 'node' AND recipient_id = ?) \
-                 ) AND timestamp_ms < ? \
-                 ORDER BY timestamp_ms DESC LIMIT ?",
-            )
-            .bind(peer_or_room_id)
-            .bind(my_node_id)
-            .bind(my_node_id)
-            .bind(peer_or_room_id)
-            .bind(before)
-            .bind(lim)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        rows.into_iter()
-            .map(|r| {
-                row_to_envelope(
-                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
-                )
-            })
-            .collect()
+    async fn get_conversation_messages(&self, my_node_id: &str, peer_or_room_id: &str, is_room: bool, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {
+        self.message_page(&crate::MessageListQuery::Conversation { me: my_node_id, peer: peer_or_room_id, is_room }, limit, before_timestamp, None).await
     }
 
-    async fn get_node_messages_of_kind(
-        &self,
-        my_node_id: &str,
-        kind: u16,
-        limit: u32,
-        before_timestamp: Option<u64>,
-    ) -> Result<Vec<UkmEnvelope>, StorageError> {
-        let before = before_timestamp.map_or(i64::MAX, |t| t.min(i64::MAX as u64) as i64);
-        let lim = limit as i64;
-        let rows = sqlx::query_as::<_, (
-            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
-            String, String,
-        )>(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-             FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND kind = ? \
-             AND recipient_type = 'node' AND (sender = ? OR recipient_id = ?) AND timestamp_ms < ? \
-             ORDER BY timestamp_ms DESC LIMIT ?",
-        )
-        .bind(i64::from(kind))
-        .bind(my_node_id)
-        .bind(my_node_id)
-        .bind(before)
-        .bind(lim)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|r| {
-                row_to_envelope(
-                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
-                )
-            })
-            .collect()
+    async fn get_node_messages_of_kind(&self, my_node_id: &str, kind: u16, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {
+        self.message_page(&crate::MessageListQuery::NodeKind { me: my_node_id, kind }, limit, before_timestamp, None).await
+    }
+
+    async fn message_page(&self, scope: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<Vec<UkmEnvelope>, StorageError> {
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND "
+        );
+        match scope {
+            crate::MessageListQuery::Recipient(recipient) => {
+                let (rtype, rid) = recipient_to_parts(recipient);
+                query.push("recipient_type = ").push_bind(rtype).push(" AND recipient_id = ").push_bind(rid);
+            }
+            crate::MessageListQuery::Conversation { peer, is_room: true, .. } => {
+                query.push("recipient_type = 'room' AND recipient_id = ").push_bind(*peer);
+            }
+            crate::MessageListQuery::Conversation { me, peer, is_room: false } => {
+                query.push("recipient_type = 'node' AND ((sender = ").push_bind(*peer)
+                    .push(" AND recipient_id = ").push_bind(*me)
+                    .push(") OR (sender = ").push_bind(*me)
+                    .push(" AND recipient_id = ").push_bind(*peer).push("))");
+            }
+            crate::MessageListQuery::NodeKind { me, kind } => {
+                query.push("kind = ").push_bind(i64::from(*kind))
+                    .push(" AND recipient_type = 'node' AND (sender = ").push_bind(*me)
+                    .push(" OR recipient_id = ").push_bind(*me).push(")");
+            }
+        }
+        query.push(" AND timestamp_ms < ").push_bind(before.map_or(i64::MAX, |t| t.min(i64::MAX as u64) as i64));
+        if let Some(cursor) = cursor {
+            query.push(" AND (timestamp_ms, id) < (").push_bind(cursor.timestamp.min(i64::MAX as u64) as i64)
+                .push(", ").push_bind(&cursor.id).push(")");
+        }
+        query.push(" ORDER BY timestamp_ms DESC, id DESC LIMIT ").push_bind(i64::from(limit));
+        let rows = query.build_query_as::<(
+            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String, String, String,
+        )>().fetch_all(&self.pool).await?;
+        rows.into_iter().map(|r| row_to_envelope(
+            &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11, &r.12,
+        )).collect()
     }
 
     async fn delete_message(&self, id: &MessageId) -> Result<bool, StorageError> {
@@ -2000,22 +1919,34 @@ impl Storage for SqliteStorage {
     }
 
     async fn list_files(&self, limit: u32) -> Result<Vec<FileMetadata>, StorageError> {
-        let lim = limit as i64;
+        Ok(self.file_page(limit, None).await?.into_iter().map(|row| row.metadata).collect())
+    }
 
-        let rows = sqlx::query_as::<_, (
+    async fn file_page(&self, limit: u32, cursor: Option<&crate::ListCursor<String>>) -> Result<Vec<crate::FileListRow>, StorageError> {
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT id, filename, mime_type, size_bytes, blake3_hash, sender, message_id, created_at FROM files");
+        if let Some(cursor) = cursor {
+            let staged_time = cursor.id.starts_with("stage-").then(|| chrono::DateTime::parse_from_rfc3339(&cursor.timestamp).ok()).flatten();
+            if let Some(time) = staged_time {
+                let sub_ms = time.timestamp_subsec_nanos() % 1_000_000 != 0;
+                let boundary = if sub_ms {
+                    time + chrono::Duration::nanoseconds(i64::from(1_000_000 - time.timestamp_subsec_nanos() % 1_000_000))
+                } else { time };
+                query.push(" WHERE (created_at, id) < (")
+                    .push_bind(boundary.with_timezone(&chrono::Utc).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                    .push(", ").push_bind(if sub_ms { "" } else { &cursor.id }).push(")");
+            } else {
+                query.push(" WHERE (created_at, id) < (").push_bind(&cursor.timestamp).push(", ").push_bind(&cursor.id).push(")");
+            }
+        }
+        query.push(" ORDER BY created_at DESC, id DESC LIMIT ").push_bind(i64::from(limit));
+        let rows = query.build_query_as::<(
             String, String, String, i64, String, String, Option<String>, String,
-        )>(
-            "SELECT id, filename, mime_type, size_bytes, blake3_hash, sender, message_id, created_at \
-             FROM files ORDER BY created_at DESC LIMIT ?",
-        )
-        .bind(lim)
-        .fetch_all(&self.pool)
-        .await?;
+        )>().fetch_all(&self.pool).await?;
 
         rows.into_iter().map(|(id, filename, mime_type, size_bytes, blake3_hash, sender, message_id, created_at)| {
             let sz = u64::try_from(size_bytes)
                 .map_err(|_| StorageError::Conversion(format!("file size negative: {size_bytes}")))?;
-            Ok(FileMetadata {
+            Ok(crate::FileListRow::from(FileMetadata {
                 id,
                 filename,
                 mime_type,
@@ -2024,7 +1955,7 @@ impl Storage for SqliteStorage {
                 sender,
                 message_id,
                 created_at,
-            })
+            }))
         }).collect()
     }
 
