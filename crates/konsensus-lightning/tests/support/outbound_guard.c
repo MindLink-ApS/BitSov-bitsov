@@ -1,6 +1,6 @@
 // Test-process-only network guard. Loaded before any Rust/runtime code runs.
 // Reject before DNS or connect so even a swallowed fallback error fails the test
-// without contacting that host. The sole allowed peer is the parent's RPC fixture.
+// without contacting that host. The sole allowed peer is the parent's Core or Electrum fixture.
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dlfcn.h>

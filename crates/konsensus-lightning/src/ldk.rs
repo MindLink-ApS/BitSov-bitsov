@@ -49,6 +49,8 @@ use konsensus_core::traits::lightning::{
 pub struct LdkConfig {
     /// Own Bitcoin Core overrides Esplora, including probes and fallback.
     pub bitcoind: Option<konsensus_chain::BitcoindConfig>,
+    /// Explicit Electrum source overrides Esplora; mutually exclusive with Core.
+    pub electrum: Option<konsensus_chain::ElectrumConfig>,
     /// Explicit LSPS2 provider registry (off by default).
     pub liquidity: LiquidityConfig,
     /// Path to store LDK state (channel monitors, network graph, scorer, etc.).
@@ -270,6 +272,7 @@ pub struct LdkProvider {
     /// uses for chain sync, so verification reflects what LDK saw.
     esplora_url: String,
     bitcoind: Option<konsensus_chain::BitcoindProvider>,
+    electrum: Option<konsensus_chain::ElectrumProvider>,
     /// L0g (2026-04-30): set to `true` to signal the dedicated event
     /// drainer task to exit. Set during graceful shutdown BEFORE
     /// `node.stop()` so the drainer doesn't try to call into a stopped
@@ -411,7 +414,12 @@ impl LdkProvider {
         let ldk_seed = Zeroizing::new(derive_ldk_entropy(&*bip39_seed));
 
         let network = parse_network(&config.network)?;
-        if config.bitcoind.is_none() {
+        if config.bitcoind.is_some() && config.electrum.is_some() {
+            return Err(LightningError::InvalidStartupConfig(
+                "select only one of bitcoind or electrum".into(),
+            ));
+        }
+        if config.bitcoind.is_none() && config.electrum.is_none() {
             validate_startup_url("esplora_url", &config.esplora_url)?;
             if let Some(url) = &config.esplora_url_fallback {
                 validate_startup_url("esplora_url_fallback", url)?;
@@ -419,6 +427,12 @@ impl LdkProvider {
         }
         let bitcoind = config.bitcoind.clone().map(konsensus_chain::BitcoindProvider::new)
             .transpose().map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
+        let electrum = config
+            .electrum
+            .clone()
+            .map(konsensus_chain::ElectrumProvider::new)
+            .transpose()
+            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
         if let Some(url) = &config.rgs_url {
             validate_startup_url("rgs_url", url)?;
         }
@@ -505,11 +519,24 @@ impl LdkProvider {
             node.start().map_err(|_| LightningError::ChainSourceUnavailable { network: config.network.clone(), service: "bitcoind".into(), attempts: 1, elapsed_ms: started.elapsed().as_millis() as u64, cause: "Bitcoin Core RPC startup failed".into() })?;
             tokio::task::yield_now().await;
             (node, String::new(), baseline)
+        } else if let Some(server) = &config.electrum {
+            builder.set_chain_source_electrum(server.server_url.clone(), None);
+            let node = builder.build().map_err(startup_build_error)?;
+            let baseline = node.status();
+            node.start().map_err(|_| LightningError::ChainSourceUnavailable {
+                network: config.network.clone(),
+                service: "electrum".into(),
+                attempts: 1,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: "Electrum startup failed".into(),
+            })?;
+            tokio::task::yield_now().await;
+            (node, String::new(), baseline)
         } else {
             let chosen = select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref()).await;
             start_esplora_with_retry(builder, &config, chosen, started).await?
         };
-        info!(network = %config.network, chain_backend = if bitcoind.is_some() { "bitcoind" } else { "esplora" }, "LDK embedded Lightning node started");
+        info!(network = %config.network, chain_backend = if bitcoind.is_some() { "bitcoind" } else if electrum.is_some() { "electrum" } else { "esplora" }, "LDK embedded Lightning node started");
 
         let node = Arc::new(node);
         let drainer_shutdown = Arc::new(AtomicBool::new(false));
@@ -556,6 +583,7 @@ impl LdkProvider {
             payment_capable: AtomicBool::new(true),
             esplora_url: chosen_esplora_url,
             bitcoind,
+            electrum,
             drainer_shutdown,
             inbound_tx,
             outgoing_tx,
@@ -587,6 +615,7 @@ impl LdkProvider {
             // callers go through `new()` and get a populated URL.
             esplora_url: String::new(),
             bitcoind: None,
+            electrum: None,
             // Pre-set to `true` so any consumer wrapping a from_node-constructed
             // provider sees the drainer as already-shutdown.
             drainer_shutdown: Arc::new(AtomicBool::new(true)),
@@ -1434,7 +1463,7 @@ impl LightningProvider for LdkProvider {
 
         // Verify asynchronous broadcast against the selected chain backend.
         // A timeout preserves the txid in BroadcastUnconfirmed; never consult
-        // Esplora when the operator selected Bitcoin Core.
+        // Esplora when the operator selected Bitcoin Core or Electrum.
         let txid_str = txid.to_string();
         let verify_deadline = std::time::Duration::from_secs(10);
         match tokio::time::timeout(
@@ -1443,6 +1472,13 @@ impl LightningProvider for LdkProvider {
                 if let Some(rpc) = &self.bitcoind {
                     loop {
                         if rpc.tx_visible(&txid_str).await.map_err(|e| e.to_string())? { return Ok(true); }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                } else if let Some(server) = &self.electrum {
+                    loop {
+                        if server.tx_visible(&txid_str).await.map_err(|e| e.to_string())? {
+                            return Ok(true);
+                        }
                         tokio::time::sleep(Duration::from_millis(250)).await;
                     }
                 } else {

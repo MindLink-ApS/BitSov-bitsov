@@ -2,7 +2,7 @@
 //! without affecting other tests. Requires the system C compiler used by Cargo.
 use std::path::Path;
 
-pub async fn run(test: &str, dir: &Path, core: &str, primary: &str, fallback: &str) -> String {
+pub async fn run(test: &str, dir: &Path, endpoint: &str, primary: &str, fallback: &str) -> String {
     assert!(
         cfg!(any(target_os = "macos", target_os = "linux")),
         "the no-fallback network guard requires macOS or Linux"
@@ -52,8 +52,9 @@ pub async fn run(test: &str, dir: &Path, core: &str, primary: &str, fallback: &s
             &library,
         )
         .env("BITSOV_GUARD_LOG", &log)
-        .env("BITSOV_GUARD_PORT", core.rsplit(':').next().unwrap())
-        .env("BITSOV_GUARD_CORE", core)
+        .env("BITSOV_GUARD_PORT", endpoint.rsplit(':').next().unwrap())
+        .env("BITSOV_GUARD_CORE", endpoint)
+        .env("BITSOV_GUARD_ENDPOINT", endpoint)
         .env("BITSOV_GUARD_PRIMARY", primary)
         .env("BITSOV_GUARD_FALLBACK", fallback)
         // The test's destinations must not depend on the developer's proxy.
@@ -78,9 +79,9 @@ pub async fn run(test: &str, dir: &Path, core: &str, primary: &str, fallback: &s
     assert!(
         attempts.contains(&format!(
             "ALLOW connect {}",
-            core.trim_start_matches("http://")
+            endpoint.split_once("://").unwrap().1
         )),
-        "guard must intercept the actual RPC connections: {attempts}"
+        "guard must intercept the actual chain-source connections: {attempts}"
     );
     attempts
 }

@@ -4,7 +4,8 @@ BitSov can use your own Bitcoin Core (pruned or full) for both embedded LDK
 Lightning and chain height, headers, fees and transaction confirmation. MindLink
 does not run a default chain server. Existing Esplora configurations and fresh
 `init` defaults remain unchanged;
-onboarding selection, Neutrino and Electrum are later steps.
+Electrum is also supported with an explicit server. Onboarding selection and
+Neutrino are later steps.
 
 ## Own Bitcoin Core
 
@@ -59,6 +60,64 @@ on pruned nodes too. A transaction outside that window or already pruned returns
 **unavailable**, not “unconfirmed.” Archival arbitrary-txid lookup requires a full
 node with `txindex=1`. There is no fallback to a public explorer.
 
+## Electrum server
+
+Owners running electrs or Fulcrum (for example on Umbrel or Start9) can select
+that server for both chain queries and embedded LDK:
+
+```toml
+[chain]
+backend = "electrum"
+server_url = "tcp://192.168.1.20:50001"
+operator = "own"
+```
+
+Use the Electrum port exposed by your server, not its Esplora HTTP port.
+`server_url` is required; there is no default server or discovery. Only
+`ssl://host:port` and `tcp://host:port` with an explicit nonzero port are accepted.
+Credentials, paths, queries and fragments are rejected. Missing or invalid URLs
+fail startup. An unreachable server fails startup or leaves sync stalled;
+**there is no switch to Esplora**, including for post-broadcast verification.
+The Lightning Esplora primary/fallback settings are ignored for this backend.
+Keep Lightning's `network` aligned with the Electrum server's Bitcoin network.
+
+Plain `tcp://` is permitted only for `localhost`, loopback IPs, RFC1918 private
+IPv4 addresses, IPv6 unique-local addresses (including private/loopback IPv4
+mapped into IPv6), and `.onion` names. LAN hostnames such as `umbrel.local` require
+`ssl://`; use a private IP literal for plaintext LAN access. Public addresses and
+other hostnames require `ssl://`, which verifies the server certificate and
+hostname. A self-signed certificate is not automatically trusted. Plain LAN TCP
+is not encrypted and can be observed or altered on that network. `.onion`
+acceptance does **not** configure Tor: this integration adds no SOCKS proxy or
+Tor routing; provide working external transport or a loopback tunnel yourself.
+For TLS to an IPv6 server, use a DNS hostname: the pinned Electrum client's TLS
+parser does not support IPv6 literals, so `ssl://[IPv6]:port` is rejected at
+startup. Private and loopback IPv6 literals remain supported with `tcp://`.
+
+`operator` accepts `own` or `third_party`; omission defaults to `third_party`,
+even for a loopback or private address. With `operator = "own"`, owner status is:
+
+```json
+{"chain_view":{"backend":"electrum","trust_level":"own_node","host":"192.168.1.20"}}
+```
+
+For Electrum, `own_node` means **you declared that you run this server**.
+`third_party` means no such declaration was made (or you explicitly chose it).
+Neither label proves ownership, full block validation, correct responses, the
+server's network, connectivity, or synchronization. Electrum remains
+server-trusting in both cases. It sees queried script hashes and transactions,
+which let it link the addresses and outputs the wallets watch; TLS protects
+transport, not this disclosure to the operator. Using your own server removes
+that disclosure to a third-party chain server only if you actually control it.
+
+Height, headers, fees and transaction lookups use this same Electrum endpoint.
+Confirmation lookup fetches the transaction and its output script histories
+(the standard protocol supported by electrs and Fulcrum); it does not require
+the optional verbose-transaction extension. Missing history or unavailable
+transactions return an error rather than an assertion that they are unconfirmed.
+An available server tip is not proof that it is current. No keys are sent to the
+server, and chain selection does not change custody.
+
 ## Privacy and status
 
 Authenticated `GET /api/v1/status` includes:
@@ -76,7 +135,8 @@ that operator. The separate height/readiness fields report availability.
 to `own_node`. App clients matching this value must update; `third_party` is
 unchanged.
 
-LDK wallet sync failures appear in owner status, including during initial sync:
+LDK wallet sync failures for Esplora, Bitcoin Core and Electrum appear in owner
+status, including during initial sync:
 
 ```json
 {"chain_sync":{"state":"stalled","since":1790899200,"last_error_kind":"sync_failed"},"money_ready":false}
@@ -87,8 +147,8 @@ wallet in this process. Retries preserve it, and a successful sync clears that
 wallet's failure. A failure of either wallet keeps the diagnostic stalled. This
 diagnostic does not gate money operations: `money_ready` retains its running,
 post-startup wallet sync and timestamp freshness checks. `sync_failed` is a fixed,
-non-secret kind: it does not diagnose pruning versus an unreachable RPC. No remote error text, credentials or paths
-are returned. Restore required block history or RPC access and let LDK retry.
+non-secret kind: it does not diagnose pruning versus an unreachable RPC or Electrum server. No remote error text, credentials or paths
+are returned. Restore required block history or chain-server access and let LDK retry.
 `chain_sync: null` means no observed wallet sync failure (or a backend without
 this diagnostic), **not** proof of synchronization. Use `money_ready` for money
 readiness. Diagnostics reset on restart; existing freshness checks still apply.
