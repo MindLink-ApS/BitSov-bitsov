@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod balance;
+mod onchain;
 pub mod circuit_breaker;
 pub mod recovering;
 pub use recovering::RecoveringLightning;

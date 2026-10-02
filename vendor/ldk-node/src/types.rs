@@ -193,7 +193,7 @@ pub(crate) type Sweeper = OutputSweeper<
 pub(crate) type BumpTransactionEventHandler =
 	lightning::events::bump_transaction::BumpTransactionEventHandler<
 		Arc<Broadcaster>,
-		Arc<lightning::events::bump_transaction::Wallet<Arc<Wallet>, Arc<Logger>>>,
+		Arc<crate::wallet::bump::BumpWallet>,
 		Arc<KeysManager>,
 		Arc<Logger>,
 	>;

@@ -1355,7 +1355,7 @@ fn build_with_store_internal(
 		Arc::clone(&payment_store),
 		Arc::clone(&config),
 		Arc::clone(&logger),
-	));
+	).map_err(|_| BuildError::WalletSetupFailed)?);
 
 	// Initialize the KeysManager
 	let cur_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|e| {

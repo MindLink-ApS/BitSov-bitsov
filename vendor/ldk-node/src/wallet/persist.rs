@@ -19,7 +19,7 @@ use crate::logger::{log_error, LdkLogger, Logger};
 use crate::types::DynStore;
 pub(crate) struct KVStoreWalletPersister {
 	latest_change_set: Option<ChangeSet>,
-	kv_store: Arc<DynStore>,
+	pub(super) kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 }
 

@@ -271,8 +271,9 @@ pub struct LdkProvider {
     /// post-broadcast verification (L0f). Same endpoint LDK itself
     /// uses for chain sync, so verification reflects what LDK saw.
     esplora_url: String,
-    bitcoind: Option<konsensus_chain::BitcoindProvider>,
-    electrum: Option<konsensus_chain::ElectrumProvider>,
+    bitcoind: Option<Arc<konsensus_chain::BitcoindProvider>>,
+    electrum: Option<Arc<konsensus_chain::ElectrumProvider>>,
+    onchain_operations: crate::onchain::OnchainOperations,
     /// L0g (2026-04-30): set to `true` to signal the dedicated event
     /// drainer task to exit. Set during graceful shutdown BEFORE
     /// `node.stop()` so the drainer doesn't try to call into a stopped
@@ -579,11 +580,12 @@ impl LdkProvider {
             routing_fee_policy: Default::default(),
             liquidity,
             liquidity_info: config.liquidity.info(),
+            onchain_operations: crate::onchain::OnchainOperations::new(node.onchain_operation_lock()),
             node,
             payment_capable: AtomicBool::new(true),
             esplora_url: chosen_esplora_url,
-            bitcoind,
-            electrum,
+            bitcoind: bitcoind.map(Arc::new),
+            electrum: electrum.map(Arc::new),
             drainer_shutdown,
             inbound_tx,
             outgoing_tx,
@@ -608,6 +610,7 @@ impl LdkProvider {
             routing_fee_policy: Default::default(),
             liquidity: None,
             liquidity_info: LiquidityInfo::default(),
+            onchain_operations: crate::onchain::OnchainOperations::new(node.onchain_operation_lock()),
             node,
             payment_capable: AtomicBool::new(true),
             // Test path — broadcast verification will fall through to
@@ -621,6 +624,14 @@ impl LdkProvider {
             drainer_shutdown: Arc::new(AtomicBool::new(true)),
             inbound_tx,
             outgoing_tx,
+        }
+    }
+
+    fn chain_visibility(&self) -> crate::onchain::ChainVisibility {
+        crate::onchain::ChainVisibility {
+            esplora_url: self.esplora_url.clone(),
+            bitcoind: self.bitcoind.clone(),
+            electrum: self.electrum.clone(),
         }
     }
 
@@ -1454,67 +1465,32 @@ impl LightningProvider for LdkProvider {
                 })
             })
             .transpose()?;
-        let txid = self
-            .node
-            .onchain_payment()
-            .send_to_address(&addr, amount_sats, fee_rate)
-            .map_err(|e| LightningError::Backend(format!("send_onchain failed: {e}")))?;
-        tracing::info!(txid = %txid, amount_sats, address, "on-chain send initiated");
-
-        // Verify asynchronous broadcast against the selected chain backend.
-        // A timeout preserves the txid in BroadcastUnconfirmed; never consult
-        // Esplora when the operator selected Bitcoin Core or Electrum.
-        let txid_str = txid.to_string();
-        let verify_deadline = std::time::Duration::from_secs(10);
-        match tokio::time::timeout(
-            verify_deadline,
-            async {
-                if let Some(rpc) = &self.bitcoind {
-                    loop {
-                        if rpc.tx_visible(&txid_str).await.map_err(|e| e.to_string())? { return Ok(true); }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-                } else if let Some(server) = &self.electrum {
-                    loop {
-                        if server.tx_visible(&txid_str).await.map_err(|e| e.to_string())? {
-                            return Ok(true);
-                        }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-                } else {
-                    esplora_tx_visible(&self.esplora_url, &txid_str).await
-                }
-            },
-        )
-        .await
-        {
-            Ok(Ok(true)) => {
-                tracing::debug!(txid = %txid_str, "broadcast verified visible on chain provider");
-            }
-            Ok(Ok(false)) => {
-                tracing::warn!(
-                    txid = %txid_str,
-                    "broadcast NOT visible on chain provider after 10s — returning BroadcastUnconfirmed"
-                );
-                return Err(LightningError::BroadcastUnconfirmed { txid: txid_str });
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    txid = %txid_str,
-                    error = %e,
-                    "chain provider query failed during broadcast verification"
-                );
-                return Err(LightningError::BroadcastUnconfirmed { txid: txid_str });
-            }
-            Err(_) => {
-                tracing::warn!(
-                    txid = %txid_str,
-                    "chain provider query timed out during broadcast verification"
-                );
-                return Err(LightningError::BroadcastUnconfirmed { txid: txid_str });
-            }
-        }
-        Ok(txid.to_string())
+        let node = self.node.clone();
+        let chain = self.chain_visibility();
+        self.onchain_operations
+            .run(async move {
+                let sender = node.clone();
+                let txid = tokio::task::spawn_blocking(move || {
+                    sender
+                        .onchain_payment()
+                        .send_to_address(&addr, amount_sats, fee_rate)
+                })
+                .await
+                .map_err(|e| LightningError::Backend(format!("send_onchain worker failed: {e}")))?
+                .map_err(|e| LightningError::Backend(format!("send_onchain failed: {e}")))?;
+                // Vendored Wallet records and persists this spend before returning.
+                // Chain acceptance is separate evidence, checked against the selected source.
+                let txid_string = txid.to_string();
+                crate::onchain::verify_broadcast(&txid_string, |id| chain.tx_visible(id)).await?;
+                node.transaction_broadcast_verified(txid).map_err(|e| {
+                    LightningError::Backend(format!(
+                        "transaction {txid} accepted but wallet reservation update failed: {e}"
+                    ))
+                })?;
+                tracing::info!(%txid, amount_sats, "on-chain send verified");
+                Ok(txid_string)
+            })
+            .await
     }
 
     async fn open_channel(
@@ -1525,14 +1501,36 @@ impl LightningProvider for LdkProvider {
         announce: bool,
         fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        open_ldk_channel(
-            self.node.as_ref(),
-            peer_pubkey,
-            peer_addr,
-            amount_sats,
-            announce,
-            fee_rate_sat_per_vb,
-        )
+        let node = self.node.clone();
+        let chain = self.chain_visibility();
+        let peer_pubkey = peer_pubkey.to_owned();
+        let peer_addr = peer_addr.to_owned();
+        self.onchain_operations.run(async move {
+            let opener = node.clone();
+            let channel_id = tokio::task::spawn_blocking(move || open_ldk_channel(
+                opener.as_ref(), &peer_pubkey, &peer_addr, amount_sats, announce, fee_rate_sat_per_vb,
+            )).await.map_err(|e| LightningError::Backend(format!("open_channel worker failed: {e}")))??;
+            let pending_id = channel_id.clone();
+            crate::onchain::finish_channel_open(channel_id, || {
+                let channel = node.list_channels().into_iter()
+                    .find(|ch| ch.user_channel_id.to_string() == pending_id)
+                    .ok_or_else(|| LightningError::Backend(format!(
+                        "channel {pending_id} disappeared before funding was verified; inspect channel events before retrying"
+                    )))?;
+                Ok(channel.funding_txo.map(|outpoint| outpoint.txid.to_string()))
+            }, |id| {
+                let chain = &chain;
+                let node = &node;
+                async move {
+                let visible = chain.tx_visible(id.clone()).await?;
+                if visible {
+                    let txid = id.parse().map_err(|e| format!("invalid funding txid: {e}"))?;
+                    node.transaction_broadcast_verified(txid).map_err(|e| e.to_string())?;
+                }
+                Ok(visible)
+                }
+            }).await
+        }).await
     }
 
     async fn close_channel(
@@ -1552,35 +1550,43 @@ impl LightningProvider for LdkProvider {
         .map_err(|e| LightningError::Backend(format!("invalid channel_id: {e}")))?;
         let user_channel_id = ldk_node::UserChannelId(user_channel_id_num);
 
-        let channels = self.node.list_channels();
-        let counterparty_pubkey = channels
-            .into_iter()
-            .find(|ch| ch.user_channel_id == user_channel_id)
-            .map(|ch| ch.counterparty_node_id)
-            .ok_or_else(|| {
-                LightningError::Backend(format!(
-                    "channel not found for user_channel_id {channel_id}"
-                ))
-            })?;
-
-        if force {
-            self.node
-                .force_close_channel(&user_channel_id, counterparty_pubkey, None)
-                .map_err(|e| LightningError::Backend(format!("close_channel failed: {e}")))?;
-        } else {
-            self.node
-                .close_channel(&user_channel_id, counterparty_pubkey)
-                .map_err(|e| LightningError::Backend(format!("close_channel failed: {e}")))?;
-        }
-
-        tracing::info!(
-            channel_id = %channel_id,
-            force,
-            "Lightning channel close initiated"
-        );
-
-        Ok(None)
+        let node = self.node.clone();
+        let channel_id = channel_id.to_owned();
+        self.onchain_operations
+            .run(async move {
+                let closer = node.clone();
+                tokio::task::spawn_blocking(move || {
+                    let counterparty_pubkey = closer
+                        .list_channels()
+                        .into_iter()
+                        .find(|ch| ch.user_channel_id == user_channel_id)
+                        .map(|ch| ch.counterparty_node_id)
+                        .ok_or_else(|| {
+                            LightningError::Backend(format!(
+                                "channel not found for user_channel_id {user_channel_id}"
+                            ))
+                        })?;
+                    if force {
+                        closer.force_close_channel(&user_channel_id, counterparty_pubkey, None)
+                    } else {
+                        closer.close_channel(&user_channel_id, counterparty_pubkey)
+                    }
+                    .map_err(|e| LightningError::Backend(format!("close_channel failed: {e}")))
+                })
+                .await
+                .map_err(|e| {
+                    LightningError::Backend(format!("close_channel worker failed: {e}"))
+                })??;
+                crate::onchain::finish_channel_close(&channel_id, || {
+                    node.list_channels()
+                        .iter()
+                        .any(|ch| ch.user_channel_id == user_channel_id)
+                })
+                .await
+            })
+            .await
     }
+
 }
 
 // --- Helper functions ---

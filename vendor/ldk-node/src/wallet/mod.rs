@@ -60,10 +60,14 @@ pub(crate) enum OnchainSendAmount {
 	AllDrainingReserve,
 }
 
+pub(crate) mod bump;
+mod local_spends;
 pub(crate) mod persist;
 pub(crate) mod ser;
 
 pub(crate) struct Wallet {
+	local_spends: Mutex<local_spends::LocalSpends>,
+	pub(crate) operation_lock: Arc<tokio::sync::Mutex<()>>,
 	// A BDK on-chain wallet.
 	inner: Mutex<PersistedWallet<KVStoreWalletPersister>>,
 	persister: Mutex<KVStoreWalletPersister>,
@@ -77,13 +81,27 @@ pub(crate) struct Wallet {
 impl Wallet {
 	pub(crate) fn new(
 		wallet: bdk_wallet::PersistedWallet<KVStoreWalletPersister>,
-		wallet_persister: KVStoreWalletPersister, broadcaster: Arc<Broadcaster>,
-		fee_estimator: Arc<OnchainFeeEstimator>, payment_store: Arc<PaymentStore>,
-		config: Arc<Config>, logger: Arc<Logger>,
-	) -> Self {
+		wallet_persister: KVStoreWalletPersister,
+		broadcaster: Arc<Broadcaster>,
+		fee_estimator: Arc<OnchainFeeEstimator>,
+		payment_store: Arc<PaymentStore>,
+		config: Arc<Config>,
+		logger: Arc<Logger>,
+	) -> Result<Self, Error> {
+		let local_spends = local_spends::LocalSpends::load(Arc::clone(&wallet_persister.kv_store))?;
 		let inner = Mutex::new(wallet);
 		let persister = Mutex::new(wallet_persister);
-		Self { inner, persister, broadcaster, fee_estimator, payment_store, config, logger }
+		Ok(Self {
+			inner,
+			persister,
+			broadcaster,
+			fee_estimator,
+			payment_store,
+			config,
+			logger,
+			local_spends: Mutex::new(local_spends),
+			operation_lock: Arc::new(tokio::sync::Mutex::new(())),
+		})
 	}
 
 	pub(crate) fn get_full_scan_request(&self) -> FullScanRequest<KeychainKind> {
@@ -115,6 +133,13 @@ impl Wallet {
 
 	pub(crate) fn apply_update(&self, update: impl Into<Update>) -> Result<(), Error> {
 		let mut locked_wallet = self.inner.lock().unwrap();
+		let update = update.into();
+		for (txid, _) in &update.tx_update.seen_ats {
+			self.local_spends.lock().unwrap().verified(*txid)?;
+		}
+		for (_, txid) in &update.tx_update.anchors {
+			self.local_spends.lock().unwrap().verified(*txid)?;
+		}
 		match locked_wallet.apply_update(update) {
 			Ok(()) => {
 				let mut locked_persister = self.persister.lock().unwrap();
@@ -123,6 +148,7 @@ impl Wallet {
 					Error::PersistenceFailed
 				})?;
 
+				self.reconcile_confirmed_spends(&locked_wallet)?;
 				self.update_payment_store(&mut *locked_wallet).map_err(|e| {
 					log_error!(self.logger, "Failed to update payment store: {}", e);
 					Error::PersistenceFailed
@@ -138,9 +164,14 @@ impl Wallet {
 	}
 
 	pub(crate) fn apply_mempool_txs(
-		&self, unconfirmed_txs: Vec<(Transaction, u64)>, evicted_txids: Vec<(Txid, u64)>,
+		&self,
+		unconfirmed_txs: Vec<(Transaction, u64)>,
+		evicted_txids: Vec<(Txid, u64)>,
 	) -> Result<(), Error> {
 		let mut locked_wallet = self.inner.lock().unwrap();
+		for (tx, _) in &unconfirmed_txs {
+			self.local_spends.lock().unwrap().verified(tx.compute_txid())?;
+		}
 		locked_wallet.apply_unconfirmed_txs(unconfirmed_txs);
 		locked_wallet.apply_evicted_txs(evicted_txids);
 
@@ -229,13 +260,18 @@ impl Wallet {
 
 	#[allow(deprecated)]
 	pub(crate) fn create_funding_transaction(
-		&self, output_script: ScriptBuf, amount: Amount, confirmation_target: ConfirmationTarget,
+		&self,
+		output_script: ScriptBuf,
+		amount: Amount,
+		confirmation_target: ConfirmationTarget,
 		locktime: LockTime,
 	) -> Result<Transaction, Error> {
 		let fee_rate = self.fee_estimator.estimate_fee_rate(confirmation_target);
 
 		let mut locked_wallet = self.inner.lock().unwrap();
+		let unavailable = self.local_spends.lock().unwrap().unavailable();
 		let mut tx_builder = locked_wallet.build_tx();
+		tx_builder.unspendable(unavailable);
 
 		tx_builder.add_recipient(output_script, amount).fee_rate(fee_rate).nlocktime(locktime);
 
@@ -262,18 +298,86 @@ impl Wallet {
 			},
 		}
 
-		let mut locked_persister = self.persister.lock().unwrap();
-		locked_wallet.persist(&mut locked_persister).map_err(|e| {
-			log_error!(self.logger, "Failed to persist wallet: {}", e);
-			Error::PersistenceFailed
-		})?;
-
 		let tx = psbt.extract_tx().map_err(|e| {
 			log_error!(self.logger, "Failed to extract transaction: {}", e);
 			e
 		})?;
-
+		self.record_outgoing_transaction(&mut locked_wallet, &tx, false)?;
 		Ok(tx)
+	}
+
+	/// Register our signed spend before another builder can select its inputs. BDK's
+	/// build_tx/sign only reserve change addresses, not UTXOs. Applying and persisting
+	/// the transaction under the same wallet lock also protects the asynchronous LDK
+	/// funding handshake, cancelled API requests, and restarts before chain sync.
+	/// This is local spend knowledge, NOT evidence of chain-source acceptance.
+	fn record_outgoing_transaction(
+		&self,
+		wallet: &mut PersistedWallet<KVStoreWalletPersister>,
+		tx: &Transaction,
+		bump: bool,
+	) -> Result<(), Error> {
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_err(|_| Error::WalletOperationFailed)?
+			.as_secs();
+		self.local_spends.lock().unwrap().record(tx, bump)?;
+		wallet.apply_unconfirmed_txs([(tx.clone(), now)]);
+		wallet.persist(&mut self.persister.lock().unwrap()).map_err(|e| {
+			log_error!(self.logger, "Failed to persist outgoing transaction: {}", e);
+			Error::PersistenceFailed
+		})?;
+		Ok(())
+	}
+
+	fn reconcile_confirmed_spends(
+		&self,
+		wallet: &PersistedWallet<KVStoreWalletPersister>,
+	) -> Result<(), Error> {
+		let mut local = self.local_spends.lock().unwrap();
+		for tx in wallet.transactions().filter(|tx| tx.chain_position.is_confirmed()) {
+			local.confirmed(&tx.tx_node.tx)?;
+		}
+		Ok(())
+	}
+
+	pub(crate) fn transaction_verified(&self, txid: Txid) -> Result<(), Error> {
+		let _wallet = self.inner.lock().unwrap();
+		self.local_spends.lock().unwrap().verified(txid)
+	}
+
+	pub(crate) fn discard_funding(
+		&self,
+		funding: lightning::events::FundingInfo,
+	) -> Result<(), Error> {
+		let tx = match funding {
+			lightning::events::FundingInfo::Tx { transaction } => Some(transaction),
+			lightning::events::FundingInfo::OutPoint { outpoint } => {
+				self.local_spends.lock().unwrap().transaction(outpoint.txid)
+			},
+		};
+		// Drop the ledger guard before taking the wallet lock in abandon_funding.
+		if let Some(tx) = tx {
+			self.abandon_funding(&tx)?;
+		}
+		Ok(())
+	}
+
+	/// Only for LDK's definitive pre-broadcast rejection / DiscardFunding event.
+	/// Chain-source absence alone must NEVER release local input ownership.
+	pub(crate) fn abandon_funding(&self, tx: &Transaction) -> Result<(), Error> {
+		let mut wallet = self.inner.lock().unwrap();
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_err(|_| Error::WalletOperationFailed)?
+			.as_secs()
+			.saturating_add(1);
+		wallet.cancel_tx(tx);
+		wallet.apply_evicted_txs([(tx.compute_txid(), now)]);
+		wallet
+			.persist(&mut self.persister.lock().unwrap())
+			.map_err(|_| Error::PersistenceFailed)?;
+		self.local_spends.lock().unwrap().abandon(tx.compute_txid())
 	}
 
 	pub(crate) fn get_new_address(&self) -> Result<bitcoin::Address, Error> {
@@ -318,16 +422,6 @@ impl Wallet {
 	) -> Result<(u64, u64), Error> {
 		let balance = self.inner.lock().unwrap().balance();
 
-		// Make sure `list_confirmed_utxos` returns at least one `Utxo` we could use to spend/bump
-		// Anchors if we have any confirmed amounts.
-		#[cfg(debug_assertions)]
-		if balance.confirmed != Amount::ZERO {
-			debug_assert!(
-				self.list_confirmed_utxos_inner().map_or(false, |v| !v.is_empty()),
-				"Confirmed amounts should always be available for Anchor spending"
-			);
-		}
-
 		self.get_balances_inner(balance, total_anchor_channels_reserve_sats)
 	}
 
@@ -357,7 +451,9 @@ impl Wallet {
 
 	#[allow(deprecated)]
 	pub(crate) fn send_to_address(
-		&self, address: &bitcoin::Address, send_amount: OnchainSendAmount,
+		&self,
+		address: &bitcoin::Address,
+		send_amount: OnchainSendAmount,
 		fee_rate: Option<FeeRate>,
 	) -> Result<Txid, Error> {
 		self.parse_and_validate_address(&address)?;
@@ -374,7 +470,9 @@ impl Wallet {
 			const DUST_LIMIT_SATS: u64 = 546;
 			let tx_builder = match send_amount {
 				OnchainSendAmount::ExactRetainingReserve { amount_sats, .. } => {
+					let unavailable = self.local_spends.lock().unwrap().unavailable();
 					let mut tx_builder = locked_wallet.build_tx();
+					tx_builder.unspendable(unavailable);
 					let amount = Amount::from_sat(amount_sats);
 					tx_builder.add_recipient(address.script_pubkey(), amount).fee_rate(fee_rate);
 					tx_builder
@@ -389,7 +487,9 @@ impl Wallet {
 						.map(|(_, s)| s)
 						.unwrap_or(0);
 					let tmp_tx = {
+						let unavailable = self.local_spends.lock().unwrap().unavailable();
 						let mut tmp_tx_builder = locked_wallet.build_tx();
+						tmp_tx_builder.unspendable(unavailable);
 						tmp_tx_builder
 							.drain_wallet()
 							.drain_to(address.script_pubkey())
@@ -436,7 +536,9 @@ impl Wallet {
 						return Err(Error::InsufficientFunds);
 					}
 
+					let unavailable = self.local_spends.lock().unwrap().unavailable();
 					let mut tx_builder = locked_wallet.build_tx();
+					tx_builder.unspendable(unavailable);
 					tx_builder
 						.add_recipient(address.script_pubkey(), estimated_spendable_amount)
 						.fee_absolute(estimated_tx_fee);
@@ -444,7 +546,9 @@ impl Wallet {
 				},
 				OnchainSendAmount::AllDrainingReserve
 				| OnchainSendAmount::AllRetainingReserve { cur_anchor_reserve_sats: _ } => {
+					let unavailable = self.local_spends.lock().unwrap().unavailable();
 					let mut tx_builder = locked_wallet.build_tx();
+					tx_builder.unspendable(unavailable);
 					tx_builder.drain_wallet().drain_to(address.script_pubkey()).fee_rate(fee_rate);
 					tx_builder
 				},
@@ -525,16 +629,12 @@ impl Wallet {
 				},
 			}
 
-			let mut locked_persister = self.persister.lock().unwrap();
-			locked_wallet.persist(&mut locked_persister).map_err(|e| {
-				log_error!(self.logger, "Failed to persist wallet: {}", e);
-				Error::PersistenceFailed
-			})?;
-
-			psbt.extract_tx().map_err(|e| {
+			let tx = psbt.extract_tx().map_err(|e| {
 				log_error!(self.logger, "Failed to extract transaction: {}", e);
 				e
-			})?
+			})?;
+			self.record_outgoing_transaction(&mut locked_wallet, &tx, false)?;
+			tx
 		};
 
 		self.broadcaster.broadcast_transactions(&[&tx]);
@@ -586,7 +686,9 @@ impl Wallet {
 			ExtendedDescriptor::Wpkh(_)
 		));
 
+		let unavailable = self.local_spends.lock().unwrap().unavailable();
 		let mut tx_builder = locked_wallet.build_tx();
+		tx_builder.unspendable(unavailable);
 		tx_builder.only_witness_utxo();
 
 		for input in &must_spend {
@@ -624,15 +726,30 @@ impl Wallet {
 	}
 
 	fn list_confirmed_utxos_inner(&self) -> Result<Vec<Utxo>, ()> {
+		self.list_confirmed_utxos_for_claim(None, false)
+	}
+
+	fn list_confirmed_utxos_for_claim(
+		&self,
+		claim: Option<bitcoin::OutPoint>,
+		allow_other_bumps: bool,
+	) -> Result<Vec<Utxo>, ()> {
 		let locked_wallet = self.inner.lock().unwrap();
 		let mut utxos = Vec::new();
-		let confirmed_txs: Vec<Txid> = locked_wallet
+		let confirmed_txs: std::collections::HashSet<Txid> = locked_wallet
 			.transactions()
 			.filter(|t| t.chain_position.is_confirmed())
 			.map(|t| t.tx_node.txid)
 			.collect();
-		let unspent_confirmed_utxos =
-			locked_wallet.list_unspent().filter(|u| confirmed_txs.contains(&u.outpoint.txid));
+		let local = self.local_spends.lock().unwrap();
+		let unavailable = local.unavailable();
+		let bump_inputs = local.bump_inputs(&confirmed_txs, claim, allow_other_bumps);
+		drop(local);
+		let unspent_confirmed_utxos = locked_wallet.list_output().filter(|u| {
+			confirmed_txs.contains(&u.outpoint.txid)
+				&& ((!u.is_spent && !unavailable.contains(&u.outpoint))
+					|| bump_inputs.contains(&u.outpoint))
+		});
 
 		for u in unspent_confirmed_utxos {
 			let script_pubkey = u.txout.script_pubkey;
@@ -767,7 +884,9 @@ impl Wallet {
 
 	#[allow(deprecated)]
 	fn sign_psbt_inner(&self, mut psbt: Psbt) -> Result<Transaction, ()> {
-		let locked_wallet = self.inner.lock().unwrap();
+		let mut locked_wallet = self.inner.lock().unwrap();
+
+		self.local_spends.lock().unwrap().check_bump(&psbt.unsigned_tx)?;
 
 		// While BDK populates both `witness_utxo` and `non_witness_utxo` fields, LDK does not. As
 		// BDK by default doesn't trust the witness UTXO to account for the Segwit bug, we must
@@ -792,8 +911,10 @@ impl Wallet {
 			()
 		})?;
 
+		self.record_outgoing_transaction(&mut locked_wallet, &tx, true).map_err(|_| ())?;
 		Ok(tx)
 	}
+
 }
 
 impl Listen for Wallet {
@@ -847,6 +968,9 @@ impl Listen for Wallet {
 				return;
 			},
 		};
+		if let Err(e) = self.reconcile_confirmed_spends(&locked_wallet) {
+			log_error!(self.logger, "Failed to update confirmed spend reservations: {}", e);
+		}
 	}
 
 	fn blocks_disconnected(&self, _fork_point_block: BestBlock) {
@@ -1032,3 +1156,7 @@ impl ChangeDestinationSource for WalletKeysManager {
 		})
 	}
 }
+
+#[cfg(test)]
+#[path = "money_tests.rs"]
+mod bitsov_money_tests;
