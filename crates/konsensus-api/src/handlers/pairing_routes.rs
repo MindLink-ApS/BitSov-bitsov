@@ -667,6 +667,12 @@ pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
         .route("/api/v1/pair/challenge", get(pair_challenge))
         .route("/api/v1/pair/token", post(pair_token))
         .route("/api/v1/pair/rotate", post(rotate_pairing))
+        .route("/api/v1/pair/elevation-request", post(elevation_request))
+        .route(
+            "/api/v1/pair/elevation/:op_id",
+            get(elevation_status).delete(super::device_routes::cancel_elevation),
+        )
+        .route("/api/v1/pair/grant", get(own_grant))
 }
 
 #[cfg(test)]

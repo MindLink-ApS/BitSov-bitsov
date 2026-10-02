@@ -1,9 +1,68 @@
-//! LDK wallet-category conversion, with no network or wallet mutations.
+//! LDK balance accounting with injected funding verification and no wallet mutations.
 
-use konsensus_core::traits::lightning::WalletBalanceBreakdown;
+use konsensus_core::traits::lightning::{LightningError, WalletBalanceBreakdown};
 use ldk_node::lightning::ln::types::ChannelId;
 use ldk_node::{BalanceDetails, LightningBalance, PendingSweepBalance};
 use std::collections::HashSet;
+
+/// Validate removed-channel funding before either aggregate or breakdown reads.
+/// The resolver uses the configured chain source; errors never mean zero funds.
+pub(crate) async fn verify_closed_funding<F, Fut>(
+    balances: &mut BalanceDetails,
+    open: &HashSet<ChannelId>,
+    mut resolve: F,
+) -> Result<(), LightningError>
+where
+    F: FnMut(ChannelId) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, LightningError>>,
+{
+    let removed: HashSet<_> = balances.lightning_balances.iter().filter_map(|balance| {
+        match balance {
+            LightningBalance::ClaimableOnChannelClose { channel_id, .. }
+                if !open.contains(channel_id) => Some(*channel_id),
+            _ => None,
+        }
+    }).collect();
+    let mut confirmed = HashSet::new();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for channel_id in removed {
+            if resolve(channel_id).await? { confirmed.insert(channel_id); }
+        }
+        Ok::<_, LightningError>(())
+    }).await.map_err(|_| LightningError::Backend("channel funding verification timed out".into()))??;
+    filter_unfunded_closures(balances, open, &confirmed);
+    Ok(())
+}
+
+/// Explicit absence/unconfirmed is different from failed verification.
+pub(crate) fn decode_funding_status(status: u16, body: &[u8]) -> Result<bool, LightningError> {
+    if status == 404 { return Ok(false); }
+    if status != 200 {
+        return Err(LightningError::Backend("funding status backend refused request".into()));
+    }
+    #[derive(serde::Deserialize)]
+    struct FundingStatus { confirmed: bool }
+    serde_json::from_slice::<FundingStatus>(body).map(|status| status.confirmed)
+        .map_err(|_| LightningError::Backend("invalid funding status response".into()))
+}
+
+/// Remove claims without confirmed funding from both balance representations.
+pub(crate) fn filter_unfunded_closures(
+    balances: &mut BalanceDetails,
+    open: &HashSet<ChannelId>,
+    confirmed: &HashSet<ChannelId>,
+) {
+    balances.lightning_balances.retain(|balance| {
+        if let LightningBalance::ClaimableOnChannelClose { channel_id, amount_satoshis, .. } = balance {
+            if !open.contains(channel_id) && !confirmed.contains(channel_id) {
+                balances.total_lightning_balance_sats = balances.total_lightning_balance_sats
+                    .saturating_sub(*amount_satoshis);
+                return false;
+            }
+        }
+        true
+    });
+}
 
 /// Channels supply their ID, usability, and outbound capacity in millisatoshis.
 pub(crate) fn breakdown(
@@ -116,6 +175,82 @@ mod tests {
             outbound_forwarded_htlc_rounded_msat: 0,
             inbound_claiming_htlc_rounded_msat: 0,
             inbound_htlc_rounded_msat: 0,
+        }
+    }
+
+    #[test]
+    fn funding_status_requires_explicit_evidence() {
+        assert!(decode_funding_status(200, br#"{"confirmed":true}"#).unwrap());
+        assert!(!decode_funding_status(200, br#"{"confirmed":false}"#).unwrap());
+        assert!(!decode_funding_status(404, b"not found").unwrap());
+        for (status, body) in [(500, b"{}".as_slice()), (200, b"{}"), (200, b"invalid")] {
+            assert!(decode_funding_status(status, body).is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn funding_verification_errors_and_timeouts_do_not_erase_claims() {
+        let mut balances = balances();
+        balances.lightning_balances = vec![on_close()];
+        balances.total_lightning_balance_sats = 123;
+        let open = HashSet::new();
+        assert!(verify_closed_funding(&mut balances, &open, |_| async {
+            Err(LightningError::Backend("missing monitor or unavailable history".into()))
+        }).await.is_err());
+        assert_eq!(balances.total_lightning_balance_sats, 123);
+        assert!(verify_closed_funding(&mut balances, &open, |_| {
+            std::future::pending::<Result<bool, LightningError>>()
+        }).await.is_err());
+        assert_eq!(balances.total_lightning_balance_sats, 123);
+        assert_eq!(balances.lightning_balances.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn funding_verification_keeps_confirmed_and_skips_open_channels() {
+        let mut balances = balances();
+        let mut confirmed = on_close();
+        if let LightningBalance::ClaimableOnChannelClose { channel_id, .. } = &mut confirmed {
+            *channel_id = ChannelId([2; 32]);
+        }
+        balances.lightning_balances = vec![on_close(), confirmed];
+        balances.total_lightning_balance_sats = 246;
+        verify_closed_funding(&mut balances, &HashSet::new(), |id| async move {
+            Ok(id == ChannelId([2; 32]))
+        }).await.unwrap();
+        assert_eq!(balances.total_lightning_balance_sats, 123);
+        assert_eq!(breakdown(&balances, []).closing_sats, Some(123));
+        verify_closed_funding(&mut balances, &HashSet::from([ChannelId([2; 32])]), |_| async {
+            panic!("open channels must not trigger funding queries")
+        }).await.unwrap();
+    }
+
+    #[test]
+    fn ghost_channel_is_excluded_from_closing_and_aggregate() {
+        let mut balances = balances();
+        let mut ghost = on_close();
+        if let LightningBalance::ClaimableOnChannelClose { amount_satoshis, .. } = &mut ghost {
+            *amount_satoshis = 79_638;
+        }
+        balances.lightning_balances = vec![ghost];
+        balances.total_lightning_balance_sats = 79_638;
+        filter_unfunded_closures(&mut balances, &HashSet::new(), &HashSet::new());
+        assert_eq!(breakdown(&balances, []).closing_sats, Some(0));
+        assert_eq!(balances.total_lightning_balance_sats, 0);
+        assert_eq!(balances.total_onchain_balance_sats, 100_000);
+    }
+
+    #[test]
+    fn confirmed_funding_and_open_channels_keep_their_claims() {
+        for open in [false, true] {
+            let mut balances = balances();
+            balances.lightning_balances = vec![on_close()];
+            balances.total_lightning_balance_sats = 123;
+            let ids = HashSet::from([ChannelId([1; 32])]);
+            let empty = HashSet::new();
+            filter_unfunded_closures(&mut balances,
+                if open { &ids } else { &empty }, if open { &empty } else { &ids });
+            assert_eq!(balances.total_lightning_balance_sats, 123);
+            assert_eq!(balances.lightning_balances.len(), 1);
         }
     }
 

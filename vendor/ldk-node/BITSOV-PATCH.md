@@ -56,3 +56,19 @@ The unit regression checks retry timestamps, independent wallet failures and
 clearing on success. Workspace regressions cover owner-only status, unchanged
 readiness/dispatch after failure, and failed Core synchronization with an isolated
 process network guard permitting only the disposable RPC fixture.
+
+## Closed-channel funding evidence
+
+`Node::channel_funding_outpoint` exposes a monitor's funding outpoint even after
+force-close. It is a local read, not proof of broadcast or confirmation. The
+BitSov provider verifies removed-channel funding against the configured chain
+source before counting the claim in either closing funds or its legacy total;
+monitor persistence and recovery remain unchanged.
+
+`LightningBalance::from_ldk_balance` selects the same on-close balance candidate
+as LDK's `claimable_amount_satoshis`: the latest candidate when confirmed index
+is zero, otherwise the confirmed candidate. Amount and transaction fee remain
+paired. This keeps subtraction from the aggregate exact with pending splices.
+The candidate remains an estimate, not proof of replacement funding confirmation.
+
+    cargo test --offline --manifest-path vendor/ldk-node/Cargo.toml --lib bitsov_funding_tests

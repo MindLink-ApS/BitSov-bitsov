@@ -1164,3 +1164,68 @@ async fn staging_replacement_grant_cannot_read_previous_grant_blob() {
 async fn staging_revoked_then_regranted_blob_stays_revoked() {
     staging_previous_grant_isolation(true).await;
 }
+
+// Exercise the actual remote route selection in memory; no listener or live node.
+fn remote_app(state: Arc<AppState>) -> axum::Router {
+    use axum::extract::connect_info::MockConnectInfo;
+    konsensus_api::build_remote_router(state)
+        .layer(MockConnectInfo("127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap()))
+}
+
+#[tokio::test]
+async fn remote_elevation_asks_reads_and_cancels_without_granting() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), true);
+    let key = SigningKey::from_bytes(&[91; 32]);
+    let (client_id, token) = pair_and_token(&test_router(state.clone()), &service, &key).await;
+    let app = remote_app(state);
+    let (status, body) = post(&app, "/api/v1/pair/elevation-request",
+        serde_json::json!({"scopes": ["spend"], "budget": {"budget_msat": 10000}}), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let op = body["op_id"].as_str().unwrap();
+    for (method, path) in [
+        ("GET", format!("/api/v1/pair/elevation/{op}")),
+        ("GET", "/api/v1/pair/grant".into()),
+        ("DELETE", format!("/api/v1/pair/elevation/{op}")),
+    ] {
+        let response = app.clone().oneshot(Request::builder().method(method).uri(&path)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if method == "GET" && path.ends_with(op) { assert_eq!(value["status"], "pending"); }
+        if path.ends_with("/grant") { assert!(value["grant"].is_null()); }
+    }
+    assert!(service.grant_view_for(&client_id).is_none());
+}
+
+#[tokio::test]
+async fn remote_elevation_routes_require_auth_and_approval_routes_are_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, _) = state_with_pairing(dir.path(), true);
+    let app = remote_app(state.clone());
+    for (method, path) in [
+        ("POST", "/api/v1/pair/elevation-request"),
+        ("GET", "/api/v1/pair/elevation/unknown"),
+        ("DELETE", "/api/v1/pair/elevation/unknown"),
+        ("GET", "/api/v1/pair/grant"),
+    ] {
+        let response = app.clone().oneshot(Request::builder().method(method).uri(path)
+            .header("content-type", "application/json").body(Body::from("{}"))
+            .unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+    // Even an owner token cannot reach an approval handler through this router.
+    let owner = konsensus_api::auth::create_token(&state.identity.node_id().to_hex(),
+        &state.jwt_secret, Scope::all()).unwrap();
+    for path in [
+        "/api/v1/pair/grant", "/api/v1/pair/elevation/unknown",
+        "/api/v1/pair/elevation/unknown/grant", "/api/v1/pair/approve",
+        "/api/v1/pair/first-contact-grant", "/api/v1/pair/relation-intent",
+        "/api/v1/pair/device-key/request", "/api/v1/identity/approve-replacement",
+    ] {
+        let (status, _) = post(&app, path, serde_json::json!({}), Some(&owner)).await;
+        assert!(matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED), "{path}: {status}");
+    }
+}

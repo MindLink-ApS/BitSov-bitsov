@@ -192,7 +192,7 @@ async fn a_confirmation_must_fit_the_budget_grant() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn no_budget_grant_means_no_confirmation_and_no_quote() {
+async fn no_budget_grant_means_no_first_contact_confirmation() {
     let s = stranger(2000).await;
     let read = s.fx.token().await;
     let (status, _) = s.fx.call("POST", "/api/v1/pair/first-contact-grant",
@@ -250,7 +250,7 @@ async fn the_door_quote_is_the_invoice_the_send_pays() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_quote_needs_a_live_budget_grant() {
+async fn a_quote_rejects_a_stale_token_after_grant_revocation() {
     let s = stranger(2000).await;
     let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
     s.fx.service.revoke_grants(Some(&s.fx.client_id)).unwrap();
@@ -393,4 +393,28 @@ async fn owner_socket_first_contact_checks_tuple_and_consumes_once() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     stop.send(true).unwrap();
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn read_receive_pairing_can_quote_without_a_grant_or_reservation() {
+    let mut s = stranger(2000).await;
+    let token = s.fx.token().await;
+    s.fx.state = Arc::new(AppState {
+        rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::with_window(
+            1, std::time::Duration::from_secs(60))),
+        ..(*s.fx.state).clone()
+    });
+    let body = json!({"recipient": s.peer.to_hex()});
+    let (status, quote) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
+        Some(body.clone()), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{quote}");
+    assert_eq!(quote["total_msat"], 14_000); // 2,000 + 2,000 + two 5,000 routing ceilings
+    assert_eq!(s.spent().await, 0);
+    assert_eq!(s.fx.used(), 0);
+    assert!(s.fx.service.grant_view_for(&s.fx.client_id).is_none());
+    assert!(!s.fx.state.session_manager.has_session(&s.peer).await);
+    let (status, _) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
+        Some(body), Some(&token)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(s.spent().await, 0);
 }

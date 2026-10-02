@@ -2258,15 +2258,13 @@ pub struct FirstContactQuoteResponse {
 /// target for its signed admission quote (F1's bounded payment preparation),
 /// validates it exactly as a send would, and remembers it for up to 60 s so
 /// the confirmed send pays this very invoice. Pays nothing and reserves
-/// nothing. Needs `spend`; a paired client also needs a live budget grant.
+/// nothing and creates no obligation. Needs only `read`; HTTP and recipient
+/// quote rate limits still apply. Sending separately requires spend authority.
 pub(super) async fn first_contact_quote(
-    auth: MeteredSpend,
+    _auth: crate::auth::scoped::ScopedAuth<crate::auth::scoped::Read>,
     State(state): State<Arc<AppState>>,
     Json(req): Json<FirstContactQuoteRequest>,
 ) -> Result<Json<FirstContactQuoteResponse>, ApiError> {
-    if !auth.has_live_grant(&state) {
-        return Err(ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::NoGrant));
-    }
     let peer_id = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
     if !state.transport.is_connected(&peer_id).await {
