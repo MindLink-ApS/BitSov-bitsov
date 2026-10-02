@@ -27,7 +27,7 @@ merged. No tag or publication is part of this preparation.
 - Isolated owner-token test probes (#177); argued design anchor `docs/DESIGN-REASONING.md` (#159), without treating proposals as shipped code.
 
 ### App and operator compatibility
-- Tokens without an `scp` (scope) claim are rejected (#73): rc7-era sessions/tokens fail after upgrade. Re-pair the app or re-login to mint new scoped tokens.
+- Tokens without an `scp` (scope) claim are rejected (`401`, #73): rc7-era sessions/tokens fail after upgrade. Re-login via `POST /api/v1/auth/local` or re-pairing restores only `read` + `receive`, not rc7's full loopback authority. With those scopes, pay/compose/file sends, channel and on-chain operations, peer administration and live identity routes return `403` (`token lacks required scope`). Sends require pairing plus an owner `spend` grant, or the Ed25519 key-proof `POST /api/v1/auth/token`; only that key-proof endpoint mints full scopes. `admin`, `identity` and `credential` are not grantable to a pairing; admin and live identity routes remain unavailable to it. Do not keep retrying a cached rc7 token.
 - Live `POST /api/v1/identity/restore` is removed (`404`); restore exists only on the bootstrap router before identity exists (#77). Live replacement requires the owner-control workflow.
 - `POST /api/v1/identity/verify-mnemonic` now requires `passphrase` when the node has a BIP-39 passphrase configured; omission returns `400` (#164).
 - Uploaded file IDs are now temporary `stage-*` IDs, not persistent upload UUIDs (#83). Treat IDs as opaque; staging expires after five minutes, restart or paired-grant expiry/revocation, and is consumed once claimed by a send even on error/cancellation. Keep local bytes; never automatically retry an unresolved paid send.

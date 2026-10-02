@@ -317,8 +317,16 @@ also supports rc7. Check peer capabilities before offering new wire behavior;
 a node implementation is not a claim that a matching app screen has shipped.
 
 - **Scoped-token break (#73):** tokens without an `scp` (scope) claim are
-  rejected, so rc7-era sessions/tokens fail after upgrade. Re-pair the app or
-  re-login to mint new scoped tokens; discard cached rc7 tokens.
+  rejected (`401`), so rc7-era sessions/tokens fail after upgrade. Re-login via
+  `POST /api/v1/auth/local` or re-pairing restores only `read` + `receive`, not
+  rc7's full loopback authority. With those scopes, message/compose and file
+  sends, pay/keysend, channel and on-chain operations, peer administration and
+  live identity routes return `403` (`token lacks required scope`). Apps that
+  sent over a loopback token must pair and obtain an owner `spend` grant, or use
+  the Ed25519 key-proof `POST /api/v1/auth/token`. Only that key-proof endpoint
+  mints full scopes: `admin`, `identity` and `credential` are not grantable to a
+  pairing, and admin and live identity routes remain unavailable to it. Discard
+  cached rc7 tokens; do not keep retrying them.
 - **Restore route removed (#77):** live `POST /api/v1/identity/restore` returns
   `404`. Restore exists only on the bootstrap router before identity exists.
   Move first-run restore into that bootstrap flow; live replacement uses the
