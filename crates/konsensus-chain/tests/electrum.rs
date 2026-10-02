@@ -41,7 +41,6 @@ fn plaintext_is_restricted_without_resolving_hostnames() {
         "[::1]",
         "[fd12::1]",
         "[::ffff:192.168.1.1]",
-        "server.onion",
     ] {
         config(&format!("tcp://{host}:50001"));
     }
@@ -73,6 +72,22 @@ fn plaintext_is_restricted_without_resolving_hostnames() {
             serde_json::from_value::<ElectrumConfig>(json!({"server_url":url})).is_err(),
             "accepted {url}"
         );
+    }
+}
+
+#[test]
+fn onion_servers_are_rejected_without_a_proxy_setting() {
+    for scheme in ["tcp", "ssl"] {
+        for host in ["server.onion", "SERVER.ONION", "server.OnIoN"] {
+            let url = format!("{scheme}://{host}:50001");
+            let error = serde_json::from_value::<ElectrumConfig>(json!({"server_url":url}))
+                .expect_err(&format!("accepted {url}"));
+            assert_eq!(
+                error.to_string(),
+                "Tor/.onion Electrum servers are not supported yet: no proxy setting",
+                "{url}"
+            );
+        }
     }
 }
 
