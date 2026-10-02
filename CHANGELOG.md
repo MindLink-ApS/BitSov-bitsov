@@ -20,13 +20,18 @@ merged. No tag or publication is part of this preparation.
 - Owner-scoped paid peer-exchange quotes and kind-903 redemption; off by default; no unpaid discovery or automatic buyer (#170).
 - Disk reserve/admission guard (2 GiB default) and `STATE_GENERATION` 1 with startup lease; not backup freshness proof (#169).
 - Explicit file-authenticated Bitcoin Core chain source for chain reads and LDK (#175); explicit Electrum source and `operator` declaration (#180). No public Esplora fallback for either; `.onion` Electrum rejected (#182).
-- `chain_view.trust_level`: `own_node` replaces `trustless`; nullable `chain_sync` diagnoses observed LDK sync stalls, not readiness (#179).
+- `chain_view.trust_level`: `own_node` labels a configured Bitcoin Core / declared-own Electrum source; nullable `chain_sync` diagnoses observed LDK sync stalls, not readiness (#179). The interim `trustless` value existed only on `main` between #175 and #179, never on the rc7 tag.
 - Read-scoped balance breakdown in sats alongside unchanged `balance_msat`; omitted categories mean unknown and categories may overlap (#178).
 - Optional `fee_paid_msat` on payment and compose results: actual settled outgoing LDK routing fees when known; never substitute the authorization ceiling (#184).
 - BIP-39 passphrase-aware mnemonic verification (#164); zeroizing mnemonic requests and seed/key material, including vendored X25519 support (#174).
 - Isolated owner-token test probes (#177); argued design anchor `docs/DESIGN-REASONING.md` (#159), without treating proposals as shipped code.
 
 ### App and operator compatibility
+- Tokens without an `scp` (scope) claim are rejected (#73): rc7-era sessions/tokens fail after upgrade. Re-pair the app or re-login to mint new scoped tokens.
+- Live `POST /api/v1/identity/restore` is removed (`404`); restore exists only on the bootstrap router before identity exists (#77). Live replacement requires the owner-control workflow.
+- `POST /api/v1/identity/verify-mnemonic` now requires `passphrase` when the node has a BIP-39 passphrase configured; omission returns `400` (#164).
+- Uploaded file IDs are now temporary `stage-*` IDs, not persistent upload UUIDs (#83). Treat IDs as opaque; staging expires after five minutes, restart or paired-grant expiry/revocation, and is consumed once claimed by a send even on error/cancellation. Keep local bytes; never automatically retry an unresolved paid send.
+- `POST /api/v1/peers/:node_id/discover` now returns `400` for authorized, valid-node requests; its old `requested`/`note` success fields are gone (#170). Disable unpaid discovery; this cut has no HTTP buyer replacement.
 - **Esplora remains the default unless the owner configures bitcoind/electrum.** New chain keys: Core `rpc_host`, `rpc_port`, `cookie_file` or `rpc_user` + `rpc_password_file`; Electrum `server_url`, `operator` (default `third_party`). `own` is a declaration, not proven ownership or validation.
 - New disk, privacy, remote-access, routing-fee, liquidity, sponsor, identity, endpoint and call config keys/defaults are inventoried in [UPGRADING](docs/UPGRADING.md#new-config-keys-and-changed-defaults-since-rc7).
 - App decoders must handle `own_node`, nullable `chain_sync`, optional `fee_paid_msat`, disk/status fields, and optional balance fields `onchain_spendable_sats`, `onchain_total_sats`, `anchor_reserve_sats`, `lightning_spendable_sats`, `closing_sats`, `contested_sats`. Missing fees/balances mean unknown, not zero; null sync is not ready.

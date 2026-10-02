@@ -316,6 +316,21 @@ Accept additive response fields and tolerate absent optional fields when an app
 also supports rc7. Check peer capabilities before offering new wire behavior;
 a node implementation is not a claim that a matching app screen has shipped.
 
+- **Scoped-token break (#73):** tokens without an `scp` (scope) claim are
+  rejected, so rc7-era sessions/tokens fail after upgrade. Re-pair the app or
+  re-login to mint new scoped tokens; discard cached rc7 tokens.
+- **Restore route removed (#77):** live `POST /api/v1/identity/restore` returns
+  `404`. Restore exists only on the bootstrap router before identity exists.
+  Move first-run restore into that bootstrap flow; live replacement uses the
+  owner-control workflow described in [pairing](security/pairing.md#live-identity-replacement-binds-five-fields).
+- **Mnemonic verification (#164):** `POST /api/v1/identity/verify-mnemonic`
+  now returns `400` if `passphrase` is omitted while the node has a BIP-39
+  passphrase configured. Prompt for and submit the recovery passphrase.
+- **Upload IDs and lifetime (#83):** `POST /api/v1/files` now returns opaque
+  `stage-*` IDs rather than persistent upload UUIDs. Upload staging expires after
+  five minutes and is lost on restart or paired-grant expiry/revocation. Once
+  claimed by a send, it is consumed even on error/cancellation. Keep local bytes
+  for re-upload; do not infer permission to retry an unresolved paid send.
 - **Balance (#178):** read-scoped `GET /api/v1/payments/balance` retains
   `balance_msat` unchanged and adds flat optional satoshi fields
   `onchain_spendable_sats`, `onchain_total_sats`, `anchor_reserve_sats`,
@@ -326,9 +341,11 @@ a node implementation is not a claim that a matching app screen has shipped.
   claims are conditional; Lightning spendable is outbound capacity, not a
   guaranteed routable amount. The old aggregate is not spendable Lightning.
 - **Chain status (#175, #179, #180):** owner `/api/v1/status` adds
-  `chain_view.{backend,trust_level,host}`. Replace enum comparisons to
-  `trustless` with **`own_node`**; `third_party` is unchanged. Core reports
-  `own_node`; Electrum does so only with `operator = "own"`. These are configured
+  `chain_view.{backend,trust_level,host}`. **`own_node`** labels a configured
+  Bitcoin Core source or Electrum declared with `operator = "own"`; other
+  Electrum sources use the default `third_party`. Only apps used with `main`
+  between #175 and #179 need to replace the interim `trustless` value in enum
+  comparisons; `trustless` was never on the rc7 tag. These are configured
   ownership labels, not validation, sync, privacy, or custody guarantees.
   Nullable `chain_sync` has `state: "stalled"`, `since` (Unix seconds), and
   `last_error_kind: "sync_failed"`. It records observed LDK wallet failures,
@@ -369,8 +386,10 @@ a node implementation is not a claim that a matching app screen has shipped.
   paid request; a reply never grants admission. Card cache is memory-only.
   Update app price displays to the enforced 1-sat minimum. See [Browse](protocol/BROWSE.md).
 - **Peer exchange (#170):** old unpaid `PeerExchangeRequest` is refused with
-  `peer_exchange_requires_quote_and_payment`; the old HTTP discover endpoint
-  explicitly refuses. Use the signed quote + paid kind-903 redemption protocol
+  `peer_exchange_requires_quote_and_payment`; `POST /api/v1/peers/:node_id/discover`
+  now returns `400` for an authorized request with a valid node ID. Its former
+  `requested`/`note` success fields are gone; disable the old unpaid app flow.
+  Use the signed quote + paid kind-903 redemption protocol
   only with explicit spending authority. This cut ships the receiving service,
   not an HTTP buyer workflow or automatic discovery. Off/empty owner policy
   discloses nothing. A downgrade to the former unpaid-discovery behavior would
