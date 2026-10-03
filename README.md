@@ -100,3 +100,5 @@ CI runs the PostgreSQL tests in the separate, non-blocking
 ## License
 
 MIT
+
+For long-running nodes, use [journal-only service logging](docs/operations/LOGGING.md) to avoid an unbounded redirected `node.log`.

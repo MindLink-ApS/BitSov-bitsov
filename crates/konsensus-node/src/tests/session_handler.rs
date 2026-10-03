@@ -1216,7 +1216,7 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
 
     handle_invoice_requested_gated(
         &peer_id, "req-priv", 25_000, "konsensus message", true,
-        &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &pricing, &konsensus_chain::MockChainProvider::new(), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
         &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default(),
     ).await;
 
@@ -1239,7 +1239,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
 
     handle_invoice_requested_gated(
         &peer_id, "req-strange", 1_000_000, "konsensus message", false,
-        &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &pricing, &konsensus_chain::MockChainProvider::new(), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
         &membrane, &mut last_refusal,
     ).await;
 
@@ -1252,7 +1252,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
     for _ in 0..100 {
         handle_invoice_requested_gated(
             &peer_id, "req-strange", 1_000_000, "konsensus message", false,
-            &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &pricing, &konsensus_chain::MockChainProvider::new(), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
             &membrane, &mut last_refusal,
         ).await;
     }
@@ -1409,7 +1409,7 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
     for purpose in ["konsensus:admission:200", "konsensus:admission:100", "konsensus:admission", "arbitrary invoice"] {
         handle_invoice_requested_gated(
             &peer_id, &id, 1, purpose, false,
-            &pricing, &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut quotes,
+            &pricing, &konsensus_chain::MockChainProvider::new(), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut quotes,
             &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default(),
         ).await;
     }
@@ -1619,7 +1619,7 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
     let request_id = konsensus_core::admission_quote::request_id(&recipient, &peer,
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
     handle_invoice_requested_gated(&peer, &request_id, 1,
-        konsensus_core::admission_quote::PURPOSE, false, &admission_pricing(), &provider,
+        konsensus_core::admission_quote::PURPOSE, false, &admission_pricing(), &konsensus_chain::MockChainProvider::new(), &provider,
         &target, &recipient, "127.0.0.1".parse().unwrap(), &mut quotes, &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default()).await;
     let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await.unwrap().unwrap();
     assert!(matches!(event, ControlEvent::InvoiceErrorReceived { peer_id, request_id: id, reason, .. }
@@ -1661,7 +1661,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
             while let Some(event) = target.recv_control().await {
                 if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged, source_ip } = event {
                     handle_invoice_requested_gated(&peer_id, &request_id, amount_msat, &purpose, privileged,
-                        &admission_pricing(), &lightning, &target, &recipient, source_ip, &mut quotes, &membrane, &mut limits).await;
+                        &admission_pricing(), &konsensus_chain::MockChainProvider::new(), &lightning, &target, &recipient, source_ip, &mut quotes, &membrane, &mut limits).await;
                     handled.fetch_add(1, Ordering::Release);
                 }
             }
@@ -2147,4 +2147,210 @@ async fn recovery_announces_lightning_once_only_to_privileged_connected_peers() 
     source.shutdown();
     stranger.shutdown();
     target.shutdown();
+}
+
+struct NoInvoiceWallet;
+#[async_trait::async_trait]
+impl LightningProvider for NoInvoiceWallet {
+    async fn create_stateless_invoice(
+        &self,
+        _: u64,
+        _: &str,
+        _: u32,
+    ) -> Result<
+        konsensus_core::traits::lightning::Invoice,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        panic!("unready chain must not issue an invoice")
+    }
+    async fn create_invoice(
+        &self,
+        _: u64,
+        _: &str,
+        _: u32,
+    ) -> Result<
+        konsensus_core::traits::lightning::Invoice,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        panic!("no stateful fallback")
+    }
+    async fn pay_invoice(
+        &self,
+        _: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        panic!("no payment")
+    }
+    async fn get_payment_status(
+        &self,
+        _: &str,
+    ) -> Result<
+        konsensus_core::traits::lightning::PaymentDetails,
+        konsensus_core::traits::lightning::LightningError,
+    > {
+        panic!("no payment state")
+    }
+    async fn get_balance_msat(
+        &self,
+    ) -> Result<u64, konsensus_core::traits::lightning::LightningError> {
+        Ok(0)
+    }
+    async fn is_available(&self) -> bool {
+        true
+    }
+}
+
+// No sockets: exercise the same preparation path used by the inbound handler.
+#[tokio::test(start_paused = true)]
+async fn unavailable_admission_quote_is_prompt_and_creates_no_payment() {
+    use konsensus_core::traits::chain::{BlockHeader, ChainError, FeeEstimate, TrustLevel};
+    struct Chain {
+        mode: u8,
+    }
+    #[async_trait::async_trait]
+    impl ChainProvider for Chain {
+        fn trust_level(&self) -> TrustLevel {
+            TrustLevel::ServerTrust
+        }
+        async fn get_block_height(&self) -> Result<u64, ChainError> {
+            match self.mode {
+                0 => Err(ChainError::Backend("private backend detail".into())),
+                2 => std::future::pending().await,
+                _ => Ok(900_000),
+            }
+        }
+        async fn is_synced(&self) -> bool {
+            false
+        }
+        async fn get_block_header(&self, _: u64) -> Result<BlockHeader, ChainError> {
+            unreachable!()
+        }
+        async fn estimate_fee(&self, _: u32) -> Result<FeeEstimate, ChainError> {
+            unreachable!()
+        }
+        async fn is_tx_confirmed(&self, _: &str, _: u32) -> Result<bool, ChainError> {
+            unreachable!()
+        }
+    }
+    for (mode, reason) in [
+        (0, "konsensus:not_ready:chain_unavailable"),
+        (1, "konsensus:not_ready:not_synced"),
+        (2, "konsensus:not_ready:chain_unavailable"),
+    ] {
+        let lightning = NoInvoiceWallet;
+        let start = tokio::time::Instant::now();
+        let result = prepare_admission_invoice(
+            admission_pricing().as_ref(),
+            &Chain { mode },
+            &lightning,
+            "test-request",
+            u64::MAX,
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), reason);
+        assert!(start.elapsed() <= std::time::Duration::from_secs(5));
+    }
+}
+
+#[tokio::test]
+async fn not_ready_refusal_only_finishes_the_bound_recipients_request() {
+    let recipient = NodeId::from_bytes([41; 32]);
+    let requester = NodeId::from_bytes([42; 32]);
+    let wrong = NodeId::from_bytes([43; 32]);
+    for reason in [
+        "konsensus:not_ready:chain_unavailable",
+        "konsensus:not_ready:not_synced",
+    ] {
+        let id = konsensus_core::admission_quote::request_id(&recipient, &requester, 100);
+        let binding = konsensus_api::invoice_refusal::bind(&id, recipient);
+        let map = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
+        map.lock().await.insert(id.clone(), tx);
+        for privileged in [false, true] {
+            handle_invoice_error_received(&wrong, &id, reason, privileged, &map).await;
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        handle_invoice_error_received(&recipient, &id, reason, false, &map).await;
+        let error = rx.try_recv().unwrap().unwrap_err();
+        assert_eq!(error.reason, reason);
+        assert_eq!(error.recipient, recipient);
+        assert!(map.lock().await.is_empty());
+        drop(binding);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_backend_readiness_race_and_timeout_return_fixed_refusals() {
+    use konsensus_core::traits::lightning::{Invoice, LightningError, PaymentDetails};
+    struct Wallet(bool);
+    #[async_trait::async_trait]
+    impl LightningProvider for Wallet {
+        async fn create_stateless_invoice(
+            &self,
+            _: u64,
+            _: &str,
+            _: u32,
+        ) -> Result<Invoice, LightningError> {
+            if self.0 {
+                std::future::pending().await
+            } else {
+                Err(LightningError::NotReady)
+            }
+        }
+        async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
+            panic!("no stateful fallback")
+        }
+        async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+            panic!("no payment")
+        }
+        async fn get_payment_status(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+            panic!("no payment state")
+        }
+        async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+            Ok(0)
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+    for (hang, reason) in [
+        (false, "konsensus:not_ready:not_synced"),
+        (true, "konsensus:invoice_unavailable"),
+    ] {
+        let start = tokio::time::Instant::now();
+        let result = prepare_admission_invoice(
+            admission_pricing().as_ref(),
+            &konsensus_chain::MockChainProvider::new(),
+            &Wallet(hang),
+            "test-request",
+            u64::MAX,
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), reason);
+        assert!(start.elapsed() <= std::time::Duration::from_secs(5));
+    }
+}
+
+#[tokio::test]
+async fn ready_admission_preparation_preserves_signed_stateless_quote() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(
+        &dir.path().join("wallet.sqlite"), "recipient", 0).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let (invoice, amount, description) = prepare_admission_invoice(
+        admission_pricing().as_ref(), &konsensus_chain::MockChainProvider::new(),
+        &wallet, "test-request", now + 60).await.unwrap();
+    let signed = invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
+    assert_eq!(signed.amount_milli_satoshis(), Some(amount));
+    assert_eq!(signed.description().to_string(), description);
+    assert_eq!(signed.payment_hash().to_string(), invoice.payment_hash);
+    assert!(signed.expires_at().unwrap().as_secs() <= now + 60);
+    assert_eq!(signed.recover_payee_pub_key().to_string(), wallet.get_node_pubkey().await.unwrap());
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+    assert_eq!(wallet.get_balance_msat().await.unwrap(), 0);
 }
