@@ -45,6 +45,18 @@ pub trait PricingEngine: Send + Sync {
     /// Returns `Err(PricingError::NotPriceable)` for unsupported/deferred kinds.
     async fn get_price_msat(&self, kind: u16) -> Result<u64, PricingError>;
 
+    /// Price using a successful, bounded-age height observation from the same
+    /// chain provider. Admission readiness can share its lookup with pricing.
+    /// Preserve the original observation time when reporting data freshness.
+    async fn get_price_msat_with_chain_height(
+        &self,
+        kind: u16,
+        _height: u64,
+        _observed_at: std::time::Instant,
+    ) -> Result<u64, PricingError> {
+        self.get_price_msat(kind).await
+    }
+
     /// Get the price for a kind category (bulk pricing lookup).
     async fn get_category_price_msat(&self, category: KindCategory) -> Result<u64, PricingError>;
 

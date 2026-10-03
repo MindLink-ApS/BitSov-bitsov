@@ -285,11 +285,30 @@ impl ChainProvider for ElectrumProvider {
         // Like Esplora, this means a tip is available, not proof of freshness.
         self.get_block_height().await.is_ok()
     }
+
+    async fn is_synced_with_height(&self, _height: u64) -> bool {
+        // This backend defines sync as availability of a tip. The caller's
+        // successful bounded-age height read already established that.
+        true
+    }
 }
 
 #[cfg(test)]
 mod funding_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn known_height_satisfies_height_only_sync_without_another_lookup() {
+        // Deliberately unconnectable configuration: no network is needed when
+        // readiness already has a successful, bounded-age height observation.
+        let provider = ElectrumProvider {
+            config: ElectrumConfig {
+                server_url: "unsupported://no-network".into(),
+                operator: ElectrumOperator::ThirdParty,
+            },
+        };
+        assert!(provider.is_synced_with_height(900_000).await);
+    }
 
     #[test]
     fn returned_funding_is_present_without_a_confirmation_query() {
