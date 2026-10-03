@@ -390,8 +390,14 @@ async fn bearer_ldk_live_refresh_failure_falls_back_without_auth() {
     assert_eq!(client.get_height().await.unwrap(), 900000);
     tokio::time::advance(Duration::from_secs(270)).await;
     assert_eq!(client.clone().get_height().await.unwrap(), 900001);
+    let started = Instant::now();
+    for _ in 0..8 {
+        assert_eq!(client.clone().get_height().await.unwrap(), 900001);
+    }
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(wire.tokens.load(SeqCst), 2);
     assert_eq!(wire.primary.load(SeqCst), 1);
-    assert_eq!(wire.fallback.load(SeqCst), 1);
+    assert_eq!(wire.fallback.load(SeqCst), 9);
     assert_eq!(failover.active_host().as_deref(), Some("fallback.invalid"));
 }
 
@@ -546,4 +552,257 @@ async fn bearer_chain_provider_sends_header_and_reports_third_party_host() {
     assert_eq!(wire.api_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(provider.chain_view().host.as_deref(), Some("api.invalid"));
     assert_eq!(provider.chain_view().trust_level, "third_party");
+}
+
+#[tokio::test]
+async fn bearer_provider_preserves_configured_request_budgets() {
+    use konsensus_core::traits::chain::{ChainProvider, TrustLevel};
+    #[derive(Debug)]
+    struct Budgets(u64);
+    impl HttpTransport for Budgets {
+        fn execute(
+            &self,
+            request: RequestBuilder,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Response, esplora_client::Error>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let request = request.build().unwrap();
+                let (seconds, body) = match request.url().path() {
+                    "/token" => (4, TOKEN),
+                    "/api/blocks/tip/height" => (4, "900000"),
+                    "/api/fee-estimates" => (self.0, r#"{"6":2.0}"#),
+                    _ => panic!("unexpected request"),
+                };
+                assert_eq!(request.timeout(), Some(&Duration::from_secs(seconds)));
+                Ok(http::Response::builder().body(body).unwrap().into())
+            })
+        }
+    }
+    for seconds in [30, 17] {
+        let mut config = crate::EsploraConfig::custom(
+            "https://budgets.invalid/api".into(),
+            TrustLevel::ServerTrust,
+        );
+        config.timeout_secs = seconds;
+        let provider = crate::EsploraProvider::new(config)
+            .unwrap()
+            .with_bearer(auth_with_wire(Arc::new(Budgets(seconds))))
+            .unwrap();
+        assert_eq!(provider.get_block_height().await.unwrap(), 900000);
+        provider.estimate_fee(6).await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn bearer_failed_token_posts_are_coalesced_during_backoff() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for reply in [(503, "private-secret"), (200, "private-token")] {
+        let (auth, wire) = fixture(vec![reply; 9]);
+        let started = Instant::now();
+        assert!(auth.header(None).await.is_err());
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let auth = auth.clone();
+            tasks.spawn(async move {
+                assert!(auth.header(None).await.is_err());
+            });
+        }
+        while let Some(task) = tasks.join_next().await {
+            task.unwrap();
+        }
+        assert_eq!(wire.token_calls.load(SeqCst), 1);
+        assert_eq!(started.elapsed(), Duration::ZERO, "cooldown must not sleep");
+        // The retry window is short and bounded, even after repeated failures.
+        for expected in 2..=5 {
+            tokio::time::advance(Duration::from_secs(3)).await;
+            assert!(auth.header(None).await.is_err());
+            assert_eq!(wire.token_calls.load(SeqCst), expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn bearer_failover_preserves_upstream_status_without_error_body() {
+    for status in [400, 401, 403, 500, 502] {
+        for fallback in [false, true] {
+            let mut replies = vec![(200, TOKEN), (status, "private-token")];
+            if status == 401 {
+                replies.extend([(200, TOKEN), (401, "private-secret")]);
+            }
+            if fallback {
+                replies.push((504, "private-token private-secret"));
+            }
+            let (auth, _) = fixture(replies);
+            let transport = BearerFailover::new(
+                auth,
+                "https://status.invalid/api",
+                if fallback {
+                    vec!["https://fallback-status.invalid/api".into()]
+                } else {
+                    vec![]
+                },
+            )
+            .unwrap();
+            let error = transport
+                .execute(
+                    Client::new()
+                        .post("https://status.invalid/api/tx")
+                        .body("transaction"),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, esplora_client::Error::HttpResponse { status: actual, .. } if actual == status)
+            );
+            assert!(!format!("{error:?} {error}").contains("private-"));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn bearer_backoff_expires_and_success_restores_cached_token() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (auth, wire) = fixture(vec![(503, "private-secret"), (200, TOKEN), (200, "900000")]);
+    assert!(auth.header(None).await.is_err());
+    let delay = auth.token.lock().await.retry_at.unwrap() - Instant::now();
+    assert!((Duration::from_secs(1)..=Duration::from_secs(3)).contains(&delay));
+    tokio::time::advance(delay - Duration::from_nanos(1)).await;
+    assert!(auth.header(None).await.is_err());
+    assert_eq!(wire.token_calls.load(SeqCst), 1);
+    tokio::time::advance(Duration::from_nanos(1)).await;
+    auth.header(None).await.unwrap();
+    assert!(auth.token.lock().await.retry_at.is_none());
+    let transport = auth.transport("https://api.invalid/api").unwrap();
+    assert_eq!(get(&transport).await.status(), 200);
+    assert_eq!(wire.token_calls.load(SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn bearer_failed_or_cancelled_token_post_backs_off_then_retries() {
+    #[derive(Debug)]
+    struct BrokenWire(std::sync::atomic::AtomicUsize);
+    impl HttpTransport for BrokenWire {
+        fn execute(
+            &self,
+            request: RequestBuilder,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Response, esplora_client::Error>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let request = request.build().unwrap();
+                if request.url().host_str() == Some("fallback-cancel.invalid") {
+                    assert!(!request.headers().contains_key(AUTHORIZATION));
+                    return Ok(http::Response::builder().body("900000").unwrap().into());
+                }
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                Err(unavailable())
+            })
+        }
+    }
+    for cancel in [false, true] {
+        let wire = Arc::new(BrokenWire(0.into()));
+        let auth = auth_with_wire(wire.clone());
+        if cancel {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), auth.header(None))
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert!(auth.header(None).await.is_err());
+        }
+        let failed = Instant::now();
+        assert!(auth.header(None).await.is_err());
+        let transport = BearerFailover::new(
+            auth.clone(),
+            "https://cancel.invalid/api",
+            vec!["https://fallback-cancel.invalid/api".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            transport
+                .execute(Client::new().get("https://cancel.invalid/api/blocks/tip/height"))
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(failed.elapsed(), Duration::ZERO);
+        assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(if cancel { 7 } else { 3 })).await;
+        assert!(auth.header(None).await.is_err());
+        assert_eq!(wire.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn bearer_request_timeout_survives_401_retry_and_fallback() {
+    #[derive(Debug)]
+    struct Budgets(Arc<Wire>);
+    impl HttpTransport for Budgets {
+        fn execute(
+            &self,
+            request: RequestBuilder,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Response, esplora_client::Error>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let (client, request) = request.build_split();
+                let request = request.unwrap();
+                let seconds = if request.url().host_str() == Some("login.invalid") {
+                    4
+                } else {
+                    10
+                };
+                assert_eq!(request.timeout(), Some(&Duration::from_secs(seconds)));
+                self.0
+                    .execute(RequestBuilder::from_parts(client, request))
+                    .await
+            })
+        }
+    }
+    let (_, wire) = fixture(vec![
+        (200, TOKEN),
+        (401, "private-token"),
+        (200, TOKEN),
+        (403, "private-secret"),
+        (200, "900000"),
+    ]);
+    let auth = auth_with_wire(Arc::new(Budgets(wire.clone())));
+    let transport = BearerFailover::new(
+        auth,
+        "https://budgets-retry.invalid/api",
+        vec!["https://fallback-budgets.invalid/api".into()],
+    )
+    .unwrap();
+    let client: esplora_client::AsyncClient =
+        esplora_client::Builder::new("https://budgets-retry.invalid/api")
+            .timeout(10)
+            .build_async()
+            .unwrap()
+            .with_transport(transport.clone());
+    assert_eq!(client.clone().get_height().await.unwrap(), 900000);
+    assert_eq!(
+        transport.active_host().as_deref(),
+        Some("fallback-budgets.invalid")
+    );
+    assert_eq!(
+        wire.token_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(wire.api_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
 }

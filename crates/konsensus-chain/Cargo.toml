@@ -21,6 +21,7 @@ zeroize.workspace = true
 toml.workspace = true
 rustix = { version = "1", features = ["fs", "process"] }
 http = "1"
+rand.workspace = true
 
 electrum-client = { version = "0.24", default-features = false, features = ["proxy", "use-rustls-ring"] }
 

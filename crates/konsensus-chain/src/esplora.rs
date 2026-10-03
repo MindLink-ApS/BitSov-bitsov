@@ -174,7 +174,7 @@ impl EsploraProvider {
                 std::time::Duration::from_secs(self.config.timeout_secs)
             };
             let result = tokio::time::timeout(timeout, async {
-                let request = self.client.get(format!("{base}{path}"));
+                let request = self.client.get(format!("{base}{path}")).timeout(timeout);
                 let response = limiter
                     .run(false, || async {
                         match if index == 0 { self.bearer.as_ref().or(self.transport.as_ref()) } else { self.transport.as_ref() } {

@@ -1,5 +1,6 @@
 //! File-backed OAuth client credentials. Secrets and responses never enter diagnostics.
 use esplora_client::r#async::HttpTransport;
+use rand::Rng;
 use reqwest::{
     header::{HeaderValue, AUTHORIZATION},
     Client, RequestBuilder, Response,
@@ -28,11 +29,20 @@ struct Token {
     generation: u64,
 }
 
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(4);
+
+#[derive(Default)]
+struct TokenCache {
+    token: Option<Token>,
+    retry_at: Option<Instant>,
+    generation: u64,
+}
+
 /// Shared in-memory token cache; refresh is serialized across concurrent requests.
 pub struct BearerAuth {
     credentials: Credentials,
     client: Client,
-    token: Mutex<Option<Token>>,
+    token: Mutex<TokenCache>,
     #[cfg(test)]
     wire: Option<Arc<dyn HttpTransport>>,
 }
@@ -102,13 +112,12 @@ impl BearerAuth {
             }
             let client = Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(4))
                 .build()
                 .map_err(|_| CredentialsError("cannot build chain authentication client"))?;
             Ok(Arc::new(Self {
                 credentials,
                 client,
-                token: Mutex::new(None),
+                token: Mutex::new(TokenCache::default()),
                 #[cfg(test)]
                 wire: None,
             }))
@@ -135,22 +144,50 @@ impl BearerAuth {
         rejected_generation: Option<u64>,
     ) -> Result<(HeaderValue, u64), esplora_client::Error> {
         let mut cached = self.token.lock().await;
-        if let Some(token) = cached.as_ref() {
+        if let Some(token) = cached.token.as_ref() {
             if Instant::now() < token.refresh_at && rejected_generation != Some(token.generation) {
                 return Ok((token.header.clone(), token.generation));
             }
         }
-        let generation = cached.as_ref().map_or(1, |t| t.generation + 1);
+        if cached.retry_at.is_some_and(|until| Instant::now() < until) {
+            return Err(unavailable());
+        }
         // A failed refresh must never cause reuse of a rejected/expiring token.
-        *cached = None;
+        cached.token = None;
+        let backoff = Duration::from_millis(rand::thread_rng().gen_range(1_000..=3_000));
+        // Also cover cancellation while the POST/body is in flight. Waiters never
+        // sleep through a cooldown: they immediately take the caller's fallback.
+        cached.retry_at = Some(Instant::now() + TOKEN_TIMEOUT + backoff);
+        let generation = cached.generation + 1;
+        match self.fetch_token(generation).await {
+            Ok(token) => {
+                let header = token.header.clone();
+                cached.token = Some(token);
+                cached.generation = generation;
+                cached.retry_at = None;
+                Ok((header, generation))
+            }
+            Err(error) => {
+                cached.retry_at = Some(Instant::now() + backoff);
+                Err(error)
+            }
+        }
+    }
+
+    async fn fetch_token(&self, generation: u64) -> Result<Token, esplora_client::Error> {
         let started = Instant::now();
         let response = self
-            .send(self.client.post(&self.credentials.token_url).form(&[
-                ("client_id", self.credentials.client_id.as_str()),
-                ("client_secret", self.credentials.client_secret.as_str()),
-                ("grant_type", "client_credentials"),
-                ("scope", "openid"),
-            ]))
+            .send(
+                self.client
+                    .post(&self.credentials.token_url)
+                    .timeout(TOKEN_TIMEOUT)
+                    .form(&[
+                        ("client_id", self.credentials.client_id.as_str()),
+                        ("client_secret", self.credentials.client_secret.as_str()),
+                        ("grant_type", "client_credentials"),
+                        ("scope", "openid"),
+                    ]),
+            )
             .await
             .map_err(|_| unavailable())?;
         if !response.status().is_success() {
@@ -179,12 +216,11 @@ impl BearerAuth {
         if refresh_at <= Instant::now() {
             return Err(unavailable());
         }
-        *cached = Some(Token {
-            header: header.clone(),
+        Ok(Token {
+            header,
             refresh_at,
             generation,
-        });
-        Ok((header, generation))
+        })
     }
 
     /// Attach live credentials only to this explicit source. Redirects are never followed.
@@ -379,6 +415,9 @@ impl HttpTransport for BearerFailover {
                 .ok_or_else(unavailable)?;
             let broadcast = request.method() == reqwest::Method::POST;
             let mut rate_limited = false;
+            // Prefer the primary's HTTP status if all endpoints fail. Never retain
+            // response bodies or transport errors, which may contain credentials.
+            let mut upstream_status = None;
             for (index, (endpoint, limiter)) in self.endpoints.iter().enumerate() {
                 if broadcast
                     && !limiter.retry_delay().is_zero()
@@ -437,6 +476,9 @@ impl HttpTransport for BearerFailover {
                     Err(esplora_client::Error::HttpResponse { status: 429, .. }) => {
                         rate_limited = true
                     }
+                    Ok(response) => {
+                        upstream_status.get_or_insert(response.status().as_u16());
+                    }
                     _ => {}
                 }
             }
@@ -446,6 +488,11 @@ impl HttpTransport for BearerFailover {
                 Err(esplora_client::Error::HttpResponse {
                     status: 429,
                     message: "chain source rate limited".into(),
+                })
+            } else if let Some(status) = upstream_status {
+                Err(esplora_client::Error::HttpResponse {
+                    status,
+                    message: "chain source request failed".into(),
                 })
             } else {
                 Err(unavailable())

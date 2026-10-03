@@ -227,7 +227,11 @@ token on its next request. A 401 forces one refresh and one retry. Concurrent
 requests share the cache within each client and coalesce refreshes. The vendored
 LDK transport applies live headers to wallet sync, fees, funding checks and
 broadcasts, including client clones; it does not require a restart every five
-minutes. Authentication errors and HTTP error bodies are redacted.
+minutes. Token POSTs have a four-second timeout; API requests retain the caller's
+budget (ten seconds for LDK and the configured timeout for the chain provider,
+with the existing shorter height/readiness deadline). Authentication errors and
+HTTP error bodies are redacted. If all endpoints fail, LDK retains the primary's
+HTTP status when available; rate-limit failures keep their existing 429 policy.
 
 Chain requests use the existing ordered fallback list when token acquisition,
 refresh, or API requests fail, and report the endpoint that actually supplied
@@ -236,7 +240,10 @@ startup and after startup (including a failed token refresh). The live transport
 logs source changes with `third_party` and the host only, and retains each
 endpoint's shared rate limiter. If every source fails, wallet synchronization
 reports failure and readiness expires under the existing health policy. Neither
-client sends an expired token after a refresh failure.
+client sends an expired token after a refresh failure. Failed token fetches share
+a randomized one-to-three-second cooldown within the client. Requests arriving
+during that cooldown go directly to the fallback list without another token POST
+or a cooldown sleep; successful token acquisition clears the cooldown.
 
 The loopback mock-server test is intentionally ignored in the socket-restricted
 build environment. Run it on a host allowing sockets:
