@@ -423,6 +423,9 @@ pub enum LightningConfig {
         /// never imposed on an existing configuration.
         #[serde(default)]
         esplora_url_fallback: Option<String>,
+        /// Owner-only OAuth client credentials for the primary Esplora source.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credentials_file: Option<PathBuf>,
         /// Optional RapidGossipSync server URL for faster network graph sync.
         #[serde(default)]
         rgs_url: Option<String>,
@@ -528,6 +531,9 @@ pub enum ChainConfig {
         /// LDK field above for why).
         #[serde(default, alias = "api_url_fallback")]
         esplora_url_fallback: Option<String>,
+        /// Owner-only OAuth client credentials for the primary Esplora source.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credentials_file: Option<PathBuf>,
     },
     /// Mock provider — static block data, no network calls.
     /// For testnet, development, and offline operation.
@@ -576,6 +582,7 @@ impl Default for ChainConfig {
         Self::Esplora {
             api_url: FRESH_CHAIN_PRIMARY.to_string(),
             esplora_url_fallback: Some(FRESH_CHAIN_FALLBACK.to_string()),
+            credentials_file: None,
         }
     }
 }
@@ -1536,6 +1543,7 @@ impl NodeConfig {
                     // the serde defaults above stay on the legacy provider.
                     esplora_url: FRESH_LDK_PRIMARY.to_string(),
                     esplora_url_fallback: Some(FRESH_LDK_FALLBACK.to_string()),
+                    credentials_file: None,
                     rgs_url: None,
                     lsp_node_id: None,
                     lsp_address: None,

@@ -176,3 +176,71 @@ Your own Core removes that explorer query disclosure; it does not hide Bitcoin
 P2P traffic or make Lightning anonymous. Chain host details appear only in
 owner status, not public health. Chain selection changes no identities, contacts,
 payment admission rules or custody arrangement.
+
+## Optional authenticated Esplora (OAuth client credentials)
+
+A paid or private Esplora API can be selected explicitly. It remains a
+`third_party` chain source: paying for access does not provide local validation.
+Status shows the active chain source's hostname only. No paid provider or
+credentials are enabled by default, and configurations without `credentials_file`
+keep their existing behavior.
+
+Example for Blockstream Explorer API:
+
+```toml
+[chain]
+backend = "esplora"
+api_url = "https://enterprise.blockstream.info/api"
+credentials_file = "/home/bitsov/secrets/chain-api.toml"
+# Optional: use an Esplora endpoint you have chosen as the fallback.
+api_url_fallback = "https://your-fallback.example/api"
+
+[lightning]
+backend = "ldk"
+network = "bitcoin"
+esplora_url = "https://enterprise.blockstream.info/api"
+credentials_file = "/home/bitsov/secrets/chain-api.toml"
+esplora_url_fallback = "https://your-fallback.example/api"
+```
+
+The credentials file is separate TOML (these are placeholders, not real keys):
+
+```toml
+token_url = "https://login.blockstream.com/realms/blockstream-public/protocol/openid-connect/token"
+client_id = "YOUR_CLIENT_ID"
+client_secret = "YOUR_CLIENT_SECRET"
+```
+
+Create it privately, owned by the account running BitSov, with **exactly mode
+0600** (`chmod 600 /home/bitsov/secrets/chain-api.toml`). Startup refuses insecure
+permissions, another owner's file, symlinks, directories, or malformed contents.
+Use HTTPS URLs without userinfo, query parameters or fragments. Redirects are
+not followed. Keep secrets out of the node config, URLs and command arguments.
+Each stanza's credentials apply only to that stanza's primary endpoint; fallback
+requests never receive those credentials. Restart after replacing the file.
+
+The token request POSTs `client_id`, `client_secret`,
+`grant_type=client_credentials`, and `scope=openid` as form fields. Tokens remain
+in memory. A request refreshes the token when it enters its refresh window
+(30 seconds before expiry for a 300-second token); an idle node fetches a fresh
+token on its next request. A 401 forces one refresh and one retry. Concurrent
+requests share the cache within each client and coalesce refreshes. The vendored
+LDK transport applies live headers to wallet sync, fees, funding checks and
+broadcasts, including client clones; it does not require a restart every five
+minutes. Authentication errors and HTTP error bodies are redacted.
+
+Chain requests use the existing ordered fallback list when token acquisition,
+refresh, or API requests fail, and report the endpoint that actually supplied
+the data. Authenticated LDK sources use the configured LDK fallback both during
+startup and after startup (including a failed token refresh). The live transport
+logs source changes with `third_party` and the host only, and retains each
+endpoint's shared rate limiter. If every source fails, wallet synchronization
+reports failure and readiness expires under the existing health policy. Neither
+client sends an expired token after a refresh failure.
+
+The loopback mock-server test is intentionally ignored in the socket-restricted
+build environment. Run it on a host allowing sockets:
+
+```sh
+cargo test -p konsensus-chain bearer_mock_server -- --ignored
+```

@@ -32,6 +32,7 @@ use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{BuildError, Error, NodeMetrics};
 
 pub(super) struct EsploraChainSource {
+    live_transport: Option<Arc<dyn esplora_client::r#async::HttpTransport>>,
 	pub(super) sync_config: EsploraSyncConfig,
 	esplora_client: EsploraAsyncClient,
 	rate_limit: Arc<super::rate_limit::RateLimitedTransport>,
@@ -81,6 +82,7 @@ impl EsploraChainSource {
 		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		Ok(Self {
+            live_transport: None,
 			sync_config,
 			esplora_client,
 			rate_limit,
@@ -95,11 +97,20 @@ impl EsploraChainSource {
 		})
 	}
 
+    pub(super) fn set_transport(&mut self, transport: Arc<dyn esplora_client::r#async::HttpTransport>) {
+        self.live_transport = Some(transport.clone());
+        self.esplora_client = self.esplora_client.clone().with_transport(transport);
+        self.tx_sync = Arc::new(EsploraSyncClient::from_client(self.esplora_client.clone(), self.logger.clone()));
+    }
+
     pub(super) fn rate_limit_failure(&self) -> Option<super::sync_health::ChainSyncFailure> {
-        self.rate_limit.failure()
+        match &self.live_transport {
+            Some(transport) => transport.rate_limit_failure(),
+            None => self.rate_limit.failure(),
+        }
     }
     fn classify<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
-        result.map_err(|error| if self.rate_limit.failure().is_some() { Error::ChainRateLimited } else { error })
+        result.map_err(|error| if self.rate_limit_failure().is_some() { Error::ChainRateLimited } else { error })
     }
 
 	pub(super) async fn sync_onchain_wallet(
@@ -299,7 +310,7 @@ impl EsploraChainSource {
 		})?
 		.map_err(|e| {
 			log_error!(self.logger, "Failed to retrieve fee rate estimates: {}", e);
-			if self.rate_limit.failure().is_some() { Error::ChainRateLimited } else { Error::FeerateEstimationUpdateFailed }
+			if self.rate_limit_failure().is_some() { Error::ChainRateLimited } else { Error::FeerateEstimationUpdateFailed }
 		})?;
 
 		if estimates.is_empty() && self.config.network == Network::Bitcoin {
@@ -375,7 +386,7 @@ impl EsploraChainSource {
         loop {
             // A single bounded wait, never extended by another package or GET.
             // The transport admits the following POST as its own recovery probe.
-            let delay = self.rate_limit.retry_delay().min(Duration::from_secs(300));
+            let delay = self.live_transport.as_ref().map_or_else(|| self.rate_limit.retry_delay(), |t| t.retry_delay()).min(Duration::from_secs(300));
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
@@ -579,6 +590,33 @@ mod bitsov_http_rate_tests {
         source.tx_sync = Arc::new(EsploraSyncClient::from_client(source.esplora_client.clone(), node.logger.clone()));
         (dir, node, source, fixture)
     }
+    #[tokio::test]
+    async fn live_transport_builder_reaches_fee_client_and_redacts_decode_logs() {
+        #[derive(Debug)]
+        struct Live;
+        impl HttpTransport for Live {
+            fn redact_errors(&self) -> bool { true }
+            fn execute(&self, request: reqwest::RequestBuilder) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<reqwest::Response, esplora_client::Error>> + Send + '_>> {
+                Box::pin(async move {
+                    assert_eq!(request.build().unwrap().url().path(), "/api/fee-estimates");
+                    Ok(http::Response::builder().status(200).body("{\"1\":\"credential-sentinel\"}").unwrap().into())
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = crate::Builder::new();
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().to_owned());
+        let log_path = dir.path().join("live.log");
+        builder.set_filesystem_logger(Some(log_path.to_str().unwrap().to_owned()), None);
+        builder.set_chain_source_esplora_with_transport("https://live.invalid/api".into(), None, Arc::new(Live));
+        let node = builder.build().unwrap();
+        let super::super::ChainSourceKind::Esplora(source) = &node.chain_source.kind else { panic!("wrong source") };
+        assert_eq!(source.update_fee_rate_estimates().await, Err(Error::FeerateEstimationUpdateFailed));
+        let logs = std::fs::read_to_string(log_path).unwrap();
+        assert!(logs.contains("InvalidResponse"));
+        assert!(!logs.contains("credential-sentinel"));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn real_fee_sync_funding_and_broadcast_calls_share_cooldown_and_recover() {
         let (_dir, node, source, fixture) = fixture(vec![

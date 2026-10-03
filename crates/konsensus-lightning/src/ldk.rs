@@ -74,6 +74,8 @@ pub struct LdkConfig {
     /// caused by mempool.space fee-fetch timeouts), `LdkProvider::new`
     /// switches to this URL on preflight or actual startup fee-fetch failure.
     pub esplora_url_fallback: Option<String>,
+    /// Owner-only OAuth credentials for the primary Esplora source.
+    pub credentials_file: Option<PathBuf>,
     /// Optional RapidGossipSync server URL.
     pub rgs_url: Option<String>,
     /// Optional LSPS2 LSP node ID (hex pubkey) for automatic inbound liquidity.
@@ -432,6 +434,11 @@ impl LdkProvider {
         let ldk_seed = Zeroizing::new(derive_ldk_entropy(&*bip39_seed));
 
         let network = parse_network(&config.network)?;
+        let auth = config.credentials_file.as_deref()
+            .map(konsensus_chain::bearer::BearerAuth::from_file).transpose()
+            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
+        let auth_transport = auth.as_ref().map(|auth| konsensus_chain::bearer::BearerFailover::new(auth.clone(), &config.esplora_url, config.esplora_url_fallback.iter().cloned().collect())).transpose()
+            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
         if config.bitcoind.is_some() && config.electrum.is_some() {
             return Err(LightningError::InvalidStartupConfig(
                 "select only one of bitcoind or electrum".into(),
@@ -562,8 +569,11 @@ impl LdkProvider {
             tokio::task::yield_now().await;
             (node, String::new(), baseline)
         } else {
-            let chosen = select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref()).await;
-            start_esplora_with_retry(builder, &config, chosen, started).await?
+            // Authenticated sources use LDK's real fee barrier as the probe, with live auth.
+            let chosen = if auth_transport.is_some() { config.esplora_url.clone() } else {
+                select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref()).await
+            };
+            start_esplora_with_retry(builder, &config, chosen, started, auth_transport).await?
         };
         info!(network = %config.network, chain_backend = if bitcoind.is_some() { "bitcoind" } else if electrum.is_some() { "electrum" } else { "esplora" }, "LDK embedded Lightning node started");
 
@@ -1741,6 +1751,7 @@ async fn start_esplora_with_retry(
     config: &LdkConfig,
     mut endpoint: String,
     started: Instant,
+    auth_transport: Option<Arc<konsensus_chain::bearer::BearerFailover>>,
 ) -> Result<(LdkNode, String, ldk_node::NodeStatus), LightningError> {
     const BUDGET: Duration = Duration::from_secs(60);
     const FEE_WINDOW: Duration = Duration::from_secs(5);
@@ -1753,7 +1764,11 @@ async fn start_esplora_with_retry(
             break;
         }
         if node.is_none() {
-            builder.set_chain_source_esplora(endpoint.clone(), Some(EsploraSyncConfig::default()));
+            if let Some(transport) = auth_transport.as_ref().filter(|_| endpoint == config.esplora_url) {
+                builder.set_chain_source_esplora_with_transport(endpoint.clone(), Some(EsploraSyncConfig::default()), transport.clone());
+            } else {
+                builder.set_chain_source_esplora(endpoint.clone(), Some(EsploraSyncConfig::default()));
+            }
             node = Some(builder.build().map_err(startup_build_error)?);
         }
         if started.elapsed() + FEE_WINDOW > BUDGET {
@@ -1807,7 +1822,7 @@ async fn start_esplora_with_retry(
         if let Some(fallback) = config
             .esplora_url_fallback
             .as_ref()
-            .filter(|url| **url != endpoint)
+            .filter(|url| auth_transport.is_none() && **url != endpoint)
         {
             // Only switch away from the primary. Never re-probe and bounce back.
             // Drop the old instance/store before rebuilding with the SAME

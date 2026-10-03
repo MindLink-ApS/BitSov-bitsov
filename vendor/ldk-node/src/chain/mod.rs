@@ -158,8 +158,9 @@ impl ChainSource {
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
+        transport: Option<Arc<dyn esplora_client::r#async::HttpTransport>>,
 	) -> Result<(Self, Option<BestBlock>), BuildError> {
-		let esplora_chain_source = EsploraChainSource::new(
+		let mut esplora_chain_source = EsploraChainSource::new(
 			server_url,
 			headers,
 			sync_config,
@@ -169,6 +170,7 @@ impl ChainSource {
 			Arc::clone(&logger),
 			node_metrics,
 		)?;
+        if let Some(transport) = transport { esplora_chain_source.set_transport(transport); }
 		let kind = ChainSourceKind::Esplora(esplora_chain_source);
 		Ok((Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()), funding_verifier: RwLock::new(None) }, None))
 	}

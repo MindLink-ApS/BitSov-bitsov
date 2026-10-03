@@ -2095,6 +2095,7 @@ esplora_url_fallback = "https://fallback.example.com"
         ChainConfig::Esplora {
             api_url,
             esplora_url_fallback,
+            ..
         } => {
             assert_eq!(api_url, "https://primary.example.com");
             assert_eq!(
@@ -2121,6 +2122,7 @@ fn issue66_existing_config_omitting_primary_keeps_its_provider() {
         ChainConfig::Esplora {
             api_url,
             esplora_url_fallback,
+            ..
         } => {
             assert_eq!(
                 api_url, "https://mempool.space",
@@ -2162,6 +2164,7 @@ fn issue66_explicit_primary_is_never_overridden() {
         ChainConfig::Esplora {
             api_url,
             esplora_url_fallback,
+            ..
         } => {
             assert_eq!(api_url, "https://esplora.mine.internal");
             assert_eq!(
@@ -2204,6 +2207,7 @@ fn issue66_fresh_full_tier_config_ships_a_chain_fallback() {
         ChainConfig::Esplora {
             api_url,
             esplora_url_fallback,
+            ..
         } => {
             let fallback = esplora_url_fallback
                 .as_deref()
@@ -2230,6 +2234,7 @@ api_url = "https://legacy.example.com"
         ChainConfig::Esplora {
             api_url,
             esplora_url_fallback,
+            ..
         } => {
             assert_eq!(api_url, "https://legacy.example.com");
             assert_eq!(esplora_url_fallback, None);
@@ -2679,4 +2684,16 @@ fn issue204_chain_fallback_resolution_keeps_primary_and_reuses_ldk() {
     let explicit: ChainConfig = toml::from_str("backend = 'esplora'\napi_url_fallback = 'https://explicit.invalid'\n").unwrap();
     assert_eq!(explicit.esplora_fallbacks(&ldk), vec!["https://explicit.invalid"]);
     assert!(chain.esplora_fallbacks(&LightningConfig::Mock { initial_balance_msat: 0 }).is_empty());
+}
+
+#[test]
+fn oauth_credentials_files_are_explicit_and_optional() {
+    let chain: ChainConfig = toml::from_str("backend = 'esplora'\napi_url = 'https://paid.invalid/api'\ncredentials_file = '/private/chain.toml'").unwrap();
+    assert!(matches!(chain, ChainConfig::Esplora { credentials_file: Some(path), .. } if path == std::path::Path::new("/private/chain.toml")));
+    let ldk: LightningConfig = toml::from_str("backend = 'ldk'\ncredentials_file = '/private/ldk.toml'").unwrap();
+    assert!(matches!(ldk, LightningConfig::Ldk { credentials_file: Some(path), .. } if path == std::path::Path::new("/private/ldk.toml")));
+    let chain: ChainConfig = toml::from_str("backend = 'esplora'").unwrap();
+    assert!(matches!(chain, ChainConfig::Esplora { credentials_file: None, .. }));
+    let ldk: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
+    assert!(matches!(ldk, LightningConfig::Ldk { credentials_file: None, .. }));
 }

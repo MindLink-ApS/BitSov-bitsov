@@ -18,10 +18,14 @@ tracing.workspace = true
 sha2.workspace = true
 hex.workspace = true
 zeroize.workspace = true
+toml.workspace = true
+rustix = { version = "1", features = ["fs", "process"] }
+http = "1"
 
 electrum-client = { version = "0.24", default-features = false, features = ["proxy", "use-rustls-ring"] }
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 tempfile = "3"
 mockall.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

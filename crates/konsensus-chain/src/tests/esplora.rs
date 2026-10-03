@@ -564,3 +564,37 @@ async fn issue204_stalled_primary_leaves_time_for_fallback_before_readiness_dead
     .await;
     assert_eq!(height.unwrap().unwrap(), 850123);
 }
+
+#[tokio::test]
+async fn bearer_token_failure_uses_existing_fallback_and_reports_actual_host() {
+    #[derive(Debug)]
+    struct AuthFailure;
+    impl HttpTransport for AuthFailure {
+        fn execute(&self, request: reqwest::RequestBuilder) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<reqwest::Response, esplora_client::Error>> + Send + '_>> {
+            Box::pin(async move {
+                let request = request.build().unwrap();
+                assert_eq!(request.url().host_str(), Some("login.invalid"));
+                Ok(http::Response::builder().status(401).body("private-secret").unwrap().into())
+            })
+        }
+    }
+    #[derive(Debug)]
+    struct Fallback;
+    impl HttpTransport for Fallback {
+        fn execute(&self, request: reqwest::RequestBuilder) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<reqwest::Response, esplora_client::Error>> + Send + '_>> {
+            Box::pin(async move {
+                let request = request.build().unwrap();
+                assert_eq!(request.url().host_str(), Some("fallback.invalid"));
+                assert!(!request.headers().contains_key(reqwest::header::AUTHORIZATION));
+                Ok(http::Response::builder().status(200).body("900000").unwrap().into())
+            })
+        }
+    }
+    let auth = crate::bearer::tests::auth_with_wire(Arc::new(AuthFailure));
+    let mut provider = EsploraProvider::with_fallbacks(EsploraConfig::custom("https://paid.invalid/api".into(), TrustLevel::ServerTrust), vec!["https://fallback.invalid/api".into()]).unwrap().with_bearer(auth).unwrap();
+    provider.transport = Some(Arc::new(Fallback));
+    assert_eq!(provider.get_block_height().await.unwrap(), 900000);
+    let view = provider.chain_view();
+    assert_eq!(view.host.as_deref(), Some("fallback.invalid"));
+    assert_eq!(view.trust_level, "third_party");
+}

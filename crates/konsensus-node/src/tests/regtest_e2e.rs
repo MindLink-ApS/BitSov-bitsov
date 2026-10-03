@@ -1965,7 +1965,7 @@ async fn bitcoind_chain_source_pruned_and_full() {
             mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".into(),
             passphrase: None, network: "regtest".into(),
             // These must not even be validated/probed when Core is selected.
-            esplora_url: "disabled".into(), esplora_url_fallback: Some("disabled".into()),
+            esplora_url: "disabled".into(), esplora_url_fallback: Some("disabled".into()), credentials_file: None,
             rgs_url: None, lsp_node_id: None, lsp_address: None, lsp_token: None, listening_address: None,
         }).await.unwrap();
         assert!(ldk.is_available().await);
