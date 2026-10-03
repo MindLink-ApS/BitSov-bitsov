@@ -356,8 +356,18 @@ impl Wallet {
 		wallet: &PersistedWallet<KVStoreWalletPersister>,
 	) -> Result<(), Error> {
 		let mut local = self.local_spends.lock().unwrap();
-		for tx in wallet.transactions().filter(|tx| tx.chain_position.is_confirmed()) {
-			local.confirmed(&tx.tx_node.tx)?;
+		let height = wallet.latest_checkpoint().height();
+		for tx in wallet.transactions() {
+			if let bdk_chain::ChainPosition::Confirmed { anchor, .. } = tx.chain_position {
+				// Confirmation makes change usable, but a shallow reorg can return
+				// this signed spend (or its replacement) to the mempool. Keep its
+				// durable input ownership until the same finality as payments.
+				if height.saturating_sub(anchor.block_id.height) >= ANTI_REORG_DELAY - 1 {
+					local.finalized(&tx.tx_node.tx)?;
+				} else {
+					local.verified(tx.tx_node.txid)?;
+				}
+			}
 		}
 		Ok(())
 	}
@@ -392,6 +402,16 @@ impl Wallet {
 		self.local_spends.lock().unwrap().unreadable_rows
 	}
 
+	fn has_confirmed_input_spend(
+		wallet: &PersistedWallet<KVStoreWalletPersister>, tx: &Transaction,
+	) -> bool {
+		wallet.transactions().any(|known| {
+			known.chain_position.is_confirmed() && known.tx_node.tx.input.iter().any(|input| {
+				tx.input.iter().any(|reserved| reserved.previous_output == input.previous_output)
+			})
+		})
+	}
+
 	/// Called only after a successful source lookup reports absence. Errors
 	/// must not be passed as absence. The age check and eviction share the wallet lock.
 	pub(crate) fn reconcile_absent_spend(&self, txid: Txid, at: u64) -> Result<bool, Error> {
@@ -403,6 +423,9 @@ impl Wallet {
 			local.transaction(txid)
 		};
 		if let Some(tx) = tx {
+			// Source not-found (e.g. Core without txindex) cannot override our
+			// chain evidence. Finalized rows were already reconciled above.
+			if Self::has_confirmed_input_spend(&wallet, &tx) { return Ok(false); }
 			self.abandon_funding_inner(&mut wallet, &tx)?;
 			log_warn!(self.logger, "Released local spend {} after bounded chain-source absence; transaction may still propagate", txid);
 			return Ok(true);
@@ -411,11 +434,17 @@ impl Wallet {
 	}
 
 	/// Owner-directed abandonment. The caller must hold the operation gate and
-	/// authenticate the owner; an old signed transaction may still propagate.
+	/// authenticate the owner, and obtain definitive absence from the configured
+	/// chain source under that gate. Lookup errors/visibility must refuse release.
+	/// An absent signed transaction may still propagate later.
 	pub(crate) fn release_local_spend(&self, txid: Txid) -> Result<(), Error> {
 		let mut wallet = self.inner.lock().unwrap();
+		self.reconcile_confirmed_spends(&wallet)?;
 		let tx = self.local_spends.lock().unwrap().transaction(txid);
 		if let Some(tx) = tx {
+			if Self::has_confirmed_input_spend(&wallet, &tx) {
+				return Err(Error::LocalSpendStillConfirmed);
+			}
 			self.abandon_funding_inner(&mut wallet, &tx)?;
 			log_warn!(self.logger, "Owner released local spend {}; transaction may still propagate", txid);
 		}

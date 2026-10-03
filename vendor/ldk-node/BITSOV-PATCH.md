@@ -67,10 +67,15 @@ Every vendor delta in this branch is covered below:
   `bitsov_local_spends` KV namespace, keyed by txid. Version 2 adds creation and
   last-sighting Unix times; legacy rows migrate once. Malformed/unreadable rows
   are skipped, counted, and warned about by `Wallet::new`, with diagnostics
-  exposed to the owner API. Confirmation/conflict removes reservations;
-  successful chain-source absence after 24 hours since creation/last sighting
-  or explicit owner abandonment releases stranded inputs. Lookup errors do not
-  count as absence. The adapter reconciles on startup and every minute, with
+  exposed to the owner API. Confirmation/conflict removes reservations only
+  after `ANTI_REORG_DELAY` confirmations, matching payment finality. Earlier
+  confirmations release change but preserve durable input ownership through a
+  shallow reorg, restart, and mempool eviction. Wallet-known confirmations
+  (including conflicting spends) block owner/absence release below finality,
+  even if the source reports not-found (such as Core without txindex). Successful
+  chain-source absence after 24 hours since creation/last sighting or explicit owner abandonment
+  after definitive source absence releases stranded inputs. Lookup errors do
+  not count as absence. The adapter reconciles on startup and every minute, with
   a total 10-second pass budget and a rotating cursor to prevent starvation.
 - `wallet/mod.rs`: shared operation gate, input/change exclusions in every
   ordinary transaction builder, reservation registration before a signed tx is
@@ -83,6 +88,8 @@ Every vendor delta in this branch is covered below:
   The upstream debug assertion that confirmed funds are always available for
   anchor spends was removed: reservations can legitimately exhaust those funds;
   selection returns insufficient funds instead of panicking.
+- `error.rs`: adds a clear retained-reservation error when owner release would
+  override the wallet's confirmation evidence below finality.
 - `wallet/bump.rs` (new): local coin-selection wrapper reconstructs persisted
   bump claim ownership and delegates fee/weight selection to LDK's unchanged
   selector. Last-resort conflicts may involve other bumps, never ordinary
@@ -99,19 +106,25 @@ Every vendor delta in this branch is covered below:
 - `lib.rs`: exposes the shared operation gate, source-verification update,
   reservation metadata/unreadable-row diagnostics, source reconciliation, and
   specific abandonment. The embedding adapter authenticates owner releases
-  and holds the gate; pairing tokens cannot release reservations.
+  and holds the gate across lookup and release; pairing tokens cannot release
+  reservations. Owner release requires the same definitive source not-found as
+  reconciliation. Visibility, lookup errors, missing source, and a 10-second
+  lookup timeout refuse release with a clear error; there is no force flag.
 - `wallet/money_tests.rs` (new) and its module registration: disposable,
   unstarted-node regressions for real BDK selection/signing/persistence,
-  concurrency, restart, source absence, owner release, corrupt rows, and
-  persist-failure cleanup. `tests/bitsov_jit.rs` changes its wallet wrapper
-  import to keep the existing JIT event regressions exercising production code.
+  concurrency, restart, source absence, owner release, corrupt rows,
+  persist-failure cleanup, shallow reorgs, and finality on both sync paths.
+  `tests/bitsov_jit.rs` changes its wallet wrapper import to keep the existing JIT event regressions exercising production code.
 
-Offline commands (no node startup or socket fixtures):
+Offline commands (deny networking at the OS level; exclude known socket fixtures
+from the Lightning library suite):
 
     cargo test --offline --manifest-path vendor/ldk-node/Cargo.toml --locked --lib bitsov_money_tests
     cargo test --offline --manifest-path vendor/ldk-node/Cargo.toml --locked --lib bitsov_
     cargo test --offline --locked -p konsensus-lightning --lib
-    cargo clippy --offline --locked -p konsensus-lightning --all-targets -- -D warnings
+    cargo test --offline --locked -p konsensus-api --lib
+    cargo test --offline --locked -p konsensus-api --test local_spend_tests
+    cargo clippy --offline --locked -p konsensus-lightning -p konsensus-api --all-targets -- -D warnings
 
 No recipient amount, fee calculation, admission policy, or settlement rule is
 changed. Explicit abandonment and bounded absence cannot revoke an already

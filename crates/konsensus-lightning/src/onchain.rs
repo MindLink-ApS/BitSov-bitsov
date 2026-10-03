@@ -111,6 +111,35 @@ async fn reconcile_local_spends_with<F, Fut>(
     }
 }
 
+/// Caller holds the operation gate across the lookup and durable release.
+/// Only the configured source's definitive not-found result permits release.
+pub(crate) async fn release_local_spend_with<F, Fut>(
+    node: Arc<ldk_node::Node>,
+    txid: ldk_node::bitcoin::Txid,
+    visible: F,
+) -> Result<(), LightningError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    match tokio::time::timeout(BROADCAST_TIMEOUT, visible(txid.to_string())).await {
+        Ok(Ok(false)) => {}
+        Ok(Ok(true)) => return Err(LightningError::Backend(format!(
+            "cannot release {txid}: transaction is visible to the chain source; reservation retained"
+        ))),
+        Ok(Err(_)) => return Err(LightningError::Backend(format!(
+            "cannot release {txid}: chain-source lookup is inconclusive; reservation retained"
+        ))),
+        Err(_) => return Err(LightningError::Backend(format!(
+            "cannot release {txid}: chain-source lookup timed out; reservation retained"
+        ))),
+    }
+    tokio::task::spawn_blocking(move || node.release_local_spend(txid))
+        .await
+        .map_err(|e| LightningError::Backend(e.to_string()))?
+        .map_err(|e| LightningError::Backend(e.to_string()))
+}
+
 pub(crate) async fn verify_broadcast<F, Fut>(
     txid: &str,
     mut visible: F,
@@ -354,6 +383,79 @@ mod tests {
         }
         std::fs::write(rows.join("malformed"), [9]).unwrap();
         (dir, Arc::new(builder.build_with_fs_store().unwrap()))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_release_requires_definitive_absence() {
+        for (visibility, refused) in [
+            (Ok(true), true),
+            (Err("lookup failed".into()), true),
+            (Ok(false), false),
+        ] {
+            let (dir, node) = restarted_reservations();
+            let txid = node.local_spend_reservations()[0].txid;
+            let gate = OnchainOperations::new(node.onchain_operation_lock());
+            let worker_node = node.clone();
+            let result = gate
+                .run(async move {
+                    release_local_spend_with(worker_node, txid, |id| {
+                        assert_eq!(id, txid.to_string());
+                        std::future::ready(visibility)
+                    })
+                    .await
+                })
+                .await;
+            assert_eq!(result.is_err(), refused);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("reservation retained"));
+            }
+            assert_eq!(
+                node.local_spend_reservations().len(),
+                if refused { 3 } else { 2 }
+            );
+            assert_eq!(
+                dir.path()
+                    .join("fs_store/bitsov_local_spends")
+                    .join(txid.to_string())
+                    .exists(),
+                refused
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_release_retains_reservation_on_lookup_timeout() {
+        let (_dir, node) = restarted_reservations();
+        let txid = node.local_spend_reservations()[0].txid;
+        let gate = OnchainOperations::new(node.onchain_operation_lock());
+        let worker_node = node.clone();
+        let result = gate
+            .run(async move {
+                release_local_spend_with(worker_node, txid, |_| {
+                    std::future::pending::<Result<bool, String>>()
+                })
+                .await
+            })
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("reservation retained"));
+        assert_eq!(node.local_spend_reservations().len(), 3);
+        assert!(node.onchain_operation_lock().try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn owner_release_without_chain_source_is_inconclusive() {
+        use konsensus_core::traits::lightning::LightningProvider;
+        let (_dir, node) = restarted_reservations();
+        let provider = crate::ldk::LdkProvider::from_node(node.clone());
+        let txid = node.local_spend_reservations()[0].txid;
+        assert!(provider
+            .release_local_spend(&txid.to_string())
+            .await
+            .is_err());
+        assert_eq!(node.local_spend_reservations().len(), 3);
     }
 
     #[tokio::test(start_paused = true)]

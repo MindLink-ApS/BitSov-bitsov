@@ -243,8 +243,10 @@ impl Node {
 		else { self.wallet.reconcile_absent_spend(txid, wallet::reservation_time()).map(|_| ()) }
 	}
 
-	/// Explicit owner-only abandonment. Hold onchain_operation_lock and verify
-	/// owner authorization. The signed transaction may still propagate later.
+	/// Explicit owner-only abandonment. Hold onchain_operation_lock, verify
+	/// owner authorization, and require definitive absence from the configured
+	/// chain source before calling. Visibility or inconclusive lookups must refuse
+	/// release. The signed transaction may still propagate later.
 	pub fn release_local_spend(&self, txid: bitcoin::Txid) -> Result<(), NodeError> {
 		self.wallet.release_local_spend(txid)
 	}

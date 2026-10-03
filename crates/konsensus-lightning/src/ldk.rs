@@ -1578,10 +1578,9 @@ impl LightningProvider for LdkProvider {
     async fn release_local_spend(&self, txid: &str) -> Result<(), LightningError> {
         let txid = txid.parse().map_err(|_| LightningError::Backend("invalid reservation txid".into()))?;
         let node = self.node.clone();
+        let chain = self.chain_visibility();
         self.onchain_operations.run(async move {
-            tokio::task::spawn_blocking(move || node.release_local_spend(txid)).await
-                .map_err(|e| LightningError::Backend(e.to_string()))?
-                .map_err(|e| LightningError::Backend(e.to_string()))
+            crate::onchain::release_local_spend_with(node, txid, |id| chain.tx_visible(id)).await
         }).await
     }
 
@@ -2050,7 +2049,7 @@ pub async fn select_esplora_endpoint(primary: &str, fallback: Option<&str>) -> S
 
 pub async fn esplora_tx_visible(esplora_url: &str, txid: &str) -> Result<bool, String> {
     if esplora_url.is_empty() {
-        return Ok(false);
+        return Err("no chain source configured".into());
     }
     let trimmed = esplora_url.trim_end_matches('/');
     let url = format!("{trimmed}/tx/{txid}");

@@ -289,6 +289,124 @@ fn pending_close_fee_inputs_remain_available_for_rbf_only() {
 	node.wallet.sign_psbt_inner(replacement).unwrap();
 }
 
+// Advance either sync path without introducing another spend.
+fn advance_confirmations(wallet: &Wallet, via_blocks: bool, through: u32) {
+	for height in 3..=through {
+		let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+		block.header.prev_blockhash = wallet.current_best_block().block_hash;
+		block.header.nonce = height;
+		block.txdata.clear();
+		if via_blocks {
+			wallet.block_connected(&block, height);
+		} else {
+			let tip = wallet.inner.lock().unwrap().latest_checkpoint();
+			wallet.apply_update(Update {
+				chain: Some(tip.push(bdk_chain::BlockId { height, hash: block.block_hash() }).unwrap()),
+				..Default::default()
+			}).unwrap();
+		}
+	}
+}
+
+#[test]
+fn shallow_reorg_retains_input_reservations_across_restart_and_eviction() {
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	let first = funding(&node.wallet, 2);
+	funding(&node.wallet, 3);
+	let fork = node.wallet.current_best_block();
+	let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+	block.header.prev_blockhash = fork.block_hash;
+	block.txdata = vec![first.clone()];
+	node.wallet.block_connected(&block, 2);
+	node.wallet.blocks_disconnected(fork);
+	block.header.nonce += 1;
+	block.txdata.clear();
+	node.wallet.block_connected(&block, 2);
+	node.wallet.apply_mempool_txs(vec![(first.clone(), local_spends::now())], vec![]).unwrap();
+	assert!(node.wallet.inner.lock().unwrap().transactions()
+		.any(|tx| tx.tx_node.txid == first.compute_txid() && !tx.chain_position.is_confirmed()));
+	drop(node);
+	let node = self::node(dir.path());
+	// Even if the reorged mempool spend later disappears from BDK's view,
+	// its input must remain unavailable to both ordinary and bump builders.
+	node.wallet.apply_mempool_txs(vec![], vec![(first.compute_txid(), local_spends::now() + 1)]).unwrap();
+	assert!(node.wallet.create_funding_transaction(
+		ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([9; 32])),
+		Amount::from_sat(80_000), ConfirmationTarget::ChannelFunding, LockTime::ZERO,
+	).is_err(), "shallow reorg unlocked a signed spend's input");
+	assert!(node.wallet.list_confirmed_utxos_inner().unwrap().iter()
+		.all(|utxo| first.input.iter().all(|i| i.previous_output != utxo.outpoint)));
+	assert!(node.local_spend_reservations().iter().any(|r| r.txid == first.compute_txid()));
+}
+
+#[test]
+fn source_absence_cannot_release_shallow_confirmed_spends_or_replacements() {
+	for replacement in [false, true] {
+		for owner_release in [false, true] {
+			let dir = tempfile::tempdir().unwrap();
+			let node = node(dir.path());
+			fund(&node.wallet);
+			let first = if replacement {
+				node.wallet.sign_psbt_inner(bump_psbt(&node.wallet)).unwrap()
+			} else { funding(&node.wallet, 2) };
+			let confirmed = if replacement {
+				node.wallet.sign_psbt_inner(bump_psbt(&node.wallet)).unwrap()
+			} else { first.clone() };
+			let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+			block.header.prev_blockhash = node.wallet.current_best_block().block_hash;
+			block.txdata = vec![confirmed];
+			node.wallet.block_connected(&block, 2);
+			age_reservation(&node, first.compute_txid(), 1, None);
+			// Core without txindex can report not-found for a confirmed tx.
+			// That source result must not override the wallet's chain evidence.
+			if owner_release {
+				let error = node.release_local_spend(first.compute_txid()).unwrap_err();
+				assert!(error.to_string().contains("confirmed"));
+			} else {
+				node.reconcile_local_spend(first.compute_txid(), false).unwrap();
+			}
+			assert!(node.local_spend_reservations().iter().any(|r| r.txid == first.compute_txid()));
+		}
+	}
+}
+
+#[test]
+fn reservation_cleanup_waits_for_finality_on_both_sync_paths() {
+	for via_blocks in [false, true] {
+		let dir = tempfile::tempdir().unwrap();
+		let node = node(dir.path());
+		fund(&node.wallet);
+		let first = funding(&node.wallet, 2);
+		let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+		block.header.prev_blockhash = node.wallet.current_best_block().block_hash;
+		block.txdata = vec![first.clone()];
+		node.wallet.block_connected(&block, 2);
+		advance_confirmations(&node.wallet, via_blocks, ANTI_REORG_DELAY);
+		assert!(node.local_spend_reservations().iter().any(|r| r.txid == first.compute_txid()),
+			"reservation removed one confirmation before finality");
+		drop(node);
+		let node = self::node(dir.path());
+		let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+		block.header.prev_blockhash = node.wallet.current_best_block().block_hash;
+		block.txdata.clear();
+		let height = ANTI_REORG_DELAY + 1;
+		if via_blocks {
+			node.wallet.block_connected(&block, height);
+		} else {
+			let tip = node.wallet.inner.lock().unwrap().latest_checkpoint();
+			node.wallet.apply_update(Update {
+				chain: Some(tip.push(bdk_chain::BlockId { height, hash: block.block_hash() }).unwrap()),
+				..Default::default()
+			}).unwrap();
+		}
+		assert!(node.local_spend_reservations().is_empty());
+		drop(node);
+		assert!(self::node(dir.path()).local_spend_reservations().is_empty());
+	}
+}
+
 #[test]
 fn core_block_confirmation_releases_change_without_mempool_observation() {
 	let dir = tempfile::tempdir().unwrap();
@@ -307,7 +425,7 @@ fn core_block_confirmation_releases_change_without_mempool_observation() {
 }
 
 #[test]
-fn confirmed_bump_replacement_releases_unused_fee_input() {
+fn finalized_bump_replacement_releases_unused_fee_input() {
 	let dir = tempfile::tempdir().unwrap();
 	let node = node(dir.path());
 	fund(&node.wallet);
@@ -320,6 +438,17 @@ fn confirmed_bump_replacement_releases_unused_fee_input() {
 	block.header.prev_blockhash = node.wallet.current_best_block().block_hash;
 	block.txdata = vec![second];
 	node.wallet.block_connected(&block, 2);
+	advance_confirmations(&node.wallet, true, ANTI_REORG_DELAY);
+	assert_eq!(node.local_spend_reservations().len(), 2);
+	assert!(node.wallet.create_funding_transaction(
+		ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([9; 32])),
+		Amount::from_sat(80_000), ConfirmationTarget::ChannelFunding, LockTime::ZERO,
+	).is_err(), "replacement freed fee input before finality");
+	let mut final_block = block.clone();
+	final_block.header.prev_blockhash = node.wallet.current_best_block().block_hash;
+	final_block.txdata.clear();
+	node.wallet.block_connected(&final_block, ANTI_REORG_DELAY + 1);
+	assert!(node.local_spend_reservations().is_empty());
 	drop(node);
 	let node = self::node(dir.path());
 	let next = funding(&node.wallet, 3);
@@ -580,7 +709,7 @@ fn owner_release_recycles_only_requested_reservation_and_survives_restart() {
 }
 
 #[test]
-fn legacy_reservation_age_is_migrated_once_and_confirmation_removes_record() {
+fn legacy_reservation_age_is_migrated_once_and_finality_removes_record() {
 	use lightning::util::persist::KVStoreSync;
 	let dir = tempfile::tempdir().unwrap();
 	let node = node(dir.path());
@@ -608,6 +737,8 @@ fn legacy_reservation_age_is_migrated_once_and_confirmation_removes_record() {
 	block.header.prev_blockhash = node.wallet.current_best_block().block_hash;
 	block.txdata = vec![tx];
 	node.wallet.block_connected(&block, 2);
+	assert_eq!(node.local_spend_reservations().len(), 1);
+	advance_confirmations(&node.wallet, true, ANTI_REORG_DELAY + 1);
 	assert!(node.local_spend_reservations().is_empty());
 }
 

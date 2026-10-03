@@ -163,12 +163,12 @@ impl LocalSpends {
 		Ok(())
 	}
 
-	pub(super) fn confirmed(&mut self, tx: &Transaction) -> Result<(), Error> {
+	pub(super) fn finalized(&mut self, tx: &Transaction) -> Result<(), Error> {
 		let txid = tx.compute_txid();
 		if self.spends.contains_key(&txid) {
 			self.abandon(txid)?;
 		}
-		// A confirmed replacement definitively spends the shared claim/input.
+		// A replacement past ANTI_REORG_DELAY spends the shared claim/input.
 		// Its abandoned variants must not strand their additional fee inputs.
 		let superseded: Vec<_> = self
 			.spends
