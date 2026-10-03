@@ -1009,8 +1009,8 @@ async fn start_node_services<'a>(
     // derive: from an encrypted seed whose password was typed at this start.
     // Otherwise they are off node-wide, with the reason the app shows.
     let device_authority = owner_approval_key(
-        &config,
-        mnemonic_password.as_deref(),
+        config,
+        mnemonic_password,
         password_typed,
         &node.identity().node_id().to_hex(),
     );
@@ -1152,7 +1152,7 @@ async fn start_node_services<'a>(
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
         stun_port: stun_socket.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()),
-        custody_mode: custody_mode(&config),
+        custody_mode: custody_mode(config),
     });
 
     // Public remote access is Noise only. Decrypted bytes go to an ephemeral
@@ -1392,7 +1392,7 @@ async fn start_node_services<'a>(
                 identity_fingerprint: identity_fingerprint.clone(),
                 data_dir: data_dir.clone(),
                 mnemonic_path: config.identity.mnemonic_file.clone(),
-                replacement_guard: owner_cmd::replacement_guard(&data_dir, &config),
+                replacement_guard: owner_cmd::replacement_guard(&data_dir, config),
             });
             let server = konsensus_api::control::ControlServer::bind(&data_dir, ctx)
                 .with_context(|| {
@@ -1558,7 +1558,7 @@ async fn start_node_services<'a>(
             .downcast_ref::<konsensus_pricing::ChainAwarePricingEngine>()
         {
             if let Some(snapshot) = chain_engine.snapshot().await {
-                KonsensusNode::save_fee_rate_snapshot(&config, &snapshot);
+                KonsensusNode::save_fee_rate_snapshot(config, &snapshot);
                 debug!("fee rate EMA snapshot saved on shutdown");
             }
         }
