@@ -608,7 +608,7 @@ async fn peer_update_auto_connect() {
         NodeId::from_verifying_key(&signing.verifying_key())
     };
 
-    // Add with auto_connect=false (default)
+    // An explicit legacy false flag remains representable.
     let app = build_router(Arc::clone(&state));
     let req = Request::builder()
         .method("POST")
@@ -618,7 +618,7 @@ async fn peer_update_auto_connect() {
         .body(Body::from(
             serde_json::json!({
                 "node_id": peer_id.to_hex(),
-                "addr": "10.0.0.1:9735"
+                "addr": "10.0.0.1:9735", "auto_connect": false
             })
             .to_string(),
         ))
@@ -845,7 +845,7 @@ async fn peer_add_without_label() {
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["label"].is_null());
-    assert_eq!(json["auto_connect"], false);
+    assert_eq!(json["auto_connect"], true);
     // Should have fingerprint and safety_number
     assert!(json["fingerprint"].is_string());
     assert!(json["safety_number"].is_string());
@@ -2155,4 +2155,60 @@ async fn discover_peers_requires_explicit_quote_and_payment() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
     assert!(String::from_utf8_lossy(&body).contains("quote and per-request payment"));
+}
+
+/// Exercise the owner API, not a test-only call to start_supervisor.
+#[tokio::test]
+async fn contact_with_auto_connect_false_redials_and_removal_stops_it() {
+    use konsensus_core::traits::transport::MessageTransport;
+    use konsensus_message::{NoiseTransport, TransportConfig, ReachabilityMode};
+    use std::time::Duration;
+    let original = test_state();
+    let mut state = (*original).clone();
+    let config = TransportConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        admission_mode: ReachabilityMode::PriceOpen,
+        ..Default::default()
+    };
+    let (_, remote_identity) = NodeIdentity::generate().unwrap();
+    let peer = *remote_identity.node_id();
+    let remote = NoiseTransport::new(Arc::new(remote_identity), config.clone());
+    remote.start_listener().await.unwrap();
+    let transport = Arc::new(NoiseTransport::new(state.identity.clone(), config));
+    state.transport = transport.clone();
+    let state = Arc::new(state);
+    let auth = auth_header(&state);
+    let response = build_router(state.clone()).oneshot(Request::builder()
+        .method("POST").uri("/api/v1/peers")
+        .header("authorization", &auth).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({
+            "node_id": peer.to_hex(), "addr": remote.listen_addr().unwrap().to_string(),
+            "auto_connect": false
+        }).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let wait = |previous| {
+        let transport = transport.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(now) = transport.connected_since(&peer).await {
+                        if Some(now) != previous { return now; }
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }).await.expect("owner contact must connect/reconnect")
+        }
+    };
+    let first = wait(None).await;
+    transport.disconnect(&peer).await.unwrap();
+    wait(Some(first)).await;
+    let response = build_router(state.clone()).oneshot(Request::builder()
+        .method("DELETE").uri(format!("/api/v1/peers/{}", peer.to_hex()))
+        .header("authorization", &auth).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!transport.is_connected(&peer).await);
+    assert!(state.storage.get_peer(&peer).await.unwrap().is_none());
+    transport.shutdown();
+    remote.shutdown();
 }

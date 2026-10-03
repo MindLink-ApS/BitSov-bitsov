@@ -448,6 +448,22 @@ pub(super) async fn connect_to_peer(
     use super::{PeerConnection, spawn_reader_task};
     use super::ControlEvent;
 
+    // Explicit dials and reconnect tasks share a single in-flight handshake per
+    // NodeId. Recheck after acquiring the lock so the losing caller reuses it.
+    let dial = {
+        let mut locks = ctx.dial_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let dial = locks.get(peer).and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+        locks.insert(*peer, Arc::downgrade(&dial));
+        dial
+    };
+    let _dial = dial.lock().await;
+    if *ctx.shutdown.borrow() {
+        return Err(TransportError::Other("transport shut down".into()));
+    }
+    if ctx.peers.read().await.contains_key(peer) { return Ok(()); }
+
     let stream = tokio::net::TcpStream::connect(addr)
         .await
         .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
@@ -530,18 +546,17 @@ pub(super) async fn connect_to_peer(
         invalid_frame_last_leak: now,
         bytes_received: 0,
         memory_budget_window_start: now,
-    }, peer_node_id, Arc::clone(&ctx.peers))?;
+    }, peer_node_id, Arc::clone(&ctx.peers), true)?;
 
-    if let Some(old) = ctx.peers.write().await.insert(peer_node_id, Arc::clone(&conn)) { old.close(); }
+    if !conn.register(ctx.identity.node_id(), &peer_node_id, &ctx.peers).await {
+        return Ok(());
+    }
 
     spawn_reader_task(
         peer_node_id,
         reader,
         Arc::clone(&conn),
-        Arc::clone(&ctx.peers),
-        Arc::clone(&ctx.banned_peers),
-        ctx.incoming_tx.clone(),
-        ctx.control_tx.clone(),
+        ctx.clone(),
     );
 
     // Notify application layer of new peer connection. M1b: carry the privilege

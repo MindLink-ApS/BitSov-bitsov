@@ -223,6 +223,8 @@ impl NoiseTransport {
         }
 
         let ctx = TransportCtx {
+            dial_locks: Arc::clone(&self.dial_locks),
+            shutdown: self.shutdown.subscribe(),
             identity: Arc::clone(&self.identity),
             config: self.config.clone(),
             whitelist: Arc::clone(&self.whitelist),
@@ -347,7 +349,7 @@ impl NoiseTransport {
 
     /// Shut down the listener and disconnect all peers.
     pub fn shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 
     /// Return the actual listen address after `start_listener()` completes.
@@ -468,15 +470,16 @@ pub(super) async fn handle_incoming(
         invalid_frame_last_leak: now,
         bytes_received: 0,
         memory_budget_window_start: now,
-    }, peer_node_id, Arc::clone(&ctx.peers))?;
+    }, peer_node_id, Arc::clone(&ctx.peers), false)?;
 
-    if let Some(old) = ctx.peers.write().await.insert(peer_node_id, Arc::clone(&conn)) { old.close(); }
+    if !conn.register(ctx.identity.node_id(), &peer_node_id, &ctx.peers).await {
+        return Ok(());
+    }
 
     // Spawn reader task
     spawn_reader_task(
         peer_node_id, reader, conn,
-        Arc::clone(&ctx.peers), Arc::clone(&ctx.banned_peers),
-        ctx.incoming_tx.clone(), ctx.control_tx.clone(),
+        ctx.clone(),
     );
 
     // Notify application layer of new peer connection. M1b: carry the privilege

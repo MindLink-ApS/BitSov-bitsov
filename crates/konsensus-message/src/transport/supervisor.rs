@@ -1,203 +1,134 @@
-//! Peer supervision — reconnect loop and keepalive pings.
-
+//! Local reconnect policy. Keepalives belong to each connection, not this task.
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use tracing::{debug, info, warn};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use konsensus_core::types::NodeId;
-
-use crate::wire::Frame;
+use konsensus_crypto::SessionManager;
+use tokio::time::Instant;
+use tracing::{debug, warn};
 
 use super::{
-    write_noise_message,
-    TransportCtx,
-    KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT,
+    handshake::connect_to_peer, NoiseTransport, TransportCtx, HANDSHAKE_TIMEOUT,
     RECONNECT_MAX_DELAY, RECONNECT_MIN_DELAY,
 };
-use super::handshake::connect_to_peer;
-use super::NoiseTransport;
+
+pub(super) type SupervisionMap = Arc<Mutex<HashMap<NodeId, Supervision>>>;
+
+pub(super) struct Supervision {
+    addr: SocketAddr,
+    interest: Arc<Mutex<Interest>>,
+    task: tokio::task::AbortHandle,
+}
+
+#[derive(Clone, Default)]
+struct Interest {
+    contact: bool,
+    operation: Weak<()>,
+    quote_until: Option<Instant>,
+}
+
+impl Interest {
+    fn wanted(&self, session: bool) -> bool {
+        self.contact
+            || session
+            || self.operation.strong_count() > 0
+            || self.quote_until.is_some_and(|until| until > Instant::now())
+    }
+}
+
+// The map lock serializes retirement with every reason acquisition. A caller
+// either retains this worker or observes that it has already retired.
+fn retire_if_unwanted(
+    entries: &SupervisionMap,
+    peer: &NodeId,
+    interest: &Arc<Mutex<Interest>>,
+    session: bool,
+) -> bool {
+    let mut entries = entries.lock().unwrap();
+    if interest.lock().unwrap().wanted(session) {
+        return false;
+    }
+    if entries
+        .get(peer)
+        .is_some_and(|e| Arc::ptr_eq(&e.interest, interest))
+    {
+        entries.remove(peer);
+    }
+    true
+}
 
 impl NoiseTransport {
-    /// Start the connection supervisor for a set of peers.
-    ///
-    /// For each peer, spawns a background task that:
-    /// 1. Monitors connection health
-    /// 2. Reconnects with exponential backoff if the connection drops
-    /// 3. Sends periodic keepalive pings on idle connections
-    ///
-    /// This is the key mechanism for test network stability — nodes recover
-    /// from restarts, temporary network partitions, and connection drops.
-    pub fn start_supervisor(&self, supervised_peers: Vec<(NodeId, SocketAddr)>) {
-        for (node_id, addr) in supervised_peers {
-            let ctx = TransportCtx {
-                identity: Arc::clone(&self.identity),
-                config: self.config.clone(),
-                whitelist: Arc::clone(&self.whitelist),
-                peers: Arc::clone(&self.peers),
-                banned_peers: Arc::clone(&self.banned_peers),
-                incoming_tx: self.incoming_tx.clone(),
-                control_tx: self.control_tx.clone(),
-                cookie_keyring: Arc::clone(&self.cookie_keyring),
-            };
-            let mut shutdown_rx = self.shutdown.subscribe();
-            let ping_counter = Arc::clone(&self.ping_counter);
+    pub(super) async fn is_whitelisted(&self, peer: &NodeId) -> bool {
+        self.whitelist.read().await.contains(peer)
+    }
 
-            tokio::spawn(async move {
-                let mut backoff = RECONNECT_MIN_DELAY;
+    /// The session owner supplies only a weak reference. Supervision reads live
+    /// session existence on every retry and never promotes a Noise connection.
+    pub fn set_reconnect_sessions(&self, sessions: &Arc<SessionManager>) {
+        *self.reconnect_sessions.write().unwrap() = Some(Arc::downgrade(sessions));
+    }
 
-                loop {
-                    // Check if connected
-                    let connected = ctx.peers.read().await.contains_key(&node_id);
-
-                    if !connected {
-                        info!(
-                            peer = %node_id,
-                            delay_ms = backoff.as_millis(),
-                            "supervisor: attempting connection"
-                        );
-
-                        match connect_to_peer(&node_id, &addr, &ctx).await
-                        {
-                            Ok(()) => {
-                                info!(peer = %node_id, "supervisor: connected");
-                                // backoff is reset after the keepalive loop exits
-                            }
-                            Err(e) => {
-                                warn!(
-                                    peer = %node_id,
-                                    error = %e,
-                                    retry_in_ms = backoff.as_millis(),
-                                    "supervisor: connection failed, will retry"
-                                );
-                                // Wait with backoff before retrying
-                                tokio::select! {
-                                    _ = tokio::time::sleep(backoff) => {}
-                                    _ = shutdown_rx.changed() => {
-                                        debug!(peer = %node_id, "supervisor: shutdown");
-                                        return;
-                                    }
-                                }
-                                // Exponential backoff with cap
-                                backoff = (backoff * 2).min(RECONNECT_MAX_DELAY);
-                                continue;
-                            }
-                        }
-                    }
-
-                    // Connection is up — monitor health and send keepalives.
-                    // Check connection status every second (fast detection),
-                    // send keepalive pings at KEEPALIVE_INTERVAL.
-                    let mut last_ping = Instant::now();
-                    let mut waiting_for_pong = false;
-                    let mut pong_deadline = Instant::now();
-
-                    loop {
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                                // Fast check: is the peer still in the connection map?
-                                let still_connected = ctx.peers.read().await.contains_key(&node_id);
-                                if !still_connected {
-                                    info!(peer = %node_id, "supervisor: peer disconnected, will reconnect");
-                                    break; // Back to reconnect loop
-                                }
-
-                                // Check pong timeout
-                                if waiting_for_pong && Instant::now() >= pong_deadline {
-                                    // Clone Arc so the RwLock read guard is not held
-                                    // across the connection Mutex lock.
-                                    let conn_arc = {
-                                        let peers_read = ctx.peers.read().await;
-                                        peers_read.get(&node_id).map(Arc::clone)
-                                    };
-                                    let alive = if let Some(conn) = conn_arc {
-                                        let conn = conn.lock().await;
-                                        conn.pending_ping.is_none()
-                                            || conn.last_recv.elapsed() < KEEPALIVE_INTERVAL
-                                    } else {
-                                        false
-                                    };
-
-                                    if !alive {
-                                        warn!(peer = %node_id, "supervisor: keepalive timeout, peer is dead");
-                                        ctx.peers.write().await.remove(&node_id);
-                                        break;
-                                    }
-                                    waiting_for_pong = false;
-                                }
-
-                                // Time to send a keepalive ping?
-                                if !waiting_for_pong && last_ping.elapsed() >= KEEPALIVE_INTERVAL {
-                                    let nonce = ping_counter.fetch_add(1, Ordering::Relaxed);
-
-                                    // Clone Arc so the RwLock read guard is not held
-                                    // across network I/O (write_noise_message).
-                                    let conn_arc = {
-                                        let peers_read = ctx.peers.read().await;
-                                        peers_read.get(&node_id).map(Arc::clone)
-                                    };
-                                    let ping_sent = if let Some(conn) = conn_arc {
-                                        let mut conn = conn.lock().await;
-                                        conn.pending_ping = Some(nonce);
-                                        let ping = Frame::Ping { nonce };
-                                        if let Ok(bytes) = ping.to_bytes() {
-                                            if let Ok(encrypted) = conn.noise.encrypt(&bytes) {
-                                                write_noise_message(&mut conn.writer, &encrypted)
-                                                    .await
-                                                    .is_ok()
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    };
-
-                                    if !ping_sent {
-                                        warn!(peer = %node_id, "supervisor: ping send failed, reconnecting");
-                                        ctx.peers.write().await.remove(&node_id);
-                                        break;
-                                    }
-
-                                    debug!(peer = %node_id, %nonce, "supervisor: sent keepalive ping");
-                                    last_ping = Instant::now();
-                                    waiting_for_pong = true;
-                                    pong_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
-                                }
-                            }
-                            _ = shutdown_rx.changed() => {
-                                debug!(peer = %node_id, "supervisor: shutdown");
-                                return;
-                            }
-                        }
-                    }
-
-                    // After disconnection, reset backoff and wait briefly before reconnecting
-                    backoff = RECONNECT_MIN_DELAY;
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
-                        _ = shutdown_rx.changed() => {
-                            debug!(peer = %node_id, "supervisor: shutdown");
-                            return;
-                        }
-                    }
-                }
-            });
+    /// Contacts reconnect regardless of the legacy startup auto_connect flag.
+    pub fn start_supervisor(&self, peers: Vec<(NodeId, SocketAddr)>) {
+        for (peer, addr) in peers {
+            self.supervise_single_peer(peer, addr);
         }
     }
 
-    /// Start connection supervision for a single peer added after startup.
-    ///
-    /// This spawns the same per-peer supervisor task as `start_supervisor` but
-    /// for a single dynamically-added peer. Used when a peer is added via
-    /// invite redemption so they get automatic reconnection with exponential
-    /// backoff and keepalive monitoring — identical to config-file peers.
-    pub fn supervise_single_peer(&self, node_id: NodeId, addr: SocketAddr) {
+    pub fn supervise_single_peer(&self, peer: NodeId, addr: SocketAddr) {
+        self.track_peer(peer, addr, true);
+    }
+
+    pub(super) fn stop_supervising(&self, peer: &NodeId) {
+        if let Some(entry) = self.supervision.lock().unwrap().remove(peer) {
+            entry.task.abort();
+        }
+    }
+
+    pub(super) fn retain_reconnect(&self, peer: &NodeId) -> Option<Arc<()>> {
+        let entries = self.supervision.lock().unwrap();
+        let mut interest = entries.get(peer)?.interest.lock().unwrap();
+        let handle = interest.operation.upgrade().unwrap_or_else(|| Arc::new(()));
+        interest.operation = Arc::downgrade(&handle);
+        Some(handle)
+    }
+
+    pub(super) fn extend_reconnect(&self, peer: &NodeId, duration: Duration) {
+        if let Some(entry) = self.supervision.lock().unwrap().get(peer) {
+            let mut interest = entry.interest.lock().unwrap();
+            let until = Instant::now() + duration;
+            interest.quote_until = Some(interest.quote_until.map_or(until, |old| old.max(until)));
+        }
+    }
+
+    pub(super) fn track_peer(&self, peer: NodeId, addr: SocketAddr, contact: bool) {
+        if *self.shutdown.borrow() {
+            return;
+        }
+        // Persisted inbound-only contacts use 0.0.0.0:0. Never dial a sentinel.
+        if addr.port() == 0 || addr.ip().is_unspecified() {
+            self.stop_supervising(&peer);
+            return;
+        }
+        let mut entries = self.supervision.lock().unwrap();
+        if let Some(entry) = entries.get(&peer) {
+            if entry.addr == addr {
+                entry.interest.lock().unwrap().contact |= contact;
+                return; // Idempotent: no competing supervisors for one peer.
+            }
+        }
+        let interest = entries
+            .remove(&peer)
+            .map(|old| {
+                old.task.abort();
+                Arc::new(Mutex::new(old.interest.lock().unwrap().clone()))
+            })
+            .unwrap_or_default();
+        interest.lock().unwrap().contact |= contact;
         let ctx = TransportCtx {
+            dial_locks: Arc::clone(&self.dial_locks),
             identity: Arc::clone(&self.identity),
             config: self.config.clone(),
             whitelist: Arc::clone(&self.whitelist),
@@ -206,150 +137,167 @@ impl NoiseTransport {
             incoming_tx: self.incoming_tx.clone(),
             control_tx: self.control_tx.clone(),
             cookie_keyring: Arc::clone(&self.cookie_keyring),
+            shutdown: self.shutdown.subscribe(),
         };
-        let mut shutdown_rx = self.shutdown.subscribe();
-        let ping_counter = Arc::clone(&self.ping_counter);
-
-        tokio::spawn(async move {
-            let mut backoff = RECONNECT_MIN_DELAY;
-
-            loop {
-                let connected = ctx.peers.read().await.contains_key(&node_id);
-
-                if !connected {
-                    info!(
-                        peer = %node_id,
-                        delay_ms = backoff.as_millis(),
-                        "supervisor: attempting connection (dynamic peer)"
-                    );
-
-                    match connect_to_peer(&node_id, &addr, &ctx).await {
-                        Ok(()) => {
-                            info!(peer = %node_id, "supervisor: connected (dynamic peer)");
-                        }
-                        Err(e) => {
-                            warn!(
-                                peer = %node_id,
-                                error = %e,
-                                retry_in_ms = backoff.as_millis(),
-                                "supervisor: connection failed, will retry"
-                            );
-                            tokio::select! {
-                                _ = tokio::time::sleep(backoff) => {}
-                                _ = shutdown_rx.changed() => {
-                                    debug!(peer = %node_id, "supervisor: shutdown");
-                                    return;
-                                }
-                            }
-                            backoff = (backoff * 2).min(RECONNECT_MAX_DELAY);
-                            continue;
-                        }
-                    }
+        let mut shutdown = self.shutdown.subscribe();
+        let sessions = Arc::clone(&self.reconnect_sessions);
+        let entries_weak = Arc::downgrade(&self.supervision);
+        let worker_interest = Arc::clone(&interest);
+        let task = tokio::spawn(async move {
+            let stopped = *shutdown.borrow();
+            let run = async {
+                if stopped {
+                    return;
                 }
-
-                // Connection is up — monitor health and send keepalives
-                let mut last_ping = Instant::now();
-                let mut waiting_for_pong = false;
-                let mut pong_deadline = Instant::now();
-
+                let mut backoff = RECONNECT_MIN_DELAY;
                 loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                            let still_connected = ctx.peers.read().await.contains_key(&node_id);
-                            if !still_connected {
-                                info!(peer = %node_id, "supervisor: peer disconnected, will reconnect");
-                                break;
-                            }
-
-                            if waiting_for_pong && Instant::now() >= pong_deadline {
-                                // Clone Arc so the RwLock read guard is not held
-                                // across the connection Mutex lock.
-                                let conn_arc = {
-                                    let peers_read = ctx.peers.read().await;
-                                    peers_read.get(&node_id).map(Arc::clone)
-                                };
-                                let alive = if let Some(conn) = conn_arc {
-                                    let conn = conn.lock().await;
-                                    conn.pending_ping.is_none()
-                                        || conn.last_recv.elapsed() < KEEPALIVE_INTERVAL
-                                } else {
-                                    false
-                                };
-
-                                if !alive {
-                                    warn!(peer = %node_id, "supervisor: keepalive timeout, peer is dead");
-                                    ctx.peers.write().await.remove(&node_id);
-                                    break;
-                                }
-                                waiting_for_pong = false;
-                            }
-
-                            if !waiting_for_pong && last_ping.elapsed() >= KEEPALIVE_INTERVAL {
-                                let nonce = ping_counter.fetch_add(1, Ordering::Relaxed);
-
-                                // Clone Arc so the RwLock read guard is not held
-                                // across network I/O (write_noise_message).
-                                let conn_arc = {
-                                    let peers_read = ctx.peers.read().await;
-                                    peers_read.get(&node_id).map(Arc::clone)
-                                };
-                                let ping_sent = if let Some(conn) = conn_arc {
-                                    let mut conn = conn.lock().await;
-                                    conn.pending_ping = Some(nonce);
-                                    let ping = Frame::Ping { nonce };
-                                    if let Ok(bytes) = ping.to_bytes() {
-                                        if let Ok(encrypted) = conn.noise.encrypt(&bytes) {
-                                            write_noise_message(&mut conn.writer, &encrypted)
-                                                .await
-                                                .is_ok()
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
-
-                                if !ping_sent {
-                                    warn!(peer = %node_id, "supervisor: ping send failed, reconnecting");
-                                    ctx.peers.write().await.remove(&node_id);
-                                    break;
-                                }
-
-                                debug!(peer = %node_id, %nonce, "supervisor: sent keepalive ping");
-                                last_ping = Instant::now();
-                                waiting_for_pong = true;
-                                pong_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
-                            }
-                        }
-                        _ = shutdown_rx.changed() => {
-                            debug!(peer = %node_id, "supervisor: shutdown");
-                            return;
-                        }
+                    if ctx.peers.read().await.contains_key(&peer) {
+                        backoff = RECONNECT_MIN_DELAY;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    let manager = sessions.read().unwrap().as_ref().and_then(Weak::upgrade);
+                    let session = match manager {
+                        Some(manager) => manager.has_session(&peer).await,
+                        None => false,
+                    };
+                    let Some(entries) = entries_weak.upgrade() else {
+                        break;
+                    };
+                    if retire_if_unwanted(&entries, &peer, &worker_interest, session) {
+                        break;
+                    }
+                    drop(entries);
+                    let banned = ctx
+                        .banned_peers
+                        .read()
+                        .await
+                        .get(&peer)
+                        .is_some_and(|until| *until > std::time::Instant::now());
+                    if banned {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(RECONNECT_MAX_DELAY);
+                        continue;
+                    }
+                    // Bound the whole dial, including the TCP connect. Cancellation
+                    // (contact removal/shutdown) also cancels an in-flight handshake.
+                    let result = tokio::time::timeout(
+                        HANDSHAKE_TIMEOUT * 3,
+                        connect_to_peer(&peer, &addr, &ctx),
+                    )
+                    .await;
+                    if !matches!(result, Ok(Ok(()))) {
+                        warn!(%peer, ?result, "supervisor: dial failed");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(RECONNECT_MAX_DELAY);
                     }
                 }
-
-                backoff = RECONNECT_MIN_DELAY;
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {}
-                    _ = shutdown_rx.changed() => {
-                        debug!(peer = %node_id, "supervisor: shutdown");
-                        return;
-                    }
+            };
+            tokio::select! {
+                _ = run => {},
+                _ = shutdown.changed() => {},
+            }
+            if let Some(entries) = entries_weak.upgrade() {
+                let mut entries = entries.lock().unwrap();
+                if entries
+                    .get(&peer)
+                    .is_some_and(|e| Arc::ptr_eq(&e.interest, &worker_interest))
+                {
+                    entries.remove(&peer);
                 }
             }
+            debug!(%peer, "supervisor: stopped");
         });
+        entries.insert(
+            peer,
+            Supervision {
+                addr,
+                interest,
+                task: task.abort_handle(),
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_prevents_late_supervision_and_dials() {
+        use konsensus_core::traits::transport::MessageTransport;
+        let identity = super::super::tests::make_identity(super::super::tests::TEST_MNEMONIC_A);
+        let peer = *identity.node_id();
+        let transport = NoiseTransport::new(
+            identity,
+            super::super::TransportConfig {
+                admission_mode: super::super::ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        );
+        // No receiver exists yet: shutdown must still remain visible to new tasks.
+        transport.shutdown();
+        transport.supervise_single_peer(peer, "127.0.0.1:9735".parse().unwrap());
+        assert!(transport.supervision.lock().unwrap().is_empty());
+        let error = transport
+            .connect(&peer, "127.0.0.1:9735")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("shut down"));
     }
 
-    /// Check if a node ID is in the whitelist.
-    ///
-    /// Returns `false` when the whitelist is empty — a node with no configured
-    /// peers rejects all connections (Principle 3: closed mesh). This prevents
-    /// a freshly initialized node from being open to the world.
-    pub(super) async fn is_whitelisted(&self, node_id: &NodeId) -> bool {
-        let wl = self.whitelist.read().await;
-        !wl.is_empty() && wl.contains(node_id)
+    #[tokio::test]
+    async fn acquiring_interest_before_retirement_keeps_worker_and_removal_cancels_it() {
+        let identity = super::super::tests::make_identity(super::super::tests::TEST_MNEMONIC_A);
+        let peer = *identity.node_id();
+        let transport = NoiseTransport::new(identity, Default::default());
+        let interest = Arc::new(Mutex::new(Interest::default()));
+        // A dormant worker lets us exercise retirement atomically without sockets.
+        let worker = tokio::spawn(std::future::pending::<()>());
+        transport.supervision.lock().unwrap().insert(
+            peer,
+            Supervision {
+                addr: "127.0.0.1:9735".parse().unwrap(),
+                interest: interest.clone(),
+                task: worker.abort_handle(),
+            },
+        );
+        let operation = transport.retain_reconnect(&peer).unwrap();
+        assert!(!retire_if_unwanted(
+            &transport.supervision,
+            &peer,
+            &interest,
+            false
+        ));
+        drop(operation);
+        transport.supervise_single_peer(peer, "127.0.0.1:9735".parse().unwrap());
+        assert!(!retire_if_unwanted(
+            &transport.supervision,
+            &peer,
+            &interest,
+            false
+        ));
+        transport.stop_supervising(&peer);
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(transport.supervision.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_reasons_expire_without_turning_strangers_into_contacts() {
+        let mut interest = Interest::default();
+        assert!(!interest.wanted(false));
+        assert!(interest.wanted(true));
+        let operation = Arc::new(());
+        interest.operation = Arc::downgrade(&operation);
+        assert!(interest.wanted(false));
+        drop(operation);
+        assert!(!interest.wanted(false));
+        interest.quote_until = Some(Instant::now() + Duration::from_secs(60));
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(interest.wanted(false));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!interest.wanted(false));
+        interest.contact = true;
+        assert!(interest.wanted(false));
     }
 }

@@ -142,20 +142,20 @@ socket-dependent suite remain blocked by the no-network constraint.
 These root causes are derived from code and the reported failures; the real
 regtest runtime was not available for this correction.
 
-1. **Offline quote was a fixture keepalive omission.** `three_node::connect`
-   opened Noise directly, without the production dialer's supervisor. The
-   transport closes an idle read at 30 seconds. The test waits for real
-   `LdkProvider::money_ready()` to expire (Lightning freshness is 60 seconds,
-   on-chain freshness 160 seconds), so the unpaid idle connection expires first.
-   Production startup and dynamic auto-connect peers use the supervisor's pings;
-   transport acceptance, pings and reconnects have no chain-readiness dependency.
-   The chain proxy forwards only Esplora HTTP, at a separate endpoint from Noise.
-   LDK peers are separate from BitSov's Noise peers. The fixture now sends real
-   Ping/Pong keepalives every 10 seconds, tracked and stopped with its application.
-   Reconnection remains explicit. The 429 scenario asserts both original Noise
-   connection generations throughout readiness loss and across the refusal,
-   distinguishing transport loss from the quote/refusal hop. This does not prove
-   the cause of Maya's live-run reachability issue.
+1. **Offline quote exposed a product keepalive and reconnect gap.** Raw
+   introduction/front-door dials and contacts with `auto_connect=false` had no
+   supervisor pings. Both readers expired after 30 seconds. The initial CI
+   `Recipient is offline` was a true positive; the harness-only Ping loop masked
+   it and has been removed. Every production connection now sends Ping every
+   10 seconds on both ends, independently of reconnect eligibility. The read
+   future retains its original 30-second deadline, including partial frames;
+   outgoing pings do not reset it. Reader completion, replacement, shutdown or
+   a failed ping write stops that connection's keepalive. The 429 scenario still
+   asserts both original Noise generations across readiness loss and refusal.
+   The slow-owner scenario explicitly asserts >30 seconds between quote and
+   send, unchanged generations on both ends, and successful paid delivery.
+   Transport liveness has no chain-readiness dependency. This does not establish
+   the cause of Maya's separate live-run reachability issue.
 2. **The ghost bound assumed durable absence evidence.** The existing test already
    passed channel removal, real `/tx/{txid}` 404, provider existence lookup,
    `closing_sats == 0`, and aggregate exclusion before reaching the failed bound.
@@ -186,3 +186,58 @@ suite. `cargo clippy --offline --locked -p konsensus-node --all-targets --featur
 regtest-e2e -- -D warnings` passed under the same sandbox. Cargo still reports the
 pre-existing sqlx-postgres future-compatibility notice. Core/electrs runtime tests
 were compiled but not run. No network, including port 3141, was contacted.
+
+## Product reconnect policy
+
+- Owner-added contacts default to `auto_connect=true`. All local contacts with a
+  usable listening endpoint get supervised reconnects, including legacy entries
+  that explicitly store `false`. The field remains accepted for compatibility;
+  it is not a reconnect opt-out. Remove a contact to stop its supervision.
+  Add, update, import, explicit Connect and node startup use the same supervisor.
+  Deletion also removes the persisted contact. Static config entries remain
+  owner configuration and must be removed from that file to remove them at boot.
+- An introduction/front-door open remains a one-off unprivileged dial. Its
+  authenticated, locally supplied endpoint is remembered only in memory while
+  connected or needed. It is never put in a contact list or published. The
+  supervisor may retry it only while an E2EE session exists, a quote is still
+  valid, or a quote/payment operation holds a reconnect handle. Expiring a quote,
+  dropping the last operation handle, or removing the session removes that
+  reason. A disconnected stranger without any reason is forgotten.
+- Retries use exponential backoff from 1 to 60 seconds, respect local bans, and
+  have a bounded dial deadline. Repeated registration is idempotent; address
+  changes replace the worker; explicit and supervised outbound dials serialize
+  by NodeId. Simultaneous inbound/outbound duplicates select the same surviving
+  socket at both ends using authenticated NodeId order. Contact removal and
+  shutdown cancel pending dials. Each reader and
+  keepalive is tied to its connection generation.
+- A listening endpoint must be supplied locally. Inbound ephemeral source ports
+  and the persisted `0.0.0.0:0` sentinel are never dial targets. An inbound-only
+  peer without a known listening endpoint must reconnect from its side; session
+  existence cannot manufacture an address. No directory or gossip is used.
+- Reconnect restores reachability only. Existing generation-bound quotes, paid
+  admission, reservation checks, and single-use recipient-bound payments retain
+  their checks. Reconnect never automatically pays or replays an operation.
+
+Doctrine: 1–6 hold for this change: liveness grants no admission or service,
+refusals spend nothing, keys remain identity, reconnect reasons and endpoints
+stay local, custody is unchanged, and runtime limits are reported explicitly.
+
+## Product-fix verification (2026-10-03)
+
+The final reviewed patch was tested offline under an OS sandbox denying all
+network access, including loopback. Across `konsensus-core`, `konsensus-message`,
+`konsensus-api`, and `konsensus-node` with `regtest-e2e`, Cargo reported **2,519
+passed, 183 failed, 10 ignored** (exit 101). Every failure was a denied socket
+operation or a resulting fixture failure. This is not a green runtime suite.
+[The verification record](testing/node-liveness-offline.txt) names every failed
+test, including the new >60-second acceptor, forced contact redial, stranger
+non-redial, live-session/operation reconnect, crossed-dial and cancellation tests.
+
+The socket-free tests passed: the owner-contact default, expiring reconnect
+reasons, atomic worker retirement, late shutdown, duplicate-direction selection,
+and the unchanged 30-second timeout for silent and partial-frame peers. Clippy
+passed offline for all four crates and all targets with `-D warnings`; Cargo
+still reports the pre-existing sqlx-postgres future-compatibility notice. The
+three-node regtest scenarios compiled but were not executed. No network was
+contacted. Independent source review approved the patch after the reported
+concurrency and lifecycle findings were resolved.

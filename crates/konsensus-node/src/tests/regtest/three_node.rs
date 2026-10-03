@@ -157,7 +157,6 @@ async fn connect(from: &app::App, to: &app::App, incident: &str) {
         to.transport.is_connected(from.state.identity.node_id())
     })
     .await;
-    from.keep_connection_alive(*to.state.identity.node_id()).await;
     // The production stateless quote gate quarantines a new connection for 1s.
     tokio::time::sleep(Duration::from_millis(1100)).await;
 }
@@ -223,7 +222,7 @@ async fn list_contact(from: &app::App, to: &app::App, incident: &str) {
             "/api/v1/peers",
             json!({
                 "node_id": to.state.identity.node_id().to_hex(),
-                "addr": to.transport.listen_addr().unwrap().to_string(), "auto_connect": false,
+                "addr": to.transport.listen_addr().unwrap().to_string(),
             }),
             true,
         )
@@ -645,6 +644,9 @@ async fn three_node_paid_e2e() {
 
     let first_c = quote(&alice, &carol, ROOM).await;
     let expires = first_c["expires_at"].as_u64().expect(SLOW_OWNER);
+    let idle_started = std::time::Instant::now();
+    let ac = alice.transport.connected_since(carol.state.identity.node_id()).await.unwrap();
+    let ca = carol.transport.connected_since(alice.state.identity.node_id()).await.unwrap();
     let payments = settled_outgoing(&a).await.len();
     let used = alice.used();
     // Real wall clock: neither the signed quote nor the owner's clock is mocked.
@@ -656,6 +658,11 @@ async fn three_node_paid_e2e() {
     {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    assert!(idle_started.elapsed() > Duration::from_secs(30), "{SLOW_OWNER}: exercise the old read timeout");
+    assert_eq!(alice.transport.connected_since(carol.state.identity.node_id()).await,
+        Some(ac), "{SLOW_OWNER}: product keepalive must preserve the dialer's quote link");
+    assert_eq!(carol.transport.connected_since(alice.state.identity.node_id()).await,
+        Some(ca), "{SLOW_OWNER}: product keepalive must preserve the acceptor's quote link");
     approve_contact(&alice, &carol, &first_c, None).await;
     paid(
         &alice,

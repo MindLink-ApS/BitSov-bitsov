@@ -33,7 +33,6 @@ use handshake::verify_identity_binding;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -361,19 +360,9 @@ pub enum ControlEvent {
     },
 }
 
-/// Keepalive interval — the dialing side's supervisor sends a Ping once this
-/// long has passed since the last one and the previous Pong wait is over, so
-/// the cadence is the larger of this and [`KEEPALIVE_TIMEOUT`].
-///
-/// That cadence must stay well under [`READ_TIMEOUT`]: the accepting side sends no pings of
-/// its own and closes a connection it has not read from for `READ_TIMEOUT`. At
-/// 30 s (equal to the read timeout) an idle connection was closed just as the
-/// ping went out, and every reconnect starts unprivileged, so a paid sender was
-/// demoted to a stranger after half a minute of silence.
+/// Each connection sends a Ping every ten seconds, on both ends, independent
+/// of reconnect eligibility. Sending never resets the 30-second read deadline.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-
-/// If no Pong received within this duration after a Ping, consider the connection dead.
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Minimum reconnection delay (exponential backoff base).
 const RECONNECT_MIN_DELAY: Duration = Duration::from_secs(1);
@@ -411,13 +400,8 @@ pub(crate) const MAX_TRACKED_SUBNETS: usize = 65_536;
 /// Prevents slowloris attacks where an attacker sends partial data to hold connections.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-// An idle connection must see at least two pings per read timeout.
-const _: () = {
-    let interval = KEEPALIVE_INTERVAL.as_secs();
-    let pong_wait = KEEPALIVE_TIMEOUT.as_secs();
-    let cadence = if interval > pong_wait { interval } else { pong_wait };
-    assert!(cadence * 2 <= READ_TIMEOUT.as_secs());
-};
+// Allow multiple keepalive round trips inside the unchanged dead-read deadline.
+const _: () = assert!(KEEPALIVE_INTERVAL.as_secs() * 2 < READ_TIMEOUT.as_secs());
 
 /// Timeout for the entire Noise_XX + federation handshake.
 /// Prevents attackers from holding inbound connection slots indefinitely.
@@ -628,7 +612,7 @@ struct PeerConnection {
     connected_at: Instant,
     /// Last time we received any frame from this peer (monotonic).
     last_recv: Instant,
-    /// Outstanding ping nonce (Some if we sent a Ping and are waiting for Pong).
+    /// Latest connection-local ping awaiting its matching pong.
     pending_ping: Option<u64>,
     /// Leaky-bucket level for invalid (unparseable) frames.
     ///
@@ -656,11 +640,14 @@ type PeerMap = Arc<RwLock<HashMap<NodeId, Arc<Connection>>>>;
 /// Shared map of temporarily banned peers. Value is the ban expiry time (monotonic).
 type BanMap = Arc<RwLock<HashMap<NodeId, Instant>>>;
 
-/// Shared context passed to per-peer connection tasks (reader, supervisor, incoming handler).
-///
-/// Groups the fields that every connection handler needs without requiring 8+ arguments.
+/// Serialize outbound handshakes per identity; unused entries hold no strong references.
+type DialLocks = Arc<std::sync::Mutex<HashMap<NodeId, std::sync::Weak<Mutex<()>>>>>;
+
+/// Shared context passed to connection, reader and supervisor tasks.
 #[derive(Clone)]
 struct TransportCtx {
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    dial_locks: DialLocks,
     identity: Arc<NodeIdentity>,
     config: TransportConfig,
     whitelist: SharedWhitelist,
@@ -699,8 +686,11 @@ pub struct NoiseTransport {
     control_rx: Mutex<mpsc::Receiver<ControlEvent>>,
     /// Listener shutdown signal.
     shutdown: tokio::sync::watch::Sender<bool>,
-    /// Monotonic counter for ping nonces (shared with supervisor tasks).
-    ping_counter: Arc<AtomicU64>,
+    /// Local reconnect reasons and one worker per known dial endpoint.
+    supervision: supervisor::SupervisionMap,
+    dial_locks: DialLocks,
+    /// Only session existence is consulted; this confers no admission authority.
+    reconnect_sessions: Arc<std::sync::RwLock<Option<std::sync::Weak<konsensus_crypto::SessionManager>>>>,
     /// Actual bound address after `start_listener()` (may differ from config if port 0 was used).
     actual_listen_addr: tokio::sync::watch::Sender<Option<SocketAddr>>,
     /// Receiver for the actual listen address.
@@ -735,7 +725,9 @@ impl NoiseTransport {
             control_tx,
             control_rx: Mutex::new(control_rx),
             shutdown,
-            ping_counter: Arc::new(AtomicU64::new(1)),
+            supervision: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            dial_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reconnect_sessions: Arc::new(std::sync::RwLock::new(None)),
             actual_listen_addr,
             actual_listen_addr_rx,
             cookie_keyring: Arc::new(cookie::CookieKeyring::random()),
@@ -817,7 +809,7 @@ async fn read_bounded_message(
 /// Applies [`READ_TIMEOUT`] to prevent slowloris attacks where an attacker
 /// sends partial data to hold connections open indefinitely.
 async fn read_noise_message(
-    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> Result<Vec<u8>, WireError> {
     // Wrap the entire read (length prefix + payload) in a timeout
     tokio::time::timeout(READ_TIMEOUT, async {
@@ -902,6 +894,9 @@ impl MessageTransport for NoiseTransport {
 
     #[instrument(skip(self), fields(peer = %peer, addr = %addr))]
     async fn connect(&self, peer: &NodeId, addr: &str) -> Result<(), TransportError> {
+        if *self.shutdown.borrow() {
+            return Err(TransportError::Other("transport shut down".into()));
+        }
         // Check whitelist (Principle 3). In PriceOpen mode the outbound wall is
         // skipped so a stranger can be dialed UNPRIVILEGED; the per-message
         // PaymentGate remains the sole admission authority.
@@ -913,16 +908,18 @@ impl MessageTransport for NoiseTransport {
             )));
         }
 
-        // Check if already connected
-        if self.is_connected(peer).await {
-            return Ok(());
-        }
-
         let socket_addr: SocketAddr = addr
             .parse()
             .map_err(|e| TransportError::ConnectionFailed(format!("invalid address: {e}")))?;
 
+        if self.is_connected(peer).await {
+            self.track_peer(*peer, socket_addr, self.is_whitelisted(peer).await);
+            return Ok(());
+        }
+
         let ctx = TransportCtx {
+            shutdown: self.shutdown.subscribe(),
+            dial_locks: Arc::clone(&self.dial_locks),
             identity: Arc::clone(&self.identity),
             config: self.config.clone(),
             whitelist: Arc::clone(&self.whitelist),
@@ -932,24 +929,34 @@ impl MessageTransport for NoiseTransport {
             control_tx: self.control_tx.clone(),
             cookie_keyring: Arc::clone(&self.cookie_keyring),
         };
-        handshake::connect_to_peer(peer, &socket_addr, &ctx).await
+        handshake::connect_to_peer(peer, &socket_addr, &ctx).await?;
+        // Remember only an owner-supplied, successfully authenticated dial target.
+        // An inbound source port is never treated as a listening endpoint.
+        self.track_peer(*peer, socket_addr, self.is_whitelisted(peer).await);
+        Ok(())
     }
 
     async fn disconnect(&self, peer: &NodeId) -> Result<(), TransportError> {
         let conn = self.peers.write().await.remove(peer);
         if let Some(conn) = conn {
-            // Send graceful disconnect
-            let disconnect = Frame::Disconnect {
-                reason: "requested".into(),
-            };
-            let mut conn = conn.lock().await;
-            if let Ok(bytes) = disconnect.to_bytes() {
-                if let Ok(encrypted) = conn.noise.encrypt(&bytes) {
-                    if let Err(e) = write_noise_message(&mut conn.writer, &encrypted).await {
-                        debug!(error = %e, "failed to send disconnect frame (peer may already be gone)");
+            // The reader owns another Arc: removal alone does not close it.
+            // Close on cancellation too, even while waiting for a busy writer.
+            struct CloseOnDrop(Arc<Connection>);
+            impl Drop for CloseOnDrop {
+                fn drop(&mut self) { self.0.close(); }
+            }
+            let _close = CloseOnDrop(Arc::clone(&conn));
+            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                let disconnect = Frame::Disconnect { reason: "requested".into() };
+                let mut state = conn.lock().await;
+                if let Ok(bytes) = disconnect.to_bytes() {
+                    if let Ok(encrypted) = state.noise.encrypt(&bytes) {
+                        if let Err(e) = write_noise_message(&mut state.writer, &encrypted).await {
+                            debug!(error = %e, "failed to send disconnect frame (peer may already be gone)");
+                        }
                     }
                 }
-            }
+            }).await;
         }
         Ok(())
     }
@@ -1075,10 +1082,19 @@ impl MessageTransport for NoiseTransport {
     }
 
     async fn remove_from_whitelist(&self, peer: &NodeId) {
+        self.stop_supervising(peer);
         let mut wl = self.whitelist.write().await;
         if wl.remove(peer) {
             info!(peer = %peer.to_hex(), "removed peer from transport whitelist");
         }
+    }
+
+    async fn retain_peer(&self, peer: &NodeId) -> Option<Arc<()>> {
+        self.retain_reconnect(peer)
+    }
+
+    async fn reconnect_for(&self, peer: &NodeId, duration: Duration) {
+        self.extend_reconnect(peer, duration);
     }
 
     async fn supervise_peer(&self, peer: &NodeId, addr: &str) {
@@ -1108,12 +1124,12 @@ mod tests {
     use konsensus_core::identity::NodeIdentity;
     use konsensus_core::types::{Nonce, PaymentProof, Recipient, Signature};
 
-    const TEST_MNEMONIC_A: &str =
+    pub(super) const TEST_MNEMONIC_A: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon art";
 
-    const TEST_MNEMONIC_B: &str =
+    pub(super) const TEST_MNEMONIC_B: &str =
         "zoo zoo zoo zoo zoo zoo zoo zoo \
          zoo zoo zoo zoo zoo zoo zoo zoo \
          zoo zoo zoo zoo zoo zoo zoo vote";
@@ -1123,7 +1139,7 @@ mod tests {
          cage absurd amount doctor acoustic avoid letter advice cage absurd \
          amount doctor acoustic bless";
 
-    fn make_identity(mnemonic: &str) -> Arc<NodeIdentity> {
+    pub(super) fn make_identity(mnemonic: &str) -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::from_mnemonic(mnemonic, "").unwrap())
     }
 
@@ -4284,3 +4300,6 @@ mod cancelled_noise_write_tests {
 
 #[cfg(test)]
 mod reply_tests;
+
+#[cfg(test)]
+mod idle_regressions;

@@ -418,10 +418,10 @@ impl KonsensusNode {
     }
 
     /// Start the node — begins listening for peer connections and starts
-    /// the connection supervisor for auto-connect peers.
+    /// the connection supervisor for local contacts.
     ///
     /// The supervisor monitors each peer's connection health, reconnects
-    /// with exponential backoff on drops, and sends keepalive pings.
+    /// with exponential backoff on drops, while each connection handles its own keepalive.
     pub async fn start(&self) -> Result<()> {
         // Start P2P transport listener
         self.transport
@@ -431,10 +431,10 @@ impl KonsensusNode {
 
         info!(addr = %self.config.network.listen_addr, "P2P transport listening");
 
-        // Start supervised connections for auto-connect peers
+        // Start supervised connections for local contacts
         let registry = self.peer_registry.read().await;
         let supervised: Vec<_> = registry
-            .auto_connect_peers()
+            .all()
             .into_iter()
             .map(|e| (e.node_id, e.addr))
             .collect();
@@ -443,7 +443,7 @@ impl KonsensusNode {
         if !supervised.is_empty() {
             info!(
                 count = supervised.len(),
-                "starting connection supervisor for auto-connect peers"
+                "starting connection supervisor for local contacts"
             );
             self.transport.start_supervisor(supervised);
         }

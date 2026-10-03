@@ -186,11 +186,19 @@ pub trait MessageTransport: Send + Sync {
     /// No-op for transports that don't enforce whitelists.
     async fn remove_from_whitelist(&self, _peer: &NodeId) {}
 
+    /// Hold a local reconnect reason while a quote/payment operation is running.
+    /// Dropping the last handle releases it. Does not admit, pay or replay work.
+    /// Only a previously validated local dial endpoint can be retained.
+    async fn retain_peer(&self, _peer: &NodeId) -> Option<std::sync::Arc<()>> { None }
+
+    /// Retain reconnect interest until a displayed quote expires.
+    async fn reconnect_for(&self, _peer: &NodeId, _duration: std::time::Duration) {}
+
     /// Start connection supervision for a single peer.
     ///
     /// Spawns a background task that monitors the connection to `peer` and
     /// automatically reconnects with exponential backoff if the connection
-    /// drops. Also sends keepalive pings to detect silent failures.
+    /// drops. Connection liveness is independent of supervision.
     ///
     /// Called when a peer is added dynamically (e.g. via invite redemption)
     /// so that the peer gets the same reconnection resilience as peers
