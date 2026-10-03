@@ -1,0 +1,17 @@
+# Example user unit: install as ~/.config/systemd/user/konsensus.service.
+# Adjust the binary/config paths to the existing installation before enabling.
+[Unit]
+Description=BitSov node
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/konsensus start --config %h/.local/share/konsensus/konsensus.toml --owner-control
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=konsensus
+
+[Install]
+WantedBy=default.target

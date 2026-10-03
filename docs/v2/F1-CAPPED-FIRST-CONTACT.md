@@ -216,3 +216,40 @@ approval. Cached quotes remain chat-only and expire at the signed BOLT11 expiry,
 which may be earlier than the admission request deadline.
 
 Owner terminal commands for the app handoff: [Owner approvals](OWNER-APPROVALS.md).
+
+## Recipient readiness refusals
+
+A valid, rate-permitted `RequestInvoice` for first contact receives the existing
+`InvoiceError { request_id, reason }` frame when the recipient cannot prepare a
+quote. Stable readiness reasons are:
+
+| Wire `reason` | Meaning | Sender API `reason` |
+| --- | --- | --- |
+| `konsensus:not_ready:chain_unavailable` | Chain data unavailable, chain/pricing preparation deadline exceeded, or backend reports chain-source failure | `chain_unavailable` |
+| `konsensus:not_ready:not_synced` | Chain reports unsynced, or the Lightning backend refuses as not ready | `not_synced` |
+
+The sender's first-contact quote and compose endpoints return HTTP **503** with
+`code: "peer_not_ready"`, the reason above, and `retry_allowed: true`. This is the
+recipient's readiness, not the sender's `money_ready`. An invoice readiness
+refusal creates no payment or admission/session state and does not promote the
+connection. Existing bounded replay and source/global request/reply counters
+still apply; excess requests can be dropped. Readiness plus pricing has a
+five-second deadline, and stateless invoice creation has its own five-second
+deadline. There is no stateful invoice fallback.
+
+`InvoiceError` has no separate signature in this protocol. It travels over the
+existing authenticated, encrypted Noise connection. The sender accepts an
+unprivileged refusal only for a pending request bound to that NodeId; a different
+peer cannot cancel it. BOLT11 success responses retain their existing signatures.
+Refusals contain fixed codes, not raw backend errors or service addresses.
+
+The frame schema and protocol version are unchanged. New senders still time out
+against older recipients that silently drop a request. Older senders may report
+these new reason strings as a generic refusal or ignore them until timeout;
+they cannot interpret them as invoices or payment authorization.
+
+Unclassified pricing or invoice failures use `konsensus:price_unavailable` or
+`konsensus:invoice_unavailable`; an exhausted attempt uses
+`konsensus:quote_expired`. These remain generic refusals, not assertions that a
+reachable chain is unavailable or unsynced. Disk and unsupported-backend
+refusals retain their existing codes.

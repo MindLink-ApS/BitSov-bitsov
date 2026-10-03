@@ -244,8 +244,8 @@ pub enum PairingError {
          front_door."
     )]
     OwnerChannelUnavailable,
-    /// Neither the owner terminal nor a protected elevation file is available.
-    #[error("owner_approval_unavailable: start with --owner-control and provide an owner terminal or a writable owner-only pairing directory")]
+    /// No supported owner approval delivery channel is available.
+    #[error("owner_approval_unavailable: start with --owner-control and provide an owner terminal or a writable owner-only pairing directory (identity replacement requires an owner terminal)")]
     OwnerApprovalUnavailable,
     /// Durable state could not be read or written.
     #[error("pairing store error: {0}")]
@@ -807,7 +807,9 @@ impl PairingService {
         // reissuing fresh codes, including after an unclean shutdown.
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with("owner-approval-") {
+            if entry.file_name().to_string_lossy().starts_with("owner-approval-")
+                && entry.file_type()?.is_file()
+            {
                 std::fs::remove_file(entry.path())?;
             }
         }
@@ -891,13 +893,14 @@ impl PairingService {
     }
 
     /// Deliver approval to the terminal, or a protected file for headless
-    /// elevations, and remember digests of what the owner channel showed.
+    /// owner-confirmable operations, and remember digests of the delivered codes.
     ///
     /// Every operation gets the full `<label> CODE <nonce>` line. A grant
     /// request (`short_code`) also gets a short code the owner types into
     /// `konsensus grant`. Neither reaches HTTP, control socket replies, or
-    /// stdout/stderr. Only elevation labels (`GRANT ...`) allow the file
-    /// fallback; device registration and identity replacement remain terminal-only.
+    /// stdout/stderr. Operations with an owner CLI command (elevations and
+    /// device registration) allow file fallback; identity replacement remains
+    /// terminal-only and refuses clearly when that delivery is unavailable.
     fn console_challenge(
         &self,
         inner: &mut Inner,
@@ -938,10 +941,10 @@ impl PairingService {
             });
         let approval_file = match delivered {
             Ok(()) => None,
-            Err(_) if label.starts_with("GRANT ") => {
+            Err(_) if command.is_some() => {
                 Some(self.write_owner_approval_file(op_id, expires_at, &text)?)
             }
-            Err(error) => return Err(error.into()),
+            Err(_) => return Err(PairingError::OwnerApprovalUnavailable),
         };
         let now = chrono::Utc::now().timestamp();
         inner.owner_confirmations.retain(|_, c| c.expires_at > now);
@@ -982,7 +985,7 @@ impl PairingService {
                 .and_then(|()| file.sync_all())
                 .map_err(|_| PairingError::OwnerApprovalUnavailable)?;
             tracing::info!(path = %protected.0.display(), expires_at,
-                "owner approval is in this owner-only file; read it privately, then grant over control.sock");
+                "owner approval is in this owner-only file; read it privately, then approve over control.sock");
             Ok(protected)
         }
         #[cfg(not(unix))]
@@ -999,7 +1002,8 @@ impl PairingService {
         inner.owner_confirmations.retain(|op_id, c| {
             c.expires_at > now
                 && (c.approval_file.is_none()
-                    || inner.file.pending_elevations.iter().any(|op| &op.op_id == op_id))
+                    || inner.file.pending_elevations.iter().any(|op| &op.op_id == op_id)
+                    || inner.file.pending_device_keys.iter().any(|op| &op.op_id == op_id))
         });
     }
 
