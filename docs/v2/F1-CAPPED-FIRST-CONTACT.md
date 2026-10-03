@@ -52,13 +52,15 @@ message-idempotency API: clients must not blindly retry a lost send response.
 The whitepaper's irreducible floor permits only the work needed to determine
 whether inbound contact is paid. Its membrane section describes a bounded,
 unprivileged quarantine before promotion; the 2026-07-01 keystone specifically
-has the target re-price and the requester pay the target's invoice. This change
-implements that narrow invoice-payment preparation step. It does not interpret
-the floor as permission for a general unpaid price/invoice service. The literal
-"no invoice" clause and an invoice-first keystone cannot both apply without
-this exception: here the floor includes only the bounded payment-preparation
-quote needed to offer that payment. This is an explicit protocol clarification,
-not a claim that creating an invoice is already settled work.
+has the target re-price and the requester pay the target's invoice. The
+stranger quote below is an instance of the **receptor** rule
+(`ADR-042-receptor-floor.md`): a stateless, node-signed, short-lived,
+one-per-request, rate-capped quote that discloses only one act's price and is
+the same for human and agent requesters. The receptor is part of the floor; it
+is payment preparation, not settled work. Any quote that fails that test,
+including a general unpaid price/invoice service, remains beyond the floor.
+This section applies the rule to `KIND_CHAT` first contact only; extending it to
+other act types is tracked in `ROADMAP.md`. Behavior is unchanged.
 
 The stranger path returns a signed invoice and its chat price (the signed
 message-price field), or the fixed `stateless_quote_unsupported` refusal. It never
