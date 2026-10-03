@@ -48,7 +48,9 @@ use crate::state::AppState;
 /// success — a failure here means the operation did not happen.
 fn map_err(e: PairingError) -> ApiError {
     match e {
-        PairingError::Closed => ApiError::Conflict(e.to_string()),
+        PairingError::Closed | PairingError::OwnerApprovalUnavailable => {
+            ApiError::Conflict(e.to_string())
+        }
         PairingError::TooManyPending => ApiError::TooManyRequests(e.to_string()),
         PairingError::UnknownPending | PairingError::BadProof => {
             ApiError::Unauthorized(e.to_string())

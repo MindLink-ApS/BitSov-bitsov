@@ -483,14 +483,9 @@ async fn a_sidecar_never_honours_a_front_door_grant() {
     assert_eq!(scopes, ["read", "receive"]);
     assert_eq!(fx.publish(&token, "Ada").await.0, StatusCode::FORBIDDEN);
     let (status, op) = fx.ask(json!({"scopes": ["front_door"]})).await;
-    assert_eq!(status, StatusCode::OK, "{op}");
-    assert!(
-        op["owner_action"]
-            .as_str()
-            .unwrap()
-            .starts_with("unavailable"),
-        "{op}"
-    );
+    assert_eq!(status, StatusCode::CONFLICT, "{op}");
+    assert!(op["error"].as_str().unwrap().contains("owner_approval_unavailable"));
+    assert!(fx.service.snapshot().pending_elevations.is_empty());
 }
 
 #[test]

@@ -1242,6 +1242,14 @@ async fn elevation_status_is_private_on_remote_and_loopback() {
             let (_, token_b) = pair_and_token(&local, &service, &SigningKey::from_bytes(&[82; 32])).await;
             let app = if remote { remote_app(state) } else { local };
             for scope in [Scope::Spend, Scope::FrontDoor] {
+                if !owner_control {
+                    let (status, body) = post(&app, "/api/v1/pair/elevation-request",
+                        serde_json::json!({"scopes": [scope.as_str()]}), Some(&token_a)).await;
+                    assert_eq!(status, StatusCode::CONFLICT);
+                    assert!(body.to_string().contains("owner_approval_unavailable"));
+                    assert!(service.snapshot().pending_elevations.is_empty());
+                    continue;
+                }
                 let op = service.create_elevation_request(&a, vec![scope]).unwrap();
                 for phase in 0..2 {
                     for (token, id, expected) in [
@@ -1313,4 +1321,239 @@ async fn pending_elevation_cap_is_per_client_and_releases_cancelled_slots() {
     service.create_elevation_request(&b, vec![Scope::Spend]).unwrap();
     service.cancel_pending(&a, &ops[0].op_id).unwrap();
     service.create_elevation_request(&a, vec![Scope::Spend]).unwrap();
+}
+
+struct NoOwnerTerminal;
+
+impl std::io::Write for NoOwnerTerminal {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(6))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn headless_elevation_uses_protected_file_and_grants_over_socket() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let base = test_state_with_data_dir(tmp.path().to_path_buf());
+    let service = Arc::new(
+        PairingService::open(
+            tmp.path(),
+            pairing::identity_fingerprint(&base.identity.node_id().to_hex()),
+            true,
+        )
+        .unwrap()
+        .with_owner_console(Box::new(NoOwnerTerminal))
+        .without_stdout_code(),
+    );
+    let app = test_router(Arc::new(AppState {
+        pairing: Some(service.clone()),
+        ..(*base).clone()
+    }));
+    let (client, token) = pair_and_token(&app, &service, &SigningKey::from_bytes(&[92; 32])).await;
+    let (status, body) = post(
+        &app,
+        "/api/v1/pair/elevation-request",
+        serde_json::json!({"scopes": ["spend"]}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let op_id = body["op_id"].as_str().unwrap();
+    let path = service.dir().join(format!("owner-approval-{op_id}"));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(service.dir())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    let phrase = text.lines().find(|l| l.starts_with("GRANT ")).unwrap();
+    let code = text
+        .lines()
+        .find_map(|l| {
+            l.split_once("type this code when it asks: ")
+                .map(|(_, c)| c)
+        })
+        .unwrap();
+    assert!(!body.to_string().contains(code));
+    assert!(!body.to_string().contains(phrase));
+    assert!(!std::fs::read_to_string(service.dir().join("clients.json"))
+        .unwrap()
+        .contains(code));
+    let context = Arc::new(control::ControlContext {
+        service: service.clone(),
+        identity_fingerprint: service.bound_fingerprint(),
+        data_dir: tmp.path().to_path_buf(),
+        mnemonic_path: tmp.path().join("mnemonic.txt"),
+        replacement_guard: control::ReplacementGuard {
+            layout: konsensus_api::bootstrap::DataDirLayout::new(tmp.path()),
+            uses_identity_derived_keys: false,
+            has_identity_passphrase: false,
+        },
+    });
+    let server = control::ControlServer::bind(tmp.path(), context).unwrap();
+    let socket = server.path().to_path_buf();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let status = control::send(&socket, &control::ControlRequest::Status)
+        .await
+        .unwrap();
+    assert!(!serde_json::to_string(&status).unwrap().contains(code));
+    let granted = control::send(
+        &socket,
+        &control::ControlRequest::Grant {
+            op_id: op_id.to_string(),
+            confirmation: code.to_string(),
+            terms: konsensus_api::spend_budget::GrantTerms::new(1000),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(granted, control::ControlResponse::Ok { .. }));
+    assert!(!path.exists(), "consumed codes must be removed");
+    assert!(matches!(
+        service.elevation_status(&client, op_id).unwrap(),
+        pairing::ElevationStatus::Granted
+    ));
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn headless_elevation_without_owner_delivery_returns_conflict() {
+    for owner_control in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = test_state_with_data_dir(tmp.path().to_path_buf());
+        let service = Arc::new(
+            PairingService::open(
+                tmp.path(),
+                pairing::identity_fingerprint(&base.identity.node_id().to_hex()),
+                owner_control,
+            )
+            .unwrap()
+            .with_owner_console(Box::new(NoOwnerTerminal))
+            .without_stdout_code(),
+        );
+        let app = test_router(Arc::new(AppState {
+            pairing: Some(service.clone()),
+            ..(*base).clone()
+        }));
+        let (_, token) = pair_and_token(&app, &service, &SigningKey::from_bytes(&[93; 32])).await;
+        // No directory to deliver into; keep the service/token live in memory.
+        std::fs::rename(service.dir(), tmp.path().join("unavailable")).unwrap();
+        let (status, body) = post(
+            &app,
+            "/api/v1/pair/elevation-request",
+            serde_json::json!({"scopes": ["spend"]}),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.to_string().contains("owner_approval_unavailable"));
+        assert!(service.snapshot().pending_elevations.is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_output_child() {
+    let Some(dir) = std::env::var_os("BITSOV_HEADLESS_TEST_DIR") else {
+        return;
+    };
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(std::io::stdout)
+        .init();
+    let service = PairingService::open(std::path::Path::new(&dir), "test".into(), true)
+        .unwrap()
+        .with_owner_console(Box::new(NoOwnerTerminal));
+    let key = SigningKey::from_bytes(&[97; 32]);
+    let client = service
+        .create_verified_remote_pairing(
+            "test",
+            &hex::encode(key.verifying_key().to_bytes()),
+            &[98; 32],
+        )
+        .unwrap();
+    service
+        .create_elevation_request(&client.client_id, vec![Scope::Spend])
+        .unwrap();
+    // Simulate process death so the parent can inspect the private code file.
+    std::mem::forget(service);
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_codes_never_reach_stdout_stderr_or_tracing() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "headless_output_child", "--nocapture"])
+        .env("BITSOV_HEADLESS_TEST_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let path = std::fs::read_dir(dir.path().join("pairing"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("owner-approval-")
+        })
+        .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let phrase = text.lines().find(|l| l.starts_with("GRANT ")).unwrap();
+    let nonce = phrase.split_once(" CODE ").unwrap().1;
+    let code = text
+        .lines()
+        .find_map(|l| {
+            l.split_once("type this code when it asks: ")
+                .map(|(_, c)| c)
+        })
+        .unwrap();
+    for bytes in [&output.stdout, &output.stderr] {
+        let captured = String::from_utf8_lossy(bytes);
+        assert!(!captured.contains(nonce));
+        assert!(!captured.contains(code));
+        assert!(!captured.contains(&code.replace('-', "")));
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&path.display().to_string()),
+        "only the path is announced"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_front_door_can_be_granted_without_spend() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = PairingService::open(dir.path(), "test".into(), true)
+        .unwrap().with_owner_console(Box::new(NoOwnerTerminal));
+    let key = SigningKey::from_bytes(&[95; 32]);
+    let client = service.create_verified_remote_pairing("test", &hex::encode(key.verifying_key().to_bytes()), &[96; 32]).unwrap();
+    let op = service
+        .create_elevation_request(&client.client_id, vec![Scope::FrontDoor])
+        .unwrap();
+    let path = service.dir().join(format!("owner-approval-{}", op.op_id));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let phrase = text
+        .lines()
+        .find(|line| line.starts_with("GRANT "))
+        .unwrap();
+    service.grant_front_door(&op.op_id, phrase, 60).unwrap();
+    assert!(!path.exists());
+    assert!(service.snapshot().grants.is_empty());
+    assert_eq!(service.snapshot().front_door_grants.len(), 1);
 }

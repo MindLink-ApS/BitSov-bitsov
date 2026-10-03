@@ -294,7 +294,7 @@ fn sidecar_reopen_does_not_inherit_owner_granted_spend() {
 #[test]
 fn sidecar_elevation_unavailable() {
     // The packaged sidecar deployment: no owner control socket, so elevation
-    // can be REQUESTED and never obtained. This is the operator lock, asserted
+    // is refused at request time. This is the operator lock, asserted
     // by effect: not a scope check that a cleverer caller might satisfy.
     let tmp = tempfile::tempdir().unwrap();
     let sidecar = Arc::new(
@@ -305,12 +305,13 @@ fn sidecar_elevation_unavailable() {
     let key = client_key(3);
     let client = pair(&sidecar, &key, "packaged app");
 
-    let op = sidecar
+    let err = sidecar
         .create_elevation_request(&client.client_id, vec![Scope::Spend])
-        .unwrap();
-    let phrase = pairing::grant_confirmation_phrase(&op);
+        .unwrap_err();
+    assert!(matches!(err, PairingError::OwnerApprovalUnavailable));
+    assert!(sidecar.snapshot().pending_elevations.is_empty());
 
-    let err = sidecar.grant_elevation(&op.op_id, &phrase, konsensus_api::spend_budget::GrantTerms::new(1_000_000)).unwrap_err();
+    let err = sidecar.grant_elevation("unknown", "unknown", konsensus_api::spend_budget::GrantTerms::new(1_000_000)).unwrap_err();
     assert!(
         matches!(err, PairingError::OwnerChannelUnavailable),
         "sidecar elevation must be unavailable, got: {err}"
