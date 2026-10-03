@@ -374,3 +374,19 @@ async fn generation_change_before_dispatch_reports_no_admission_fee_ceiling() {
     assert_eq!(spent, 0);
     assert_message_fee_only(&body);
 }
+
+#[tokio::test]
+async fn read_scope_quote_moves_no_money_and_does_not_authorize_send() {
+    let mut net = net().await;
+    net.token = auth::create_token(&net.state.identity.node_id().to_hex(),
+        &net.state.jwt_secret, vec![auth::Scope::Read, auth::Scope::Receive]).unwrap();
+    let (status, body) = net.post("/api/v1/messages/first-contact/quote",
+        serde_json::json!({"recipient": net.contact.peer.to_hex()})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total_msat"], 14_000); // admission + message + two routing ceilings
+    assert_eq!(net.spent().await, 0);
+    assert!(!net.contact.paid.load(Ordering::SeqCst));
+    let (status, body) = net.compose(&uuid::Uuid::new_v4().to_string(), 4000).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(net.spent().await, 0);
+}

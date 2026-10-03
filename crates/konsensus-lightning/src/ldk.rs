@@ -272,7 +272,7 @@ pub struct LdkProvider {
     /// uses for chain sync, so verification reflects what LDK saw.
     esplora_url: String,
     bitcoind: Option<konsensus_chain::BitcoindProvider>,
-    electrum: Option<konsensus_chain::ElectrumProvider>,
+    electrum: Option<Arc<konsensus_chain::ElectrumProvider>>,
     /// L0g (2026-04-30): set to `true` to signal the dedicated event
     /// drainer task to exit. Set during graceful shutdown BEFORE
     /// `node.stop()` so the drainer doesn't try to call into a stopped
@@ -308,6 +308,54 @@ impl std::fmt::Debug for LdkProvider {
 static INVOICE_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl LdkProvider {
+    /// A monitor can survive funding that never reached the chain. Value a
+    /// removed channel only after checking its funding, without changing LDK's
+    /// monitor/recovery state. Queries use the configured backend exclusively.
+    async fn funded_balances(&self, channels: &[ldk_node::ChannelDetails]) -> Result<ldk_node::BalanceDetails, LightningError> {
+        let mut balances = self.node.list_balances();
+        let open: std::collections::HashSet<_> = channels.iter().map(|ch| ch.channel_id).collect();
+        crate::balance::verify_closed_funding(&mut balances, &open, |channel_id| async move {
+            let funding = self.node.channel_funding_outpoint(channel_id)
+                .ok_or_else(|| LightningError::Backend("channel funding monitor unavailable".into()))?;
+            self.funding_present(&funding.txid.to_string()).await
+        }).await?;
+        Ok(balances)
+    }
+
+    async fn funding_present(&self, txid: &str) -> Result<bool, LightningError> {
+        let result = if let Some(rpc) = &self.bitcoind {
+            // Absence requires independent mempool and synced txindex evidence.
+            rpc.funding_present(txid).await
+        } else if let Some(server) = &self.electrum {
+            // A cancelled spawn_blocking lookup keeps running. Keep its permit
+            // in an owned task until it finishes, so repeated timed-out reads
+            // cannot accumulate background Electrum workers.
+            static VERIFY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+            let permit = VERIFY.acquire().await
+                .map_err(|_| LightningError::Backend("funding verifier closed".into()))?;
+            let server = Arc::clone(server);
+            let txid = txid.to_owned();
+            tokio::spawn(async move {
+                let _permit = permit;
+                server.funding_present(&txid).await
+            }).await.map_err(|_| LightningError::Backend("funding verification worker failed".into()))?
+        } else {
+            let response = reqwest::Client::new()
+                .get(format!("{}/tx/{txid}/status", self.esplora_url.trim_end_matches('/')))
+                .send().await.map_err(|_| LightningError::Backend("funding status request failed".into()))?;
+            let status = response.status().as_u16();
+            // Error bodies are irrelevant; distinguish absence without parsing.
+            if status != 200 { return crate::balance::decode_funding_status(status, &[]); }
+            let body = response.bytes().await
+                .map_err(|_| LightningError::Backend("funding status body unavailable".into()))?;
+            return crate::balance::decode_funding_status(status, &body);
+        };
+        match result {
+            Ok(present) => Ok(present),
+            Err(error) => Err(LightningError::Backend(format!("funding presence unavailable: {error}"))),
+        }
+    }
+
     /// Configure the ordinary payment fee ceiling before sharing this provider.
     pub fn with_routing_fee_policy(mut self, policy: konsensus_core::traits::lightning::RoutingFeePolicy) -> Self {
         self.routing_fee_policy = policy;
@@ -432,7 +480,8 @@ impl LdkProvider {
             .clone()
             .map(konsensus_chain::ElectrumProvider::new)
             .transpose()
-            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
+            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?
+            .map(Arc::new);
         if let Some(url) = &config.rgs_url {
             validate_startup_url("rgs_url", url)?;
         }
@@ -1183,9 +1232,9 @@ impl LightningProvider for LdkProvider {
 
     #[instrument(skip(self))]
     async fn get_balance_msat(&self) -> Result<u64, LightningError> {
-        let balances = self.node.list_balances();
-        // Legacy aggregate: claimable Lightning plus spendable on-chain, not
-        // spendable Lightning capacity. Preserve its value for existing clients.
+        let balances = self.funded_balances(&self.node.list_channels()).await?;
+        // Legacy aggregate, excluding removed-channel claims without confirmed
+        // funding. This remains claimable value, not spendable LN capacity.
         let lightning_msat = balances.total_lightning_balance_sats * 1000;
         let onchain_msat = balances.spendable_onchain_balance_sats * 1000;
 
@@ -1193,8 +1242,8 @@ impl LightningProvider for LdkProvider {
     }
 
     async fn get_balance_breakdown(&self) -> Result<WalletBalanceBreakdown, LightningError> {
-        let balances = self.node.list_balances();
         let channels = self.node.list_channels();
+        let balances = self.funded_balances(&channels).await?;
         Ok(crate::balance::breakdown(
             &balances,
             channels

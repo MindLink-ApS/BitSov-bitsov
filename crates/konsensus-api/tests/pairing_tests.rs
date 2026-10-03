@@ -1164,3 +1164,153 @@ async fn staging_replacement_grant_cannot_read_previous_grant_blob() {
 async fn staging_revoked_then_regranted_blob_stays_revoked() {
     staging_previous_grant_isolation(true).await;
 }
+
+// Exercise the actual remote route selection in memory; no listener or live node.
+fn remote_app(state: Arc<AppState>) -> axum::Router {
+    use axum::extract::connect_info::MockConnectInfo;
+    konsensus_api::build_remote_router(state)
+        .layer(MockConnectInfo("127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap()))
+}
+
+#[tokio::test]
+async fn remote_elevation_asks_reads_and_cancels_without_granting() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), true);
+    let key = SigningKey::from_bytes(&[91; 32]);
+    let (client_id, token) = pair_and_token(&test_router(state.clone()), &service, &key).await;
+    let app = remote_app(state);
+    let (status, body) = post(&app, "/api/v1/pair/elevation-request",
+        serde_json::json!({"scopes": ["spend"], "budget": {"budget_msat": 10000}}), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let op = body["op_id"].as_str().unwrap();
+    for (method, path) in [
+        ("GET", format!("/api/v1/pair/elevation/{op}")),
+        ("GET", "/api/v1/pair/grant".into()),
+        ("DELETE", format!("/api/v1/pair/elevation/{op}")),
+    ] {
+        let response = app.clone().oneshot(Request::builder().method(method).uri(&path)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if method == "GET" && path.ends_with(op) { assert_eq!(value["status"], "pending"); }
+        if path.ends_with("/grant") { assert!(value["grant"].is_null()); }
+    }
+    assert!(service.grant_view_for(&client_id).is_none());
+}
+
+#[tokio::test]
+async fn remote_elevation_routes_require_auth_and_approval_routes_are_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, _) = state_with_pairing(dir.path(), true);
+    let app = remote_app(state.clone());
+    for (method, path) in [
+        ("POST", "/api/v1/pair/elevation-request"),
+        ("GET", "/api/v1/pair/elevation/unknown"),
+        ("DELETE", "/api/v1/pair/elevation/unknown"),
+        ("GET", "/api/v1/pair/grant"),
+    ] {
+        let response = app.clone().oneshot(Request::builder().method(method).uri(path)
+            .header("content-type", "application/json").body(Body::from("{}"))
+            .unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+    // Even an owner token cannot reach an approval handler through this router.
+    let owner = konsensus_api::auth::create_token(&state.identity.node_id().to_hex(),
+        &state.jwt_secret, Scope::all()).unwrap();
+    for path in [
+        "/api/v1/pair/grant", "/api/v1/pair/elevation/unknown",
+        "/api/v1/pair/elevation/unknown/grant", "/api/v1/pair/approve",
+        "/api/v1/pair/first-contact-grant", "/api/v1/pair/relation-intent",
+        "/api/v1/pair/device-key/request", "/api/v1/identity/approve-replacement",
+    ] {
+        let (status, _) = post(&app, path, serde_json::json!({}), Some(&owner)).await;
+        assert!(matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED), "{path}: {status}");
+    }
+}
+
+#[tokio::test]
+async fn elevation_status_is_private_on_remote_and_loopback() {
+    for remote in [false, true] {
+        for owner_control in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (state, service, console) = state_with_pairing(dir.path(), owner_control);
+            let local = test_router(state.clone());
+            let (a, token_a) = pair_and_token(&local, &service, &SigningKey::from_bytes(&[81; 32])).await;
+            service.open_pairing_window(std::time::Duration::from_secs(30));
+            let (_, token_b) = pair_and_token(&local, &service, &SigningKey::from_bytes(&[82; 32])).await;
+            let app = if remote { remote_app(state) } else { local };
+            for scope in [Scope::Spend, Scope::FrontDoor] {
+                let op = service.create_elevation_request(&a, vec![scope]).unwrap();
+                for phase in 0..2 {
+                    for (token, id, expected) in [
+                        (&token_a, op.op_id.as_str(), StatusCode::OK),
+                        (&token_b, op.op_id.as_str(), StatusCode::NOT_FOUND),
+                        (&token_b, "unknown", StatusCode::NOT_FOUND),
+                    ] {
+                        let response = app.clone().oneshot(Request::builder()
+                            .uri(format!("/api/v1/pair/elevation/{id}"))
+                            .header("authorization", format!("Bearer {token}"))
+                            .body(Body::empty()).unwrap()).await.unwrap();
+                        assert_eq!(response.status(), expected, "remote={remote} owner={owner_control} phase={phase}");
+                        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+                        if expected == StatusCode::NOT_FOUND {
+                            assert!(String::from_utf8_lossy(&bytes).contains("no such pending operation"));
+                        } else {
+                            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                            assert_eq!(body["status"], if phase == 0 { "pending" } else { "granted" });
+                        }
+                    }
+                    if !owner_control || phase == 1 { break; }
+                    let code = console.owner_code(&op.op_id);
+                    if scope == Scope::Spend {
+                        service.grant_elevation(&op.op_id, &code, konsensus_api::spend_budget::GrantTerms::new(1000)).unwrap();
+                    } else {
+                        service.grant_front_door(&op.op_id, &code, 60).unwrap();
+                    }
+                }
+            }
+            if owner_control {
+                let op = service.create_elevation_request(&a, vec![Scope::Spend]).unwrap();
+                for _ in 0..3 {
+                    let _ = service.grant_elevation(&op.op_id, "WRONG",
+                        konsensus_api::spend_budget::GrantTerms::new(1000));
+                }
+                for (token, expected) in [(&token_a, StatusCode::OK), (&token_b, StatusCode::NOT_FOUND)] {
+                    let response = app.clone().oneshot(Request::builder()
+                        .uri(format!("/api/v1/pair/elevation/{}", op.op_id))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty()).unwrap()).await.unwrap();
+                    assert_eq!(response.status(), expected);
+                    if expected == StatusCode::OK {
+                        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+                        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(body["status"], "lost");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_elevation_cap_is_per_client_and_releases_cancelled_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, service, _) = state_with_pairing(dir.path(), true);
+    let app = test_router(state);
+    let (a, token_a) = pair_and_token(&app, &service, &SigningKey::from_bytes(&[83; 32])).await;
+    service.open_pairing_window(std::time::Duration::from_secs(30));
+    let (b, _) = pair_and_token(&app, &service, &SigningKey::from_bytes(&[84; 32])).await;
+    let mut ops = Vec::new();
+    for _ in 0..4 {
+        ops.push(service.create_elevation_request(&a, vec![Scope::Spend]).unwrap());
+    }
+    let (status, _) = post(&app, "/api/v1/pair/elevation-request",
+        serde_json::json!({"scopes":["spend"]}), Some(&token_a)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(service.reload_from_disk().unwrap().pending_elevations.len(), 4);
+    service.create_elevation_request(&b, vec![Scope::Spend]).unwrap();
+    service.cancel_pending(&a, &ops[0].op_id).unwrap();
+    service.create_elevation_request(&a, vec![Scope::Spend]).unwrap();
+}

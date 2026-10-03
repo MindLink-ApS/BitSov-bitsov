@@ -273,7 +273,7 @@ fn sidecar_reopen_does_not_inherit_owner_granted_spend() {
     // The sidecar must not report the grant as in effect either.
     let durable = sidecar.reload_from_disk().unwrap();
     assert_eq!(
-        sidecar.elevation_status(&durable.grants[0].op_id),
+        sidecar.elevation_status(&client.client_id, &durable.grants[0].op_id).unwrap(),
         pairing::ElevationStatus::Absent
     );
 
@@ -1413,7 +1413,7 @@ fn wrong_codes_cancel_the_request_without_effect() {
     for left in [2u8, 1] {
         let err = service.grant_elevation(&op.op_id, "AAAA-AAAA", terms()).unwrap_err();
         assert!(matches!(err, PairingError::WrongOwnerCode(l) if l == left), "{err}");
-        assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Pending);
+        assert_eq!(service.elevation_status(&a.client_id, &op.op_id).unwrap(), pairing::ElevationStatus::Pending);
     }
     let err = service.grant_elevation(&op.op_id, "AAAA-AAAA", terms()).unwrap_err();
     assert!(matches!(err, PairingError::ConfirmationLost), "{err}");
@@ -1425,7 +1425,7 @@ fn wrong_codes_cancel_the_request_without_effect() {
         assert!(matches!(err, PairingError::UnknownOperation), "{err}");
     }
     assert!(service.reload_from_disk().unwrap().grants.is_empty());
-    assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Lost);
+    assert_eq!(service.elevation_status(&a.client_id, &op.op_id).unwrap(), pairing::ElevationStatus::Lost);
     // Cancelled durably: a restart re-issues no code for it.
     assert!(service.reload_from_disk().unwrap().pending_elevations.is_empty());
 
@@ -1496,13 +1496,13 @@ fn a_request_from_before_a_restart_is_lost_not_pending() {
         .unwrap();
     let code = console.owner_code(&op.op_id);
     let phrase = console.confirmation(&pairing::grant_confirmation_phrase(&op));
-    assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Pending);
+    assert_eq!(service.elevation_status(&a.client_id, &op.op_id).unwrap(), pairing::ElevationStatus::Pending);
     drop(service);
 
     // Restart: the request is still on file, its codes are not.
     let (service, _) = owner_run_service(tmp.path());
     assert_eq!(service.reload_from_disk().unwrap().pending_elevations.len(), 1);
-    assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Lost);
+    assert_eq!(service.elevation_status(&a.client_id, &op.op_id).unwrap(), pairing::ElevationStatus::Lost);
     assert_eq!(
         serde_json::to_value(pairing::ElevationStatus::Lost).unwrap(),
         serde_json::json!("lost")
@@ -1534,11 +1534,11 @@ fn a_request_from_before_a_restart_is_lost_not_pending() {
     let again = service
         .create_elevation_request(&a.client_id, vec![Scope::Spend])
         .unwrap();
-    assert_eq!(service.elevation_status(&again.op_id), pairing::ElevationStatus::Pending);
+    assert_eq!(service.elevation_status(&a.client_id, &again.op_id).unwrap(), pairing::ElevationStatus::Pending);
     service
         .grant_elevation(&again.op_id, &console.owner_code(&again.op_id), konsensus_api::spend_budget::GrantTerms::new(1_000))
         .unwrap();
-    assert_eq!(service.elevation_status(&again.op_id), pairing::ElevationStatus::Granted);
+    assert_eq!(service.elevation_status(&a.client_id, &again.op_id).unwrap(), pairing::ElevationStatus::Granted);
 }
 
 #[test]
@@ -1646,5 +1646,30 @@ fn an_expired_request_reads_expired_not_lost_to_the_owner() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Expired);
+    assert_eq!(service.elevation_status(&a.client_id, &op.op_id).unwrap(), pairing::ElevationStatus::Expired);
+}
+
+#[test]
+fn pending_elevation_cap_survives_restart_and_releases_granted_and_expired_slots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _) = owner_run_service(tmp.path());
+    let a = pair(&service, &client_key(1), "client A");
+    for _ in 0..pairing::MAX_PENDING_ELEVATIONS_PER_CLIENT {
+        service.create_elevation_request(&a.client_id, vec![Scope::Spend]).unwrap();
+    }
+    drop(service);
+    let (service, console) = owner_run_service(tmp.path());
+    let before = console.text();
+    assert!(matches!(service.create_elevation_request(&a.client_id, vec![Scope::FrontDoor]),
+        Err(PairingError::TooManyPending)));
+    assert_eq!(console.text(), before, "a refused request must not print a challenge");
+    service.reissue_owner_challenges().unwrap();
+    let op = service.reload_from_disk().unwrap().pending_elevations[0].clone();
+    service.grant_elevation(&op.op_id, &console.owner_code(&op.op_id),
+        konsensus_api::spend_budget::GrantTerms::new(1000)).unwrap();
+    service.create_elevation_request(&a.client_id, vec![Scope::FrontDoor]).unwrap();
+    drop(service);
+    let (service, _) = expire_approvals_on_disk(tmp.path());
+    service.create_elevation_request(&a.client_id, vec![Scope::Spend]).unwrap();
+    assert_eq!(service.reload_from_disk().unwrap().pending_elevations.len(), 1);
 }

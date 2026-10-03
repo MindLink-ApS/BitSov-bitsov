@@ -183,6 +183,12 @@ impl BitcoindProvider {
             .map_err(|code| ChainError::Backend(format!("bitcoind {method} failed (RPC {code})")))
     }
 
+    /// Funding presence, with absence requiring a synced txindex and a mempool miss.
+    /// Unlike broadcast visibility, an unindexed historical lookup is inconclusive.
+    pub async fn funding_present(&self, txid: &str) -> Result<bool, ChainError> {
+        funding_present_with(txid, |method, params| self.rpc(method, params)).await
+    }
+
     /// Visibility check for LDK's asynchronous broadcast; never queries Esplora.
     pub async fn tx_visible(&self, txid: &str) -> Result<bool, ChainError> {
         match self.rpc("getrawtransaction", json!([txid, true])).await? {
@@ -192,6 +198,68 @@ impl BitcoindProvider {
                 "bitcoind transaction lookup failed (RPC {code})"
             ))),
         }
+    }
+}
+
+/// Inject only the RPC transport so the evidence rules can be tested without sockets.
+async fn funding_present_with<F, Fut>(txid: &str, mut rpc: F) -> Result<bool, ChainError>
+where
+    F: FnMut(&'static str, Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Result<Value, i64>, ChainError>>,
+{
+    let txid = txid.parse::<bitcoin::Txid>()
+        .map_err(|_| ChainError::Backend("invalid funding txid".into()))?.to_string();
+    match rpc("getrawtransaction", json!([txid, true])).await? {
+        Ok(tx) => return validate_funding_tx(&tx, &txid),
+        Err(-5) => {},
+        Err(code) => return Err(ChainError::Backend(format!("funding lookup failed (RPC {code})"))),
+    }
+    // Check mempool independently: a broadcast may arrive after the first lookup.
+    match rpc("getmempoolentry", json!([txid])).await? {
+        Ok(entry) if entry["vsize"].as_u64().is_some_and(|size| size > 0) => return Ok(true),
+        Err(-5) => {},
+        _ => return Err(ChainError::Backend("funding mempool lookup unavailable".into())),
+    }
+    let tip = funding_tip(rpc("getblockchaininfo", json!([])).await?)?;
+    let index = rpc("getindexinfo", json!(["txindex"])).await?
+        .map_err(|_| ChainError::Backend("funding transaction index unavailable".into()))?;
+    if index["txindex"]["synced"].as_bool() != Some(true)
+        || index["txindex"]["best_block_height"].as_u64().is_none_or(|height| height != tip.0)
+    {
+        return Err(ChainError::NotAvailable("funding absence requires a synced transaction index".into()));
+    }
+    // Recheck after the mempool/index evidence, including a transaction mined
+    // between the first raw lookup and the mempool check.
+    match rpc("getrawtransaction", json!([txid, true])).await? {
+        Ok(tx) => validate_funding_tx(&tx, &txid),
+        Err(-5) => {
+            // A moving/reorged tip can leave txindex behind while a newly mined
+            // transaction is already gone from the mempool. That is unknown.
+            if funding_tip(rpc("getblockchaininfo", json!([])).await?)? != tip {
+                return Err(ChainError::NotAvailable("chain tip changed during funding lookup".into()));
+            }
+            Ok(false)
+        }
+        Err(code) => Err(ChainError::Backend(format!("funding lookup failed (RPC {code})"))),
+    }
+}
+
+fn funding_tip(result: Result<Value, i64>) -> Result<(u64, bitcoin::BlockHash), ChainError> {
+    let info = result.map_err(|_| ChainError::Backend("funding chain tip unavailable".into()))?;
+    let blocks = number(&info, "blocks")?;
+    if info["initialblockdownload"].as_bool() != Some(false) || number(&info, "headers")? != blocks {
+        return Err(ChainError::NotAvailable("funding absence requires a synced chain".into()));
+    }
+    let hash = info["bestblockhash"].as_str().unwrap_or("").parse()
+        .map_err(|_| ChainError::Backend("invalid funding chain tip hash".into()))?;
+    Ok((blocks, hash))
+}
+
+fn validate_funding_tx(tx: &Value, txid: &str) -> Result<bool, ChainError> {
+    if tx["txid"].as_str() == Some(txid) {
+        Ok(true)
+    } else {
+        Err(ChainError::Backend("invalid funding transaction response".into()))
     }
 }
 
@@ -299,5 +367,98 @@ impl ChainProvider for BitcoindProvider {
             }
             Err(_) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod funding_tests {
+    use super::*;
+
+    fn tip() -> Value {
+        json!({"blocks":101,"headers":101,"initialblockdownload":false,"bestblockhash":"cd".repeat(32)})
+    }
+
+    async fn resolve(replies: Vec<(&'static str, Result<Value, i64>)>) -> Result<bool, ChainError> {
+        let mut replies = replies.into_iter();
+        funding_present_with(&"ab".repeat(32), |method, params| {
+            let (expected_method, response) = replies.next().expect("unexpected RPC");
+            assert_eq!(method, expected_method);
+            if matches!(method, "getrawtransaction" | "getmempoolentry") {
+                assert_eq!(params[0], "ab".repeat(32));
+            }
+            std::future::ready(Ok(response))
+        }).await
+    }
+
+    #[tokio::test]
+    async fn confirmed_and_zero_confirmation_funding_are_present() {
+        for confirmations in [0, 1, 100] {
+            assert!(resolve(vec![("getrawtransaction", Ok(json!({
+                "txid": "ab".repeat(32), "confirmations": confirmations,
+            })))]).await.unwrap());
+        }
+        assert!(resolve(vec![
+            ("getrawtransaction", Err(-5)),
+            ("getmempoolentry", Ok(json!({"vsize": 100, "height": 101}))),
+        ]).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn absence_requires_mempool_miss_and_current_synced_txindex() {
+        for index in [
+            json!({}), json!({"txindex":{"synced":false,"best_block_height":101}}),
+            json!({"txindex":{"synced":true,"best_block_height":100}}),
+            json!({"txindex":{"synced":true,"best_block_height":102}}),
+            json!({"txindex":{"synced":true}}),
+        ] {
+            assert!(resolve(vec![
+                ("getrawtransaction", Err(-5)), ("getmempoolentry", Err(-5)),
+                ("getblockchaininfo", Ok(tip())), ("getindexinfo", Ok(index)),
+            ]).await.is_err());
+        }
+        for last in [Err(-5), Ok(json!({"txid":"ab".repeat(32),"confirmations":1}))] {
+            let absent = last.is_err();
+            let mut replies = vec![
+                ("getrawtransaction", Err(-5)), ("getmempoolentry", Err(-5)),
+                ("getblockchaininfo", Ok(tip())),
+                ("getindexinfo", Ok(json!({"txindex":{"synced":true,"best_block_height":101}}))),
+                ("getrawtransaction", last),
+            ];
+            if absent { replies.push(("getblockchaininfo", Ok(tip()))); }
+            assert_eq!(resolve(replies).await.unwrap(), !absent);
+        }
+    }
+
+    #[tokio::test]
+    async fn syncing_or_changing_chain_is_inconclusive() {
+        for (field, value) in [("initialblockdownload", json!(true)), ("headers", json!(102))] {
+            let mut info = tip();
+            info[field] = value;
+            assert!(resolve(vec![
+                ("getrawtransaction", Err(-5)), ("getmempoolentry", Err(-5)),
+                ("getblockchaininfo", Ok(info)),
+            ]).await.is_err());
+        }
+        let mut reorg = tip();
+        reorg["bestblockhash"] = json!("ef".repeat(32));
+        assert!(resolve(vec![
+            ("getrawtransaction", Err(-5)), ("getmempoolentry", Err(-5)),
+            ("getblockchaininfo", Ok(tip())),
+            ("getindexinfo", Ok(json!({"txindex":{"synced":true,"best_block_height":101}}))),
+            ("getrawtransaction", Err(-5)), ("getblockchaininfo", Ok(reorg)),
+        ]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_or_malformed_lookups_are_not_absence() {
+        for raw in [Err(-1), Ok(json!(null)), Ok(json!({"txid":"cd".repeat(32)}))] {
+            assert!(resolve(vec![("getrawtransaction", raw)]).await.is_err());
+        }
+        for mempool in [Err(-1), Ok(json!(null))] {
+            assert!(resolve(vec![("getrawtransaction", Err(-5)), ("getmempoolentry", mempool)]).await.is_err());
+        }
+        assert!(funding_present_with(&"ab".repeat(32), |_, _| {
+            std::future::ready(Err(ChainError::Connection("offline".into())))
+        }).await.is_err());
     }
 }

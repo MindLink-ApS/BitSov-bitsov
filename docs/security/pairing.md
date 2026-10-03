@@ -111,6 +111,40 @@ replace the console code for per-contact spend.
 Arbitrary access to the owner's terminal or process memory remains outside this
 tier's threat model.
 
+### Remote spend requests and price preparation
+
+An already paired remote client can use these Noise-tunnel HTTP routes with
+exactly the same JWT, live pairing binding and `read` scope checks as loopback:
+
+- `POST /api/v1/pair/elevation-request` proposes an owner-approved budget.
+  Each client may have at most four unexpired pending elevation requests
+  (`MAX_PENDING_ELEVATIONS_PER_CLIENT`), across scope kinds and both routers.
+  Additional requests return HTTP 429 without writing a proposal or printing an
+  owner challenge. Cancellation, grant, or the 15-minute expiry frees a slot;
+  another client's pending requests do not consume that client's allowance.
+- `GET /api/v1/pair/elevation/{op_id}` reads only the requesting client's status.
+  Another client's operation and an unknown operation both return `UnknownOperation` (HTTP 404).
+- `DELETE /api/v1/pair/elevation/{op_id}` withdraws the caller's own request.
+- `GET /api/v1/pair/grant` reads the caller's own grant (or `null`).
+
+These routes never issue a grant. Remote first-contact approvals, device-key
+management and relation intents remain absent; spend elevation is still granted
+only through the owner control socket. Asking or quoting confers no spend scope.
+
+`POST /api/v1/messages/first-contact/quote` requires `read`, including for a
+`read` + `receive` pairing with no spend grant. It performs only bounded payment
+preparation: requests and validates the recipient's signed invoice, and caches
+it briefly for a later send. It pays nothing, reserves no funds or budget,
+creates no obligation, and grants no admission. HTTP and recipient quote rate
+limits still apply. Actual sends independently require spend authority and
+settlement. The app's other pre-send prices (`GET /pricing`, `/pricing/peers`,
+`/pricing/peers/{id}`, `/pricing/peers/{id}/call`, and `/payments/price/{kind}`, under `/api/v1`) already
+require only `read`; room prices are assembled from those reads.
+
+Doctrine: lines 1, 3, 5 and 6 hold. Authenticated price preparation and pending
+consent requests are control-plane operations; paid peer service remains gated
+by settlement, keys retain authority, and custody remains with the owner.
+
 ### Live-identity replacement binds five fields
 
 `{ op_id, client_id, current_identity_fingerprint,

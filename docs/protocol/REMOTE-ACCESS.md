@@ -25,7 +25,9 @@ Axum listener on `127.0.0.1:0`; plaintext HTTP is never bound non-loopback.
 ## Pairing link
 
 If pairing is open when the listener starts, the node generates a random
-256-bit, memory-only, single-use code and prints one line to stdout:
+256-bit, single-use code. The full link is written to
+`<data_dir>/pairing/remote-access-link` at mode `0600`; stdout prints only its
+protected path and expiry. The file contains:
 
 ```
 bitsov://pair/<base64url-no-pad(JSON)>
@@ -55,8 +57,10 @@ link, and refuse a Noise responder static that differs from
 `transport_pubkey`. The node test suite verifies its side of the link; pinned
 key refusal is also required in the app.
 
-No link is printed when pairing is closed. The code is never persisted or
-logged. A successful pairing consumes it; a wrong code or proof does not.
+No link is created when pairing is closed. The server-side code is memory-only;
+the complete link exists only in the protected file, never stdout or tracing.
+It expires after five minutes. Successful pairing consumes it; a wrong code or
+proof does not. The file is removed on success, expiry or clean shutdown.
 Restarting replaces an unused code.
 
 ## Framing and Noise
@@ -141,10 +145,35 @@ After successful auth, each decrypted byte chunk is written to the internal
 loopback Axum connection and response bytes are encrypted back to the app.
 HTTP/1.1 keep-alive and WebSocket upgrades work as byte streams.
 
-The remote router is the existing API router except
-`POST /api/v1/auth/local` is not mounted. A tunnel cannot use the bridge's
-loopback source address to mint an unbound local JWT. Apps obtain and present
-ordinary paired JWTs through the existing pairing challenge/token flow.
+The remote router excludes the loopback token mint, public probes, metrics,
+first-pair file ceremony, and owner-management pairing routes. A tunnel cannot
+use the bridge's loopback source address to mint an unbound local JWT. Apps
+obtain and present ordinary paired JWTs through `GET /api/v1/pair/challenge`
+and `POST /api/v1/pair/token`; `POST /api/v1/pair/rotate` remains available.
+
+It also exposes exactly these spend-request/read routes, using the same
+handlers and authorization as loopback:
+
+| Method | Path | Effect |
+|---|---|---|
+| POST | `/api/v1/pair/elevation-request` | Ask for elevation; at most four unexpired pending requests per client; never grant it |
+| GET | `/api/v1/pair/elevation/{op_id}` | Read only the caller's operation status; other clients' IDs return the same 404 as unknown IDs |
+| DELETE | `/api/v1/pair/elevation/{op_id}` | Cancel the caller's own pending request |
+| GET | `/api/v1/pair/grant` | Read the caller's own live grant, or `null` |
+
+All require `read`; asking, cancelling and reading a grant also require a live
+paired-client binding. No remote grant/approve handler is mounted, including
+first-contact grants, device-key management or relation intents. The owner
+still grants spend through `<data_dir>/control.sock`.
+
+A read-only pairing may obtain a first-contact price via
+`POST /api/v1/messages/first-contact/quote` before requesting spend. This remains
+rate-limited payment preparation, with no payment, reservation, obligation or
+admission; the later send retains its spend and settlement checks.
+
+Doctrine: lines 1, 3, 4, 5 and 6 hold: authenticated preparation creates no free
+peer service, authority remains key-bound and local, and no custody or privacy
+claim is widened.
 
 There is no TLS, relay, remote signer, new auth system, or remotely exposed
 HTTP listener in this protocol.
