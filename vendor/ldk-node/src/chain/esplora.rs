@@ -44,20 +44,29 @@ pub(super) struct EsploraChainSource {
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 }
 
+// Keep a per-request deadline in addition to the aggregate wallet deadlines.
+// Tests inject a resolver on this builder; production uses the default transport.
+fn esplora_http_client_builder(headers: HashMap<String, String>) -> reqwest::ClientBuilder {
+	let mut default_headers = reqwest::header::HeaderMap::new();
+	for (name, value) in headers {
+		default_headers.insert(
+			reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+			reqwest::header::HeaderValue::from_str(&value).unwrap(),
+		);
+	}
+	reqwest::Client::builder()
+		.timeout(Duration::from_secs(DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS))
+		.default_headers(default_headers)
+}
+
 impl EsploraChainSource {
 	pub(crate) fn new(
 		server_url: String, headers: HashMap<String, String>, sync_config: EsploraSyncConfig,
 		fee_estimator: Arc<OnchainFeeEstimator>, kv_store: Arc<DynStore>, config: Arc<Config>,
 		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
-		let mut client_builder = esplora_client::Builder::new(&server_url);
-		client_builder = client_builder.timeout(DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS);
-
-		for (header_name, header_value) in &headers {
-			client_builder = client_builder.header(header_name, header_value);
-		}
-
-		let esplora_client = client_builder.build_async().unwrap();
+		let esplora_client = EsploraAsyncClient::from_client(server_url,
+			esplora_http_client_builder(headers).build().unwrap());
 		let tx_sync =
 			Arc::new(EsploraSyncClient::from_client(esplora_client.clone(), Arc::clone(&logger)));
 
@@ -80,24 +89,10 @@ impl EsploraChainSource {
 	pub(super) async fn sync_onchain_wallet(
 		&self, onchain_wallet: Arc<Wallet>,
 	) -> Result<(), Error> {
-		let receiver_res = {
-			let mut status_lock = self.onchain_wallet_sync_status.lock().unwrap();
-			status_lock.register_or_subscribe_pending_sync()
-		};
-		if let Some(mut sync_receiver) = receiver_res {
-			log_info!(self.logger, "Sync in progress, skipping.");
-			return sync_receiver.recv().await.map_err(|e| {
-				debug_assert!(false, "Failed to receive wallet sync result: {:?}", e);
-				log_error!(self.logger, "Failed to receive wallet sync result: {:?}", e);
-				Error::WalletOperationFailed
-			})?;
-		}
-
-		let res = self.sync_onchain_wallet_inner(onchain_wallet).await;
-
-		self.onchain_wallet_sync_status.lock().unwrap().propagate_result_to_subscribers(res);
-
-		res
+		WalletSyncStatus::run(
+			&self.onchain_wallet_sync_status, Duration::from_secs(BDK_WALLET_SYNC_TIMEOUT_SECS),
+			Error::WalletOperationTimeout, self.sync_onchain_wallet_inner(onchain_wallet),
+		).await
 	}
 
 	async fn sync_onchain_wallet_inner(&self, onchain_wallet: Arc<Wallet>) -> Result<(), Error> {
@@ -205,25 +200,11 @@ impl EsploraChainSource {
 		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
-		let receiver_res = {
-			let mut status_lock = self.lightning_wallet_sync_status.lock().unwrap();
-			status_lock.register_or_subscribe_pending_sync()
-		};
-		if let Some(mut sync_receiver) = receiver_res {
-			log_info!(self.logger, "Sync in progress, skipping.");
-			return sync_receiver.recv().await.map_err(|e| {
-				debug_assert!(false, "Failed to receive wallet sync result: {:?}", e);
-				log_error!(self.logger, "Failed to receive wallet sync result: {:?}", e);
-				Error::WalletOperationFailed
-			})?;
-		}
-
-		let res =
-			self.sync_lightning_wallet_inner(channel_manager, chain_monitor, output_sweeper).await;
-
-		self.lightning_wallet_sync_status.lock().unwrap().propagate_result_to_subscribers(res);
-
-		res
+		WalletSyncStatus::run(
+			&self.lightning_wallet_sync_status, Duration::from_secs(LDK_WALLET_SYNC_TIMEOUT_SECS),
+			Error::TxSyncTimeout,
+			self.sync_lightning_wallet_inner(channel_manager, chain_monitor, output_sweeper),
+		).await
 	}
 
 	async fn sync_lightning_wallet_inner(
@@ -441,5 +422,29 @@ impl Filter for EsploraChainSource {
 	}
 	fn register_output(&self, output: WatchedOutput) {
 		self.tx_sync.register_output(output);
+	}
+}
+
+#[cfg(test)]
+mod bitsov_request_tests {
+	use super::*;
+
+	struct HangingResolver;
+	impl reqwest::dns::Resolve for HangingResolver {
+		fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+			// Never returns an address, so no DNS query or TCP connection is possible.
+			Box::pin(std::future::pending())
+		}
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn hanging_esplora_request_hits_production_client_deadline() {
+		let http = esplora_http_client_builder(HashMap::new())
+			.no_proxy().dns_resolver(Arc::new(HangingResolver)).build().unwrap();
+		let client: EsploraAsyncClient = EsploraAsyncClient::from_client("http://chain.invalid".into(), http);
+		let started = tokio::time::Instant::now();
+		let result = tokio::time::timeout(Duration::from_secs(11), client.get_tip_hash()).await;
+		assert!(matches!(result, Ok(Err(esplora_client::Error::Reqwest(ref error))) if error.is_timeout()));
+		assert_eq!(started.elapsed(), Duration::from_secs(10));
 	}
 }

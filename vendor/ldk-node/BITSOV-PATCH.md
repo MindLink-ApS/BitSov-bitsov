@@ -72,3 +72,67 @@ paired. This keeps subtraction from the aggregate exact with pending splices.
 The candidate remains an estimate, not proof of replacement funding confirmation.
 
     cargo test --offline --manifest-path vendor/ldk-node/Cargo.toml --lib bitsov_funding_tests
+
+## Chain-sync retry resilience (2026-10-03)
+
+Investigation of test #5 (Atlas run 2 item 13, and the repeat around 04:14 on
+3 October), against ldk-node 0.7.0, esplora-client 0.12.3 and
+lightning-transaction-sync 0.2.1:
+
+- Ordinary Esplora errors and the existing inner wallet timeouts already return
+  through the sync-status cleanup and retry on later background ticks. The HTTP
+  client already has a 10-second per-request deadline; this patch retains it.
+- A cancelled outer Esplora sync leaves `WalletSyncStatus::InProgress` behind.
+  Subsequent subscribers wait without a deadline, blocking the shared sequential
+  wallet/fee loop. An offline regression reproduces the stranded waiter before
+  the fix. A drop guard now notifies subscribers and releases ownership; both
+  owner work and subscriber waits have the existing wallet deadline (onchain
+  20 seconds, Lightning 10 seconds). Subscriber timeout does not steal ownership
+  from a still-running sync. Losing the last subscriber during notification is
+  normal, not an assertion failure.
+- **The production trigger remains unconfirmed.** Normal request errors/timeouts
+  do not cancel the outer owner. No incident `ldk_node.log`, task dump or live
+  transport evidence was available under the no-network constraint. This is a
+  demonstrated cancellation fix and resilience hardening, not proof that beta's
+  hours-long incident is resolved. Restart also clears process-local sync health.
+- The absent journal error is explained by LDK's default filesystem logger.
+  Background failures now additionally use the application's `log` facade
+  (bridged by the node's tracing initialization), with only fixed operation and
+  error categories plus a numeric delay:
+  `chain_sync_failed operation=onchain|lightning|fees kind=sync_failed|timeout retry_in_secs=N`.
+  No remote error text, URLs, credentials, transaction IDs or wallet data enters
+  this message. Existing detailed file logging is unchanged.
+
+Esplora/Electrum background wallet and fee workers now wait independently and
+retry after 10, 20, 40, 80, 160, then at most 300 seconds, indefinitely. Every
+failed background attempt emits one fixed error line, bounded to one per worker
+per 10 seconds. Success restores the configured interval, measured from completion;
+missed ticks never cause a catch-up burst. Fees retain their delayed first tick.
+Shutdown interrupts retry sleep and lets an active attempt finish under its source
+limits. These workers isolate asynchronous waits, not blocking persistence, mutex
+operations or arbitrary panics. Bitcoin Core polling is unchanged.
+
+`money_ready`, sync-health slots, successful-sync timestamp updates, settlement,
+channel safety and custody semantics are unchanged. Failure never fabricates a
+successful sync or resets another wallet's failure. The Esplora HTTP builder is
+extracted only to permit injection of a never-resolving DNS implementation in the
+request-timeout test; it preserves default retry behavior and custom headers.
+
+Offline verification (no listeners, network connections or node starts):
+
+    cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib
+    cargo test --offline --locked -p konsensus-lightning --lib ldk::tests
+    cargo clippy --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib --tests
+    cargo clippy --offline --locked -p konsensus-lightning --lib -- -D warnings
+
+The vendor suite includes all existing `bitsov_` settlement regressions and new
+cancellation, source-error recovery, timeout, log, bounded-backoff, worker-isolation
+and shutdown tests. Virtual time drives retry tests; the HTTP timeout test never
+resolves an address. Verification passed 38 vendor tests and 49 LDK adapter tests. Downstream Clippy
+passes with warnings denied. Vendor Clippy completes with 281 pre-existing
+warnings (baseline: 282; no added warning categories); its strict `-D warnings`
+run is not clean. No workspace tests that open sockets were run.
+
+Doctrine: 1, 2, 5 and 6 hold: settlement/admission and custody remain unchanged;
+Bitcoin remains chain evidence, never identity; diagnostics disclose no identifiers;
+incident-resolution claims remain explicitly unverified. Lines 3 and 4 unchanged.
