@@ -95,9 +95,20 @@ lightning-transaction-sync 0.2.1:
   transport evidence was available under the no-network constraint. This is a
   demonstrated cancellation fix and resilience hardening, not proof that beta's
   hours-long incident is resolved. Restart also clears process-local sync health.
-- The absent journal error is explained by LDK's default filesystem logger.
-  Background failures now additionally use the application's `log` facade
-  (bridged by the node's tracing initialization), with only fixed operation and
+- LDK's detailed diagnostics use its default filesystem logger. Background
+  failures additionally use the application's `log` facade. The node explicitly
+  enables `tracing-subscriber`'s `tracing-log` feature; `logging::init()` calls
+  `SubscriberInitExt::init()` once at startup, which installs `LogTracer` and sets
+  the facade's maximum level. A `ldk_node::chain_sync=warn` output directive
+  admits WARN/ERROR and suppresses INFO/DEBUG/TRACE for that target; other LDK
+  targets retain their existing default/environment levels. The subprocess test
+  exercises this same startup subscriber and captures the failure payload on
+  stdout, including with `RUST_LOG=off`. Journald receives it when the service
+  captures stdout; no live journal or beta incident was inspected.
+  The earlier build already enabled the bridge through subscriber default
+  features, so the claim that a missing bridge caused beta's absent journal
+  line is not supported. The new explicit feature and test make the dependency
+  and filtering contract visible. The line contains only fixed operation and
   error categories plus a numeric delay:
   `chain_sync_failed operation=onchain|lightning|fees kind=sync_failed|timeout retry_in_secs=N`.
   No remote error text, URLs, credentials, transaction IDs or wallet data enters
@@ -112,26 +123,64 @@ Shutdown interrupts retry sleep and lets an active attempt finish under its sour
 limits. These workers isolate asynchronous waits, not blocking persistence, mutex
 operations or arbitrary panics. Bitcoin Core polling is unchanged.
 
+Electrum intentionally retains its existing owner cleanup on normal return.
+Its wallet calls use `spawn_blocking`, and the Lightning worker holds confirmables
+and can still apply chain updates after its join handle is dropped. Copying the
+Esplora cancellation guard would release ownership while that worker can still
+run, allowing a second caller to overlap it. A safe Electrum cancellation fix
+needs worker lifetime/draining ownership, not just a drop guard around the async
+wait. Existing Electrum timeouts can also detach blocking work; this patch does
+not claim to solve that. Shutdown abort during an attempt can still strand its
+async sync status, so restarting the process remains necessary in that case.
+
 `money_ready`, sync-health slots, successful-sync timestamp updates, settlement,
 channel safety and custody semantics are unchanged. Failure never fabricates a
 successful sync or resets another wallet's failure. The Esplora HTTP builder is
-extracted only to permit injection of a never-resolving DNS implementation in the
-request-timeout test; it preserves default retry behavior and custom headers.
+extracted to permit injection of a never-resolving DNS implementation in the
+request-timeout test. Names are explicitly ASCII-lowercased; invalid names or
+values now return `BuildError::InvalidEsploraHeaders` through `Builder::build()`.
+HTTP client construction failures return `BuildError::EsploraClientSetupFailed`.
+Neither error includes header contents. Mixed-case names (including
+`Authorization`) were already accepted by the locked `http` crate's normalizing
+`HeaderName::from_bytes`; the actual regression was panicking on invalid input.
+Tests cover mixed-case standard/custom names and invalid names/values. Valid
+custom headers, the 10-second request deadline and default retry behavior are
+preserved.
 
-Offline verification (no listeners, network connections or node starts):
+Offline verification for the fix round (2026-10-03): all Cargo commands used
+`--offline --locked` and ran inside macOS `sandbox-exec` with
+`(version 1)(allow default)(deny network*)`, including subprocess tests. No
+network connections, including `127.0.0.1:3141`, were permitted.
 
     cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib
-    cargo test --offline --locked -p konsensus-lightning --lib ldk::tests
+    cargo test --offline --locked -p konsensus-lightning --lib
+    cargo test --offline --locked -p konsensus-node --lib
+    cargo test --offline --locked -p konsensus-node --bin konsensus
     cargo clippy --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib --tests
-    cargo clippy --offline --locked -p konsensus-lightning --lib -- -D warnings
+    cargo clippy --offline --locked -p konsensus-node -p konsensus-lightning --all-targets -- -D warnings
 
-The vendor suite includes all existing `bitsov_` settlement regressions and new
-cancellation, source-error recovery, timeout, log, bounded-backoff, worker-isolation
-and shutdown tests. Virtual time drives retry tests; the HTTP timeout test never
-resolves an address. Verification passed 38 vendor tests and 49 LDK adapter tests. Downstream Clippy
-passes with warnings denied. Vendor Clippy completes with 281 pre-existing
-warnings (baseline: 282; no added warning categories); its strict `-D warnings`
-run is not clean. No workspace tests that open sockets were run.
+The full vendor library suite passes: **41 tests**. It includes settlement,
+cancellation, source-error recovery, timeout, log, bounded-backoff,
+worker-isolation, shutdown and header-construction regressions. Virtual time
+drives retry tests; the HTTP timeout test never resolves an address.
+
+The unrestricted test selections above were also attempted under network denial.
+They are **not all green**: 77 Lightning tests (46 LNbits and 31 LND), 5 node
+library STUN tests, and 79 node binary tests (message/peer/session/remote-access
+and STUN) fail with socket permission errors. Every failure was inspected for
+`PermissionDenied` / `Operation not permitted`; networking was not enabled.
+Re-running with only those exact failing test names excluded via `--skip` passes
+**148 Lightning**, **65 node library**, and **579 node binary** tests (one
+pre-existing ignored binary test). No source tests were removed, ignored or
+weakened. The binary passes include the subprocess log-capture regression for
+default filters, global OFF, unrelated LDK DEBUG, and exact chain-sync OFF/TRACE
+overrides. Before the fix, that regression caught unwanted chain-sync INFO, and
+the invalid-header regressions reproduced both panics.
+
+Node and Lightning Clippy pass with warnings denied. Vendor Clippy completes
+with **281 pre-existing warnings**, unchanged from the prior retry commit; its
+strict `-D warnings` run is not clean. These offline results do not verify a live
+journal, network behavior or resolution of the production incident.
 
 Doctrine: 1, 2, 5 and 6 hold: settlement/admission and custody remain unchanged;
 Bitcoin remains chain evidence, never identity; diagnostics disclose no identifiers;

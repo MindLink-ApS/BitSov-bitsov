@@ -32,7 +32,7 @@ use crate::io::utils::write_node_metrics;
 use crate::logger::{log_debug, log_info, LdkLogger, Logger};
 use crate::runtime::Runtime;
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
-use crate::{Error, NodeMetrics};
+use crate::{BuildError, Error, NodeMetrics};
 
 pub(crate) enum WalletSyncStatus {
 	Completed,
@@ -132,7 +132,7 @@ impl ChainSource {
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
-	) -> (Self, Option<BestBlock>) {
+	) -> Result<(Self, Option<BestBlock>), BuildError> {
 		let esplora_chain_source = EsploraChainSource::new(
 			server_url,
 			headers,
@@ -142,9 +142,9 @@ impl ChainSource {
 			config,
 			Arc::clone(&logger),
 			node_metrics,
-		);
+		)?;
 		let kind = ChainSourceKind::Esplora(esplora_chain_source);
-		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, None)
+		Ok((Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, None))
 	}
 
 	pub(crate) fn new_electrum(

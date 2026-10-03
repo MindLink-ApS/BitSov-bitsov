@@ -2189,6 +2189,7 @@ dependencies = [
  "ldk-node",
  "libc",
  "lightning-invoice",
+ "log",
  "metrics",
  "rand 0.8.6",
  "reqwest",
