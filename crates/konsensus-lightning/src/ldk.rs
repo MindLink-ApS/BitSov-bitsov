@@ -1068,13 +1068,17 @@ impl Drop for LdkProvider {
     /// shutdown didn't run, but treat it as best-effort.
     fn drop(&mut self) {
         self.drainer_shutdown.store(true, Ordering::Relaxed);
-        if let Err(e) = self.node.stop() {
-            error!(
+        match self.node.stop() {
+            Ok(()) => warn!("LDK node stopped in Drop — panic-path fallback; explicit shutdown did not stop it"),
+            // stop() is not idempotent: this is the expected result after
+            // LightningProvider::shutdown has already persisted and stopped it.
+            Err(ldk_node::NodeError::NotRunning) => debug!("LDK node already stopped before Drop"),
+            Err(e) => error!(
                 error = %e,
                 "LDK node.stop() in Drop failed — this is the panic-path fallback; \
                  graceful shutdown should have called LightningProvider::shutdown() \
                  earlier"
-            );
+            ),
         }
     }
 }

@@ -803,17 +803,11 @@ async fn cmd_start(
     // Install shutdown handling before construction: startup may now be waiting
     // in bounded chain-source backoff. Dropping construction cancels that retry;
     // readiness/API serving is only established after construction succeeds.
-    #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("failed to install SIGTERM handler")?;
-    let shutdown_signal = async {
-        #[cfg(unix)]
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result.context("failed to listen for Ctrl+C"),
-            _ = sigterm.recv() => Ok(()),
-        }
-        #[cfg(not(unix))]
-        tokio::signal::ctrl_c().await.context("failed to listen for Ctrl+C")
+    // Poll signals independently of startup/cleanup I/O so the process deadline
+    // also covers a stalled startup and Tokio's blocking-pool teardown.
+    let signal_task = tokio::spawn(shutdown_signal()?);
+    let shutdown_signal = async move {
+        signal_task.await.context("shutdown signal task failed")?
     };
     tokio::pin!(shutdown_signal);
     let node = tokio::select! {
@@ -830,6 +824,30 @@ async fn cmd_start(
 
     info!(node_id = %node.node_id(), "node built");
 
+    let services = start_node_services(
+        &node, &config, config_path, data_dir, mnemonic_password.as_deref(),
+        password_typed, owner_control,
+    );
+    run_node_lifecycle(services, &mut shutdown_signal, || node.shutdown(), node.lightning().as_ref()).await?;
+    info!("konsensus node stopped");
+    Ok(())
+}
+
+/// Start services without owning the node, so cancellation always leaves its
+/// Lightning provider available to the explicit shutdown path.
+async fn start_node_services<'a>(
+    node: &'a KonsensusNode,
+    config: &'a NodeConfig,
+    config_path: &Path,
+    data_dir: PathBuf,
+    mnemonic_password: Option<&str>,
+    password_typed: bool,
+    owner_control: bool,
+) -> Result<(
+    impl std::future::Future<Output = Result<()>>,
+    impl std::future::Future<Output = Result<()>> + 'a,
+    impl FnOnce() -> Result<()>,
+)> {
     // ── Lightning health check ─────────────────────────────────────
     // Verify Lightning connectivity at startup so users get a clear
     // error message if their wallet is misconfigured.
@@ -991,8 +1009,8 @@ async fn cmd_start(
     // derive: from an encrypted seed whose password was typed at this start.
     // Otherwise they are off node-wide, with the reason the app shows.
     let device_authority = owner_approval_key(
-        &config,
-        mnemonic_password.as_deref(),
+        config,
+        mnemonic_password,
         password_typed,
         &node.identity().node_id().to_hex(),
     );
@@ -1134,7 +1152,7 @@ async fn cmd_start(
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
         stun_port: stun_socket.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()),
-        custody_mode: custody_mode(&config),
+        custody_mode: custody_mode(config),
     });
 
     // Public remote access is Noise only. Decrypted bytes go to an ephemeral
@@ -1374,7 +1392,7 @@ async fn cmd_start(
                 identity_fingerprint: identity_fingerprint.clone(),
                 data_dir: data_dir.clone(),
                 mnemonic_path: config.identity.mnemonic_file.clone(),
-                replacement_guard: owner_cmd::replacement_guard(&data_dir, &config),
+                replacement_guard: owner_cmd::replacement_guard(&data_dir, config),
             });
             let server = konsensus_api::control::ControlServer::bind(&data_dir, ctx)
                 .with_context(|| {
@@ -1519,107 +1537,182 @@ async fn cmd_start(
         );
     }
 
-    // Wait for shutdown signal (SIGINT, SIGTERM, or API server fatal error).
-    // SIGTERM is what `kill`, systemd, and container runtimes send.
-    // SIGINT is Ctrl+C in a terminal.
-    // API fatal error means the API server could not start (e.g. port in use)
-    // and the node is unusable without it.
-    tokio::select! {
-        result = &mut shutdown_signal => { result?; }
-        result = api_fatal_rx => {
-            if let Ok(err_msg) = result {
-                error!(error = %err_msg, "API server failed to start — shutting down node");
+    let service_failure = async move {
+        match api_fatal_rx.await {
+            Ok(err_msg) => anyhow::bail!("API server failed to start: {err_msg}"),
+            Err(_) => anyhow::bail!("API server exited unexpectedly"),
+        }
+    };
+    let cleanup = async move {
+        audit_log.record(
+            konsensus_api::audit::events::NODE_SHUTDOWN,
+            &node.node_id().to_hex(),
+            None,
+        );
+
+        // Persist fee rate EMA snapshot before shutdown — prevents losing up to
+        // 10 minutes of smoothing history (the periodic save interval).
+        if let Some(chain_engine) = node
+            .pricing()
+            .as_any()
+            .downcast_ref::<konsensus_pricing::ChainAwarePricingEngine>()
+        {
+            if let Some(snapshot) = chain_engine.snapshot().await {
+                KonsensusNode::save_fee_rate_snapshot(config, &snapshot);
+                debug!("fee rate EMA snapshot saved on shutdown");
             }
         }
-    }
 
-    info!("shutdown signal received, initiating graceful shutdown");
-    audit_log.record(
-        konsensus_api::audit::events::NODE_SHUTDOWN,
-        &node.node_id().to_hex(),
-        None,
+        // The lifecycle gives snapshots and task joins 10s; the final grant
+        // prune runs separately even if this future is dropped at the deadline.
+        if let Err(e) = msg_handle.await { warn!(error = %e, "message handler task panicked"); }
+        if let Err(e) = pending_handle.await { warn!(error = %e, "pending delivery task panicked"); }
+        if let Err(e) = auto_channel_handle.await { warn!(error = %e, "auto-channel task panicked"); }
+        if let Err(e) = session_handle.await { warn!(error = %e, "session handler task panicked"); }
+        if let Err(e) = nonce_cleanup_handle.await { warn!(error = %e, "nonce cleanup task panicked"); }
+        if let Err(e) = pending_cleanup_handle.await { warn!(error = %e, "pending cleanup task panicked"); }
+        if let Err(e) = timestamps_cleanup_handle.await { warn!(error = %e, "timestamps cleanup task panicked"); }
+        if let Err(e) = retention_handle.await { warn!(error = %e, "retention cleanup task panicked"); }
+        if let Err(e) = price_refresh_handle.await { warn!(error = %e, "price refresh task panicked"); }
+        if let Err(e) = gossip_eviction_handle.await { warn!(error = %e, "gossip eviction task panicked"); }
+        if let Err(e) = peer_ln_cleanup_handle.await { warn!(error = %e, "peer_ln_pubkeys cleanup task panicked"); }
+        if let Err(e) = invoice_req_cleanup_handle.await { warn!(error = %e, "invoice_requests cleanup task panicked"); }
+        if let Err(e) = fiat_snapshot_handle.await { warn!(error = %e, "fiat rate snapshot task panicked"); }
+        if let Err(e) = hosting_payment_handle.await { warn!(error = %e, "operator hosting payment task panicked"); }
+        if let Err(e) = whitelist_backup_handle.await { warn!(error = %e, "whitelist backup task panicked"); }
+        if let Err(e) = api_handle.await { warn!(error = %e, "API server task panicked"); }
+        if let Err(e) = grant_cleanup_handle.await { warn!(error = %e, "grant cleanup task panicked"); }
+        if let Some(h) = stun_discovery_handle { if let Err(e) = h.await { warn!(error = %e, "STUN discovery task panicked"); } }
+        if let Some(h) = stun_handle { if let Err(e) = h.await { warn!(error = %e, "STUN responder task panicked"); } }
+        if let Some(h) = remote_access_handle { if let Err(e) = h.await { warn!(error = %e, "remote access task panicked"); } }
+        if let Some(h) = remote_internal_handle { if let Err(e) = h.await { warn!(error = %e, "internal remote API task panicked"); } }
+        Ok(())
+    };
+    let finalize = move || {
+        // A grant can expire while the API/backend tasks drain, after the sweeper
+        // has stopped. Purge once more before returning from graceful shutdown;
+        // surface an I/O failure instead of claiming that cleanup succeeded.
+        pairing_service
+            .prune_expired_grants()
+            .context("failed to purge expired spend grants at shutdown")?;
+
+        Ok(())
+    };
+    Ok((service_failure, cleanup, finalize))
+}
+
+// 15s for monitor persistence + 10s for task cleanup, with a 30s wall-clock
+// backstop. Keep this comfortably below docs/operations/konsensus.service's 45s.
+const SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn arm_shutdown_deadline() {
+    static ARMED: std::sync::Once = std::sync::Once::new();
+    ARMED.call_once(|| {
+        // A Tokio timeout cannot interrupt synchronous I/O or Runtime::drop
+        // waiting for spawn_blocking. This thread intentionally lives until
+        // process exit, including after cmd_start returns successfully.
+        std::thread::spawn(|| {
+            std::thread::sleep(SHUTDOWN_DEADLINE);
+            eprintln!("shutdown deadline exceeded; forcing exit; channel monitor persistence may be incomplete");
+            std::process::exit(1);
+        });
+    });
+}
+
+/// Register both Unix handlers before returning, including SIGINT during startup.
+fn shutdown_signal() -> Result<impl std::future::Future<Output = Result<()>>> {
+    #[cfg(unix)]
+    let (mut sigint, mut sigterm) = (
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .context("failed to install SIGINT handler")?,
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("failed to install SIGTERM handler")?,
     );
-
-    // Persist fee rate EMA snapshot before shutdown — prevents losing up to
-    // 10 minutes of smoothing history (the periodic save interval).
-    if let Some(chain_engine) = node
-        .pricing()
-        .as_any()
-        .downcast_ref::<konsensus_pricing::ChainAwarePricingEngine>()
-    {
-        if let Some(snapshot) = chain_engine.snapshot().await {
-            KonsensusNode::save_fee_rate_snapshot(&config, &snapshot);
-            debug!("fee rate EMA snapshot saved on shutdown");
+    Ok(async move {
+        #[cfg(unix)]
+        tokio::select! {
+            signal = sigint.recv() => { signal.context("SIGINT stream closed")?; }
+            signal = sigterm.recv() => { signal.context("SIGTERM stream closed")?; }
         }
-    }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await.context("failed to listen for Ctrl+C")?;
+        arm_shutdown_deadline();
+        Ok(())
+    })
+}
 
-    node.shutdown();
-
-    // L0e (2026-04-30): cleanly stop the Lightning backend BEFORE the
-    // tokio runtime begins tearing down. LDK queues `ChannelMonitor`
-    // persistence calls during shutdown; if we wait for `Drop`, the
-    // runtime is already half-gone and those persistence calls can be
-    // silently lost — real-fund-loss class on a live channel. Bound by
-    // 15s wall clock so a misbehaving backend cannot block process exit.
-    let lightning_shutdown_deadline = std::time::Duration::from_secs(15);
-    match tokio::time::timeout(
-        lightning_shutdown_deadline,
-        node.lightning().shutdown(),
-    )
-    .await
-    {
-        Ok(Ok(())) => debug!("Lightning provider shut down cleanly"),
-        Ok(Err(e)) => warn!(error = %e, "Lightning shutdown returned error"),
-        Err(_) => warn!(
-            "Lightning shutdown timed out after {}s — channel monitor persistence may be incomplete",
-            lightning_shutdown_deadline.as_secs()
-        ),
-    }
-
-    // Wait for all background tasks with a timeout to prevent hanging.
-    // 10 seconds is generous — all tasks should exit within milliseconds
-    // once the shutdown watch channel fires.
-    let shutdown_timeout = std::time::Duration::from_secs(10);
-    let join_result = tokio::time::timeout(
-        shutdown_timeout,
-        async {
-            if let Err(e) = msg_handle.await { warn!(error = %e, "message handler task panicked"); }
-            if let Err(e) = pending_handle.await { warn!(error = %e, "pending delivery task panicked"); }
-            if let Err(e) = auto_channel_handle.await { warn!(error = %e, "auto-channel task panicked"); }
-            if let Err(e) = session_handle.await { warn!(error = %e, "session handler task panicked"); }
-            if let Err(e) = nonce_cleanup_handle.await { warn!(error = %e, "nonce cleanup task panicked"); }
-            if let Err(e) = pending_cleanup_handle.await { warn!(error = %e, "pending cleanup task panicked"); }
-            if let Err(e) = timestamps_cleanup_handle.await { warn!(error = %e, "timestamps cleanup task panicked"); }
-            if let Err(e) = retention_handle.await { warn!(error = %e, "retention cleanup task panicked"); }
-            if let Err(e) = price_refresh_handle.await { warn!(error = %e, "price refresh task panicked"); }
-            if let Err(e) = gossip_eviction_handle.await { warn!(error = %e, "gossip eviction task panicked"); }
-            if let Err(e) = peer_ln_cleanup_handle.await { warn!(error = %e, "peer_ln_pubkeys cleanup task panicked"); }
-            if let Err(e) = invoice_req_cleanup_handle.await { warn!(error = %e, "invoice_requests cleanup task panicked"); }
-            if let Err(e) = fiat_snapshot_handle.await { warn!(error = %e, "fiat rate snapshot task panicked"); }
-            if let Err(e) = hosting_payment_handle.await { warn!(error = %e, "operator hosting payment task panicked"); }
-            if let Err(e) = whitelist_backup_handle.await { warn!(error = %e, "whitelist backup task panicked"); }
-            if let Err(e) = api_handle.await { warn!(error = %e, "API server task panicked"); }
-            if let Err(e) = grant_cleanup_handle.await { warn!(error = %e, "grant cleanup task panicked"); }
-            if let Some(h) = stun_discovery_handle { if let Err(e) = h.await { warn!(error = %e, "STUN discovery task panicked"); } }
-            if let Some(h) = stun_handle { if let Err(e) = h.await { warn!(error = %e, "STUN responder task panicked"); } }
-            if let Some(h) = remote_access_handle { if let Err(e) = h.await { warn!(error = %e, "remote access task panicked"); } }
-            if let Some(h) = remote_internal_handle { if let Err(e) = h.await { warn!(error = %e, "internal remote API task panicked"); } }
+/// Own the whole post-construction lifecycle: cancellation during startup must
+/// persist Lightning state too. Cleanup exists only once services are ready.
+async fn run_node_lifecycle<Failure, Cleanup, Finalize>(
+    startup: impl std::future::Future<Output = Result<(Failure, Cleanup, Finalize)>>,
+    signal: impl std::future::Future<Output = Result<()>>,
+    stop_work: impl FnOnce(),
+    lightning: &dyn konsensus_core::traits::lightning::LightningProvider,
+) -> Result<()>
+where
+    Failure: std::future::Future<Output = Result<()>>,
+    Cleanup: std::future::Future<Output = Result<()>>,
+    Finalize: FnOnce() -> Result<()>,
+{
+    tokio::pin!(signal);
+    let (run_result, cleanup) = tokio::select! {
+        biased;
+        result = &mut signal => (result, None),
+        result = startup => match result {
+            Err(e) => (Err(e), None),
+            Ok((failure, cleanup, finalize)) => {
+                let result = tokio::select! {
+                    biased;
+                    result = &mut signal => result,
+                    result = failure => {
+                        if let Err(e) = result {
+                            error!(error = %e, "API server failed — shutting down node");
+                        }
+                        // Preserve a clean exit for API bind/serve failures:
+                        // Restart=on-failure must not loop on a busy port.
+                        Ok(())
+                    },
+                };
+                (result, Some((cleanup, finalize)))
+            }
         },
-    )
-    .await;
-
-    if join_result.is_err() {
-        warn!("shutdown timed out after {}s, forcing exit", shutdown_timeout.as_secs());
+    };
+    info!("initiating graceful shutdown");
+    let lightning_result = shutdown_node(stop_work, lightning).await;
+    if let Err(e) = &lightning_result {
+        warn!(error = %e, "Lightning shutdown failed; channel monitor persistence may be incomplete");
     }
+    let cleanup_result = if let Some((cleanup, finalize)) = cleanup {
+        let drain_result = tokio::time::timeout(std::time::Duration::from_secs(10), cleanup)
+            .await
+            .context("node cleanup timed out after 10s")
+            .and_then(|result| result);
+        // Grants can expire while tasks drain. This must run outside the join
+        // timeout, including on error; the process-wide deadline still applies.
+        let finalize_result = finalize();
+        finalize_result.and(drain_result)
+    } else {
+        Ok(())
+    };
+    // All cleanup runs even when startup, the API, or Lightning failed.
+    run_result?;
+    lightning_result?;
+    cleanup_result
+}
 
-    // A grant can expire while the API/backend tasks drain, after the sweeper
-    // has stopped. Purge once more before returning from graceful shutdown;
-    // surface an I/O failure instead of claiming that cleanup succeeded.
-    pairing_service
-        .prune_expired_grants()
-        .context("failed to purge expired spend grants at shutdown")?;
-
-    info!("konsensus node stopped");
+/// Stop new work before persisting monitors, while the Tokio runtime is alive.
+async fn shutdown_node(
+    stop_work: impl FnOnce(),
+    lightning: &dyn konsensus_core::traits::lightning::LightningProvider,
+) -> Result<()> {
+    // Also bound shutdown initiated by a fatal API error rather than a signal.
+    arm_shutdown_deadline();
+    stop_work();
+    tokio::time::timeout(std::time::Duration::from_secs(15), lightning.shutdown())
+        .await
+        .context("Lightning shutdown timed out after 15s")?
+        .context("Lightning shutdown returned error")?;
+    info!("Lightning provider shut down cleanly");
     Ok(())
 }
 
@@ -2074,3 +2167,7 @@ mod custody_mode_tests {
 #[cfg(all(test, feature = "regtest-e2e"))]
 #[path = "tests/regtest_e2e.rs"]
 mod regtest_e2e;
+
+#[cfg(test)]
+#[path = "tests/shutdown.rs"]
+mod shutdown_tests;
