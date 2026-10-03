@@ -35,18 +35,6 @@ where
     Ok(())
 }
 
-/// Esplora 404 proves absence; a valid status proves presence even at zero confirmations.
-pub(crate) fn decode_funding_status(status: u16, body: &[u8]) -> Result<bool, LightningError> {
-    if status == 404 { return Ok(false); }
-    if status != 200 {
-        return Err(LightningError::Backend("funding status backend refused request".into()));
-    }
-    #[derive(serde::Deserialize)]
-    struct FundingStatus { #[serde(rename = "confirmed")] _confirmed: bool }
-    serde_json::from_slice::<FundingStatus>(body).map(|_| true)
-        .map_err(|_| LightningError::Backend("invalid funding status response".into()))
-}
-
 /// Remove only claims whose funding is proven absent from both balance representations.
 pub(crate) fn filter_unfunded_closures(
     balances: &mut BalanceDetails,
@@ -179,30 +167,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn funding_status_requires_explicit_evidence() {
-        assert!(decode_funding_status(200, br#"{"confirmed":true}"#).unwrap());
-        assert!(decode_funding_status(200, br#"{"confirmed":false}"#).unwrap());
-        assert!(!decode_funding_status(404, b"not found").unwrap());
-        for (status, body) in [(500, b"{}".as_slice()), (200, b"{}"), (200, b"invalid")] {
-            assert!(decode_funding_status(status, body).is_err());
-        }
-    }
-
     #[tokio::test]
-    async fn esplora_funding_evidence_controls_both_balance_views() {
-        for (status, body, expected) in [
-            (200, br#"{"confirmed":true}"#.as_slice(), Some(123)),
-            (200, br#"{"confirmed":false}"#.as_slice(), Some(123)),
-            (404, b"not found".as_slice(), Some(0)),
-            (503, b"unavailable".as_slice(), None),
-            (200, b"{}".as_slice(), None),
+    async fn funding_evidence_controls_both_balance_views() {
+        // HTTP decoding is exercised through the shared production client in
+        // vendor/ldk-node's bitsov_http_rate_tests. This checks balance consumers.
+        for (evidence, expected) in [
+            (Ok(true), Some(123)),
+            (Ok(false), Some(0)),
+            (Err("inconclusive funding evidence"), None),
         ] {
             let mut balances = balances();
             balances.lightning_balances = vec![on_close()];
             balances.total_lightning_balance_sats = 123;
             let result = verify_closed_funding(&mut balances, &HashSet::new(), |_| async {
-                decode_funding_status(status, body)
+                evidence.map_err(|error| LightningError::Backend(error.into()))
             }).await;
             if let Some(amount) = expected {
                 result.unwrap();

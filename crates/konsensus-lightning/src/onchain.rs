@@ -42,7 +42,7 @@ impl OnchainOperations {
 
 #[derive(Clone)]
 pub(crate) struct ChainVisibility {
-    pub(crate) esplora_url: String,
+    pub(crate) node: Arc<ldk_node::Node>,
     pub(crate) bitcoind: Option<Arc<konsensus_chain::BitcoindProvider>>,
     pub(crate) electrum: Option<Arc<konsensus_chain::ElectrumProvider>>,
 }
@@ -54,7 +54,8 @@ impl ChainVisibility {
         } else if let Some(server) = &self.electrum {
             server.tx_visible(&txid).await.map_err(|e| e.to_string())
         } else {
-            crate::ldk::esplora_tx_visible(&self.esplora_url, &txid).await
+            let txid = txid.parse().map_err(|_| "invalid transaction id".to_owned())?;
+            self.node.funding_present(txid).await.map_err(|e| e.to_string())
         }
     }
 }
