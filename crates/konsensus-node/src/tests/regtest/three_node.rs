@@ -859,8 +859,17 @@ async fn three_node_paid_e2e() {
     );
     list_contact(&alice, &carol, ROOM).await;
 
-    // An older recipient advertised height 0 while current senders enforce
-    // table expiry. Inject the old wire representation, not a cache mutation.
+    // A height-zero table from an older recipient cannot destroy a usable
+    // cached offer. Establish a known good offer, then inject the old wire form.
+    bob.transport.send_frame(alice.state.identity.node_id(), &Frame::PriceTable {
+        prices: std::collections::HashMap::from([("communication".to_owned(), 2_001)]),
+        block_height: tip, valid_blocks: 6, trust_discount: 0.0,
+    }).await.expect(SKEW);
+    eventually(SKEW, || async {
+        alice.state.peer_prices.get_peer_entry(bob.state.identity.node_id()).await
+            .is_some_and(|entry| entry.block_height == tip && entry.prices.get("communication") == Some(&2_001))
+    }).await;
+    let fence = std::time::Instant::now();
     bob.transport
         .send_frame(
             alice.state.identity.node_id(),
@@ -873,44 +882,22 @@ async fn three_node_paid_e2e() {
         )
         .await
         .expect(SKEW);
+    bob.transport.send_frame(alice.state.identity.node_id(), &Frame::PriceResponse {
+        kind: 400, price_msat: 2_001, block_height: tip,
+    }).await.expect(SKEW);
     eventually(SKEW, || async {
-        alice
-            .state
-            .peer_prices
-            .get_peer_entry(bob.state.identity.node_id())
-            .await
-            .is_some_and(|entry| {
-                entry.block_height == 0 && entry.prices.get("communication") == Some(&999_999)
-            })
-    })
-    .await;
-    assert!(
-        alice
-            .state
-            .peer_prices
-            .get_fresh_peer_price(
-                bob.state.identity.node_id(),
-                0,
-                tip,
-                Duration::from_secs(300)
-            )
-            .await
-            .is_none(),
-        "{SKEW}: reject expired height-0 table"
-    );
+        alice.state.peer_prices.kind_answered_at(bob.state.identity.node_id(), 400).await
+            .is_some_and(|at| at >= fence)
+    }).await;
+    assert_eq!(alice.state.peer_prices.get_fresh_peer_price(
+        bob.state.identity.node_id(), 0, tip, Duration::from_secs(300),
+    ).await, Some(2_001), "{SKEW}: retain the valid cached price");
     let (status, tables) = alice.get("/api/v1/pricing/peers", false).await;
     assert_eq!(status, StatusCode::OK, "{SKEW}: {tables}");
-    let entry = tables
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["peer_id"] == bob.state.identity.node_id().to_hex())
-        .expect(SKEW);
-    assert_eq!(
-        entry["stale"], true,
-        "{SKEW}: UI must flag the expired table"
-    );
-    assert_eq!(entry["block_height"], 0, "{SKEW}");
+    let entry = tables.as_array().unwrap().iter()
+        .find(|entry| entry["peer_id"] == bob.state.identity.node_id().to_hex()).expect(SKEW);
+    assert_eq!(entry["stale"], false, "{SKEW}: usable prior table remains fresh");
+    assert_eq!(entry["block_height"], tip, "{SKEW}");
     let before = (
         alice.used(),
         settled_outgoing(&a).await.len(),
@@ -954,7 +941,7 @@ async fn three_node_paid_e2e() {
             })
     })
     .await;
-    steps.pass("Atlas run 4 stale pricing: /pricing/peers marks stale, quote uses fresh target price, wire refresh clears stale");
+    steps.pass("Atlas run 4 stale pricing: invalid update preserves usable cache; quote and wire refresh use target price");
 
     // Restart the whole recipient stack between paid acts while A stays live.
     let bob_id = *bob.state.identity.node_id();

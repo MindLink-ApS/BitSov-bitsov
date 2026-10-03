@@ -20,6 +20,9 @@ pub(crate) async fn send_price_frame(
     pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
     min_admission_cost_msat: u64,
 ) -> Result<(), TransportError> {
+    if matches!(frame, Frame::PriceTable { block_height: 0, .. } | Frame::PriceResponse { block_height: 0, .. }) {
+        return Err(TransportError::Other("konsensus:not_ready:chain_unavailable".into()));
+    }
     let mut advertised = frame.clone();
     if let Frame::PriceTable { prices, .. } = &mut advertised {
         prices.insert(ADMISSION_FLOOR_KEY.into(), min_admission_cost_msat);

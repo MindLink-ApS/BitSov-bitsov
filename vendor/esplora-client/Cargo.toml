@@ -128,3 +128,13 @@ default-features = false
 version = "1"
 features = ["time"]
 optional = true
+
+[dependencies.httpdate]
+version = "1"
+
+[dev-dependencies.http]
+version = "1"
+
+[dev-dependencies.tokio]
+version = "1"
+features = ["macros", "rt", "test-util"]

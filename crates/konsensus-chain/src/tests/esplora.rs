@@ -9,8 +9,7 @@ async fn mock_esplora() -> (EsploraConfig, tokio::task::JoinHandle<()>) {
             "/api/block-height/:height",
             get(|Path(height): Path<String>| async move {
                 if height == "850000" {
-                    "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72f8804bf"
-                        .to_string()
+                    "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72f8804bf".to_string()
                 } else {
                     "not_found".to_string()
                 }
@@ -144,10 +143,7 @@ async fn tx_unconfirmed() {
     let (config, _server) = mock_esplora().await;
     let provider = EsploraProvider::new(config).unwrap();
 
-    let confirmed = provider
-        .is_tx_confirmed("unconfirmed_tx", 1)
-        .await
-        .unwrap();
+    let confirmed = provider.is_tx_confirmed("unconfirmed_tx", 1).await.unwrap();
     assert!(!confirmed);
 }
 
@@ -157,10 +153,7 @@ async fn tx_insufficient_confirmations() {
     let provider = EsploraProvider::new(config).unwrap();
 
     // tx at height 849990, tip at 850000 = 11 confirmations
-    let confirmed = provider
-        .is_tx_confirmed("confirmed_tx", 100)
-        .await
-        .unwrap();
+    let confirmed = provider.is_tx_confirmed("confirmed_tx", 100).await.unwrap();
     assert!(!confirmed);
 
     let confirmed = provider.is_tx_confirmed("confirmed_tx", 11).await.unwrap();
@@ -192,7 +185,7 @@ async fn api_url_strips_trailing_api_suffix() {
     let provider = EsploraProvider::new(config).unwrap();
 
     // Without /api suffix (correct form)
-    let url_correct = provider.api_url("/blocks/tip/height");
+    let url_correct = format!("{}/blocks/tip/height", provider.endpoints[0].0);
     assert!(
         url_correct.ends_with("/api/blocks/tip/height"),
         "unexpected url: {url_correct}"
@@ -205,7 +198,7 @@ async fn api_url_strips_trailing_api_suffix() {
         timeout_secs: 10,
     };
     let provider2 = EsploraProvider::new(config_with_suffix).unwrap();
-    let url_suffix = provider2.api_url("/blocks/tip/height");
+    let url_suffix = format!("{}/blocks/tip/height", provider2.endpoints[0].0);
     assert_eq!(url_correct, url_suffix);
 }
 
@@ -220,7 +213,7 @@ async fn api_url_with_trailing_slash() {
         timeout_secs: 10,
     };
     let provider = EsploraProvider::new(config_slash).unwrap();
-    let url = provider.api_url("/blocks/tip/height");
+    let url = format!("{}/blocks/tip/height", provider.endpoints[0].0);
     assert!(
         url.ends_with("/api/blocks/tip/height"),
         "unexpected url: {url}"
@@ -234,7 +227,12 @@ async fn mock_error_esplora() -> (EsploraConfig, tokio::task::JoinHandle<()>) {
     let app = Router::new()
         .route(
             "/api/blocks/tip/height",
-            get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "server error") }),
+            get(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "server error",
+                )
+            }),
         )
         .route(
             "/api/block-height/:height",
@@ -409,7 +407,6 @@ async fn fake_hash_is_deterministic_and_looks_like_block_hash() {
     assert!(header1.hash.starts_with("000000"));
 }
 
-
 #[tokio::test]
 async fn known_height_satisfies_height_only_sync_without_another_lookup() {
     // An unsupported URL makes an accidental lookup fail before any network I/O.
@@ -419,4 +416,151 @@ async fn known_height_satisfies_height_only_sync_without_another_lookup() {
     ))
     .unwrap();
     assert!(provider.is_synced_with_height(900_000).await);
+}
+
+/// HTTP boundary fixture: the real provider, parser and shared limiter run.
+#[derive(Debug)]
+struct ScriptedHttp(
+    std::sync::Mutex<std::collections::VecDeque<(&'static str, u16, &'static str)>>,
+);
+impl HttpTransport for ScriptedHttp {
+    fn execute(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<reqwest::Response, esplora_client::Error>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let request = request.build().unwrap();
+            let (host, status, body) = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected request (cooldown bypassed)");
+            assert_eq!(request.url().host_str(), Some(host));
+            assert!(request.url().path().starts_with("/api/"));
+            if status == 0 {
+                return std::future::pending().await;
+            }
+            Ok(http::Response::builder()
+                .status(status)
+                .header("retry-after", "86400")
+                .body(body)
+                .unwrap()
+                .into())
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue204_primary_429_uses_fallback_and_shares_bounded_cooldown() {
+    let mut provider = EsploraProvider::with_fallbacks(
+        EsploraConfig::custom(
+            "https://primary-204.invalid/api/".into(),
+            TrustLevel::ServerTrust,
+        ),
+        vec![
+            "https://primary-204.invalid".into(),
+            "https://fallback-204.invalid".into(),
+        ],
+    )
+    .unwrap();
+    provider.transport = Some(Arc::new(ScriptedHttp(std::sync::Mutex::new(
+        [
+            ("primary-204.invalid", 429, "private error"),
+            ("fallback-204.invalid", 200, "850123"),
+            ("fallback-204.invalid", 200, "850124"),
+            ("fallback-204.invalid", 200, "{\"6\": 5.0}"),
+            ("primary-204.invalid", 200, "850125"),
+        ]
+        .into(),
+    ))));
+    assert_eq!(provider.get_block_height().await.unwrap(), 850123);
+    assert_eq!(
+        provider.chain_view().host.as_deref(),
+        Some("fallback-204.invalid")
+    );
+    assert_eq!(provider.chain_view().trust_level, "third_party");
+    // Same constructor as LDK: a new consumer must share the active cooldown.
+    let ldk_limiter = RateLimitedTransport::shared("https://primary-204.invalid/api");
+    assert!(ldk_limiter
+        .run(false, || async { panic!("shared cooldown bypassed") })
+        .await
+        .is_err());
+    assert_eq!(provider.get_block_height().await.unwrap(), 850124);
+    assert_eq!(provider.estimate_fee(6).await.unwrap().sat_per_vbyte, 5.0);
+    tokio::time::advance(std::time::Duration::from_secs(299)).await;
+    assert!(ldk_limiter
+        .run(false, || async { panic!("retried early") })
+        .await
+        .is_err());
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    assert_eq!(provider.get_block_height().await.unwrap(), 850125);
+    assert!(ldk_limiter.failure().is_none());
+}
+
+#[tokio::test]
+async fn issue204_zero_or_malformed_height_tries_fallback() {
+    for bad in ["0", "not a height"] {
+        let mut provider = EsploraProvider::with_fallbacks(
+            EsploraConfig::custom("https://bad-height.invalid".into(), TrustLevel::ServerTrust),
+            vec!["https://good-height.invalid/api".into()],
+        )
+        .unwrap();
+        provider.transport = Some(Arc::new(ScriptedHttp(std::sync::Mutex::new(
+            [
+                ("bad-height.invalid", 200, bad),
+                ("good-height.invalid", 200, "850123"),
+            ]
+            .into(),
+        ))));
+        assert_eq!(provider.get_block_height().await.unwrap(), 850123);
+    }
+}
+
+#[tokio::test]
+async fn issue204_all_endpoints_down_returns_error_not_zero() {
+    let mut provider = EsploraProvider::with_fallbacks(
+        EsploraConfig::custom(
+            "https://down-primary.invalid".into(),
+            TrustLevel::ServerTrust,
+        ),
+        vec!["https://down-fallback.invalid/api".into()],
+    )
+    .unwrap();
+    provider.transport = Some(Arc::new(ScriptedHttp(std::sync::Mutex::new(
+        [
+            ("down-primary.invalid", 429, "private"),
+            ("down-fallback.invalid", 503, "private"),
+        ]
+        .into(),
+    ))));
+    assert!(provider.get_block_height().await.is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue204_stalled_primary_leaves_time_for_fallback_before_readiness_deadline() {
+    let mut provider = EsploraProvider::with_fallbacks(
+        EsploraConfig::custom("https://stalled.invalid".into(), TrustLevel::ServerTrust),
+        vec!["https://working.invalid/api".into()],
+    )
+    .unwrap();
+    provider.transport = Some(Arc::new(ScriptedHttp(std::sync::Mutex::new(
+        [
+            ("stalled.invalid", 0, ""),
+            ("working.invalid", 200, "850123"),
+        ]
+        .into(),
+    ))));
+    let height = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.get_block_height(),
+    )
+    .await;
+    assert_eq!(height.unwrap().unwrap(), 850123);
 }

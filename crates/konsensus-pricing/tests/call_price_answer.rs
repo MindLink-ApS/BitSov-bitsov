@@ -15,10 +15,10 @@ async fn a_fresh_call_price_answer_is_never_paired_with_the_previous_price() {
     let b = barrier.clone();
     let writer = tokio::spawn(async move {
         for _ in 0..100_000 {
-            c.update_kind_price(peer, 400, 10_000, 0).await;
+            c.update_kind_price(peer, 400, 10_000, 850_000).await;
             b.wait().await;
             b.wait().await;
-            c.update_kind_price(peer, 400, 20_000, 0).await;
+            c.update_kind_price(peer, 400, 20_000, 850_000).await;
             b.wait().await;
         }
     });
@@ -33,7 +33,7 @@ async fn a_fresh_call_price_answer_is_never_paired_with_the_previous_price() {
             }
             std::hint::spin_loop();
         }
-        let actual = cache.get_fresh_discounted_peer_price(&peer, 400, 0, Duration::from_secs(60)).await;
+        let actual = cache.get_fresh_discounted_peer_price(&peer, 400, 850_000, Duration::from_secs(60)).await;
         if actual != Some(20_000) {
             stale += 1;
             if stale == 1 { eprintln!("fresh kind-400 answer exposed previous price {actual:?} at iteration {iteration}"); }

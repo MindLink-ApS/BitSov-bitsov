@@ -331,10 +331,16 @@ pub(crate) async fn run_price_refresh(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(refresh_interval) => {
-                let meta = konsensus_pricing::peer_prices::build_full_price_table(
+                let meta = match konsensus_pricing::peer_prices::build_full_price_table(
                     pricing.as_ref(),
                     chain.as_ref(),
-                ).await;
+                ).await {
+                    Ok(meta) => meta,
+                    Err(_) => {
+                        warn!("not_ready: chain unavailable for price refresh");
+                        continue;
+                    }
+                };
 
                 // Persist fee rate EMA snapshot for restart continuity.
                 if let Some(chain_engine) = pricing
