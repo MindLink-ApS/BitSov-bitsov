@@ -1,6 +1,7 @@
 //! Shared wire format for the node's Noise-protected remote-access tunnel.
 //!
-//! The public listener carries only bounded, length-prefixed Noise messages.
+//! The public listener carries bounded, length-prefixed Noise messages, or a
+//! generic plaintext retry hint when refusing a handshake before Noise.
 //! HTTP and WebSocket bytes exist only inside the encrypted transport and on
 //! the node's loopback connection to the ordinary Axum router.
 
@@ -113,6 +114,18 @@ pub enum AuthResponse {
         code: String,
         message: String,
     },
+}
+
+/// Optional first server frame instead of Noise message 2, followed by close.
+/// This plaintext, unauthenticated hint confers no authority. It carries no
+/// node/client identity, pairing status, or endpoint information. Clients may
+/// defer reconnects by `retry_after_secs` (integer seconds, 1..=60), then must
+/// perform the usual pinned Noise handshake and authentication on a new TCP
+/// connection. Older clients fail the Noise handshake safely.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HandshakeRefusal {
+    RateLimited { v: u8, retry_after_secs: u64 },
 }
 
 /// Write one outer record: unsigned 32-bit big-endian byte length followed by
