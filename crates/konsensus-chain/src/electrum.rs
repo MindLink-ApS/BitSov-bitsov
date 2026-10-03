@@ -139,6 +139,13 @@ impl ElectrumProvider {
         .map_err(|_| ChainError::Backend("Electrum worker failed".into()))?
     }
 
+    /// A returned transaction proves presence at any confirmation depth.
+    /// Electrum not-found (including -5 during propagation) cannot prove absence.
+    pub async fn funding_present(&self, txid: &str) -> Result<bool, ChainError> {
+        let txid = parse_txid(txid)?;
+        self.query(move |client| funding_presence(txid, client.transaction_get(&txid))).await
+    }
+
     /// Used after LDK's asynchronous broadcast, against this endpoint only.
     pub async fn tx_visible(&self, txid: &str) -> Result<bool, ChainError> {
         let txid = parse_txid(txid)?;
@@ -156,6 +163,17 @@ impl ElectrumProvider {
         })
         .await
     }
+}
+
+fn funding_presence(
+    txid: bitcoin::Txid,
+    result: Result<bitcoin::Transaction, electrum_client::Error>,
+) -> Result<bool, ChainError> {
+    let tx = result.map_err(rpc_error)?;
+    if tx.compute_txid() != txid {
+        return Err(ChainError::Backend("Electrum transaction ID mismatch".into()));
+    }
+    Ok(true)
 }
 
 fn parse_txid(txid: &str) -> Result<bitcoin::Txid, ChainError> {
@@ -266,5 +284,32 @@ impl ChainProvider for ElectrumProvider {
     async fn is_synced(&self) -> bool {
         // Like Esplora, this means a tip is available, not proof of freshness.
         self.get_block_height().await.is_ok()
+    }
+}
+
+#[cfg(test)]
+mod funding_tests {
+    use super::*;
+
+    #[test]
+    fn returned_funding_is_present_without_a_confirmation_query() {
+        // transaction.get returns the same raw transaction whether confirmed
+        // or in the mempool; neither status needs a history/tip lookup.
+        let tx = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin).txdata[0].clone();
+        assert!(funding_presence(tx.compute_txid(), Ok(tx.clone())).unwrap());
+        assert!(funding_presence("ab".repeat(32).parse().unwrap(), Ok(tx)).is_err());
+    }
+
+    #[test]
+    fn electrum_cannot_prove_absence_including_minus_five() {
+        let txid = "ab".repeat(32).parse().unwrap();
+        for code in [-5, -1, -32603] {
+            assert!(funding_presence(txid, Err(electrum_client::Error::Protocol(
+                serde_json::json!({"code":code,"message":"not found"}),
+            ))).is_err());
+        }
+        assert!(funding_presence(txid, Err(electrum_client::Error::IOError(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "offline"),
+        ))).is_err());
     }
 }

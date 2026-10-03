@@ -129,3 +129,19 @@ from the Lightning library suite):
 No recipient amount, fee calculation, admission policy, or settlement rule is
 changed. Explicit abandonment and bounded absence cannot revoke an already
 signed transaction: it may propagate later, and the release API says so.
+
+## Closed-channel funding evidence
+
+`Node::channel_funding_outpoint` exposes a monitor's funding outpoint even after
+force-close. It is a local read, not proof of broadcast or confirmation. The
+BitSov provider verifies removed-channel funding against the configured chain
+source before counting the claim in either closing funds or its legacy total;
+monitor persistence and recovery remain unchanged.
+
+`LightningBalance::from_ldk_balance` selects the same on-close balance candidate
+as LDK's `claimable_amount_satoshis`: the latest candidate when confirmed index
+is zero, otherwise the confirmed candidate. Amount and transaction fee remain
+paired. This keeps subtraction from the aggregate exact with pending splices.
+The candidate remains an estimate, not proof of replacement funding confirmation.
+
+    cargo test --offline --manifest-path vendor/ldk-node/Cargo.toml --lib bitsov_funding_tests

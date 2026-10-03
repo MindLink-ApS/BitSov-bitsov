@@ -1615,6 +1615,15 @@ impl Node {
 		self.payment_store.remove(&payment_id)
 	}
 
+	/// Returns a monitored channel's funding outpoint, including after force-close.
+	///
+	/// A monitor is not evidence that funding was broadcast or confirmed. Callers
+	/// must verify funding against their chain source before valuing a removed channel.
+	pub fn channel_funding_outpoint(&self, channel_id: lightning::ln::types::ChannelId) -> Option<bitcoin::OutPoint> {
+		self.chain_monitor.get_monitor(channel_id).ok()
+			.map(|monitor| monitor.get_funding_txo().into_bitcoin_outpoint())
+	}
+
 	/// Retrieves an overview of all known balances.
 	pub fn list_balances(&self) -> BalanceDetails {
 		let cur_anchor_reserve_sats =

@@ -71,45 +71,91 @@ Therefore, per the operator lock:
   `<data_dir>/control.sock` (mode `0600`, not reachable over loopback TCP),
   created only when the node is started with `--owner-control`.
 - **A packaged sidecar app cannot spend, and cannot replace a live identity.**
-  It may request elevation and will never obtain it. A user who wants a spending
-  client runs the node themselves. This is a real product constraint and belongs
-  in the app's copy.
+  Elevation requests return HTTP 409 `owner_approval_unavailable`. A user who
+  wants a spending client runs the node themselves. This is a real product
+  constraint and belongs in the app's copy.
 - OS user-presence (Touch ID, Windows Hello) would close the sidecar case
   properly. Out of scope for this step; not approximated by anything weaker.
 
-Elevation consent requires a secret printed only to the owner node's
-controlling terminal (`/dev/tty`), never stdout, tracing, HTTP, socket
-status/description, or a file under `data_dir`: an operation-bound **256-bit
-random nonce** (the full `GRANT … CODE <nonce>` line), and for grant requests
-also a **short owner code** (`XXXX-XXXX`, 40 bits from the CSPRNG) that
-`konsensus grant` asks for after printing the terms. Knowing the public
-operation id/label or connecting as the same uid is insufficient. Without an
-owner terminal, elevation fails closed. Identity replacement accepts only the
-full nonce line.
+Elevation consent requires an operation-bound **256-bit random nonce** (the
+full `GRANT … CODE <nonce>` line), or for grants a **short owner code**
+(`XXXX-XXXX`) typed into `konsensus grant` after reviewing the terms. The node
+first writes these only to its controlling terminal (`/dev/tty`), never stdout,
+stderr, tracing, HTTP, or socket status/description. When that succeeds, no
+approval file is created and the existing terminal ceremony is unchanged.
 
-The short code is shorter only because online guessing is bounded: each wrong
-confirmation is announced on the owner terminal, the third wrong one cancels
-that request, and after ten wrong ones in a node run short codes stop working
-until restart (the full line still does). A same-uid process that can create
-requests and reach the socket therefore gets at most ten guesses per node run
-against a 2^40 space.
+For an owner-run node without a working terminal (for example systemd with
+`--owner-control`), spend and front-door elevation instead write the full
+approval instructions to `<data_dir>/pairing/owner-approval-<op_id>`, created
+exclusively at mode `0600` inside the `0700` pairing directory. The node logs
+**only the path and expiry**, never the code. Read the file privately as the
+node's OS user and run `konsensus grant --op <op_id> --config <config>`; grant
+still executes only over `control.sock`. HTTP and control-socket replies contain
+no approval secret. If owner-run mode is off, or neither terminal nor protected
+file delivery succeeds, the request returns HTTP **409
+`owner_approval_unavailable`**, without creating a pending operation.
 
-Why not "the socket peer is an interactive TTY": on the dev-node path the app
-launches the node, so it runs as the owner's uid, shares the node's controlling
-terminal, and can reach the `0600` socket. It can allocate a pseudo-terminal
-(or inject input into its own controlling terminal with `TIOCSTI`), so no
-property of the peer or its terminal separates the app from the owner. What the
-app cannot do is read the terminal's screen; the code travels only there.
+**Headless approval trusts the node's OS account and data directory.** A process
+with that user's file access can read the code and approve over the socket.
+Keep the paired app outside that account and directory. This fallback does not
+provide user presence or protection against same-user malware. A working owner
+terminal still keeps codes off disk, so socket/file access alone cannot approve
+those terminal-delivered requests. Device-key registration and live-identity
+replacement remain terminal-only; replacement accepts only the full nonce line.
 
-Codes are memory-only; the pending records are durable. When an owner-run node
-starts, it prints fresh codes for every approval that survived the restart, so
-the request stays `pending` and old codes stop working. A request cancelled by
-wrong codes reads `lost` from `GET /api/v1/pair/elevation/{op_id}`,
-`konsensus pair-status` marks it, and `konsensus grant` refuses it up front;
-the client asks again. See `device-keys.md` for Touch ID device keys, which
-replace the console code for per-contact spend.
-Arbitrary access to the owner's terminal or process memory remains outside this
-tier's threat model.
+Wrong confirmations are counted per request and node run: the third wrong one
+cancels the request; after ten wrong ones, short codes stop working until
+restart (the full nonce line still works). Warnings are best-effort on the owner
+terminal. These limits bound guessing, not reading a headless approval file.
+
+The node removes headless files on grant, withdrawal, cancellation by wrong
+codes, and clean service shutdown. The existing cleanup worker removes expired
+files within its one-second sweep interval; reads also clean them. Pending
+records are durable but confirmation digests are memory-only. Startup removes
+stale files and reissues fresh codes for surviving requests, through the terminal
+or protected elevation file. Old codes stop working. A cancelled request reads
+`lost` from `GET /api/v1/pair/elevation/{op_id}`; `konsensus pair-status` marks it
+and `konsensus grant` refuses it up front. The client asks again. See
+[owner control commands](../v2/OWNER-APPROVALS.md) for headless operation and
+[device keys](device-keys.md) for Touch ID per-contact spend.
+
+Doctrine: lines 1, 3, 5 and 6 hold. This changes local owner consent delivery;
+requests confer no authority or admission, grants remain bounded, peer service
+still requires settlement, and the OS-account trust boundary is explicit.
+
+### Remote spend requests and price preparation
+
+An already paired remote client can use these Noise-tunnel HTTP routes with
+exactly the same JWT, live pairing binding and `read` scope checks as loopback:
+
+- `POST /api/v1/pair/elevation-request` proposes an owner-approved budget.
+  Each client may have at most four unexpired pending elevation requests
+  (`MAX_PENDING_ELEVATIONS_PER_CLIENT`), across scope kinds and both routers.
+  Additional requests return HTTP 429 without writing a proposal or printing an
+  owner challenge. Cancellation, grant, or the 15-minute expiry frees a slot;
+  another client's pending requests do not consume that client's allowance.
+- `GET /api/v1/pair/elevation/{op_id}` reads only the requesting client's status.
+  Another client's operation and an unknown operation both return `UnknownOperation` (HTTP 404).
+- `DELETE /api/v1/pair/elevation/{op_id}` withdraws the caller's own request.
+- `GET /api/v1/pair/grant` reads the caller's own grant (or `null`).
+
+These routes never issue a grant. Remote first-contact approvals, device-key
+management and relation intents remain absent; spend elevation is still granted
+only through the owner control socket. Asking or quoting confers no spend scope.
+
+`POST /api/v1/messages/first-contact/quote` requires `read`, including for a
+`read` + `receive` pairing with no spend grant. It performs only bounded payment
+preparation: requests and validates the recipient's signed invoice, and caches
+it briefly for a later send. It pays nothing, reserves no funds or budget,
+creates no obligation, and grants no admission. HTTP and recipient quote rate
+limits still apply. Actual sends independently require spend authority and
+settlement. The app's other pre-send prices (`GET /pricing`, `/pricing/peers`,
+`/pricing/peers/{id}`, `/pricing/peers/{id}/call`, and `/payments/price/{kind}`, under `/api/v1`) already
+require only `read`; room prices are assembled from those reads.
+
+Doctrine: lines 1, 3, 5 and 6 hold. Authenticated price preparation and pending
+consent requests are control-plane operations; paid peer service remains gated
+by settlement, keys retain authority, and custody remains with the owner.
 
 ### Live-identity replacement binds five fields
 

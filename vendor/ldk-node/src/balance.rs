@@ -229,8 +229,15 @@ impl LightningBalance {
 				inbound_claiming_htlc_rounded_msat,
 				inbound_htlc_rounded_msat,
 			} => {
-				// unwrap safety: confirmed_balance_candidate_index is guaranteed to index into balance_candidates
-				let balance = balance_candidates.get(confirmed_balance_candidate_index).unwrap();
+				// Match LDK's claimable_amount_satoshis, which feeds the aggregate:
+				// before a splice confirms, its latest candidate is the estimate.
+				// Keep amount and fee on the same candidate so excluding a claim
+				// removes exactly the amount that was included in the aggregate.
+				let balance = if confirmed_balance_candidate_index == 0 {
+					balance_candidates.last().unwrap()
+				} else {
+					balance_candidates.get(confirmed_balance_candidate_index).unwrap()
+				};
 
 				Self::ClaimableOnChannelClose {
 					channel_id,
@@ -393,5 +400,46 @@ fn value_from_descriptor(descriptor: &SpendableOutputDescriptor) -> Amount {
 		SpendableOutputDescriptor::StaticOutput { output, .. } => output.value,
 		SpendableOutputDescriptor::DelayedPaymentOutput(output) => output.output.value,
 		SpendableOutputDescriptor::StaticPaymentOutput(output) => output.output.value,
+	}
+}
+
+#[cfg(test)]
+mod bitsov_funding_tests {
+	use super::*;
+	use lightning::chain::channelmonitor::HolderCommitmentTransactionBalance;
+	use std::str::FromStr;
+
+	#[test]
+	fn on_close_conversion_matches_aggregate_candidate_and_fee() {
+		for (amounts, confirmed, expected_amount, expected_fee) in [
+			(vec![100], 0, 100, 1),
+			(vec![100, 200, 300], 0, 300, 3),
+			(vec![100, 200, 300], 1, 200, 2),
+		] {
+			let claim = LdkBalance::ClaimableOnChannelClose {
+				balance_candidates: amounts.iter().enumerate().map(|(i, amount)| {
+					HolderCommitmentTransactionBalance {
+						amount_satoshis: *amount,
+						transaction_fee_satoshis: i as u64 + 1,
+					}
+				}).collect(),
+				confirmed_balance_candidate_index: confirmed,
+				outbound_payment_htlc_rounded_msat: 0,
+				outbound_forwarded_htlc_rounded_msat: 0,
+				inbound_claiming_htlc_rounded_msat: 0,
+				inbound_htlc_rounded_msat: 0,
+			};
+			assert_eq!(claim.claimable_amount_satoshis(), expected_amount);
+			let converted = LightningBalance::from_ldk_balance(
+				ChannelId([1; 32]),
+				PublicKey::from_str("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap(),
+				claim,
+			);
+			let LightningBalance::ClaimableOnChannelClose { amount_satoshis, transaction_fee_satoshis, .. } = converted else {
+				panic!("wrong claim variant");
+			};
+			assert_eq!(amount_satoshis, expected_amount);
+			assert_eq!(transaction_fee_satoshis, expected_fee);
+		}
 	}
 }

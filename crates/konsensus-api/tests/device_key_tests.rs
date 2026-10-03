@@ -496,7 +496,7 @@ fn a_restart_reissues_codes_instead_of_losing_the_approval() {
     assert_eq!(service.device_key_status(&client.client_id, &reg.op_id), DeviceKeyStatus::Lost);
     assert_eq!(service.reissue_owner_challenges().unwrap(), 2);
     assert_eq!(service.device_key_status(&client.client_id, &reg.op_id), DeviceKeyStatus::Pending);
-    assert_eq!(service.elevation_status(&grant.op_id), pairing::ElevationStatus::Pending);
+    assert_eq!(service.elevation_status(&client.client_id, &grant.op_id).unwrap(), pairing::ElevationStatus::Pending);
 
     // The old codes do not carry over; the new ones approve.
     assert!(service.approve_device_key(&reg.op_id, &old_reg_code, &owner_sig(&reg)).is_err());
@@ -521,7 +521,7 @@ fn a_client_cancels_only_its_own_pending_request() {
     let code = console.owner_code(&op.op_id);
     assert!(matches!(service.cancel_pending(&b.client_id, &op.op_id), Err(PairingError::UnknownOperation)));
     service.cancel_pending(&a.client_id, &op.op_id).unwrap();
-    assert_eq!(service.elevation_status(&op.op_id), pairing::ElevationStatus::Absent);
+    assert!(matches!(service.elevation_status(&a.client_id, &op.op_id), Err(PairingError::UnknownOperation)));
     assert!(service
         .grant_elevation(&op.op_id, &code, konsensus_api::spend_budget::GrantTerms::new(1_000))
         .is_err());

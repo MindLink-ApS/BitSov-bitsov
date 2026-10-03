@@ -48,7 +48,9 @@ use crate::state::AppState;
 /// success — a failure here means the operation did not happen.
 fn map_err(e: PairingError) -> ApiError {
     match e {
-        PairingError::Closed => ApiError::Conflict(e.to_string()),
+        PairingError::Closed | PairingError::OwnerApprovalUnavailable => {
+            ApiError::Conflict(e.to_string())
+        }
         PairingError::TooManyPending => ApiError::TooManyRequests(e.to_string()),
         PairingError::UnknownPending | PairingError::BadProof => {
             ApiError::Unauthorized(e.to_string())
@@ -463,11 +465,14 @@ async fn elevation_request(
 
 /// `GET /api/v1/pair/elevation/{op_id}` — read status. A read, never a write.
 async fn elevation_status(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let status = service(&state)?.elevation_status(&op_id);
+    let binding = auth.pairing.as_ref().ok_or_else(|| {
+        ApiError::Forbidden("only a paired client can read an elevation request".into())
+    })?;
+    let status = service(&state)?.elevation_status(&binding.client_id, &op_id).map_err(map_err)?;
     Ok(Json(serde_json::json!({
         "op_id": op_id,
         "status": status,
@@ -667,6 +672,12 @@ pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
         .route("/api/v1/pair/challenge", get(pair_challenge))
         .route("/api/v1/pair/token", post(pair_token))
         .route("/api/v1/pair/rotate", post(rotate_pairing))
+        .route("/api/v1/pair/elevation-request", post(elevation_request))
+        .route(
+            "/api/v1/pair/elevation/:op_id",
+            get(elevation_status).delete(super::device_routes::cancel_elevation),
+        )
+        .route("/api/v1/pair/grant", get(own_grant))
 }
 
 #[cfg(test)]
