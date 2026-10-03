@@ -3,10 +3,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use konsensus_core::envelope::UkmEnvelope;
 use konsensus_core::traits::transport::TransportError;
 use konsensus_core::types::NodeId;
 
@@ -14,7 +12,7 @@ use crate::wire::Frame;
 
 use super::{
     write_noise_message, read_noise_message,
-    BanMap, ControlEvent, Connection, PeerMap,
+    ControlEvent, Connection,
     FRAME_BAN_DURATION, INVALID_FRAME_BUDGET, INVALID_FRAME_WINDOW,
     MEMORY_BUDGET_WINDOW, PEER_MEMORY_BUDGET,
 };
@@ -319,12 +317,14 @@ pub(super) fn spawn_reader_task(
     peer_id: NodeId,
     mut reader: tokio::net::tcp::OwnedReadHalf,
     conn: Arc<Connection>,
-    peers: PeerMap,
-    banned_peers: BanMap,
-    incoming_tx: mpsc::Sender<UkmEnvelope>,
-    control_tx: mpsc::Sender<ControlEvent>,
+    ctx: super::TransportCtx,
 ) {
     tokio::spawn(async move {
+        let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, mut shutdown, .. } = ctx;
+        if *shutdown.borrow() { conn.remove(&peer_id, &peers).await; return; }
+        // Keep the read future alive across ping ticks: cancelling/restarting a
+        // partial length-prefixed read would corrupt framing and reset its deadline.
+        let read_frames = async {
         loop {
             // Read the next encrypted message
             let encrypted = match read_noise_message(&mut reader).await {
@@ -479,11 +479,9 @@ pub(super) fn spawn_reader_task(
                 }
                 Frame::Pong { nonce } => {
                     debug!(peer = %peer_id, %nonce, "received pong");
-                    // Clear pending ping — keepalive supervisor will see this
-                    let mut conn = conn.lock().await;
-                    if conn.pending_ping == Some(nonce) {
-                        conn.pending_ping = None;
-                    }
+                    // Valid inbound traffic satisfies the connection read deadline.
+                    let mut state = conn.lock().await;
+                    if state.pending_ping == Some(nonce) { state.pending_ping = None; }
                 }
                 Frame::Disconnect { reason } => {
                     info!(peer = %peer_id, %reason, "peer disconnected gracefully");
@@ -767,8 +765,36 @@ pub(super) fn spawn_reader_task(
             }
         }
 
-        // Clean up: remove peer from connection map
+        };
+        tokio::select! {
+            _ = read_frames => {},
+            _ = connection_keepalive(&conn) => {},
+            _ = shutdown.changed() => {},
+        }
+
+        // Clean up: remove only this generation from the connection map
         conn.remove(&peer_id, &peers).await;
         debug!(peer = %peer_id, "peer connection cleaned up");
     });
+}
+
+/// Liveness belongs to a connection, including an unsupervised acceptor.
+/// A silent peer still hits READ_TIMEOUT; outgoing pings never extend that read.
+async fn connection_keepalive(conn: &Connection) {
+    let mut nonce = 0u64;
+    loop {
+        tokio::time::sleep(super::KEEPALIVE_INTERVAL).await;
+        nonce = nonce.wrapping_add(1);
+        // Local writer contention is not evidence that the peer is dead. The
+        // reader still owns its independent 30-second inbound deadline.
+        let mut state = conn.lock().await;
+        if conn.is_closed() { return; }
+        state.pending_ping = Some(nonce);
+        let sent = tokio::time::timeout(super::READ_TIMEOUT, async {
+            let bytes = Frame::Ping { nonce }.to_bytes().ok()?;
+            let encrypted = state.noise.encrypt(&bytes).ok()?;
+            write_noise_message(&mut state.writer, &encrypted).await.ok()
+        }).await;
+        if !matches!(sent, Ok(Some(()))) { return; }
+    }
 }

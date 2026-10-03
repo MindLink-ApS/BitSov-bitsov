@@ -161,18 +161,87 @@ async fn connect(from: &app::App, to: &app::App, incident: &str) {
     tokio::time::sleep(Duration::from_millis(1100)).await;
 }
 
+async fn log_reconnect(from: &app::App, to: &app::App, phase: &str) {
+    for (label, local, remote) in [("sender", from, to), ("recipient", to, from)] {
+        let peer = remote.state.identity.node_id();
+        println!(
+            "{READMISSION}: {phase}: {label}: e2ee_session={}, {}",
+            local.state.session_manager.has_session(peer).await,
+            local.transport.reconnect_diagnostics(peer).await,
+        );
+    }
+}
+
 async fn reconnect(from: &app::App, to: &app::App, incident: &str) {
-    from.transport
-        .disconnect(to.state.identity.node_id())
-        .await
+    let peer = to.state.identity.node_id();
+    let sender = from.state.identity.node_id();
+    let old_from = from.transport.connected_since(peer).await.expect(incident);
+    let old_to = to.transport.connected_since(sender).await.expect(incident);
+    let used = from.used();
+    println!(
+        "{incident}: forcing reconnect from generations sender={old_from:?}, recipient={old_to:?}"
+    );
+    log_reconnect(from, to, "before forced disconnect").await;
+    from.transport.disconnect(peer).await.expect(incident);
+    log_reconnect(from, to, "after forced disconnect").await;
+    // A live E2EE session (created by slow-owner delivery) keeps the product
+    // supervisor interested. It may replace the socket between polls. Waiting
+    // for !is_connected on the recipient can then wait forever on a healthy
+    // replacement. Accept either the supervisor's dial or this explicit dial,
+    // but require a NEW generation at BOTH ends before testing re-admission.
+    let dial = tokio::time::timeout(
+        Duration::from_secs(30),
+        from.transport
+            .connect(peer, &to.transport.listen_addr().unwrap().to_string()),
+    )
+    .await;
+    log_reconnect(from, to, "explicit dial finished").await;
+    dial.expect("re-admission: explicit dial deadline")
         .expect(incident);
-    eventually(incident, || async {
-        !to.transport
-            .is_connected(from.state.identity.node_id())
-            .await
+    let wait = tokio::time::timeout(Duration::from_secs(360), async {
+        let mut next_log = std::time::Instant::now();
+        loop {
+            let new_from = from.transport.connected_since(peer).await;
+            let new_to = to.transport.connected_since(sender).await;
+            if new_from.is_some_and(|generation| generation != old_from)
+                && new_to.is_some_and(|generation| generation != old_to)
+            {
+                break;
+            }
+            if std::time::Instant::now() >= next_log {
+                log_reconnect(from, to, "waiting for both replacement generations").await;
+                next_log = std::time::Instant::now() + Duration::from_secs(5);
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     })
     .await;
-    connect(from, to, incident).await;
+    log_reconnect(from, to, "replacement generation wait finished").await;
+    wait.unwrap_or_else(|_| panic!("{incident}: replacement generations did not recover in 360s"));
+    assert_eq!(
+        from.used(),
+        used,
+        "{incident}: reconnect itself spends nothing"
+    );
+    for (local, remote) in [(from, to), (to, from)] {
+        assert!(
+            !local
+                .transport
+                .admission_paid_on_connection(remote.state.identity.node_id())
+                .await,
+            "{incident}: new generation must not inherit paid admission"
+        );
+        assert!(
+            local
+                .state
+                .session_manager
+                .has_session(remote.state.identity.node_id())
+                .await,
+            "{incident}: reconnect must preserve the E2EE session"
+        );
+    }
+    // The production stateless quote gate quarantines a new connection for 1s.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
 }
 
 async fn quote(from: &app::App, to: &app::App, incident: &str) -> Value {
@@ -222,7 +291,7 @@ async fn list_contact(from: &app::App, to: &app::App, incident: &str) {
             "/api/v1/peers",
             json!({
                 "node_id": to.state.identity.node_id().to_hex(),
-                "addr": to.transport.listen_addr().unwrap().to_string(), "auto_connect": false,
+                "addr": to.transport.listen_addr().unwrap().to_string(),
             }),
             true,
         )
@@ -411,12 +480,23 @@ async fn three_node_paid_e2e() {
     connect(&alice, &carol, QUOTE).await;
     steps.pass("Atlas run 2 channels: A->B and A->C usable, three application nodes");
 
+    // Noise and Esplora are separate hops. Capture connection generations so
+    // automatic reconnects cannot hide chain-triggered transport loss.
+    let ab = alice.transport.connected_since(bob.state.identity.node_id()).await.unwrap();
+    let ba = bob.transport.connected_since(alice.state.identity.node_id()).await.unwrap();
+    assert_ne!(fault.url, format!("http://{}", bob.transport.listen_addr().unwrap()));
     // No cache seeding: 429 travels through B's real chain provider and LDK.
     fault.set_limited(true);
     eventually(SYNC, || async {
+        assert_eq!(alice.transport.connected_since(bob.state.identity.node_id()).await,
+            Some(ab), "{SYNC}: sender->recipient Noise hop lost while waiting for chain failure; rejected={}, sync={:?}", fault.rejected(), b.chain_sync_status());
+        assert_eq!(bob.transport.connected_since(alice.state.identity.node_id()).await,
+            Some(ba), "{SYNC}: recipient->sender Noise hop lost while waiting for chain failure");
         fault.rejected() > 0 && b.chain_sync_status().is_some() && !b.money_ready().await
     })
     .await;
+    println!("{SYNC}: Esplora rejected={}, sync={:?}, money_ready=false, both original Noise connections alive",
+        fault.rejected(), b.chain_sync_status());
     let before = (
         capacity(a.node()),
         capacity(b.node()),
@@ -432,7 +512,12 @@ async fn three_node_paid_e2e() {
     )
     .await
     .unwrap_or_else(|_| panic!("{SYNC}: recipient silently timed out"));
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{SYNC}: {refusal}");
+    assert_eq!(alice.transport.connected_since(bob.state.identity.node_id()).await,
+        Some(ab), "{SYNC}: sender Noise connection changed during quote: {refusal}");
+    assert_eq!(bob.transport.connected_since(alice.state.identity.node_id()).await,
+        Some(ba), "{SYNC}: recipient Noise connection changed during quote: {refusal}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE,
+        "{SYNC}: Noise intact, quote/refusal hop failed: {refusal}; sync={:?}", b.chain_sync_status());
     assert_eq!(refusal["code"], "peer_not_ready", "{SYNC}: {refusal}");
     assert_eq!(refusal["retry_allowed"], true, "{SYNC}: {refusal}");
     assert_eq!(
@@ -628,6 +713,9 @@ async fn three_node_paid_e2e() {
 
     let first_c = quote(&alice, &carol, ROOM).await;
     let expires = first_c["expires_at"].as_u64().expect(SLOW_OWNER);
+    let idle_started = std::time::Instant::now();
+    let ac = alice.transport.connected_since(carol.state.identity.node_id()).await.unwrap();
+    let ca = carol.transport.connected_since(alice.state.identity.node_id()).await.unwrap();
     let payments = settled_outgoing(&a).await.len();
     let used = alice.used();
     // Real wall clock: neither the signed quote nor the owner's clock is mocked.
@@ -639,6 +727,11 @@ async fn three_node_paid_e2e() {
     {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    assert!(idle_started.elapsed() > Duration::from_secs(30), "{SLOW_OWNER}: exercise the old read timeout");
+    assert_eq!(alice.transport.connected_since(carol.state.identity.node_id()).await,
+        Some(ac), "{SLOW_OWNER}: product keepalive must preserve the dialer's quote link");
+    assert_eq!(carol.transport.connected_since(alice.state.identity.node_id()).await,
+        Some(ca), "{SLOW_OWNER}: product keepalive must preserve the acceptor's quote link");
     approve_contact(&alice, &carol, &first_c, None).await;
     paid(
         &alice,
@@ -670,7 +763,7 @@ async fn three_node_paid_e2e() {
             .is_empty(),
         "{READMISSION}"
     );
-    reconnect(&alice, &carol, READMISSION).await;
+    reconnect(&alice, &carol, "re-admission without recipient allowance").await;
     assert!(
         !alice
             .state
@@ -697,6 +790,8 @@ async fn three_node_paid_e2e() {
             false,
         )
         .await;
+    log_reconnect(&alice, &carol, "compose without recipient allowance returned").await;
+    println!("{READMISSION}: refusal status={status}, body={refusal}");
     assert_eq!(status, StatusCode::CONFLICT, "{READMISSION}: {refusal}");
     assert_eq!(
         refusal["code"], "budget_exceeded",
@@ -743,8 +838,9 @@ async fn three_node_paid_e2e() {
         READMISSION,
     )
     .await;
+    log_reconnect(&alice, &carol, "paid with recipient allowance").await;
     assert_eq!(alice.used() - used, 4_002, "{READMISSION}");
-    reconnect(&alice, &carol, READMISSION).await;
+    reconnect(&alice, &carol, "re-admission with standing recipient allowance").await;
     let used = alice.used();
     paid(
         &alice,
@@ -1011,11 +1107,10 @@ async fn three_node_paid_e2e() {
     );
 }
 
-/// PR #200 owns /tx/{txid} presence and absent-parent rebroadcast suppression.
-/// Kept executable on this branch so merging that fix can enable the same
-/// assertions without rewriting the fixture. Never counts as a default PASS.
+/// PR #200's transaction-existence and absent-parent rebroadcast contract.
+/// Healthy 404 evidence suppresses; unavailable evidence preserves recovery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "BLOCKED by unmerged PR #200: set REGTEST_GHOST_AFTER_PR200=1 after merge; requires Core/electrs"]
+#[ignore = "requires Core/electrs; set REGTEST_GHOST_AFTER_PR200=1"]
 async fn ghost_unfunded_channel_requires_pr200() {
     assert_eq!(
         std::env::var("REGTEST_GHOST_AFTER_PR200").as_deref(),
@@ -1119,31 +1214,75 @@ async fn ghost_unfunded_channel_requires_pr200() {
         "ghost claim excluded from node aggregate too"
     );
     let commitments = || {
-        fault
-            .broadcasts()
-            .iter()
-            .filter(|tx| {
-                tx.input
-                    .iter()
-                    .any(|input| input.previous_output == funding)
-            })
-            .count()
+        fault.broadcast_attempts().into_iter()
+            .filter(|(_, tx)| tx.input.iter().any(|input| input.previous_output == funding))
+            .map(|(at, _)| at).collect::<Vec<_>>()
     };
-    // Let initial close processing finish, then observe three actual LDK
-    // 30-second rebroadcast ticks while HTTP is limited. A steady retry loop
-    // burns at least three POSTs and must fail this finite bound.
+    // First test suppression with fresh absence evidence available. The first
+    // close can race channel removal; allow it to finish, then cover the next
+    // eligible rebroadcast (the queue backs off at 30, 60, 120... seconds).
     tokio::time::sleep(Duration::from_secs(35)).await;
-    let before = commitments();
-    fault.set_limited(true);
+    let before = commitments().len();
+    let reads_before = fault.read_responses().len();
     tokio::time::sleep(Duration::from_secs(95)).await;
-    assert!(
-        fault.rejected() > 0,
-        "ghost: backend fault must actually be exercised"
-    );
-    assert!(
-        commitments() - before <= 1,
-        "#200: absent-parent commitment rebroadcast burn must be bounded"
-    );
+    let funding_path = format!("/tx/{}", funding.txid);
+    let evidence: Vec<_> = fault.read_responses()[reads_before..].iter()
+        .filter(|(path, _)| path == &funding_path).cloned().collect();
+    println!("ghost: funding={}, listed_channels={}, raw_claim_sats={}, fresh_evidence={evidence:?}, commitment_posts_before={before}, after={}",
+        funding, a.node().list_channels().len(), raw.total_lightning_balance_sats, commitments().len());
+    assert!(a.node().list_channels().is_empty(), "ghost: suppression requires a closed monitor");
+    assert!(evidence.iter().any(|(_, status)| *status == StatusCode::NOT_FOUND),
+        "ghost: no fresh funding absence lookup during rebroadcast window: {evidence:?}");
+    assert_eq!(commitments().len(), before,
+        "#200: fresh 404 + closed monitor must suppress commitment POSTs");
+
+    // A 429 is UNKNOWN, not absence. #200 intentionally does not cache a 404:
+    // funding may arrive later. Such packages remain eligible and POST retries
+    // share a cooldown with a 10s floor (exponential by backend episode).
+    // One POST in 95s was not that contract.
+    let before = commitments().len();
+    fault.set_limited(true);
+    eventually("ghost: UNKNOWN funding must still permit a commitment POST under 429", || async {
+        commitments().len() > before
+    }).await;
+    // Start observation at an actual commitment attempt, not an arbitrary LDK
+    // tick. Queue cooldown and other HTTP work may delay its first attempt.
+    let first = commitments()[before];
+    tokio::time::sleep(Duration::from_secs(95).saturating_sub(first.elapsed())).await;
+    let attempts = commitments();
+    let attempts: Vec<_> = attempts[before..].iter().copied()
+        .filter(|at| at.duration_since(first) <= Duration::from_secs(95)).collect();
+    let gaps: Vec<_> = attempts.windows(2).map(|pair| pair[1].duration_since(pair[0])).collect();
+    println!("ghost: unknown funding under 429; rejected={}, commitment_posts={}, gaps={gaps:?}, sync={:?}",
+        fault.rejected(), attempts.len(), a.chain_sync_status());
+    assert!(fault.rejected() > 0, "ghost: backend fault must actually be exercised");
+    // Every retry waits at least 10s after its own 429. Concurrent packages can
+    // extend a shared episode, so its exponent is NOT this transaction's retry
+    // index. At most ten attempts fit in 95s even at the 10s floor.
+    assert!(!attempts.is_empty(), "ghost: UNKNOWN funding branch never exercised");
+    assert!(attempts.len() <= 10,
+        "#200: 95s 429 retry bound exceeded: posts={}, gaps={gaps:?}", attempts.len());
+    for (index, gap) in gaps.iter().enumerate() {
+        // Proxy timestamps precede response processing; tolerate 1s scheduling skew.
+        let minimum = Duration::from_secs(9);
+        assert!(*gap >= minimum,
+            "#200: commitment retry {} failed backoff: gap={gap:?}, minimum={minimum:?}", index + 1);
+    }
+    // Even if shared cooldown reached 300s before this POST, it must retain
+    // the commitment and retry. Do not let one observed attempt mask its loss.
+    eventually("ghost: commitment retained for retry during 429 (300s cooldown cap)", || async {
+        commitments().len() >= before + 2
+    }).await;
+    let retried = commitments();
+    let retry_gap = retried[before + 1].duration_since(retried[before]);
+    assert!((Duration::from_secs(9)..=Duration::from_secs(360)).contains(&retry_gap),
+        "ghost: retained commitment retry outside 10s floor / 300s cap plus allowance: {retry_gap:?}");
+    // This fixture closes one channel without mining/fee changes during the
+    // observation: there must be only one commitment transaction stream.
+    let commitment_ids: std::collections::HashSet<_> = fault.broadcast_attempts().into_iter()
+        .filter(|(_, tx)| tx.input.iter().any(|input| input.previous_output == funding))
+        .map(|(_, tx)| tx.compute_txid()).collect();
+    assert_eq!(commitment_ids.len(), 1, "ghost: unexpected competing commitment transactions: {commitment_ids:?}");
     fault.set_limited(false);
     for wallet in [&a, &b] {
         wallet.shutdown().await.unwrap();

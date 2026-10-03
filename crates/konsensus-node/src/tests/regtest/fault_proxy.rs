@@ -8,8 +8,9 @@ pub struct FaultProxy {
     limited: Arc<AtomicBool>,
     rejected: Arc<AtomicU64>,
     drop_broadcasts: Arc<AtomicBool>,
-    broadcasts: Arc<std::sync::Mutex<Vec<bitcoin::Transaction>>>,
+    broadcasts: Arc<std::sync::Mutex<Vec<(std::time::Instant, bitcoin::Transaction)>>>,
     reads: Arc<std::sync::Mutex<Vec<String>>>,
+    read_responses: Arc<std::sync::Mutex<Vec<(String, axum::http::StatusCode)>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -33,6 +34,8 @@ impl FaultProxy {
         let drop_broadcasts = Arc::new(AtomicBool::new(false));
         let broadcasts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let read_responses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let response_log = read_responses.clone();
         let (drop_tx, tx_log, read_log) =
             (drop_broadcasts.clone(), broadcasts.clone(), reads.clone());
         let client = reqwest::Client::builder()
@@ -49,13 +52,15 @@ impl FaultProxy {
                 count.clone(),
             );
             let (drop_tx, tx_log, read_log) = (drop_tx.clone(), tx_log.clone(), read_log.clone());
+            let response_log = response_log.clone();
             async move {
                 use axum::response::IntoResponse;
                 let (parts, body) = request.into_parts();
                 let path = parts.uri.path_and_query().unwrap().as_str();
                 let path = path.strip_prefix("/api").unwrap_or(path);
                 let body = axum::body::to_bytes(body, 4 << 20).await.unwrap();
-                if parts.method == axum::http::Method::GET {
+                let is_read = parts.method == axum::http::Method::GET;
+                if is_read {
                     read_log.lock().unwrap().push(path.to_owned());
                 }
                 if parts.method == axum::http::Method::POST
@@ -66,12 +71,15 @@ impl FaultProxy {
                         if let Ok(tx) =
                             bitcoin::consensus::deserialize::<bitcoin::Transaction>(&raw)
                         {
-                            tx_log.lock().unwrap().push(tx);
+                            tx_log.lock().unwrap().push((std::time::Instant::now(), tx));
                         }
                     }
                 }
                 if gate.load(Ordering::SeqCst) {
                     count.fetch_add(1, Ordering::SeqCst);
+                    if is_read {
+                        response_log.lock().unwrap().push((path.to_owned(), axum::http::StatusCode::TOO_MANY_REQUESTS));
+                    }
                     return (
                         axum::http::StatusCode::TOO_MANY_REQUESTS,
                         [("retry-after", "1")],
@@ -85,7 +93,7 @@ impl FaultProxy {
                 {
                     return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
-                match client
+                let response = match client
                     .request(parts.method, format!("{upstream}{path}"))
                     .body(body)
                     .send()
@@ -96,7 +104,11 @@ impl FaultProxy {
                         (status, response.bytes().await.unwrap()).into_response()
                     }
                     Err(_) => axum::http::StatusCode::BAD_GATEWAY.into_response(),
+                };
+                if is_read {
+                    response_log.lock().unwrap().push((path.to_owned(), response.status()));
                 }
+                response
             }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -111,6 +123,7 @@ impl FaultProxy {
             drop_broadcasts,
             broadcasts,
             reads,
+            read_responses,
             task,
         }
     }
@@ -119,7 +132,13 @@ impl FaultProxy {
         self.drop_broadcasts.store(true, Ordering::SeqCst);
     }
     pub fn broadcasts(&self) -> Vec<bitcoin::Transaction> {
+        self.broadcasts.lock().unwrap().iter().map(|(_, tx)| tx.clone()).collect()
+    }
+    pub fn broadcast_attempts(&self) -> Vec<(std::time::Instant, bitcoin::Transaction)> {
         self.broadcasts.lock().unwrap().clone()
+    }
+    pub fn read_responses(&self) -> Vec<(String, axum::http::StatusCode)> {
+        self.read_responses.lock().unwrap().clone()
     }
     pub fn reads(&self) -> Vec<String> {
         self.reads.lock().unwrap().clone()

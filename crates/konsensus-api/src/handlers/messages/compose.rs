@@ -485,6 +485,8 @@ pub(crate) async fn create_metered_payment_proof(
         return Ok(generate_valid_proof(0));
     }
 
+    let _reconnect = state.transport.retain_peer(peer_id).await;
+
     // Recheck after quoting: readiness may have changed before dispatch.
     crate::error::require_money_ready(state).await?;
 
@@ -2275,6 +2277,7 @@ pub(super) async fn first_contact_quote(
 ) -> Result<Json<FirstContactQuoteResponse>, ApiError> {
     let peer_id = NodeId::from_hex(&req.recipient)
         .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+    let _reconnect = state.transport.retain_peer(&peer_id).await;
     if !state.transport.is_connected(&peer_id).await {
         return Err(ApiError::BadRequest(
             "Recipient is offline. A first-contact quote needs a connected node.".into(),
@@ -2321,6 +2324,8 @@ pub(super) async fn first_contact_quote(
     if state.transport.connected_since(&peer_id).await != generation {
         return Err(quote_generation_changed(&peer_id));
     }
+    state.transport.reconnect_for(&peer_id,
+        Duration::from_secs(quote.expires_at_unix.saturating_sub(now_unix()))).await;
     cache_quote(peer_id, request_id, response, quote.expires_at_unix, generation);
     Ok(Json(FirstContactQuoteResponse {
         max_routing_fee_msat: total_msat - quote.admission_msat - quote.message_price,
@@ -2745,6 +2750,8 @@ async fn first_contact_admission_at(
         // Nothing was paid. Keep this very quote, bound to the generation that
         // obtained it: the owner's quote read shows it, and a send under a cap
         // that fits pays exactly this invoice without asking the target again.
+        state.transport.reconnect_for(peer_id,
+            Duration::from_secs(expires_at_unix.saturating_sub(now_unix()))).await;
         cache_quote(*peer_id, request_id, response, expires_at_unix, quote_generation);
         return Err(ApiError::PriceCapExceeded(format!(
             "{peer_id} asks {admission_msat} msat for admission again plus {message_price} msat \
@@ -3002,6 +3009,8 @@ async fn compose_room_member(
     member: NodeId,
     price_msat: u64,
 ) -> RoomMemberOutcome {
+
+    let _reconnect = state.transport.retain_peer(&member).await;
 
     // Encrypt via Double Ratchet for this specific member.
     let ratchet_msg = match state.session_manager.encrypt(&member, ctx.plaintext.as_bytes()).await {
@@ -3431,6 +3440,7 @@ pub(super) async fn compose_peer(
         // ── Peer compose: existing single-recipient path ──
         let peer_id = NodeId::from_hex(&req.recipient)
             .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+        let _reconnect = state.transport.retain_peer(&peer_id).await;
         // A room-bound chat is checked again here, before any quote: a
         // journaled retry that found nothing paid re-enters this path.
         let room = crate::room_binding::outgoing(&sender, req.kind, &req.plaintext)?;

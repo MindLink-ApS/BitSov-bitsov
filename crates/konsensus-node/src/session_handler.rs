@@ -163,6 +163,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         mut shutdown_rx,
     } = deps;
 
+    transport.set_reconnect_sessions(&session_manager);
+
     /// Maximum entries in cooldown maps before forced eviction to prevent
     /// memory exhaustion from a burst of unique peer identities.
     const MAX_COOLDOWN_ENTRIES: usize = 10_000;

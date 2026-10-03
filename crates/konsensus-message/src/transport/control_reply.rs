@@ -11,6 +11,7 @@ const MAX_REPLY_BYTES: usize = 4096;
 const MAX_PEER_EXCHANGE_REPLY_BYTES: usize = 60_000;
 
 pub(super) struct Connection {
+    outbound: bool,
     state: Mutex<PeerConnection>,
     replies: mpsc::Sender<Vec<u8>>,
     socket: socket2::Socket,
@@ -24,6 +25,7 @@ impl Connection {
         state: PeerConnection,
         peer: NodeId,
         peers: PeerMap,
+        outbound: bool,
     ) -> Result<Arc<Self>, TransportError> {
         let socket = socket2::SockRef::from(state.writer.as_ref())
             .try_clone()
@@ -31,6 +33,7 @@ impl Connection {
         let (replies, mut rx) = mpsc::channel::<Vec<u8>>(REPLY_CAPACITY);
         let connected_at = state.connected_at;
         let conn = Arc::new(Self {
+            outbound,
             admission_paid: AtomicBool::new(false),
             connected_at,
             state: Mutex::new(state),
@@ -68,6 +71,21 @@ impl Connection {
             }
         });
         Ok(conn)
+    }
+
+    /// Both endpoints select the lower NodeId as initiator when opposite
+    /// directions collide. A sole connection is accepted in either direction.
+    /// Rejected candidates never publish a reader or PeerConnected event.
+    pub(super) async fn register(self: &Arc<Self>, local: &NodeId, peer: &NodeId, peers: &PeerMap) -> bool {
+        let mut peers = peers.write().await;
+        if let Some(old) = peers.get(peer) {
+            if !old.is_closed() && prefer_existing_direction(local, peer, old.outbound, self.outbound) {
+                self.close();
+                return false;
+            }
+        }
+        if let Some(old) = peers.insert(*peer, Arc::clone(self)) { old.close(); }
+        true
     }
 
     pub(super) async fn lock(&self) -> tokio::sync::MutexGuard<'_, PeerConnection> {
@@ -129,5 +147,32 @@ impl NoiseTransport {
             ));
         }
         Ok(())
+    }
+}
+
+
+// Only opposite-direction duplicates are arbitrated. A fresh handshake in the
+// same direction can replace a stale socket after a remote restart.
+fn prefer_existing_direction(local: &NodeId, peer: &NodeId, old_outbound: bool, new_outbound: bool) -> bool {
+    old_outbound != new_outbound && old_outbound == (local.as_bytes() < peer.as_bytes())
+}
+
+#[cfg(test)]
+mod duplicate_direction_tests {
+    use super::*;
+
+    #[test]
+    fn crossed_registrations_choose_the_same_socket_in_either_order() {
+        let a = super::super::tests::make_identity(super::super::tests::TEST_MNEMONIC_A);
+        let b = super::super::tests::make_identity(super::super::tests::TEST_MNEMONIC_B);
+        let (low, high) = if a.node_id().as_bytes() < b.node_id().as_bytes() { (a.node_id(), b.node_id()) } else { (b.node_id(), a.node_id()) };
+        // Low keeps its outbound; High keeps the matching inbound, regardless
+        // of which socket completed registration first on each side.
+        assert!(prefer_existing_direction(low, high, true, false));
+        assert!(!prefer_existing_direction(low, high, false, true));
+        assert!(prefer_existing_direction(high, low, false, true));
+        assert!(!prefer_existing_direction(high, low, true, false));
+        assert!(!prefer_existing_direction(low, high, true, true));
+        assert!(!prefer_existing_direction(high, low, false, false));
     }
 }

@@ -45,20 +45,16 @@ runs the offline runner. The hash provenance is the pinned `corepc-node 0.10.1`
 and `electrsd 0.36.1` checksum manifests. Exit 77 is reported as **SKIPPED** in
 the job summary and fails the job; exit zero also requires the runtime PASS marker.
 
-The ghost/unfunded-channel scenario is separately ignored with the reason
-**requires unmerged PR #200**. This branch still checks `/tx/{txid}/status`, which
-can return `200 {"confirmed":false}` for an unknown transaction, and lacks the
-absent-parent rebroadcast suppression that scenario requires. The default wrapper
-prints this scoped SKIP; it does not claim ghost coverage. After #200 merges, use:
+PR #200 is merged. The ghost/unfunded-channel scenario still requires explicit
+selection through the existing `REGTEST_GHOST_AFTER_PR200=1` runner gate (or the
+workflow's `ghost_after_pr200` input). Enable it when verifying this fix:
 
 ```sh
 REGTEST_GHOST_AFTER_PR200=1 scripts/regress/three_node_paid_e2e.sh
 ```
 
-The dispatch workflow exposes the same named gate. With it enabled, both scenarios
-must run and pass; no failure is swallowed. Until #200 merges, nightly runs cover
-the paid-flow lane and explicitly report the ghost subscenario as skipped. Enable
-the gate by default in the wrapper/workflow when landing #200.
+Both scenarios must run and pass when selected; no failure is swallowed. The
+ordinary Cargo test run leaves the real Core/electrs scenarios ignored.
 
 ```sh
 # Build and run the touched crate's ordinary tests, including fixture tests:
@@ -117,7 +113,7 @@ Every scenario assertion/helper carries an incident label from
 | Sender-side 429 | A's chain/LDK backend is limited. Compose must return local `503 not_ready` within 8 seconds without budget, capacity or invoice changes; background recovery must permit another 2,001-msat paid message. |
 | Slow owner approval | C's first-contact quote ages beyond its signed absolute TTL before the owner approves through the real socket. Sending must replace the expired quote and deliver, with exactly two settled payments (one admission and one message) and a 4,002-msat debit. This proves no duplicate paid admission, not an exact count of unpaid wire requests. |
 | Grant without recipient entries, reconnect | A's original grant has an empty recipient map; both first-contact approvals omit a contact budget. After C reconnects, compose must return `409 budget_exceeded`, reason `first_contact`, without any payment, invoice or budget change. The owner revokes that grant and issues explicit B/C recipient entries via the socket. Re-admission then costs exactly 4,002; a further reconnect pays the same amount without another owner confirmation. |
-| Ghost channel (gated on #200) | Drop actual funding broadcasts before they reach Core, retain the real LDK monitor, force-close the unfunded channel, prove real `/tx/{txid}` returns 404, observe the provider querying that existence endpoint, and assert `closing_sats == 0` and aggregate exclusion despite a nonzero raw monitor claim. After initial processing, observe 95 seconds (three 30-second LDK rebroadcast ticks) under 429: at most one additional commitment POST is allowed. |
+| Ghost channel (explicit runner gate) | Drop actual funding broadcasts before they reach Core, retain the real LDK monitor, force-close the unfunded channel, prove real `/tx/{txid}` returns 404, observe the provider querying that existence endpoint, and assert `closing_sats == 0` and aggregate exclusion despite a nonzero raw monitor claim. After initial close processing, observe 95 seconds with fresh 404 lookups and require zero additional commitment POSTs. Under 429, require a commitment POST, then observe 95 seconds: at most ten attempts, separated by at least the 10-second cooldown floor (1-second timestamp tolerance). Require a retained retry within the 300-second cooldown cap plus scheduling allowance. Unknown funding must remain recoverable. |
 | Run 4 steps 2–3: recipient restart during active client flow | B closes/reopens its existing wallet and stores; mesh key, LN key, channel IDs and encrypted session survive. A keeps its client/grant, reconnects, and pays exactly 4,002 msat for one re-admission and one delivered message. B does not whitelist A, so reconnect cannot bypass the admission gate. |
 | Run 2 #14–18: room flow blocked | A fans out a room message to B+C; two settled member receipts, 4,002-msat budget debit, known zero routing fee, two decrypted recipient-bound envelopes. |
 
@@ -139,3 +135,165 @@ and ghost scenarios were compiled but not executed, and no runtime PASS is claim
 Missing-fixture runner verification exits 77, and explicitly selecting the Rust
 scenario with missing fixtures fails (101). Fixture execution and a green
 socket-dependent suite remain blocked by the no-network constraint.
+
+
+## First CI run correction (run 37117079614, base 359b910)
+
+These root causes are derived from code and the reported failures; the real
+regtest runtime was not available for this correction.
+
+1. **Offline quote exposed a product keepalive and reconnect gap.** Raw
+   introduction/front-door dials and contacts with `auto_connect=false` had no
+   supervisor pings. Both readers expired after 30 seconds. The initial CI
+   `Recipient is offline` was a true positive; the harness-only Ping loop masked
+   it and has been removed. Every production connection now sends Ping every
+   10 seconds on both ends, independently of reconnect eligibility. The read
+   future retains its original 30-second deadline, including partial frames;
+   outgoing pings do not reset it. Reader completion, replacement, shutdown or
+   a failed ping write stops that connection's keepalive. The 429 scenario still
+   asserts both original Noise generations across readiness loss and refusal.
+   The slow-owner scenario explicitly asserts >30 seconds between quote and
+   send, unchanged generations on both ends, and successful paid delivery.
+   Transport liveness has no chain-readiness dependency. This does not establish
+   the cause of Maya's separate live-run reachability issue.
+2. **The ghost bound assumed durable absence evidence.** The existing test already
+   passed channel removal, real `/tx/{txid}` 404, provider existence lookup,
+   `closing_sats == 0`, and aggregate exclusion before reaching the failed bound.
+   In #200, `eligible_package` rechecks funding for every eligible package; its
+   absence set is local to that call. A 429 is unknown, never absence. Keeping an
+   old 404 indefinitely would prevent recovery if funding arrived later. Once
+   eligible, `broadcast_with_backoff` retains the package on 429; queue-level
+   30/60/120-second backoff does not count those HTTP retries. Therefore one POST
+   per 95 seconds was not #200's contract. Concurrent package responses can extend
+   the same shared cooldown episode, so even a per-transaction 10/20/40 schedule
+   is not guaranteed. The corrected test separately verifies fresh-404 suppression
+   and unknown-funding recovery with the guaranteed 10-second retry floor. It
+   logs funding response codes, closed-channel/claim state, POST counts, retry
+   gaps and chain health. It requires actual commitment POSTs and a retained retry
+   so an idle or lost broadcast worker cannot pass the 429 phase vacuously.
+
+No product readiness or payment gate was relaxed. The source Northstar and
+whitepaper are outside this checkout; the supplied doctrine card governs this
+change. Doctrine: 1–6 hold; chain availability does not identify or disconnect
+mesh peers, keepalives grant no admission, refusals spend nothing, and runtime
+success is not claimed.
+
+Verification for this correction used `cargo test --offline --locked -p
+konsensus-node --features regtest-e2e --no-fail-fast` under a deny-all-network
+sandbox: **695 passed, 103 failed, 10 ignored**, exit 101. Every failure was a
+denied socket operation or consequent fixture/setup failure; this is not a green
+suite. `cargo clippy --offline --locked -p konsensus-node --all-targets --features
+regtest-e2e -- -D warnings` passed under the same sandbox. Cargo still reports the
+pre-existing sqlx-postgres future-compatibility notice. Core/electrs runtime tests
+were compiled but not run. No network, including port 3141, was contacted.
+
+## Product reconnect policy
+
+- Owner-added contacts default to `auto_connect=true`. All local contacts with a
+  usable listening endpoint get supervised reconnects, including legacy entries
+  that explicitly store `false`. The field remains accepted for compatibility;
+  it is not a reconnect opt-out. Remove a contact to stop its supervision.
+  Add, update, import, explicit Connect and node startup use the same supervisor.
+  Deletion also removes the persisted contact. Static config entries remain
+  owner configuration and must be removed from that file to remove them at boot.
+- An introduction/front-door open remains a one-off unprivileged dial. Its
+  authenticated, locally supplied endpoint is remembered only in memory while
+  connected or needed. It is never put in a contact list or published. The
+  supervisor may retry it only while an E2EE session exists, a quote is still
+  valid, or a quote/payment operation holds a reconnect handle. Expiring a quote,
+  dropping the last operation handle, or removing the session removes that
+  reason. A disconnected stranger without any reason is forgotten.
+- Retries use exponential backoff from 1 to 60 seconds, respect local bans, and
+  have a bounded dial deadline. Repeated registration is idempotent; address
+  changes replace the worker; explicit and supervised outbound dials serialize
+  by NodeId. Simultaneous inbound/outbound duplicates select the same surviving
+  socket at both ends using authenticated NodeId order. Contact removal and
+  shutdown cancel pending dials. Each reader and
+  keepalive is tied to its connection generation.
+- A listening endpoint must be supplied locally. Inbound ephemeral source ports
+  and the persisted `0.0.0.0:0` sentinel are never dial targets. An inbound-only
+  peer without a known listening endpoint must reconnect from its side; session
+  existence cannot manufacture an address. No directory or gossip is used.
+- Reconnect restores reachability only. Existing generation-bound quotes, paid
+  admission, reservation checks, and single-use recipient-bound payments retain
+  their checks. Reconnect never automatically pays or replays an operation.
+
+Doctrine: 1–6 hold for this change: liveness grants no admission or service,
+refusals spend nothing, keys remain identity, reconnect reasons and endpoints
+stay local, custody is unchanged, and runtime limits are reported explicitly.
+
+## Product-fix verification (2026-10-03)
+
+The final reviewed patch was tested offline under an OS sandbox denying all
+network access, including loopback. Across `konsensus-core`, `konsensus-message`,
+`konsensus-api`, and `konsensus-node` with `regtest-e2e`, Cargo reported **2,519
+passed, 183 failed, 10 ignored** (exit 101). Every failure was a denied socket
+operation or a resulting fixture failure. This is not a green runtime suite.
+[The verification record](testing/node-liveness-offline.txt) names every failed
+test, including the new >60-second acceptor, forced contact redial, stranger
+non-redial, live-session/operation reconnect, crossed-dial and cancellation tests.
+
+The socket-free tests passed: the owner-contact default, expiring reconnect
+reasons, atomic worker retirement, late shutdown, duplicate-direction selection,
+and the unchanged 30-second timeout for silent and partial-frame peers. Clippy
+passed offline for all four crates and all targets with `-D warnings`; Cargo
+still reports the pre-existing sqlx-postgres future-compatibility notice. The
+three-node regtest scenarios compiled but were not executed. No network was
+contacted. Independent source review approved the patch after the reported
+concurrency and lifecycle findings were resolved.
+
+## Re-admission observer correction (2026-10-03)
+
+Run 37120721675 at `8e1b4b0` passed slow-owner delivery, then timed out in
+`eventually(READMISSION)`. In this step that helper only waits for the recipient
+socket to disappear (or appear after the explicit dial); it does not wait for a
+budget refusal. Slow-owner delivery has already installed the E2EE session, so
+Alice's remembered C endpoint remains eligible for supervised redial. A new
+connection can be registered between the helper's 250ms polls. The old
+`!is_connected` predicate then stays false on a healthy replacement for the
+entire 360-second timeout. Nothing in the supplied failure demonstrates lost
+E2EE, retired interest, an absent endpoint, or a stuck dial lock. The original
+output does not distinguish which of the two re-admission reconnect calls or
+which predicate timed out; confirming the runtime interleaving needs CI.
+
+The helper now captures both original connection generations, forces the drop,
+and allows either the product supervisor or explicit dial to reconnect. It
+requires a different, present generation at **both** ends. It also asserts that
+E2EE survives, reconnect spends nothing, and neither replacement inherits paid
+admission. The scenario still requires `budget_exceeded` / `first_contact`, no
+balance/grant/payment/invoice changes without a recipient allowance, and exactly
+4,002 msat (2,001 admission + 2,001 message) with the explicit allowance, including
+a second reconnect. The transport regression now checks recipient generation
+replacement even when the observer arrives after redial, and loss of the old
+paid-admission marker while the E2EE session remains.
+
+Each reconnect is labelled with/without allowance. Before and after the forced
+drop, after the explicit dial, every five seconds while waiting, at completion,
+and at the refusal/payment boundary, output includes the connection generation,
+closed/paid flags, E2EE existence, local supervision endpoint, worker completion,
+contact/operation/quote interest, and dial-handle/lock state. These are local,
+independently sampled diagnostics, not a public endpoint or an atomic snapshot.
+
+Fable N1 remains: `Connection::register` prefers the lower key's outbound socket
+against an opposite-direction candidate until the old socket is locally closed.
+A restarted remote can therefore be rejected until read/keepalive detects that
+old connection's death (about 30 seconds, plus retry scheduling). This bounded
+recovery delay does not itself explain waiting 360 seconds for an absence that
+redial already repaired. An unconditional preference reversal would risk
+crossed-dial convergence; distinguishing a restart from a concurrent handshake
+needs a separately tested liveness/incarnation design. No arbitration change is
+included in this test correction.
+
+Doctrine: 1–6 hold. Payment and admission gates are unchanged, refusals spend
+nothing, keys identify peers, diagnostics and reconnect interest remain local,
+custody is unchanged, and CI runtime recovery remains to be verified.
+
+Final offline checks for `konsensus-message` and `konsensus-node` with
+`regtest-e2e`: **930 passed, 169 failed, 10 ignored**, exit 101, under an OS sandbox
+denying all network including loopback. Failures were socket-denied setup or
+consequent fixture failures; the strengthened live-session reconnect regression
+failed at listener bind. [The verification record](testing/readmission-offline.txt)
+names every failure. Clippy passed offline for both crates/all targets with
+`-D warnings`; the existing sqlx-postgres future-compatibility notice remains.
+Source review approved the code change. Core/electrs runtime was not run and no
+network was contacted.

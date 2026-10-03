@@ -57,10 +57,12 @@ pub struct AddPeerRequest {
     pub addr: String,
     /// Optional human-readable label.
     pub label: Option<String>,
-    /// Whether to auto-connect on startup.
-    #[serde(default)]
+    /// Legacy startup flag (defaults true); all local contacts are supervised.
+    #[serde(default = "default_auto_connect")]
     pub auto_connect: bool,
 }
+
+fn default_auto_connect() -> bool { true }
 
 /// A single peer in an export/import backup.
 #[derive(Serialize, Deserialize, Clone)]
@@ -223,13 +225,8 @@ async fn add_peer(
     // Add to transport whitelist so the peer can connect (Principle 3)
     state.transport.add_to_whitelist(&node_id).await;
 
-    // Start supervised connection for auto-connect peers
-    if req.auto_connect {
-        state
-            .transport
-            .supervise_peer(&node_id, &addr.to_string())
-            .await;
-    }
+    // Owner-added contacts reconnect even with a legacy false auto_connect flag.
+    state.transport.supervise_peer(&node_id, &addr.to_string()).await;
 
     // P3-2: persist so the gate whitelist survives restart (the PeerRegistry is
     // reloaded from the durable `peers` table at boot, not just config.peers).
@@ -273,13 +270,18 @@ async fn remove_peer(
         return Err(ApiError::NotFound(format!("peer {node_id_hex} not found")));
     }
 
-    // Remove from transport whitelist and disconnect (Principle 3)
+    // Remove from transport whitelist and disconnect (Principle 3).
+    // Stop retries even if removing the durable record below fails.
     state.transport.remove_from_whitelist(&node_id).await;
     if state.transport.is_connected(&node_id).await {
         if let Err(e) = state.transport.disconnect(&node_id).await {
             tracing::warn!(peer = %node_id_hex, error = %e, "failed to disconnect removed peer");
         }
     }
+
+    // Removal must survive restart, or startup supervision would dial it again.
+    state.storage.delete_peer(&node_id).await
+        .map_err(|e| ApiError::Storage(e.to_string()))?;
 
     state.audit_log.record(
         events::PEER_REMOVED,
@@ -364,6 +366,7 @@ async fn update_peer(
 
     registry.add(updated);
     drop(registry);
+    state.transport.supervise_peer(&node_id, &new_addr.to_string()).await;
 
     // P3-2: persist the update so address/label/auto_connect edits survive
     // restart (merge_persisted_peers reloads the durable row at boot).
@@ -439,11 +442,10 @@ async fn connect_peer(
         .await
         .map_err(|e| ApiError::Internal(format!("failed to persist connected peer: {e}")))?;
 
-    state
-        .transport
-        .connect(&node_id, &addr.to_string())
-        .await
-        .map_err(|e| ApiError::Transport(e.to_string()))?;
+    let connected = state.transport.connect(&node_id, &addr.to_string()).await;
+    // Start retries after the explicit dial finishes, including on failure.
+    state.transport.supervise_peer(&node_id, &addr.to_string()).await;
+    connected.map_err(|e| ApiError::Transport(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "connected": true })))
 }
@@ -577,6 +579,8 @@ async fn import_peers(
         // Add to transport whitelist (Principle 3)
         state.transport.add_to_whitelist(&node_id).await;
 
+        state.transport.supervise_peer(&node_id, &addr.to_string()).await;
+
         // P3-2: persist so imported peers survive restart.
         let mut persisted = konsensus_storage::Peer::new(node_id);
         persisted.address = Some(addr.to_string());
@@ -621,4 +625,17 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/api/v1/peers/:node_id/connect", post(connect_peer))
         .route("/api/v1/peers/:node_id/discover", post(discover_peers))
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    #[test]
+    fn owner_added_contact_defaults_to_auto_connect() {
+        let req: AddPeerRequest = serde_json::from_value(serde_json::json!({
+            "node_id": "unused by deserialization", "addr": "127.0.0.1:9735"
+        })).unwrap();
+        assert!(req.auto_connect, "owner-added contacts should connect without a hidden opt-in");
+    }
 }
