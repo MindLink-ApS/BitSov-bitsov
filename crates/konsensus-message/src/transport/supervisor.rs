@@ -60,6 +60,44 @@ fn retire_if_unwanted(
 }
 
 impl NoiseTransport {
+    /// Local diagnostic snapshot for reconnect failures. No network I/O, secrets,
+    /// or writer lock; fields are sampled independently, not an atomic status.
+    pub async fn reconnect_diagnostics(&self, peer: &NodeId) -> String {
+        let connection = self.peers.read().await.get(peer).map(|conn| {
+            (
+                conn.connected_at,
+                conn.is_closed(),
+                conn.admission_paid
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        });
+        let supervision = self.supervision.lock().unwrap().get(peer).map(|entry| {
+            let interest = entry.interest.lock().unwrap();
+            (
+                entry.addr,
+                entry.task.is_finished(),
+                interest.contact,
+                interest.operation.strong_count(),
+                interest
+                    .quote_until
+                    .map(|until| until.saturating_duration_since(Instant::now())),
+            )
+        });
+        let dial = self
+            .dial_locks
+            .lock()
+            .unwrap()
+            .get(peer)
+            .and_then(Weak::upgrade);
+        let dial_present = dial.is_some();
+        let dial_locked = dial.as_ref().is_some_and(|lock| lock.try_lock().is_err());
+        format!(
+            "peer={peer}, connection(generation,closed,paid)={connection:?}, \
+             supervision(endpoint,finished,contact,operations,quote_remaining)={supervision:?}, \
+             dial_present={dial_present}, dial_locked={dial_locked}"
+        )
+    }
+
     pub(super) async fn is_whitelisted(&self, peer: &NodeId) -> bool {
         self.whitelist.read().await.contains(peer)
     }

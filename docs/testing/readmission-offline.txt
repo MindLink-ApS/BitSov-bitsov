@@ -1,0 +1,191 @@
+BitSov re-admission correction offline verification (2026-10-03)
+
+All test and clippy commands run under:
+  sandbox-exec -p '(version 1)(allow default)(deny network*)'
+No network, including 127.0.0.1:3141, was contacted.
+
+cargo test --offline --locked -p konsensus-message -p konsensus-node --features regtest-e2e --no-fail-fast
+Exit 101: 930 passed, 169 failed, 10 ignored.
+Every failure contains denied socket I/O or a consequent fixture failure,
+except owner_token_script_error_path_and_url_guard whose wrapper hides stderr:
+its fixture starts by binding IPv4/IPv6 sockets (docs/ops/test-owner-token.sh:23).
+This is not a green suite. Real Core/electrs regtests compiled but stayed ignored.
+The strengthened live_session_reconnects_without_contact_or_auto_connect test
+failed at listener bind (EPERM), before exercising its assertions.
+
+cargo clippy --offline --locked -p konsensus-message -p konsensus-node --all-targets --features regtest-e2e -- -D warnings
+Exit 0. Pre-existing sqlx-postgres future-compatibility notice remains.
+
+Independent source review approved the code change with no actionable findings.
+Doctrine: 1-6 hold; this is offline verification, not a claim of CI runtime success.
+
+Failed tests (one entry per failed test execution; names can repeat across targets):
+- a_leftover_plaintext_copy_is_refused_too
+- a_lost_request_fails_before_asking_for_a_code
+- a_malformed_tuple_is_refused_before_signing
+- a_plaintext_recovery_phrase_is_refused_before_anything_is_asked
+- an_empty_line_cancels_and_sends_nothing
+- attacker_node_rejected_whitelist_is_final_gate
+- cookie_required_rejects_client_that_cannot_answer
+- cookie_required_responder_accepts_initiator
+- cookie_response_with_reserved_field_set_is_rejected
+- default_disabled_handshake_is_unchanged
+- f7_stress_20_messages_alternating
+- f8_persistence_survives_beta_restart
+- first_contact_cli_escapes_summary_and_preserves_wire_strings
+- first_contact_cli_sends_exact_tuple_after_summary
+- gift_cli_escapes_summary_and_preserves_wire_strings
+- gift_cli_keeps_leading_zero_code_and_reports_node_refusal
+- handshake_gate_with_invite_ref_invitee_initiated_connection_is_accepted
+- it_refuses_while_the_node_is_running
+- large_messages_survive_full_e2ee_pipeline
+- msg_handler::tests::category_offer_binds_original_kind_exclusion_after_tariffs_converge
+- msg_handler::tests::category_offer_binds_original_kind_inclusion_after_tariffs_diverge
+- msg_handler::tests::discounted_kind_offer_survives_price_rise
+- msg_handler::tests::kind_offer_establishes_discount_on_new_connection
+- msg_handler::tests::kind_offer_publication_serializes_discount_and_fails_closed
+- msg_handler::tests::legacy_limbo_heals_only_after_signature_and_settlement_gate
+- msg_handler::tests::lost_ack_after_price_rise_still_gets_duplicate_ack
+- msg_handler::tests::lost_ack_survives_recipient_retention_and_sender_restart
+- msg_handler::tests::paid_acceptance_storage_retry_and_lost_ack_are_idempotent
+- msg_handler::tests::paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call
+- msg_handler::tests::porch_adverts_admission_matches_offer_and_gate
+- msg_handler::tests::porch_adverts_match_durable_offer_and_gate
+- msg_handler::tests::quoted_payment_delayed_until_price_rise_is_accepted_once_over_noise
+- msg_handler::tests::room_chats_stay_hidden_until_their_binding_is_admitted
+- msg_handler::tests::unpaid_stranger_envelope_is_silent_and_creates_no_records
+- msg_handler::tests::whitelisted_price_open_peer_keeps_detailed_rejection
+- non_whitelisted_peer_rejected_by_responder
+- one_step_grant_sends_the_typed_code_after_the_terms
+- oversized_pre_noise_frame_is_refused
+- owner_token_script_error_path_and_url_guard
+- peer_exchange::tests::whitelist_privilege_refuses_unpaid_exchange_and_paid_wire_act_is_served
+- peer_exchange::tests::wire_default_off_returns_explicit_refusal_and_no_records
+- regtest_e2e::three_node::fault_proxy::proxy_forwards_then_rate_limits_then_recovers
+- remote_access::tests::pairing_link_signature_and_noise_tunnel_round_trip
+- self_removal_reconnect_and_send_rejected
+- send_lock_concurrency_does_not_starve_registry_reads
+- session_handler::budgeted_reconnect_two_node::a_contact_without_a_budget_needs_the_one_time_confirmation_once
+- session_handler::budgeted_reconnect_two_node::budgeted_contact_is_readmitted_from_the_budget_without_a_prompt
+- session_handler::budgeted_reconnect_two_node::capped_paired_send_cannot_add_unquoted_reconnection_debit
+- session_handler::budgeted_reconnect_two_node::capped_reconnect_no_double_pay_on_retry_or_flap
+- session_handler::budgeted_reconnect_two_node::capped_reconnect_readmission_refusal_carries_a_stable_reason
+- session_handler::budgeted_reconnect_two_node::capped_reconnect_readmission_succeeds_when_quote_fits
+- session_handler::budgeted_reconnect_two_node::capped_reconnect_refuses_before_payment_when_quote_does_not_fit
+- session_handler::budgeted_reconnect_two_node::capped_reconnect_refuses_when_quoted_all_in_exceeds_grant_before_pay
+- session_handler::budgeted_reconnect_two_node::capped_reconnect_refuses_with_no_quote
+- session_handler::budgeted_reconnect_two_node::capped_reconnect_rejects_quote_from_prior_connection_generation
+- session_handler::budgeted_reconnect_two_node::capped_reconnect_respects_paired_grant_contact_limit
+- session_handler::budgeted_reconnect_two_node::failed_admission_releases_the_undispatched_message_reservation
+- session_handler::budgeted_reconnect_two_node::failed_message_after_readmission_charges_admission_only_once
+- session_handler::budgeted_reconnect_two_node::fresh_quote_is_reserved_into_the_grant_before_admission_pay
+- session_handler::budgeted_reconnect_two_node::owner_readmission_preserves_zero_routing_fee_ceiling
+- session_handler::budgeted_reconnect_two_node::paid_message_after_reconnect_is_delivered_not_silently_dropped
+- session_handler::budgeted_reconnect_two_node::regression_readmission_respects_aggregate_grant_per_call_limit
+- session_handler::budgeted_reconnect_two_node::regression_recovered_admission_emits_one_n2_event
+- session_handler::budgeted_reconnect_two_node::repriced_readmission_error_reports_the_fee_ceilings_it_authorized
+- session_handler::budgeted_reconnect_two_node::repriced_readmission_reports_the_fee_ceilings_it_authorized
+- session_handler::budgeted_reconnect_two_node::unknown_admission_keeps_only_its_own_reservation
+- session_handler::paid_first_contact_two_node::browse_two_node::concurrent_porch_read_returns_busy_without_deadlocking_the_slot
+- session_handler::paid_first_contact_two_node::browse_two_node::porch_read_pays_once_and_returns_the_verified_card
+- session_handler::paid_first_contact_two_node::browse_two_node::porch_read_without_a_session_pays_nothing
+- session_handler::paid_first_contact_two_node::browse_two_node::reconnect_requires_explicit_knock_before_browse_and_pays_nothing
+- session_handler::paid_first_contact_two_node::m11_payer_restart_inside_the_window_pays_once_per_connection
+- session_handler::paid_first_contact_two_node::m12_a_quote_from_someone_else_is_refused_and_promotes_nothing
+- session_handler::paid_first_contact_two_node::m1_card_only_first_contact_delivers_once_payee_initiates
+- session_handler::paid_first_contact_two_node::m1_card_only_first_contact_delivers_once_payer_initiates
+- session_handler::paid_first_contact_two_node::m2_reply_to_dialler_first_contact_delivers_once_payee_initiates
+- session_handler::paid_first_contact_two_node::m2_reply_to_dialler_first_contact_delivers_once_payer_initiates
+- session_handler::paid_first_contact_two_node::m3_whitelisted_dialler_first_contact_delivers_once_payee_initiates
+- session_handler::paid_first_contact_two_node::m3_whitelisted_dialler_first_contact_delivers_once_payer_initiates
+- session_handler::paid_first_contact_two_node::m4_retry_on_the_same_connection_does_not_repay
+- session_handler::paid_first_contact_two_node::m5_retry_after_flap_readmits_once_payee_initiates
+- session_handler::paid_first_contact_two_node::m5_retry_after_flap_readmits_once_payer_initiates
+- session_handler::paid_first_contact_two_node::m7_unpaid_stranger_gets_nothing_while_the_payer_pays_someone_else
+- session_handler::paid_first_contact_two_node::m8_paid_payee_gets_no_peer_exchange_lightning_or_gossip
+- session_handler::paid_first_contact_two_node::m9_m10_reconnect_needs_readmission_then_acks_count
+- session_handler::paid_first_contact_two_node::p1_replacement_between_mark_and_send_pays_admission_once_payee_initiates
+- session_handler::paid_first_contact_two_node::p1_replacement_between_mark_and_send_pays_admission_once_payer_initiates
+- session_handler::paid_first_contact_two_node::p2_paid_payee_gets_no_rejection_or_prices_for_an_unpaid_envelope
+- session_handler::paid_first_contact_two_node::p2_replacement_after_classification_readmits_once_and_delivers
+- session_handler::paid_first_contact_two_node::peer_exchange_payment_promoted_sender_still_requires_own_quote_and_payment
+- session_handler::paid_first_contact_two_node::post_peers_whitelist_takes_effect_on_the_live_connection
+- session_handler::paid_first_contact_two_node::sixteen_minute_flap_with_legacy_outbox_accepts_only_one_new_admission
+- session_handler::paid_first_contact_two_node::speed_eager_offer_never_reaches_an_unpaid_replacement
+- session_handler::paid_first_contact_two_node::speed_first_contact_is_fast_payee_initiates
+- session_handler::paid_first_contact_two_node::speed_first_contact_is_fast_payer_initiates
+- session_handler::paid_first_contact_two_node::speed_payer_higher_first_compose_delivers_while_ratchet_init_is_in_flight
+- session_handler::reconnect_two_node::paid_message_after_reconnect_is_delivered_not_silently_dropped
+- session_handler::tests::lnd_stranger_quote_returns_stable_refusal_over_noise
+- session_handler::tests::recovery_announces_lightning_once_only_to_privileged_connected_peers
+- session_handler::tests::stranger_quote_over_noise_creates_no_application_state
+- session_handler::tests::unpaid_request_flood_does_not_stall_other_peers
+- session_recovers_after_node_restart
+- socket_text_is_never_printed_and_the_terms_shown_are_computed_locally
+- stun::tests::client_discovers_a_public_mapped_ip_and_uses_the_peer_port
+- stun::tests::client_discovers_a_public_mapped_ip_and_uses_the_peer_port
+- stun::tests::client_rejects_loopback_mapped_as_invalid_response
+- stun::tests::client_rejects_loopback_mapped_as_invalid_response
+- stun::tests::client_reports_family_mismatch_when_stun_has_no_matching_address
+- stun::tests::client_reports_family_mismatch_when_stun_has_no_matching_address
+- stun::tests::client_reports_unreachable_and_invalid_responses
+- stun::tests::client_reports_unreachable_and_invalid_responses
+- stun::tests::udp_responder_reflects_the_caller_and_drops_junk_and_floods
+- stun::tests::udp_responder_reflects_the_caller_and_drops_junk_and_floods
+- three_nodes_federate_and_exchange_encrypted_messages
+- transport::cancelled_noise_write_tests::cancelled_partial_frame_closes_socket_before_next_send
+- transport::idle_regressions::acceptor_pings_a_passive_initiator_for_over_sixty_seconds
+- transport::idle_regressions::busy_local_writer_is_not_a_one_second_keepalive_failure
+- transport::idle_regressions::cancelled_disconnect_closes_untracked_generation
+- transport::idle_regressions::introduction_only_stranger_is_not_redialed
+- transport::idle_regressions::live_session_reconnects_without_contact_or_auto_connect
+- transport::idle_regressions::operation_reconnects_then_releases_stranger
+- transport::idle_regressions::raw_acceptor_and_dialer_survive_sixty_seconds_idle
+- transport::idle_regressions::simultaneous_contact_dials_converge_on_one_live_generation
+- transport::reply_tests::admission_payment_guard_lives_until_connection_replacement
+- transport::reply_tests::control_reply_backpressure_closes_without_waiting_for_connection_lock
+- transport::reply_tests::control_reply_deadline_includes_waiting_for_connection_lock
+- transport::tests::active_bans_preserved_on_connection
+- transport::tests::actively_banned_peer_rejected
+- transport::tests::admission_paid_connection_accepts_only_the_bought_frames
+- transport::tests::banned_peer_can_reconnect_after_expiry
+- transport::tests::bidirectional_message_exchange
+- transport::tests::connected_peers_returns_correct_list
+- transport::tests::connected_privileged_peers_excludes_unprivileged_until_promoted
+- transport::tests::control_events_emitted_on_connect
+- transport::tests::dynamic_whitelist_add_enables_connection
+- transport::tests::dynamic_whitelist_remove_blocks_new_connections
+- transport::tests::e2e_encrypted_message_exchange
+- transport::tests::eager_frames_go_only_to_the_exact_paid_or_promoted_generation
+- transport::tests::empty_whitelist_rejects_inbound
+- transport::tests::empty_whitelist_rejects_outbound
+- transport::tests::expired_bans_evicted_on_connection
+- transport::tests::frame_validation_budget_exceeded_disconnects_peer
+- transport::tests::frame_validation_budget_not_refilled_by_interleaved_valid_frames
+- transport::tests::frame_validation_budget_tolerates_occasional_garbage
+- transport::tests::graceful_disconnect_cleans_up_peer
+- transport::tests::keepalive_ping_pong
+- transport::tests::listen_addr_set_after_start
+- transport::tests::message_ack_and_reject_routed
+- transport::tests::multiple_messages_in_sequence
+- transport::tests::peer_exchange_request_and_response_routed
+- transport::tests::peer_info_returns_tier_and_capabilities
+- transport::tests::prekey_offer_routed_through_control_channel
+- transport::tests::price_query_and_response_routed
+- transport::tests::price_table_routed_through_control_channel
+- transport::tests::priceopen_connect_dials_stranger
+- transport::tests::priceopen_responder_admits_unprivileged_stranger
+- transport::tests::promote_binds_sender_to_its_own_connection
+- transport::tests::promote_to_privileged_flips_unprivileged_connection
+- transport::tests::ratchet_init_routed_through_control_channel
+- transport::tests::reader_stamps_current_privilege_onto_control_events
+- transport::tests::send_frame_does_not_hold_peers_rwlock_during_io
+- transport::tests::send_raw_frame_does_not_hold_peers_rwlock_during_io
+- transport::tests::session_init_and_ack_routed
+- transport::tests::supervise_peer_connects_dynamically
+- transport::tests::supervise_peer_reconnects_after_disconnect
+- transport::tests::supervisor_reconnects_after_disconnect
+- transport::tests::two_nodes_connect_and_exchange_messages
+- transport::tests::version_mismatch_rejects_connection
+- transport::tests::whitelist_responder_still_rejects_empty
+- transport::tests::whitelisting_a_live_peer_privileges_its_connection

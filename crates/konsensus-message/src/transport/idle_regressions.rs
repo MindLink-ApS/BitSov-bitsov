@@ -97,7 +97,7 @@ async fn operation_reconnects_then_releases_stranger() {
 
 #[tokio::test]
 async fn live_session_reconnects_without_contact_or_auto_connect() {
-    let (a, b, _aid, bid) = pair().await;
+    let (a, b, aid, bid) = pair().await;
     let sessions = Arc::new(konsensus_crypto::SessionManager::new(a.identity.clone()));
     let recipient = konsensus_crypto::SessionManager::new(b.identity.clone());
     sessions
@@ -106,8 +106,18 @@ async fn live_session_reconnects_without_contact_or_auto_connect() {
         .unwrap();
     a.set_reconnect_sessions(&sessions);
     let old = a.connected_since(&bid).await.unwrap();
+    let old_recipient = b.connected_since(&aid).await.unwrap();
+    a.mark_admission_paid(&bid, old).await;
     a.disconnect(&bid).await.unwrap();
     wait_reconnected(&a, bid, old).await;
+    wait_reconnected(&b, aid, old_recipient).await;
+    // Reproduce a delayed observer arriving after supervised redial. A helper
+    // waiting for a disconnected recipient here would miss the whole transition.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(b.is_connected(&aid).await);
+    assert_ne!(b.connected_since(&aid).await, Some(old_recipient));
+    assert!(sessions.has_session(&bid).await);
+    assert!(!a.admission_paid_on_connection(&bid).await);
     assert!(a.connected_privileged_peers().await.is_empty());
     sessions.remove_session(&bid).await;
     a.disconnect(&bid).await.unwrap();

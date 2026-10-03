@@ -241,3 +241,59 @@ still reports the pre-existing sqlx-postgres future-compatibility notice. The
 three-node regtest scenarios compiled but were not executed. No network was
 contacted. Independent source review approved the patch after the reported
 concurrency and lifecycle findings were resolved.
+
+## Re-admission observer correction (2026-10-03)
+
+Run 37120721675 at `8e1b4b0` passed slow-owner delivery, then timed out in
+`eventually(READMISSION)`. In this step that helper only waits for the recipient
+socket to disappear (or appear after the explicit dial); it does not wait for a
+budget refusal. Slow-owner delivery has already installed the E2EE session, so
+Alice's remembered C endpoint remains eligible for supervised redial. A new
+connection can be registered between the helper's 250ms polls. The old
+`!is_connected` predicate then stays false on a healthy replacement for the
+entire 360-second timeout. Nothing in the supplied failure demonstrates lost
+E2EE, retired interest, an absent endpoint, or a stuck dial lock. The original
+output does not distinguish which of the two re-admission reconnect calls or
+which predicate timed out; confirming the runtime interleaving needs CI.
+
+The helper now captures both original connection generations, forces the drop,
+and allows either the product supervisor or explicit dial to reconnect. It
+requires a different, present generation at **both** ends. It also asserts that
+E2EE survives, reconnect spends nothing, and neither replacement inherits paid
+admission. The scenario still requires `budget_exceeded` / `first_contact`, no
+balance/grant/payment/invoice changes without a recipient allowance, and exactly
+4,002 msat (2,001 admission + 2,001 message) with the explicit allowance, including
+a second reconnect. The transport regression now checks recipient generation
+replacement even when the observer arrives after redial, and loss of the old
+paid-admission marker while the E2EE session remains.
+
+Each reconnect is labelled with/without allowance. Before and after the forced
+drop, after the explicit dial, every five seconds while waiting, at completion,
+and at the refusal/payment boundary, output includes the connection generation,
+closed/paid flags, E2EE existence, local supervision endpoint, worker completion,
+contact/operation/quote interest, and dial-handle/lock state. These are local,
+independently sampled diagnostics, not a public endpoint or an atomic snapshot.
+
+Fable N1 remains: `Connection::register` prefers the lower key's outbound socket
+against an opposite-direction candidate until the old socket is locally closed.
+A restarted remote can therefore be rejected until read/keepalive detects that
+old connection's death (about 30 seconds, plus retry scheduling). This bounded
+recovery delay does not itself explain waiting 360 seconds for an absence that
+redial already repaired. An unconditional preference reversal would risk
+crossed-dial convergence; distinguishing a restart from a concurrent handshake
+needs a separately tested liveness/incarnation design. No arbitration change is
+included in this test correction.
+
+Doctrine: 1–6 hold. Payment and admission gates are unchanged, refusals spend
+nothing, keys identify peers, diagnostics and reconnect interest remain local,
+custody is unchanged, and CI runtime recovery remains to be verified.
+
+Final offline checks for `konsensus-message` and `konsensus-node` with
+`regtest-e2e`: **930 passed, 169 failed, 10 ignored**, exit 101, under an OS sandbox
+denying all network including loopback. Failures were socket-denied setup or
+consequent fixture failures; the strengthened live-session reconnect regression
+failed at listener bind. [The verification record](testing/readmission-offline.txt)
+names every failure. Clippy passed offline for both crates/all targets with
+`-D warnings`; the existing sqlx-postgres future-compatibility notice remains.
+Source review approved the code change. Core/electrs runtime was not run and no
+network was contacted.

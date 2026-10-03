@@ -161,18 +161,87 @@ async fn connect(from: &app::App, to: &app::App, incident: &str) {
     tokio::time::sleep(Duration::from_millis(1100)).await;
 }
 
+async fn log_reconnect(from: &app::App, to: &app::App, phase: &str) {
+    for (label, local, remote) in [("sender", from, to), ("recipient", to, from)] {
+        let peer = remote.state.identity.node_id();
+        println!(
+            "{READMISSION}: {phase}: {label}: e2ee_session={}, {}",
+            local.state.session_manager.has_session(peer).await,
+            local.transport.reconnect_diagnostics(peer).await,
+        );
+    }
+}
+
 async fn reconnect(from: &app::App, to: &app::App, incident: &str) {
-    from.transport
-        .disconnect(to.state.identity.node_id())
-        .await
+    let peer = to.state.identity.node_id();
+    let sender = from.state.identity.node_id();
+    let old_from = from.transport.connected_since(peer).await.expect(incident);
+    let old_to = to.transport.connected_since(sender).await.expect(incident);
+    let used = from.used();
+    println!(
+        "{incident}: forcing reconnect from generations sender={old_from:?}, recipient={old_to:?}"
+    );
+    log_reconnect(from, to, "before forced disconnect").await;
+    from.transport.disconnect(peer).await.expect(incident);
+    log_reconnect(from, to, "after forced disconnect").await;
+    // A live E2EE session (created by slow-owner delivery) keeps the product
+    // supervisor interested. It may replace the socket between polls. Waiting
+    // for !is_connected on the recipient can then wait forever on a healthy
+    // replacement. Accept either the supervisor's dial or this explicit dial,
+    // but require a NEW generation at BOTH ends before testing re-admission.
+    let dial = tokio::time::timeout(
+        Duration::from_secs(30),
+        from.transport
+            .connect(peer, &to.transport.listen_addr().unwrap().to_string()),
+    )
+    .await;
+    log_reconnect(from, to, "explicit dial finished").await;
+    dial.expect("re-admission: explicit dial deadline")
         .expect(incident);
-    eventually(incident, || async {
-        !to.transport
-            .is_connected(from.state.identity.node_id())
-            .await
+    let wait = tokio::time::timeout(Duration::from_secs(360), async {
+        let mut next_log = std::time::Instant::now();
+        loop {
+            let new_from = from.transport.connected_since(peer).await;
+            let new_to = to.transport.connected_since(sender).await;
+            if new_from.is_some_and(|generation| generation != old_from)
+                && new_to.is_some_and(|generation| generation != old_to)
+            {
+                break;
+            }
+            if std::time::Instant::now() >= next_log {
+                log_reconnect(from, to, "waiting for both replacement generations").await;
+                next_log = std::time::Instant::now() + Duration::from_secs(5);
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     })
     .await;
-    connect(from, to, incident).await;
+    log_reconnect(from, to, "replacement generation wait finished").await;
+    wait.unwrap_or_else(|_| panic!("{incident}: replacement generations did not recover in 360s"));
+    assert_eq!(
+        from.used(),
+        used,
+        "{incident}: reconnect itself spends nothing"
+    );
+    for (local, remote) in [(from, to), (to, from)] {
+        assert!(
+            !local
+                .transport
+                .admission_paid_on_connection(remote.state.identity.node_id())
+                .await,
+            "{incident}: new generation must not inherit paid admission"
+        );
+        assert!(
+            local
+                .state
+                .session_manager
+                .has_session(remote.state.identity.node_id())
+                .await,
+            "{incident}: reconnect must preserve the E2EE session"
+        );
+    }
+    // The production stateless quote gate quarantines a new connection for 1s.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
 }
 
 async fn quote(from: &app::App, to: &app::App, incident: &str) -> Value {
@@ -694,7 +763,7 @@ async fn three_node_paid_e2e() {
             .is_empty(),
         "{READMISSION}"
     );
-    reconnect(&alice, &carol, READMISSION).await;
+    reconnect(&alice, &carol, "re-admission without recipient allowance").await;
     assert!(
         !alice
             .state
@@ -721,6 +790,8 @@ async fn three_node_paid_e2e() {
             false,
         )
         .await;
+    log_reconnect(&alice, &carol, "compose without recipient allowance returned").await;
+    println!("{READMISSION}: refusal status={status}, body={refusal}");
     assert_eq!(status, StatusCode::CONFLICT, "{READMISSION}: {refusal}");
     assert_eq!(
         refusal["code"], "budget_exceeded",
@@ -767,8 +838,9 @@ async fn three_node_paid_e2e() {
         READMISSION,
     )
     .await;
+    log_reconnect(&alice, &carol, "paid with recipient allowance").await;
     assert_eq!(alice.used() - used, 4_002, "{READMISSION}");
-    reconnect(&alice, &carol, READMISSION).await;
+    reconnect(&alice, &carol, "re-admission with standing recipient allowance").await;
     let used = alice.used();
     paid(
         &alice,
