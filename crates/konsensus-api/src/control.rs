@@ -17,8 +17,8 @@
 //! option (i)), and the sidecar case is a named limitation rather than a
 //! silently weaker path:
 //!
-//! - The packaged sidecar app is a `read` + `receive` client. It may *request*
-//!   elevation and can never obtain it. [`ControlServer`] is not started, so
+//! - The packaged sidecar app is a `read` + `receive` client. Its elevation
+//!   requests receive `owner_approval_unavailable`. [`ControlServer`] is not started, so
 //!   `<data_dir>/control.sock` does not exist, and every grant-writing call
 //!   refuses with [`crate::pairing::PairingError::OwnerChannelUnavailable`].
 //! - OS user-presence (Touch ID, Windows Hello) would close the sidecar case
@@ -37,10 +37,12 @@
 //! # Consent is the typed phrase, not the connection
 //!
 //! The node never treats "a message arrived on the socket" as consent. Each
-//! elevation/replacement request must carry an operation-bound random nonce
-//! printed only to the owner node's terminal. HTTP, socket status, and files
-//! expose no nonce. Same-uid socket access alone is insufficient for those
-//! operations. First-contact and gift commands instead take the complete
+//! elevation/replacement request must carry an operation-bound random nonce.
+//! Elevation uses the owner terminal, falling back to a protected owner file
+//! when headless; replacement remains terminal-only. HTTP and socket replies
+//! expose no nonce. Headless elevation trusts the node's OS account and files;
+//! terminal-delivered codes remain unavailable through same-uid socket access.
+//! First-contact and gift commands instead take the complete
 //! owner-reviewed tuple as consent; they require an owner-managed node and OS
 //! account outside the paired app's control, as the owner-key HTTP paths do.
 

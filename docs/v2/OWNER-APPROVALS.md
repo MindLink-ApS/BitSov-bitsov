@@ -27,8 +27,45 @@ command when not running from the node's data directory. The default is
 returned to the app. Unix is required. A packaged app sidecar does not enable
 this socket. Keep the owner node and terminal outside the paired app's control;
 the socket is not a security boundary against a process running as the owner OS
-user. Existing spend elevation and identity replacement still require their
-separate owner-console confirmations.
+user. Spend elevation requires a separate owner code, delivered to the node's
+terminal or a protected file when headless. Identity replacement still requires
+its owner-terminal confirmation.
+
+## Headless spend elevation (systemd / no controlling terminal)
+
+Start the node with `--owner-control`. A paired client's spend or front-door
+request creates a pending operation, never a grant. If the node cannot write to
+`/dev/tty`, it writes the approval instructions to
+`<data_dir>/pairing/owner-approval-<op_id>` (`0600` in a `0700` directory).
+The journal contains only that path and expiry. Do not copy the code into logs,
+shell arguments, or a journal-captured command.
+
+1. Run `konsensus pair-status --config /path/to/konsensus.toml` as the owner to
+   find the pending operation id.
+2. Read the matching protected file privately, for example in an editor over an
+   owner SSH session. Check its operation id and expiry.
+3. Run `konsensus grant --op <op_id> --config /path/to/konsensus.toml`, supplying
+   budget flags when the client proposed none. Review the displayed terms and
+   type the short code (or full `GRANT … CODE` line) at the prompt.
+
+`grant` sends approval only through `control.sock`; neither `pair-status` nor
+socket descriptions return codes. Successful grant removes the file. Withdrawal,
+wrong-code cancellation, expiry (within the one-second cleanup sweep), and clean
+shutdown also remove it. Restart removes stale files and reissues codes for
+unexpired pending requests; read the new file, since the old code is invalid.
+
+Without owner-run mode, or if both the terminal and protected-file delivery are
+unavailable, `POST /api/v1/pair/elevation-request` returns HTTP 409 with
+`owner_approval_unavailable`; no pending operation is created.
+
+The file fallback trusts the node's OS user: an app with the same file access
+can read and submit the code. Use an owner-managed account/data directory outside
+the paired app's control. Terminal-delivered codes remain off disk. Device-key
+registration and identity replacement still require the node's terminal.
+
+Doctrine: lines 1, 3, 5 and 6 hold. Local consent delivery does not settle a
+payment or grant network admission; keys and bounded owner grants retain
+authority, custody stays with the owner, and the access boundary is stated.
 
 ## First contact
 

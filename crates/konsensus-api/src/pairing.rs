@@ -244,6 +244,9 @@ pub enum PairingError {
          front_door."
     )]
     OwnerChannelUnavailable,
+    /// Neither the owner terminal nor a protected elevation file is available.
+    #[error("owner_approval_unavailable: start with --owner-control and provide an owner terminal or a writable owner-only pairing directory")]
+    OwnerApprovalUnavailable,
     /// Durable state could not be read or written.
     #[error("pairing store error: {0}")]
     Io(String),
@@ -677,7 +680,7 @@ struct PendingFirstContact {
     budget_op_id: String,
 }
 
-/// What the owner console showed for one pending operation. Memory only.
+/// Digests of what the owner channel delivered for one pending operation.
 struct OwnerConfirmation {
     /// Digest of the full `<label> CODE <nonce>` line.
     phrase: blake3::Hash,
@@ -686,6 +689,21 @@ struct OwnerConfirmation {
     expires_at: i64,
     /// Wrong confirmations typed for this operation.
     failures: u8,
+    /// Present only for a headless elevation; removed when consumed or expired.
+    approval_file: Option<OwnerApprovalFile>,
+}
+
+/// Owns the lifetime of a headless code file. Never formats its contents.
+struct OwnerApprovalFile(PathBuf);
+
+impl Drop for OwnerApprovalFile {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(path = %self.0.display(), %error, "could not remove owner approval file");
+            }
+        }
+    }
 }
 
 /// A fresh short owner code, `XXXX-XXXX`: 40 bits from the CSPRNG.
@@ -751,7 +769,7 @@ impl std::io::Write for OwnerTerminal {
         #[cfg(unix)]
         {
             // A dedicated owner terminal, never tracing, stdout capture, or a
-            // file under data_dir. No terminal means no elevation challenge.
+            // file under data_dir. The caller handles headless elevation delivery.
             std::fs::OpenOptions::new()
                 .write(true)
                 .open("/dev/tty")?
@@ -785,6 +803,14 @@ impl PairingService {
         let dir = data_dir.join("pairing");
         std::fs::create_dir_all(&dir)?;
         restrict_dir(&dir)?;
+        // Old files cannot approve anything after restart. Remove them before
+        // reissuing fresh codes, including after an unclean shutdown.
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with("owner-approval-") {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
         let file_path = dir.join("clients.json");
         let file = if file_path.exists() {
             let raw = std::fs::read(&file_path)?;
@@ -864,14 +890,14 @@ impl PairingService {
         self
     }
 
-    /// Tell the owner, on the owner terminal only, how a pending operation is
-    /// approved, and remember digests of what it showed.
+    /// Deliver approval to the terminal, or a protected file for headless
+    /// elevations, and remember digests of what the owner channel showed.
     ///
     /// Every operation gets the full `<label> CODE <nonce>` line. A grant
     /// request (`short_code`) also gets a short code the owner types into
-    /// `konsensus grant`. Both reach only this console: never HTTP, the control
-    /// socket's replies, stdout/stderr (which a launching app may pipe) or a
-    /// file under `data_dir`.
+    /// `konsensus grant`. Neither reaches HTTP, control socket replies, or
+    /// stdout/stderr. Only elevation labels (`GRANT ...`) allow the file
+    /// fallback; device registration and identity replacement remain terminal-only.
     fn console_challenge(
         &self,
         inner: &mut Inner,
@@ -902,12 +928,21 @@ impl PairingService {
                 label.split(' ').next().unwrap_or("GRANT")
             ));
         }
-        let mut console = self
+        let delivered = self
             .owner_console
             .lock()
-            .map_err(|_| PairingError::Io("owner console unavailable".into()))?;
-        console.write_all(text.as_bytes())?;
-        console.flush()?;
+            .map_err(|_| io::Error::other("owner console unavailable"))
+            .and_then(|mut console| {
+                console.write_all(text.as_bytes())?;
+                console.flush()
+            });
+        let approval_file = match delivered {
+            Ok(()) => None,
+            Err(_) if label.starts_with("GRANT ") => {
+                Some(self.write_owner_approval_file(op_id, expires_at, &text)?)
+            }
+            Err(error) => return Err(error.into()),
+        };
         let now = chrono::Utc::now().timestamp();
         inner.owner_confirmations.retain(|_, c| c.expires_at > now);
         inner.owner_confirmations.insert(
@@ -917,9 +952,55 @@ impl PairingService {
                 code: code.map(|c| blake3::hash(normalize_owner_code(&c).as_bytes())),
                 expires_at,
                 failures: 0,
+                approval_file,
             },
         );
         Ok(())
+    }
+
+    fn write_owner_approval_file(
+        &self,
+        op_id: &str,
+        expires_at: i64,
+        text: &str,
+    ) -> Result<OwnerApprovalFile, PairingError> {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = self.dir.join(format!("owner-approval-{op_id}"));
+            // Exclusive creation never follows an existing symlink or writes
+            // secrets into an existing file with permissive mode bits.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|_| PairingError::OwnerApprovalUnavailable)?;
+            let protected = OwnerApprovalFile(path);
+            file.write_all(text.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|_| PairingError::OwnerApprovalUnavailable)?;
+            tracing::info!(path = %protected.0.display(), expires_at,
+                "owner approval is in this owner-only file; read it privately, then grant over control.sock");
+            Ok(protected)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (op_id, expires_at, text);
+            Err(PairingError::OwnerApprovalUnavailable)
+        }
+    }
+
+    /// Cleanup runs on reads and the once-per-second grant sweeper. Revoked
+    /// or rotated clients lose their pending file as well as their authority.
+    fn prune_owner_confirmations(inner: &mut Inner) {
+        let now = chrono::Utc::now().timestamp();
+        inner.owner_confirmations.retain(|op_id, c| {
+            c.expires_at > now
+                && (c.approval_file.is_none()
+                    || inner.file.pending_elevations.iter().any(|op| &op.op_id == op_id))
+        });
     }
 
     /// The full console line only (identity replacement).
@@ -1112,6 +1193,7 @@ impl PairingService {
     /// assert effects rather than trust an in-memory copy.
     pub fn reload_from_disk(&self) -> Result<PairingFile, PairingError> {
         let mut inner = self.lock_without_cleanup();
+        Self::prune_owner_confirmations(&mut inner);
         self.prune_expired_locked(&mut inner.file)?;
         if !self.file_path.exists() {
             return Ok(PairingFile {
@@ -1168,6 +1250,7 @@ impl PairingService {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         let mut inner = self.lock_without_cleanup();
+        Self::prune_owner_confirmations(&mut inner);
         // Reads are also cleanup boundaries, including auth and owner status.
         // Keep failed deletions in the private state so the next access retries.
         if let Err(e) = self.prune_expired_locked(&mut inner.file) {
@@ -2021,6 +2104,9 @@ impl PairingService {
             .find(|c| c.client_id == client_id)
             .cloned()
             .ok_or(PairingError::UnknownClient)?;
+        if !self.owner_control_enabled {
+            return Err(PairingError::OwnerApprovalUnavailable);
+        }
         // Hold the same lock through check and insertion so concurrent requests
         // cannot exceed the cap. Expired proposals do not consume a slot.
         if inner.file.pending_elevations.iter()
@@ -2047,7 +2133,11 @@ impl PairingService {
         )?;
         inner.file.pending_elevations.retain(|e| e.expires_at > now);
         inner.file.pending_elevations.push(op.clone());
-        self.persist(&mut inner.file)?;
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file.pending_elevations.retain(|e| e.op_id != op.op_id);
+            inner.owner_confirmations.remove(&op.op_id);
+            return Err(error);
+        }
         Ok(op)
     }
 
@@ -2131,8 +2221,8 @@ impl PairingService {
 
     /// Write a budget-scoped spend grant. **Owner CLI only.**
     ///
-    /// Requires the operation-bound random confirmation printed only to the
-    /// owner console. The public operation label is insufficient. `terms` are
+    /// Requires the operation-bound confirmation from the owner terminal or
+    /// protected headless file. The public operation label is insufficient. `terms` are
     /// the owner's, not the client's proposal: they bound the budget, the
     /// per-call maximum, per-recipient budgets and the window (≤ 24 h).
     pub fn grant_elevation(
@@ -2209,8 +2299,8 @@ impl PairingService {
 
     /// Write a `front_door` grant. **Owner CLI only.**
     ///
-    /// Same consent as a spend grant: the operation-bound confirmation printed
-    /// only to the owner console. `ttl_secs` is the owner's window (at most
+    /// Same consent as a spend grant: the operation-bound confirmation from the
+    /// owner terminal or protected headless file. `ttl_secs` is the owner's window (at most
     /// 24 h). It replaces the client's previous front-door grant and leaves a
     /// live spend grant alone.
     pub fn grant_front_door(
@@ -3046,6 +3136,7 @@ impl PairingService {
     /// cleanup transaction; errors keep deletion queued for a later retry.
     pub fn prune_expired_grants(&self) -> Result<usize, PairingError> {
         let mut inner = self.lock_without_cleanup();
+        Self::prune_owner_confirmations(&mut inner);
         self.prune_expired_locked(&mut inner.file)
     }
 
@@ -3278,3 +3369,7 @@ pub fn fsync_dir(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 #[path = "pairing/budget_tests.rs"]
 mod budget_transaction_tests;
+
+#[cfg(all(test, unix))]
+#[path = "pairing/headless_tests.rs"]
+mod headless_tests;
