@@ -86,6 +86,44 @@ Handshake and first-auth reads each have a 10-second deadline. The public
 listener rate-limits attempts before Noise, accepts at most 64 concurrent
 connections, and exits on node shutdown.
 
+### Pre-handshake retry hint
+
+Before doing Noise or looking up any pairing, the node applies a per-IP
+budget: at most 20 immediate handshakes, replenishing one admission every
+three seconds. Only admitted attempts consume budget; rejected retries do
+not extend the penalty. After 60 seconds without admitted attempts the full
+burst budget is restored. The table holds at most 2,048 IPs and does not
+evict active budgets to admit new IPs.
+
+When rate-limited, the first server frame can instead be **plaintext JSON**,
+using the same `u32` big-endian length prefix, followed by connection close:
+
+```json
+{"code":"rate_limited","v":1,"retry_after_secs":3}
+```
+
+`retry_after_secs` is a positive integer number of seconds, rounded up from
+the remaining delay, bounded to 1–60. For a full IP table it indicates the
+earliest entry expiry. This is the entire refusal: no node or client identity,
+pairing state, keys, endpoint, or diagnostic details are disclosed. Paired
+and unpaired callers receive the same format.
+
+The app should recognize this frame while waiting for Noise message 2, close
+the old connection, and wait at least the indicated delay before opening a
+new one (additional jitter is permitted). Other traffic sharing its IP may
+consume the next admission first. The hint is unauthenticated and conveys
+no authority: a subsequent connection still requires the pinned Noise
+handshake and ordinary authentication. It must never clear a durable pairing
+or replace pinned keys. Older clients fail the Noise handshake safely.
+
+Refusal writes have a one-second deadline and at most 64 concurrent writers,
+separate from the 64 connection slots. Within that same deadline the node
+drains the client's first bounded frame without Noise processing, so closing
+does not interrupt a legitimate client's handshake write before it can read
+the hint. Under resource exhaustion or write
+failure the connection may still close without a hint; clients should use
+bounded reconnect backoff for that case as well.
+
 ## First encrypted auth record
 
 The first transport plaintext is compact JSON. For a new pairing:

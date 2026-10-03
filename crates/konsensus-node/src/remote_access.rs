@@ -26,7 +26,11 @@ use crate::config::RemoteAccessConfig;
 
 const MAX_CONNECTIONS: usize = 64;
 const HANDSHAKES_PER_IP_PER_MINUTE: u32 = 20;
+const HANDSHAKE_WINDOW: Duration = Duration::from_secs(60);
+const HANDSHAKE_COST: Duration = Duration::from_secs(60 / HANDSHAKES_PER_IP_PER_MINUTE as u64);
 const MAX_RATE_LIMIT_IPS: usize = 2048;
+const MAX_PENDING_REFUSALS: usize = 64;
+const REFUSAL_TIMEOUT: Duration = Duration::from_secs(1);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const PAIRING_CODE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -45,7 +49,9 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 struct HandshakeLimiter {
-    entries: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    // Time at which each IP's handshake debt has fully drained. Debt is at
+    // most one minute and only admitted attempts add to it.
+    entries: Mutex<HashMap<IpAddr, Instant>>,
 }
 
 impl HandshakeLimiter {
@@ -55,23 +61,47 @@ impl HandshakeLimiter {
         }
     }
 
-    fn allow(&self, ip: IpAddr, now: Instant) -> bool {
+    fn allow(&self, ip: IpAddr, now: Instant) -> Result<(), Duration> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.retain(|_, (start, _)| now.duration_since(*start) < Duration::from_secs(60));
+        entries.retain(|_, drained_at| *drained_at > now);
         if entries.len() >= MAX_RATE_LIMIT_IPS && !entries.contains_key(&ip) {
-            return false;
+            // Do not evict an active budget for an attacker rotating IPs.
+            // A new IP can retry when the first tracked entry drains.
+            return Err(*entries.values().min().unwrap() - now);
         }
-        let (start, count) = entries.entry(ip).or_insert((now, 0));
-        if now.duration_since(*start) >= Duration::from_secs(60) {
-            *start = now;
-            *count = 0;
+        let drained_at = entries.entry(ip).or_insert(now);
+        let next = *drained_at + HANDSHAKE_COST;
+        let ceiling = now + HANDSHAKE_WINDOW;
+        if next > ceiling {
+            return Err(next - ceiling);
         }
-        if *count >= HANDSHAKES_PER_IP_PER_MINUTE {
-            return false;
-        }
-        *count += 1;
-        true
+        *drained_at = next;
+        Ok(())
     }
+}
+
+async fn write_handshake_refusal<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    retry_after: Duration,
+) -> Result<()> {
+    // Round up so a client honoring whole seconds does not retry too early.
+    let retry_after_secs = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() != 0);
+    let refusal = wire::HandshakeRefusal::RateLimited {
+        v: VERSION,
+        retry_after_secs: retry_after_secs.clamp(1, HANDSHAKE_WINDOW.as_secs()),
+    };
+    let bytes = serde_json::to_vec(&refusal)?;
+    tokio::time::timeout(REFUSAL_TIMEOUT, async {
+        wire::write_frame(stream, &bytes).await?;
+        // Let the initiator finish sending message 1 before closing. Dropping
+        // TCP with that frame unread can reset its write before it reads the
+        // hint. Drain one bounded frame without parsing or doing any Noise work.
+        wire::read_frame(stream, MAX_NOISE_MSG_LEN).await?;
+        stream.shutdown().await
+    })
+    .await
+    .context("remote handshake refusal timed out")??;
+    Ok(())
 }
 
 pub struct RemoteAccessServer {
@@ -168,6 +198,7 @@ impl RemoteAccessServer {
     pub async fn serve(mut self, mut shutdown: watch::Receiver<bool>) {
         let limits = Arc::new(HandshakeLimiter::new());
         let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let refusal_slots = Arc::new(Semaphore::new(MAX_PENDING_REFUSALS));
         let mut tasks = tokio::task::JoinSet::new();
 
         loop {
@@ -182,15 +213,23 @@ impl RemoteAccessServer {
                     }
                 }
                 accepted = self.listener.accept() => {
-                    let (stream, peer_addr) = match accepted {
+                    let (mut stream, peer_addr) = match accepted {
                         Ok(value) => value,
                         Err(error) => {
                             warn!(%error, "remote access accept failed");
                             continue;
                         }
                     };
-                    if !limits.allow(peer_addr.ip(), Instant::now()) {
+                    if let Err(retry_after) = limits.allow(peer_addr.ip(), Instant::now()) {
                         debug!(%peer_addr, "remote access pre-handshake rate limit");
+                        // No Noise, identity or pairing work before this refusal.
+                        // Slow readers cannot block accepts or create unbounded tasks.
+                        if let Ok(permit) = Arc::clone(&refusal_slots).try_acquire_owned() {
+                            tasks.spawn(async move {
+                                let _permit = permit;
+                                let _ = write_handshake_refusal(&mut stream, retry_after).await;
+                            });
+                        }
                         continue;
                     }
                     let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
@@ -477,6 +516,158 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
+    #[test]
+    fn handshake_burst_is_limited_then_recovers_without_restarting() {
+        let limiter = HandshakeLimiter::new();
+        let ip = "192.0.2.1".parse().unwrap();
+        let now = Instant::now();
+        for _ in 0..20 {
+            assert!(limiter.allow(ip, now).is_ok());
+        }
+        for _ in 0..1000 {
+            assert!(limiter.allow(ip, now + Duration::from_secs(1)).is_err());
+        }
+        // Rejected attempts cannot extend the debt; backing off restores the
+        // full burst budget within one minute, without replacing the limiter.
+        for _ in 0..20 {
+            assert!(limiter.allow(ip, now + Duration::from_secs(60)).is_ok());
+        }
+        assert!(limiter.allow(ip, now + Duration::from_secs(60)).is_err());
+    }
+
+    #[test]
+    fn handshake_penalty_decays_gradually_and_ips_are_independent() {
+        let limiter = HandshakeLimiter::new();
+        let ip = "192.0.2.1".parse().unwrap();
+        let now = Instant::now();
+        for _ in 0..20 {
+            assert!(limiter.allow(ip, now).is_ok());
+        }
+        assert!(limiter
+            .allow(ip, now + Duration::from_millis(2999))
+            .is_err());
+        assert!(limiter.allow("192.0.2.2".parse().unwrap(), now).is_ok());
+        // Twenty handshakes/minute replenish one admission every 3 seconds.
+        assert!(limiter.allow(ip, now + Duration::from_secs(3)).is_ok());
+        assert!(limiter.allow(ip, now + Duration::from_secs(3)).is_err());
+        for _ in 0..2 {
+            assert!(limiter.allow(ip, now + Duration::from_secs(9)).is_ok());
+        }
+        assert!(limiter.allow(ip, now + Duration::from_secs(9)).is_err());
+    }
+
+    #[test]
+    fn handshake_ip_table_stays_bounded_and_recovers_after_debt_drains() {
+        let limiter = HandshakeLimiter::new();
+        let now = Instant::now();
+        for n in 0..MAX_RATE_LIMIT_IPS as u32 {
+            assert!(limiter.allow(IpAddr::V4(n.into()), now).is_ok());
+        }
+        let new_ip = "192.0.2.1".parse().unwrap();
+        assert_eq!(limiter.allow(new_ip, now), Err(Duration::from_secs(3)));
+        assert_eq!(limiter.entries.lock().unwrap().len(), MAX_RATE_LIMIT_IPS);
+        // A full table must still apply the existing IP's remaining budget.
+        let tracked = IpAddr::V4(0.into());
+        for _ in 0..19 {
+            assert!(limiter.allow(tracked, now).is_ok());
+        }
+        assert_eq!(limiter.allow(tracked, now), Err(Duration::from_secs(3)));
+        assert_eq!(
+            limiter.allow(new_ip, now + Duration::from_millis(2999)),
+            Err(Duration::from_millis(1))
+        );
+        assert!(limiter.allow(new_ip, now + Duration::from_secs(3)).is_ok());
+        assert_eq!(limiter.entries.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn handshake_refusal_carries_only_retry_hint_and_honoring_it_recovers() {
+        let limiter = HandshakeLimiter::new();
+        let ip = "192.0.2.1".parse().unwrap();
+        let now = Instant::now();
+        for _ in 0..20 {
+            limiter.allow(ip, now).unwrap();
+        }
+        for (elapsed_ms, expected_secs) in [(0, 3), (1000, 2), (2999, 1)] {
+            let retry_after = limiter
+                .allow(ip, now + Duration::from_millis(elapsed_ms))
+                .unwrap_err();
+            let (mut server, mut client) = tokio::io::duplex(256);
+            wire::write_frame(&mut client, &[0; 32]).await.unwrap();
+            write_handshake_refusal(&mut server, retry_after)
+                .await
+                .unwrap();
+            // Decode the actual outer frame that the app receives before Noise.
+            let bytes = wire::read_frame(&mut client, 256).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "v": 1, "code": "rate_limited", "retry_after_secs": expected_secs
+                })
+            );
+            assert_eq!(
+                client.read_u8().await.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        assert!(limiter.allow(ip, now + Duration::from_secs(3)).is_ok());
+        assert!(limiter.allow(ip, now + Duration::from_secs(3)).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_refusal_does_not_wait_forever_for_a_slow_reader() {
+        let (mut server, _client) = tokio::io::duplex(1);
+        let start = tokio::time::Instant::now();
+        let result = write_handshake_refusal(&mut server, Duration::from_secs(3)).await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn handshake_refusal_allows_client_to_finish_first_frame() {
+        let (mut server, mut client) = tokio::io::duplex(256);
+        client.write_u32(32).await.unwrap();
+        let refusal = tokio::spawn(async move {
+            write_handshake_refusal(&mut server, Duration::from_secs(3)).await
+        });
+        let bytes = wire::read_frame(&mut client, 256).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["retry_after_secs"],
+            3
+        );
+        // A real TCP client can send the length and body in separate packets.
+        // Closing before the body arrives can reset its write and lose the hint.
+        client.write_all(&[0; 32]).await.unwrap();
+        refusal.await.unwrap().unwrap();
+        assert_eq!(
+            client.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_refusal_bounds_wait_for_incomplete_first_frame() {
+        let (mut server, mut client) = tokio::io::duplex(256);
+        client.write_u32(32).await.unwrap();
+        let start = tokio::time::Instant::now();
+        let refusal = tokio::spawn(async move {
+            write_handshake_refusal(&mut server, Duration::from_secs(3)).await
+        });
+        let bytes = wire::read_frame(&mut client, 256).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["code"],
+            "rate_limited"
+        );
+        assert!(refusal
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("timed out"));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
 
     fn active_code(value: &str) -> Mutex<Option<ActivePairingCode>> {
         Mutex::new(Some(ActivePairingCode {
