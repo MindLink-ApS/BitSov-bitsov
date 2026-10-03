@@ -36,6 +36,13 @@ use crate::{
 
 /// Optional shared HTTP transport. Used by BitSov to coordinate backend rate limits.
 pub trait HttpTransport: std::fmt::Debug + Send + Sync {
+    /// Suppress response decoding details for transports carrying credentials.
+    fn redact_errors(&self) -> bool { false }
+    /// Aggregate rate-limit health for a transport that owns endpoint admission.
+    #[cfg(feature = "tokio")]
+    fn rate_limit_failure(&self) -> Option<crate::rate_limit::ChainSyncFailure> { None }
+    /// Time before a bounded broadcast retry can reach a usable endpoint.
+    fn retry_delay(&self) -> Duration { Duration::ZERO }
     /// Execute one request, including any shared admission/cooldown policy.
     fn execute(&self, request: reqwest::RequestBuilder) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, Error>> + Send + '_>>;
 }
@@ -107,6 +114,12 @@ impl<S: Sleeper> AsyncClient<S> {
         self
     }
 
+    fn request_error(&self, error: reqwest::Error) -> Error {
+        if self.transport.as_ref().is_some_and(|t| t.redact_errors()) {
+            Error::InvalidResponse
+        } else { Error::Reqwest(error) }
+    }
+
     async fn execute(&self, request: reqwest::RequestBuilder) -> Result<Response, Error> {
         match &self.transport {
             Some(transport) => transport.execute(request).await,
@@ -132,11 +145,11 @@ impl<S: Sleeper> AsyncClient<S> {
         if !response.status().is_success() {
             return Err(Error::HttpResponse {
                 status: response.status().as_u16(),
-                message: response.text().await?,
+                message: response.text().await.map_err(|e| self.request_error(e))?,
             });
         }
 
-        Ok(deserialize::<T>(&response.bytes().await?)?)
+        Ok(deserialize::<T>(&response.bytes().await.map_err(|e| self.request_error(e))?)?)
     }
 
     /// Make an HTTP GET request to given URL, deserializing to `Option<T>`.
@@ -172,11 +185,11 @@ impl<S: Sleeper> AsyncClient<S> {
         if !response.status().is_success() {
             return Err(Error::HttpResponse {
                 status: response.status().as_u16(),
-                message: response.text().await?,
+                message: response.text().await.map_err(|e| self.request_error(e))?,
             });
         }
 
-        response.json::<T>().await.map_err(Error::Reqwest)
+        response.json::<T>().await.map_err(|e| self.request_error(e))
     }
 
     /// Make an HTTP GET request to given URL, deserializing to `Option<T>`.
@@ -214,11 +227,11 @@ impl<S: Sleeper> AsyncClient<S> {
         if !response.status().is_success() {
             return Err(Error::HttpResponse {
                 status: response.status().as_u16(),
-                message: response.text().await?,
+                message: response.text().await.map_err(|e| self.request_error(e))?,
             });
         }
 
-        let hex_str = response.text().await?;
+        let hex_str = response.text().await.map_err(|e| self.request_error(e))?;
         Ok(deserialize(&Vec::from_hex(&hex_str)?)?)
     }
 
@@ -251,11 +264,11 @@ impl<S: Sleeper> AsyncClient<S> {
         if !response.status().is_success() {
             return Err(Error::HttpResponse {
                 status: response.status().as_u16(),
-                message: response.text().await?,
+                message: response.text().await.map_err(|e| self.request_error(e))?,
             });
         }
 
-        Ok(response.text().await?)
+        Ok(response.text().await.map_err(|e| self.request_error(e))?)
     }
 
     /// Make an HTTP GET request to given URL, deserializing to `Option<T>`.
@@ -297,7 +310,7 @@ impl<S: Sleeper> AsyncClient<S> {
         if !response.status().is_success() {
             return Err(Error::HttpResponse {
                 status: response.status().as_u16(),
-                message: response.text().await?,
+                message: response.text().await.map_err(|e| self.request_error(e))?,
             });
         }
 
@@ -440,7 +453,7 @@ impl<S: Sleeper> AsyncClient<S> {
             )
             .await?;
 
-        Ok(response.json::<SubmitPackageResult>().await?)
+        Ok(response.json::<SubmitPackageResult>().await.map_err(|e| self.request_error(e))?)
     }
 
     /// Get the current height of the blockchain tip

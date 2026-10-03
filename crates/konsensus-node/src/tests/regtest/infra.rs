@@ -266,7 +266,7 @@ pub fn lightning_config(dir: &std::path::Path, url: &str) -> konsensus_lightning
         passphrase: None,
         network: "regtest".into(),
         esplora_url: url.to_owned(),
-        esplora_url_fallback: None,
+        esplora_url_fallback: None, credentials_file: None,
         rgs_url: None,
         lsp_node_id: None,
         lsp_address: None,

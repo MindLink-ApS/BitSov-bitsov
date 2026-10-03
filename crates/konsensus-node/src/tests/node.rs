@@ -480,7 +480,7 @@ async fn offline_fee_barrier_preserves_local_identity_and_storage() {
     let expected = *KonsensusNode::from_config(config.clone(), None).await.unwrap().node_id();
     config.lightning = LightningConfig::Ldk {
         liquidity: Default::default(), network: "bitcoin".into(),
-        esplora_url: "http://127.0.0.1:1".into(), esplora_url_fallback: None,
+        esplora_url: "http://127.0.0.1:1".into(), esplora_url_fallback: None, credentials_file: None,
         rgs_url: None, lsp_node_id: None, lsp_address: None, lsp_token: None,
         listening_address: None, advertised_address: None,
     };

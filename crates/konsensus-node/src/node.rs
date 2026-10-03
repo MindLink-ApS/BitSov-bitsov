@@ -81,6 +81,12 @@ impl KonsensusNode {
     /// backend selections. The node is not started yet — call [`Self::start`] next.
     pub async fn from_config(config: NodeConfig, mnemonic_password: Option<&str>) -> Result<Self> {
         config.validate_routing_fee_backend()?;
+        // Fail closed before starting LDK or opening node state on insecure credentials.
+        let chain_auth = match &config.chain {
+            ChainConfig::Esplora { credentials_file: Some(path), .. } =>
+                Some(konsensus_chain::bearer::BearerAuth::from_file(path)?),
+            _ => None,
+        };
         // Same directory as the embedded LDK state. Check before opening either store.
         let data_dir = config.identity.mnemonic_file.parent()
             .filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
@@ -182,6 +188,7 @@ impl KonsensusNode {
                 network,
                 esplora_url,
                 esplora_url_fallback,
+                credentials_file,
                 rgs_url,
                 lsp_node_id,
                 lsp_address,
@@ -218,6 +225,7 @@ impl KonsensusNode {
                     network: network.clone(),
                     esplora_url: esplora_url.clone(),
                     esplora_url_fallback: esplora_url_fallback.clone(),
+                    credentials_file: credentials_file.clone(),
                     rgs_url: rgs_url.clone(),
                     lsp_node_id: lsp_node_id.clone(),
                     lsp_address: lsp_address.clone(),
@@ -271,11 +279,9 @@ impl KonsensusNode {
                     api_url.clone(),
                     konsensus_core::traits::chain::TrustLevel::ServerTrust,
                 );
-                info!(backend = "esplora", api_url = %api_url, "chain provider");
-                Arc::new(
-                    EsploraProvider::with_fallbacks(esplora_config, config.chain.esplora_fallbacks(&config.lightning))
-                        .map_err(|e| anyhow::anyhow!("esplora provider: {e}"))?,
-                )
+                info!(backend = "esplora", "chain provider");
+                let provider = EsploraProvider::with_fallbacks(esplora_config, config.chain.esplora_fallbacks(&config.lightning))?;
+                Arc::new(match chain_auth { Some(auth) => provider.with_bearer(auth)?, None => provider })
             }
             ChainConfig::Bitcoind(rpc) => {
                 info!(backend = "bitcoind", "chain provider (own node)");

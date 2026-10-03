@@ -18,6 +18,7 @@ pub use electrum::{ElectrumConfig, ElectrumOperator, ElectrumProvider};
 pub mod bitcoind;
 pub use bitcoind::{BitcoindConfig, BitcoindProvider};
 
+pub mod bearer;
 pub mod esplora;
 pub mod mock;
 

@@ -92,7 +92,7 @@ fn config(dir: &tempfile::TempDir, url: &str) -> LdkConfig {
         passphrase: None,
         network: "bitcoin".into(),
         esplora_url: url.into(),
-        esplora_url_fallback: None,
+        esplora_url_fallback: None, credentials_file: None,
         rgs_url: None,
         lsp_node_id: None,
         lsp_address: None,

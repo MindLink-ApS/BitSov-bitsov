@@ -84,6 +84,7 @@ const PERSISTER_MAX_PENDING_UPDATES: u64 = 100;
 #[derive(Debug, Clone)]
 enum ChainDataSourceConfig {
 	Esplora {
+        transport: Option<Arc<dyn esplora_client::r#async::HttpTransport>>,
 		server_url: String,
 		headers: HashMap<String, String>,
 		sync_config: Option<EsploraSyncConfig>,
@@ -335,6 +336,7 @@ impl NodeBuilder {
 		&mut self, server_url: String, sync_config: Option<EsploraSyncConfig>,
 	) -> &mut Self {
 		self.chain_data_source_config = Some(ChainDataSourceConfig::Esplora {
+            transport: None,
 			server_url,
 			headers: Default::default(),
 			sync_config,
@@ -354,9 +356,21 @@ impl NodeBuilder {
 		sync_config: Option<EsploraSyncConfig>,
 	) -> &mut Self {
 		self.chain_data_source_config =
-			Some(ChainDataSourceConfig::Esplora { server_url, headers, sync_config });
+			Some(ChainDataSourceConfig::Esplora { server_url, headers, sync_config, transport: None });
 		self
 	}
+
+    /// Configure a live HTTP transport shared by all wallet/sync client clones.
+    /// The caller owns authentication, per-endpoint admission, and Debug redaction.
+    pub fn set_chain_source_esplora_with_transport(
+        &mut self, server_url: String, sync_config: Option<EsploraSyncConfig>,
+        transport: Arc<dyn esplora_client::r#async::HttpTransport>,
+    ) -> &mut Self {
+        self.chain_data_source_config = Some(ChainDataSourceConfig::Esplora {
+            server_url, headers: HashMap::new(), sync_config, transport: Some(transport),
+        });
+        self
+    }
 
 	/// Configures the [`Node`] instance to source its chain data from the given Electrum server.
 	///
@@ -1202,7 +1216,7 @@ fn build_with_store_internal(
 	};
 
 	let (chain_source, chain_tip_opt) = match chain_data_source_config {
-		Some(ChainDataSourceConfig::Esplora { server_url, headers, sync_config }) => {
+		Some(ChainDataSourceConfig::Esplora { server_url, headers, sync_config, transport }) => {
 			let sync_config = sync_config.unwrap_or(EsploraSyncConfig::default());
 			ChainSource::new_esplora(
 				server_url.clone(),
@@ -1214,6 +1228,7 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
+                transport.clone(),
 			)?
 		},
 		Some(ChainDataSourceConfig::Electrum { server_url, sync_config }) => {
@@ -1283,6 +1298,7 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
+                None,
 			)?
 		},
 	};

@@ -500,6 +500,7 @@ version = "0.12.3"
 dependencies = [
  "bitcoin",
  "hex-conservative 0.2.2",
+ "httpdate",
  "log",
  "reqwest",
  "serde",
@@ -1112,7 +1113,6 @@ dependencies = [
  "electrum-client",
  "esplora-client",
  "http",
- "httpdate",
  "libc",
  "lightning",
  "lightning-background-processor",
