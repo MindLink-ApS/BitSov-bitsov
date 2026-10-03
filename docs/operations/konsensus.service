@@ -9,6 +9,8 @@ Type=simple
 ExecStart=%h/.local/bin/konsensus start --config %h/.local/share/konsensus/konsensus.toml --owner-control
 Restart=on-failure
 RestartSec=10
+# The node allows 15s for Lightning, 10s for cleanup, and enforces a 30s deadline.
+TimeoutStopSec=45
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=konsensus
