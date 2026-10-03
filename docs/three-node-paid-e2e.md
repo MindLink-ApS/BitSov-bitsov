@@ -45,20 +45,16 @@ runs the offline runner. The hash provenance is the pinned `corepc-node 0.10.1`
 and `electrsd 0.36.1` checksum manifests. Exit 77 is reported as **SKIPPED** in
 the job summary and fails the job; exit zero also requires the runtime PASS marker.
 
-The ghost/unfunded-channel scenario is separately ignored with the reason
-**requires unmerged PR #200**. This branch still checks `/tx/{txid}/status`, which
-can return `200 {"confirmed":false}` for an unknown transaction, and lacks the
-absent-parent rebroadcast suppression that scenario requires. The default wrapper
-prints this scoped SKIP; it does not claim ghost coverage. After #200 merges, use:
+PR #200 is merged. The ghost/unfunded-channel scenario still requires explicit
+selection through the existing `REGTEST_GHOST_AFTER_PR200=1` runner gate (or the
+workflow's `ghost_after_pr200` input). Enable it when verifying this fix:
 
 ```sh
 REGTEST_GHOST_AFTER_PR200=1 scripts/regress/three_node_paid_e2e.sh
 ```
 
-The dispatch workflow exposes the same named gate. With it enabled, both scenarios
-must run and pass; no failure is swallowed. Until #200 merges, nightly runs cover
-the paid-flow lane and explicitly report the ghost subscenario as skipped. Enable
-the gate by default in the wrapper/workflow when landing #200.
+Both scenarios must run and pass when selected; no failure is swallowed. The
+ordinary Cargo test run leaves the real Core/electrs scenarios ignored.
 
 ```sh
 # Build and run the touched crate's ordinary tests, including fixture tests:
@@ -117,7 +113,7 @@ Every scenario assertion/helper carries an incident label from
 | Sender-side 429 | A's chain/LDK backend is limited. Compose must return local `503 not_ready` within 8 seconds without budget, capacity or invoice changes; background recovery must permit another 2,001-msat paid message. |
 | Slow owner approval | C's first-contact quote ages beyond its signed absolute TTL before the owner approves through the real socket. Sending must replace the expired quote and deliver, with exactly two settled payments (one admission and one message) and a 4,002-msat debit. This proves no duplicate paid admission, not an exact count of unpaid wire requests. |
 | Grant without recipient entries, reconnect | A's original grant has an empty recipient map; both first-contact approvals omit a contact budget. After C reconnects, compose must return `409 budget_exceeded`, reason `first_contact`, without any payment, invoice or budget change. The owner revokes that grant and issues explicit B/C recipient entries via the socket. Re-admission then costs exactly 4,002; a further reconnect pays the same amount without another owner confirmation. |
-| Ghost channel (gated on #200) | Drop actual funding broadcasts before they reach Core, retain the real LDK monitor, force-close the unfunded channel, prove real `/tx/{txid}` returns 404, observe the provider querying that existence endpoint, and assert `closing_sats == 0` and aggregate exclusion despite a nonzero raw monitor claim. After initial processing, observe 95 seconds (three 30-second LDK rebroadcast ticks) under 429: at most one additional commitment POST is allowed. |
+| Ghost channel (explicit runner gate) | Drop actual funding broadcasts before they reach Core, retain the real LDK monitor, force-close the unfunded channel, prove real `/tx/{txid}` returns 404, observe the provider querying that existence endpoint, and assert `closing_sats == 0` and aggregate exclusion despite a nonzero raw monitor claim. After initial close processing, observe 95 seconds with fresh 404 lookups and require zero additional commitment POSTs. Under 429, require a commitment POST, then observe 95 seconds: at most ten attempts, separated by at least the 10-second cooldown floor (1-second timestamp tolerance). Require a retained retry within the 300-second cooldown cap plus scheduling allowance. Unknown funding must remain recoverable. |
 | Run 4 steps 2–3: recipient restart during active client flow | B closes/reopens its existing wallet and stores; mesh key, LN key, channel IDs and encrypted session survive. A keeps its client/grant, reconnects, and pays exactly 4,002 msat for one re-admission and one delivered message. B does not whitelist A, so reconnect cannot bypass the admission gate. |
 | Run 2 #14–18: room flow blocked | A fans out a room message to B+C; two settled member receipts, 4,002-msat budget debit, known zero routing fee, two decrypted recipient-bound envelopes. |
 
@@ -139,3 +135,54 @@ and ghost scenarios were compiled but not executed, and no runtime PASS is claim
 Missing-fixture runner verification exits 77, and explicitly selecting the Rust
 scenario with missing fixtures fails (101). Fixture execution and a green
 socket-dependent suite remain blocked by the no-network constraint.
+
+
+## First CI run correction (run 37117079614, base 359b910)
+
+These root causes are derived from code and the reported failures; the real
+regtest runtime was not available for this correction.
+
+1. **Offline quote was a fixture keepalive omission.** `three_node::connect`
+   opened Noise directly, without the production dialer's supervisor. The
+   transport closes an idle read at 30 seconds. The test waits for real
+   `LdkProvider::money_ready()` to expire (Lightning freshness is 60 seconds,
+   on-chain freshness 160 seconds), so the unpaid idle connection expires first.
+   Production startup and dynamic auto-connect peers use the supervisor's pings;
+   transport acceptance, pings and reconnects have no chain-readiness dependency.
+   The chain proxy forwards only Esplora HTTP, at a separate endpoint from Noise.
+   LDK peers are separate from BitSov's Noise peers. The fixture now sends real
+   Ping/Pong keepalives every 10 seconds, tracked and stopped with its application.
+   Reconnection remains explicit. The 429 scenario asserts both original Noise
+   connection generations throughout readiness loss and across the refusal,
+   distinguishing transport loss from the quote/refusal hop. This does not prove
+   the cause of Maya's live-run reachability issue.
+2. **The ghost bound assumed durable absence evidence.** The existing test already
+   passed channel removal, real `/tx/{txid}` 404, provider existence lookup,
+   `closing_sats == 0`, and aggregate exclusion before reaching the failed bound.
+   In #200, `eligible_package` rechecks funding for every eligible package; its
+   absence set is local to that call. A 429 is unknown, never absence. Keeping an
+   old 404 indefinitely would prevent recovery if funding arrived later. Once
+   eligible, `broadcast_with_backoff` retains the package on 429; queue-level
+   30/60/120-second backoff does not count those HTTP retries. Therefore one POST
+   per 95 seconds was not #200's contract. Concurrent package responses can extend
+   the same shared cooldown episode, so even a per-transaction 10/20/40 schedule
+   is not guaranteed. The corrected test separately verifies fresh-404 suppression
+   and unknown-funding recovery with the guaranteed 10-second retry floor. It
+   logs funding response codes, closed-channel/claim state, POST counts, retry
+   gaps and chain health. It requires actual commitment POSTs and a retained retry
+   so an idle or lost broadcast worker cannot pass the 429 phase vacuously.
+
+No product readiness or payment gate was relaxed. The source Northstar and
+whitepaper are outside this checkout; the supplied doctrine card governs this
+change. Doctrine: 1–6 hold; chain availability does not identify or disconnect
+mesh peers, keepalives grant no admission, refusals spend nothing, and runtime
+success is not claimed.
+
+Verification for this correction used `cargo test --offline --locked -p
+konsensus-node --features regtest-e2e --no-fail-fast` under a deny-all-network
+sandbox: **695 passed, 103 failed, 10 ignored**, exit 101. Every failure was a
+denied socket operation or consequent fixture/setup failure; this is not a green
+suite. `cargo clippy --offline --locked -p konsensus-node --all-targets --features
+regtest-e2e -- -D warnings` passed under the same sandbox. Cargo still reports the
+pre-existing sqlx-postgres future-compatibility notice. Core/electrs runtime tests
+were compiled but not run. No network, including port 3141, was contacted.

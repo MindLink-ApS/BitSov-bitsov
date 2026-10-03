@@ -185,12 +185,16 @@ pub struct App {
     pub client: String,
     shutdown: tokio::sync::watch::Sender<bool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    keepalives: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 impl Drop for App {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
         self.transport.shutdown();
         for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.keepalives.get_mut().unwrap().drain(..) {
             task.abort();
         }
     }
@@ -455,7 +459,35 @@ impl App {
             token,
             shutdown,
             tasks,
+            keepalives: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Mirror the dialer's supervisor keepalives, but leave reconnects explicit.
+    /// Binding to this connection generation prevents a hidden reconnect from
+    /// masking transport loss or resetting paid admission during a scenario.
+    pub async fn keep_connection_alive(&self, peer: konsensus_core::NodeId) {
+        let since = self.transport.connected_since(&peer).await.expect("keepalive: connected peer");
+        let transport = Arc::downgrade(&self.transport);
+        let mut shutdown = self.shutdown.subscribe();
+        let task = tokio::spawn(async move {
+            let mut nonce = 0;
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                }
+                let Some(transport) = transport.upgrade() else { return };
+                if transport.connected_since(&peer).await != Some(since) {
+                    return;
+                }
+                nonce += 1;
+                if transport.send_frame(&peer, &konsensus_message::Frame::Ping { nonce }).await.is_err() {
+                    return;
+                }
+            }
+        });
+        self.keepalives.lock().unwrap().push(task);
     }
 
     pub async fn post(&self, uri: &str, body: Value, owner: bool) -> (StatusCode, Value) {
@@ -559,6 +591,11 @@ impl App {
     pub async fn stop(mut self) {
         let _ = self.shutdown.send(true);
         self.transport.shutdown();
+        let keepalives = std::mem::take(self.keepalives.get_mut().unwrap());
+        for task in keepalives {
+            task.abort();
+            let _ = task.await;
+        }
         for task in self.tasks.drain(..) {
             task.abort();
             let _ = task.await;
