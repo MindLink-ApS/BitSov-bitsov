@@ -73,7 +73,7 @@ impl EsploraChainSource {
 		let http_client = esplora_http_client_builder(headers)?
 			.build()
 			.map_err(|_| BuildError::EsploraClientSetupFailed)?;
-		let rate_limit = super::rate_limit::RateLimitedTransport::new(&server_url);
+		let rate_limit = super::rate_limit::RateLimitedTransport::shared(&server_url);
 		let esplora_client = EsploraAsyncClient::from_client(server_url, http_client).with_transport(rate_limit.clone());
 		let tx_sync =
 			Arc::new(EsploraSyncClient::from_client(esplora_client.clone(), Arc::clone(&logger)));
@@ -572,7 +572,7 @@ mod bitsov_http_rate_tests {
         let mut builder = crate::Builder::new();
         builder.set_storage_dir_path(dir.path().to_str().unwrap().to_owned());
         let node = builder.build().unwrap();
-        let mut source = EsploraChainSource::new("https://user:secret@chain.invalid/api?private=secret".into(), HashMap::new(), EsploraSyncConfig::default(),
+        let mut source = EsploraChainSource::new(format!("https://user:secret@chain.invalid/api?private={}", dir.path().display()), HashMap::new(), EsploraSyncConfig::default(),
             node.fee_estimator.clone(), node.kv_store.clone(), node.config.clone(), node.logger.clone(), node.node_metrics.clone()).unwrap();
         let fixture = Arc::new(Fixture { limiter: source.rate_limit.clone(), replies: Mutex::new(replies.into()), requests: Mutex::new(vec![]), posted: Mutex::new(vec![]), parked: Mutex::new(None) });
         source.esplora_client = EsploraAsyncClient::from_client("https://chain.invalid".into(), reqwest::Client::new()).with_transport(fixture.clone());

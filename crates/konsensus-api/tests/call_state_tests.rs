@@ -241,11 +241,11 @@ async fn an_unrelated_price_response_is_not_a_call_quote() {
     let peer = NodeId::from_bytes([82; 32]);
     let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
     Arc::get_mut(&mut state).unwrap().transport = transport;
-    state.peer_prices.update_kind_price(peer, 400, 10_000, 100).await;
+    state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     let update = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        state.peer_prices.update_kind_price(peer, 0, 2_000, 100).await;
+        state.peer_prices.update_kind_price(peer, 0, 2_000, 850_000).await;
     };
     let (price, ()) = tokio::join!(calls::peer_call_price(&state, &peer), update);
     let err = price.unwrap_err();
@@ -253,7 +253,7 @@ async fn an_unrelated_price_response_is_not_a_call_quote() {
     // A real kind-400 answer after the query does count.
     let answer = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        state.peer_prices.update_kind_price(peer, 400, 12_000, 100).await;
+        state.peer_prices.update_kind_price(peer, 400, 12_000, 850_000).await;
     };
     tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
     let (price, ()) = tokio::join!(calls::peer_call_price(&state, &peer), answer);
@@ -270,7 +270,7 @@ async fn price_queries_to_one_peer_are_rate_limited() {
     Arc::get_mut(&mut state).unwrap().transport = Arc::clone(&transport) as _;
     let answer = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        state.peer_prices.update_kind_price(peer, 400, 10_000, 100).await;
+        state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
     };
     let (a, b, c, ()) = tokio::join!(calls::peer_call_price(&state, &peer), calls::peer_call_price(&state, &peer), calls::peer_call_price(&state, &peer), answer);
     assert_eq!((a.unwrap(), b.unwrap(), c.unwrap()), (10_000, 10_000, 10_000));
@@ -296,7 +296,7 @@ async fn a_price_query_that_was_not_sent_does_not_hold_the_slot() {
     Arc::get_mut(&mut state).unwrap().transport = Arc::clone(&transport) as _;
     let answer = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        state.peer_prices.update_kind_price(peer, 400, 10_000, 100).await;
+        state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
     };
     let (price, ()) = tokio::join!(calls::peer_call_price(&state, &peer), answer);
     assert_eq!(price.unwrap(), 10_000);

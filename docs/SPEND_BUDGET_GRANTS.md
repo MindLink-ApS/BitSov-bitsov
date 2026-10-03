@@ -165,10 +165,12 @@ backs that one answer with a short, single-use **first-contact grant**.
    connected stranger for its signed admission quote. This is F1's bounded
    payment preparation (`docs/v2/F1-CAPPED-FIRST-CONTACT.md`). The node
    validates the quote as a send would and returns `admission_msat`,
-   `message_msat`, `max_routing_fee_msat`, `total_msat` and `expires_at` (≤ 60 s). It pays and
-   reserves nothing, and needs a live budget grant. The node keeps the quote for
-   its validity, so the send pays exactly this invoice and the stranger is never
-   asked for a second one. For a stranger, it returns 409 if a first contact is
+   `message_msat`, `max_routing_fee_msat`, `total_msat` and `expires_at` (≤ 300 s). It pays and
+   reserves nothing, and needs only paired `read` authority. The node keeps the quote for
+   its validity, so the send pays exactly this invoice while it is live.
+   After expiry the approved send requests a fresh quote, still bounded by the
+   approved all-in cap. A paid or unresolved attempt is reconciled first and
+   never becomes a second payment merely because its quote expired. For a stranger, it returns 409 if a first contact is
    already paid or in flight. For a contact that needs admission again after a
    reconnect (see below), it returns that contact's quote, reusing one the node
    already holds.
@@ -187,11 +189,56 @@ backs that one answer with a short, single-use **first-contact grant**.
      what is left of the budget, and the recipient's budget if set. It is at most
      100,000 msat (F1's first-contact ceiling).
    - Nothing is reserved yet.
-   - The grant expires after 120 s, or with the budget grant if that is sooner.
+   - The grant expires after 300 s, or with the budget grant if that is sooner.
    - It is single use and for exactly this recipient. A new confirmation replaces
      an unused one.
    - It is held in memory only: never written down, and dropped on restart,
      revocation, rotation or replacement of the budget grant.
+   The owner can instead run `konsensus approve first-contact --client <client>
+   --op <grant-op> --to <recipient> --max-msat <cap>` on the node host. The
+   existing CLI output/local receipt flow remains compatible.
+
+   **Remote observation (issue #205).** The paired app polls
+   `GET /api/v1/pair/first-contact-grant/<grant-op>?recipient=<64-hex-node-id>`
+   with its ordinary paired bearer token (`read` scope). `<grant-op>` is the
+   exact budget operation passed to CLI `--op`, not a quote or message ID.
+   No receipt file has to cross machines. The response has `Cache-Control:
+   no-store` and this shape:
+
+   ```json
+   {
+     "grant_op_id": "<grant-op>",
+     "recipient": "<64-hex-node-id>",
+     "state": "approved",
+     "approval_window_secs": 300,
+     "approval": {
+       "recipient": "<64-hex-node-id>",
+       "max_total_msat": 4000,
+       "expires_at": 1791000300
+     }
+   }
+   ```
+
+   `state` is `pending` (no matching approval; `approval: null`), `approved`,
+   `consumed`, or `expired`. Reads never approve, consume, reserve, or pay.
+   The app checks the returned recipient/cap and waits at most
+   `approval_window_secs` for the owner; this app polling change is separate.
+   Approval expires five minutes after the owner confirms, capped by the
+   budget's expiry. Unknown, foreign, replaced, revoked, or expired budget
+   operations return 404; unauthenticated callers cannot read status. A
+   restart drops approvals; a new owner confirmation replaces the previous
+   record for that client. These observations are not payment credentials:
+   compose atomically consumes the node-held approval, once, under the same
+   grant and recipient binding. A consumed state does not imply settlement;
+   use the compose operation's result to learn the payment outcome.
+
+   The named limits are `FIRST_CONTACT_QUOTE_VALIDITY_SECS` (core) and
+   `FIRST_CONTACT_APPROVAL_WINDOW_SECS` (API), both five minutes. Signed
+   invoices can expire slightly earlier to allow clock skew; older nodes may
+   issue shorter quotes. Always honor returned deadlines. Headless owner-only
+   challenge files from #194/#197 remain node-local and are never returned by
+   this endpoint.
+
 3. **Send.** `POST /api/v1/messages/compose` to that stranger consumes the grant.
    - The grant's amount caps the whole first contact: admission principal, first
      message principal, and both approved routing ceilings, together with any

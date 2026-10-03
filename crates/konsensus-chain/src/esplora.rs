@@ -19,9 +19,14 @@
 //! - `GET /api/tx/{txid}` — transaction details (JSON)
 
 use async_trait::async_trait;
+use esplora_client::{r#async::HttpTransport, rate_limit::RateLimitedTransport};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tracing::{debug, instrument};
 
 use konsensus_core::traits::chain::{
@@ -64,6 +69,9 @@ impl EsploraConfig {
 pub struct EsploraProvider {
     config: EsploraConfig,
     client: Client,
+    endpoints: Vec<(String, Arc<RateLimitedTransport>)>,
+    active: AtomicUsize,
+    transport: Option<Arc<dyn HttpTransport>>,
 }
 
 /// JSON response from `/api/block/{hash}`.
@@ -98,71 +106,115 @@ impl EsploraProvider {
     /// Returns an error if the HTTP client cannot be built (e.g. TLS
     /// backend unavailable).
     pub fn new(config: EsploraConfig) -> Result<Self, ChainError> {
+        Self::with_fallbacks(config, Vec::new())
+    }
+
+    /// Try the primary followed by the operator's fallback endpoints.
+    pub fn with_fallbacks(
+        config: EsploraConfig,
+        fallbacks: Vec<String>,
+    ) -> Result<Self, ChainError> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
             .map_err(|e| ChainError::Connection(format!("failed to build HTTP client: {e}")))?;
 
-        Ok(Self { config, client })
+        Ok(Self::from_parts(config, client, fallbacks))
     }
 
     /// Create a provider with a custom reqwest Client (for testing).
     pub fn with_client(config: EsploraConfig, client: Client) -> Self {
-        Self { config, client }
+        Self::from_parts(config, client, Vec::new())
     }
 
-    /// Build the API URL for a given path.
-    ///
-    /// Handles both `https://mempool.space` and `https://mempool.space/api`
-    /// as input — strips a trailing `/api` if present to avoid double-prefixing.
-    fn api_url(&self, path: &str) -> String {
-        let base = self.config.api_url.trim_end_matches('/');
-        let base = base.strip_suffix("/api").unwrap_or(base);
-        format!("{base}/api{path}")
+    fn from_parts(config: EsploraConfig, client: Client, fallbacks: Vec<String>) -> Self {
+        let mut endpoints: Vec<(String, Arc<RateLimitedTransport>)> = Vec::new();
+        for url in std::iter::once(&config.api_url).chain(fallbacks.iter()) {
+            let base = url.trim_end_matches('/');
+            let base = base.strip_suffix("/api").unwrap_or(base);
+            let api = format!("{base}/api");
+            if !endpoints.iter().any(|(url, _)| *url == api) {
+                let limiter = RateLimitedTransport::shared(&api);
+                endpoints.push((api, limiter));
+            }
+        }
+        Self {
+            config,
+            client,
+            endpoints,
+            active: AtomicUsize::new(0),
+            transport: None,
+        }
     }
 
-    /// Make a GET request and return the response text.
+    /// Fall through on transport, HTTP and unusable payload errors. All chain
+    /// requests share the same limiter as LDK for each configured API endpoint.
+    async fn get_parsed<T>(
+        &self,
+        path: &str,
+        parse: impl Fn(&str) -> Result<T, ChainError>,
+    ) -> Result<T, ChainError> {
+        let mut last_error = ChainError::NotAvailable("no usable Esplora endpoint".into());
+        for (index, (base, limiter)) in self.endpoints.iter().enumerate() {
+            // Admission's outer readiness deadline is five seconds. Reserve
+            // four for the complete height lookup, divided across endpoints,
+            // so even a blackholed primary leaves time to try every fallback.
+            let timeout = if path == "/blocks/tip/height" {
+                std::time::Duration::from_secs(4) / self.endpoints.len() as u32
+            } else {
+                std::time::Duration::from_secs(self.config.timeout_secs)
+            };
+            let result = tokio::time::timeout(timeout, async {
+                let request = self.client.get(format!("{base}{path}"));
+                let response = limiter
+                    .run(false, || async {
+                        match &self.transport {
+                            Some(transport) => transport.execute(request).await,
+                            None => Ok(request.send().await?),
+                        }
+                    })
+                    .await
+                    .map_err(|error| match error {
+                        esplora_client::Error::Reqwest(_) => {
+                            ChainError::Connection("Esplora connection unavailable".into())
+                        }
+                        _ => ChainError::NotAvailable("Esplora request unavailable".into()),
+                    })?;
+                if !response.status().is_success() {
+                    return Err(ChainError::Backend(format!(
+                        "{path}: {}",
+                        response.status()
+                    )));
+                }
+                let text = response
+                    .text()
+                    .await
+                    .map_err(|_| ChainError::Backend("Esplora body unavailable".into()))?;
+                parse(&text)
+            })
+            .await
+            .unwrap_or_else(|_| Err(ChainError::NotAvailable("Esplora request timed out".into())));
+            match result {
+                Ok(value) => {
+                    self.active.store(index, Ordering::Relaxed);
+                    return Ok(value);
+                }
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    }
+
     async fn get_text(&self, path: &str) -> Result<String, ChainError> {
-        let url = self.api_url(path);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ChainError::Connection(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ChainError::Backend(format!("{path}: {status} — {body}")));
-        }
-
-        response
-            .text()
-            .await
-            .map_err(|e| ChainError::Backend(format!("read body: {e}")))
+        self.get_parsed(path, |text| Ok(text.to_owned())).await
     }
 
-    /// Make a GET request and deserialize JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ChainError> {
-        let url = self.api_url(path);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ChainError::Connection(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ChainError::Backend(format!("{path}: {status} — {body}")));
-        }
-
-        response
-            .json()
-            .await
-            .map_err(|e| ChainError::Backend(format!("parse json: {e}")))
+        self.get_parsed(path, |text| {
+            serde_json::from_str(text)
+                .map_err(|_| ChainError::Backend("invalid Esplora JSON".into()))
+        })
+        .await
     }
 }
 
@@ -170,8 +222,11 @@ impl EsploraProvider {
 impl ChainProvider for EsploraProvider {
     fn chain_view(&self) -> konsensus_core::traits::chain::ChainView {
         konsensus_core::traits::chain::ChainView {
-            backend: "esplora", trust_level: "third_party",
-            host: reqwest::Url::parse(&self.config.api_url).ok().and_then(|url| url.host_str().map(str::to_owned)),
+            backend: "esplora",
+            trust_level: "third_party",
+            host: reqwest::Url::parse(&self.endpoints[self.active.load(Ordering::Relaxed)].0)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned)),
         }
     }
 
@@ -181,11 +236,18 @@ impl ChainProvider for EsploraProvider {
 
     #[instrument(skip(self))]
     async fn get_block_height(&self) -> Result<u64, ChainError> {
-        let text = self.get_text("/blocks/tip/height").await?;
-        let height: u64 = text
-            .trim()
-            .parse()
-            .map_err(|e| ChainError::Backend(format!("parse height: {e}")))?;
+        let height = self
+            .get_parsed("/blocks/tip/height", |text| {
+                let height = text
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| ChainError::Backend("invalid Esplora height".into()))?;
+                if height == 0 {
+                    return Err(ChainError::NotAvailable("Esplora height is zero".into()));
+                }
+                Ok(height)
+            })
+            .await?;
 
         debug!(height, "got block height");
         Ok(height)
@@ -207,8 +269,9 @@ impl ChainProvider for EsploraProvider {
             height: block.height,
             hash: block.id,
             timestamp: block.timestamp,
-            bits: u32::try_from(block.bits)
-                .map_err(|_| ChainError::Backend(format!("block bits overflows u32: {}", block.bits)))?,
+            bits: u32::try_from(block.bits).map_err(|_| {
+                ChainError::Backend(format!("block bits overflows u32: {}", block.bits))
+            })?,
         })
     }
 
@@ -241,11 +304,9 @@ impl ChainProvider for EsploraProvider {
                 }
             }
 
-            closest
-                .map(|(_, rate)| rate)
-                .ok_or_else(|| {
-                    ChainError::FeeEstimationFailed("no fee estimates available".into())
-                })?
+            closest.map(|(_, rate)| rate).ok_or_else(|| {
+                ChainError::FeeEstimationFailed("no fee estimates available".into())
+            })?
         };
 
         debug!(target_blocks, sat_per_vbyte, "fee estimate");

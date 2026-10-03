@@ -530,8 +530,7 @@ async fn pricing_chain_aware_fresh_cache_is_as_of_the_chain_fetch() {
 }
 
 #[tokio::test]
-async fn pricing_chain_aware_with_chain_down_and_no_cache_is_stale() {
-    let before = Utc::now() - chrono::Duration::seconds(1);
+async fn pricing_chain_aware_with_chain_down_is_not_ready() {
     let chain: Arc<dyn ChainProvider> = Arc::new(DownChain);
     let engine =
         ChainAwarePricingEngine::new(ChainAwarePricingConfig::default(), Arc::clone(&chain));
@@ -542,16 +541,13 @@ async fn pricing_chain_aware_with_chain_down_and_no_cache_is_stale() {
     )
     .await;
 
-    assert_eq!(r.status, StatusCode::OK);
-    assert_eq!(r.json["mode"], "chain_aware");
-    assert_eq!(r.json["block_height"], 0);
-    // Prices fell back to the static table the node really charges right now.
-    assert!(parse_as_of(r.as_of.as_deref().unwrap()) >= before);
-    assert_eq!(r.stale.as_deref(), Some("1"));
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.json["code"], "not_ready");
+    assert!(r.json.get("block_height").is_none());
 }
 
 #[tokio::test]
-async fn pricing_chain_aware_with_chain_down_and_expired_cache_is_as_of_that_cache() {
+async fn pricing_chain_aware_with_chain_down_and_expired_cache_is_not_ready() {
     let chain: Arc<dyn ChainProvider> = Arc::new(DownChain);
     let config = ChainAwarePricingConfig {
         cache_ttl: Duration::from_secs(120),
@@ -572,17 +568,9 @@ async fn pricing_chain_aware_with_chain_down_and_expired_cache_is_as_of_that_cac
     )
     .await;
 
-    assert_eq!(r.status, StatusCode::OK);
-    assert_eq!(
-        r.json["ema_fee_rate"], 5.0,
-        "fee fields come from the old cache"
-    );
-    let as_of = parse_as_of(r.as_of.as_deref().unwrap());
-    assert!(
-        as_of <= Utc::now() - chrono::Duration::seconds(119),
-        "as-of must be the cache fetch time, not now: {as_of}"
-    );
-    assert_eq!(r.stale.as_deref(), Some("1"));
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.json["code"], "not_ready");
+    assert!(r.json.get("block_height").is_none());
 }
 
 /// Synced chain whose fee estimates fail for the listed targets only.

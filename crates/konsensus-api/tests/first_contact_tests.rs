@@ -347,7 +347,7 @@ async fn lost_admission_response_never_pays_twice_but_explicit_non_dispatch_can_
 }
 
 /// The authenticated target may return a correctly signed invoice whose own
-/// relative expiry is <=60 seconds but whose timestamp extends the attempt.
+/// relative expiry is <=300 seconds but whose timestamp extends the attempt.
 async fn admission_invoice_time_case(future_timestamp: bool) {
     use bitcoin::hashes::{sha256, Hash};
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
@@ -373,7 +373,7 @@ async fn admission_invoice_time_case(future_timestamp: bool) {
                     issued + 120
                 } else {
                     // Model one second of target/backend latency. The invoice
-                    // is current, but a fresh 60-second TTL exceeds the attempt.
+                    // is current, but a fresh 300-second TTL exceeds the attempt.
                     std::thread::sleep(Duration::from_millis(1100));
                     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
                 };
@@ -384,7 +384,7 @@ async fn admission_invoice_time_case(future_timestamp: bool) {
                     .duration_since_epoch(Duration::from_secs(timestamp))
                     .min_final_cltv_expiry_delta(18)
                     .amount_milli_satoshis(2000)
-                    .expiry_time(Duration::from_secs(60))
+                    .expiry_time(Duration::from_secs(300))
                     .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(
                         hash, &SecretKey::from_slice(&[7; 32]).unwrap(),
                     ))

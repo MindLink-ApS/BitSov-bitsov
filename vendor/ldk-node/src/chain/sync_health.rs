@@ -1,13 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A process-local wallet sync failure. No remote error text is retained.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChainSyncFailure {
-	/// Unix seconds when the currently failing wallet first failed to sync.
-	pub since: u64,
-	/// Whether the latest observed failure was an HTTP 429.
-	pub rate_limited: bool,
-}
+pub use esplora_client::rate_limit::ChainSyncFailure;
 
 /// Separate slots prevent a successful wallet sync from hiding the other failure.
 #[derive(Default)]
