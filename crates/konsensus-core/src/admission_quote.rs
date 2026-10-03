@@ -1,7 +1,10 @@
 //! First-contact payment preparation: only chat, a short-lived attempt bound
 //! to both endpoints, and no application admission authority in the quote.
 use crate::types::NodeId;
-pub const EXPIRY_SECS: u32 = 60;
+/// Human approval window: an owner may need to SSH to the node first.
+pub const FIRST_CONTACT_QUOTE_VALIDITY_SECS: u32 = 5 * 60;
+/// Wire attempt lifetime, shared by quote issuers and validators.
+pub const EXPIRY_SECS: u32 = FIRST_CONTACT_QUOTE_VALIDITY_SECS;
 pub const PURPOSE: &str = "konsensus:admission:0";
 pub fn request_id(recipient: &NodeId, sender: &NodeId, now: u64) -> String {
     format!(
@@ -34,9 +37,9 @@ mod tests {
         let b = NodeId::from_bytes([2; 32]);
         let c = NodeId::from_bytes([3; 32]);
         let id = request_id(&b, &a, 100);
-        assert_eq!(expires_at(&id, &b, &a, 100), Some(160));
-        assert_eq!(expires_at(&id, &b, &a, 159), Some(160));
-        assert_eq!(expires_at(&id, &b, &a, 160), None);
+        assert_eq!(expires_at(&id, &b, &a, 100), Some(400));
+        assert_eq!(expires_at(&id, &b, &a, 399), Some(400));
+        assert_eq!(expires_at(&id, &b, &a, 400), None);
         assert_eq!(expires_at(&id, &b, &a, 99), None);
         assert_eq!(expires_at(&id, &c, &a, 100), None);
         assert_eq!(expires_at(&id, &b, &c, 100), None);

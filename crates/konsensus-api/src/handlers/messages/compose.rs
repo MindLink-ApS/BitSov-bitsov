@@ -2164,7 +2164,7 @@ fn quote_cache() -> &'static QuoteCache {
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Bound on remembered quotes (each expires within 60 s anyway).
+/// Bound on remembered quotes (each expires within five minutes).
 const MAX_CACHED_QUOTES: usize = 256;
 
 fn now_unix() -> u64 {
@@ -2259,14 +2259,14 @@ pub struct FirstContactQuoteResponse {
     pub message_msat: u64,
     /// Admission plus first message plus both routing ceilings: cap to confirm, msat.
     pub total_msat: u64,
-    /// The quote is payable until this unix time (≤ 60 s).
+    /// The quote is payable until this unix time (≤ five minutes).
     pub expires_at: u64,
 }
 
 /// `POST /api/v1/messages/first-contact/quote` — show the owner a stranger's
 /// own price before anything is paid (the "door card"). Asks the connected
 /// target for its signed admission quote (F1's bounded payment preparation),
-/// validates it exactly as a send would, and remembers it for up to 60 s so
+/// validates it exactly as a send would, and remembers it for up to five minutes so
 /// the confirmed send pays this very invoice. Pays nothing and reserves
 /// nothing and creates no obligation. Needs only `read`; HTTP and recipient
 /// quote rate limits still apply. Sending separately requires spend authority.
@@ -3766,7 +3766,7 @@ mod admission_invoice_clock_tests {
     use super::*;
 
     const NOW: u64 = 1_700_000_000;
-    /// Attempt issued at NOW, live until NOW + EXPIRY_SECS.
+    /// A legacy short attempt, still accepted inside the five-minute ceiling.
     const ATTEMPT_END: u64 = NOW + 60;
 
     fn secs(n: u64) -> Duration {
@@ -3781,6 +3781,12 @@ mod admission_invoice_clock_tests {
             secs(now),
             attempt_end,
         )
+    }
+
+    #[test]
+    fn human_approval_window_is_payable_until_its_strict_deadline() {
+        assert!(check(NOW, 300, NOW + 299, Some(NOW + 300)));
+        assert!(!check(NOW, 300, NOW + 300, Some(NOW + 300)));
     }
 
     #[test]
@@ -3839,7 +3845,7 @@ mod admission_invoice_clock_tests {
 
     #[test]
     fn relative_ttl_above_cap_is_refused() {
-        assert!(!check(NOW, 61, NOW, Some(ATTEMPT_END)));
+        assert!(!check(NOW, 301, NOW, Some(NOW + 301)));
     }
 
     #[test]
