@@ -2354,3 +2354,36 @@ async fn ready_admission_preparation_preserves_signed_stateless_quote() {
     assert!(wallet.list_payments(10).await.unwrap().is_empty());
     assert_eq!(wallet.get_balance_msat().await.unwrap(), 0);
 }
+
+#[test]
+fn privileged_invoice_error_frames_never_contain_backend_details() {
+    use konsensus_core::traits::lightning::LightningError;
+    const PRIVATE: &str = "https://user:secret@private-backend.invalid/private-wallet";
+    let cases = [
+        (LightningError::Backend(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::InvoiceCreation(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::Connection(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::Auth(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::InvalidStartupConfig(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::PaymentNotDispatched(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::NotReady, "konsensus:not_ready:not_synced"),
+        (LightningError::StatelessQuoteUnsupported, "stateless_quote_unsupported"),
+        (LightningError::PaymentNotDispatched("disk_low".into()), "disk_low"),
+        (LightningError::ChainSourceUnavailable {
+            network: PRIVATE.into(), service: PRIVATE.into(), attempts: 1,
+            elapsed_ms: 1, cause: PRIVATE.into(),
+        }, "konsensus:not_ready:chain_unavailable"),
+    ];
+    for (error, expected) in cases {
+        let frame = invoice_error_frame("request-199", error);
+        let bytes = frame.to_bytes().unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(PRIVATE));
+        match Frame::from_bytes(&bytes).unwrap() {
+            Frame::InvoiceError { request_id, reason } => {
+                assert_eq!(request_id, "request-199");
+                assert_eq!(reason, expected);
+            }
+            frame => panic!("unexpected frame: {frame:?}"),
+        }
+    }
+}

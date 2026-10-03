@@ -1314,18 +1314,34 @@ async fn handle_invoice_requested(
                 "failed to create invoice for peer request — sending error to peer"
             );
             if !refusals.permit(source_ip, tokio::time::Instant::now()) { return; }
-            let error_frame = Frame::InvoiceError {
-                request_id: request_id.to_string(),
-                reason: match e {
-                    konsensus_core::traits::lightning::LightningError::NotReady => konsensus_api::invoice_refusal::NOT_SYNCED.into(),
-                    konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(reason) if reason == "disk_low" => reason,
-                    e => format!("invoice creation failed: {e}"),
-                },
-            };
+            let error_frame = invoice_error_frame(request_id, e);
             if let Err(send_err) = transport.enqueue_control_frame(peer_id, &error_frame).await {
                 warn!(peer = %peer_id, %request_id, error = %send_err, "failed to send invoice error frame");
             }
         }
+    }
+}
+
+fn invoice_error_frame(
+    request_id: &str,
+    error: konsensus_core::traits::lightning::LightningError,
+) -> Frame {
+    Frame::InvoiceError {
+        request_id: request_id.into(),
+        reason: invoice_refusal_reason(error).into(),
+    }
+}
+
+/// Only fixed protocol codes may leave the node; backend details stay local.
+fn invoice_refusal_reason(error: konsensus_core::traits::lightning::LightningError) -> &'static str {
+    use konsensus_api::invoice_refusal::{CHAIN_UNAVAILABLE, NOT_SYNCED};
+    use konsensus_core::traits::lightning::LightningError;
+    match error {
+        LightningError::NotReady => NOT_SYNCED,
+        LightningError::StatelessQuoteUnsupported => "stateless_quote_unsupported",
+        LightningError::PaymentNotDispatched(reason) if reason == "disk_low" => "disk_low",
+        LightningError::ChainSourceUnavailable { .. } => CHAIN_UNAVAILABLE,
+        _ => "konsensus:invoice_unavailable",
     }
 }
 
@@ -1339,7 +1355,6 @@ async fn prepare_admission_invoice(
     attempt_end: u64,
 ) -> Result<(konsensus_core::traits::lightning::Invoice, u64, String), &'static str> {
     use konsensus_api::invoice_refusal::{CHAIN_UNAVAILABLE, NOT_SYNCED};
-    use konsensus_core::traits::lightning::LightningError;
     let price = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         chain
             .get_block_height()
@@ -1379,13 +1394,7 @@ async fn prepare_admission_invoice(
     )
     .await
     .map_err(|_| "konsensus:invoice_unavailable")?
-    .map_err(|error| match error {
-        LightningError::NotReady => NOT_SYNCED,
-        LightningError::StatelessQuoteUnsupported => "stateless_quote_unsupported",
-        LightningError::PaymentNotDispatched(reason) if reason == "disk_low" => "disk_low",
-        LightningError::ChainSourceUnavailable { .. } => CHAIN_UNAVAILABLE,
-        _ => "konsensus:invoice_unavailable",
-    })?;
+    .map_err(invoice_refusal_reason)?;
     Ok((invoice, admission, description))
 }
 
