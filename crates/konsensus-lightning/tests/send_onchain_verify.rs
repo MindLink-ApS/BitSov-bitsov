@@ -9,7 +9,8 @@
 //! 1. A 200 from Esplora's `/tx/<txid>` → `Ok(true)`.
 //! 2. A 404 → `Ok(false)`.
 //! 3. Any other status (5xx, 502 from CDN, etc.) → `Err`.
-//! 4. Empty `esplora_url` (test-path via `LdkProvider::from_node`) → `Ok(false)`.
+//! 4. Empty `esplora_url` → `Err`: with no chain source, absence is never assumed
+//!    (an `Ok(false)` would let a reservation be released as "proven absent", #189).
 //!
 //! `LightningError::BroadcastUnconfirmed { txid }` is exercised at the
 //! API-handler layer (`konsensus-api` send_onchain handler test).
@@ -17,9 +18,9 @@
 use konsensus_lightning::esplora_tx_visible;
 
 #[tokio::test]
-async fn empty_url_returns_false_no_panic() {
+async fn empty_url_is_an_error_not_absence() {
     let result = esplora_tx_visible("", "deadbeef").await;
-    assert_eq!(result, Ok(false));
+    assert!(result.is_err(), "no chain source must not read as absent: {result:?}");
 }
 
 #[tokio::test]
