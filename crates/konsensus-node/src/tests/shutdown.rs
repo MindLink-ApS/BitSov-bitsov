@@ -8,6 +8,7 @@ fn stopped_ldk_does_not_report_drop_fallback() {
     let log = tempfile::tempfile().unwrap();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(log.try_clone().unwrap())
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
@@ -27,6 +28,135 @@ fn stopped_ldk_does_not_report_drop_fallback() {
     let mut output = String::new();
     log.read_to_string(&mut output).unwrap();
     assert!(!output.contains("panic-path fallback"), "{output}");
+    assert!(
+        output.contains("DEBUG") && output.contains("LDK node already stopped"),
+        "{output}"
+    );
+}
+
+// Keep the process-wide shutdown watchdog out of the parallel test runner.
+fn lifecycle_child(name: &str) -> bool {
+    const CHILD: &str = "BITSOV_LIFECYCLE_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &format!("shutdown_tests::{name}"), "--nocapture"])
+        .env(CHILD, name)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+#[tokio::test]
+async fn api_failure_exits_cleanly_after_shutdown() {
+    if !lifecycle_child("api_failure_exits_cleanly_after_shutdown") {
+        return;
+    }
+    let accepting = std::sync::atomic::AtomicBool::new(true);
+    let provider = PersistenceProbe {
+        accepting: &accepting,
+        persisted: Default::default(),
+    };
+    let drained = std::sync::atomic::AtomicBool::new(false);
+    // Inject the API serve error at the lifecycle boundary without binding a socket.
+    for kind in [
+        std::io::ErrorKind::AddrInUse,
+        std::io::ErrorKind::ConnectionAborted,
+    ] {
+        let startup = async {
+            let failure = async move { Err(std::io::Error::from(kind).into()) };
+            let cleanup = async {
+                assert!(provider.persisted.load(std::sync::atomic::Ordering::SeqCst));
+                drained.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            };
+            Ok((failure, cleanup, || Ok(())))
+        };
+        let result = run_node_lifecycle(
+            startup,
+            std::future::pending(),
+            || accepting.store(false, std::sync::atomic::Ordering::SeqCst),
+            &provider,
+        )
+        .await;
+        assert!(drained.swap(false, std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            result.is_ok(),
+            "API failure must not trigger Restart=on-failure: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn timed_out_drain_still_prunes_expired_grants() {
+    if !lifecycle_child("timed_out_drain_still_prunes_expired_grants") {
+        return;
+    }
+    use konsensus_api::pairing::{PairingFile, PairingService, SpendGrant, PAIRING_FILE_VERSION};
+    use konsensus_api::spend_budget::{GrantBudget, GrantTerms};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pairing/clients.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let file = PairingFile {
+        version: PAIRING_FILE_VERSION,
+        grants: vec![SpendGrant {
+            op_id: "shutdown-test".into(),
+            client_id: "client".into(),
+            scopes: vec![konsensus_api::auth::Scope::Spend],
+            granted_at: now,
+            expires_at: now + 2,
+            identity_fingerprint: "identity".into(),
+            epoch: 1,
+            granted_by: "cli".into(),
+            budget: Some(GrantBudget::from_terms(&GrantTerms::new(1_000))),
+        }],
+        ..Default::default()
+    };
+    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let pairing = PairingService::open(dir.path(), "identity".into(), false).unwrap();
+    assert_eq!(pairing.reload_from_disk().unwrap().grants.len(), 1);
+    let accepting = std::sync::atomic::AtomicBool::new(true);
+    let provider = PersistenceProbe {
+        accepting: &accepting,
+        persisted: Default::default(),
+    };
+    let startup = async {
+        let failure = async { Ok(()) };
+        let cleanup = async {
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        let finalize = || {
+            pairing.prune_expired_grants()?;
+            Ok(())
+        };
+        Ok((failure, cleanup, finalize))
+    };
+    let result = run_node_lifecycle(
+        startup,
+        std::future::pending(),
+        || accepting.store(false, std::sync::atomic::Ordering::SeqCst),
+        &provider,
+    )
+    .await;
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("cleanup timed out"));
+    // Read raw disk: PairingService's read helpers themselves trigger pruning.
+    let persisted: PairingFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert!(
+        persisted.grants.is_empty(),
+        "expired grant survived the drain timeout"
+    );
 }
 
 #[cfg(unix)]
@@ -58,7 +188,7 @@ fn signals_persist_before_drop() {
                     println!("DRAINED");
                     Ok(())
                 };
-                Ok((failure, cleanup))
+                Ok((failure, cleanup, || Ok(())))
             };
             run_node_lifecycle(
                 startup,

@@ -846,6 +846,7 @@ async fn start_node_services<'a>(
 ) -> Result<(
     impl std::future::Future<Output = Result<()>>,
     impl std::future::Future<Output = Result<()>> + 'a,
+    impl FnOnce() -> Result<()>,
 )> {
     // ── Lightning health check ─────────────────────────────────────
     // Verify Lightning connectivity at startup so users get a clear
@@ -1562,7 +1563,8 @@ async fn start_node_services<'a>(
             }
         }
 
-        // The lifecycle gives all cleanup (including snapshots and grants) 10s.
+        // The lifecycle gives snapshots and task joins 10s; the final grant
+        // prune runs separately even if this future is dropped at the deadline.
         if let Err(e) = msg_handle.await { warn!(error = %e, "message handler task panicked"); }
         if let Err(e) = pending_handle.await { warn!(error = %e, "pending delivery task panicked"); }
         if let Err(e) = auto_channel_handle.await { warn!(error = %e, "auto-channel task panicked"); }
@@ -1584,6 +1586,9 @@ async fn start_node_services<'a>(
         if let Some(h) = stun_handle { if let Err(e) = h.await { warn!(error = %e, "STUN responder task panicked"); } }
         if let Some(h) = remote_access_handle { if let Err(e) = h.await { warn!(error = %e, "remote access task panicked"); } }
         if let Some(h) = remote_internal_handle { if let Err(e) = h.await { warn!(error = %e, "internal remote API task panicked"); } }
+        Ok(())
+    };
+    let finalize = move || {
         // A grant can expire while the API/backend tasks drain, after the sweeper
         // has stopped. Purge once more before returning from graceful shutdown;
         // surface an I/O failure instead of claiming that cleanup succeeded.
@@ -1593,7 +1598,7 @@ async fn start_node_services<'a>(
 
         Ok(())
     };
-    Ok((service_failure, cleanup))
+    Ok((service_failure, cleanup, finalize))
 }
 
 // 15s for monitor persistence + 10s for task cleanup, with a 30s wall-clock
@@ -1638,8 +1643,8 @@ fn shutdown_signal() -> Result<impl std::future::Future<Output = Result<()>>> {
 
 /// Own the whole post-construction lifecycle: cancellation during startup must
 /// persist Lightning state too. Cleanup exists only once services are ready.
-async fn run_node_lifecycle<Failure, Cleanup>(
-    startup: impl std::future::Future<Output = Result<(Failure, Cleanup)>>,
+async fn run_node_lifecycle<Failure, Cleanup, Finalize>(
+    startup: impl std::future::Future<Output = Result<(Failure, Cleanup, Finalize)>>,
     signal: impl std::future::Future<Output = Result<()>>,
     stop_work: impl FnOnce(),
     lightning: &dyn konsensus_core::traits::lightning::LightningProvider,
@@ -1647,6 +1652,7 @@ async fn run_node_lifecycle<Failure, Cleanup>(
 where
     Failure: std::future::Future<Output = Result<()>>,
     Cleanup: std::future::Future<Output = Result<()>>,
+    Finalize: FnOnce() -> Result<()>,
 {
     tokio::pin!(signal);
     let (run_result, cleanup) = tokio::select! {
@@ -1654,13 +1660,20 @@ where
         result = &mut signal => (result, None),
         result = startup => match result {
             Err(e) => (Err(e), None),
-            Ok((failure, cleanup)) => {
+            Ok((failure, cleanup, finalize)) => {
                 let result = tokio::select! {
                     biased;
                     result = &mut signal => result,
-                    result = failure => result,
+                    result = failure => {
+                        if let Err(e) = result {
+                            error!(error = %e, "API server failed — shutting down node");
+                        }
+                        // Preserve a clean exit for API bind/serve failures:
+                        // Restart=on-failure must not loop on a busy port.
+                        Ok(())
+                    },
                 };
-                (result, Some(cleanup))
+                (result, Some((cleanup, finalize)))
             }
         },
     };
@@ -1669,11 +1682,15 @@ where
     if let Err(e) = &lightning_result {
         warn!(error = %e, "Lightning shutdown failed; channel monitor persistence may be incomplete");
     }
-    let cleanup_result = if let Some(cleanup) = cleanup {
-        tokio::time::timeout(std::time::Duration::from_secs(10), cleanup)
+    let cleanup_result = if let Some((cleanup, finalize)) = cleanup {
+        let drain_result = tokio::time::timeout(std::time::Duration::from_secs(10), cleanup)
             .await
             .context("node cleanup timed out after 10s")
-            .and_then(|result| result)
+            .and_then(|result| result);
+        // Grants can expire while tasks drain. This must run outside the join
+        // timeout, including on error; the process-wide deadline still applies.
+        let finalize_result = finalize();
+        finalize_result.and(drain_result)
     } else {
         Ok(())
     };
