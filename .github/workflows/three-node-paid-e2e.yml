@@ -1,0 +1,100 @@
+name: Three-node paid regtest
+
+# Expensive real-node lane; deliberately absent from pull_request and push.
+on:
+  workflow_dispatch:
+    inputs:
+      ghost_after_pr200:
+        description: 'Enable ghost-channel regression only after PR #200 has merged'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '23 2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: three-node-paid-regtest-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  paid-regtest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      BITCOIND_SKIP_DOWNLOAD: '1'
+      ELECTRS_SKIP_DOWNLOAD: '1'
+      ELECTRSD_SKIP_DOWNLOAD: '1'
+      REGTEST_TIMEOUT_SECONDS: '3000'
+      REGTEST_GHOST_AFTER_PR200: ${{ inputs.ghost_after_pr200 && '1' || '0' }}
+      # Hashes transcribed from corepc-node 0.10.1 sha256/bitcoin-core-28.2-SHA256SUMS
+      # and electrsd 0.36.1 sha256 (both pinned in Cargo.lock). Verify archives
+      # BEFORE extraction or execution; never fetch a mutable checksum at runtime.
+      BITCOIN_VERSION: '28.2'
+      BITCOIN_SHA256: '98add5f220c01b387343b70edeb6273403fe081e22cd85fda132704cdcaa98aa'
+      ELECTRS_COMMIT: 'a33e97e1a1fc63fa9c20a116bb92579bbf43b254'
+      ELECTRS_SHA256: '865e26a96e8df77df01d96f2f569dcf9622fc87a8d99a9b8fe30861a4db9ddf1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Provision hash-pinned regtest fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_dir="$RUNNER_TEMP/regtest-fixtures"
+          mkdir -p "$fixture_dir"
+          cd "$fixture_dir"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            "https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/bitcoin-${BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz" -o bitcoin.tar.gz
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            "https://github.com/RCasatta/electrsd/releases/download/electrs_releases/electrs_linux_esplora_${ELECTRS_COMMIT}.zip" -o electrs.zip
+          printf '%s  %s\n' "$BITCOIN_SHA256" bitcoin.tar.gz "$ELECTRS_SHA256" electrs.zip | sha256sum --check --strict
+          tar -xzf bitcoin.tar.gz
+          # This pinned electrsd archive has one executable; do not depend on
+          # its internal filename or allow unchecked archive paths to escape.
+          python3 - <<'PY'
+          import pathlib, zipfile
+          with zipfile.ZipFile('electrs.zip') as archive:
+              files = [entry for entry in archive.infolist() if not entry.is_dir()]
+              assert len(files) == 1, 'expected one pinned electrs executable'
+              pathlib.Path('electrs').write_bytes(archive.read(files[0]))
+          PY
+          chmod 755 electrs
+          echo "BITCOIND_EXE=$fixture_dir/bitcoin-${BITCOIN_VERSION}/bin/bitcoind" >> "$GITHUB_ENV"
+          echo "ELECTRS_EXE=$fixture_dir/electrs" >> "$GITHUB_ENV"
+      - name: Cache Rust dependencies for the offline runner
+        run: cargo fetch --locked
+      - name: Runner lifecycle tests
+        run: python3 scripts/regress/test_regtest_e2e_runner.py -v
+      - name: Three-node paid E2E (skip is a CI failure)
+        shell: bash
+        run: |
+          set +e
+          scripts/regress/three_node_paid_e2e.sh 2>&1 | tee regtest.log
+          result=${PIPESTATUS[0]}
+          set -e
+          if [[ "$result" == 77 ]]; then
+            echo '### SKIPPED: required regtest fixtures unavailable' >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::Regtest skipped (77); this lane requires execution.'
+            exit 1
+          fi
+          if [[ "$REGTEST_GHOST_AFTER_PR200" != 1 ]]; then
+            echo 'Ghost/unfunded-channel subscenario SKIPPED: awaiting PR #200. The paid-flow lane still requires execution.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ "$result" != 0 ]]; then exit "$result"; fi
+          grep -q '^THREE-NODE PAID E2E PASS;' regtest.log
+          if [[ "$REGTEST_GHOST_AFTER_PR200" == 1 ]]; then
+            grep -q '^GHOST UNFUNDED CHANNEL PASS:' regtest.log
+          fi
+      - name: Retain evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: three-node-regtest-log
+          path: regtest.log
+          if-no-files-found: ignore

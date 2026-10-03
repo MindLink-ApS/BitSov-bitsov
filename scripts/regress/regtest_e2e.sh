@@ -63,8 +63,13 @@ try:
     if build_only:
         command += ["--no-run"]
     else:
-        command += [os.environ.get("REGTEST_TEST", "regtest_e2e::"),
-                    "--", "--ignored", "--nocapture", "--test-threads=1"]
+        selected = os.environ.get("REGTEST_TEST", "regtest_e2e::")
+        command += [selected, "--", "--ignored", "--nocapture", "--test-threads=1"]
+        ghost = "regtest_e2e::three_node::ghost_unfunded_channel_requires_pr200"
+        if env.get("REGTEST_GHOST_AFTER_PR200") != "1" and selected != ghost:
+            command += ["--skip", ghost]
+            if ghost.startswith(selected):
+                print("SKIP ghost/unfunded-channel subscenario: requires unmerged PR #200; set REGTEST_GHOST_AFTER_PR200=1 after merge.", flush=True)
     child = subprocess.Popen(command, env=env, start_new_session=True)
     if pending_signal is not None:
         raise SystemExit(128 + pending_signal)
@@ -72,6 +77,7 @@ try:
         result = child.wait(timeout=int(os.environ.get("REGTEST_TIMEOUT_SECONDS", "900")))
         if result == 0 and build_only:
             print("SKIP three-node paid E2E: compiled; BITCOIND_EXE and/or ELECTRS_EXE unavailable offline. No daemons started.", flush=True)
+            raise SystemExit(77)
         raise SystemExit(result)
     except subprocess.TimeoutExpired:
         print("REGTEST-E2E timeout; terminating the test and its daemons", flush=True)

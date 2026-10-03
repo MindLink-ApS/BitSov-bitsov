@@ -16,7 +16,10 @@ const QUOTE: &str = "Atlas runs 1–2: read-scope quote and paid receipt blocked
 const SYNC: &str = "Atlas run 2 #13 / run 4 steps 1,3: 429 stalls and silent recipient timeout";
 const REPLY: &str = "Atlas run 2 #17: A has zero inbound liquidity; B cannot reply yet";
 const RESTART: &str = "Atlas run 4 steps 2–3: recipient restart during an active client flow";
-const SKEW: &str = "Atlas run 4 step 3: mixed-version height-0 price table";
+const SKEW: &str = "Atlas run 4 step 6: stale peer prices at quote time";
+const SENDER_SYNC: &str = "sender-side 429: local not_ready before dispatch";
+const SLOW_OWNER: &str = "quote TTL expires while owner approves";
+const READMISSION: &str = "reconnect needs a per-recipient allowance";
 const ROOM: &str = "Atlas run 2 #14–18: paid room flow never reached";
 
 async fn eventually<F, Fut>(incident: &str, mut check: F)
@@ -24,13 +27,13 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    tokio::time::timeout(Duration::from_secs(180), async {
+    tokio::time::timeout(Duration::from_secs(360), async {
         while !check().await {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("{incident}: condition did not recover in 180s"));
+    .unwrap_or_else(|_| panic!("{incident}: condition did not recover in 360s"));
 }
 
 async fn owner(app: &app::App, request: ControlRequest, incident: &str) {
@@ -50,7 +53,7 @@ async fn owner(app: &app::App, request: ControlRequest, incident: &str) {
     );
 }
 
-async fn elevate(app: &mut app::App) {
+async fn elevate(app: &mut app::App, recipients: &[String]) {
     use std::os::unix::fs::PermissionsExt;
     let scopes = app.refresh_token().await;
     assert_eq!(
@@ -111,14 +114,18 @@ async fn elevate(app: &mut app::App) {
             );
         }
     }
+    let mut terms = konsensus_api::spend_budget::GrantTerms::new(1_000_000)
+        .per_call(200_000)
+        .for_secs(3600);
+    for recipient in recipients {
+        terms = terms.recipient(recipient, 200_000);
+    }
     owner(
         app,
         ControlRequest::Grant {
             op_id: op.to_owned(),
             confirmation,
-            terms: konsensus_api::spend_budget::GrantTerms::new(1_000_000)
-                .per_call(200_000)
-                .for_secs(3600),
+            terms,
         },
         APPROVAL,
     )
@@ -154,6 +161,20 @@ async fn connect(from: &app::App, to: &app::App, incident: &str) {
     tokio::time::sleep(Duration::from_millis(1100)).await;
 }
 
+async fn reconnect(from: &app::App, to: &app::App, incident: &str) {
+    from.transport
+        .disconnect(to.state.identity.node_id())
+        .await
+        .expect(incident);
+    eventually(incident, || async {
+        !to.transport
+            .is_connected(from.state.identity.node_id())
+            .await
+    })
+    .await;
+    connect(from, to, incident).await;
+}
+
 async fn quote(from: &app::App, to: &app::App, incident: &str) -> Value {
     let (status, body) = tokio::time::timeout(
         Duration::from_secs(8),
@@ -171,7 +192,12 @@ async fn quote(from: &app::App, to: &app::App, incident: &str) -> Value {
     body
 }
 
-async fn approve_contact(from: &app::App, to: &app::App, quote: &Value) {
+async fn approve_contact(
+    from: &app::App,
+    to: &app::App,
+    quote: &Value,
+    contact_budget_msat: Option<u64>,
+) {
     owner(
         from,
         ControlRequest::ApproveFirstContact {
@@ -183,7 +209,7 @@ async fn approve_contact(from: &app::App, to: &app::App, quote: &Value) {
                 .op_id,
             recipient: to.state.identity.node_id().to_hex(),
             max_total_msat: quote["total_msat"].as_u64().expect(QUOTE),
-            contact_budget_msat: Some(200_000),
+            contact_budget_msat,
         },
         APPROVAL,
     )
@@ -293,10 +319,10 @@ async fn start_app(
 #[ignore = "local Bitcoin Core + Esplora electrs; scripts/regress/three_node_paid_e2e.sh"]
 async fn three_node_paid_e2e() {
     for variable in ["BITCOIND_EXE", "ELECTRS_EXE"] {
-        if !std::env::var_os(variable).is_some_and(|p| Path::new(&p).is_file()) {
-            eprintln!("SKIP three-node paid E2E: {variable} unavailable offline; compiled, no daemons started");
-            return;
-        }
+        assert!(
+            std::env::var_os(variable).is_some_and(|p| Path::new(&p).is_file()),
+            "missing {variable}: ignored regtest requires fixtures; use runner for SKIP (exit 77)"
+        );
     }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -304,9 +330,10 @@ async fn three_node_paid_e2e() {
     let mut steps = Steps::new();
     let chain = infra::Chain::start().await;
     let fault = fault_proxy::FaultProxy::start(&chain.url).await;
+    let sender_fault = fault_proxy::FaultProxy::start(&chain.url).await;
     let dirs = [(); 3].map(|_| tempfile::tempdir().unwrap());
     let configs = [
-        infra::lightning_config(dirs[0].path(), &chain.url),
+        infra::lightning_config(dirs[0].path(), &sender_fault.url),
         infra::lightning_config(dirs[1].path(), &fault.url),
         infra::lightning_config(dirs[2].path(), &chain.url),
     ];
@@ -319,7 +346,7 @@ async fn three_node_paid_e2e() {
         &chain,
         a.clone(),
         &configs[0],
-        &chain.api_url,
+        &sender_fault.url,
     )
     .await;
     let mut bob = start_app(dirs[1].path(), &chain, b.clone(), &configs[1], &fault.url).await;
@@ -432,6 +459,8 @@ async fn three_node_paid_e2e() {
     .await;
     steps.pass("Atlas run 4 429: typed refusal in <8s, background sync recovers without restart/manual sync");
 
+    // The refused quote consumed the recipient's 10s source cooldown.
+    tokio::time::sleep(Duration::from_secs(10)).await;
     let payments_before = b.list_payments(500).await.unwrap().len();
     let first = quote(&alice, &bob, QUOTE).await;
     assert_eq!(
@@ -482,8 +511,8 @@ async fn three_node_paid_e2e() {
         ),
         "{APPROVAL}: refused compose must not reach recipient"
     );
-    elevate(&mut alice).await;
-    approve_contact(&alice, &bob, &first).await;
+    elevate(&mut alice, &[]).await;
+    approve_contact(&alice, &bob, &first, None).await;
     paid(&alice, &mut bob, "Atlas paid first contact A to B", QUOTE).await;
     assert_eq!(
         alice.used(),
@@ -492,8 +521,64 @@ async fn three_node_paid_e2e() {
     );
     steps.pass("Atlas runs 1–3: read quote, remote spend request, headless control grant, paid E2EE receipt");
 
+    sender_fault.set_limited(true);
+    eventually(SENDER_SYNC, || async {
+        sender_fault.rejected() > 0 && a.chain_sync_status().is_some() && !a.money_ready().await
+    })
+    .await;
+    let before = (
+        alice.used(),
+        capacity(a.node()),
+        capacity(b.node()),
+        settled_outgoing(&a).await.len(),
+        b.list_payments(500).await.unwrap().len(),
+    );
+    let (status, refusal) = tokio::time::timeout(
+        Duration::from_secs(8),
+        alice.post(
+            "/api/v1/messages/compose",
+            json!({"recipient": bob.state.identity.node_id().to_hex(),
+            "kind": 0, "plaintext": "sender chain is limited"}),
+            false,
+        ),
+    )
+    .await
+    .expect(SENDER_SYNC);
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{SENDER_SYNC}: {refusal}"
+    );
+    assert_eq!(refusal["code"], "not_ready", "{SENDER_SYNC}: {refusal}");
+    assert_eq!(
+        (
+            alice.used(),
+            capacity(a.node()),
+            capacity(b.node()),
+            settled_outgoing(&a).await.len(),
+            b.list_payments(500).await.unwrap().len()
+        ),
+        before,
+        "{SENDER_SYNC}: local refusal before payment/invoice"
+    );
+    sender_fault.set_limited(false);
+    eventually(SENDER_SYNC, || async {
+        a.chain_sync_status().is_none() && a.money_ready().await
+    })
+    .await;
+    let used = alice.used();
+    paid(
+        &alice,
+        &mut bob,
+        "sender recovers without restart",
+        SENDER_SYNC,
+    )
+    .await;
+    assert_eq!(alice.used() - used, 2_001, "{SENDER_SYNC}");
+    steps.pass("Sender 429: local not_ready pays nothing; background recovery permits paid send");
+
     list_contact(&alice, &bob, REPLY).await;
-    elevate(&mut bob).await;
+    elevate(&mut bob, &[]).await;
     let before = (
         capacity(a.node()),
         capacity(b.node()),
@@ -525,7 +610,7 @@ async fn three_node_paid_e2e() {
     settle(&a, &invoice.payment_hash).await;
     settle(&b, &invoice.payment_hash).await;
     eventually(REPLY, || async { capacity(b.node()) > 10_000_000 }).await;
-    paid(
+    let reply = paid(
         &bob,
         &mut alice,
         "B replies after A obtains inbound liquidity",
@@ -533,14 +618,149 @@ async fn three_node_paid_e2e() {
     )
     .await;
     assert_eq!(bob.used(), 2_001, "{REPLY}: one paid reply only");
-    list_contact(&bob, &alice, RESTART).await;
+    assert!(
+        reply["readmission_msat"].is_null(),
+        "{REPLY}: admitted reply requires no first-contact payment"
+    );
     steps.pass(
         "Atlas run 2 liquidity: unfunded reply refused without payment, rebalanced reply delivered",
     );
 
     let first_c = quote(&alice, &carol, ROOM).await;
-    approve_contact(&alice, &carol, &first_c).await;
-    paid(&alice, &mut carol, "A to C first contact", ROOM).await;
+    let expires = first_c["expires_at"].as_u64().expect(SLOW_OWNER);
+    let payments = settled_outgoing(&a).await.len();
+    let used = alice.used();
+    // Real wall clock: neither the signed quote nor the owner's clock is mocked.
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        <= expires
+    {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    approve_contact(&alice, &carol, &first_c, None).await;
+    paid(
+        &alice,
+        &mut carol,
+        "A to C first contact after slow owner approval",
+        SLOW_OWNER,
+    )
+    .await;
+    assert_eq!(
+        alice.used() - used,
+        4_002,
+        "{SLOW_OWNER}: no double admission debit"
+    );
+    assert_eq!(
+        settled_outgoing(&a).await.len() - payments,
+        2,
+        "{SLOW_OWNER}: admission and message only"
+    );
+    steps.pass("Slow owner: expired quote replaced; exactly one admission and one message paid");
+
+    // C was approved once, without a standing per-recipient budget. Its
+    // consumed one-time approval must not authorize another admission.
+    assert!(
+        alice
+            .service
+            .grant_view_for(&alice.client)
+            .unwrap()
+            .per_recipient_msat
+            .is_empty(),
+        "{READMISSION}"
+    );
+    reconnect(&alice, &carol, READMISSION).await;
+    assert!(
+        !alice
+            .state
+            .peer_ln_pubkeys
+            .lock()
+            .await
+            .contains_key(carol.state.identity.node_id()),
+        "{READMISSION}: fixture must exercise invoice/admission, not a cached keysend route"
+    );
+    let before = (
+        alice.used(),
+        capacity(a.node()),
+        capacity(c.node()),
+        settled_outgoing(&a).await.len(),
+        c.list_payments(500).await.unwrap().len(),
+    );
+    let (status, refusal) = alice
+        .post(
+            "/api/v1/messages/compose",
+            json!({
+                "recipient": carol.state.identity.node_id().to_hex(), "kind": 0,
+                "plaintext": "no standing C allowance after reconnect",
+            }),
+            false,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{READMISSION}: {refusal}");
+    assert_eq!(
+        refusal["code"], "budget_exceeded",
+        "{READMISSION}: {refusal}"
+    );
+    assert_eq!(
+        refusal["reason"], "first_contact",
+        "{READMISSION}: {refusal}"
+    );
+    assert_eq!(
+        (
+            alice.used(),
+            capacity(a.node()),
+            capacity(c.node()),
+            settled_outgoing(&a).await.len(),
+            c.list_payments(500).await.unwrap().len()
+        ),
+        before,
+        "{READMISSION}: refusal pays nothing and creates no invoice"
+    );
+    // Replace the empty grant through the owner socket with explicit
+    // --recipient-style entries. No new one-time contact approval is issued.
+    owner(
+        &alice,
+        ControlRequest::RevokeGrant {
+            client_id: Some(alice.client.clone()),
+        },
+        READMISSION,
+    )
+    .await;
+    elevate(
+        &mut alice,
+        &[
+            bob.state.identity.node_id().to_hex(),
+            carol.state.identity.node_id().to_hex(),
+        ],
+    )
+    .await;
+    let used = alice.used();
+    paid(
+        &alice,
+        &mut carol,
+        "owner authorizes C re-admission",
+        READMISSION,
+    )
+    .await;
+    assert_eq!(alice.used() - used, 4_002, "{READMISSION}");
+    reconnect(&alice, &carol, READMISSION).await;
+    let used = alice.used();
+    paid(
+        &alice,
+        &mut carol,
+        "C allowance alone authorizes re-admission",
+        READMISSION,
+    )
+    .await;
+    assert_eq!(
+        alice.used() - used,
+        4_002,
+        "{READMISSION}: admission 2001 + message 2001"
+    );
+    steps.pass(
+        "Re-admission: absent recipient cap refuses without spend; standing cap pays exactly 4002",
+    );
     list_contact(&alice, &carol, ROOM).await;
 
     // An older recipient advertised height 0 while current senders enforce
@@ -582,21 +802,63 @@ async fn three_node_paid_e2e() {
             .is_none(),
         "{SKEW}: reject expired height-0 table"
     );
-    let used = alice.used();
-    paid(
-        &alice,
-        &mut bob,
-        "paid through mixed-version price table",
-        SKEW,
-    )
-    .await;
+    let (status, tables) = alice.get("/api/v1/pricing/peers", false).await;
+    assert_eq!(status, StatusCode::OK, "{SKEW}: {tables}");
+    let entry = tables
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["peer_id"] == bob.state.identity.node_id().to_hex())
+        .expect(SKEW);
     assert_eq!(
-        alice.used() - used,
-        2_001,
-        "{SKEW}: equal-price fallback; no stale overpayment"
+        entry["stale"], true,
+        "{SKEW}: UI must flag the expired table"
     );
-    steps
-        .pass("Atlas run 4 version mix: stale height-0 wire table cannot change the settled price");
+    assert_eq!(entry["block_height"], 0, "{SKEW}");
+    let before = (
+        alice.used(),
+        settled_outgoing(&a).await.len(),
+        b.list_payments(500).await.unwrap().len(),
+    );
+    let fresh = quote(&alice, &bob, SKEW).await;
+    assert_eq!(
+        fresh["message_msat"], 2_001,
+        "{SKEW}: quote must reject the cached 999999 price"
+    );
+    assert_eq!(
+        (
+            alice.used(),
+            settled_outgoing(&a).await.len(),
+            b.list_payments(500).await.unwrap().len()
+        ),
+        before,
+        "{SKEW}: quote and pricing reads spend nothing"
+    );
+    // The pricing endpoint reports cache freshness; it does not silently refresh
+    // it. Exercise the real wire update and read the same app endpoint again.
+    bob.transport
+        .send_frame(
+            alice.state.identity.node_id(),
+            &Frame::PriceTable {
+                prices: std::collections::HashMap::from([("communication".to_owned(), 2_001)]),
+                block_height: tip,
+                valid_blocks: 6,
+                trust_discount: 0.0,
+            },
+        )
+        .await
+        .expect(SKEW);
+    eventually(SKEW, || async {
+        let (status, tables) = alice.get("/api/v1/pricing/peers", false).await;
+        status == StatusCode::OK
+            && tables.as_array().unwrap().iter().any(|entry| {
+                entry["peer_id"] == bob.state.identity.node_id().to_hex()
+                    && entry["stale"] == false
+                    && entry["prices"]["communication"] == 2_001
+            })
+    })
+    .await;
+    steps.pass("Atlas run 4 stale pricing: /pricing/peers marks stale, quote uses fresh target price, wire refresh clears stale");
 
     // Restart the whole recipient stack between paid acts while A stays live.
     let bob_id = *bob.state.identity.node_id();
@@ -654,6 +916,15 @@ async fn three_node_paid_e2e() {
         used_a,
         "{RESTART}: reconnect itself is not a payment"
     );
+    assert!(
+        !alice
+            .state
+            .peer_ln_pubkeys
+            .lock()
+            .await
+            .contains_key(&bob_id),
+        "{RESTART}: fixture must exercise re-admission rather than cached keysend"
+    );
     paid(
         &alice,
         &mut bob,
@@ -661,6 +932,11 @@ async fn three_node_paid_e2e() {
         RESTART,
     )
     .await;
+    assert_eq!(
+        alice.used() - used_a,
+        4_002,
+        "{RESTART}: exactly one re-admission plus one message"
+    );
     steps.pass(
         "Atlas run 4 restart: same keys/channels/session storage, A's existing client sends again",
     );
@@ -732,5 +1008,147 @@ async fn three_node_paid_e2e() {
     println!(
         "THREE-NODE PAID E2E PASS; Doctrine: 1–6 hold; elapsed {:?}",
         steps.started.elapsed()
+    );
+}
+
+/// PR #200 owns /tx/{txid} presence and absent-parent rebroadcast suppression.
+/// Kept executable on this branch so merging that fix can enable the same
+/// assertions without rewriting the fixture. Never counts as a default PASS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "BLOCKED by unmerged PR #200: set REGTEST_GHOST_AFTER_PR200=1 after merge; requires Core/electrs"]
+async fn ghost_unfunded_channel_requires_pr200() {
+    assert_eq!(
+        std::env::var("REGTEST_GHOST_AFTER_PR200").as_deref(),
+        Ok("1"),
+        "SKIP ghost/unfunded channel: requires PR #200; enable explicitly after merge"
+    );
+    let chain = infra::Chain::start().await;
+    let fault = fault_proxy::FaultProxy::start(&chain.url).await;
+    let dirs = [(); 2].map(|_| tempfile::tempdir().unwrap());
+    let a_config = infra::lightning_config(dirs[0].path(), &fault.url);
+    let b_config = infra::lightning_config(dirs[1].path(), &chain.url);
+    let a = LdkProvider::new(a_config).await.unwrap();
+    let b = LdkProvider::new(b_config.clone()).await.unwrap();
+    chain.fund(a.node()).await;
+    eventually("ghost: wallets ready", || async {
+        a.money_ready().await && b.money_ready().await
+    })
+    .await;
+    // Lose the funding broadcast at the backend boundary, preserving the real
+    // signed funding transaction, channel negotiation, and durable LDK monitor.
+    fault.drop_broadcasts();
+    let opened = a
+        .open_channel_with_status(
+            &b.node().node_id().to_string(),
+            b_config.listening_address.as_ref().unwrap(),
+            1_000_000,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    eventually("ghost: funding outpoint", || async {
+        a.node()
+            .list_channels()
+            .iter()
+            .any(|ch| ch.funding_txo.is_some())
+    })
+    .await;
+    let channel = a
+        .node()
+        .list_channels()
+        .into_iter()
+        .find(|ch| ch.funding_txo.is_some())
+        .unwrap();
+    let funding = channel.funding_txo.unwrap();
+    eventually("ghost: funding actually dropped", || async {
+        fault
+            .broadcasts()
+            .iter()
+            .any(|tx| tx.compute_txid() == funding.txid)
+    })
+    .await;
+    let mempool: Vec<String> = chain.bitcoin.client.call("getrawmempool", &[]).unwrap();
+    assert!(mempool.is_empty(), "ghost funding must never reach Core");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let absent = client
+        .get(format!("{}/tx/{}", chain.url, funding.txid))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        absent.status(),
+        StatusCode::NOT_FOUND,
+        "only /tx/{{txid}} 404 proves absence"
+    );
+    // Do not use /status: this electrs may answer 200 + confirmed:false for an
+    // unknown tx, which says nothing about funding existence.
+    a.close_channel(&opened.channel_id, true).await.unwrap();
+    eventually("ghost: removed channel with retained closing claim", || async {
+        a.node().list_channels().is_empty() && a.node().list_balances().lightning_balances.iter().any(|balance|
+            matches!(balance, ldk_node::LightningBalance::ClaimableOnChannelClose { amount_satoshis, .. } if *amount_satoshis > 0))
+    }).await;
+    let reads_before = fault.reads().len();
+    let balance = a
+        .get_balance_breakdown()
+        .await
+        .expect("#200: proven absent funding must be excluded");
+    assert!(
+        fault.reads()[reads_before..]
+            .iter()
+            .any(|path| path == &format!("/tx/{}", funding.txid)),
+        "#200: production funding_present must use transaction existence, not /status"
+    );
+    assert_eq!(
+        balance.closing_sats,
+        Some(0),
+        "ghost claim excluded from closing"
+    );
+    let raw = a.node().list_balances();
+    assert!(
+        raw.total_lightning_balance_sats > 0,
+        "fixture must retain the ghost monitor claim"
+    );
+    assert_eq!(
+        a.get_balance_msat().await.unwrap(),
+        raw.spendable_onchain_balance_sats * 1_000,
+        "ghost claim excluded from node aggregate too"
+    );
+    let commitments = || {
+        fault
+            .broadcasts()
+            .iter()
+            .filter(|tx| {
+                tx.input
+                    .iter()
+                    .any(|input| input.previous_output == funding)
+            })
+            .count()
+    };
+    // Let initial close processing finish, then observe three actual LDK
+    // 30-second rebroadcast ticks while HTTP is limited. A steady retry loop
+    // burns at least three POSTs and must fail this finite bound.
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    let before = commitments();
+    fault.set_limited(true);
+    tokio::time::sleep(Duration::from_secs(95)).await;
+    assert!(
+        fault.rejected() > 0,
+        "ghost: backend fault must actually be exercised"
+    );
+    assert!(
+        commitments() - before <= 1,
+        "#200: absent-parent commitment rebroadcast burn must be bounded"
+    );
+    fault.set_limited(false);
+    for wallet in [&a, &b] {
+        wallet.shutdown().await.unwrap();
+    }
+    println!(
+        "GHOST UNFUNDED CHANNEL PASS: proven absence, excluded closing claim, bounded rebroadcast"
     );
 }

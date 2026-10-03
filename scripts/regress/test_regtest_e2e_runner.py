@@ -156,12 +156,67 @@ class MissingFixtures(unittest.TestCase):
                            ELECTRS_EXE=str(directory / "missing-electrs"), PROBE=str(probe))
                 result = subprocess.run(["bash", str(RUNNER.with_name("three_node_paid_e2e.sh"))],
                                         env=env, capture_output=True, text=True, timeout=15)
-                self.assertEqual(result.returncode, build_exit, result.stdout + result.stderr)
+                self.assertEqual(result.returncode, 77 if build_exit == 0 else build_exit, result.stdout + result.stderr)
                 args = probe.read_text().splitlines()
                 for required in ("--offline", "--locked", "--no-run", "regtest-e2e"):
                     self.assertIn(required, args)
                 self.assertNotIn("--ignored", args)
                 self.assertEqual("SKIP three-node paid E2E" in result.stdout, build_exit == 0)
+
+
+class GhostGate(unittest.TestCase):
+    def test_full_suite_excludes_pending_ghost_scenario(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                cargo = directory / "cargo"
+                cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PROBE\"\n")
+                cargo.chmod(0o755)
+                probe = directory / "args"
+                env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                           BITCOIND_EXE=shutil.which("true"), ELECTRS_EXE=shutil.which("true"),
+                           PROBE=str(probe), REGTEST_GHOST_AFTER_PR200="1" if enabled else "0")
+                env.pop("REGTEST_TEST", None)
+                result = subprocess.run(["bash", str(RUNNER)], env=env,
+                                        capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                args = probe.read_text().splitlines()
+                self.assertIn("regtest_e2e::", args)
+                self.assertEqual("--skip" in args, not enabled)
+                if not enabled:
+                    self.assertEqual(args[args.index("--skip") + 1],
+                                     "regtest_e2e::three_node::ghost_unfunded_channel_requires_pr200")
+                self.assertEqual("SKIP ghost/unfunded-channel" in result.stdout, not enabled)
+
+    def test_named_gate_and_failures_propagate(self):
+        for enabled, main_exit, ghost_exit in ((False, 0, 0), (True, 0, 0),
+                                              (True, 17, 0), (True, 0, 19)):
+            with self.subTest(enabled=enabled, main_exit=main_exit, ghost_exit=ghost_exit), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                cargo = directory / "cargo"
+                cargo.write_text("""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['PROBE'], 'a') as probe:
+    probe.write(json.dumps(sys.argv[1:]) + '\\n')
+main_exit = int(os.environ['MAIN_EXIT'])
+sys.exit(main_exit or (int(os.environ['GHOST_EXIT']) if '--skip' not in sys.argv else 0))
+""")
+                cargo.chmod(0o755)
+                probe = directory / "args"
+                env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                           BITCOIND_EXE=shutil.which("true"), ELECTRS_EXE=shutil.which("true"),
+                           PROBE=str(probe), REGTEST_GHOST_AFTER_PR200="1" if enabled else "0",
+                           MAIN_EXIT=str(main_exit), GHOST_EXIT=str(ghost_exit))
+                result = subprocess.run(["bash", str(RUNNER.with_name("three_node_paid_e2e.sh"))],
+                                        env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, main_exit or (ghost_exit if enabled else 0),
+                                 result.stdout + result.stderr)
+                calls = [json.loads(line) for line in probe.read_text().splitlines()]
+                self.assertIn("regtest_e2e::three_node::", calls[0])
+                self.assertEqual(len(calls), 1, "both scenarios share one supervised process group")
+                self.assertEqual("--skip" in calls[0], not enabled)
+                self.assertEqual("SKIP ghost/unfunded-channel" in result.stdout,
+                                 not enabled)
 
 
 if __name__ == "__main__":
