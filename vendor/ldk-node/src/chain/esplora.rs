@@ -75,7 +75,9 @@ impl EsploraChainSource {
 			.build()
 			.map_err(|_| BuildError::EsploraClientSetupFailed)?;
 		let rate_limit = super::rate_limit::RateLimitedTransport::shared(&server_url);
-		let esplora_client = EsploraAsyncClient::from_client(server_url, http_client).with_transport(rate_limit.clone());
+		let esplora_client = EsploraAsyncClient::from_client(server_url, http_client)
+            .with_timeout(Duration::from_secs(DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS))
+            .with_transport(rate_limit.clone());
 		let tx_sync =
 			Arc::new(EsploraSyncClient::from_client(esplora_client.clone(), Arc::clone(&logger)));
 
@@ -590,6 +592,37 @@ mod bitsov_http_rate_tests {
         source.tx_sync = Arc::new(EsploraSyncClient::from_client(source.esplora_client.clone(), node.logger.clone()));
         (dir, node, source, fixture)
     }
+    #[tokio::test]
+    async fn live_transport_keeps_wallet_fee_and_broadcast_request_budgets() {
+        #[derive(Debug)]
+        struct Budget;
+        impl HttpTransport for Budget {
+            fn execute(&self, request: reqwest::RequestBuilder) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<reqwest::Response, esplora_client::Error>> + Send + '_>> {
+                Box::pin(async move {
+                    let request = request.build().unwrap();
+                    assert_eq!(request.timeout(), Some(&Duration::from_secs(10)));
+                    let body = match request.url().path() {
+                        "/api/blocks/tip/height" => "900000",
+                        "/api/fee-estimates" => "{\"6\":2.0}",
+                        "/api/tx" => "",
+                        _ => panic!("unexpected request"),
+                    };
+                    Ok(http::Response::builder().body(body).unwrap().into())
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = crate::Builder::new();
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().to_owned());
+        builder.set_chain_source_esplora_with_transport("https://budget.invalid/api".into(), None, Arc::new(Budget));
+        let node = builder.build().unwrap();
+        let super::super::ChainSourceKind::Esplora(source) = &node.chain_source.kind else { panic!("wrong source") };
+        let client = source.esplora_client.clone();
+        assert_eq!(client.get_height().await.unwrap(), 900000);
+        client.get_fee_estimates().await.unwrap();
+        client.broadcast(&transaction(0)).await.unwrap();
+    }
+
     #[tokio::test]
     async fn live_transport_builder_reaches_fee_client_and_redacts_decode_logs() {
         #[derive(Debug)]

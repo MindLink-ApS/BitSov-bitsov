@@ -15,6 +15,12 @@ retry loop. LDK installs its shared cooldown here so it can inspect the original
 No error variants, Bitcoin parsing, blocking-client code, or endpoint semantics
 are changed.
 
+The async builder's timeout also travels on each request, including retries and
+clones, so a transport that replaces the HTTP client keeps that budget. Clients
+created with `from_client` can use `with_timeout` to supply the otherwise opaque
+client default; LDK sets its existing ten-second budget here. Token POSTs use a
+separate four-second request timeout in the chain bearer transport.
+
 Packaging follows the existing LDK vendor: production sources and licenses only.
 The upstream `lib.rs` daemon/socket test module and its unused electrsd/lazy_static
 and Tokio dev dependencies are omitted. No upstream daemon is downloaded or run.

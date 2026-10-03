@@ -54,6 +54,8 @@ pub struct AsyncClient<S = DefaultSleeper> {
     url: String,
     /// The inner [`reqwest::Client`] to make HTTP requests.
     client: Client,
+    #[cfg(not(target_arch = "wasm32"))]
+    request_timeout: Option<Duration>,
     transport: Option<std::sync::Arc<dyn HttpTransport>>,
     /// Number of times to retry a request
     max_retries: usize,
@@ -91,6 +93,8 @@ impl<S: Sleeper> AsyncClient<S> {
         Ok(AsyncClient {
             url: builder.base_url,
             client: client_builder.build()?,
+            #[cfg(not(target_arch = "wasm32"))]
+            request_timeout: builder.timeout.map(Duration::from_secs),
             max_retries: builder.max_retries,
             marker: PhantomData,
             transport: None,
@@ -102,10 +106,20 @@ impl<S: Sleeper> AsyncClient<S> {
         AsyncClient {
             url,
             client,
+            #[cfg(not(target_arch = "wasm32"))]
+            request_timeout: None,
             max_retries: crate::DEFAULT_MAX_RETRIES,
             marker: PhantomData,
             transport: None,
         }
+    }
+
+    /// Set an explicit per-request timeout, retained when a transport switches
+    /// HTTP clients. Use this with `from_client`, whose client defaults are opaque.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
     }
 
     /// Install a transport shared by this client and all subsequent clones.
@@ -121,6 +135,11 @@ impl<S: Sleeper> AsyncClient<S> {
     }
 
     async fn execute(&self, request: reqwest::RequestBuilder) -> Result<Response, Error> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let request = match self.request_timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        };
         match &self.transport {
             Some(transport) => transport.execute(request).await,
             None => Ok(request.send().await?),
