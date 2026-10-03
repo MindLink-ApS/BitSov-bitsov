@@ -274,40 +274,51 @@ Production changes:
   the on-chain wallet, Lightning sync, fees, funding/visibility verification, and
   broadcasts, including their cloned clients and internal GET retries. A 429
   establishes a cooldown of 10, 20, 40, 80, 160, then at most 300 seconds without
-  a usable Retry-After. Numeric and HTTP-date Retry-After are honored as lower
-  bounds even beyond that cap; malformed headers fall back to exponential delay.
-  Calls during cooldown return a fixed rate-limit error without HTTP. Only one
-  recovery probe is admitted. A non-429 response clears the episode; cancelled
-  or failed probes release ownership with a short cooldown. Older concurrent
+  a usable Retry-After. Numeric and HTTP-date Retry-After are clamped to 300
+  seconds; malformed headers fall back to exponential delay. GET calls during
+  cooldown return a fixed rate-limit error without HTTP, with one GET recovery
+  probe admitted. Each broadcast POST has its own bounded wait and bypasses GET
+  admission after that wait, even if another request has extended the cooldown.
+  A non-429 recovery probe clears the episode; a POST admitted during a newer
+  cooldown does not clear that newer episode. Cancelled or failed probes release
+  ownership with a short cooldown. Older concurrent
   responses cannot clear a newer 429. Huge numeric Retry-After cannot overflow
   an Instant. Journal output names only the parsed backend hostname, fixed kind,
   and numeric delay; response text, credentials, paths and query strings are
   excluded.
 - `chain/esplora.rs`: installs that transport, classifies wallet/fee failures,
-  performs funding-status queries through it, and retains a broadcast across
-  429 cooldowns. The existing request and wallet attempt deadlines remain; a
-  broadcast's cooldown wait is outside its HTTP attempt deadline. Shutdown can
-  cancel the wait. Actual HTTP response fixtures exercise fee, on-chain wallet,
-  Lightning wallet, funding, and POST paths without sockets.
+  queries funding with `get_tx_info` (`GET /tx/{txid}`), and retains a broadcast
+  across 429 cooldowns. The existing request and wallet attempt deadlines remain;
+  each POST waits at most one 300-second cooldown outside its HTTP attempt
+  deadline, then attempts the POST as its own probe. A newer cooldown cannot
+  extend that wait. Shutdown can cancel the wait. Actual HTTP response fixtures
+  exercise fee, on-chain wallet, Lightning wallet, funding, and POST paths without
+  sockets.
 - `tx_broadcaster.rs`: repeated transactions back off 30, 60, 120, 240, then at
   most 300 seconds, across all supported chain sources. New transactions are
   immediately eligible. A package with a new/due child retains its parents for
   relay. Identical pending packages are coalesced so recovery cannot flush a
   backlog of duplicates. Idle history expires after 24 hours. Queue-full refusal
-  does not advance a transaction's retry clock. An in-flight package is retained
+  does not advance a transaction's retry clock. Every in-flight package is retained
   before the first await and resumed if the same Node's worker is aborted and
-  restarted; only completed processing clears its pending ownership. This is
+  restarted; completing one package clears only its own pending ownership. This is
   process-local scheduling, not a new durable transaction store.
 - `chain/broadcast.rs`, `chain/mod.rs`, `lib.rs`: before dispatch, inspect only
   spends of monitored **closed** channels' exact funding outpoints. Explicit
-  Esplora 404 proves absence; valid status (confirmed or unconfirmed) proves
-  presence. Core/Electrum use the adapter's existing #192 indexed/synced proof
-  via a verifier callback. Missing verifier, malformed data, timeouts, 429, and
+  `GET /tx/{txid}` 404 proves absence; a valid transaction response (confirmed
+  or mempool) proves presence. `/tx/{txid}/status` is not presence evidence:
+  incident backends return 200 `{"confirmed":false}` even for unknown txids.
+  Core/Electrum use the adapter's existing #192 indexed/synced proof via a verifier
+  callback. Missing verifier, malformed data, timeouts, 429, and
   every other error remain inconclusive. Suppress the absent-funding commitment
   and its descendants, retaining ordinary/open-channel transactions and packages
   supplying their own funding parent. One ten-second verification budget preserves
   earlier definitive results when a later lookup times out. Recheck on a later
-  eligible broadcast: late funding propagation restores eligibility. No monitor,
+  eligible broadcast: late funding propagation restores eligibility. A lagging
+  Esplora index can report 404 temporarily; suppression is rechecked, never durable.
+  Packages run independently under a cancellation-owned JoinSet: a parked package
+  cannot hold later justice, HTLC-timeout/success, sweep or anchor packages behind
+  its retries. Order within each package is preserved. No monitor,
   wallet reservation, channel, or settlement record is deleted or marked settled.
 - `chain/sync_health.rs`, `error.rs`, `chain/sync_retry.rs`: retain the oldest
   outstanding failure timestamp and expose rate-limited failure kind, including

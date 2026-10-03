@@ -453,55 +453,62 @@ impl ChainSource {
 		}
 	}
 
-	pub(crate) async fn continuously_process_broadcast_queue(
-		&self, mut stop_tx_bcast_receiver: tokio::sync::watch::Receiver<()>,
+    pub(crate) async fn continuously_process_broadcast_queue(
+        self: &Arc<Self>, mut stop_tx_bcast_receiver: tokio::sync::watch::Receiver<()>,
         channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-	) {
-		let mut receiver = self.tx_broadcaster.get_broadcast_queue().await;
-		loop {
-			let tx_bcast_logger = Arc::clone(&self.logger);
-			tokio::select! {
-				_ = stop_tx_bcast_receiver.changed() => {
-					log_debug!(
-						tx_bcast_logger,
-						"Stopping broadcasting transactions.",
-					);
-					return;
-				}
-                Some(next_package) = async {
-                    if let Some(package) = self.tx_broadcaster.interrupted_broadcast() { Some(package) }
-                    else { receiver.recv().await }
-                } => {
-                    self.tx_broadcaster.begin_broadcast(&next_package);
-                    let package_txids: Vec<_> = next_package.iter().map(bitcoin::Transaction::compute_txid).collect();
-                    let open: std::collections::HashSet<_> = channel_manager.list_channels().iter().map(|ch| ch.channel_id).collect();
-                    let closed = chain_monitor.list_monitors().into_iter().filter(|id| !open.contains(id))
-                        .filter_map(|id| chain_monitor.get_monitor(id).ok().map(|monitor| monitor.get_funding_txo().into_bitcoin_outpoint()))
-                        .collect();
-                    let process = async {
-                        let next_package = broadcast::eligible_package(next_package, &closed, |id| self.funding_present(id)).await;
-                        match &self.kind {
-						ChainSourceKind::Esplora(esplora_chain_source) => {
-							esplora_chain_source.process_broadcast_package(next_package).await
-						},
-						ChainSourceKind::Electrum(electrum_chain_source) => {
-							electrum_chain_source.process_broadcast_package(next_package).await
-						},
-						ChainSourceKind::Bitcoind(bitcoind_chain_source) => {
-                            bitcoind_chain_source.process_broadcast_package(next_package).await
-                        },
-                        }
-                    };
-                    let stopping = tokio::select! {
-                        _ = stop_tx_bcast_receiver.changed() => true,
-                        _ = process => false,
-                    };
-                    if stopping { return; } // Keep the interrupted package for restart.
-                    self.tx_broadcaster.broadcast_completed(&package_txids);
+    ) {
+        let mut receiver = self.tx_broadcaster.get_broadcast_queue().await;
+        // JoinSet aborts all child futures if this worker is cancelled. Only this
+        // worker clears ownership on completion; interrupted packages survive.
+        let mut packages = tokio::task::JoinSet::new();
+        let start_package = |package: Vec<bitcoin::Transaction>, packages: &mut tokio::task::JoinSet<Vec<Txid>>| {
+            self.tx_broadcaster.begin_broadcast(&package);
+            let source = Arc::clone(self);
+            let manager = Arc::clone(&channel_manager);
+            let monitor = Arc::clone(&chain_monitor);
+            packages.spawn(async move { source.process_broadcast_package(package, manager, monitor).await });
+        };
+        for package in self.tx_broadcaster.interrupted_broadcasts() {
+            start_package(package, &mut packages);
+        }
+        loop {
+            tokio::select! {
+                _ = stop_tx_bcast_receiver.changed() => {
+                    log_debug!(self.logger, "Stopping broadcasting transactions.");
+                    return;
                 }
-			}
-		}
-	}
+                Some(next_package) = receiver.recv() => {
+                    start_package(next_package, &mut packages);
+                }
+                Some(result) = packages.join_next(), if !packages.is_empty() => {
+                    match result {
+                        Ok(txids) => self.tx_broadcaster.broadcast_completed(&txids),
+                        // Preserve all outstanding packages for the next worker.
+                        Err(error) => std::panic::resume_unwind(error.into_panic()),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn process_broadcast_package(
+        &self, package: Vec<bitcoin::Transaction>,
+        channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
+    ) -> Vec<Txid> {
+        let txids = package.iter().map(bitcoin::Transaction::compute_txid).collect();
+        let open: std::collections::HashSet<_> = channel_manager.list_channels().iter().map(|ch| ch.channel_id).collect();
+        let closed = chain_monitor.list_monitors().into_iter().filter(|id| !open.contains(id))
+            .filter_map(|id| chain_monitor.get_monitor(id).ok().map(|monitor| monitor.get_funding_txo().into_bitcoin_outpoint()))
+            .collect();
+        let package = broadcast::eligible_package(package, &closed, |id| self.funding_present(id)).await;
+        match &self.kind {
+            ChainSourceKind::Esplora(source) => source.process_broadcast_package(package).await,
+            ChainSourceKind::Electrum(source) => source.process_broadcast_package(package).await,
+            ChainSourceKind::Bitcoind(source) => source.process_broadcast_package(package).await,
+        }
+        txids
+    }
+
 }
 
 impl Filter for ChainSource {

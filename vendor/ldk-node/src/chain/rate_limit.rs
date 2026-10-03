@@ -44,6 +44,7 @@ impl RateLimitedTransport {
     }
     pub(super) async fn run<F, Fut>(
         &self,
+        broadcast: bool,
         send: F,
     ) -> Result<reqwest::Response, esplora_client::Error>
     where
@@ -52,15 +53,15 @@ impl RateLimitedTransport {
     {
         let probe = {
             let mut state = self.state.lock().unwrap();
-            if state.probing
-                || state
-                    .until
-                    .is_some_and(|(start, delay)| start.elapsed() < delay)
-            {
+            let cooling_down = state.until.is_some_and(|(start, delay)| start.elapsed() < delay);
+            // Each broadcast waits one bounded cooldown in its own package task.
+            // Its POST must reach the backend even if another request extends the
+            // cooldown or owns the GET recovery probe in the meantime.
+            if !broadcast && (state.probing || cooling_down) {
                 return Err(rate_limited());
             }
-            let probe = state.until.is_some();
-            state.probing = probe;
+            let probe = state.until.is_some() && !state.probing && !cooling_down;
+            if probe { state.probing = true; }
             probe
         };
         let mut guard = ProbeGuard {
@@ -90,7 +91,8 @@ impl RateLimitedTransport {
                 .and_then(|h| h.to_str().ok())
                 .and_then(|h| retry_after(h, now))
                 .unwrap_or(fallback)
-                .max(fallback);
+                .max(fallback)
+                .min(Duration::from_secs(300));
             let remaining = state.until.map_or(Duration::ZERO, |(start, duration)| {
                 duration.saturating_sub(start.elapsed())
             });
@@ -163,7 +165,12 @@ impl HttpTransport for RateLimitedTransport {
                 + '_,
         >,
     > {
-        Box::pin(self.run(|| async { Ok(request.send().await?) }))
+        Box::pin(async move {
+            let (client, request) = request.build_split();
+            let request = request?;
+            let broadcast = request.method() == reqwest::Method::POST;
+            self.run(broadcast, || async { Ok(client.execute(request).await?) }).await
+        })
     }
 }
 
@@ -181,26 +188,36 @@ mod bitsov_rate_limit_tests {
         Ok(builder.body(String::new()).unwrap().into())
     }
     #[tokio::test(start_paused = true)]
+    async fn remote_retry_after_cannot_defer_admission_beyond_300_seconds() {
+        for retry in ["86400".to_owned(), u64::MAX.to_string(), httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(86400))] {
+            let transport = RateLimitedTransport::new("https://chain.invalid");
+            assert!(transport.run(false, || async { response(429, Some(&retry)) }).await.is_err());
+            assert!(transport.retry_delay() <= Duration::from_secs(300));
+            tokio::time::advance(Duration::from_secs(300)).await;
+            assert!(transport.run(false, || async { response(200, None) }).await.is_ok());
+        }
+    }
+    #[tokio::test(start_paused = true)]
     async fn retry_after_blocks_other_operations_and_recovers() {
         super::super::sync_retry::bitsov_retry_tests::capture_logs();
         let transport =
             RateLimitedTransport::new("https://user:secret@chain.invalid/private?token=secret");
         assert!(transport
-            .run(|| async { response(429, Some("120")) })
+            .run(false, || async { response(429, Some("120")) })
             .await
             .is_err());
         assert!(transport
-            .run(|| async { panic!("sync/fee/broadcast must share cooldown") })
+            .run(false, || async { panic!("sync/fee/broadcast must share cooldown") })
             .await
             .is_err());
         tokio::time::advance(Duration::from_secs(119)).await;
         assert!(transport
-            .run(|| async { panic!("Retry-After must be respected") })
+            .run(false, || async { panic!("Retry-After must be respected") })
             .await
             .is_err());
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(transport
-            .run(|| async { response(200, None) })
+            .run(false, || async { response(200, None) })
             .await
             .is_ok());
         assert_eq!(transport.host, "chain.invalid");
@@ -217,27 +234,27 @@ mod bitsov_rate_limit_tests {
         let transport = RateLimitedTransport::new("https://chain.invalid");
         for delay in [10, 20, 40, 80, 160, 300, 300] {
             assert!(transport
-                .run(|| async { response(429, None) })
+                .run(false, || async { response(429, None) })
                 .await
                 .is_err());
             tokio::time::advance(Duration::from_secs(delay - 1)).await;
             assert!(transport
-                .run(|| async { panic!("retry early") })
+                .run(false, || async { panic!("retry early") })
                 .await
                 .is_err());
             tokio::time::advance(Duration::from_secs(1)).await;
         }
         assert!(transport
-            .run(|| async { response(200, None) })
+            .run(false, || async { response(200, None) })
             .await
             .is_ok());
         assert!(transport
-            .run(|| async { response(429, Some("garbage")) })
+            .run(false, || async { response(429, Some("garbage")) })
             .await
             .is_err());
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(transport
-            .run(|| async { response(200, None) })
+            .run(false, || async { response(200, None) })
             .await
             .is_ok());
     }
@@ -271,20 +288,20 @@ mod bitsov_recovery_tests {
             .body("")
             .unwrap()
             .into();
-        assert!(transport.run(|| async { Ok(response) }).await.is_err());
+        assert!(transport.run(false, || async { Ok(response) }).await.is_err());
         tokio::time::advance(Duration::from_secs(10)).await;
         let probe_transport = transport.clone();
-        let probe = tokio::spawn(async move { probe_transport.run(std::future::pending).await });
+        let probe = tokio::spawn(async move { probe_transport.run(false, std::future::pending).await });
         tokio::task::yield_now().await;
         assert!(transport
-            .run(|| async { panic!("only one recovery probe") })
+            .run(false, || async { panic!("only one recovery probe") })
             .await
             .is_err());
         probe.abort();
         let _ = probe.await;
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(transport
-            .run(|| async { Ok(http::Response::new("").into()) })
+            .run(false, || async { Ok(http::Response::new("").into()) })
             .await
             .is_ok());
         assert!(transport.failure().is_none());

@@ -27,7 +27,7 @@ where
     logger: L,
     attempts: std::sync::Mutex<HashMap<Txid, (Instant, u64)>>,
     pending: std::sync::Mutex<HashMap<Txid, usize>>,
-    in_flight: std::sync::Mutex<Option<Vec<Transaction>>>,
+    in_flight: std::sync::Mutex<HashMap<Vec<Txid>, Vec<Transaction>>>,
 }
 
 impl<L: Deref> TransactionBroadcaster<L>
@@ -42,21 +42,22 @@ where
             logger,
             attempts: std::sync::Mutex::new(HashMap::new()),
             pending: std::sync::Mutex::new(HashMap::new()),
-            in_flight: std::sync::Mutex::new(None),
+            in_flight: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     // Save before the first await. A dropped/aborted worker leaves this package
     // available for the next worker on the same Node, even if the queue is full.
     pub(crate) fn begin_broadcast(&self, package: &[Transaction]) {
-        *self.in_flight.lock().unwrap() = Some(package.to_vec());
+        let txids = package.iter().map(Transaction::compute_txid).collect();
+        self.in_flight.lock().unwrap().insert(txids, package.to_vec());
     }
-    pub(crate) fn interrupted_broadcast(&self) -> Option<Vec<Transaction>> {
-        self.in_flight.lock().unwrap().clone()
+    pub(crate) fn interrupted_broadcasts(&self) -> Vec<Vec<Transaction>> {
+        self.in_flight.lock().unwrap().values().cloned().collect()
     }
 
     pub(crate) fn broadcast_completed(&self, txids: &[Txid]) {
-        self.in_flight.lock().unwrap().take();
+        self.in_flight.lock().unwrap().remove(txids);
         let mut pending = self.pending.lock().unwrap();
         for txid in txids {
             if let Some(count) = pending.get_mut(txid) {
@@ -210,7 +211,7 @@ mod bitsov_rebroadcast_tests {
         worker.abort();
         let _ = worker.await;
         let interrupted = broadcaster
-            .interrupted_broadcast()
+            .interrupted_broadcasts().pop()
             .expect("aborted package must survive for restart");
         assert_eq!(interrupted, vec![tx.clone()]);
         let mut queue = broadcaster.get_broadcast_queue().await;
@@ -221,8 +222,31 @@ mod bitsov_rebroadcast_tests {
             "restarted worker owns interrupted package"
         );
         broadcaster.broadcast_completed(&[tx.compute_txid()]);
-        assert!(broadcaster.interrupted_broadcast().is_none());
+        assert!(broadcaster.interrupted_broadcasts().is_empty());
         broadcaster.broadcast_transactions(&[&tx]);
         assert!(queue.try_recv().is_ok());
     }
+    #[tokio::test]
+    async fn completing_one_package_retains_other_interrupted_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = crate::Builder::new();
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().to_owned());
+        let node = builder.build().unwrap();
+        let broadcaster = &node.tx_broadcaster;
+        let first = Transaction { version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO, input: vec![], output: vec![] };
+        let mut second = first.clone();
+        second.lock_time = bitcoin::absolute::LockTime::from_consensus(1);
+        let mut queue = broadcaster.get_broadcast_queue().await;
+        broadcaster.broadcast_transactions(&[&first]);
+        broadcaster.broadcast_transactions(&[&second]);
+        broadcaster.begin_broadcast(&queue.recv().await.unwrap());
+        broadcaster.begin_broadcast(&queue.recv().await.unwrap());
+        assert_eq!(broadcaster.interrupted_broadcasts().len(), 2);
+        broadcaster.broadcast_completed(&[second.compute_txid()]);
+        assert_eq!(broadcaster.interrupted_broadcasts(), vec![vec![first.clone()]]);
+        broadcaster.broadcast_transactions(&[&first]);
+        assert!(queue.try_recv().is_err(), "incomplete package must remain coalesced");
+    }
+
 }

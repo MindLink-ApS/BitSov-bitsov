@@ -1,6 +1,6 @@
 # Rate-limit/rebroadcast offline verification
 
-All Cargo invocations used `--offline` under macOS
+The initial implementation verification used `--offline` under macOS
 `sandbox-exec -p '(version 1)(allow default)(deny network*)'`. This denies all
 networking, including loopback and 127.0.0.1:3141. No live chain/relay, real funds,
 or daemon fixtures were used. No dependencies were downloaded.
@@ -113,7 +113,7 @@ lnd::tests::probe_not_synced_marks_incapable
 lnd::tests::verify_payment_settled_returns_ok
 ```
 
-## Final results
+## Initial implementation results (1a6521b)
 
 - Vendored LDK library: **81 passed**, zero failed or excluded.
 - Core library: **354 passed**, zero failed or excluded.
@@ -128,7 +128,90 @@ lnd::tests::verify_payment_settled_returns_ok
 
 An independent read-only review found and prompted fixes for startup 429 retry
 classification, reservation-lookup cooldown sharing, and aborted broadcast worker
-retention. The final review found no remaining actionable blockers.
+retention. Subsequent Grok and Fable verdicts rejected the unbounded shared
+cooldown; Grok also identified the incorrect funding-status endpoint. The fix
+round below supersedes the initial review outcome.
 
 Doctrine: 1, 2, 5 and 6 hold; 3 and 4 unchanged. No readiness or settlement rule
 was relaxed, and no live incident resolution is asserted.
+
+
+## Review fix round (3 October 2026)
+
+The two supplied verdicts and the existing d9ef270 sanity-log item 22 were read
+locally. No live backend checks were performed. The corrected fixtures first
+failed on the old endpoint, unbounded header, and sequential broadcast worker.
+
+Changes verified:
+
+- Funding presence uses `get_tx_info`, where `/tx/{txid}` 404 is absent and a
+  valid 200 transaction is present, including mempool transactions. The fixture
+  reproduces `/status` 200 `{"confirmed":false}` alongside `/tx` 404 through
+  `Node::funding_present`. #192 closed balances (`ldk.rs::funded_balances`) and
+  reservation reconciliation/send verification (`onchain.rs::ChainVisibility`)
+  both call that API; ghost eligibility uses the same chain-source method.
+- Numeric 86400, maximum-u64 and future HTTP-date headers are capped at 300s.
+  A POST is attempted by 300s even when another request refreshes the cooldown
+  at second 299; that POST does not clear the newer GET cooldown.
+- The real queue worker broadcasts a newly queued sweep while another package
+  keeps returning 429. Shutdown/restart retains the parked package, and completing
+  one concurrent package leaves the others' ownership and coalescing intact.
+
+Final verification used `--offline --locked` under explicit macOS
+`sandbox-exec -p '(version 1)(allow default)(deny network*)'`. Initial targeted
+runs also used the environment's existing network-restricted sandbox. No network
+connection was made, no dependency downloaded, and no daemon or live funds used.
+
+```sh
+cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib
+cargo test --offline --locked -p konsensus-lightning -p konsensus-chain -p konsensus-api --lib --no-fail-fast
+cargo clippy --offline --locked -p konsensus-lightning -p konsensus-chain -p konsensus-api --all-targets -- -D warnings
+cargo clippy --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib --tests
+```
+
+The full crate run had **94 socket-fixture failures**, each containing
+`PermissionDenied` / `Operation not permitted`: the 77 LNbits/LND names above
+plus the 17 chain names below. The second crate run appended `-- --skip NAME`
+for each of exactly those 94 names. These excluded tests are not claimed as
+passes; no test was ignored or weakened in source.
+
+| Target | Final result |
+| --- | --- |
+| Vendored LDK library | 87 passed, zero failed/excluded |
+| konsensus-lightning library | 158 passed, 77 socket fixtures excluded |
+| konsensus-chain library | 24 passed, 17 socket fixtures excluded |
+| konsensus-api library | 216 passed, zero failed/excluded |
+| Three workspace crates, Clippy, all targets, `-D warnings` | Passed |
+| Vendored LDK Clippy, lib/tests | Passed with the existing 281-warning baseline |
+
+The existing sqlx-postgres 0.8.0 future-incompatibility notice remains. Independent
+read-only review of this fix found no blocker. No live incident resolution is
+claimed. `git diff --check` passed.
+
+Additional chain socket exclusions:
+
+```text
+esplora::tests::api_url_strips_trailing_api_suffix
+esplora::tests::api_url_with_trailing_slash
+esplora::tests::block_header_not_found_returns_error
+esplora::tests::block_height_server_error_returns_backend_error
+esplora::tests::confirmation_count_boundary
+esplora::tests::empty_fee_estimates_returns_error
+esplora::tests::estimate_fee_closest_target
+esplora::tests::estimate_fee_exact_target
+esplora::tests::fee_estimate_all_targets
+esplora::tests::get_best_block_header
+esplora::tests::get_block_header_existing
+esplora::tests::get_block_height
+esplora::tests::is_synced_returns_true
+esplora::tests::tx_confirmed
+esplora::tests::tx_insufficient_confirmations
+esplora::tests::tx_lookup_not_found_returns_error
+esplora::tests::tx_unconfirmed
+```
+
+Doctrine: 1 and 5 preserve settlement and self-custody with bounded independent
+broadcast progress; 2 keeps chain evidence as chain evidence; 3 and 4 unchanged;
+6 / P8 distinguishes offline evidence from live recovery. P7's liveness constraint
+is enforced in code: once a transaction enters its broadcast wait, remote headers cannot extend it
+beyond one capped cooldown; the existing HTTP-attempt deadline remains.
