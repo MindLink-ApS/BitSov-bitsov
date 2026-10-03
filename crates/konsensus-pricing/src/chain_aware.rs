@@ -379,9 +379,13 @@ impl ChainAwarePricingEngine {
     ///
     /// Returns the block height if successful, or None if chain is unavailable.
     /// After this call, per-target fee rates are cached with EMA smoothing.
-    async fn refresh_chain_state(&self) -> Option<u64> {
+    async fn refresh_chain_state(&self, observed_height: Option<(u64, Instant)>) -> Option<u64> {
         // Verify chain provider is synced before trusting its data.
-        if !self.chain.is_synced().await {
+        let synced = match observed_height {
+            Some((height, _)) => self.chain.is_synced_with_height(height).await,
+            None => self.chain.is_synced().await,
+        };
+        if !synced {
             warn!("chain-aware pricing: provider not synced, falling back to static prices");
             return None;
         }
@@ -393,8 +397,13 @@ impl ChainAwarePricingEngine {
         // Fee targets are fetched sequentially (typically 1-3 targets, each
         // is a single HTTP call with sub-second latency). The cache TTL (60s)
         // ensures this runs at most once per minute, not per message.
-        let height_read_at = Instant::now();
-        let height_result = self.chain.get_block_height().await;
+        let (height_result, height_read_at) = match observed_height {
+            Some((height, observed_at)) => (Ok(height), observed_at),
+            None => {
+                let read_at = Instant::now();
+                (self.chain.get_block_height().await, read_at)
+            }
+        };
         let mut fee_results = Vec::with_capacity(unique_targets.len());
         for &target in &unique_targets {
             // Capture before this read, not after later reads have completed.
@@ -511,7 +520,11 @@ impl ChainAwarePricingEngine {
     ///
     /// Returns `(ema_fee_rate, block_height)` for the category's configured
     /// confirmation target. Refreshes the cache if expired.
-    async fn get_chain_state_for_category(&self, category: KindCategory) -> Option<(f64, u64)> {
+    async fn get_chain_state_for_category(
+        &self,
+        category: KindCategory,
+        observed_height: Option<(u64, Instant)>,
+    ) -> Option<(f64, u64)> {
         let target = self.config.target_for_category(category);
 
         // Check cache freshness (read lock — cheap).
@@ -530,7 +543,7 @@ impl ChainAwarePricingEngine {
         }
 
         // Cache expired or target missing — refresh all targets.
-        let height = self.refresh_chain_state().await?;
+        let height = self.refresh_chain_state(observed_height).await?;
 
         // Read the freshly populated cache.
         let cache = self.cached_state.read().await;
@@ -714,6 +727,33 @@ impl ChainAwarePricingEngine {
         }
     }
 
+    async fn price_for_kind(
+        &self,
+        kind: u16,
+        observed_height: Option<(u64, Instant)>,
+    ) -> Result<u64, PricingError> {
+        // Get base price first — propagates NotPriceable for deferred kinds.
+        let base_price = self.base_engine.get_price_msat(kind).await?;
+
+        // Use the category-specific fee target for this kind.
+        let category = KindCategory::from_kind(kind);
+        match self
+            .get_chain_state_for_category(category, observed_height)
+            .await
+        {
+            Some((fee_rate, height)) => {
+                let sensitivity = Self::halving_sensitivity(height);
+                Ok(Self::apply_multiplier(
+                    base_price,
+                    fee_rate,
+                    sensitivity,
+                    self.config.max_price_multiplier,
+                ))
+            }
+            None => Ok(base_price), // Fallback: static price.
+        }
+    }
+
     /// Get the configured category fee targets (for API/observability).
     pub fn category_fee_targets(&self) -> &HashMap<String, u32> {
         &self.config.category_fee_targets
@@ -737,29 +777,22 @@ impl PricingEngine for ChainAwarePricingEngine {
     }
 
     async fn get_price_msat(&self, kind: u16) -> Result<u64, PricingError> {
-        // Get base price first — propagates NotPriceable for deferred kinds.
-        let base_price = self.base_engine.get_price_msat(kind).await?;
+        self.price_for_kind(kind, None).await
+    }
 
-        // Use the category-specific fee target for this kind.
-        let category = KindCategory::from_kind(kind);
-        match self.get_chain_state_for_category(category).await {
-            Some((fee_rate, height)) => {
-                let sensitivity = Self::halving_sensitivity(height);
-                Ok(Self::apply_multiplier(
-                    base_price,
-                    fee_rate,
-                    sensitivity,
-                    self.config.max_price_multiplier,
-                ))
-            }
-            None => Ok(base_price), // Fallback: static price.
-        }
+    async fn get_price_msat_with_chain_height(
+        &self,
+        kind: u16,
+        height: u64,
+        observed_at: Instant,
+    ) -> Result<u64, PricingError> {
+        self.price_for_kind(kind, Some((height, observed_at))).await
     }
 
     async fn get_category_price_msat(&self, category: KindCategory) -> Result<u64, PricingError> {
         let base_price = self.base_engine.get_category_price_msat(category).await?;
 
-        match self.get_chain_state_for_category(category).await {
+        match self.get_chain_state_for_category(category, None).await {
             Some((fee_rate, height)) => {
                 let sensitivity = Self::halving_sensitivity(height);
                 Ok(Self::apply_multiplier(

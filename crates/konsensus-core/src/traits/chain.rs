@@ -120,6 +120,13 @@ pub trait ChainProvider: Send + Sync {
 
     /// Check whether the chain backend is connected and synced.
     async fn is_synced(&self) -> bool;
+
+    /// Check sync after a successful, bounded-age height read from this provider.
+    /// Height-only backends can reuse that observation instead of fetching the
+    /// tip twice. Backends with independent sync state must still check it.
+    async fn is_synced_with_height(&self, _height: u64) -> bool {
+        self.is_synced().await
+    }
 }
 
 #[cfg(test)]

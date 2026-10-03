@@ -1216,7 +1216,7 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
 
     handle_invoice_requested_gated(
         &peer_id, "req-priv", 25_000, "konsensus message", true,
-        &pricing, &konsensus_chain::MockChainProvider::new(), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &pricing, &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
         &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default(),
     ).await;
 
@@ -1239,7 +1239,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
 
     handle_invoice_requested_gated(
         &peer_id, "req-strange", 1_000_000, "konsensus message", false,
-        &pricing, &konsensus_chain::MockChainProvider::new(), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &pricing, &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
         &membrane, &mut last_refusal,
     ).await;
 
@@ -1252,7 +1252,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
     for _ in 0..100 {
         handle_invoice_requested_gated(
             &peer_id, "req-strange", 1_000_000, "konsensus message", false,
-            &pricing, &konsensus_chain::MockChainProvider::new(), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &pricing, &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
             &membrane, &mut last_refusal,
         ).await;
     }
@@ -1409,7 +1409,7 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
     for purpose in ["konsensus:admission:200", "konsensus:admission:100", "konsensus:admission", "arbitrary invoice"] {
         handle_invoice_requested_gated(
             &peer_id, &id, 1, purpose, false,
-            &pricing, &konsensus_chain::MockChainProvider::new(), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut quotes,
+            &pricing, &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut quotes,
             &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default(),
         ).await;
     }
@@ -1619,7 +1619,7 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
     let request_id = konsensus_core::admission_quote::request_id(&recipient, &peer,
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
     handle_invoice_requested_gated(&peer, &request_id, 1,
-        konsensus_core::admission_quote::PURPOSE, false, &admission_pricing(), &konsensus_chain::MockChainProvider::new(), &provider,
+        konsensus_core::admission_quote::PURPOSE, false, &admission_pricing(), &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &provider,
         &target, &recipient, "127.0.0.1".parse().unwrap(), &mut quotes, &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default()).await;
     let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await.unwrap().unwrap();
     assert!(matches!(event, ControlEvent::InvoiceErrorReceived { peer_id, request_id: id, reason, .. }
@@ -1661,7 +1661,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
             while let Some(event) = target.recv_control().await {
                 if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged, source_ip } = event {
                     handle_invoice_requested_gated(&peer_id, &request_id, amount_msat, &purpose, privileged,
-                        &admission_pricing(), &konsensus_chain::MockChainProvider::new(), &lightning, &target, &recipient, source_ip, &mut quotes, &membrane, &mut limits).await;
+                        &admission_pricing(), &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &target, &recipient, source_ip, &mut quotes, &membrane, &mut limits).await;
                     handled.fetch_add(1, Ordering::Release);
                 }
             }
@@ -2243,7 +2243,7 @@ async fn unavailable_admission_quote_is_prompt_and_creates_no_payment() {
         let start = tokio::time::Instant::now();
         let result = prepare_admission_invoice(
             admission_pricing().as_ref(),
-            &Chain { mode },
+            &ReadinessHeightCache::new(Arc::new(Chain { mode })),
             &lightning,
             "test-request",
             u64::MAX,
@@ -2325,7 +2325,7 @@ async fn admission_backend_readiness_race_and_timeout_return_fixed_refusals() {
         let start = tokio::time::Instant::now();
         let result = prepare_admission_invoice(
             admission_pricing().as_ref(),
-            &konsensus_chain::MockChainProvider::new(),
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
             &Wallet(hang),
             "test-request",
             u64::MAX,
@@ -2343,7 +2343,7 @@ async fn ready_admission_preparation_preserves_signed_stateless_quote() {
         &dir.path().join("wallet.sqlite"), "recipient", 0).unwrap();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let (invoice, amount, description) = prepare_admission_invoice(
-        admission_pricing().as_ref(), &konsensus_chain::MockChainProvider::new(),
+        admission_pricing().as_ref(), &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
         &wallet, "test-request", now + 60).await.unwrap();
     let signed = invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
     assert_eq!(signed.amount_milli_satoshis(), Some(amount));
@@ -2353,4 +2353,337 @@ async fn ready_admission_preparation_preserves_signed_stateless_quote() {
     assert_eq!(signed.recover_payee_pub_key().to_string(), wallet.get_node_pubkey().await.unwrap());
     assert!(wallet.list_payments(10).await.unwrap().is_empty());
     assert_eq!(wallet.get_balance_msat().await.unwrap(), 0);
+}
+
+#[test]
+fn privileged_invoice_error_frames_never_contain_backend_details() {
+    use konsensus_core::traits::lightning::LightningError;
+    const PRIVATE: &str = "https://user:secret@private-backend.invalid/private-wallet";
+    let cases = [
+        (LightningError::Backend(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::InvoiceCreation(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::Connection(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::Auth(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::InvalidStartupConfig(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::PaymentNotDispatched(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (LightningError::NotReady, "konsensus:not_ready:not_synced"),
+        (LightningError::StatelessQuoteUnsupported, "stateless_quote_unsupported"),
+        (LightningError::PaymentNotDispatched("disk_low".into()), "disk_low"),
+        (LightningError::ChainSourceUnavailable {
+            network: PRIVATE.into(), service: PRIVATE.into(), attempts: 1,
+            elapsed_ms: 1, cause: PRIVATE.into(),
+        }, "konsensus:not_ready:chain_unavailable"),
+    ];
+    for (error, expected) in cases {
+        let frame = invoice_error_frame("request-199", error);
+        let bytes = frame.to_bytes().unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(PRIVATE));
+        match Frame::from_bytes(&bytes).unwrap() {
+            Frame::InvoiceError { request_id, reason } => {
+                assert_eq!(request_id, "request-199");
+                assert_eq!(reason, expected);
+            }
+            frame => panic!("unexpected frame: {frame:?}"),
+        }
+    }
+}
+
+// Count the external height reads made by real admission preparation, without sockets.
+#[derive(Default)]
+struct AdmissionHeightChain {
+    calls: std::sync::atomic::AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+    unsynced: std::sync::atomic::AtomicBool,
+    hang: std::sync::atomic::AtomicBool,
+    height_only_sync: Option<konsensus_chain::EsploraProvider>,
+}
+#[async_trait::async_trait]
+impl ChainProvider for AdmissionHeightChain {
+    fn trust_level(&self) -> konsensus_core::traits::chain::TrustLevel {
+        konsensus_core::traits::chain::TrustLevel::ServerTrust
+    }
+    async fn get_block_height(&self) -> Result<u64, konsensus_core::traits::chain::ChainError> {
+        use std::sync::atomic::Ordering;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        if self.fail.load(Ordering::SeqCst) {
+            Err(konsensus_core::traits::chain::ChainError::Backend(
+                "private detail".into(),
+            ))
+        } else {
+            Ok(900_000)
+        }
+    }
+    async fn is_synced(&self) -> bool {
+        if self.height_only_sync.is_some() {
+            self.get_block_height().await.is_ok()
+        } else {
+            !self.unsynced.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    async fn is_synced_with_height(&self, height: u64) -> bool {
+        match &self.height_only_sync {
+            Some(provider) => provider.is_synced_with_height(height).await,
+            None => self.is_synced().await,
+        }
+    }
+    async fn get_block_header(
+        &self,
+        _: u64,
+    ) -> Result<konsensus_core::traits::chain::BlockHeader, konsensus_core::traits::chain::ChainError>
+    {
+        unreachable!()
+    }
+    async fn estimate_fee(
+        &self,
+        target_blocks: u32,
+    ) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError>
+    {
+        Ok(konsensus_core::traits::chain::FeeEstimate {
+            target_blocks,
+            sat_per_vbyte: 1.0,
+        })
+    }
+    async fn is_tx_confirmed(
+        &self,
+        _: &str,
+        _: u32,
+    ) -> Result<bool, konsensus_core::traits::chain::ChainError> {
+        unreachable!()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_height_cache_coalesces_and_expires_in_static_mode() {
+    assert_admission_height_cache(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_height_cache_coalesces_and_expires_in_chain_aware_mode() {
+    assert_admission_height_cache(true).await;
+}
+
+async fn assert_admission_height_cache(dynamic: bool) {
+    use std::sync::atomic::Ordering;
+    let chain = Arc::new(AdmissionHeightChain {
+        height_only_sync: Some(
+            konsensus_chain::EsploraProvider::new(konsensus_chain::EsploraConfig::custom(
+                "unsupported://no-network".into(),
+                konsensus_core::traits::chain::TrustLevel::ServerTrust,
+            ))
+            .unwrap(),
+        ),
+        ..Default::default()
+    });
+    let cache = ReadinessHeightCache::new(chain.clone());
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = if dynamic {
+        Arc::new(konsensus_pricing::ChainAwarePricingEngine::new(
+            Default::default(),
+            chain.clone(),
+        ))
+    } else {
+        admission_pricing()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(
+        &dir.path().join("wallet.sqlite"),
+        "recipient",
+        0,
+    )
+    .unwrap();
+    let results = futures::future::join_all((0..16).map(|_| {
+        prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+    }))
+    .await;
+    assert!(
+        results.iter().all(Result::is_ok),
+        "admission remains available in both pricing modes"
+    );
+    for _ in 0..16 {
+        prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+            .await
+            .unwrap();
+    }
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
+    tokio::time::advance(std::time::Duration::from_secs(59)).await;
+    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_height_cache_failure_is_shared_and_later_success_recovers() {
+    use std::sync::atomic::Ordering;
+    let chain = Arc::new(AdmissionHeightChain::default());
+    let cache = ReadinessHeightCache::new(chain.clone());
+    let pricing = admission_pricing();
+    chain.fail.store(true, Ordering::SeqCst);
+    let results = futures::future::join_all((0..16).map(|_| {
+        prepare_admission_invoice(
+            pricing.as_ref(),
+            &cache,
+            &NoInvoiceWallet,
+            "request",
+            u64::MAX,
+        )
+    }))
+    .await;
+    for result in results {
+        assert_eq!(result.unwrap_err(), "konsensus:not_ready:chain_unavailable");
+    }
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
+
+    chain.fail.store(false, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(
+        &dir.path().join("wallet.sqlite"),
+        "recipient",
+        0,
+    )
+    .unwrap();
+    for _ in 0..16 {
+        prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+            .await
+            .unwrap();
+    }
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+
+    // An expired success cannot mask a new failure, and failure does not renew it.
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    chain.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        prepare_admission_invoice(
+            pricing.as_ref(),
+            &cache,
+            &NoInvoiceWallet,
+            "request",
+            u64::MAX
+        )
+        .await
+        .unwrap_err(),
+        "konsensus:not_ready:chain_unavailable"
+    );
+    chain.fail.store(false, Ordering::SeqCst);
+    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_height_cache_timeout_recovers_and_does_not_cache_sync_state() {
+    use std::sync::atomic::Ordering;
+    let chain = Arc::new(AdmissionHeightChain::default());
+    let cache = ReadinessHeightCache::new(chain.clone());
+    let pricing = admission_pricing();
+    chain.hang.store(true, Ordering::SeqCst);
+    let start = tokio::time::Instant::now();
+    assert_eq!(
+        prepare_admission_invoice(
+            pricing.as_ref(),
+            &cache,
+            &NoInvoiceWallet,
+            "request",
+            u64::MAX
+        )
+        .await
+        .unwrap_err(),
+        "konsensus:not_ready:chain_unavailable"
+    );
+    assert!(start.elapsed() <= std::time::Duration::from_secs(5));
+    chain.hang.store(false, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(
+        &dir.path().join("wallet.sqlite"),
+        "recipient",
+        0,
+    )
+    .unwrap();
+    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+        .await
+        .unwrap();
+    chain.unsynced.store(true, Ordering::SeqCst);
+    assert_eq!(
+        prepare_admission_invoice(
+            pricing.as_ref(),
+            &cache,
+            &NoInvoiceWallet,
+            "request",
+            u64::MAX
+        )
+        .await
+        .unwrap_err(),
+        "konsensus:not_ready:not_synced"
+    );
+    chain.unsynced.store(false, Ordering::SeqCst);
+    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_height_cache_discards_overdue_cancelled_lookups() {
+    use std::sync::atomic::Ordering;
+    let chain = Arc::new(AdmissionHeightChain::default());
+    let cache = ReadinessHeightCache::new(chain.clone());
+    // Leave a read pending with no waiter. Its delayed response must not become
+    // a new observation when the next admission arrives much later.
+    assert!(tokio::time::timeout(std::time::Duration::ZERO, cache.get()).await.is_err());
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+    cache.get().await.unwrap();
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_height_cache_discards_cancelled_lookups_before_deadline() {
+    use std::sync::atomic::Ordering;
+    let chain = Arc::new(AdmissionHeightChain::default());
+    let cache = ReadinessHeightCache::new(chain.clone());
+    let mut lookup = Box::pin(cache.get());
+    assert!(futures::poll!(&mut lookup).is_pending());
+    drop(lookup);
+    cache.get().await.unwrap();
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+    cache.get().await.unwrap();
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_height_cache_cancelling_one_waiter_preserves_shared_lookup() {
+    use std::sync::atomic::Ordering;
+    let chain = Arc::new(AdmissionHeightChain::default());
+    let cache = ReadinessHeightCache::new(chain.clone());
+    let mut first = Box::pin(cache.get());
+    let mut second = Box::pin(cache.get());
+    assert!(futures::poll!(&mut first).is_pending());
+    assert!(futures::poll!(&mut second).is_pending());
+    drop(first);
+    cache.get().await.unwrap();
+    second.await.unwrap();
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_height_cache_rejects_overdue_ready_response() {
+    use std::sync::atomic::Ordering;
+    let chain = Arc::new(AdmissionHeightChain::default());
+    let cache = ReadinessHeightCache::new(chain.clone());
+    let mut lookup = Box::pin(cache.get());
+    assert!(futures::poll!(&mut lookup).is_pending());
+    // Both the response and timeout are ready when the lookup is polled again.
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    assert_eq!(lookup.await.unwrap_err(), "konsensus:not_ready:chain_unavailable");
+    cache.get().await.unwrap();
+    assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
 }
