@@ -142,5 +142,27 @@ class RunnerCleanup(unittest.TestCase):
         self.check_cleanup("signal", 143, launch=True)
 
 
+class MissingFixtures(unittest.TestCase):
+    def test_missing_binary_still_builds_and_reports_skip(self):
+        for build_exit in (0, 17):
+            with self.subTest(build_exit=build_exit), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                cargo = directory / "cargo"
+                cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PROBE\"\nexit " + str(build_exit) + "\n")
+                cargo.chmod(0o755)
+                probe = directory / "args"
+                env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                           BITCOIND_EXE=str(directory / "missing-bitcoind"),
+                           ELECTRS_EXE=str(directory / "missing-electrs"), PROBE=str(probe))
+                result = subprocess.run(["bash", str(RUNNER.with_name("three_node_paid_e2e.sh"))],
+                                        env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, build_exit, result.stdout + result.stderr)
+                args = probe.read_text().splitlines()
+                for required in ("--offline", "--locked", "--no-run", "regtest-e2e"):
+                    self.assertIn(required, args)
+                self.assertNotIn("--ignored", args)
+                self.assertEqual("SKIP three-node paid E2E" in result.stdout, build_exit == 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,9 +14,14 @@ find_binary() {
   echo "Missing $name: set its *_EXE environment variable to a local executable (see docs/regtest-e2e.md)." >&2
   return 1
 }
-export BITCOIND_EXE="${BITCOIND_EXE:-$(find_binary bitcoind)}"
-export ELECTRS_EXE="${ELECTRS_EXE:-$(find_binary electrs)}"
-[[ -x "$BITCOIND_EXE" && -x "$ELECTRS_EXE" ]]
+export BITCOIND_EXE="${BITCOIND_EXE:-$(find_binary bitcoind || true)}"
+export ELECTRS_EXE="${ELECTRS_EXE:-$(find_binary electrs || true)}"
+export REGTEST_BUILD_ONLY=0
+if [[ ! -x "$BITCOIND_EXE" || ! -x "$ELECTRS_EXE" ]]; then
+  if [[ "${REGTEST_ALLOW_MISSING:-0}" != 1 ]]; then exit 1; fi
+  echo "Local regtest fixtures unavailable; compiling the scenario before reporting SKIP."
+  export REGTEST_BUILD_ONLY=1
+fi
 echo "Bitcoin Core: $BITCOIND_EXE"
 echo "electrs: $ELECTRS_EXE"
 # Own the whole process group: Rust RAII handles normal exits and panics;
@@ -50,15 +55,24 @@ try:
     print(f"Disposable regtest data: {root}", flush=True)
     env = {k: v for k, v in os.environ.items() if k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}}
     env.update(TMPDIR=root, TEMPDIR_ROOT=root, NO_PROXY="*", no_proxy="*")
-    child = subprocess.Popen([
+    command = [
         "cargo", "test", "--offline", "--locked", "-p", "konsensus-node",
         "--features", "regtest-e2e", "--bin", "konsensus",
-        os.environ.get("REGTEST_TEST", "regtest_e2e::"), "--", "--ignored", "--nocapture", "--test-threads=1",
-    ], env=env, start_new_session=True)
+    ]
+    build_only = env.get("REGTEST_BUILD_ONLY") == "1"
+    if build_only:
+        command += ["--no-run"]
+    else:
+        command += [os.environ.get("REGTEST_TEST", "regtest_e2e::"),
+                    "--", "--ignored", "--nocapture", "--test-threads=1"]
+    child = subprocess.Popen(command, env=env, start_new_session=True)
     if pending_signal is not None:
         raise SystemExit(128 + pending_signal)
     try:
-        raise SystemExit(child.wait(timeout=int(os.environ.get("REGTEST_TIMEOUT_SECONDS", "900"))))
+        result = child.wait(timeout=int(os.environ.get("REGTEST_TIMEOUT_SECONDS", "900")))
+        if result == 0 and build_only:
+            print("SKIP three-node paid E2E: compiled; BITCOIND_EXE and/or ELECTRS_EXE unavailable offline. No daemons started.", flush=True)
+        raise SystemExit(result)
     except subprocess.TimeoutExpired:
         print("REGTEST-E2E timeout; terminating the test and its daemons", flush=True)
         raise SystemExit(124)

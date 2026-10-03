@@ -1,5 +1,10 @@
 # Real LDK regtest regression (REGTEST-E2E)
 
+For the Atlas TEST5 robustness lane (three application nodes, remote spend
+elevation, recipient 429/restart and price-table skew), use
+[`scripts/regress/three_node_paid_e2e.sh`](three-node-paid-e2e.md). The existing
+routed scenarios below retain their assertions.
+
 This opt-in test runs real LDK nodes, Bitcoin Core regtest, Noise transports,
 the production session/message handlers, and the production Axum routes. It
 uses temporary SQLite stores and paired-client spend grants. No mock Lightning

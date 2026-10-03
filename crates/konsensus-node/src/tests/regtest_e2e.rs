@@ -11,6 +11,9 @@ use std::time::Duration;
 mod app;
 #[path = "regtest/infra.rs"]
 mod infra;
+#[cfg(unix)]
+#[path = "regtest/three_node.rs"]
+mod three_node;
 
 async fn wait<F, Fut>(label: &str, mut check: F)
 where
