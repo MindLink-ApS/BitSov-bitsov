@@ -1342,3 +1342,31 @@ async fn seeded_values_reused_after_fee_failure_stay_expired() {
         "seed is not a real fetch: {age:?}"
     );
 }
+
+#[tokio::test]
+async fn admission_height_observation_preserves_price_and_original_freshness() {
+    let chain = Arc::new(FlakyFeeChain::new());
+    let engine = ChainAwarePricingEngine::new(Default::default(), chain.clone());
+    let observed_at = Instant::now() - Duration::from_secs(40);
+    // Chat base 10 + ceil(10 * 10 sat/vB * 1.8 / 100) = 12.
+    assert_eq!(
+        engine
+            .get_price_msat_with_chain_height(KIND_CHAT, 886_000, observed_at)
+            .await
+            .unwrap(),
+        12
+    );
+    assert!(
+        chain
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(target, _)| target.is_some()),
+        "pricing must reuse admission's height instead of fetching it again"
+    );
+    let cache = engine.cached_state.read().await;
+    let cached = cache.as_ref().unwrap();
+    assert_eq!(cached.block_height, 886_000);
+    assert_eq!(cached.block_height_fetched_at, observed_at);
+}

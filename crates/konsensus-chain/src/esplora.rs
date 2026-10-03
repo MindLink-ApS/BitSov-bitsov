@@ -287,6 +287,12 @@ impl ChainProvider for EsploraProvider {
     async fn is_synced(&self) -> bool {
         self.get_block_height().await.is_ok()
     }
+
+    async fn is_synced_with_height(&self, _height: u64) -> bool {
+        // This backend defines sync as availability of a tip. The caller's
+        // successful bounded-age height read already established that.
+        true
+    }
 }
 
 #[cfg(test)]

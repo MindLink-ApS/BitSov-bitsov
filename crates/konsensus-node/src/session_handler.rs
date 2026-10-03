@@ -176,6 +176,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
     let mut exchange_quotes = std::collections::HashMap::<NodeId, tokio::time::Instant>::new();
     let exchange_nonces = konsensus_storage::StorageNonceAdapter::new(storage.clone());
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
+    let readiness_height = ReadinessHeightCache::new(chain.clone());
     // PSI-SPEED: bounds our prekey replies to a paid payee's offer. Separate
     // from the other two eager limiters on purpose; see `eager_offers` in the
     // compose handler.
@@ -303,7 +304,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
                         handle_invoice_requested_gated(
                             &peer_id, &request_id, amount_msat, &purpose, privileged,
-                            &pricing, chain.as_ref(), &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
+                            &pricing, &readiness_height, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
                             audit_log.membrane(), &mut last_admission_refusal,
                         ).await;
                     }
@@ -1177,7 +1178,7 @@ async fn handle_invoice_requested_gated(
     purpose: &str,
     privileged: bool,
     pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
-    chain: &dyn ChainProvider,
+    readiness_height: &ReadinessHeightCache,
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
     recipient: &NodeId,
@@ -1214,7 +1215,7 @@ async fn handle_invoice_requested_gated(
         let Some(attempt_end) = admission_quote::expires_at(request_id, recipient, peer_id, unix)
         else { return; };
         let (invoice, admission, description) = match prepare_admission_invoice(
-            pricing.as_ref(), chain, lightning.as_ref(), request_id, attempt_end,
+            pricing.as_ref(), readiness_height, lightning.as_ref(), request_id, attempt_end,
         ).await {
             Ok(invoice) => invoice,
             Err(reason) => {
@@ -1345,26 +1346,97 @@ fn invoice_refusal_reason(error: konsensus_core::traits::lightning::LightningErr
     }
 }
 
+/// One entry shared by every admission request, independent of pricing mode.
+/// The future coalesces in-flight reads (including failures); only successful
+/// heights are reused for 60 seconds. The next caller retries a failed read.
+/// Pending reads abandoned by all callers are discarded, as are overdue results.
+type HeightLookup = futures::future::Shared<
+    futures::future::BoxFuture<
+        'static,
+        Result<(u64, tokio::time::Instant, std::time::Instant), &'static str>,
+    >,
+>;
+
+struct ReadinessHeightCache {
+    chain: Arc<dyn ChainProvider>,
+    lookup: tokio::sync::Mutex<Option<HeightLookup>>,
+}
+
+impl ReadinessHeightCache {
+    fn new(chain: Arc<dyn ChainProvider>) -> Self {
+        Self {
+            chain,
+            lookup: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn get(&self) -> Result<(u64, std::time::Instant), &'static str> {
+        use futures::FutureExt;
+        use konsensus_api::invoice_refusal::CHAIN_UNAVAILABLE;
+        use std::time::Duration;
+
+        let lookup = {
+            let mut slot = self.lookup.lock().await;
+            let refresh = match slot.as_ref() {
+                None => true,
+                Some(lookup) => match lookup.peek() {
+                    Some(Err(_)) => true,
+                    Some(Ok((_, fetched_at, _))) => {
+                        fetched_at.elapsed() >= Duration::from_secs(60)
+                    }
+                    // The slot owns one handle; callers clone only under this
+                    // lock. With no other handle, every waiter has cancelled.
+                    None => lookup.strong_count() == Some(1),
+                },
+            };
+            if refresh {
+                let chain = self.chain.clone();
+                *slot = Some(
+                    async move {
+                        let observed_at = std::time::Instant::now();
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        let height =
+                            tokio::time::timeout_at(deadline, chain.get_block_height())
+                                .await
+                                .map_err(|_| CHAIN_UNAVAILABLE)?
+                                .map_err(|_| CHAIN_UNAVAILABLE)?;
+                        let fetched_at = tokio::time::Instant::now();
+                        // Timeout polls the response first. A delayed poll can
+                        // therefore return success even after its deadline.
+                        if fetched_at >= deadline {
+                            return Err(CHAIN_UNAVAILABLE);
+                        }
+                        Ok((height, fetched_at, observed_at))
+                    }
+                    .boxed()
+                    .shared(),
+                );
+            }
+            slot.as_ref().expect("height lookup initialized").clone()
+        };
+        lookup
+            .await
+            .map(|(height, _, observed_at)| (height, observed_at))
+    }
+}
+
 /// Bounded payment preparation only: no invoice is issued until chain data is
 /// usable. Fixed refusal codes never expose backend URLs, credentials or errors.
 async fn prepare_admission_invoice(
     pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
-    chain: &dyn ChainProvider,
+    readiness_height: &ReadinessHeightCache,
     lightning: &dyn LightningProvider,
     request_id: &str,
     attempt_end: u64,
 ) -> Result<(konsensus_core::traits::lightning::Invoice, u64, String), &'static str> {
     use konsensus_api::invoice_refusal::{CHAIN_UNAVAILABLE, NOT_SYNCED};
     let price = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        chain
-            .get_block_height()
-            .await
-            .map_err(|_| CHAIN_UNAVAILABLE)?;
-        if !chain.is_synced().await {
+        let (height, observed_at) = readiness_height.get().await?;
+        if !readiness_height.chain.is_synced_with_height(height).await {
             return Err(NOT_SYNCED);
         }
         pricing
-            .get_price_msat(ADMISSION_INVOICE_KIND)
+            .get_price_msat_with_chain_height(ADMISSION_INVOICE_KIND, height, observed_at)
             .await
             .map_err(|error| match error {
                 konsensus_core::traits::pricing::PricingError::ChainUnavailable(_) => {

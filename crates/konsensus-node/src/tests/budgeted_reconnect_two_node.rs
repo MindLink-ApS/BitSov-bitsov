@@ -379,7 +379,7 @@ async fn start_recipient(
                     }
                     handle_invoice_requested_gated(
                         &peer_id, &request_id, amount_msat, &purpose, privileged,
-                        &pricing, &konsensus_chain::MockChainProvider::new(), &lightning, &transport, &us, source_ip, &mut quotes,
+                        &pricing, &super::ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &us, source_ip, &mut quotes,
                         audit.membrane(), &mut last_refusal,
                     )
                     .await;

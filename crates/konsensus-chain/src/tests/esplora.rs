@@ -408,3 +408,15 @@ async fn fake_hash_is_deterministic_and_looks_like_block_hash() {
     // Hashes start with zeros like real Bitcoin block hashes
     assert!(header1.hash.starts_with("000000"));
 }
+
+
+#[tokio::test]
+async fn known_height_satisfies_height_only_sync_without_another_lookup() {
+    // An unsupported URL makes an accidental lookup fail before any network I/O.
+    let provider = EsploraProvider::new(EsploraConfig::custom(
+        "unsupported://no-network".into(),
+        TrustLevel::ServerTrust,
+    ))
+    .unwrap();
+    assert!(provider.is_synced_with_height(900_000).await);
+}
