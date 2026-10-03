@@ -442,6 +442,24 @@ impl LightningProvider for RecoveringLightning {
         )
         .await
     }
+    async fn open_channel_with_status(
+        &self, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
+        announce: bool, fee_rate_sat_per_vb: Option<f32>,
+    ) -> Result<konsensus_core::traits::lightning::ChannelOpenResult, LightningError> {
+        self.backend()?.open_channel_with_status(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb).await
+    }
+
+    fn local_spend_diagnostics(&self) -> konsensus_core::traits::lightning::LocalSpendDiagnostics {
+        self.state.read().unwrap().backend.as_ref().map(|p| p.local_spend_diagnostics()).unwrap_or_default()
+    }
+
+    async fn release_local_spend(&self, txid: &str) -> Result<(), LightningError> {
+        // Owner recovery remains available even when money readiness is false.
+        let backend = self.state.read().unwrap().backend.clone()
+            .ok_or_else(|| LightningError::Backend("wallet backend unavailable".into()))?;
+        backend.release_local_spend(txid).await
+    }
+
     async fn close_channel(
         &self,
         channel_id: &str,

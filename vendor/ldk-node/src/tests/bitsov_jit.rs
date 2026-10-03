@@ -1,7 +1,7 @@
 //! Exercise the production pre-claim handler, without starting a node, network
 //! listeners, chain RPC or a funded wallet. MPP parts use LDK's in-memory harness.
 use super::*;
-use lightning::events::bump_transaction::Wallet as LdkWallet;
+use crate::wallet::bump::BumpWallet as LdkWallet;
 use lightning_types::payment::PaymentSecret;
 
 #[derive(Default)]

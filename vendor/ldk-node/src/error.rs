@@ -55,6 +55,8 @@ pub enum Error {
 	FeerateEstimationUpdateTimeout,
 	/// A wallet operation failed.
 	WalletOperationFailed,
+	/// A reserved input still has a confirmed spend below the finality threshold.
+	LocalSpendStillConfirmed,
 	/// A wallet operation timed out.
 	WalletOperationTimeout,
 	/// A signing operation for transaction failed.
@@ -157,6 +159,7 @@ impl fmt::Display for Error {
 				write!(f, "Updating fee rate estimates timed out.")
 			},
 			Self::WalletOperationFailed => write!(f, "Failed to conduct wallet operation."),
+			Self::LocalSpendStillConfirmed => write!(f, "Transaction or conflicting spend is still confirmed below finality; reservation retained."),
 			Self::WalletOperationTimeout => write!(f, "A wallet operation timed out."),
 			Self::OnchainTxSigningFailed => write!(f, "Failed to sign given transaction."),
 			Self::TxSyncFailed => write!(f, "Failed to sync transactions."),

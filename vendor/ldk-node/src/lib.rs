@@ -134,7 +134,8 @@ use graph::NetworkGraph;
 pub use io::utils::generate_entropy_mnemonic;
 use io::utils::write_node_metrics;
 use lightning::chain::BestBlock;
-use lightning::events::bump_transaction::{Input, Wallet as LdkWallet};
+use lightning::events::bump_transaction::Input;
+use crate::wallet::bump::BumpWallet as LdkWallet;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::chan_utils::{make_funding_redeemscript, FUNDING_TRANSACTION_WITNESS_WEIGHT};
 use lightning::ln::channel_state::{ChannelDetails as LdkChannelDetails, ChannelShutdownState};
@@ -209,7 +210,47 @@ pub struct Node {
 	async_payments_role: Option<AsyncPaymentsRole>,
 }
 
+pub use wallet::LocalSpendReservation;
+
 impl Node {
+	/// Shared gate for owner on-chain operations and asynchronous close fee bumps.
+	/// Callers retain it through funding/chain verification. LDK funding events must
+	/// not acquire it again: they complete the operation already holding the gate.
+	pub fn onchain_operation_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+		Arc::clone(&self.wallet.operation_lock)
+	}
+
+	/// Release locally-created change for selection after the configured chain
+	/// source has independently reported the transaction. Does not release inputs.
+	pub fn transaction_broadcast_verified(&self, txid: bitcoin::Txid) -> Result<(), NodeError> {
+		self.wallet.transaction_verified(txid)
+	}
+	/// Active local reservations, including durable creation/last-sighting times.
+	pub fn local_spend_reservations(&self) -> Vec<LocalSpendReservation> {
+		self.wallet.local_spend_reservations()
+	}
+
+	/// Rows skipped at startup; exposed by the owner status endpoint.
+	pub fn local_spend_unreadable_rows(&self) -> u64 {
+		self.wallet.local_spend_unreadable_rows()
+	}
+
+	/// Reconcile a successful lookup against the configured chain source.
+	/// Hold onchain_operation_lock across lookup and reconciliation. A lookup
+	/// error must never be represented as `visible = false`.
+	pub fn reconcile_local_spend(&self, txid: bitcoin::Txid, visible: bool) -> Result<(), NodeError> {
+		if visible { self.wallet.transaction_verified(txid) }
+		else { self.wallet.reconcile_absent_spend(txid, wallet::reservation_time()).map(|_| ()) }
+	}
+
+	/// Explicit owner-only abandonment. Hold onchain_operation_lock, verify
+	/// owner authorization, and require definitive absence from the configured
+	/// chain source before calling. Visibility or inconclusive lookups must refuse
+	/// release. The signed transaction may still propagate later.
+	pub fn release_local_spend(&self, txid: bitcoin::Txid) -> Result<(), NodeError> {
+		self.wallet.release_local_spend(txid)
+	}
+
 	/// Starts the necessary background tasks, such as handling events coming from user input,
 	/// LDK/BDK, and the peer-to-peer network.
 	///
