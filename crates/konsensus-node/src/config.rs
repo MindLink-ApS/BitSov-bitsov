@@ -522,7 +522,7 @@ pub enum ChainConfig {
         /// unavailable or returns unusable data. #66: written by `init` for
         /// fresh configs; never injected when parsing an existing one (see the
         /// LDK field above for why).
-        #[serde(default)]
+        #[serde(default, alias = "api_url_fallback")]
         esplora_url_fallback: Option<String>,
     },
     /// Mock provider — static block data, no network calls.
@@ -538,6 +538,22 @@ pub enum ChainConfig {
 }
 
 impl ChainConfig {
+    /// Explicit chain fallback wins. Otherwise reuse only endpoints already
+    /// selected by the operator for LDK; serde defaults remain unchanged.
+    pub fn esplora_fallbacks(&self, lightning: &LightningConfig) -> Vec<String> {
+        match self {
+            Self::Esplora { esplora_url_fallback: Some(url), .. } => vec![url.clone()],
+            Self::Esplora { .. } => match lightning {
+                LightningConfig::Ldk { esplora_url, esplora_url_fallback, .. } => {
+                    std::iter::once(esplora_url.clone())
+                        .chain(esplora_url_fallback.iter().cloned()).collect()
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
     /// Human-readable backend name for diagnostics.
     pub fn backend_name(&self) -> &'static str {
         match self {

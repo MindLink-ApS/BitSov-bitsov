@@ -2687,3 +2687,14 @@ async fn admission_height_cache_rejects_overdue_ready_response() {
     cache.get().await.unwrap();
     assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn issue204_zero_height_refuses_admission_with_typed_not_ready() {
+    let chain = Arc::new(konsensus_chain::MockChainProvider::with_config(konsensus_chain::MockChainConfig {
+        initial_height: 0, ..Default::default()
+    }));
+    let cache = ReadinessHeightCache::new(chain);
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(&dir.path().join("wallet.sqlite"), "recipient", 0).unwrap();
+    assert_eq!(prepare_admission_invoice(admission_pricing().as_ref(), &cache, &wallet, "request", u64::MAX).await.unwrap_err(), konsensus_api::invoice_refusal::CHAIN_UNAVAILABLE);
+}

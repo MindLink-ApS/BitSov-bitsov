@@ -7,6 +7,22 @@ does not run a default chain server. Existing Esplora configurations and fresh
 Electrum is also supported with an explicit server. Onboarding selection and
 Neutrino are later steps.
 
+## Esplora fallbacks
+
+`[chain] api_url` remains the primary chain/pricing source. Set
+`api_url_fallback` to an optional second Esplora URL; the existing
+`esplora_url_fallback` spelling is also accepted. With no explicit chain
+fallback, the node appends the configured `[lightning]` LDK `esplora_url` and
+`esplora_url_fallback`, removing duplicate endpoints. Old configurations retain
+their primary and deserialization defaults; no new provider or key is added.
+
+Chain reads and LDK share each endpoint's HTTP 429 cooldown, including the
+bounded Retry-After policy. Height lookups try the fallback on errors, unusable
+heights or a stalled primary. External Esplora sources remain `third_party` in
+owner status. If no nonzero height is available, pricing returns `not_ready`
+and the node does not publish a height-zero price table. A sender keeps a
+cached peer offer only while its block and time validity still hold.
+
 ## Own Bitcoin Core
 
 Run Bitcoin Core with RPC enabled (`server=1`). A pruned node can use

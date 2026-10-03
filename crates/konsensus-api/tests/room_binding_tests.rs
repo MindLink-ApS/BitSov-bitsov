@@ -511,3 +511,19 @@ async fn status_advertises_room_binding_v1() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["api_capabilities"].as_array().unwrap().iter().any(|c| c == "room_binding_v1"), "{body}");
 }
+
+#[tokio::test]
+async fn issue204_sender_proceeds_with_cached_good_price_after_bad_table() {
+    let f = Fixture::new().await;
+    let peer = f.members[0];
+    for height in [0, 800_000] {
+        f.state.peer_prices.update(peer,
+            HashMap::from([("communication".into(), 999_999)]), height, 36, 0.0,
+        ).await;
+    }
+    let (status, body) = f.compose(&peer.to_hex(), false, "cached price still works").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["amount_msat"], 2_000, "must pay the still-valid recipient offer");
+    assert_eq!(f.sent().len(), 1);
+    assert_eq!(f.sent()[0].1.payment_proof.amount_msat, 2_000);
+}

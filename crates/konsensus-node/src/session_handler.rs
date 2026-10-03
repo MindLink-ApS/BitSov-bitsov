@@ -612,19 +612,26 @@ async fn handle_peer_connected(
         pricing.as_ref(),
         chain.as_ref(),
     ).await;
-    let peer_discount = routing
-        .get_peer_weight(peer_id)
-        .await
-        .map(konsensus_pricing::compute_trust_discount)
-        .unwrap_or(0.0);
-    let price_frame = Frame::PriceTable {
-        prices: meta.prices,
-        block_height: meta.block_height,
-        valid_blocks: meta.valid_blocks,
-        trust_discount: peer_discount,
-    };
-    if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage.as_ref(), peer_id, &price_frame, pricing.as_ref(), min_admission_cost_msat).await {
-        warn!(peer = %peer_id, error = %e, "failed to send price table");
+    match meta {
+        Ok(meta) => {
+            let peer_discount = routing
+                .get_peer_weight(peer_id)
+                .await
+                .map(konsensus_pricing::compute_trust_discount)
+                .unwrap_or(0.0);
+            let price_frame = Frame::PriceTable {
+                prices: meta.prices,
+                block_height: meta.block_height,
+                valid_blocks: meta.valid_blocks,
+                trust_discount: peer_discount,
+            };
+            if let Err(e) = crate::delivery_prices::send_price_frame(transport, storage.as_ref(), peer_id, &price_frame, pricing.as_ref(), min_admission_cost_msat).await {
+                warn!(peer = %peer_id, error = %e, "failed to send price table");
+            }
+        }
+        Err(_) => {
+            warn!(peer = %peer_id, "not_ready: chain unavailable for price table");
+        }
     }
 
     send_lightning_info(peer_id, transport, lightning, lightning_addr, storage, ws_delivery_tx, our_node_id).await;
@@ -1107,9 +1114,9 @@ async fn handle_price_query(
     match pricing.get_price_msat(kind).await {
         Ok(price_msat) => {
             let block_height: u64 = match chain.get_block_height().await {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(peer = %peer_id, error = %e, "chain backend unavailable, skipping price response");
+                Ok(h) if h > 0 => h,
+                _ => {
+                    warn!(peer = %peer_id, "not_ready: chain unavailable for price response");
                     return;
                 }
             };
@@ -1405,7 +1412,7 @@ impl ReadinessHeightCache {
                         let fetched_at = tokio::time::Instant::now();
                         // Timeout polls the response first. A delayed poll can
                         // therefore return success even after its deadline.
-                        if fetched_at >= deadline {
+                        if height == 0 || fetched_at >= deadline {
                             return Err(CHAIN_UNAVAILABLE);
                         }
                         Ok((height, fetched_at, observed_at))
