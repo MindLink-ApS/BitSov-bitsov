@@ -274,3 +274,7 @@ inherits = "release"
 
 [dev-dependencies.tempfile]
 version = "3"
+
+[dev-dependencies.tokio]
+version = "1.37"
+features = ["test-util"]

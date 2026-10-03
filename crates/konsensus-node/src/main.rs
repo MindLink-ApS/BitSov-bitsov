@@ -3,6 +3,7 @@
 //! Entry point for `konsensus init` and `konsensus start`.
 
 mod cli;
+mod logging;
 mod config;
 mod contracts;
 mod content_server;
@@ -39,7 +40,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::NodeId;
@@ -102,24 +102,7 @@ impl konsensus_crypto::SessionStore for StorageSessionAdapter {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing.
-    //
-    // Two layers are composed:
-    // 1. `fmt` layer — structured JSON-compatible log output with env-filter.
-    // 2. `PlaintextGuardLayer` (Principle 4) — shuts the node down immediately
-    //    if any log event records a non-empty `plaintext` field, preventing
-    //    accidental exfiltration of E2EE message content through the log stream.
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,konsensus=debug"));
-
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .with_filter(env_filter),
-        )
-        .with(konsensus_api::metrics::PlaintextGuardLayer)
-        .init();
+    logging::init();
 
     let cli = Cli::parse();
 

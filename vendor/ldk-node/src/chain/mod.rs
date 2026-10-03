@@ -9,10 +9,11 @@ mod bitcoind;
 mod electrum;
 mod esplora;
 pub(crate) mod sync_health;
+mod sync_retry;
 use sync_health::{ChainSyncFailure, SyncHealth};
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use bitcoin::{Script, Txid};
@@ -24,14 +25,14 @@ use crate::chain::electrum::ElectrumChainSource;
 use crate::chain::esplora::EsploraChainSource;
 use crate::config::{
 	BackgroundSyncConfig, BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig,
-	RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL, WALLET_SYNC_INTERVAL_MINIMUM_SECS,
+	RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL,
 };
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::utils::write_node_metrics;
-use crate::logger::{log_debug, log_info, log_trace, LdkLogger, Logger};
+use crate::logger::{log_debug, log_info, LdkLogger, Logger};
 use crate::runtime::Runtime;
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
-use crate::{Error, NodeMetrics};
+use crate::{BuildError, Error, NodeMetrics};
 
 pub(crate) enum WalletSyncStatus {
 	Completed,
@@ -39,6 +40,23 @@ pub(crate) enum WalletSyncStatus {
 }
 
 impl WalletSyncStatus {
+	// Always release ownership, including when shutdown cancels this future.
+	async fn run(
+		status: &Mutex<Self>, timeout: Duration, timeout_error: Error,
+		work: impl std::future::Future<Output = Result<(), Error>>,
+	) -> Result<(), Error> {
+		let receiver = status.lock().unwrap().register_or_subscribe_pending_sync();
+		if let Some(mut receiver) = receiver {
+			return tokio::time::timeout(timeout, receiver.recv())
+				.await
+				.map_err(|_| timeout_error)?
+				.unwrap_or(Err(Error::WalletOperationFailed));
+		}
+		let mut guard = WalletSyncGuard { status, result: Err(timeout_error) };
+		guard.result = tokio::time::timeout(timeout, work).await.unwrap_or(Err(timeout_error));
+		guard.result
+	}
+
 	fn register_or_subscribe_pending_sync(
 		&mut self,
 	) -> Option<tokio::sync::broadcast::Receiver<Result<(), Error>>> {
@@ -67,22 +85,24 @@ impl WalletSyncStatus {
 				},
 				WalletSyncStatus::InProgress { subscribers } => {
 					// A sync is in-progress, we notify subscribers.
-					if subscribers.receiver_count() > 0 {
-						match subscribers.send(res) {
-							Ok(_) => (),
-							Err(e) => {
-								debug_assert!(
-									false,
-									"Failed to send wallet sync result to subscribers: {:?}",
-									e
-								);
-							},
-						}
-					}
+					// A subscriber can disappear between receiver_count and send.
+					// No receivers is normal (e.g. a caller timed out), not a panic.
+					let _ = subscribers.send(res);
 					*self = WalletSyncStatus::Completed;
 				},
 			}
 		}
+	}
+}
+
+struct WalletSyncGuard<'a> {
+	status: &'a Mutex<WalletSyncStatus>,
+	result: Result<(), Error>,
+}
+
+impl Drop for WalletSyncGuard<'_> {
+	fn drop(&mut self) {
+		self.status.lock().unwrap().propagate_result_to_subscribers(self.result);
 	}
 }
 
@@ -112,7 +132,7 @@ impl ChainSource {
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
-	) -> (Self, Option<BestBlock>) {
+	) -> Result<(Self, Option<BestBlock>), BuildError> {
 		let esplora_chain_source = EsploraChainSource::new(
 			server_url,
 			headers,
@@ -122,9 +142,9 @@ impl ChainSource {
 			config,
 			Arc::clone(&logger),
 			node_metrics,
-		);
+		)?;
 		let kind = ChainSourceKind::Esplora(esplora_chain_source);
-		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, None)
+		Ok((Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, None))
 	}
 
 	pub(crate) fn new_electrum(
@@ -246,7 +266,6 @@ impl ChainSource {
 						chain_monitor,
 						output_sweeper,
 						background_sync_config,
-						Arc::clone(&self.logger),
 					)
 					.await
 				} else {
@@ -269,7 +288,6 @@ impl ChainSource {
 						chain_monitor,
 						output_sweeper,
 						background_sync_config,
-						Arc::clone(&self.logger),
 					)
 					.await
 				} else {
@@ -296,62 +314,26 @@ impl ChainSource {
 	}
 
 	async fn start_tx_based_sync_loop(
-		&self, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
+		&self, stop_sync_receiver: tokio::sync::watch::Receiver<()>,
 		onchain_wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>,
 		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
-		background_sync_config: &BackgroundSyncConfig, logger: Arc<Logger>,
+		background_sync_config: &BackgroundSyncConfig,
 	) {
-		// Setup syncing intervals
-		let onchain_wallet_sync_interval_secs = background_sync_config
-			.onchain_wallet_sync_interval_secs
-			.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
-		let mut onchain_wallet_sync_interval =
-			tokio::time::interval(Duration::from_secs(onchain_wallet_sync_interval_secs));
-		onchain_wallet_sync_interval
-			.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-		let fee_rate_cache_update_interval_secs = background_sync_config
-			.fee_rate_cache_update_interval_secs
-			.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
-		let mut fee_rate_update_interval =
-			tokio::time::interval(Duration::from_secs(fee_rate_cache_update_interval_secs));
-		// When starting up, we just blocked on updating, so skip the first tick.
-		fee_rate_update_interval.reset();
-		fee_rate_update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-		let lightning_wallet_sync_interval_secs = background_sync_config
-			.lightning_wallet_sync_interval_secs
-			.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
-		let mut lightning_wallet_sync_interval =
-			tokio::time::interval(Duration::from_secs(lightning_wallet_sync_interval_secs));
-		lightning_wallet_sync_interval
-			.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-		// Start the syncing loop.
-		loop {
-			tokio::select! {
-				_ = stop_sync_receiver.changed() => {
-					log_trace!(
-						logger,
-						"Stopping background syncing on-chain wallet.",
-						);
-					return;
-				}
-				_ = onchain_wallet_sync_interval.tick() => {
-					let _ = self.sync_onchain_wallet(Arc::clone(&onchain_wallet)).await;
-				}
-				_ = fee_rate_update_interval.tick() => {
-					let _ = self.update_fee_rate_estimates().await;
-				}
-				_ = lightning_wallet_sync_interval.tick() => {
-					let _ = self.sync_lightning_wallet(
-						Arc::clone(&channel_manager),
-						Arc::clone(&chain_monitor),
-						Arc::clone(&output_sweeper),
-						).await;
-				}
-			}
-		}
+		// Independent workers: an async wallet wait must not starve other syncs.
+		// join! keeps all work owned by this task; attempts retain source deadlines.
+		tokio::join!(
+			sync_retry::run(stop_sync_receiver.clone(), "onchain",
+				background_sync_config.onchain_wallet_sync_interval_secs, true,
+				|| self.sync_onchain_wallet(Arc::clone(&onchain_wallet))),
+			sync_retry::run(stop_sync_receiver.clone(), "lightning",
+				background_sync_config.lightning_wallet_sync_interval_secs, true,
+				|| self.sync_lightning_wallet(Arc::clone(&channel_manager),
+					Arc::clone(&chain_monitor), Arc::clone(&output_sweeper))),
+			// Startup already refreshed fees, so preserve the initial delay.
+			sync_retry::run(stop_sync_receiver, "fees",
+				background_sync_config.fee_rate_cache_update_interval_secs, false,
+				|| self.update_fee_rate_estimates()),
+		);
 	}
 
 	// Synchronize the onchain wallet via transaction-based protocols (i.e., Esplora, Electrum,
@@ -519,4 +501,27 @@ fn periodically_archive_fully_resolved_monitors(
 		write_node_metrics(&*locked_node_metrics, kv_store, logger)?;
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod bitsov_sync_tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn cancelled_sync_notifies_waiters_and_allows_retry() {
+		let status = Mutex::new(WalletSyncStatus::Completed);
+		let mut owner = Box::pin(WalletSyncStatus::run(
+			&status, Duration::from_secs(10), Error::WalletOperationTimeout,
+			std::future::pending(),
+		));
+		// Poll once to register ownership; no socket or node is started.
+		assert!(tokio::time::timeout(Duration::from_millis(1), &mut owner).await.is_err());
+		let mut waiter = status.lock().unwrap().register_or_subscribe_pending_sync().unwrap();
+		drop(owner);
+		let result = tokio::time::timeout(Duration::from_millis(20), waiter.recv()).await;
+		assert!(matches!(result, Ok(Ok(Err(_)))), "cancelled owner stranded its waiter");
+		assert_eq!(WalletSyncStatus::run(
+			&status, Duration::from_secs(10), Error::WalletOperationTimeout, async { Ok(()) },
+		).await, Ok(()));
+	}
 }

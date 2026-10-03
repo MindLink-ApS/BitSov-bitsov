@@ -191,6 +191,10 @@ pub enum BuildError {
 	WalletSetupFailed,
 	/// We failed to setup the logger.
 	LoggerSetupFailed,
+	/// The given Esplora header names or values are invalid.
+	InvalidEsploraHeaders,
+	/// We failed to construct the Esplora HTTP client.
+	EsploraClientSetupFailed,
 	/// The given network does not match the node's previously configured network.
 	NetworkMismatch,
 	/// The role of the node in an asynchronous payments context is not compatible with the current configuration.
@@ -219,6 +223,8 @@ impl fmt::Display for BuildError {
 			Self::KVStoreSetupFailed => write!(f, "Failed to setup KVStore."),
 			Self::WalletSetupFailed => write!(f, "Failed to setup onchain wallet."),
 			Self::LoggerSetupFailed => write!(f, "Failed to setup the logger."),
+			Self::InvalidEsploraHeaders => write!(f, "Given Esplora headers are invalid."),
+			Self::EsploraClientSetupFailed => write!(f, "Failed to setup the Esplora HTTP client."),
 			Self::InvalidNodeAlias => write!(f, "Given node alias is invalid."),
 			Self::NetworkMismatch => {
 				write!(f, "Given network does not match the node's previously configured network.")
@@ -1208,7 +1214,7 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
-			)
+			)?
 		},
 		Some(ChainDataSourceConfig::Electrum { server_url, sync_config }) => {
 			let sync_config = sync_config.unwrap_or(ElectrumSyncConfig::default());
@@ -1277,7 +1283,7 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
-			)
+			)?
 		},
 	};
 	let chain_source = Arc::new(chain_source);
