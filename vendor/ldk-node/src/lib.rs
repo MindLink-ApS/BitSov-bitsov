@@ -562,10 +562,12 @@ impl Node {
 			});
 		}
 
-		let stop_tx_bcast = self.stop_sender.subscribe();
-		let chain_source = Arc::clone(&self.chain_source);
+        let stop_tx_bcast = self.stop_sender.subscribe();
+        let chain_source = Arc::clone(&self.chain_source);
+        let broadcast_manager = Arc::clone(&self.channel_manager);
+        let broadcast_monitor = Arc::clone(&self.chain_monitor);
 		self.runtime.spawn_cancellable_background_task(async move {
-			chain_source.continuously_process_broadcast_queue(stop_tx_bcast).await
+			chain_source.continuously_process_broadcast_queue(stop_tx_bcast, broadcast_manager, broadcast_monitor).await
 		});
 
 		let bump_tx_event_handler = Arc::new(BumpTransactionEventHandler::new(
@@ -1614,6 +1616,22 @@ impl Node {
 	pub fn remove_payment(&self, payment_id: &PaymentId) -> Result<(), Error> {
 		self.payment_store.remove(&payment_id)
 	}
+
+    /// Configure indexed funding verification for a non-Esplora source.
+    /// Return `Ok(false)` ONLY for proven absence under the configured source's
+    /// indexing/sync rules. Errors are inconclusive and never suppress a spend.
+    pub fn set_funding_verifier<F, Fut>(&self, verify: F)
+    where F: Fn(bitcoin::Txid) -> Fut + Send + Sync + 'static,
+          Fut: std::future::Future<Output = Result<bool, Error>> + Send + 'static {
+        self.chain_source.set_funding_verifier(verify);
+    }
+
+    /// Verify funding with the configured source and its shared HTTP cooldown.
+    /// No source evidence is inferred from a local monitor or a failed lookup.
+    pub async fn funding_present(&self, txid: bitcoin::Txid) -> Result<bool, Error> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.chain_source.funding_present(txid))
+            .await.map_err(|_| Error::TxSyncTimeout)?
+    }
 
 	/// Returns a monitored channel's funding outpoint, including after force-close.
 	///

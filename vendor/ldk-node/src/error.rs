@@ -53,6 +53,8 @@ pub enum Error {
 	FeerateEstimationUpdateFailed,
 	/// A fee rate estimation update timed out.
 	FeerateEstimationUpdateTimeout,
+	/// The chain backend returned HTTP 429; shared cooldown is active.
+	ChainRateLimited,
 	/// A wallet operation failed.
 	WalletOperationFailed,
 	/// A reserved input still has a confirmed spend below the finality threshold.
@@ -134,6 +136,7 @@ pub enum Error {
 impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match *self {
+            Self::ChainRateLimited => write!(f, "Chain backend rate limited"),
 			Self::AlreadyRunning => write!(f, "Node is already running."),
 			Self::NotRunning => write!(f, "Node is not running."),
 			Self::OnchainTxCreationFailed => {

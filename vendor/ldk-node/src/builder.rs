@@ -1286,6 +1286,12 @@ fn build_with_store_internal(
 			)?
 		},
 	};
+	if chain_data_source_config.is_none() {
+		// The implicit upstream Esplora default is not a configured source of
+		// funding evidence. Never query it to release reservations, suppress
+		// broadcasts, or discard closed-channel balances (#191 / #192).
+		chain_source.set_funding_verifier(|_| async { Err(crate::Error::TxSyncFailed) });
+	}
 	let chain_source = Arc::new(chain_source);
 
 	// Initialize the on-chain wallet and chain access

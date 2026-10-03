@@ -278,3 +278,12 @@ version = "3"
 [dev-dependencies.tokio]
 version = "1.37"
 features = ["test-util"]
+
+[patch.crates-io]
+esplora-client = { path = "../esplora-client" }
+
+[dependencies.httpdate]
+version = "1"
+
+[dev-dependencies.http]
+version = "1"
