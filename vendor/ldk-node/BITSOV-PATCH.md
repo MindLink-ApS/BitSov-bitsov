@@ -258,3 +258,102 @@ journal, network behavior or resolution of the production incident.
 Doctrine: 1, 2, 5 and 6 hold: settlement/admission and custody remain unchanged;
 Bitcoin remains chain evidence, never identity; diagnostics disclose no identifiers;
 incident-resolution claims remain explicitly unverified. Lines 3 and 4 unchanged.
+
+## Shared Esplora rate limiting and rebroadcast eligibility (2026-10-03)
+
+Incident evidence: `TEST5-SANITY-LOG.md`, Atlas run 4 step 1, and the supplied
+redacted `beta-ldk-sync-0403.txt`. The 1,385-line excerpt contains 252 broadcast
+failures, 254 Lightning wallet sync timeouts, 96 on-chain failures, and 350 lines
+mentioning 429. Broadcast errors recur about every 30 seconds. The excerpt does
+**not** identify the transaction: the ghost commitment is a plausible driver,
+not proven incident attribution. No live backend or node was contacted.
+
+Production changes:
+
+- `chain/rate_limit.rs`: one process-local Esplora HTTP admission state shared by
+  the on-chain wallet, Lightning sync, fees, funding/visibility verification, and
+  broadcasts, including their cloned clients and internal GET retries. A 429
+  establishes a cooldown of 10, 20, 40, 80, 160, then at most 300 seconds without
+  a usable Retry-After. Numeric and HTTP-date Retry-After are clamped to 300
+  seconds; malformed headers fall back to exponential delay. GET calls during
+  cooldown return a fixed rate-limit error without HTTP, with one GET recovery
+  probe admitted. Each broadcast POST has its own bounded wait and bypasses GET
+  admission after that wait, even if another request has extended the cooldown.
+  A non-429 recovery probe clears the episode; a POST admitted during a newer
+  cooldown does not clear that newer episode. Cancelled or failed probes release
+  ownership with a short cooldown. Older concurrent
+  responses cannot clear a newer 429. Huge numeric Retry-After cannot overflow
+  an Instant. Journal output names only the parsed backend hostname, fixed kind,
+  and numeric delay; response text, credentials, paths and query strings are
+  excluded.
+- `chain/esplora.rs`: installs that transport, classifies wallet/fee failures,
+  queries funding with `get_tx_info` (`GET /tx/{txid}`), and retains a broadcast
+  across 429 cooldowns. The existing request and wallet attempt deadlines remain;
+  each POST waits at most one 300-second cooldown outside its HTTP attempt
+  deadline, then attempts the POST as its own probe. A newer cooldown cannot
+  extend that wait. Shutdown can cancel the wait. Actual HTTP response fixtures
+  exercise fee, on-chain wallet, Lightning wallet, funding, and POST paths without
+  sockets.
+- `tx_broadcaster.rs`: repeated transactions back off 30, 60, 120, 240, then at
+  most 300 seconds, across all supported chain sources. New transactions are
+  immediately eligible. A package with a new/due child retains its parents for
+  relay. Identical pending packages are coalesced so recovery cannot flush a
+  backlog of duplicates. Idle history expires after 24 hours. Queue-full refusal
+  does not advance a transaction's retry clock. Every in-flight package is retained
+  before the first await and resumed if the same Node's worker is aborted and
+  restarted; completing one package clears only its own pending ownership. This is
+  process-local scheduling, not a new durable transaction store.
+- `chain/broadcast.rs`, `chain/mod.rs`, `lib.rs`: before dispatch, inspect only
+  spends of monitored **closed** channels' exact funding outpoints. Explicit
+  `GET /tx/{txid}` 404 proves absence; a valid transaction response (confirmed
+  or mempool) proves presence. `/tx/{txid}/status` is not presence evidence:
+  incident backends return 200 `{"confirmed":false}` even for unknown txids.
+  Core/Electrum use the adapter's existing #192 indexed/synced proof via a verifier
+  callback. Missing verifier, malformed data, timeouts, 429, and
+  every other error remain inconclusive. Suppress the absent-funding commitment
+  and its descendants, retaining ordinary/open-channel transactions and packages
+  supplying their own funding parent. One ten-second verification budget preserves
+  earlier definitive results when a later lookup times out. Recheck on a later
+  eligible broadcast: late funding propagation restores eligibility. A lagging
+  Esplora index can report 404 temporarily; suppression is rechecked, never durable.
+  Packages run independently under a cancellation-owned JoinSet: a parked package
+  cannot hold later justice, HTLC-timeout/success, sweep or anchor packages behind
+  its retries. Order within each package is preserved. No monitor,
+  wallet reservation, channel, or settlement record is deleted or marked settled.
+- No configured chain source: the builder's implicit upstream Esplora default
+  cannot supply funding evidence. An error verifier is installed before the
+  source is shared, so release, reconciliation, #192 balances, and ghost
+  suppression all refuse to infer absence without issuing a request. Explicit
+  Esplora clients validate their base URL before the `/tx/{txid}` transport runs.
+  In-memory 404 transports count calls and prove that both missing-source paths
+  make zero requests, independently of network availability. Only a configured
+  endpoint's explicit 404 remains absence evidence.
+- `chain/sync_health.rs`, `error.rs`, `chain/sync_retry.rs`: retain the oldest
+  outstanding failure timestamp and expose rate-limited failure kind, including
+  a 429 first observed by broadcast/fees. A successful other wallet cannot hide
+  an outstanding wallet's rate-limit failure. The adapter maps it to owner status
+  `chain_sync.last_error_kind = "rate_limited"`; other failures remain
+  `"sync_failed"`. #196's background retry schedule, cancellation-safe wallet
+  ownership, subscriber deadlines, and fee-barrier startup retries are retained.
+  Startup's retry classification includes the new rate-limit error.
+- The adapter's closed-funding queries and Esplora reservation reconciliation,
+  send verification and owner release use this same Node transport. Core/Electrum
+  transaction visibility semantics are unchanged. The existing bounded startup
+  endpoint-selection probes run before Node construction; they are not continuous
+  runtime failover. No new backend, directory, account or service endpoint is added.
+
+The small Esplora-client transport hook is documented separately in
+`../esplora-client/BITSOV-PATCH.md`; its baseline checksum remains the previously
+locked 0.12.3 archive. Locks retain all unrelated dependency versions. `httpdate`
+1.0.3 was already present in the workspace lock and is used to parse HTTP dates;
+`http` is a vendor test-only dependency for socket-free responses.
+
+Verification and the exact network-dependent fixture exclusions are recorded in
+`../../docs/testing/rate-limit-rebroadcast-offline.md`. Existing HTTP-evidence
+unit coverage moved from the adapter's private decoder to the actual shared
+vendor-client fixture; adapter tests still check both aggregate balance views.
+`money_ready`, paid admission, fee calculation and custody semantics are unchanged.
+
+Doctrine: 1 and 5 hold (settlement and self-custody preserved); 2 holds (Bitcoin
+remains chain/admission infrastructure); 3 and 4 unchanged; 6 holds (explicit
+rate-limit diagnostics and no claim of live incident resolution).

@@ -19,8 +19,10 @@ use konsensus_lightning::esplora_tx_visible;
 
 #[tokio::test]
 async fn empty_url_is_an_error_not_absence() {
-    let result = esplora_tx_visible("", "deadbeef").await;
-    assert!(result.is_err(), "no chain source must not read as absent: {result:?}");
+    for url in ["", " ", "/"] {
+        let result = esplora_tx_visible(url, "deadbeef").await;
+        assert_eq!(result, Err("no chain source configured".into()));
+    }
 }
 
 #[tokio::test]

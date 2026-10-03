@@ -267,10 +267,6 @@ pub struct LdkProvider {
     /// Set to `false` when a payment fails due to a channel/funding issue.
     /// Reset to `true` on successful payment.
     payment_capable: AtomicBool,
-    /// Esplora endpoint URL — retained from `LdkConfig` for
-    /// post-broadcast verification (L0f). Same endpoint LDK itself
-    /// uses for chain sync, so verification reflects what LDK saw.
-    esplora_url: String,
     bitcoind: Option<Arc<konsensus_chain::BitcoindProvider>>,
     electrum: Option<Arc<konsensus_chain::ElectrumProvider>>,
     onchain_operations: crate::onchain::OnchainOperations,
@@ -324,37 +320,8 @@ impl LdkProvider {
     }
 
     async fn funding_present(&self, txid: &str) -> Result<bool, LightningError> {
-        let result = if let Some(rpc) = &self.bitcoind {
-            // Absence requires independent mempool and synced txindex evidence.
-            rpc.funding_present(txid).await
-        } else if let Some(server) = &self.electrum {
-            // A cancelled spawn_blocking lookup keeps running. Keep its permit
-            // in an owned task until it finishes, so repeated timed-out reads
-            // cannot accumulate background Electrum workers.
-            static VERIFY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-            let permit = VERIFY.acquire().await
-                .map_err(|_| LightningError::Backend("funding verifier closed".into()))?;
-            let server = Arc::clone(server);
-            let txid = txid.to_owned();
-            tokio::spawn(async move {
-                let _permit = permit;
-                server.funding_present(&txid).await
-            }).await.map_err(|_| LightningError::Backend("funding verification worker failed".into()))?
-        } else {
-            let response = reqwest::Client::new()
-                .get(format!("{}/tx/{txid}/status", self.esplora_url.trim_end_matches('/')))
-                .send().await.map_err(|_| LightningError::Backend("funding status request failed".into()))?;
-            let status = response.status().as_u16();
-            // Error bodies are irrelevant; distinguish absence without parsing.
-            if status != 200 { return crate::balance::decode_funding_status(status, &[]); }
-            let body = response.bytes().await
-                .map_err(|_| LightningError::Backend("funding status body unavailable".into()))?;
-            return crate::balance::decode_funding_status(status, &body);
-        };
-        match result {
-            Ok(present) => Ok(present),
-            Err(error) => Err(LightningError::Backend(format!("funding presence unavailable: {error}"))),
-        }
+        let txid = txid.parse().map_err(|_| LightningError::Backend("invalid funding txid".into()))?;
+        self.node.funding_present(txid).await.map_err(|error| LightningError::Backend(format!("funding presence unavailable: {error}")))
     }
 
     /// Configure the ordinary payment fee ceiling before sharing this provider.
@@ -558,7 +525,7 @@ impl LdkProvider {
         // Validate all local settings before the first network request. The budget
         // includes preflight; only the two Esplora fee-barrier errors are retried.
         let started = Instant::now();
-        let (node, chosen_esplora_url, baseline) = if let Some(rpc) = &config.bitcoind {
+        let (node, _, baseline) = if let Some(rpc) = &config.bitcoind {
             let (user, password) = rpc.credentials()
                 .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
             builder.set_chain_source_bitcoind_rpc(
@@ -624,6 +591,29 @@ impl LdkProvider {
         let liquidity = config.liquidity.selected()?.map(|p| LiquidityClient::new(
             p.node_id.clone(), Arc::new(LdkJitBackend(Arc::clone(&node))),
         ));
+        let bitcoind = bitcoind.map(Arc::new);
+        if bitcoind.is_some() || electrum.is_some() {
+            let rpc = bitcoind.clone();
+            let server = electrum.clone();
+            node.set_funding_verifier(move |txid| {
+                let rpc = rpc.clone();
+                let server = server.clone();
+                async move {
+                    if let Some(rpc) = rpc {
+                        rpc.funding_present(&txid.to_string()).await.map_err(|_| ldk_node::NodeError::TxSyncFailed)
+                    } else if let Some(server) = server {
+                        // Detached Electrum work retains its permit after outer cancellation.
+                        static VERIFY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+                        let permit = VERIFY.acquire().await.map_err(|_| ldk_node::NodeError::TxSyncFailed)?;
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            server.funding_present(&txid.to_string()).await.map_err(|_| ldk_node::NodeError::TxSyncFailed)
+                        }).await.map_err(|_| ldk_node::NodeError::TxSyncFailed)?
+                    } else { Err(ldk_node::NodeError::TxSyncFailed) }
+                }
+            });
+        }
+
         let provider = Self {
             sync_baseline: (baseline.latest_lightning_wallet_sync_timestamp, baseline.latest_onchain_wallet_sync_timestamp),
             routing_fee_policy: Default::default(),
@@ -632,8 +622,7 @@ impl LdkProvider {
             onchain_operations: crate::onchain::OnchainOperations::new(node.onchain_operation_lock()),
             node,
             payment_capable: AtomicBool::new(true),
-            esplora_url: chosen_esplora_url,
-            bitcoind: bitcoind.map(Arc::new),
+            bitcoind,
             electrum,
             drainer_shutdown,
             inbound_tx,
@@ -668,10 +657,6 @@ impl LdkProvider {
             onchain_operations: crate::onchain::OnchainOperations::new(node.onchain_operation_lock()),
             node,
             payment_capable: AtomicBool::new(true),
-            // Test path — broadcast verification will fall through to
-            // BroadcastUnconfirmed (which is acceptable for tests). Real
-            // callers go through `new()` and get a populated URL.
-            esplora_url: String::new(),
             bitcoind: None,
             electrum: None,
             // Pre-set to `true` so any consumer wrapping a from_node-constructed
@@ -684,7 +669,7 @@ impl LdkProvider {
 
     fn chain_visibility(&self) -> crate::onchain::ChainVisibility {
         crate::onchain::ChainVisibility {
-            esplora_url: self.esplora_url.clone(),
+            node: self.node.clone(),
             bitcoind: self.bitcoind.clone(),
             electrum: self.electrum.clone(),
         }
@@ -1100,7 +1085,11 @@ impl LightningProvider for LdkProvider {
         self.node.status().chain_sync_failure.map(|failure| {
             konsensus_core::traits::lightning::ChainSyncStatus::Stalled {
                 since: failure.since,
-                last_error_kind: konsensus_core::traits::lightning::ChainSyncErrorKind::SyncFailed,
+                last_error_kind: if failure.rate_limited {
+                    konsensus_core::traits::lightning::ChainSyncErrorKind::RateLimited
+                } else {
+                    konsensus_core::traits::lightning::ChainSyncErrorKind::SyncFailed
+                },
             }
         })
     }
@@ -1719,7 +1708,7 @@ fn startup_build_error(error: ldk_node::BuildError) -> LightningError {
     }
 }
 
-/// Retry ONLY Esplora's startup fee barrier. In pinned LDK 0.7 these two
+/// Retry ONLY Esplora's startup fee barrier. In pinned LDK 0.7 these
 /// errors return before any background task is spawned, and Esplora's
 /// ChainSource::start is a no-op. Never extend this to arbitrary start errors
 /// or Electrum without re-auditing that ordering.
@@ -1764,7 +1753,8 @@ async fn start_esplora_with_retry(
             Ok(()) => return Ok((node.expect("node was built"), endpoint, baseline)),
             Err(
                 error @ (ldk_node::NodeError::FeerateEstimationUpdateFailed
-                | ldk_node::NodeError::FeerateEstimationUpdateTimeout),
+                | ldk_node::NodeError::FeerateEstimationUpdateTimeout
+                | ldk_node::NodeError::ChainRateLimited),
             ) => {
                 cause = error.to_string();
                 warn!(
@@ -1935,18 +1925,6 @@ fn convert_payment_details(details: &ldk_node::payment::PaymentDetails) -> Payme
     }
 }
 
-/// L0f (2026-04-30): Esplora-style "is this txid known?" query, used by
-/// `send_onchain` to verify that the broadcast actually propagated.
-///
-/// Returns `Ok(true)` if the Esplora endpoint reports the txid (HTTP 200
-/// from `/tx/<txid>`), `Ok(false)` if it reports not-found (HTTP 404),
-/// `Err(...)` for any transport / non-2xx-non-404 response. The caller
-/// should treat both `Ok(false)` and `Err` as `BroadcastUnconfirmed`.
-///
-/// If `esplora_url` is empty (test path via `LdkProvider::from_node`)
-/// the function returns `Ok(false)` immediately — broadcast verification
-/// is a no-op in that case, which is fine because tests don't actually
-/// broadcast on chain.
 /// L4b (2026-05-11): Probe an Esplora endpoint by GETting `/fee-estimates`.
 ///
 /// LDK fetches fee estimates from the configured Esplora endpoint as part
@@ -2096,8 +2074,10 @@ pub async fn select_esplora_endpoint(primary: &str, fallback: Option<&str>) -> S
     }
 }
 
+/// Query transaction presence. Only a configured endpoint's explicit HTTP 404
+/// proves absence; missing configuration and failed lookups are inconclusive.
 pub async fn esplora_tx_visible(esplora_url: &str, txid: &str) -> Result<bool, String> {
-    if esplora_url.is_empty() {
+    if esplora_url.trim().trim_end_matches('/').is_empty() {
         return Err("no chain source configured".into());
     }
     let trimmed = esplora_url.trim_end_matches('/');
