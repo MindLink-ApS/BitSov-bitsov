@@ -103,11 +103,83 @@ fn paired_client(
     (service, client.client_id, token)
 }
 
+/// New Atlas fixture options; legacy tests keep their original setup.
+pub struct Options {
+    pub identity: Arc<NodeIdentity>,
+    pub chain_url: String,
+}
+
+struct NoTerminal;
+impl std::io::Write for NoTerminal {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(libc::ENXIO))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn read_only_client(
+    dir: &std::path::Path,
+    node: &NodeIdentity,
+) -> (Arc<konsensus_api::pairing::PairingService>, String, String) {
+    use ed25519_dalek::Signer;
+    use konsensus_api::pairing::{self, PairingService};
+    let service = Arc::new(
+        PairingService::open(
+            dir,
+            pairing::identity_fingerprint(&node.node_id().to_hex()),
+            true,
+        )
+        .unwrap()
+        .with_owner_console(Box::new(NoTerminal))
+        .without_stdout_code(),
+    );
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let pubkey = hex::encode(key.verifying_key().to_bytes());
+    let clients = service.list_clients();
+    let client = if let Some(client) = clients.first() {
+        client.clone()
+    } else {
+        let pending = service
+            .request_pairing("regtest remote device", &pubkey)
+            .unwrap();
+        let challenge =
+            std::fs::read(service.dir().join(format!("challenge-{}", pending.pair_id))).unwrap();
+        let proof = key.sign(&PairingService::proof_message(
+            &pending.pair_id,
+            &pubkey,
+            &challenge,
+        ));
+        service
+            .confirm_pairing(
+                &pending.pair_id,
+                &hex::encode(proof.to_bytes()),
+                pairing::default_pairing_scopes(),
+            )
+            .unwrap()
+    };
+    let challenge = service.issue_token_challenge(&client.client_id).unwrap();
+    let signature = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
+    let token = service
+        .issue_token(
+            &node.node_id().to_hex(),
+            JWT_SECRET,
+            &client.client_id,
+            &challenge,
+            &signature,
+        )
+        .unwrap()
+        .token;
+    (service, client.client_id, token)
+}
+
 pub struct App {
     pub state: Arc<konsensus_api::AppState>,
     pub transport: Arc<NoiseTransport>,
     pub received: tokio::sync::broadcast::Receiver<Arc<konsensus_api::state::WsMessage>>,
     router: axum::Router,
+    remote_router: Option<axum::Router>,
     token: String,
     pub service: Arc<konsensus_api::pairing::PairingService>,
     pub client: String,
@@ -129,7 +201,19 @@ impl App {
         chain: &infra::Chain,
         wallet: Arc<LdkProvider>,
     ) -> Self {
-        let identity = &Arc::new(NodeIdentity::generate().unwrap().1);
+        Self::start_with_options(dir, chain, wallet, None).await
+    }
+
+    pub async fn start_with_options(
+        dir: &std::path::Path,
+        chain: &infra::Chain,
+        wallet: Arc<LdkProvider>,
+        options: Option<Options>,
+    ) -> Self {
+        let identity = &options
+            .as_ref()
+            .map(|o| o.identity.clone())
+            .unwrap_or_else(|| Arc::new(NodeIdentity::generate().unwrap().1));
         let transport = &Arc::new(NoiseTransport::new(
             identity.clone(),
             TransportConfig {
@@ -140,22 +224,57 @@ impl App {
             },
         ));
         transport.start_listener().await.unwrap();
-        let sessions = &Arc::new(SessionManager::new(identity.clone()));
-        let pairing = paired_client(
-            &dir.join("pairing"),
-            identity,
-            konsensus_api::spend_budget::GrantTerms::new(1_000_000)
-                .per_call(200_000)
-                .for_secs(3600),
-        );
+        let storage: Arc<dyn konsensus_storage::Storage> = if options.is_some() {
+            Arc::new(
+                konsensus_storage::SqliteStorage::open(
+                    dir.join("messages.sqlite").to_str().unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+        } else {
+            Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap())
+        };
+        let sessions = &Arc::new(if options.is_some() {
+            SessionManager::with_store(
+                identity.clone(),
+                Arc::new(crate::StorageSessionAdapter {
+                    storage: storage.clone(),
+                }),
+            )
+        } else {
+            SessionManager::new(identity.clone())
+        });
+        sessions.restore_sessions().await;
+        let pairing = if options.is_some() {
+            read_only_client(&dir.join("pairing"), identity)
+        } else {
+            paired_client(
+                &dir.join("pairing"),
+                identity,
+                konsensus_api::spend_budget::GrantTerms::new(1_000_000)
+                    .per_call(200_000)
+                    .for_secs(3600),
+            )
+        };
+        let mut registry = konsensus_message::PeerRegistry::new();
+        if options.is_some() {
+            crate::node::merge_persisted_peers(&mut registry, storage.list_peers().await.unwrap());
+            for peer in registry.whitelist() {
+                transport.add_to_whitelist(&peer).await;
+            }
+        }
         let invoice_requests: InvoiceRequests = Default::default();
         let state = Arc::new(konsensus_api::AppState {
             identity: Arc::clone(identity),
-            storage: Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap()),
+            storage,
             lightning: wallet.clone(),
             chain: Arc::new(
                 konsensus_chain::EsploraProvider::new(konsensus_chain::EsploraConfig::custom(
-                    chain.api_url.clone(),
+                    options
+                        .as_ref()
+                        .map(|o| o.chain_url.clone())
+                        .unwrap_or_else(|| chain.api_url.clone()),
                     konsensus_core::traits::chain::TrustLevel::FullValidation,
                 ))
                 .unwrap(),
@@ -167,9 +286,7 @@ impl App {
                 },
             )),
             gate: Arc::new(konsensus_core::PaymentGate::new()),
-            peer_registry: Arc::new(tokio::sync::RwLock::new(
-                konsensus_message::PeerRegistry::new(),
-            )),
+            peer_registry: Arc::new(tokio::sync::RwLock::new(registry)),
             transport: Arc::clone(transport) as Arc<dyn MessageTransport>,
             session_manager: Arc::clone(sessions),
             jwt_secret: JWT_SECRET.into(),
@@ -194,7 +311,9 @@ impl App {
             peer_prices: Arc::new(konsensus_pricing::PeerPriceCache::new()),
             routing: Arc::new(konsensus_routing::RoutingTable::with_defaults()),
             // As in main.rs: the API reads the plaintext cache the receive loop writes.
-            plaintext_cipher: Some(Arc::new(konsensus_crypto::PlaintextCacheCipher::new(identity.aes_key()))),
+            plaintext_cipher: Some(Arc::new(konsensus_crypto::PlaintextCacheCipher::new(
+                identity.aes_key(),
+            ))),
             send_timestamps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             invoice_requests: Arc::clone(&invoice_requests),
             // The admission journal lives here, so a stale settled admission is on disk.
@@ -292,17 +411,50 @@ impl App {
         let router = konsensus_api::build_router(state.clone()).layer(
             axum::extract::connect_info::MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50000))),
         );
+        let remote_router = options.as_ref().map(|_| {
+            konsensus_api::build_remote_router(state.clone()).layer(
+                axum::extract::connect_info::MockConnectInfo(SocketAddr::from((
+                    [127, 0, 0, 1],
+                    50001,
+                ))),
+            )
+        });
+        let mut tasks = vec![session, messages];
+        #[cfg(unix)]
+        if options.is_some() {
+            use konsensus_api::control::{ControlContext, ControlServer, ReplacementGuard};
+            let control = ControlServer::bind(
+                dir,
+                Arc::new(ControlContext {
+                    service: pairing.0.clone(),
+                    identity_fingerprint: konsensus_api::pairing::identity_fingerprint(
+                        &identity.node_id().to_hex(),
+                    ),
+                    data_dir: dir.to_path_buf(),
+                    mnemonic_path: dir.join("mnemonic.txt"),
+                    replacement_guard: ReplacementGuard {
+                        layout: konsensus_api::bootstrap::DataDirLayout::new(dir),
+                        uses_identity_derived_keys: true,
+                        has_identity_passphrase: false,
+                    },
+                }),
+            )
+            .unwrap()
+            .with_approval_state(state.clone());
+            tasks.push(tokio::spawn(control.serve(shutdown.subscribe())));
+        }
         let (service, client, token) = pairing;
         Self {
             received: state.ws_broadcast.subscribe(),
             state,
             transport: transport.clone(),
             router,
+            remote_router,
             service,
             client,
             token,
             shutdown,
-            tasks: vec![session, messages],
+            tasks,
         }
     }
 
@@ -332,8 +484,12 @@ impl App {
         } else {
             self.token.clone()
         };
-        let response = self
-            .router
+        let router = if owner {
+            &self.router
+        } else {
+            self.remote_router.as_ref().unwrap_or(&self.router)
+        };
+        let response = router
             .clone()
             .oneshot(
                 Request::builder()
@@ -347,11 +503,68 @@ impl App {
             .await
             .unwrap();
         let status = response.status();
+        // Scope extractors return text/plain; keep their exact refusal body so
+        // the Atlas scenario can assert it. JSON endpoints remain strict.
+        let plain = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/plain"));
         let bytes = axum::body::to_bytes(response.into_body(), 8 << 20)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap())
+        let body = if plain {
+            Value::String(String::from_utf8(bytes.to_vec()).unwrap())
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, body)
     }
+    /// Reauthenticate exactly as a paired remote device does after owner approval.
+    pub async fn refresh_token(&mut self) -> Value {
+        use ed25519_dalek::Signer;
+        let (status, body) = self
+            .get(
+                &format!("/api/v1/pair/challenge?client_id={}", self.client),
+                false,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Atlas run 4 relaunch: remote challenge {body}"
+        );
+        let challenge = body["challenge"].as_str().unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let (status, body) = self
+            .post(
+                "/api/v1/pair/token",
+                serde_json::json!({
+                    "client_id": self.client, "challenge": challenge,
+                    "signature": hex::encode(key.sign(challenge.as_bytes()).to_bytes()),
+                }),
+                false,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Atlas run 4 relaunch: remote token {body}"
+        );
+        self.token = body["token"].as_str().unwrap().to_owned();
+        body["scopes"].clone()
+    }
+
+    /// Join all handlers before reopening persistent state in the restart test.
+    pub async fn stop(mut self) {
+        let _ = self.shutdown.send(true);
+        self.transport.shutdown();
+        for task in self.tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     pub fn used(&self) -> u64 {
         self.service.grant_view_for(&self.client).unwrap().used_msat
     }

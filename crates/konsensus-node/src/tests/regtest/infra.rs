@@ -249,29 +249,32 @@ impl Chain {
 }
 
 pub async fn lightning(dir: &std::path::Path, chain: &Chain) -> (Arc<LdkProvider>, String) {
-    let addr = loopback();
+    let config = lightning_config(dir, &chain.url);
+    let addr = config.listening_address.clone().unwrap();
+    let provider = LdkProvider::new(config).await.unwrap();
+    (Arc::new(provider), addr)
+}
+
+pub fn lightning_config(dir: &std::path::Path, url: &str) -> konsensus_lightning::LdkConfig {
     let (mnemonic, _) = NodeIdentity::generate().unwrap();
-    let provider = LdkProvider::new(konsensus_lightning::LdkConfig {
+    konsensus_lightning::LdkConfig {
         electrum: None,
         bitcoind: None,
         storage_dir: dir.join("ldk"),
         mnemonic,
         passphrase: None,
         network: "regtest".into(),
-        esplora_url: chain.url.clone(),
+        esplora_url: url.to_owned(),
         esplora_url_fallback: None,
         rgs_url: None,
         lsp_node_id: None,
         lsp_address: None,
         lsp_token: None,
-        listening_address: Some(addr.clone()),
+        listening_address: Some(loopback()),
         liquidity: Default::default(),
         scb_backup_dir: None,
         scb_rotation_count: 2,
-    })
-    .await
-    .unwrap();
-    (Arc::new(provider), addr)
+    }
 }
 
 /// Routing-only LDK node C, built directly on ldk-node: no app, no BitSov
