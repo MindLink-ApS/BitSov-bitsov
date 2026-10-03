@@ -573,6 +573,9 @@ fn is_admission_refusal(e: &ApiError) -> bool {
 /// The error for an invoice request whose pending entry was dropped: the peer
 /// answered with `InvoiceError`, stating `refusal` when the request was bound.
 fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
+    if let Some(reason) = refusal.as_deref().and_then(invoice_refusal::not_ready_reason) {
+        return ApiError::PeerNotReady { reason };
+    }
     match refusal.as_deref() {
         Some(invoice_refusal::ADMISSION_REQUIRED) => admission_refusal(peer_id),
         Some("disk_low") => ApiError::NotDispatched("disk_low".into()),
@@ -1993,7 +1996,12 @@ async fn request_admission_invoice(
         })?
         .map_err(|_| ApiError::Lightning("target could not create an admission invoice".into()))?
         .map_err(|error| {
-            if error.recipient == *peer_id && error.reason == "disk_low" {
+            if error.recipient != *peer_id {
+                return ApiError::Lightning("invoice refusal came from another recipient".into());
+            }
+            if let Some(reason) = invoice_refusal::not_ready_reason(&error.reason) {
+                ApiError::PeerNotReady { reason }
+            } else if error.reason == "disk_low" {
                 ApiError::NotDispatched("disk_low".into())
             } else if error.recipient == *peer_id && error.reason == "stateless_quote_unsupported" {
                 ApiError::StatelessQuoteUnsupported
@@ -4909,5 +4917,42 @@ mod disk_refusal_tests {
     fn recipient_disk_refusal_keeps_machine_reason() {
         let error = invoice_refused(&NodeId::from_bytes([9; 32]), Some("disk_low".into()));
         assert!(matches!(error, ApiError::NotDispatched(ref reason) if reason == "disk_low"));
+    }
+}
+
+#[cfg(test)]
+mod peer_not_ready_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn recipient_not_ready_is_a_typed_retryable_503() {
+        for reason in ["chain_unavailable", "not_synced"] {
+            let error = invoice_refused(
+                &NodeId::from_bytes([9; 32]),
+                Some(format!("konsensus:not_ready:{reason}")),
+            );
+            let response = error.into_response();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "peer_not_ready");
+            assert_eq!(body["reason"], reason);
+            assert_eq!(body["retry_allowed"], true);
+        }
+    }
+
+    #[test]
+    fn unknown_refusal_does_not_become_peer_not_ready() {
+        let error = invoice_refused(
+            &NodeId::from_bytes([9; 32]),
+            Some("konsensus:not_ready:arbitrary peer text".into()),
+        );
+        assert!(matches!(error, ApiError::Lightning(_)));
     }
 }

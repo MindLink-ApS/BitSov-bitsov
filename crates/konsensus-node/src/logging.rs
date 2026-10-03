@@ -58,6 +58,8 @@ mod tests {
             (Some("info,ldk_node::chain_sync=trace"), true, false),
         ] {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            let working_dir = tempfile::tempdir().unwrap();
+            command.current_dir(working_dir.path());
             command
                 .args([
                     "--exact",
@@ -76,6 +78,8 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            assert!(std::fs::read_dir(working_dir.path()).unwrap().next().is_none(),
+                "stdout/journal logging must not create an unbounded node.log");
             let stdout = String::from_utf8(output.stdout).unwrap();
             assert_eq!(
                 stdout

@@ -303,7 +303,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
                         handle_invoice_requested_gated(
                             &peer_id, &request_id, amount_msat, &purpose, privileged,
-                            &pricing, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
+                            &pricing, chain.as_ref(), &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
                             audit_log.membrane(), &mut last_admission_refusal,
                         ).await;
                     }
@@ -1177,6 +1177,7 @@ async fn handle_invoice_requested_gated(
     purpose: &str,
     privileged: bool,
     pricing: &Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
+    chain: &dyn ChainProvider,
     lightning: &Arc<dyn LightningProvider>,
     transport: &Arc<NoiseTransport>,
     recipient: &NodeId,
@@ -1210,85 +1211,48 @@ async fn handle_invoice_requested_gated(
             }
             return;
         }
-        // Exactly the first-contact chat price. Neither kind nor amount is
-        // requester-selected. No peer/storage/session dependency is present.
-        let Ok(Ok(price)) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            pricing.get_price_msat(ADMISSION_INVOICE_KIND),
-        )
-        .await
-        else {
-            return;
-        };
-        // Same rule as the signed introduction's display prices.
-        let (admission, message) = konsensus_core::introduction::first_contact_prices(price);
-        let description = format!("konsensus:{request_id}:message={message}");
-        let unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let Some(attempt_end) = admission_quote::expires_at(request_id, recipient, peer_id, unix)
-        else {
+        else { return; };
+        let (invoice, admission, description) = match prepare_admission_invoice(
+            pricing.as_ref(), chain, lightning.as_ref(), request_id, attempt_end,
+        ).await {
+            Ok(invoice) => invoice,
+            Err(reason) => {
+                if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
+                    send_invoice_refusal(transport, peer_id, request_id, reason).await;
+                }
+                return;
+            }
+        };
+        let Ok(signed) = invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>() else {
             return;
         };
-        // Reserve the entire backend RPC budget, since its invoice timestamp
-        // may be assigned near the end of that call, not at our request time.
-        let expiry = attempt_end.saturating_sub(unix).saturating_sub(5) as u32;
-        if expiry == 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        if signed.duration_since_epoch() > now
+            || signed.is_expired()
+            || signed
+                .expires_at()
+                .is_none_or(|end| end.as_secs() > attempt_end)
+            || signed.amount_milli_satoshis() != Some(admission)
+            || signed.description().to_string() != description
+            || signed.payment_hash().to_string() != invoice.payment_hash
+        {
             return;
         }
-        let invoice = tokio::time::timeout(
+        // The only response is the recipient's price (inside BOLT11) and
+        // invoice. An unpaid quote never promotes the connection.
+        let response = Frame::InvoiceResponse {
+            request_id: request_id.into(),
+            bolt11: invoice.bolt11,
+            payment_hash: invoice.payment_hash,
+        };
+        let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            lightning.create_stateless_invoice(admission, &description, expiry),
+            transport.send_frame(peer_id, &response),
         )
         .await;
-        if matches!(&invoice, Ok(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(reason))) if reason == "disk_low") {
-            if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
-                send_invoice_refusal(transport, peer_id, request_id, "disk_low").await;
-            }
-            return;
-        }
-        if matches!(&invoice, Ok(Err(konsensus_core::traits::lightning::LightningError::StatelessQuoteUnsupported))) {
-            let refusal = Frame::InvoiceError {
-                request_id: request_id.into(),
-                reason: "stateless_quote_unsupported".into(),
-            };
-            if last_admission_refusal.permit(source_ip, tokio::time::Instant::now()) {
-                let _ = transport.enqueue_control_frame(peer_id, &refusal).await;
-            }
-            return;
-        }
-        if let Ok(Ok(invoice)) = invoice {
-            let Ok(signed) = invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>() else {
-                return;
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            if signed.duration_since_epoch() > now
-                || signed.is_expired()
-                || signed
-                    .expires_at()
-                    .is_none_or(|end| end.as_secs() > attempt_end)
-                || signed.amount_milli_satoshis() != Some(admission)
-                || signed.description().to_string() != description
-                || signed.payment_hash().to_string() != invoice.payment_hash
-            {
-                return;
-            }
-            // The only response is the recipient's price (inside BOLT11) and
-            // invoice. An unpaid quote never promotes the connection.
-            let response = Frame::InvoiceResponse {
-                request_id: request_id.into(),
-                bolt11: invoice.bolt11,
-                payment_hash: invoice.payment_hash,
-            };
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                transport.send_frame(peer_id, &response),
-            )
-            .await;
-        }
         return;
     }
     if !privileged {
@@ -1353,6 +1317,7 @@ async fn handle_invoice_requested(
             let error_frame = Frame::InvoiceError {
                 request_id: request_id.to_string(),
                 reason: match e {
+                    konsensus_core::traits::lightning::LightningError::NotReady => konsensus_api::invoice_refusal::NOT_SYNCED.into(),
                     konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(reason) if reason == "disk_low" => reason,
                     e => format!("invoice creation failed: {e}"),
                 },
@@ -1362,6 +1327,66 @@ async fn handle_invoice_requested(
             }
         }
     }
+}
+
+/// Bounded payment preparation only: no invoice is issued until chain data is
+/// usable. Fixed refusal codes never expose backend URLs, credentials or errors.
+async fn prepare_admission_invoice(
+    pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
+    chain: &dyn ChainProvider,
+    lightning: &dyn LightningProvider,
+    request_id: &str,
+    attempt_end: u64,
+) -> Result<(konsensus_core::traits::lightning::Invoice, u64, String), &'static str> {
+    use konsensus_api::invoice_refusal::{CHAIN_UNAVAILABLE, NOT_SYNCED};
+    use konsensus_core::traits::lightning::LightningError;
+    let price = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        chain
+            .get_block_height()
+            .await
+            .map_err(|_| CHAIN_UNAVAILABLE)?;
+        if !chain.is_synced().await {
+            return Err(NOT_SYNCED);
+        }
+        pricing
+            .get_price_msat(ADMISSION_INVOICE_KIND)
+            .await
+            .map_err(|error| match error {
+                konsensus_core::traits::pricing::PricingError::ChainUnavailable(_) => {
+                    CHAIN_UNAVAILABLE
+                }
+                _ => "konsensus:price_unavailable",
+            })
+    })
+    .await
+    .map_err(|_| CHAIN_UNAVAILABLE)??;
+    let (admission, message) = konsensus_core::introduction::first_contact_prices(price);
+    let description = format!("konsensus:{request_id}:message={message}");
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expiry = attempt_end
+        .saturating_sub(unix)
+        .saturating_sub(5)
+        .min(u32::MAX as u64) as u32;
+    if expiry == 0 {
+        return Err("konsensus:quote_expired");
+    }
+    let invoice = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        lightning.create_stateless_invoice(admission, &description, expiry),
+    )
+    .await
+    .map_err(|_| "konsensus:invoice_unavailable")?
+    .map_err(|error| match error {
+        LightningError::NotReady => NOT_SYNCED,
+        LightningError::StatelessQuoteUnsupported => "stateless_quote_unsupported",
+        LightningError::PaymentNotDispatched(reason) if reason == "disk_low" => "disk_low",
+        LightningError::ChainSourceUnavailable { .. } => CHAIN_UNAVAILABLE,
+        _ => "konsensus:invoice_unavailable",
+    })?;
+    Ok((invoice, admission, description))
 }
 
 /// Refuse a peer's invoice request out loud: nothing is created on our wallet,

@@ -15,6 +15,8 @@ pub enum ApiError {
     OperationConflict(&'static str),
     #[error("Lightning is offline or synchronizing; retry when money_ready is true")]
     NotReady,
+    #[error("recipient is not ready to receive payments: {reason}")]
+    PeerNotReady { reason: &'static str },
 
     #[error("{source}")]
     RoutingFee { source: Box<ApiError>, max_routing_fee_msat: u64 },
@@ -123,6 +125,12 @@ impl ApiError {
         if let Self::OperationConflict(code) = self {
             return (StatusCode::CONFLICT, serde_json::json!({"error": code, "code": code}));
         }
+        if let Self::PeerNotReady { reason } = self {
+            return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                "error": self.to_string(), "code": "peer_not_ready",
+                "reason": reason, "retry_allowed": true
+            }));
+        }
         if matches!(self, Self::NotReady) {
             return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
                 "error": self.to_string(), "code": "not_ready", "money_ready": false
@@ -180,7 +188,7 @@ impl ApiError {
             }));
         }
         let (status, message) = match &self {
-            ApiError::Operation { .. } | ApiError::OperationConflict(_) | ApiError::NotReady | ApiError::RoutingFee { .. } | ApiError::Reasoned { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
+            ApiError::Operation { .. } | ApiError::OperationConflict(_) | ApiError::NotReady | ApiError::PeerNotReady { .. } | ApiError::RoutingFee { .. } | ApiError::Reasoned { .. } | ApiError::NotDispatched(_) | ApiError::PriceCapExceeded(_) | ApiError::BudgetExceeded(_) | ApiError::StatelessQuoteUnsupported => unreachable!(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),

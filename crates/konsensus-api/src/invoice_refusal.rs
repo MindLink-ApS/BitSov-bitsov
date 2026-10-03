@@ -26,6 +26,18 @@ pub const ADMISSION_REQUIRED: &str = "konsensus:admission_required";
 /// too recently (the unpaid admission path has source and global limits).
 pub const ADMISSION_RATE_LIMITED: &str = "konsensus:admission_rate_limited";
 
+/// Readiness refusals use the existing authenticated InvoiceError frame.
+pub const CHAIN_UNAVAILABLE: &str = "konsensus:not_ready:chain_unavailable";
+pub const NOT_SYNCED: &str = "konsensus:not_ready:not_synced";
+
+pub fn not_ready_reason(reason: &str) -> Option<&'static str> {
+    match reason {
+        CHAIN_UNAVAILABLE => Some("chain_unavailable"),
+        NOT_SYNCED => Some("not_synced"),
+        _ => None,
+    }
+}
+
 /// Bound on requests tracked at once. The compose paths cap their own pending
 /// requests far below this; past it, new requests go unbound (a refusal then
 /// times out as before) instead of growing the map.

@@ -452,3 +452,117 @@ async fn unsupported_quote_surfaces_code_without_payment() {
     assert_eq!(state.lightning.get_balance_msat().await.unwrap(), balance);
     refused.await.unwrap();
 }
+
+#[tokio::test]
+async fn not_ready_quote_and_compose_surface_reason_without_payment() {
+    use konsensus_api::state::InvoiceResponseError;
+    for reason in ["chain_unavailable", "not_synced"] {
+        for endpoint in [
+            "/api/v1/messages/compose",
+            "/api/v1/messages/first-contact/quote",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let wallet = Arc::new(
+                SharedMockProvider::new(&dir.path().join("payments.sqlite"), "payer", 100_000)
+                    .unwrap(),
+            );
+            let mut state = common::test_state_with_lightning(wallet);
+            let peer = NodeId::from_bytes([87; 32]);
+            Arc::get_mut(&mut state).unwrap().transport = Arc::new(
+                common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()),
+            );
+            let requests = state.invoice_requests.clone();
+            let refused = tokio::spawn(async move {
+                loop {
+                    let mut pending = requests.lock().await;
+                    if let Some(id) = pending.keys().next().cloned() {
+                        pending
+                            .remove(&id)
+                            .unwrap()
+                            .send(Err(InvoiceResponseError {
+                                recipient: peer,
+                                reason: format!("konsensus:not_ready:{reason}"),
+                            }))
+                            .unwrap();
+                        break;
+                    }
+                    drop(pending);
+                    tokio::task::yield_now().await;
+                }
+            });
+            let balance = state.lightning.get_balance_msat().await.unwrap();
+            let token = auth::create_token(
+                &state.identity.node_id().to_hex(),
+                &state.jwt_secret,
+                auth::Scope::all(),
+            )
+            .unwrap();
+            let response = common::test_router(state.clone()).oneshot(Request::builder().method("POST")
+        .uri(endpoint).header("authorization",format!("Bearer {token}"))
+        .header("content-type","application/json")
+        .body(Body::from(if endpoint.ends_with("/quote") {
+            serde_json::json!({"recipient":peer.to_hex()}).to_string()
+        } else {
+            serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"hello","max_total_msat":14000}).to_string()
+        })).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["code"], "peer_not_ready");
+            assert_eq!(error["reason"], reason);
+            assert_eq!(error["retry_allowed"], true);
+            assert!(state.invoice_requests.lock().await.is_empty());
+            assert!(!state.session_manager.has_session(&peer).await);
+            assert!(state.lightning.list_payments(10).await.unwrap().is_empty());
+            assert_eq!(state.lightning.get_balance_msat().await.unwrap(), balance);
+            refused.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_recipient_without_refusal_still_times_out_without_payment() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = Arc::new(
+        SharedMockProvider::new(&dir.path().join("payments.sqlite"), "payer", 100_000).unwrap(),
+    );
+    let mut state = common::test_state_with_lightning(wallet);
+    let peer = NodeId::from_bytes([88; 32]);
+    Arc::get_mut(&mut state).unwrap().transport = Arc::new(common::ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
+    let token = auth::create_token(
+        &state.identity.node_id().to_hex(),
+        &state.jwt_secret,
+        auth::Scope::all(),
+    )
+    .unwrap();
+    let start = tokio::time::Instant::now();
+    let response = common::test_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/messages/first-contact/quote")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"recipient":peer.to_hex()}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("timed out"));
+    assert!(start.elapsed() >= std::time::Duration::from_secs(30));
+    tokio::task::yield_now().await;
+    assert!(state.invoice_requests.lock().await.is_empty());
+    assert!(state.lightning.list_payments(10).await.unwrap().is_empty());
+}
