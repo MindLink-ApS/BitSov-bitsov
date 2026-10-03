@@ -766,3 +766,28 @@ fn owner_release_keeps_retry_record_if_bdk_eviction_persist_fails() {
 		first.input[0].previous_output
 	);
 }
+
+#[tokio::test(start_paused = true)]
+async fn signed_pending_funding_keeps_rebroadcasting_with_bounded_backoff() {
+    use lightning::chain::chaininterface::BroadcasterInterface;
+    let dir = tempfile::tempdir().unwrap();
+    let node = node(dir.path());
+    fund(&node.wallet);
+    let tx = funding(&node.wallet, 2);
+    assert!(tx.input.iter().all(|input| !input.witness.is_empty()));
+    let mut queue = node.tx_broadcaster.get_broadcast_queue().await;
+    node.tx_broadcaster.broadcast_transactions(&[&tx]);
+    assert_eq!(queue.try_recv().unwrap(), vec![tx.clone()]);
+    node.tx_broadcaster.broadcast_completed(&[tx.compute_txid()]);
+    for delay in [30, 60, 120, 240, 300, 300] {
+        tokio::time::advance(std::time::Duration::from_secs(delay - 1)).await;
+        node.tx_broadcaster.broadcast_transactions(&[&tx]);
+        assert!(queue.try_recv().is_err());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        node.tx_broadcaster.broadcast_transactions(&[&tx]);
+        assert_eq!(queue.try_recv().unwrap(), vec![tx.clone()]);
+        node.tx_broadcaster.broadcast_completed(&[tx.compute_txid()]);
+    }
+    // Scheduling never releases wallet ownership or treats a refusal as settlement.
+    assert!(node.local_spend_reservations().iter().any(|reservation| reservation.txid == tx.compute_txid()));
+}

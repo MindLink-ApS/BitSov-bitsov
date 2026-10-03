@@ -34,6 +34,7 @@ use crate::{BuildError, Error, NodeMetrics};
 pub(super) struct EsploraChainSource {
 	pub(super) sync_config: EsploraSyncConfig,
 	esplora_client: EsploraAsyncClient,
+	rate_limit: Arc<super::rate_limit::RateLimitedTransport>,
 	onchain_wallet_sync_status: Mutex<WalletSyncStatus>,
 	tx_sync: Arc<EsploraSyncClient<Arc<Logger>>>,
 	lightning_wallet_sync_status: Mutex<WalletSyncStatus>,
@@ -72,7 +73,8 @@ impl EsploraChainSource {
 		let http_client = esplora_http_client_builder(headers)?
 			.build()
 			.map_err(|_| BuildError::EsploraClientSetupFailed)?;
-		let esplora_client = EsploraAsyncClient::from_client(server_url, http_client);
+		let rate_limit = super::rate_limit::RateLimitedTransport::new(&server_url);
+		let esplora_client = EsploraAsyncClient::from_client(server_url, http_client).with_transport(rate_limit.clone());
 		let tx_sync =
 			Arc::new(EsploraSyncClient::from_client(esplora_client.clone(), Arc::clone(&logger)));
 
@@ -81,6 +83,7 @@ impl EsploraChainSource {
 		Ok(Self {
 			sync_config,
 			esplora_client,
+			rate_limit,
 			onchain_wallet_sync_status,
 			tx_sync,
 			lightning_wallet_sync_status,
@@ -92,14 +95,22 @@ impl EsploraChainSource {
 		})
 	}
 
+    pub(super) fn rate_limit_failure(&self) -> Option<super::sync_health::ChainSyncFailure> {
+        self.rate_limit.failure()
+    }
+    fn classify<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+        result.map_err(|error| if self.rate_limit.failure().is_some() { Error::ChainRateLimited } else { error })
+    }
+
 	pub(super) async fn sync_onchain_wallet(
 		&self, onchain_wallet: Arc<Wallet>,
 	) -> Result<(), Error> {
-		WalletSyncStatus::run(
+		let result = WalletSyncStatus::run(
 			&self.onchain_wallet_sync_status, Duration::from_secs(BDK_WALLET_SYNC_TIMEOUT_SECS),
 			Error::WalletOperationTimeout, self.sync_onchain_wallet_inner(onchain_wallet),
-		).await
-	}
+        ).await;
+        self.classify(result)
+    }
 
 	async fn sync_onchain_wallet_inner(&self, onchain_wallet: Arc<Wallet>) -> Result<(), Error> {
 		// If this is our first sync, do a full scan with the configured gap limit.
@@ -206,12 +217,13 @@ impl EsploraChainSource {
 		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
-		WalletSyncStatus::run(
+		let result = WalletSyncStatus::run(
 			&self.lightning_wallet_sync_status, Duration::from_secs(LDK_WALLET_SYNC_TIMEOUT_SECS),
 			Error::TxSyncTimeout,
 			self.sync_lightning_wallet_inner(channel_manager, chain_monitor, output_sweeper),
-		).await
-	}
+        ).await;
+        self.classify(result)
+    }
 
 	async fn sync_lightning_wallet_inner(
 		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
@@ -287,7 +299,7 @@ impl EsploraChainSource {
 		})?
 		.map_err(|e| {
 			log_error!(self.logger, "Failed to retrieve fee rate estimates: {}", e);
-			Error::FeerateEstimationUpdateFailed
+			if self.rate_limit.failure().is_some() { Error::ChainRateLimited } else { Error::FeerateEstimationUpdateFailed }
 		})?;
 
 		if estimates.is_empty() && self.config.network == Network::Bitcoin {
@@ -350,13 +362,36 @@ impl EsploraChainSource {
 		Ok(())
 	}
 
+    pub(super) async fn funding_present(&self, txid: Txid) -> Result<bool, Error> {
+        // /status may return 200 {"confirmed":false} for an unknown txid.
+        // get_tx_info uses /tx/{txid} and maps only its explicit 404 to None.
+        match self.esplora_client.get_tx_info(&txid).await {
+            Ok(tx) => Ok(tx.is_some()),
+            Err(_) => self.classify(Err(Error::TxSyncFailed)),
+        }
+    }
+
+    async fn broadcast_with_backoff(&self, tx: &Transaction) -> Result<Result<(), esplora_client::Error>, tokio::time::error::Elapsed> {
+        loop {
+            // A single bounded wait, never extended by another package or GET.
+            // The transport admits the following POST as its own recovery probe.
+            let delay = self.rate_limit.retry_delay().min(Duration::from_secs(300));
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let result = tokio::time::timeout(Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS), self.esplora_client.broadcast(tx)).await;
+            if matches!(&result, Ok(Err(esplora_client::Error::HttpResponse { status: 429, .. }))) {
+                // Retain this transaction while other packages progress independently.
+                continue;
+            }
+            return result;
+        }
+    }
+
 	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
 		for tx in &package {
 			let txid = tx.compute_txid();
-			let timeout_fut = tokio::time::timeout(
-				Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
-				self.esplora_client.broadcast(tx),
-			);
+            let timeout_fut = self.broadcast_with_backoff(tx);
 			match timeout_fut.await {
 				Ok(res) => match res {
 					Ok(()) => {
@@ -492,4 +527,253 @@ mod bitsov_request_tests {
 		assert!(matches!(result, Ok(Err(esplora_client::Error::Reqwest(ref error))) if error.is_timeout()));
 		assert_eq!(started.elapsed(), Duration::from_secs(10));
 	}
+}
+
+#[cfg(test)]
+mod bitsov_http_rate_tests {
+    use super::*;
+    use esplora_client::r#async::HttpTransport;
+    use std::collections::VecDeque;
+    type Reply = (&'static str, u16, Option<&'static str>, &'static str);
+    #[derive(Debug)]
+    struct Fixture {
+        limiter: Arc<super::super::rate_limit::RateLimitedTransport>,
+        replies: Mutex<VecDeque<Reply>>,
+        requests: Mutex<Vec<String>>,
+        posted: Mutex<Vec<Txid>>,
+        parked: Mutex<Option<Txid>>,
+    }
+    impl HttpTransport for Fixture {
+        fn execute(&self, request: reqwest::RequestBuilder) -> std::pin::Pin<Box<dyn std::future::Future<Output=Result<reqwest::Response, esplora_client::Error>> + Send + '_>> {
+            let request = request.build().unwrap();
+            let broadcast = request.method() == reqwest::Method::POST;
+            Box::pin(self.limiter.run(broadcast, move || async move {
+                let path = request.url().path().to_owned();
+                if request.method() == reqwest::Method::POST {
+                    let hex = std::str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+                    let tx: Transaction = bitcoin::consensus::encode::deserialize_hex(hex).unwrap();
+                    let txid = tx.compute_txid();
+                    self.posted.lock().unwrap().push(txid);
+                    if *self.parked.lock().unwrap() == Some(txid) {
+                        return Ok(http::Response::builder().status(429).header("retry-after", "86400").body("").unwrap().into());
+                    }
+                }
+                self.requests.lock().unwrap().push(path.clone());
+                let (expected, status, retry, body) = self.replies.lock().unwrap().pop_front().expect("unexpected HTTP request");
+                assert_eq!(path, expected);
+                let mut response = http::Response::builder().status(status);
+                if let Some(retry) = retry { response = response.header("retry-after", retry); }
+                Ok(response.body(body).unwrap().into())
+            }))
+        }
+    }
+    fn fixture(replies: Vec<Reply>) -> (tempfile::TempDir, crate::Node, EsploraChainSource, Arc<Fixture>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = crate::Builder::new();
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().to_owned());
+        let node = builder.build().unwrap();
+        let mut source = EsploraChainSource::new("https://user:secret@chain.invalid/api?private=secret".into(), HashMap::new(), EsploraSyncConfig::default(),
+            node.fee_estimator.clone(), node.kv_store.clone(), node.config.clone(), node.logger.clone(), node.node_metrics.clone()).unwrap();
+        let fixture = Arc::new(Fixture { limiter: source.rate_limit.clone(), replies: Mutex::new(replies.into()), requests: Mutex::new(vec![]), posted: Mutex::new(vec![]), parked: Mutex::new(None) });
+        source.esplora_client = EsploraAsyncClient::from_client("https://chain.invalid".into(), reqwest::Client::new()).with_transport(fixture.clone());
+        source.tx_sync = Arc::new(EsploraSyncClient::from_client(source.esplora_client.clone(), node.logger.clone()));
+        (dir, node, source, fixture)
+    }
+    #[tokio::test(start_paused = true)]
+    async fn real_fee_sync_funding_and_broadcast_calls_share_cooldown_and_recover() {
+        let (_dir, node, source, fixture) = fixture(vec![
+            ("/fee-estimates", 429, Some("120"), "private error text"),
+            ("/tx", 200, None, ""),
+            ("/fee-estimates", 200, None, "{\"1\":1.0}"),
+        ]);
+        assert_eq!(source.update_fee_rate_estimates().await, Err(Error::ChainRateLimited));
+        assert_eq!(source.sync_onchain_wallet(node.wallet.clone()).await, Err(Error::ChainRateLimited));
+        assert_eq!(source.sync_lightning_wallet(node.channel_manager.clone(), node.chain_monitor.clone(), node.output_sweeper.clone()).await, Err(Error::ChainRateLimited));
+        use bitcoin::hashes::Hash;
+        assert_eq!(source.funding_present(Txid::all_zeros()).await, Err(Error::ChainRateLimited));
+        assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+        let source = Arc::new(source);
+        let broadcast = source.clone();
+        let task = tokio::spawn(async move {
+            broadcast.process_broadcast_package(vec![Transaction { version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO, input: vec![], output: vec![] }]).await;
+        });
+        tokio::task::yield_now().await;
+        let remaining = source.rate_limit.retry_delay();
+        tokio::time::advance(remaining - Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        task.await.unwrap();
+        assert!(source.rate_limit_failure().is_none());
+        assert_eq!(source.update_fee_rate_estimates().await, Ok(()));
+        assert_eq!(fixture.requests.lock().unwrap().len(), 3);
+    }
+    #[tokio::test]
+    async fn funding_http_evidence_is_explicit_and_not_found_is_not_rate_limit() {
+        use bitcoin::hashes::Hash;
+        let path: &'static str = Box::leak(format!("/tx/{}", Txid::all_zeros()).into_boxed_str());
+        let unconfirmed = tx_info(false);
+        let confirmed = tx_info(true);
+        let (_dir, _node, source, fixture) = fixture(vec![
+            (path, 404, None, "not found"), (path, 200, None, "garbage"),
+            (path, 200, None, "{}"), (path, 401, None, "unavailable"),
+            (path, 200, None, unconfirmed),
+            (path, 200, None, confirmed), (path, 429, None, ""),
+        ]);
+        assert_eq!(source.funding_present(Txid::all_zeros()).await, Ok(false));
+        assert!(source.funding_present(Txid::all_zeros()).await.is_err());
+        assert!(source.funding_present(Txid::all_zeros()).await.is_err());
+        assert!(source.funding_present(Txid::all_zeros()).await.is_err());
+        assert_eq!(source.funding_present(Txid::all_zeros()).await, Ok(true));
+        assert_eq!(source.funding_present(Txid::all_zeros()).await, Ok(true));
+        assert_eq!(source.funding_present(Txid::all_zeros()).await, Err(Error::ChainRateLimited));
+        assert_eq!(fixture.requests.lock().unwrap().len(), 7);
+    }
+    fn tx_info(confirmed: bool) -> &'static str {
+        use bitcoin::hashes::Hash;
+        Box::leak(format!(r#"{{"txid":"{}","version":2,"locktime":0,"vin":[],"vout":[],"size":10,"weight":40,"fee":0,"status":{{"confirmed":{confirmed}}}}}"#, Txid::all_zeros()).into_boxed_str())
+    }
+    #[derive(Debug, Default)]
+    struct AbsentTransport(std::sync::atomic::AtomicUsize);
+    impl HttpTransport for AbsentTransport {
+        fn execute(&self, _: reqwest::RequestBuilder) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<reqwest::Response, esplora_client::Error>> + Send + '_>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(http::Response::builder().status(404).body("not found").unwrap().into()) })
+        }
+    }
+    #[tokio::test]
+    async fn empty_esplora_source_never_attempts_presence_request() {
+        use bitcoin::hashes::Hash;
+        let (_dir, _node, mut source, _) = fixture(vec![]);
+        for url in ["", " ", "/"] {
+            let transport = Arc::new(AbsentTransport::default());
+            source.esplora_client = EsploraAsyncClient::from_client(url.into(), reqwest::Client::new())
+                .with_transport(transport.clone());
+            let direct = source.esplora_client.get_tx_info(&Txid::all_zeros()).await;
+            let funding = source.funding_present(Txid::all_zeros()).await;
+            assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 0, "unconfigured URL {url:?} reached HTTP transport");
+            assert!(direct.is_err());
+            assert_eq!(funding, Err(Error::TxSyncFailed));
+        }
+    }
+    #[tokio::test]
+    async fn implicit_default_source_never_attempts_funding_request() {
+        use bitcoin::hashes::Hash;
+        let (_dir, mut node, mut source, _) = fixture(vec![]);
+        let transport = Arc::new(AbsentTransport::default());
+        source.esplora_client = source.esplora_client.clone().with_transport(transport.clone());
+        // Preserve the real builder's funding policy while replacing HTTP with
+        // an in-memory 404. Other node components retain the original Arc.
+        let verifier = node.chain_source.funding_verifier.read().unwrap().clone();
+        node.chain_source = Arc::new(super::super::ChainSource {
+            kind: super::super::ChainSourceKind::Esplora(source),
+            sync_health: RwLock::new(super::super::SyncHealth::default()),
+            funding_verifier: RwLock::new(verifier), tx_broadcaster: node.tx_broadcaster.clone(), logger: node.logger.clone(),
+        });
+        // All provider callers and ghost suppression share this lookup.
+        let funding = node.funding_present(Txid::all_zeros()).await;
+        assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(funding, Err(Error::TxSyncFailed));
+    }
+    fn transaction(locktime: u32) -> Transaction {
+        Transaction { version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::from_consensus(locktime), input: vec![], output: vec![] }
+    }
+    #[tokio::test]
+    async fn unknown_status_is_not_presence_evidence_for_any_node_caller() {
+        use bitcoin::hashes::Hash;
+        let txid = Txid::all_zeros();
+        let status = Box::leak(format!("/tx/{txid}/status").into_boxed_str());
+        let info = Box::leak(format!("/tx/{txid}").into_boxed_str());
+        let (_dir, mut node, source, _) = fixture(vec![
+            (status, 200, None, r#"{"confirmed":false}"#), (info, 404, None, "not found"),
+        ]);
+        assert!(!source.esplora_client.get_tx_status(&txid).await.unwrap().confirmed);
+        node.chain_source = Arc::new(super::super::ChainSource {
+            kind: super::super::ChainSourceKind::Esplora(source),
+            sync_health: RwLock::new(super::super::SyncHealth::default()),
+            funding_verifier: RwLock::new(None), tx_broadcaster: node.tx_broadcaster.clone(), logger: node.logger.clone(),
+        });
+        // #192 balances and reservation reconciliation both use this public API.
+        assert_eq!(node.funding_present(txid).await, Ok(false));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn huge_retry_after_allows_post_probe_within_300_seconds() {
+        let (_dir, _node, source, fixture) = fixture(vec![
+            ("/tx", 429, Some("86400"), ""), ("/tx", 200, None, ""),
+        ]);
+        let started = tokio::time::Instant::now();
+        assert!(tokio::time::timeout(Duration::from_secs(301), source.process_broadcast_package(vec![transaction(0)])).await.is_ok());
+        assert!(started.elapsed() <= Duration::from_secs(300));
+        assert_eq!(fixture.posted.lock().unwrap().len(), 2);
+        assert!(source.rate_limit_failure().is_none());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn newer_cooldown_cannot_extend_a_waiting_post_deadline() {
+        let (_dir, _node, source, fixture) = fixture(vec![
+            ("/fee-estimates", 429, Some("300"), ""), ("/tx", 200, None, ""),
+        ]);
+        assert_eq!(source.update_fee_rate_estimates().await, Err(Error::ChainRateLimited));
+        let source = Arc::new(source);
+        let broadcaster = source.clone();
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move { broadcaster.process_broadcast_package(vec![transaction(0)]).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(299)).await;
+        // Model a different in-flight package receiving a fresh 429 just before
+        // this POST's wait expires. Its header cannot move our deadline.
+        assert!(source.rate_limit.run(true, || async {
+            Ok(http::Response::builder().status(429).header("retry-after", "86400").body("").unwrap().into())
+        }).await.is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::timeout(Duration::from_secs(1), task).await.expect("POST deadline must not move").expect("broadcast task");
+        assert!(started.elapsed() <= Duration::from_secs(300));
+        assert_eq!(*fixture.posted.lock().unwrap(), vec![transaction(0).compute_txid()]);
+        // A successful POST does not clear the newer GET cooldown.
+        assert!(source.rate_limit_failure().is_some());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn parked_package_does_not_block_new_sweep_and_survives_worker_restart() {
+        use lightning::chain::chaininterface::BroadcasterInterface;
+        let (_dir, node, source, fixture) = fixture(vec![("/tx", 200, None, ""), ("/tx", 200, None, "")]);
+        let parked = transaction(0);
+        let mut sweep = transaction(1);
+        // A justice/sweep input spends a commitment output, not funding.
+        sweep.input.push(bitcoin::TxIn { previous_output: bitcoin::OutPoint { txid: transaction(2).compute_txid(), vout: 0 }, ..Default::default() });
+        *fixture.parked.lock().unwrap() = Some(parked.compute_txid());
+        let chain = Arc::new(super::super::ChainSource {
+            kind: super::super::ChainSourceKind::Esplora(source),
+            sync_health: RwLock::new(super::super::SyncHealth::default()),
+            funding_verifier: RwLock::new(None), tx_broadcaster: node.tx_broadcaster.clone(), logger: node.logger.clone(),
+        });
+        let (stop, receiver) = tokio::sync::watch::channel(());
+        let worker_chain = chain.clone();
+        let manager = node.channel_manager.clone();
+        let monitor = node.chain_monitor.clone();
+        node.tx_broadcaster.broadcast_transactions(&[&parked]);
+        let worker = tokio::spawn(async move { worker_chain.continuously_process_broadcast_queue(receiver, manager, monitor).await });
+        for _ in 0..20 { tokio::task::yield_now().await; }
+        assert_eq!(*fixture.posted.lock().unwrap(), vec![parked.compute_txid()]);
+        node.tx_broadcaster.broadcast_transactions(&[&sweep]);
+        for _ in 0..20 { tokio::task::yield_now().await; }
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..40 { tokio::task::yield_now().await; }
+        assert!(fixture.posted.lock().unwrap().contains(&sweep.compute_txid()), "a repeated 429 on one package must not withhold a new justice/sweep POST");
+        stop.send(()).unwrap();
+        worker.await.unwrap();
+        assert_eq!(node.tx_broadcaster.interrupted_broadcasts(), vec![vec![parked.clone()]]);
+        *fixture.parked.lock().unwrap() = None;
+        let manager = node.channel_manager.clone();
+        let monitor = node.chain_monitor.clone();
+        let worker = tokio::spawn(async move { chain.continuously_process_broadcast_queue(stop.subscribe(), manager, monitor).await });
+        for _ in 0..20 { tokio::task::yield_now().await; }
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..40 { tokio::task::yield_now().await; }
+        assert!(node.tx_broadcaster.interrupted_broadcasts().is_empty());
+        assert_eq!(fixture.posted.lock().unwrap().iter().filter(|&&id| id == sweep.compute_txid()).count(), 1);
+        worker.abort();
+        let _ = worker.await;
+    }
+
 }

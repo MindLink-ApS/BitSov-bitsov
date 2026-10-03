@@ -8,6 +8,8 @@
 mod bitcoind;
 mod electrum;
 mod esplora;
+mod broadcast;
+mod rate_limit;
 pub(crate) mod sync_health;
 mod sync_retry;
 use sync_health::{ChainSyncFailure, SyncHealth};
@@ -106,9 +108,12 @@ impl Drop for WalletSyncGuard<'_> {
 	}
 }
 
+type FundingVerifier = Arc<dyn Fn(Txid) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, Error>> + Send>> + Send + Sync>;
+
 pub(crate) struct ChainSource {
 	kind: ChainSourceKind,
 	sync_health: RwLock<SyncHealth>,
+	funding_verifier: RwLock<Option<FundingVerifier>>,
 	tx_broadcaster: Arc<Broadcaster>,
 	logger: Arc<Logger>,
 }
@@ -120,9 +125,30 @@ enum ChainSourceKind {
 }
 
 impl ChainSource {
+    pub(crate) fn set_funding_verifier<F, Fut>(&self, verify: F)
+    where F: Fn(Txid) -> Fut + Send + Sync + 'static,
+          Fut: std::future::Future<Output = Result<bool, Error>> + Send + 'static {
+        *self.funding_verifier.write().unwrap() = Some(Arc::new(move |txid| Box::pin(verify(txid))));
+    }
+    pub(crate) async fn funding_present(&self, txid: Txid) -> Result<bool, Error> {
+        let verifier = self.funding_verifier.read().unwrap().clone();
+        if let Some(verifier) = verifier { return verifier(txid).await; }
+        match &self.kind {
+            ChainSourceKind::Esplora(source) => source.funding_present(txid).await,
+            _ => Err(Error::TxSyncFailed), // Missing indexed evidence is inconclusive.
+        }
+    }
+
 	pub(crate) fn sync_failure(&self) -> Option<ChainSyncFailure> {
 		match &self.kind {
 			ChainSourceKind::Bitcoind(source) => source.sync_failure(),
+            ChainSourceKind::Esplora(source) => {
+                let failure = self.sync_health.read().unwrap().failure();
+                source.rate_limit_failure().map(|mut limited| {
+                    if let Some(previous) = failure { limited.since = limited.since.min(previous.since); }
+                    limited
+                }).or(failure)
+            },
 			_ => self.sync_health.read().unwrap().failure(),
 		}
 	}
@@ -144,7 +170,7 @@ impl ChainSource {
 			node_metrics,
 		)?;
 		let kind = ChainSourceKind::Esplora(esplora_chain_source);
-		Ok((Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, None))
+		Ok((Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()), funding_verifier: RwLock::new(None) }, None))
 	}
 
 	pub(crate) fn new_electrum(
@@ -163,7 +189,7 @@ impl ChainSource {
 			node_metrics,
 		);
 		let kind = ChainSourceKind::Electrum(electrum_chain_source);
-		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, None)
+		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()), funding_verifier: RwLock::new(None) }, None)
 	}
 
 	pub(crate) async fn new_bitcoind_rpc(
@@ -185,7 +211,7 @@ impl ChainSource {
 		);
 		let best_block = bitcoind_chain_source.poll_best_block().await.ok();
 		let kind = ChainSourceKind::Bitcoind(bitcoind_chain_source);
-		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, best_block)
+		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()), funding_verifier: RwLock::new(None) }, best_block)
 	}
 
 	pub(crate) async fn new_bitcoind_rest(
@@ -208,7 +234,7 @@ impl ChainSource {
 		);
 		let best_block = bitcoind_chain_source.poll_best_block().await.ok();
 		let kind = ChainSourceKind::Bitcoind(bitcoind_chain_source);
-		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()) }, best_block)
+		(Self { kind, tx_broadcaster, logger, sync_health: RwLock::new(SyncHealth::default()), funding_verifier: RwLock::new(None) }, best_block)
 	}
 
 	pub(crate) fn start(&self, runtime: Arc<Runtime>) -> Result<(), Error> {
@@ -354,7 +380,7 @@ impl ChainSource {
 				unreachable!("Onchain wallet will be synced via chain polling")
 			},
 		};
-		self.sync_health.write().unwrap().record(0, result.is_ok());
+		self.sync_health.write().unwrap().record_result(0, &result);
 		result
 	}
 
@@ -381,7 +407,7 @@ impl ChainSource {
 				unreachable!("Lightning wallet will be synced via chain polling")
 			},
 		};
-		self.sync_health.write().unwrap().record(1, result.is_ok());
+		self.sync_health.write().unwrap().record_result(1, &result);
 		result
 	}
 
@@ -427,36 +453,62 @@ impl ChainSource {
 		}
 	}
 
-	pub(crate) async fn continuously_process_broadcast_queue(
-		&self, mut stop_tx_bcast_receiver: tokio::sync::watch::Receiver<()>,
-	) {
-		let mut receiver = self.tx_broadcaster.get_broadcast_queue().await;
-		loop {
-			let tx_bcast_logger = Arc::clone(&self.logger);
-			tokio::select! {
-				_ = stop_tx_bcast_receiver.changed() => {
-					log_debug!(
-						tx_bcast_logger,
-						"Stopping broadcasting transactions.",
-					);
-					return;
-				}
-				Some(next_package) = receiver.recv() => {
-					match &self.kind {
-						ChainSourceKind::Esplora(esplora_chain_source) => {
-							esplora_chain_source.process_broadcast_package(next_package).await
-						},
-						ChainSourceKind::Electrum(electrum_chain_source) => {
-							electrum_chain_source.process_broadcast_package(next_package).await
-						},
-						ChainSourceKind::Bitcoind(bitcoind_chain_source) => {
-							bitcoind_chain_source.process_broadcast_package(next_package).await
-						},
-					}
-				}
-			}
-		}
-	}
+    pub(crate) async fn continuously_process_broadcast_queue(
+        self: &Arc<Self>, mut stop_tx_bcast_receiver: tokio::sync::watch::Receiver<()>,
+        channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
+    ) {
+        let mut receiver = self.tx_broadcaster.get_broadcast_queue().await;
+        // JoinSet aborts all child futures if this worker is cancelled. Only this
+        // worker clears ownership on completion; interrupted packages survive.
+        let mut packages = tokio::task::JoinSet::new();
+        let start_package = |package: Vec<bitcoin::Transaction>, packages: &mut tokio::task::JoinSet<Vec<Txid>>| {
+            self.tx_broadcaster.begin_broadcast(&package);
+            let source = Arc::clone(self);
+            let manager = Arc::clone(&channel_manager);
+            let monitor = Arc::clone(&chain_monitor);
+            packages.spawn(async move { source.process_broadcast_package(package, manager, monitor).await });
+        };
+        for package in self.tx_broadcaster.interrupted_broadcasts() {
+            start_package(package, &mut packages);
+        }
+        loop {
+            tokio::select! {
+                _ = stop_tx_bcast_receiver.changed() => {
+                    log_debug!(self.logger, "Stopping broadcasting transactions.");
+                    return;
+                }
+                Some(next_package) = receiver.recv() => {
+                    start_package(next_package, &mut packages);
+                }
+                Some(result) = packages.join_next(), if !packages.is_empty() => {
+                    match result {
+                        Ok(txids) => self.tx_broadcaster.broadcast_completed(&txids),
+                        // Preserve all outstanding packages for the next worker.
+                        Err(error) => std::panic::resume_unwind(error.into_panic()),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn process_broadcast_package(
+        &self, package: Vec<bitcoin::Transaction>,
+        channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
+    ) -> Vec<Txid> {
+        let txids = package.iter().map(bitcoin::Transaction::compute_txid).collect();
+        let open: std::collections::HashSet<_> = channel_manager.list_channels().iter().map(|ch| ch.channel_id).collect();
+        let closed = chain_monitor.list_monitors().into_iter().filter(|id| !open.contains(id))
+            .filter_map(|id| chain_monitor.get_monitor(id).ok().map(|monitor| monitor.get_funding_txo().into_bitcoin_outpoint()))
+            .collect();
+        let package = broadcast::eligible_package(package, &closed, |id| self.funding_present(id)).await;
+        match &self.kind {
+            ChainSourceKind::Esplora(source) => source.process_broadcast_package(package).await,
+            ChainSourceKind::Electrum(source) => source.process_broadcast_package(package).await,
+            ChainSourceKind::Bitcoind(source) => source.process_broadcast_package(package).await,
+        }
+        txids
+    }
+
 }
 
 impl Filter for ChainSource {

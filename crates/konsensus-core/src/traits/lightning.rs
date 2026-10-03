@@ -310,6 +310,7 @@ pub enum WalletSync {
 #[serde(rename_all = "snake_case")]
 pub enum ChainSyncErrorKind {
     SyncFailed,
+    RateLimited,
 }
 
 /// An observed failure, not an inference from a stale timestamp or a pruned node.
@@ -890,5 +891,17 @@ mod routing_fee_policy_tests {
         let p = RoutingFeePolicy { minimum_msat: 300, proportional_millionths: u64::MAX, maximum_msat: 700 };
         assert_eq!(p.ceiling(u64::MAX, None), 700);
         assert_eq!(p.ceiling(u64::MAX, Some(500)), 500);
+    }
+}
+
+#[cfg(test)]
+mod chain_rate_limit_tests {
+    use super::*;
+    #[test]
+    fn owner_status_serializes_rate_limited_kind() {
+        let status = ChainSyncStatus::Stalled { since: 123, last_error_kind: ChainSyncErrorKind::RateLimited };
+        assert_eq!(serde_json::to_value(status).unwrap(), serde_json::json!({
+            "state": "stalled", "since": 123, "last_error_kind": "rate_limited"
+        }));
     }
 }

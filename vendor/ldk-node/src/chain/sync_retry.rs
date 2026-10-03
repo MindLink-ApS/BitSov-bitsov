@@ -40,6 +40,7 @@ pub(super) async fn run<F, Fut>(
 				// detailed logger writes to a file. One line per failed attempt;
 				// the retry delay bounds log rate to at most once/10s per worker.
 				let kind = match error {
+                    Error::ChainRateLimited => "rate_limited",
 					Error::WalletOperationTimeout
 					| Error::TxSyncTimeout
 					| Error::FeerateEstimationUpdateTimeout => "timeout",
@@ -55,7 +56,7 @@ pub(super) async fn run<F, Fut>(
 }
 
 #[cfg(test)]
-mod bitsov_retry_tests {
+pub(crate) mod bitsov_retry_tests {
 	use super::*;
 	use crate::chain::{sync_health::SyncHealth, WalletSyncStatus};
 	use std::sync::{Arc, Mutex};
@@ -75,10 +76,18 @@ mod bitsov_retry_tests {
 	}
 	static LOG: Capture = Capture(Mutex::new(Vec::new()));
 
+    pub(crate) fn capture_logs() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            log::set_logger(&LOG).unwrap();
+            log::set_max_level(log::LevelFilter::Error);
+        });
+    }
+    pub(crate) fn captured_logs() -> Vec<String> { LOG.0.lock().unwrap().clone() }
+
 	#[tokio::test(start_paused = true)]
 	async fn errors_back_off_cap_recover_and_log_without_busy_loop() {
-		log::set_logger(&LOG).unwrap();
-		log::set_max_level(log::LevelFilter::Error);
+        capture_logs();
 		let (stop, receiver) = tokio::sync::watch::channel(());
 		let times = Arc::new(Mutex::new(Vec::new()));
 		let health = Arc::new(Mutex::new(SyncHealth::default()));
