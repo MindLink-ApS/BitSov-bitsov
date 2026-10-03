@@ -908,6 +908,10 @@ async fn unmetered_money_routes_refuse_a_paired_grant() {
             "/api/v1/payments/open-channel",
             json!({"peer_pubkey": OTHER_LN, "peer_addr": "127.0.0.1:9735", "amount_sats": 20000}),
         ),
+        (
+            "/api/v1/payments/release-local-spend",
+            json!({"txid": "ab".repeat(32)}),
+        ),
     ] {
         let (status, err) = fx.call("POST", uri, Some(body), Some(&token)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {err}");

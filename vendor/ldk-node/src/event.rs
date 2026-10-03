@@ -557,6 +557,7 @@ where
 					locktime,
 				) {
 					Ok(final_tx) => {
+						let prepared_tx = final_tx.clone();
 						let needs_manual_broadcast =
 							self.liquidity_source.as_ref().map_or(false, |ls| {
 								ls.as_ref().lsps2_channel_needs_manual_broadcast(
@@ -586,6 +587,9 @@ where
 							)
 						};
 
+						if result.is_err() {
+							self.wallet.abandon_funding(&prepared_tx).map_err(|_| ReplayEvent())?;
+						}
 						match result {
 							Ok(()) => {},
 							Err(APIError::APIMisuseError { err }) => {
@@ -613,6 +617,8 @@ where
 						}
 					},
 					Err(err) => {
+						// create_funding_transaction abandons its reservation before
+						// returning a persistence error: no tx has reached LDK yet.
 						log_error!(self.logger, "Failed to create funding transaction: {}", err);
 						self.channel_manager
 							.force_close_broadcasting_latest_txn(
@@ -1580,7 +1586,9 @@ where
 					},
 				};
 			},
-			LdkEvent::DiscardFunding { .. } => {},
+			LdkEvent::DiscardFunding { funding_info, .. } => {
+				self.wallet.discard_funding(funding_info).map_err(|_| ReplayEvent())?;
+			},
 			LdkEvent::HTLCIntercepted {
 				requested_next_hop_scid,
 				intercept_id,
@@ -1651,7 +1659,16 @@ where
 					BumpTransactionEvent::HTLCResolution { .. } => {},
 				}
 
-				self.bump_tx_event_handler.handle_event(&bte).await;
+				// Do not wait for the owner gate on the event-processing thread:
+				// a pending funding handshake may need later events to complete.
+				// LDK regenerates unresolved bump events after restart. Runtime
+				// tracks this non-cancellable task through orderly shutdown.
+				let handler = Arc::clone(&self.bump_tx_event_handler);
+				let gate = Arc::clone(&self.wallet.operation_lock);
+				self.runtime.spawn_background_task(async move {
+					let _guard = gate.lock().await;
+					handler.handle_event(&bte).await;
+				});
 			},
 			LdkEvent::OnionMessageIntercepted { peer_node_id, message } => {
 				if let Some(om_mailbox) = self.om_mailbox.as_ref() {
@@ -1980,7 +1997,7 @@ mod tests {
 mod bitsov_stateless_tests {
     use super::*;
     use bitcoin::hashes::Hash;
-    use lightning::events::bump_transaction::Wallet as LdkWallet;
+    use crate::wallet::bump::BumpWallet as LdkWallet;
 
     #[derive(Default)]
     struct ClaimLog(std::sync::Mutex<Vec<String>>);
