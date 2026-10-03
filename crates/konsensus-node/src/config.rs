@@ -359,6 +359,9 @@ impl Default for NetworkConfig {
 /// instead of `lsp_node_id`) from being silently ignored with a default value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "backend", deny_unknown_fields)]
+// Config is parsed once at startup; boxing a variant would only complicate the
+// internally tagged serde shape for no runtime benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum LightningConfig {
     /// Legacy LNbits HTTP REST API. Fee-limited payments fail closed because
     /// LNbits cannot enforce per-payment routing-fee ceilings. Selecting this
