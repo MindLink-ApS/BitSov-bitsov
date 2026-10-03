@@ -30,6 +30,10 @@ A redirected file descriptor cannot follow application-managed renames, and an
 external writer can bypass these bounds. Use the shipped
 [user service example](konsensus.service), which sends stdout and stderr to the
 journal. Upgrading the binary cannot change an existing supervisor's redirection.
+On Unix, startup detects stdout or stderr pointing at the same inode/device as
+`node.log`, skips the node file writer, and emits one warning on stdout to remove
+the launcher redirect. Logging continues on stdout; the redirected file remains
+unbounded until the launcher is fixed. This check cannot detect a downstream `tee`.
 Other CLI commands continue to log only to stdout.
 
 Journald retention is configured separately by the host administrator. For example,

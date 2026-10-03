@@ -12,6 +12,19 @@ impl FileLogging {
         path: &std::path::Path,
         config: LoggingConfig,
     ) -> std::io::Result<()> {
+        // Check before open(): it can trim existing logs, while an inherited
+        // launcher fd would keep writing to the old inode after rotation.
+        #[cfg(unix)]
+        if launcher_redirects_to(path) {
+            use std::io::Write;
+            // This startup warning must remain visible even with RUST_LOG=off.
+            // Write only to stdout so a shared stdout/stderr fd cannot duplicate it.
+            let _ = writeln!(
+                std::io::stdout().lock(),
+                "WARNING: stdout or stderr already redirects to node.log; file logging disabled; remove the launcher redirect to enable bounded log rotation"
+            );
+            return Ok(());
+        }
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
@@ -19,6 +32,29 @@ impl FileLogging {
         *self.0.lock().expect("file logging lock poisoned") = Some(writer);
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn launcher_redirects_to(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    [libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        .into_iter()
+        .any(|fd| {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: fstat writes to a valid stat buffer. We only read it on
+            // success, and neither take ownership of nor close the inherited fd.
+            let stat = unsafe {
+                if libc::fstat(fd, stat.as_mut_ptr()) != 0 {
+                    return false;
+                }
+                stat.assume_init()
+            };
+            stat.st_dev as u64 == metadata.dev() && stat.st_ino as u64 == metadata.ino()
+        })
 }
 
 pub(crate) fn init() -> FileLogging {
@@ -145,6 +181,108 @@ mod tests {
 #[cfg(test)]
 mod file_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_redirect_skips_file_writer_and_warns_once() {
+        const CHILD: &str = "BITSOV_TEST_LAUNCHER_LOG_REDIRECT";
+        if std::env::var_os(CHILD).is_some() {
+            let handle = init();
+            handle
+                .enable(
+                    std::path::Path::new("node.log"),
+                    LoggingConfig {
+                        max_file_size_bytes: 256.try_into().unwrap(),
+                        max_files: 3.try_into().unwrap(),
+                    },
+                )
+                .unwrap();
+            tracing::warn!("launcher-redirect-canary");
+            return;
+        }
+
+        for (mode, filter) in [
+            ("stdout", "warn"),
+            ("stderr", "warn"),
+            ("both", "warn"),
+            ("hardlink", "warn"),
+            ("both", "off"),
+            ("unrelated", "warn"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let log_path = dir.path().join("node.log");
+            let redirected = mode != "unrelated";
+            // A matched redirect must be detected before open() can truncate
+            // an oversized existing log or rotate a newly written record.
+            let existing = "legacy launcher output\n".repeat(32);
+            std::fs::write(&log_path, if redirected { &existing } else { "" }).unwrap();
+            let redirect_path = dir.path().join("launcher.log");
+            if mode == "hardlink" {
+                std::fs::hard_link(&log_path, &redirect_path).unwrap();
+            }
+            let redirect_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(if matches!(mode, "hardlink" | "unrelated") {
+                    &redirect_path
+                } else {
+                    &log_path
+                })
+                .unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "logging::file_tests::launcher_redirect_skips_file_writer_and_warns_once",
+                    "--nocapture",
+                ])
+                .current_dir(dir.path())
+                .env(CHILD, "1")
+                .env("RUST_LOG", filter);
+            if mode != "stderr" {
+                command.stdout(redirect_file.try_clone().unwrap());
+            }
+            if matches!(mode, "stderr" | "both") {
+                command.stderr(redirect_file);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "mode={mode}: {output:?}");
+            let log = std::fs::read_to_string(&log_path).unwrap();
+            let console = if mode == "stderr" {
+                String::from_utf8(output.stdout).unwrap()
+            } else if matches!(mode, "hardlink" | "unrelated") {
+                std::fs::read_to_string(&redirect_path).unwrap()
+            } else {
+                log.clone()
+            };
+            assert_eq!(
+                console.matches("launcher-redirect-canary").count(),
+                usize::from(filter != "off"),
+                "mode={mode}: {console}"
+            );
+            assert_eq!(
+                console.matches("remove the launcher redirect").count(),
+                usize::from(redirected),
+                "mode={mode}: {console}"
+            );
+            assert!(!dir.path().join("node.log.1").exists(), "mode={mode}");
+            if redirected {
+                assert!(
+                    log.starts_with(&existing),
+                    "mode={mode}: existing log was truncated"
+                );
+                if mode == "stderr" {
+                    assert_eq!(
+                        log, existing,
+                        "stderr-only redirect must leave logging on stdout"
+                    );
+                }
+            } else {
+                assert_eq!(log.matches("launcher-redirect-canary").count(), 1);
+            }
+        }
+    }
+
     #[test]
     fn node_file_rotates_and_plaintext_never_reaches_outputs() {
         const CHILD: &str = "BITSOV_TEST_ROTATING_NODE_LOG";
