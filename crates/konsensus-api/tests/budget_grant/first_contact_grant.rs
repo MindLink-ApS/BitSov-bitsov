@@ -10,6 +10,81 @@ use super::*;
 use konsensus_api::state::InvoiceResponseData;
 use konsensus_lightning::shared_mock::SharedMockProvider;
 
+async fn remote_approval_status(fx: &Fx, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
+    use axum::extract::connect_info::MockConnectInfo;
+    let app = konsensus_api::build_remote_router(fx.state.clone())
+        .layer(MockConnectInfo("127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap()));
+    let mut request = Request::builder().uri(uri);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app.oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+    let status = response.status();
+    if status == StatusCode::OK {
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+// The control handler is the same boundary the owner CLI reaches over its
+// Unix socket; HTTP below is exercised in-process, with no socket or receipt.
+#[tokio::test(start_paused = true)]
+async fn remote_owner_approval_is_readable_only_by_its_client_and_consumed_once() {
+    let s = stranger(2000).await;
+    let read = s.fx.token().await;
+    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
+    let op = s.fx.service.grant_view_for(&s.fx.client_id).unwrap().op_id;
+    let uri = format!("/api/v1/pair/first-contact-grant/{op}?recipient={}", s.peer);
+    let (status, body) = remote_approval_status(&s.fx, &uri, Some(&read)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "pending");
+    assert_eq!(body["approval_window_secs"], 300);
+    assert_ne!(remote_approval_status(&s.fx, &uri, None).await.0, StatusCode::OK);
+    // Issue a token for another client under THIS node's auth key.
+    s.fx.service.open_pairing_window(std::time::Duration::from_secs(300));
+    let key = SigningKey::from_bytes(&[99; 32]);
+    let other = s.fx.service.create_verified_remote_pairing(
+        "other", &hex::encode(key.verifying_key().to_bytes()), &[98; 32]).unwrap();
+    let challenge = s.fx.service.issue_token_challenge(&other.client_id).unwrap();
+    let (_, issued) = s.fx.call("POST", "/api/v1/pair/token", Some(json!({
+        "client_id": other.client_id, "challenge": challenge,
+        "signature": hex::encode(key.sign(challenge.as_bytes()).to_bytes())
+    })), None).await;
+    let other_token = issued["token"].as_str().unwrap();
+    assert_eq!(remote_approval_status(&s.fx, &uri, Some(other_token)).await.0, StatusCode::NOT_FOUND);
+    let (status, body) = s.send(&token, Some(4000)).await;
+    assert_budget_exceeded(status, &body, "first_contact");
+    assert_eq!(s.spent().await, 0);
+    let before = chrono::Utc::now().timestamp();
+    let result = control::handle(&s.fx.control(), ControlRequest::ApproveFirstContact {
+        client_id: s.fx.client_id.clone(), grant_op_id: op.clone(),
+        recipient: s.peer.to_hex(), max_total_msat: 4000, contact_budget_msat: None,
+    });
+    assert!(matches!(result, ControlResponse::Ok { .. }), "{result:?}");
+    for _ in 0..2 {
+        let (status, body) = remote_approval_status(&s.fx, &uri, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "approved");
+        assert_eq!(body["grant_op_id"], op);
+        assert_eq!(body["recipient"], s.peer.to_hex());
+        assert_eq!(body["approval"]["max_total_msat"], 4000);
+        assert!(body["approval"]["expires_at"].as_i64().unwrap() >= before + 300);
+        assert_eq!(s.spent().await, 0, "polling never pays");
+    }
+    let wrong = format!("/api/v1/pair/first-contact-grant/{op}?recipient={}", "ff".repeat(32));
+    assert_eq!(remote_approval_status(&s.fx, &wrong, Some(&token)).await.1["state"], "pending");
+    let (status, body) = s.send(&token, Some(4000)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(s.spent().await, 4000);
+    assert_eq!(s.fx.used(), 4000);
+    assert_eq!(remote_approval_status(&s.fx, &uri, Some(&token)).await.1["state"], "consumed");
+    assert!(s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()).is_none());
+    s.fx.grant(None, GrantTerms::new(10_000)).await;
+    let fresh = s.fx.token().await;
+    assert_eq!(remote_approval_status(&s.fx, &uri, Some(&fresh)).await.0, StatusCode::NOT_FOUND);
+}
+
 struct Stranger {
     fx: Fx,
     peer: NodeId,
@@ -35,6 +110,10 @@ async fn stranger(message_msat: u64) -> Stranger {
 /// `establish: false` — the stranger takes the admission payment but never
 /// opens a session (the send times out after paying admission).
 async fn stranger_with(message_msat: u64, establish: bool) -> Stranger {
+    stranger_with_first_expiry(message_msat, establish, 55).await
+}
+
+async fn stranger_with_first_expiry(message_msat: u64, establish: bool, first_expiry: u32) -> Stranger {
     let mut fx = fixture().await;
     let ledger = tempfile::tempdir().unwrap();
     let path = ledger.path().join("ledger.db");
@@ -46,11 +125,11 @@ async fn stranger_with(message_msat: u64, establish: bool) -> Stranger {
     let (count, target) = (Arc::clone(&invoices), Arc::clone(&b));
     let transport = ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
         .with_invoice_responder(move |request_id, _hint| {
-            count.fetch_add(1, Ordering::SeqCst);
+            let index = count.fetch_add(1, Ordering::SeqCst);
             let inv = futures::executor::block_on(target.create_invoice(
                 2000,
                 &format!("konsensus:{request_id}:message={message_msat}"),
-                55,
+                if index == 0 { first_expiry } else { 55 },
             ))
             .unwrap();
             Some(InvoiceResponseData {
@@ -87,6 +166,28 @@ async fn stranger_with(message_msat: u64, establish: bool) -> Stranger {
         handshake,
         _ledger: ledger,
     }
+}
+
+#[tokio::test]
+async fn expired_quote_after_owner_delay_is_requoted_and_paid_once() {
+    let s = stranger_with_first_expiry(2000, true, 2).await;
+    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
+    let (status, quote) = s.fx.call("POST", "/api/v1/messages/first-contact/quote",
+        Some(json!({"recipient": s.peer.to_hex()})), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{quote}");
+    // Real BOLT11 expiry uses the wall clock, not Tokio's paused clock.
+    let expires = quote["expires_at"].as_i64().unwrap();
+    while chrono::Utc::now().timestamp() < expires {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(s.spent().await, 0);
+    assert_eq!(s.confirm(&token, &s.peer, 4000).await.0, StatusCode::OK);
+    let (status, body) = s.send(&token, Some(4000)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(s.invoices.load(Ordering::SeqCst), 3, "stale quote, fresh admission, message");
+    assert_eq!(s.spent().await, 4000, "only fresh admission and message were paid");
+    assert_eq!(s.fx.used(), 4000);
+    assert!(s.fx.service.take_first_contact(&s.fx.client_id, 1, &s.peer.to_hex()).is_none());
 }
 
 impl Stranger {
@@ -278,6 +379,11 @@ async fn admission_paid_then_no_session_keeps_exactly_the_admission_charged() {
     assert_eq!(body["amount_msat"], 2000);
     assert_eq!(s.spent().await, 2000, "only the admission left the wallet");
     assert_eq!(s.fx.used(), 2000, "resolved once: the paid admission stays charged, the rest is released");
+    let invoices = s.invoices.load(Ordering::SeqCst);
+    let (status, body) = s.send(&token, Some(4000)).await;
+    assert_budget_exceeded(status, &body, "first_contact");
+    assert_eq!(s.spent().await, 2000, "a consumed approval cannot pay again");
+    assert_eq!(s.invoices.load(Ordering::SeqCst), invoices);
 }
 
 // Regressions for authorization and signed quote boundaries.

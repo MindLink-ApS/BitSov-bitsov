@@ -50,7 +50,8 @@ pub const FIRST_CONTACT_CAPABILITY: &str = "first_contact_grant_v1";
 /// How long the owner's one-time first-contact confirmation stays usable.
 /// Long enough to send right after confirming, short enough that an
 /// unused confirmation does not linger as standing authority.
-pub const FIRST_CONTACT_GRANT_TTL_SECS: i64 = 120;
+pub const FIRST_CONTACT_APPROVAL_WINDOW_SECS: i64 = 5 * 60;
+pub const FIRST_CONTACT_GRANT_TTL_SECS: i64 = FIRST_CONTACT_APPROVAL_WINDOW_SECS;
 
 /// Largest first contact (admission + first message) a grant may cover:
 /// F1's aggregate safety ceiling for first contact, 100 sats.
@@ -73,6 +74,28 @@ pub struct FirstContactGrant {
     pub max_total_msat: u64,
     /// Absolute expiry, unix seconds.
     pub expires_at: i64,
+}
+
+/// Read-only observation, never a credential or authority to dispatch a payment.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FirstContactApprovalState {
+    Pending,
+    Approved,
+    Consumed,
+    Expired,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FirstContactApprovalStatus {
+    /// The exact budget operation passed to `konsensus approve ... --op`.
+    pub grant_op_id: String,
+    pub recipient: String,
+    pub state: FirstContactApprovalState,
+    /// Suggested maximum app wait for the owner, independent of quote expiry.
+    pub approval_window_secs: i64,
+    /// Reviewed terms, present after approval (also for consumed/expired states).
+    pub approval: Option<FirstContactGrant>,
 }
 
 /// Longest a spend grant may live: 24 hours. Also the default.

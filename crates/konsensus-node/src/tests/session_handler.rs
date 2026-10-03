@@ -1532,7 +1532,8 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
     .unwrap();
     let invoice = bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
     assert_eq!(invoice.amount_milli_satoshis(), Some(2000));
-    assert!(invoice.expiry_time().as_secs() <= 60);
+    assert!(invoice.expiry_time().as_secs() <= 300);
+    assert!(invoice.expiry_time().as_secs() > 290);
     assert_eq!(
         invoice.description().to_string(),
         format!("konsensus:{id}:message=2000")
@@ -2344,12 +2345,13 @@ async fn ready_admission_preparation_preserves_signed_stateless_quote() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let (invoice, amount, description) = prepare_admission_invoice(
         admission_pricing().as_ref(), &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
-        &wallet, "test-request", now + 60).await.unwrap();
+        &wallet, "test-request", now + u64::from(konsensus_core::admission_quote::FIRST_CONTACT_QUOTE_VALIDITY_SECS)).await.unwrap();
     let signed = invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
     assert_eq!(signed.amount_milli_satoshis(), Some(amount));
     assert_eq!(signed.description().to_string(), description);
     assert_eq!(signed.payment_hash().to_string(), invoice.payment_hash);
-    assert!(signed.expires_at().unwrap().as_secs() <= now + 60);
+    assert!(signed.expires_at().unwrap().as_secs() > now + 290);
+    assert!(signed.expires_at().unwrap().as_secs() <= now + 300);
     assert_eq!(signed.recover_payee_pub_key().to_string(), wallet.get_node_pubkey().await.unwrap());
     assert!(wallet.list_payments(10).await.unwrap().is_empty());
     assert_eq!(wallet.get_balance_msat().await.unwrap(), 0);

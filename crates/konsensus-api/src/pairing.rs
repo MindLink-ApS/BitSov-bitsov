@@ -678,6 +678,8 @@ struct PendingFirstContact {
     grant: crate::spend_budget::FirstContactGrant,
     epoch: u64,
     budget_op_id: String,
+    /// Retain one terminal observation per client; polling cannot revive it.
+    consumed: bool,
 }
 
 /// Digests of what the owner channel delivered for one pending operation.
@@ -2816,9 +2818,50 @@ impl PairingService {
                 grant: issued.clone(),
                 epoch,
                 budget_op_id,
+                consumed: false,
             },
         );
         Ok(issued)
+    }
+
+    /// Observe only this client's approval under an exact live budget operation.
+    /// The node's owner control handler writes it; reads never consume it. A
+    /// missing/replaced/revoked operation is indistinguishable from another
+    /// client's operation. Restart drops approvals, preserving fail-closed use.
+    pub fn first_contact_approval_status(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        grant_op_id: &str,
+        recipient: &str,
+    ) -> Option<crate::spend_budget::FirstContactApprovalStatus> {
+        use crate::spend_budget::{FirstContactApprovalState as State,
+            FirstContactApprovalStatus, FIRST_CONTACT_APPROVAL_WINDOW_SECS};
+        let recipient = crate::spend_budget::canonical_recipient(recipient)?;
+        let inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
+        if !self.owner_control_enabled
+            || !inner.file.clients.iter().any(|c| c.client_id == client_id && c.epoch == epoch)
+            || !inner.file.grants.iter().any(|g| g.op_id == grant_op_id
+                && g.client_id == client_id && g.epoch == epoch
+                && g.identity_fingerprint == inner.identity_fingerprint
+                && g.budget.is_some() && g.is_live(now))
+        {
+            return None;
+        }
+        let pending = inner.first_contact.get(client_id).filter(|p|
+            p.budget_op_id == grant_op_id && p.epoch == epoch && p.grant.recipient == recipient);
+        let state = match pending {
+            Some(p) if p.consumed => State::Consumed,
+            Some(p) if p.grant.expires_at <= now => State::Expired,
+            Some(_) => State::Approved,
+            None => State::Pending,
+        };
+        Some(FirstContactApprovalStatus {
+            grant_op_id: grant_op_id.to_owned(), recipient, state,
+            approval_window_secs: FIRST_CONTACT_APPROVAL_WINDOW_SECS,
+            approval: pending.map(|p| p.grant.clone()),
+        })
     }
 
     /// Whether the grant behind `parent` may pay admission to `recipient`
@@ -2844,7 +2887,7 @@ impl PairingService {
             })
             .ok_or(BudgetRefusal::NoGrant)?;
         let confirmed = inner.first_contact.get(&parent.client_id).filter(|p| {
-            p.grant.recipient == recipient
+            !p.consumed && p.grant.recipient == recipient
                 && p.epoch == grant.epoch
                 && p.budget_op_id == grant.op_id
                 && p.grant.expires_at > now
@@ -2942,7 +2985,9 @@ impl PairingService {
             .ok_or(BudgetRefusal::PerCall { max_msat })?;
         if total > max_msat { return Err(BudgetRefusal::PerCall { max_msat }); }
         if let Some(max_msat) = confirmed {
-            inner.first_contact.remove(&parent.client_id);
+            if let Some(pending) = inner.first_contact.get_mut(&parent.client_id) {
+                pending.consumed = true;
+            }
             if need > max_msat {
                 return Err(BudgetRefusal::FirstContact(format!(
                     "the recipient asks {need} msat to admit you again, more than the {max_msat} msat you confirmed — nothing was paid"
@@ -3004,14 +3049,13 @@ impl PairingService {
     /// an opaque authorization bound to its original grant. `None` when absent,
     /// for someone else, or when it has
     /// expired, or the budget grant it was issued under is no longer live
-    /// (revoked, replaced, rotated). Single use: a match is removed.
+    /// (revoked, replaced, rotated). Single use: a match is marked consumed.
     pub fn take_first_contact(&self, client_id: &str, epoch: u64, recipient: &str) -> Option<FirstContactAuthorization> {
         let recipient = crate::spend_budget::canonical_recipient(recipient)?;
         let mut inner = self.lock();
         let now = chrono::Utc::now().timestamp();
         let pending = inner.first_contact.get(client_id)?;
-        if pending.grant.expires_at <= now {
-            inner.first_contact.remove(client_id);
+        if pending.consumed || pending.grant.expires_at <= now {
             return None;
         }
         if pending.grant.recipient != recipient || pending.epoch != epoch {
@@ -3026,10 +3070,11 @@ impl PairingService {
                 && g.identity_fingerprint == fingerprint
                 && g.is_live(now)
         });
-        let taken = inner.first_contact.remove(client_id)?;
+        let taken = inner.first_contact.get_mut(client_id)?;
+        taken.consumed = true;
         live.then_some(FirstContactAuthorization {
             max_total_msat: taken.grant.max_total_msat, recipient,
-            client_id: client_id.to_owned(), epoch, budget_op_id: taken.budget_op_id,
+            client_id: client_id.to_owned(), epoch, budget_op_id: taken.budget_op_id.clone(),
             expires_at: taken.grant.expires_at,
         })
     }
