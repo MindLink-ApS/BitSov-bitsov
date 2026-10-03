@@ -365,6 +365,7 @@ impl PairingService {
         inner.file.pending_device_keys.push(op.clone());
         if let Err(e) = self.persist(&mut inner.file) {
             inner.file = before;
+            inner.owner_confirmations.remove(&op.op_id);
             return Err(e);
         }
         Ok(op)
@@ -807,8 +808,14 @@ impl PairingService {
             if Self::confirmable(&inner, &op_id) {
                 continue;
             }
-            self.console_challenge(&mut inner, &op_id, &label, expires_at, command)?;
-            issued += 1;
+            match self.console_challenge(&mut inner, &op_id, &label, expires_at, command) {
+                Ok(()) => issued += 1,
+                Err(PairingError::OwnerApprovalUnavailable) => {
+                    tracing::warn!(%op_id,
+                        "owner approval delivery unavailable; skipping this pending operation and continuing startup reissue");
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(issued)
     }

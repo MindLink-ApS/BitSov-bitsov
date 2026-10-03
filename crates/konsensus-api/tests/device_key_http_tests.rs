@@ -41,6 +41,24 @@ async fn call(state: &Arc<AppState>, method: &str, uri: &str, body: Option<Value
 
 #[tokio::test]
 async fn register_once_then_sign_per_peer_over_http() {
+    register_device_over_http(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn headless_register_once_then_sign_per_peer_over_http() {
+    register_device_over_http(true).await;
+}
+
+struct NoOwnerTerminal;
+impl std::io::Write for NoOwnerTerminal {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(6))
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+async fn register_device_over_http(headless: bool) {
     let tmp = tempfile::tempdir().unwrap();
     let base = test_state();
     let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
@@ -50,7 +68,7 @@ async fn register_once_then_sign_per_peer_over_http() {
     let service = Arc::new(
         PairingService::open(tmp.path(), fp.clone(), true)
             .unwrap()
-            .with_owner_console(Box::new(console.clone()))
+            .with_owner_console(if headless { Box::new(NoOwnerTerminal) } else { Box::new(console.clone()) })
             .without_stdout_code()
             .with_owner_config("/Users/owner/bitsov/konsensus.toml".into())
             .with_owner_approval_key(owner.verifying_key()),
@@ -88,7 +106,14 @@ async fn register_once_then_sign_per_peer_over_http() {
     assert_eq!(status, StatusCode::OK, "{reg}");
     let op_id = reg["op_id"].as_str().unwrap().to_string();
     assert_eq!(reg["owner_action"], format!("konsensus device approve --op {op_id} --config /Users/owner/bitsov/konsensus.toml"));
-    let code = console.owner_code(&op_id);
+    let approval_path = service.dir().join(format!("owner-approval-{op_id}"));
+    let code = if headless {
+        std::fs::read_to_string(&approval_path).unwrap().lines()
+            .find_map(|line| line.split_once("type this code when it asks: ").map(|(_, code)| code.to_string())).unwrap()
+    } else {
+        assert!(!approval_path.exists());
+        console.owner_code(&op_id)
+    };
     assert!(!reg.to_string().contains(&code), "the app never sees the owner code");
 
     // Pending until the owner approves at the socket; the app cannot.
@@ -118,6 +143,7 @@ async fn register_once_then_sign_per_peer_over_http() {
     assert!(matches!(reply, ControlResponse::Ok { .. }), "{reply:?}");
     let (_, done) = call(&state, "GET", &status_path, None, Some(&read_token)).await;
     assert_eq!(done["status"], "registered");
+    assert!(!approval_path.exists());
     let (_, keys) = call(&state, "GET", "/api/v1/pair/device-keys", None, Some(&read_token)).await;
     assert_eq!(keys["device_keys"].as_array().unwrap().len(), 1, "{keys}");
     assert_eq!((keys["node"].as_str(), keys["client_id"].as_str()), (Some(fp.as_str()), Some(client.client_id.as_str())));
