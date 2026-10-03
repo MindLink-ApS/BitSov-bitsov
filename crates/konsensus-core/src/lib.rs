@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod logging;
 pub mod calendar;
 pub mod card_cache;
 pub mod contracts;

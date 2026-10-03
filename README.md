@@ -101,4 +101,4 @@ CI runs the PostgreSQL tests in the separate, non-blocking
 
 MIT
 
-For long-running nodes, use [journal-only service logging](docs/operations/LOGGING.md) to avoid an unbounded redirected `node.log`.
+For long-running nodes, see [bounded file and service logging](docs/operations/LOGGING.md): `node.log` and `ldk_node.log` default to 10 MiB × 5 files each. Remove legacy stdout redirection into these managed files.

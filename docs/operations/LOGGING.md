@@ -1,23 +1,39 @@
-# Node logging: journal-only by default
+# Bounded node logging
 
-The node's tracing subscriber writes to stdout. It does not open `node.log`.
-Under systemd that same output belongs in the journal; redirecting it to
-`node.log` duplicates the journal and creates an unbounded file outside the
-node's control. The shipped [user service example](konsensus.service) explicitly
-uses `StandardOutput=journal` and `StandardError=journal`, with no shell wrapper
-or file redirection. Foreground CLI runs continue to log to stdout.
+`konsensus start` writes diagnostics to `node.log` beside its configuration file
+and to stdout (the journal under systemd). Embedded LDK writes `ldk_node.log`
+in its LDK storage directory. Both file writers use the same optional settings:
 
-For an existing installation, keep its binary, configuration, identity and data
-paths. Change its unit's output/error settings to the values above and remove
-any `>> node.log`, `tee`, `StandardOutput=append:...` or `nohup` logging wrapper.
-After reloading the user units and restarting the service, verify new events
-with `journalctl --user -u konsensus.service`. Substitute the installed unit name.
-An old `node.log` is not removed automatically: archive or delete it only after
-verifying that no process writes to it. These are deployment instructions;
-upgrading the binary alone cannot change an existing supervisor's redirection.
+```toml
+[logging]
+max_file_size_bytes = 10485760 # 10 MiB per file
+max_files = 5                 # TOTAL: active file plus four archives
+```
 
-Journald owns rotation. On a systemd host, a reasonable small-node starting
-point is this administrator-managed `/etc/systemd/journald.conf.d/size.conf`:
+Existing configurations and partial `[logging]` sections use these defaults.
+Both values must be positive integers. Limits apply independently to each log:
+by default, each retains at most 50 MiB, or 100 MiB for the two combined.
+Changes take effect on restart.
+
+Rotation renames `node.log` to `node.log.1`, shifts older archives up to
+`node.log.4`, and deletes the oldest. LDK uses the same naming convention.
+Normal writes stay intact; a single write larger than the cap is split across
+files so it cannot bypass the bound. On restart, oversized existing files retain
+their newest capped bytes and numbered archives beyond the retention count are
+removed. A split or trimmed file can start partway through a log line or UTF-8
+character. Newly created files have mode `0600` on Unix. Each path must have one
+owning process; external writers and external rotation are not supported.
+
+For an existing VM installation, remove any `>> node.log`, `tee node.log`,
+`StandardOutput=append:...`, or `nohup` file-redirection wrapper before restarting.
+A redirected file descriptor cannot follow application-managed renames, and an
+external writer can bypass these bounds. Use the shipped
+[user service example](konsensus.service), which sends stdout and stderr to the
+journal. Upgrading the binary cannot change an existing supervisor's redirection.
+Other CLI commands continue to log only to stdout.
+
+Journald retention is configured separately by the host administrator. For example,
+`/etc/systemd/journald.conf.d/size.conf` may contain:
 
 ```ini
 [Journal]
@@ -29,13 +45,15 @@ RuntimeMaxFileSize=10M
 RuntimeMaxFiles=5
 ```
 
-These bounds apply to the host journal, including other services; review them
-with the operator before installation. Journald rotates/vacuums archived files;
-active journal files can temporarily exceed retention targets. Neither this
-example nor the node silently changes host logging policy.
+These journal bounds cover all services on the host. The node does not modify
+host logging policy or rotate the append-only security audit log.
 
-`ldk_node.log` and the append-only security audit log are separate outputs, not
-`node.log`; this change does not rotate or remove those files. No new log fields
-are added. Backend error details are not included in readiness refusal reasons.
-The logging regression test captures subprocess stdout and verifies that logging
-creates no files in its working directory.
+Existing diagnostic fields, backend-error redaction, and LDK level filtering are
+preserved (including Warn-only LDK logging when LSPS2 is enabled). The plaintext
+guard rejects forbidden structured content before either node output formats it.
+Never add mnemonics, passwords, tokens, payable private invoices, or message
+plaintext to log events. Rotation is retention control, not secret redaction.
+
+Regression tests cover actual file rotation, strict total bounds, oversized
+writes, concurrent clones, restart with legacy logs, old/partial configurations,
+LDK invoice filtering, and plaintext rejection in a subprocess.

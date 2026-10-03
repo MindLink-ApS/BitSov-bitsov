@@ -47,6 +47,8 @@ use konsensus_core::traits::lightning::{
 /// Configuration for the embedded LDK Lightning provider.
 #[derive(Debug, Clone)]
 pub struct LdkConfig {
+    /// Shared per-file diagnostic log limits.
+    pub logging: konsensus_core::logging::LoggingConfig,
     /// Own Bitcoin Core overrides Esplora, including probes and fallback.
     pub bitcoind: Option<konsensus_chain::BitcoindConfig>,
     /// Explicit Electrum source overrides Esplora; mutually exclusive with Core.
@@ -491,6 +493,8 @@ impl LdkProvider {
             builder.set_gossip_source_p2p();
         }
 
+        let mut log_level = ldk_node::config::DEFAULT_LOG_LEVEL;
+
         // The old singleton fields never enabled invoice issuance. Require the
         // new explicit switch, and reject ambiguous migrations instead of silently
         // choosing a peer. Existing operators get a clear configuration error.
@@ -507,8 +511,16 @@ impl LdkProvider {
             );
             // LDK logs the full JIT invoice at INFO. Private previews must never
             // leak a payable invoice via logs before fee authorization.
-            builder.set_filesystem_logger(None, Some(ldk_node::logger::LogLevel::Warn));
+            log_level = ldk_node::logger::LogLevel::Warn;
         }
+
+        let logger = crate::ldk_logging::BoundedLdkLogger::open(
+            &config.storage_dir.join("ldk_node.log"),
+            config.logging,
+            log_level,
+        )
+        .map_err(|_| LightningError::Backend("failed to initialize bounded LDK logging".into()))?;
+        builder.set_custom_logger(Arc::new(logger));
 
         // Listening address for Lightning P2P
         if let Some(ref addr) = config.listening_address {

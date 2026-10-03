@@ -94,6 +94,10 @@ impl NodeTier {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    /// Size limits for node.log and ldk_node.log.
+    #[serde(default)]
+    pub logging: konsensus_core::logging::LoggingConfig,
+
     /// Refuse new paid work below this many available bytes beside the mnemonic/LDK state.
     #[serde(default = "default_disk_free_floor_bytes")]
     pub disk_free_floor_bytes: u64,
@@ -1537,6 +1541,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            logging: Default::default(),
             privacy: PrivacyConfig::default(),
             disk_free_floor_bytes: default_disk_free_floor_bytes(),
             routing_fees: Default::default(),

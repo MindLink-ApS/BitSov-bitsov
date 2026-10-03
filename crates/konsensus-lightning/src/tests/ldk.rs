@@ -85,6 +85,7 @@ fn convert_direction_mapping() {
 #[test]
 fn ldk_config_construction() {
     let config = LdkConfig {
+        logging: Default::default(),
         electrum: None,
         bitcoind: None,
         liquidity: Default::default(),
@@ -178,6 +179,7 @@ fn ldk_entropy_is_64_bytes() {
 #[tokio::test]
 async fn invalid_mnemonic_errors() {
     let config = LdkConfig {
+        logging: Default::default(),
         electrum: None,
         bitcoind: None,
         liquidity: Default::default(),

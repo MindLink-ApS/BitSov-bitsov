@@ -22,6 +22,8 @@ backend = "sqlite"
 "#;
     let config: NodeConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.disk_free_floor_bytes, 2147483648);
+    assert_eq!(config.logging.max_file_size_bytes.get(), 10 * 1024 * 1024);
+    assert_eq!(config.logging.max_files.get(), 5);
     let override_config: NodeConfig = toml::from_str(&format!("disk_free_floor_bytes = 4096\n{toml}")).unwrap();
     assert_eq!(override_config.disk_free_floor_bytes, 4096);
     assert_eq!(
@@ -2620,5 +2622,41 @@ fn electrum_config_rejects_missing_invalid_or_fallback_settings() {
             toml::from_str::<ChainConfig>(&format!("backend = 'electrum'\n{fields}")).is_err(),
             "accepted {fields}"
         );
+    }
+}
+
+#[test]
+fn logging_config_accepts_bounded_rotation_settings() {
+    let config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    let mut value = toml::Value::try_from(config).unwrap();
+    value.as_table_mut().unwrap().insert(
+        "logging".into(),
+        toml::from_str::<toml::Value>("max_file_size_bytes = 128\nmax_files = 3").unwrap(),
+    );
+    let parsed: Result<NodeConfig, _> = value.try_into();
+    let parsed = parsed.expect("logging rotation settings must be accepted");
+    assert_eq!(parsed.logging.max_file_size_bytes.get(), 128);
+    assert_eq!(parsed.logging.max_files.get(), 3);
+}
+
+#[test]
+fn logging_config_defaults_partial_sections_and_rejects_invalid_limits() {
+    use konsensus_core::logging::LoggingConfig;
+    let config: LoggingConfig = toml::from_str("max_files = 2").unwrap();
+    assert_eq!(config.max_files.get(), 2);
+    assert_eq!(config.max_file_size_bytes.get(), 10 * 1024 * 1024);
+    let config: LoggingConfig = toml::from_str("max_file_size_bytes = 128").unwrap();
+    assert_eq!(config.max_files.get(), 5);
+    for invalid in [
+        "max_files = 0",
+        "max_file_size_bytes = 0",
+        "max_files = -1",
+        "max_size = 128",
+    ] {
+        assert!(toml::from_str::<LoggingConfig>(invalid).is_err());
     }
 }

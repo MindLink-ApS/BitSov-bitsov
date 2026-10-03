@@ -20,6 +20,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+chrono.workspace = true
 hex.workspace = true
 rand.workspace = true
 aes-gcm.workspace = true
