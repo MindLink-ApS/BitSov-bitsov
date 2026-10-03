@@ -1308,7 +1308,7 @@ async fn background_reconcile_commits_a_paid_call_offer_before_resending() {
     // The callee answers every call price query.
     let answering = tokio::spawn(async move {
         loop {
-            prices.update_kind_price(peer, 400, 10_000, 100).await;
+            prices.update_kind_price(peer, 400, 10_000, 850_000).await;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     });
@@ -1362,7 +1362,7 @@ fn answer_call_prices(f: &Fixture) -> tokio::task::JoinHandle<()> {
     let (prices, peer) = (f.state.peer_prices.clone(), f.peer);
     tokio::spawn(async move {
         loop {
-            prices.update_kind_price(peer, 400, 10_000, 100).await;
+            prices.update_kind_price(peer, 400, 10_000, 850_000).await;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })

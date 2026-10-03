@@ -267,3 +267,7 @@ impl_error!(std::num::ParseIntError, Parsing, Error);
 impl_error!(bitcoin::consensus::encode::Error, BitcoinEncoding, Error);
 impl_error!(bitcoin::hex::HexToArrayError, HexToArray, Error);
 impl_error!(bitcoin::hex::HexToBytesError, HexToBytes, Error);
+
+/// Shared bounded HTTP 429 cooldown for Esplora consumers.
+#[cfg(all(feature = "async", feature = "tokio"))]
+pub mod rate_limit;

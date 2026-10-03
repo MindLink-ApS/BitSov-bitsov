@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use konsensus_core::kind::KindCategory;
 use konsensus_core::types::NodeId;
@@ -97,6 +98,9 @@ impl PeerPriceEntry {
     /// Also considers wall-clock time: tables older than `max_age` are stale
     /// regardless of block height (guards against chain provider outages).
     pub fn is_stale(&self, current_block_height: u64, max_age: std::time::Duration) -> bool {
+        if self.block_height == 0 {
+            return true;
+        }
         // Wall-clock staleness: guard against chain provider being down
         if self.received_at.elapsed() > max_age {
             return true;
@@ -118,6 +122,8 @@ impl PeerPriceEntry {
 /// endpoint (reader). Uses `RwLock` for read-heavy access pattern.
 pub struct PeerPriceCache {
     entries: RwLock<HashMap<NodeId, PeerPriceEntry>>,
+    /// Latest local tip supplied by a freshness reader, never a peer's claim.
+    current_height: AtomicU64,
     /// When each peer last answered a `PriceQuery` for each kind. The entry's
     /// own `received_at` moves with any table or kind update, so it cannot
     /// tell whether *this* kind was answered.
@@ -129,8 +135,22 @@ impl PeerPriceCache {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            current_height: AtomicU64::new(0),
             kind_answers: RwLock::new(HashMap::new()),
         }
+    }
+
+    fn keep_cached_price(&self, old: &PeerPriceEntry, height: u64, valid_blocks: u32) -> bool {
+        // An expired entry cannot pin a peer after a tip correction/reorg.
+        // Before the first local read, the previous table's tip is the best
+        // available comparison point. Neither path extends its receipt time.
+        let tip = match self.current_height.load(Ordering::Relaxed) {
+            0 => old.block_height,
+            tip => tip,
+        };
+        valid_blocks > 0
+            && height.saturating_add(valid_blocks as u64) < tip
+            && !old.is_stale(tip, std::time::Duration::from_secs(3600))
     }
 
     /// Store or update a peer's price table.
@@ -142,6 +162,12 @@ impl PeerPriceCache {
         valid_blocks: u32,
         trust_discount: f64,
     ) {
+        let mut entries = self.entries.write().await;
+        // Never replace a usable table with an unknown/expired tip, or
+        // refresh its wall-clock validity merely because a peer is retrying.
+        if block_height == 0 || entries.get(&peer_id).is_some_and(|old| self.keep_cached_price(old, block_height, valid_blocks)) {
+            return;
+        }
         // Clamp trust_discount to valid range [0.0, MAX_TRUST_DISCOUNT]
         let clamped_discount = trust_discount.clamp(0.0, MAX_TRUST_DISCOUNT);
         let entry = PeerPriceEntry {
@@ -158,7 +184,7 @@ impl PeerPriceCache {
             categories = entry.prices.len(),
             "cached peer price table"
         );
-        self.entries.write().await.insert(peer_id, entry);
+        entries.insert(peer_id, entry);
     }
 
     /// Get the price a specific peer requires for a message kind.
@@ -205,6 +231,9 @@ impl PeerPriceCache {
         current_block_height: u64,
         max_age: std::time::Duration,
     ) -> Option<u64> {
+        if current_block_height > 0 {
+            self.current_height.store(current_block_height, Ordering::Relaxed);
+        }
         let entries = self.entries.read().await;
         let entry = entries.get(peer_id)?;
         if entry.is_stale(current_block_height, max_age) {
@@ -237,6 +266,9 @@ impl PeerPriceCache {
         current_block_height: u64,
         max_age: std::time::Duration,
     ) -> Option<u64> {
+        if current_block_height > 0 {
+            self.current_height.store(current_block_height, Ordering::Relaxed);
+        }
         let entries = self.entries.read().await;
         let entry = entries.get(peer_id)?;
         if entry.is_stale(current_block_height, max_age) {
@@ -284,6 +316,14 @@ impl PeerPriceCache {
             category_to_string(KindCategory::from_kind(kind))
         };
         let mut entries = self.entries.write().await;
+        let valid_blocks = compute_valid_blocks(block_height);
+        let known_tip = self.current_height.load(Ordering::Relaxed);
+        if block_height == 0
+            || block_height.saturating_add(valid_blocks as u64) < known_tip
+            || entries.get(&peer_id).is_some_and(|old| self.keep_cached_price(old, block_height, valid_blocks))
+        {
+            return;
+        }
         if let Some(entry) = entries.get_mut(&peer_id) {
             entry.prices.insert(category_name.clone(), price_msat);
             entry.block_height = block_height;
@@ -303,7 +343,7 @@ impl PeerPriceCache {
                 PeerPriceEntry {
                     prices,
                     block_height,
-                    valid_blocks: 0, // Unknown — will be replaced by next full PriceTable
+                    valid_blocks, // Bound single-kind answers until a full table arrives.
                     received_at: Instant::now(),
                     trust_discount: 0.0, // Unknown — will be set by next full PriceTable
                 },
@@ -558,12 +598,15 @@ pub async fn build_price_table(
 pub async fn build_full_price_table(
     pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
     chain: &dyn konsensus_core::traits::chain::ChainProvider,
-) -> PriceTableMetadata {
+) -> Result<PriceTableMetadata, konsensus_core::traits::lightning::LightningError> {
     let prices = build_price_table(pricing).await;
-    let block_height = chain.get_block_height().await.unwrap_or_else(|e| {
-        warn!(error = %e, "chain provider unavailable when building price table, using block_height=0");
-        0
-    });
+    // Zero is an unknown tip, never a price validity anchor. Preserve the
+    // existing typed readiness contract without leaking backend diagnostics.
+    let block_height = chain.get_block_height().await
+        .map_err(|_| konsensus_core::traits::lightning::LightningError::NotReady)?;
+    if block_height == 0 {
+        return Err(konsensus_core::traits::lightning::LightningError::NotReady);
+    }
     let valid_blocks = compute_valid_blocks(block_height);
     let trust_level = chain.trust_level();
 
@@ -576,12 +619,12 @@ pub async fn build_full_price_table(
         "built price table metadata"
     );
 
-    PriceTableMetadata {
+    Ok(PriceTableMetadata {
         prices,
         block_height,
         valid_blocks,
         trust_level,
-    }
+    })
 }
 
 #[cfg(test)]

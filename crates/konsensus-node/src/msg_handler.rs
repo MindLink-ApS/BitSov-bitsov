@@ -461,10 +461,16 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 ) {
                                     debug!(peer = %sender, "corrective price table rate-limited; not resent");
                                 } else {
-                                    let meta = konsensus_pricing::peer_prices::build_full_price_table(
+                                    let meta = match konsensus_pricing::peer_prices::build_full_price_table(
                                         pricing_for_recv.as_ref(),
                                         chain_for_recv.as_ref(),
-                                    ).await;
+                                    ).await {
+                                        Ok(meta) => meta,
+                                        Err(_) => {
+                                            warn!(peer = %sender, "not_ready: chain unavailable for corrective price table");
+                                            continue;
+                                        }
+                                    };
                                     let price_frame = Frame::PriceTable {
                                         prices: meta.prices,
                                         block_height: meta.block_height,

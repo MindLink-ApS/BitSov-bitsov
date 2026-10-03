@@ -273,7 +273,7 @@ impl KonsensusNode {
                 );
                 info!(backend = "esplora", api_url = %api_url, "chain provider");
                 Arc::new(
-                    EsploraProvider::new(esplora_config)
+                    EsploraProvider::with_fallbacks(esplora_config, config.chain.esplora_fallbacks(&config.lightning))
                         .map_err(|e| anyhow::anyhow!("esplora provider: {e}"))?,
                 )
             }
