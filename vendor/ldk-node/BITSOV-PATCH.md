@@ -320,6 +320,14 @@ Production changes:
   cannot hold later justice, HTLC-timeout/success, sweep or anchor packages behind
   its retries. Order within each package is preserved. No monitor,
   wallet reservation, channel, or settlement record is deleted or marked settled.
+- No configured chain source: the builder's implicit upstream Esplora default
+  cannot supply funding evidence. An error verifier is installed before the
+  source is shared, so release, reconciliation, #192 balances, and ghost
+  suppression all refuse to infer absence without issuing a request. Explicit
+  Esplora clients validate their base URL before the `/tx/{txid}` transport runs.
+  In-memory 404 transports count calls and prove that both missing-source paths
+  make zero requests, independently of network availability. Only a configured
+  endpoint's explicit 404 remains absence evidence.
 - `chain/sync_health.rs`, `error.rs`, `chain/sync_retry.rs`: retain the oldest
   outstanding failure timestamp and expose rate-limited failure kind, including
   a 429 first observed by broadcast/fees. A successful other wallet cannot hide

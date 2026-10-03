@@ -215,3 +215,43 @@ broadcast progress; 2 keeps chain evidence as chain evidence; 3 and 4 unchanged;
 6 / P8 distinguishes offline evidence from live recovery. P7's liveness constraint
 is enforced in code: once a transaction enters its broadcast wait, remote headers cannot extend it
 beyond one capped cooldown; the existing HTTP-attempt deadline remains.
+
+## Fix round 3: missing chain source (3 October 2026)
+
+The regression came from treating LDK's implicit default Esplora endpoint as
+configured funding evidence. With networking enabled, its 404 could release a
+reservation created through `LdkProvider::from_node`. The builder now installs
+an inconclusive funding verifier when no chain source was selected. It is shared
+by release, reconciliation, closed-channel balance verification, and ghost
+suppression. Explicit Esplora transaction-info lookups validate the base URL
+before invoking the HTTP transport. Only a configured endpoint's explicit 404
+continues to prove absence.
+
+Two new transport-counter regressions first failed with **2** and **1** attempted
+requests respectively, using in-memory 404 responses without sockets. Both now
+pass with **zero** requests. The existing owner-release regression passes, and a
+new reconciliation regression keeps all three reservations without a source.
+The standalone visibility helper also rejects empty, blank, and slash-only URLs.
+
+All commands used `--offline --locked` inside the same explicit macOS
+deny-all-network sandbox shown above. No network, loopback, or daemon was used.
+The three-crate library run initially had exactly the same **94** socket failures
+listed above; every failure contained a network-denial error. A second run
+excluded only those exact names. They are not counted as passes.
+
+| Target | Result |
+| --- | --- |
+| Vendored LDK library | 89 passed, zero failed/excluded |
+| konsensus-lightning library | 159 passed, 77 socket fixtures excluded |
+| konsensus-chain library | 24 passed, 17 socket fixtures excluded |
+| konsensus-api library | 216 passed, zero failed/excluded |
+| Patched Esplora library | Builds/passes; zero standalone tests |
+| Standalone empty-URL visibility integration test | 1 passed, 4 socket tests filtered out |
+| Three workspace crates plus Esplora, Clippy all targets, `-D warnings` | Passed |
+| Vendored LDK Clippy, lib/tests | Passed with existing 281-warning baseline |
+
+The additional commands were `cargo test --offline --locked -p esplora-client
+--lib` and `cargo test --offline --locked -p konsensus-lightning --test
+send_onchain_verify empty_url_is_an_error_not_absence`; workspace Clippy also
+included `-p esplora-client`. The existing SQLx future-incompatibility notice
+remains. Read-only review found no blocker. No live recovery is claimed.

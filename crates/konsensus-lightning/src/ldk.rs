@@ -1925,18 +1925,6 @@ fn convert_payment_details(details: &ldk_node::payment::PaymentDetails) -> Payme
     }
 }
 
-/// L0f (2026-04-30): Esplora-style "is this txid known?" query, used by
-/// `send_onchain` to verify that the broadcast actually propagated.
-///
-/// Returns `Ok(true)` if the Esplora endpoint reports the txid (HTTP 200
-/// from `/tx/<txid>`), `Ok(false)` if it reports not-found (HTTP 404),
-/// `Err(...)` for any transport / non-2xx-non-404 response. The caller
-/// should treat both `Ok(false)` and `Err` as `BroadcastUnconfirmed`.
-///
-/// If `esplora_url` is empty (test path via `LdkProvider::from_node`)
-/// the function returns `Ok(false)` immediately — broadcast verification
-/// is a no-op in that case, which is fine because tests don't actually
-/// broadcast on chain.
 /// L4b (2026-05-11): Probe an Esplora endpoint by GETting `/fee-estimates`.
 ///
 /// LDK fetches fee estimates from the configured Esplora endpoint as part
@@ -2086,8 +2074,10 @@ pub async fn select_esplora_endpoint(primary: &str, fallback: Option<&str>) -> S
     }
 }
 
+/// Query transaction presence. Only a configured endpoint's explicit HTTP 404
+/// proves absence; missing configuration and failed lookups are inconclusive.
 pub async fn esplora_tx_visible(esplora_url: &str, txid: &str) -> Result<bool, String> {
-    if esplora_url.is_empty() {
+    if esplora_url.trim().trim_end_matches('/').is_empty() {
         return Err("no chain source configured".into());
     }
     let trimmed = esplora_url.trim_end_matches('/');

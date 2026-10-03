@@ -634,6 +634,48 @@ mod bitsov_http_rate_tests {
         use bitcoin::hashes::Hash;
         Box::leak(format!(r#"{{"txid":"{}","version":2,"locktime":0,"vin":[],"vout":[],"size":10,"weight":40,"fee":0,"status":{{"confirmed":{confirmed}}}}}"#, Txid::all_zeros()).into_boxed_str())
     }
+    #[derive(Debug, Default)]
+    struct AbsentTransport(std::sync::atomic::AtomicUsize);
+    impl HttpTransport for AbsentTransport {
+        fn execute(&self, _: reqwest::RequestBuilder) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<reqwest::Response, esplora_client::Error>> + Send + '_>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(http::Response::builder().status(404).body("not found").unwrap().into()) })
+        }
+    }
+    #[tokio::test]
+    async fn empty_esplora_source_never_attempts_presence_request() {
+        use bitcoin::hashes::Hash;
+        let (_dir, _node, mut source, _) = fixture(vec![]);
+        for url in ["", " ", "/"] {
+            let transport = Arc::new(AbsentTransport::default());
+            source.esplora_client = EsploraAsyncClient::from_client(url.into(), reqwest::Client::new())
+                .with_transport(transport.clone());
+            let direct = source.esplora_client.get_tx_info(&Txid::all_zeros()).await;
+            let funding = source.funding_present(Txid::all_zeros()).await;
+            assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 0, "unconfigured URL {url:?} reached HTTP transport");
+            assert!(direct.is_err());
+            assert_eq!(funding, Err(Error::TxSyncFailed));
+        }
+    }
+    #[tokio::test]
+    async fn implicit_default_source_never_attempts_funding_request() {
+        use bitcoin::hashes::Hash;
+        let (_dir, mut node, mut source, _) = fixture(vec![]);
+        let transport = Arc::new(AbsentTransport::default());
+        source.esplora_client = source.esplora_client.clone().with_transport(transport.clone());
+        // Preserve the real builder's funding policy while replacing HTTP with
+        // an in-memory 404. Other node components retain the original Arc.
+        let verifier = node.chain_source.funding_verifier.read().unwrap().clone();
+        node.chain_source = Arc::new(super::super::ChainSource {
+            kind: super::super::ChainSourceKind::Esplora(source),
+            sync_health: RwLock::new(super::super::SyncHealth::default()),
+            funding_verifier: RwLock::new(verifier), tx_broadcaster: node.tx_broadcaster.clone(), logger: node.logger.clone(),
+        });
+        // All provider callers and ghost suppression share this lookup.
+        let funding = node.funding_present(Txid::all_zeros()).await;
+        assert_eq!(transport.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(funding, Err(Error::TxSyncFailed));
+    }
     fn transaction(locktime: u32) -> Transaction {
         Transaction { version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::from_consensus(locktime), input: vec![], output: vec![] }

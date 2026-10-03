@@ -459,6 +459,16 @@ mod tests {
         assert_eq!(node.local_spend_reservations().len(), 3);
     }
 
+    #[tokio::test]
+    async fn reconciliation_without_chain_source_keeps_reservations() {
+        let (_dir, node) = restarted_reservations();
+        let chain = ChainVisibility { node: node.clone(), bitcoind: None, electrum: None };
+        let mut cursor = None;
+        reconcile_local_spends(&node, &chain, &mut cursor).await;
+        assert_eq!(node.local_spend_reservations().len(), 3);
+        assert!(node.local_spend_reservations().iter().all(|row| row.last_seen_at.is_none()));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn startup_reconciliation_retains_on_lookup_error_then_releases_absent_rows() {
         let (_dir, node) = restarted_reservations();

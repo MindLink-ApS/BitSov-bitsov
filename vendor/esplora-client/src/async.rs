@@ -341,6 +341,9 @@ impl<S: Sleeper> AsyncClient<S> {
 
     /// Get transaction info given its [`Txid`].
     pub async fn get_tx_info(&self, txid: &Txid) -> Result<Option<Tx>, Error> {
+        // Validate the configured base URL before invoking even an injected
+        // transport. Missing configuration is never evidence of tx absence.
+        self.client.get(&self.url).build()?;
         self.get_opt_response_json(&format!("/tx/{txid}")).await
     }
 
