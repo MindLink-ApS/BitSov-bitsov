@@ -1489,7 +1489,16 @@ fn headless_output_child() {
     service
         .create_elevation_request(&client.client_id, vec![Scope::Spend])
         .unwrap();
-    // Simulate process death so the parent can inspect the private code file.
+    let owner = konsensus_core::OwnerApprovalKey::from_seed(&[7; 64], &[9; 32]).unwrap();
+    let service = service.with_owner_approval_key(owner.verifying_key());
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let public = hex::encode(key.public_key().as_ref());
+    let proof = hex::encode(key.sign(&rng, pairing::device::registration_message("test", &client.client_id, &public).as_bytes()).unwrap().as_ref());
+    service.request_device_key(&client.client_id, &public, "device", &proof).unwrap();
+    // Simulate process death so the parent can inspect the private code files.
     std::mem::forget(service);
 }
 
@@ -1503,36 +1512,39 @@ fn headless_codes_never_reach_stdout_stderr_or_tracing() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    let path = std::fs::read_dir(dir.path().join("pairing"))
+    let paths: Vec<_> = std::fs::read_dir(dir.path().join("pairing"))
         .unwrap()
         .map(|e| e.unwrap().path())
-        .find(|p| {
+        .filter(|p| {
             p.file_name()
                 .unwrap()
                 .to_string_lossy()
                 .starts_with("owner-approval-")
         })
-        .unwrap();
-    let text = std::fs::read_to_string(&path).unwrap();
-    let phrase = text.lines().find(|l| l.starts_with("GRANT ")).unwrap();
-    let nonce = phrase.split_once(" CODE ").unwrap().1;
-    let code = text
-        .lines()
-        .find_map(|l| {
-            l.split_once("type this code when it asks: ")
-                .map(|(_, c)| c)
-        })
-        .unwrap();
-    for bytes in [&output.stdout, &output.stderr] {
-        let captured = String::from_utf8_lossy(bytes);
-        assert!(!captured.contains(nonce));
-        assert!(!captured.contains(code));
-        assert!(!captured.contains(&code.replace('-', "")));
+        .collect();
+    assert_eq!(paths.len(), 2);
+    for path in paths {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let phrase = text.lines().find(|l| l.contains(" CODE ")).unwrap();
+        let nonce = phrase.split_once(" CODE ").unwrap().1;
+        let code = text
+            .lines()
+            .find_map(|l| {
+                l.split_once("type this code when it asks: ")
+                    .map(|(_, c)| c)
+            })
+            .unwrap();
+        for bytes in [&output.stdout, &output.stderr] {
+            let captured = String::from_utf8_lossy(bytes);
+            assert!(!captured.contains(nonce));
+            assert!(!captured.contains(code));
+            assert!(!captured.contains(&code.replace('-', "")));
+        }
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&path.display().to_string()),
+            "only the path is announced"
+        );
     }
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains(&path.display().to_string()),
-        "only the path is announced"
-    );
 }
 
 #[cfg(unix)]
@@ -1556,4 +1568,40 @@ fn headless_front_door_can_be_granted_without_spend() {
     assert!(!path.exists());
     assert!(service.snapshot().grants.is_empty());
     assert_eq!(service.snapshot().front_door_grants.len(), 1);
+}
+
+#[tokio::test]
+async fn headless_device_and_replacement_without_delivery_return_conflict() {
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    for device_request in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = test_state_with_data_dir(tmp.path().to_path_buf());
+        let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
+        let owner = konsensus_core::OwnerApprovalKey::from_seed(&[7; 64], &[9; 32]).unwrap();
+        let service = Arc::new(PairingService::open(tmp.path(), fp.clone(), true).unwrap()
+            .with_owner_console(Box::new(NoOwnerTerminal)).without_stdout_code()
+            .with_owner_approval_key(owner.verifying_key()));
+        let app = test_router(Arc::new(AppState { pairing: Some(service.clone()), ..(*base).clone() }));
+        let (client, token) = pair_and_token(&app, &service, &SigningKey::from_bytes(&[93; 32])).await;
+        let (route, body) = if device_request {
+            let rng = ring::rand::SystemRandom::new();
+            let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+            let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+            let public = hex::encode(key.public_key().as_ref());
+            let proof = hex::encode(key.sign(&rng, pairing::device::registration_message(&fp, &client, &public).as_bytes()).unwrap().as_ref());
+            // No protected-file delivery, but the paired token is still live.
+            std::fs::rename(service.dir(), tmp.path().join("unavailable")).unwrap();
+            ("/api/v1/pair/device-key", serde_json::json!({"public_key": public, "name": "device", "proof": proof}))
+        } else {
+            ("/api/v1/identity/replacement-request", serde_json::json!({"mnemonic": REPLACEMENT_MNEMONIC}))
+        };
+        let (status, body) = post(&app, route, body, Some(&token)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{route}: {body}");
+        assert!(body.to_string().contains("owner_approval_unavailable"));
+        assert!(service.pending_device_keys().is_empty());
+        assert!(service.snapshot().replacement_approvals.is_empty());
+        if !device_request {
+            assert!(body.to_string().contains("identity replacement requires an owner terminal"));
+        }
+    }
 }
