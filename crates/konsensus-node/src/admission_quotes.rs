@@ -130,16 +130,16 @@ mod tests {
             "same attempt cannot mint another invoice after source cooldown"
         );
         assert!(
-            !q.permit(ip, &target, &peer, &id, t + Duration::from_secs(60), 160),
+            !q.permit(ip, &target, &peer, &id, t + Duration::from_secs(300), 400),
             "expired nonce never reopens"
         );
         assert!(q.permit(
             ip,
             &target,
             &peer,
-            &admission_quote::request_id(&target, &peer, 160),
-            t + Duration::from_secs(60),
-            160
+            &admission_quote::request_id(&target, &peer, 400),
+            t + Duration::from_secs(300),
+            400
         ));
     }
 }

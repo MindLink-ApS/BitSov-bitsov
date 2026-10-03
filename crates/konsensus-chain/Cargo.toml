@@ -11,6 +11,7 @@ async-trait.workspace = true
 thiserror.workspace = true
 bitcoin.workspace = true
 reqwest.workspace = true
+esplora-client = { version = "0.12", default-features = false, features = ["async-https-rustls", "tokio"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -25,3 +26,5 @@ tempfile = "3"
 mockall.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 axum.workspace = true
+
+http = "1"

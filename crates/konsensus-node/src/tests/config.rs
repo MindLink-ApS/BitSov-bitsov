@@ -2622,3 +2622,23 @@ fn electrum_config_rejects_missing_invalid_or_fallback_settings() {
         );
     }
 }
+
+#[test]
+fn issue204_chain_accepts_api_url_fallback_alias() {
+    let chain: ChainConfig = toml::from_str(r#"
+backend = "esplora"
+api_url = "https://primary.invalid"
+api_url_fallback = "https://fallback.invalid/api"
+"#).unwrap();
+    assert!(matches!(chain, ChainConfig::Esplora { esplora_url_fallback: Some(url), .. } if url == "https://fallback.invalid/api"));
+}
+
+#[test]
+fn issue204_chain_fallback_resolution_keeps_primary_and_reuses_ldk() {
+    let chain: ChainConfig = toml::from_str("backend = 'esplora'\napi_url = 'https://chain.invalid'\n").unwrap();
+    let ldk: LightningConfig = toml::from_str("backend = 'ldk'\nesplora_url = 'https://ldk.invalid/api'\nesplora_url_fallback = 'https://backup.invalid/api'\n").unwrap();
+    assert_eq!(chain.esplora_fallbacks(&ldk), vec!["https://ldk.invalid/api", "https://backup.invalid/api"]);
+    let explicit: ChainConfig = toml::from_str("backend = 'esplora'\napi_url_fallback = 'https://explicit.invalid'\n").unwrap();
+    assert_eq!(explicit.esplora_fallbacks(&ldk), vec!["https://explicit.invalid"]);
+    assert!(chain.esplora_fallbacks(&LightningConfig::Mock { initial_balance_msat: 0 }).is_empty());
+}

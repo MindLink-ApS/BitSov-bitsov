@@ -88,15 +88,16 @@ pub struct PeerPriceResponse {
 ///
 /// `BitSov-Data-As-Of`: for the chain-aware engine, the time of the chain
 /// fetch the prices were computed against; `BitSov-Data-Stale: 1` when that
-/// cached chain state is past the engine's `cache_ttl` or missing (the chain
-/// refresh failed, so prices fell back to the static table). The static
+/// cached chain state is past the engine's `cache_ttl` or missing. A missing
+/// chain tip returns typed `not_ready`, never a table anchored at zero. The static
 /// engine's prices do not depend on chain data: as-of is the read, never stale.
 async fn get_own_pricing(
     _auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<(DataFreshness, Json<OwnPricingResponse>), ApiError> {
     let read_at = SystemTime::now();
-    let block_height = state.chain.get_block_height().await.unwrap_or(0);
+    let block_height = state.chain.get_block_height().await.map_err(|_| ApiError::NotReady)?;
+    if block_height == 0 { return Err(ApiError::NotReady); }
 
     // Build price table from our own pricing engine
     let categories = [

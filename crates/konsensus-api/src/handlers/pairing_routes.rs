@@ -519,7 +519,7 @@ pub struct FirstContactGrantBody {
 /// `POST /api/v1/pair/first-contact-grant` — owner-authenticated approval for
 /// a specific paired client and live budget, to contact this recipient for this
 /// amount. Needs a live budget grant and fits inside it; single use; expires
-/// after two minutes; memory only. The send then debits the budget grant once.
+/// after five minutes; memory only. The send then debits the budget grant once.
 /// A first contact without one is refused (`budget_exceeded`, reason
 /// `first_contact`). See `docs/SPEND_BUDGET_GRANTS.md`.
 async fn first_contact_grant(
@@ -549,6 +549,32 @@ async fn first_contact_grant(
         })),
     );
     Ok(Json(grant))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirstContactStatusQuery {
+    recipient: String,
+}
+
+/// `GET /api/v1/pair/first-contact-grant/:op_id?recipient=<node-id>`.
+/// Paired read authority only, scoped to that client's exact live budget op.
+/// No local receipt or owner secret crosses HTTP. This is an observation, not
+/// authorization: compose still consumes and checks the node-held approval.
+async fn first_contact_status(
+    auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    Path(op_id): Path<String>,
+    Query(query): Query<FirstContactStatusQuery>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    let binding = auth.pairing.as_ref().ok_or_else(||
+        ApiError::Forbidden("only a paired client can read its first-contact approval".into()))?;
+    let recipient = konsensus_core::NodeId::from_hex(&query.recipient)
+        .map_err(|_| ApiError::BadRequest("invalid recipient node id".into()))?;
+    let status = service(&state)?.first_contact_approval_status(
+        &binding.client_id, binding.epoch, &op_id, &recipient.to_hex(),
+    ).ok_or_else(|| ApiError::NotFound("no live budget operation".into()))?;
+    Ok(([(axum::http::header::CACHE_CONTROL, "no-store")], Json(status)))
 }
 
 /// `POST /api/v1/identity/replacement-request` body.
@@ -654,6 +680,7 @@ pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
         )
         .route("/api/v1/pair/grant", get(own_grant))
         .route("/api/v1/pair/first-contact-grant", post(first_contact_grant))
+        .route("/api/v1/pair/first-contact-grant/:op_id", get(first_contact_status))
         .route(
             "/api/v1/identity/replacement-request",
             post(replacement_request),
@@ -678,6 +705,7 @@ pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
             get(elevation_status).delete(super::device_routes::cancel_elevation),
         )
         .route("/api/v1/pair/grant", get(own_grant))
+        .route("/api/v1/pair/first-contact-grant/:op_id", get(first_contact_status))
 }
 
 #[cfg(test)]

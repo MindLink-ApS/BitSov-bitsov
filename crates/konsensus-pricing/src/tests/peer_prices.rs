@@ -286,7 +286,7 @@ async fn full_price_table_metadata() {
     let pricing = crate::StaticPricingEngine::new(crate::StaticPricingConfig::default());
     let chain = MockChainProvider::new(); // height ~886,000
 
-    let meta = build_full_price_table(&pricing, &chain).await;
+    let meta = build_full_price_table(&pricing, &chain).await.unwrap();
 
     // Should have all priceable categories
     assert!(meta.prices.contains_key("communication"));
@@ -619,4 +619,81 @@ async fn peer_exchange_cache_does_not_apply_porch_or_advertised_admission_floor(
             .await,
         Some(500)
     );
+}
+
+#[tokio::test]
+async fn issue204_zero_height_cannot_build_a_price_table() {
+    let pricing = crate::StaticPricingEngine::new(crate::StaticPricingConfig::default());
+    let chain = konsensus_chain::MockChainProvider::with_config(konsensus_chain::MockChainConfig {
+        initial_height: 0,
+        ..Default::default()
+    });
+    let table = build_full_price_table(&pricing, &chain).await;
+    assert!(matches!(table, Err(konsensus_core::traits::lightning::LightningError::NotReady)));
+}
+
+#[tokio::test]
+async fn issue204_bad_updates_preserve_cached_good_price_and_age() {
+    let cache = PeerPriceCache::new();
+    let peer = NodeId::from_bytes([204; 32]);
+    cache.update(peer, HashMap::from([("communication".into(), 2000)]), 850_000, 144, 0.25).await;
+    let original = cache.get_peer_entry(&peer).await.unwrap();
+    for bad_height in [0, 800_000] {
+        cache.update(peer, HashMap::from([("communication".into(), 9000)]), bad_height, 72, 0.0).await;
+        cache.update_kind_price(peer, 1, 8000, bad_height).await;
+        assert_eq!(cache.get_fresh_discounted_peer_price(&peer, 1, 850_010, std::time::Duration::from_secs(3600)).await, Some(1500));
+        assert_eq!(cache.get_peer_entry(&peer).await.unwrap().received_at, original.received_at);
+    }
+    assert_eq!(cache.get_fresh_discounted_peer_price(&peer, 1, 850_145, std::time::Duration::from_secs(3600)).await, None);
+}
+
+#[tokio::test]
+async fn issue204_all_endpoints_down_refuses_price_table() {
+    let pricing = crate::StaticPricingEngine::new(crate::StaticPricingConfig::default());
+    // Unsupported schemes fail immediately, without opening sockets.
+    let chain = konsensus_chain::EsploraProvider::with_fallbacks(
+        konsensus_chain::EsploraConfig::custom("unsupported://primary".into(), konsensus_core::traits::chain::TrustLevel::ServerTrust),
+        vec!["unsupported://fallback".into()],
+    ).unwrap();
+    assert!(matches!(build_full_price_table(&pricing, &chain).await, Err(konsensus_core::traits::lightning::LightningError::NotReady)));
+}
+
+#[tokio::test]
+async fn issue204_zero_height_never_becomes_an_unlimited_cached_price() {
+    let cache = PeerPriceCache::new();
+    let peer = test_node_id(204);
+    cache.update(peer, HashMap::from([("communication".into(), 1000)]), 0, 0, 0.0).await;
+    cache.update_kind_price(peer, 1, 1000, 0).await;
+    assert!(cache.get_peer_entry(&peer).await.is_none());
+    assert!(cache.kind_answered_at(&peer, 1).await.is_none());
+}
+
+#[tokio::test]
+async fn issue204_stale_updates_cannot_displace_valid_prices_but_rollbacks_recover() {
+    let cache = PeerPriceCache::new();
+    let peer = test_node_id(205);
+    let prices = || HashMap::from([("communication".into(), 2000)]);
+    cache.update(peer, prices(), 850_000, 144, 0.0).await;
+    assert_eq!(cache.get_fresh_peer_price(&peer, 1, 850_100, std::time::Duration::from_secs(3600)).await, Some(2000));
+    cache.update(peer, HashMap::from([("communication".into(), 9000)]), 850_010, 36, 0.0).await;
+    assert_eq!(cache.get_fresh_peer_price(&peer, 1, 850_100, std::time::Duration::from_secs(3600)).await, Some(2000));
+    // A fresh table at a lower tip after a short rollback is usable.
+    cache.update(peer, prices(), 849_999, 144, 0.0).await;
+    assert_eq!(cache.get_peer_entry(&peer).await.unwrap().block_height, 849_999);
+    cache.entries.write().await.get_mut(&peer).unwrap().received_at = Instant::now() - std::time::Duration::from_secs(3601);
+    cache.update_kind_price(peer, 1, 3000, 849_998).await;
+    assert!(cache.kind_answered_at(&peer, 1).await.is_some());
+    assert_eq!(cache.get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600)).await, Some(3000));
+}
+
+#[tokio::test]
+async fn issue204_stale_kind_response_without_prior_table_is_not_a_fresh_answer() {
+    let cache = PeerPriceCache::new();
+    let peer = test_node_id(206);
+    assert!(cache.get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600)).await.is_none());
+    cache.update_kind_price(peer, 1, 9000, 800_000).await;
+    assert!(cache.get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600)).await.is_none());
+    assert!(cache.kind_answered_at(&peer, 1).await.is_none());
+    cache.update_kind_price(peer, 1, 2000, 850_000).await;
+    assert_eq!(cache.get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600)).await, Some(2000));
 }
