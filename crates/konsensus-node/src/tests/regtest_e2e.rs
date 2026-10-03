@@ -1958,6 +1958,7 @@ async fn bitcoind_chain_source_pruned_and_full() {
         assert!(!provider.is_tx_confirmed(txid, 2).await.unwrap());
         assert_eq!(provider.chain_view().trust_level, "own_node");
         let ldk = LdkProvider::new(konsensus_lightning::LdkConfig {
+            logging: Default::default(),
             electrum: None,
             bitcoind: Some(rpc), liquidity: Default::default(), storage_dir: dir.path().join("ldk"),
             scb_backup_dir: None, scb_rotation_count: 3,

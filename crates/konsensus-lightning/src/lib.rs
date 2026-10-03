@@ -14,6 +14,7 @@ pub mod circuit_breaker;
 pub mod recovering;
 pub use recovering::RecoveringLightning;
 pub mod ldk;
+mod ldk_logging;
 pub mod liquidity;
 pub mod lnd;
 pub mod lnbits;

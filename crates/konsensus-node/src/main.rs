@@ -102,8 +102,7 @@ impl konsensus_crypto::SessionStore for StorageSessionAdapter {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    logging::init();
-
+    let file_logging = logging::init();
     let cli = Cli::parse();
 
     match cli.command {
@@ -124,7 +123,7 @@ async fn main() -> Result<()> {
                 None => None,
             };
             let password = password.as_deref().or(from_file.as_deref().map(|p| p.as_str()));
-            cmd_start(&config, password, admission_mode.as_deref(), owner_control).await?;
+            cmd_start(&config, password, admission_mode.as_deref(), owner_control, &file_logging).await?;
         }
         Command::Approve { command } => {
             owner_cmd::cmd_approve(command).await?;
@@ -726,6 +725,7 @@ async fn cmd_start(
     password: Option<&str>,
     admission_mode: Option<&str>,
     owner_control: bool,
+    file_logging: &logging::FileLogging,
 ) -> Result<()> {
     // A password given by flag or file was not typed here; see owner_approval_key.
     let password_typed = password.is_none();
@@ -734,6 +734,8 @@ async fn cmd_start(
     let config_path = config_path.as_path();
     let (startup_mode, mut config) = owner_cmd::prepare_start(config_path)
         .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
+    file_logging.enable(&config_path.with_file_name("node.log"), config.logging)
+        .context("failed to initialize bounded node logging")?;
 
     // ── First-run / partial-state gate (#76) ───────────────────────
     // Before any component is built, classify the data directory from file
