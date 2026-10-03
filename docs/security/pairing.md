@@ -85,23 +85,27 @@ stderr, tracing, HTTP, or socket status/description. When that succeeds, no
 approval file is created and the existing terminal ceremony is unchanged.
 
 For an owner-run node without a working terminal (for example systemd with
-`--owner-control`), spend and front-door elevation instead write the full
-approval instructions to `<data_dir>/pairing/owner-approval-<op_id>`, created
+`--owner-control`), spend and front-door elevation and device registration write
+the full approval instructions to `<data_dir>/pairing/owner-approval-<op_id>`, created
 exclusively at mode `0600` inside the `0700` pairing directory. The node logs
 **only the path and expiry**, never the code. Read the file privately as the
 node's OS user and run `konsensus grant --op <op_id> --config <config>`; grant
-still executes only over `control.sock`. HTTP and control-socket replies contain
-no approval secret. If owner-run mode is off, or neither terminal nor protected
-file delivery succeeds, the request returns HTTP **409
-`owner_approval_unavailable`**, without creating a pending operation.
+still executes only over `control.sock`. Device registration uses
+`konsensus device approve --op <op_id> --config <config>` and additionally requires
+the owner-key signature. HTTP and control-socket replies contain
+no approval secret. On an owner-run node, if neither terminal nor protected-file
+delivery succeeds, the request returns HTTP **409 `owner_approval_unavailable`**,
+without creating a pending operation. Elevations also return this 409 when
+owner-run mode is off.
 
 **Headless approval trusts the node's OS account and data directory.** A process
 with that user's file access can read the code and approve over the socket.
 Keep the paired app outside that account and directory. This fallback does not
 provide user presence or protection against same-user malware. A working owner
 terminal still keeps codes off disk, so socket/file access alone cannot approve
-those terminal-delivered requests. Device-key registration and live-identity
-replacement remain terminal-only; replacement accepts only the full nonce line.
+those terminal-delivered requests. Live-identity replacement remains
+terminal-only and accepts only the full nonce line; unavailable terminal delivery
+returns HTTP 409 `owner_approval_unavailable` without a pending operation.
 
 Wrong confirmations are counted per request and node run: the third wrong one
 cancels the request; after ten wrong ones, short codes stop working until
@@ -113,8 +117,9 @@ codes, and clean service shutdown. The existing cleanup worker removes expired
 files within its one-second sweep interval; reads also clean them. Pending
 records are durable but confirmation digests are memory-only. Startup removes
 stale files and reissues fresh codes for surviving requests, through the terminal
-or protected elevation file. Old codes stop working. A cancelled request reads
-`lost` from `GET /api/v1/pair/elevation/{op_id}`; `konsensus pair-status` marks it
+or protected approval file. Unavailable approvals are warned about and skipped
+without stopping reissue of the remaining requests. Old codes stop working.
+A cancelled request reads `lost` from `GET /api/v1/pair/elevation/{op_id}`; `konsensus pair-status` marks it
 and `konsensus grant` refuses it up front. The client asks again. See
 [owner control commands](../v2/OWNER-APPROVALS.md) for headless operation and
 [device keys](device-keys.md) for Touch ID per-contact spend.

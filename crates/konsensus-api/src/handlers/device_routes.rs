@@ -52,6 +52,7 @@ fn map_err(e: PairingError) -> ApiError {
         PairingError::Expired => ApiError::Conflict(
             "the intent's issued_at is too far from the node's clock; sign it again".into(),
         ),
+        PairingError::OwnerApprovalUnavailable => ApiError::Conflict(e.to_string()),
         PairingError::Io(_) => ApiError::Internal(e.to_string()),
         _ => ApiError::Forbidden(e.to_string()),
     }

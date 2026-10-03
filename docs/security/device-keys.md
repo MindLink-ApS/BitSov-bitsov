@@ -16,7 +16,9 @@ Now:
    `konsensus device approve --op <id> --config <path>`. That command prints the
    device name and a fingerprint (`XXXX-XXXX-XXXX-XXXX`) to compare with the
    app's screen, then asks for the short code the node printed on its own
-   terminal. It signs only with an **encrypted** recovery phrase, whose
+   terminal, or delivered in an owner-only approval file on a headless owner-run
+   node (see [owner approvals](../v2/OWNER-APPROVALS.md)). It signs only with an
+   **encrypted** recovery phrase, whose
    password is typed at the prompt. It refuses a plaintext phrase before asking
    anything. The CLI also signs the registration with the seed-derived
    **owner-approval key**, over `client_pubkey`, `epoch`, the node and the
@@ -114,9 +116,10 @@ codes". The client can withdraw its own pending request (`DELETE …`).
 ## Security argument
 
 **What the owner proves, and when.**
-- *Registration* keeps the existing guarantee. It needs a secret printed only
-  to the node's controlling terminal (see `pairing.md`), so the app cannot
-  register a key by itself.
+- *Registration* requires a secret delivered to the node's controlling terminal
+  or its owner-only approval file (see `pairing.md`), plus the owner-key
+  signature. Headless delivery trusts the node's OS account and data directory;
+  keep the paired app outside that boundary.
 - The registration request carries a signature by the key being registered
   (proof of possession), so a client can't register a key it doesn't hold, or
   replay one made for another node or pairing.
