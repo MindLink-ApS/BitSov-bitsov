@@ -147,6 +147,13 @@ async fn real_ldk_regtest_e2e() {
     chain.refuse_explicit_rate(&a, &c_pubkey, &addr_c).await;
     steps.pass("explicit per-channel funding fee rate refused (#101), no channel, no broadcast");
 
+    // Regression #190: regtest Esplora has no fee estimates. Explicit quotes
+    // must refuse, while the default open below must still fund and confirm.
+    let estimates: Value = reqwest::get(format!("{}/fee-estimates", chain.url))
+        .await.unwrap().json().await.unwrap();
+    assert_eq!(estimates, json!({}));
+    assert!(matches!(a.funding_fee_quote(Default::default()).await,
+        Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(_))));
     // A opens through the product's supported path (no explicit rate).
     a.open_channel(&c_pubkey, &addr_c, 1_000_000, false, None)
         .await

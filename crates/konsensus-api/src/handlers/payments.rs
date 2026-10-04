@@ -646,6 +646,16 @@ async fn keysend_observed(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenChannelRequest {
+    /// Target preference; omitted keeps the provider's default (LDK: normal).
+    #[serde(default)]
+    pub funding_priority: Option<konsensus_core::traits::lightning::FundingPriority>,
+    /// Return a read-only estimate without connecting a peer or creating a channel.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Hard absolute funding fee cap, checked before signing; unsupported backends refuse.
+    #[serde(default)]
+    pub max_funding_fee_sats: Option<u64>,
+
     /// Hex-encoded Lightning public key of the peer.
     pub peer_pubkey: String,
     /// Network address of the peer (host:port).
@@ -687,21 +697,35 @@ async fn open_channel(
         validate_fee_rate_sat_per_vb(rate)
             .map_err(|e| ApiError::NotDispatched(e.to_string()))?;
     }
-    let result = state
-        .lightning
-        .open_channel_with_status(
-            &req.peer_pubkey,
-            &req.peer_addr,
-            req.amount_sats,
-            req.announce,
-            req.fee_rate_sat_per_vb,
-        )
-        .await
-        .map_err(ApiError::from)?;
+    if req.max_funding_fee_sats.is_some_and(|cap| cap == 0 || cap > 2_100_000_000_000_000) {
+        return Err(ApiError::NotDispatched("max_funding_fee_sats must be between 1 and 2100000000000000".into()));
+    }
+    let explicit = req.funding_priority.is_some() || req.max_funding_fee_sats.is_some();
+    if req.fee_rate_sat_per_vb.is_some() && (explicit || req.dry_run) {
+        return Err(ApiError::NotDispatched("exact fee_rate_sat_per_vb cannot be combined with funding priority, fee cap, or preview".into()));
+    }
+    let options = konsensus_core::traits::lightning::FundingOptions {
+        priority: req.funding_priority.unwrap_or_default(),
+        max_funding_fee_sats: req.max_funding_fee_sats,
+    };
+    if req.dry_run {
+        let quote = state.lightning.funding_fee_quote(options).await.map_err(ApiError::from)?;
+        return Ok(Json(serde_json::json!({"status": "preview", "funding_fee": quote,
+            "warning": "Estimate only; opening obtains a fresh estimate. Confirmation and channel_ready times are not guaranteed."})));
+    }
+    let result = if explicit {
+        state.lightning.open_channel_with_funding(&req.peer_pubkey, &req.peer_addr,
+            req.amount_sats, req.announce, options).await
+    } else {
+        state.lightning.open_channel_with_status(&req.peer_pubkey, &req.peer_addr,
+            req.amount_sats, req.announce, req.fee_rate_sat_per_vb).await
+    }.map_err(ApiError::from)?;
 
     Ok(Json(serde_json::json!({
         "channel_id": result.channel_id,
         "funding_txid": result.funding_txid,
+        "funding_fee": result.funding_fee,
+        "warning": "Confirmation targets are estimates, not guarantees of confirmation or channel_ready. Funding fees will not be automatically raised.",
         "peer_pubkey": req.peer_pubkey,
         "amount_sats": req.amount_sats,
         "status": result.status

@@ -2454,3 +2454,14 @@ async fn channel_fee_api_preserves_announce_without_override() {
         assert_eq!(json["channel_id"], expected_id);
     }
 }
+
+#[test]
+fn funding_priority_and_preview_are_accepted() {
+    for priority in ["economy", "normal", "fast"] {
+        let result = serde_json::from_value::<konsensus_api::handlers::payments::OpenChannelRequest>(
+            serde_json::json!({"peer_pubkey":"peer", "peer_addr":"unused", "amount_sats":50000,
+                "funding_priority":priority, "dry_run":true, "max_funding_fee_sats":1000}),
+        );
+        assert!(result.is_ok(), "{priority}: {}", result.err().unwrap());
+    }
+}

@@ -264,7 +264,6 @@ impl Wallet {
 		Ok(())
 	}
 
-	#[allow(deprecated)]
 	pub(crate) fn create_funding_transaction(
 		&self,
 		output_script: ScriptBuf,
@@ -273,7 +272,33 @@ impl Wallet {
 		locktime: LockTime,
 	) -> Result<Transaction, Error> {
 		let fee_rate = self.fee_estimator.estimate_fee_rate(confirmation_target);
+		self.create_funding_with_policy(output_script, amount, fee_rate, None, locktime)
+	}
 
+    pub(crate) fn record_funding_failure(&self, id: u128, error: Error) -> Result<(), Error> {
+        let store = Arc::clone(&self.persister.lock().unwrap().kv_store);
+        crate::funding::record_failure(store.as_ref(), id, error)
+    }
+
+	pub(crate) fn create_channel_funding_transaction(&self, output_script: ScriptBuf, amount: Amount,
+		user_channel_id: u128, locktime: LockTime,
+	) -> Result<Transaction, Error> {
+		let store = Arc::clone(&self.persister.lock().unwrap().kv_store);
+		// A refusal already observable by the owner is terminal, even if wallet
+		// conditions improve before another construction attempt for this ID.
+		if crate::funding::failure(store.as_ref(), user_channel_id)?.is_some() {
+			return Err(Error::OnchainTxCreationFailed);
+		}
+		match crate::funding::load(store.as_ref(), user_channel_id)? {
+			Some(policy) => self.create_funding_with_policy(output_script, amount, policy.fee_rate, policy.max_fee_sats, locktime),
+			None => self.create_funding_transaction(output_script, amount, ConfirmationTarget::ChannelFunding, locktime),
+		}
+	}
+
+	#[allow(deprecated)]
+	fn create_funding_with_policy(&self, output_script: ScriptBuf, amount: Amount,
+		fee_rate: FeeRate, max_fee_sats: Option<u64>, locktime: LockTime,
+	) -> Result<Transaction, Error> {
 		let mut locked_wallet = self.inner.lock().unwrap();
 		let unavailable = self.local_spends.lock().unwrap().unavailable();
 		let mut tx_builder = locked_wallet.build_tx();
@@ -291,6 +316,13 @@ impl Wallet {
 				return Err(err.into());
 			},
 		};
+
+		// Include dust/change folded into fees. Check the actual absolute PSBT fee
+		// BEFORE signing, input reservation, or any transaction can escape.
+		let fee = psbt.fee().map_err(|_| Error::OnchainTxCreationFailed)?.to_sat();
+		if max_fee_sats.is_some_and(|cap| fee > cap) {
+			return Err(Error::FundingFeeCapExceeded);
+		}
 
 		match locked_wallet.sign(&mut psbt, SignOptions::default()) {
 			Ok(finalized) => {

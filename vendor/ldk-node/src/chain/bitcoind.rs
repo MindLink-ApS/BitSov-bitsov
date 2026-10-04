@@ -507,6 +507,7 @@ impl BitcoindChainSource {
 		let confirmation_targets = get_all_conf_targets();
 
 		let mut new_fee_rate_cache = HashMap::with_capacity(10);
+		let mut funding_targets = std::collections::HashSet::new();
 		let now = Instant::now();
 		for target in confirmation_targets {
 			let fee_rate_update_res = match target {
@@ -541,7 +542,10 @@ impl BitcoindChainSource {
 			};
 
 			let fee_rate = match (fee_rate_update_res, self.config.network) {
-				(Ok(rate), _) => rate,
+				(Ok(rate), _) => {
+					if rate.to_sat_per_kwu() > 0 { funding_targets.insert(target); }
+					rate
+				},
 				(Err(e), Network::Bitcoin) => {
 					// Strictly fail on mainnet.
 					log_error!(self.logger, "Failed to retrieve fee rate estimates: {}", e);
@@ -583,7 +587,7 @@ impl BitcoindChainSource {
 			);
 		}
 
-		if self.fee_estimator.set_fee_rate_cache(new_fee_rate_cache) {
+		if self.fee_estimator.set_fee_rate_cache(new_fee_rate_cache, funding_targets) {
 			// We only log if the values changed, as it might be very spammy otherwise.
 			log_info!(
 				self.logger,

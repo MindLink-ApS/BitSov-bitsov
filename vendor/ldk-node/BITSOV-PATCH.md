@@ -357,3 +357,32 @@ vendor-client fixture; adapter tests still check both aggregate balance views.
 Doctrine: 1 and 5 hold (settlement and self-custody preserved); 2 holds (Bitcoin
 remains chain/admission infrastructure); 3 and 4 unchanged; 6 holds (explicit
 rate-limit diagnostics and no claim of live incident resolution).
+
+## Owner-selected channel funding policy (#190)
+
+Baseline/version/checksum remain the 0.7.0 archive above. Added `funding.rs`:
+closed economy/normal/fast choices reuse existing unadjusted estimator targets
+(144/12/6 blocks), with an opaque estimator-selected policy and optional absolute
+fee cap. `fee_estimator.rs` tracks cache update age and refuses missing/stale
+(older than twice the configured fee refresh interval, minimum 900 seconds)
+estimates for this API. Legacy opens retain the original cached/fallback path. The three chain adapters track which targets have real, finite, positive source estimates; synthetic fallback rates remain available to LDK but cannot qualify as funding quotes. `lib.rs` exposes quote/open/failure methods;
+policy is persisted before `create_channel`, keyed by a marked user-channel ID.
+Missing/corrupt records for marked IDs fail closed, including after restart.
+Policies/failures remain as small durable diagnostic records; automatic pruning
+is deliberately absent so replay cannot lose an enforceable policy.
+
+`event.rs` uses the policy-aware wallet builder and records construction failure
+before closing an unfunded channel. The first recorded refusal is terminal at the wallet builder, survives restart, and cannot be replaced by a later retry reason (the pinned LDK does not persist FundingGenerationReady itself across restart). `wallet/mod.rs` checks the complete unsigned
+PSBT fee before signing or reservation, and `error.rs` names cap refusal. Legacy
+unmarked channels retain their existing estimator behavior. No upstream
+confirmation/commitment/HTLC logic was changed, no new fee estimator requests
+were added, and no CPFP operation or automatic funding fee escalation was added.
+See `docs/ops/funding-fees.md` for owner API behavior and the precise CPFP gap.
+
+Validation (disposable wallet; no socket/node start):
+
+```sh
+cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib funding
+cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib bitsov_money_tests
+cargo test --offline --locked -p konsensus-api --test funding_fee_tests
+```

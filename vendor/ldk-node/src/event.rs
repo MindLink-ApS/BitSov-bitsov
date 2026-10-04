@@ -35,7 +35,6 @@ use rand::{rng, Rng};
 use crate::config::{may_announce_channel, Config};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
-use crate::fee_estimator::ConfirmationTarget;
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
 	EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -542,7 +541,6 @@ where
 			} => {
 				// Construct the raw transaction with the output that is paid the amount of the
 				// channel.
-				let confirmation_target = ConfirmationTarget::ChannelFunding;
 
 				// We set nLockTime to the current height to discourage fee sniping.
 				let cur_height = self.channel_manager.current_best_block().height;
@@ -550,10 +548,10 @@ where
 
 				// Sign the final funding transaction and broadcast it.
 				let channel_amount = Amount::from_sat(channel_value_satoshis);
-				match self.wallet.create_funding_transaction(
+				match self.wallet.create_channel_funding_transaction(
 					output_script,
 					channel_amount,
-					confirmation_target,
+					user_channel_id,
 					locktime,
 				) {
 					Ok(final_tx) => {
@@ -620,6 +618,7 @@ where
 						// create_funding_transaction abandons its reservation before
 						// returning a persistence error: no tx has reached LDK yet.
 						log_error!(self.logger, "Failed to create funding transaction: {}", err);
+						self.wallet.record_funding_failure(user_channel_id, err).map_err(|_| ReplayEvent())?;
 						self.channel_manager
 							.force_close_broadcasting_latest_txn(
 								&temporary_channel_id,

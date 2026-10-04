@@ -8,8 +8,16 @@ use konsensus_core::traits::lightning::*;
 use std::sync::Arc;
 
 #[cfg(test)]
+#[path = "../../konsensus-api/tests/common/mod.rs"]
+mod test_common;
+
+#[cfg(test)]
 #[path = "tests/balance_breakdown.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/funding_fees.rs"]
+mod funding_tests;
 
 pub struct GuardedLightning {
     pub inner: Arc<dyn LightningProvider>,
@@ -234,6 +242,45 @@ impl LightningProvider for GuardedLightning {
                 announce,
                 fee_rate_sat_per_vb,
             )
+            .await
+    }
+    async fn open_channel_with_status(
+        &self,
+        peer_pubkey: &str,
+        peer_addr: &str,
+        amount_sats: u64,
+        announce: bool,
+        fee_rate_sat_per_vb: Option<f32>,
+    ) -> Result<ChannelOpenResult, LightningError> {
+        self.disk.check()?;
+        self.inner
+            .open_channel_with_status(
+                peer_pubkey,
+                peer_addr,
+                amount_sats,
+                announce,
+                fee_rate_sat_per_vb,
+            )
+            .await
+    }
+    async fn funding_fee_quote(
+        &self,
+        options: FundingOptions,
+    ) -> Result<FundingFeeEstimate, LightningError> {
+        self.disk.check()?;
+        self.inner.funding_fee_quote(options).await
+    }
+    async fn open_channel_with_funding(
+        &self,
+        peer_pubkey: &str,
+        peer_addr: &str,
+        amount_sats: u64,
+        announce: bool,
+        options: FundingOptions,
+    ) -> Result<ChannelOpenResult, LightningError> {
+        self.disk.check()?;
+        self.inner
+            .open_channel_with_funding(peer_pubkey, peer_addr, amount_sats, announce, options)
             .await
     }
     async fn close_channel(

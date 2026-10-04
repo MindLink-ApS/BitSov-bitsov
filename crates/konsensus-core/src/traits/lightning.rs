@@ -114,8 +114,36 @@ pub enum ChannelOpenStatus {
     PendingVisibility,
 }
 
+/// Owner's funding preference. Confirmation times are estimates, not deadlines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FundingPriority {
+    Economy,
+    #[default]
+    Normal,
+    Fast,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FundingOptions {
+    pub priority: FundingPriority,
+    pub max_funding_fee_sats: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundingFeeEstimate {
+    pub priority: FundingPriority,
+    pub confirmation_target_blocks: u32,
+    /// Target blocks times Bitcoin's ten-minute average; NOT time to channel_ready.
+    pub expected_confirmation_minutes: u32,
+    pub estimated_fee_rate_sat_per_vb: f64,
+    pub max_funding_fee_sats: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelOpenResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_fee: Option<FundingFeeEstimate>,
     pub channel_id: String,
     pub funding_txid: Option<String>,
     pub status: ChannelOpenStatus,
@@ -780,7 +808,20 @@ pub trait LightningProvider: Send + Sync {
         announce: bool, fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<ChannelOpenResult, LightningError> {
         let channel_id = self.open_channel(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb).await?;
-        Ok(ChannelOpenResult { channel_id, funding_txid: None, status: ChannelOpenStatus::Opening })
+        Ok(ChannelOpenResult { funding_fee: None, channel_id, funding_txid: None, status: ChannelOpenStatus::Opening })
+    }
+
+    /// Read-only preview. Unsupported backends must refuse, never invent a quote.
+    async fn funding_fee_quote(&self, _options: FundingOptions) -> Result<FundingFeeEstimate, LightningError> {
+        Err(LightningError::PaymentNotDispatched("funding priority/fee cap not supported by this provider".into()))
+    }
+
+    /// Explicit funding preferences must survive asynchronous transaction construction.
+    async fn open_channel_with_funding(
+        &self, _peer_pubkey: &str, _peer_addr: &str, _amount_sats: u64,
+        _announce: bool, _options: FundingOptions,
+    ) -> Result<ChannelOpenResult, LightningError> {
+        Err(LightningError::PaymentNotDispatched("funding priority/fee cap not supported by this provider".into()))
     }
 
     fn local_spend_diagnostics(&self) -> LocalSpendDiagnostics {

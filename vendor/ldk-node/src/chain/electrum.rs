@@ -270,8 +270,8 @@ impl ElectrumChainSource {
 
 		let now = Instant::now();
 
-		let new_fee_rate_cache = electrum_client.get_fee_rate_cache_update().await?;
-		self.fee_estimator.set_fee_rate_cache(new_fee_rate_cache);
+		let (new_fee_rate_cache, funding_targets) = electrum_client.get_fee_rate_cache_update().await?;
+		self.fee_estimator.set_fee_rate_cache(new_fee_rate_cache, funding_targets);
 
 		log_info!(
 			self.logger,
@@ -568,7 +568,7 @@ impl ElectrumRuntimeClient {
 
 	async fn get_fee_rate_cache_update(
 		&self,
-	) -> Result<HashMap<ConfirmationTarget, FeeRate>, Error> {
+	) -> Result<(HashMap<ConfirmationTarget, FeeRate>, std::collections::HashSet<ConfirmationTarget>), Error> {
 		let electrum_client = Arc::clone(&self.electrum_client);
 
 		let mut batch = Batch::default();
@@ -614,6 +614,7 @@ impl ElectrumRuntimeClient {
 		}
 
 		let mut new_fee_rate_cache = HashMap::with_capacity(10);
+		let mut funding_targets = std::collections::HashSet::new();
 		for (target, raw_fee_rate_btc_per_kvb) in
 			confirmation_targets.into_iter().zip(raw_estimates_btc_kvb.into_iter())
 		{
@@ -621,6 +622,7 @@ impl ElectrumRuntimeClient {
 			// = 0.00001 btc/kvb) if we fail or it yields less than that. This is mostly necessary
 			// to continue on `signet`/`regtest` where we might not get estimates (or bogus
 			// values).
+			if crate::fee_estimator::usable_funding_estimate(raw_fee_rate_btc_per_kvb.as_f64()) { funding_targets.insert(target); }
 			let fee_rate_btc_per_kvb = raw_fee_rate_btc_per_kvb
 				.as_f64()
 				.map_or(0.00001, |converted| converted.max(0.00001));
@@ -646,7 +648,7 @@ impl ElectrumRuntimeClient {
 			);
 		}
 
-		Ok(new_fee_rate_cache)
+		Ok((new_fee_rate_cache, funding_targets))
 	}
 }
 

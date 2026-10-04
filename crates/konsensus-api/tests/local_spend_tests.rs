@@ -42,6 +42,7 @@ impl LightningProvider for Wallet {
         _: Option<f32>,
     ) -> Result<ChannelOpenResult, LightningError> {
         Ok(ChannelOpenResult {
+            funding_fee: None,
             channel_id: "pending-channel".into(),
             funding_txid: Some("ab".repeat(32)),
             status: ChannelOpenStatus::PendingVisibility,

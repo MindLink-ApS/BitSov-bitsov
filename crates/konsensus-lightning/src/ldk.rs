@@ -1703,6 +1703,58 @@ impl LightningProvider for LdkProvider {
         }).await
     }
 
+    async fn funding_fee_quote(&self, options: konsensus_core::traits::lightning::FundingOptions) -> Result<konsensus_core::traits::lightning::FundingFeeEstimate, LightningError> {
+        Ok(funding_estimate(&select_funding_policy(&self.node, options)?))
+    }
+
+    async fn open_channel_with_funding(&self, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
+        announce: bool, options: konsensus_core::traits::lightning::FundingOptions,
+    ) -> Result<konsensus_core::traits::lightning::ChannelOpenResult, LightningError> {
+        let node = self.node.clone();
+        let chain = self.chain_visibility();
+        let peer_pubkey = peer_pubkey.to_owned();
+        let peer_addr = peer_addr.to_owned();
+        self.onchain_operations.run(async move {
+            validate_channel_announcement(node.as_ref(), announce)?;
+            let policy = select_funding_policy(&node, options)?;
+            let estimate = funding_estimate(&policy);
+            let opener = node.clone();
+            let channel_id = tokio::task::spawn_blocking(move || open_ldk_channel_with_policy(
+                opener.as_ref(), &peer_pubkey, &peer_addr, amount_sats, announce, Some(policy),
+            )).await.map_err(|e| LightningError::Backend(format!("open_channel worker failed: {e}")))??;
+            let pending_id = channel_id.clone();
+            let mut result = crate::onchain::finish_channel_open(channel_id, || {
+                let id = pending_id.parse::<u128>().map(ldk_node::UserChannelId)
+                    .map_err(|e| LightningError::Backend(format!("invalid channel id: {e}")))?;
+                if let Some(reason) = node.channel_funding_failure(id)
+                    .map_err(|e| LightningError::Backend(format!("funding outcome unavailable: {e}")))? {
+                    return Err(LightningError::PaymentNotDispatched(format!("channel {pending_id}: {reason}; funding not dispatched")));
+                }
+                let channel = node.list_channels().into_iter()
+                    .find(|ch| ch.user_channel_id.to_string() == pending_id)
+                    .ok_or_else(|| LightningError::Backend(format!(
+                        "channel {pending_id} disappeared before funding was verified; inspect channel events before retrying"
+                    )))?;
+                Ok(channel.funding_txo.map(|outpoint| outpoint.txid.to_string()))
+            }, |id| {
+                let chain = &chain;
+                let node = &node;
+                async move {
+                let visible = chain.tx_visible(id.clone()).await?;
+                if visible {
+                    let txid = id.parse().map_err(|e| format!("invalid funding txid: {e}"))?;
+                    if let Err(error) = node.transaction_broadcast_verified(txid) {
+                        tracing::warn!(%txid, %error, "funding visible but reservation persistence failed");
+                    }
+                }
+                Ok(visible)
+                }
+            }).await?;
+            result.funding_fee = Some(estimate);
+            Ok(result)
+        }).await
+    }
+
     fn local_spend_diagnostics(&self) -> konsensus_core::traits::lightning::LocalSpendDiagnostics {
         use konsensus_core::traits::lightning::{LocalSpendDiagnostics, LocalSpendReservation};
         LocalSpendDiagnostics {
@@ -2297,6 +2349,11 @@ fn classify_dispatch_error(error: ldk_node::NodeError, payment_capable: &AtomicB
 trait ChannelOpener {
     fn has_node_alias(&self) -> bool;
     fn has_listening_addresses(&self) -> bool;
+    fn open_with_funding_policy(&self, peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress, amount_sats: u64,
+        announce: bool, policy: ldk_node::funding::FundingPolicy,
+    ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError>;
+
     fn open_channel(
         &self,
         peer: bitcoin::secp256k1::PublicKey,
@@ -2322,6 +2379,13 @@ impl ChannelOpener for LdkNode {
 
     fn has_listening_addresses(&self) -> bool {
         self.listening_addresses().is_some_and(|addrs| !addrs.is_empty())
+    }
+
+    fn open_with_funding_policy(&self, peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress, amount_sats: u64,
+        announce: bool, policy: ldk_node::funding::FundingPolicy,
+    ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError> {
+        self.open_channel_with_funding_policy(peer, addr, amount_sats, announce, policy)
     }
 
     fn open_channel(
@@ -2354,22 +2418,15 @@ fn open_ldk_channel(
     announce: bool,
     fee_rate_sat_per_vb: Option<f32>,
 ) -> Result<String, LightningError> {
-    if fee_rate_sat_per_vb.is_some() {
-        // ldk-node 0.7 / lightning 0.2.2: ChannelConfig controls forwarding
-        // and commitment policy, not funding fees. FundingGenerationReady
-        // uses the wallet's ChannelFunding estimator later. A quote checked
-        // here cannot bound that rate, so reject BEFORE connecting a peer.
-        return Err(LightningError::PaymentNotDispatched(
-            "LDK cannot enforce a per-channel funding fee rate".into(),
-        ));
-    }
-    // Mirror vendored ldk-node's may_announce_channel before any open call.
-    // Public-channel support requires operator configuration; do not invent an alias.
-    if announce && (!node.has_node_alias() || !node.has_listening_addresses()) {
-        return Err(LightningError::PaymentNotDispatched(
-            "announce_unavailable: public channel announcement requires a node alias and nonempty listening addresses".into(),
-        ));
-    }
+    refuse_exact_funding_rate(fee_rate_sat_per_vb)?;
+    open_ldk_channel_with_policy(node, peer_pubkey, peer_addr, amount_sats, announce, None)
+}
+
+fn open_ldk_channel_with_policy(
+    node: &impl ChannelOpener, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
+    announce: bool, policy: Option<ldk_node::funding::FundingPolicy>,
+) -> Result<String, LightningError> {
+    validate_channel_announcement(node, announce)?;
     use std::str::FromStr;
     let node_pubkey = ldk_node::bitcoin::secp256k1::PublicKey::from_str(peer_pubkey)
         .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid pubkey: {e}")))?;
@@ -2390,7 +2447,9 @@ fn open_ldk_channel(
     };
 
     // Open channel (connect + open in one call)
-    let user_channel_id = if announce {
+    let user_channel_id = if let Some(policy) = policy {
+        node.open_with_funding_policy(node_pubkey, ldk_addr, amount_sats, announce, policy)
+    } else if announce {
         node.open_announced_channel(node_pubkey, ldk_addr, amount_sats, None, None)
     } else {
         node.open_channel(node_pubkey, ldk_addr, amount_sats, None, None)
@@ -2409,4 +2468,53 @@ fn open_ldk_channel(
     let channel_id = format!("{}", user_channel_id);
     tracing::info!(channel_id = %channel_id, amount_sats, peer = %peer_pubkey, "Lightning channel opening initiated");
     Ok(channel_id)
+}
+
+fn select_funding_policy(node: &LdkNode, options: konsensus_core::traits::lightning::FundingOptions) -> Result<ldk_node::funding::FundingPolicy, LightningError> {
+    node.funding_fee_quote(ldk_funding_priority(options.priority), options.max_funding_fee_sats).map_err(|error| LightningError::PaymentNotDispatched(format!(
+        "funding estimate unavailable or invalid (fresh LDK estimate and valid fee cap required): {error}"
+    )))
+}
+
+fn funding_estimate(policy: &ldk_node::funding::FundingPolicy) -> konsensus_core::traits::lightning::FundingFeeEstimate {
+    use konsensus_core::traits::lightning::{FundingPriority as Core, FundingFeeEstimate};
+    use ldk_node::funding::FundingPriority as Ldk;
+    let priority = match policy.priority() { Ldk::Economy => Core::Economy, Ldk::Normal => Core::Normal, Ldk::Fast => Core::Fast };
+    let blocks = policy.priority().confirmation_target_blocks();
+    FundingFeeEstimate { priority, confirmation_target_blocks: blocks,
+        expected_confirmation_minutes: blocks * 10,
+        estimated_fee_rate_sat_per_vb: policy.estimated_fee_rate_sat_per_kwu() as f64 / 250.0,
+        max_funding_fee_sats: policy.max_fee_sats(),
+    }
+}
+
+fn ldk_funding_priority(priority: konsensus_core::traits::lightning::FundingPriority) -> ldk_node::funding::FundingPriority {
+    use konsensus_core::traits::lightning::FundingPriority as Core;
+    use ldk_node::funding::FundingPriority as Ldk;
+    match priority {
+        Core::Economy => Ldk::Economy,
+        Core::Normal => Ldk::Normal,
+        Core::Fast => Ldk::Fast,
+    }
+}
+
+fn validate_channel_announcement(node: &impl ChannelOpener, announce: bool) -> Result<(), LightningError> {
+    // Preserve the existing announcement refusal before estimating or dispatching.
+    if announce && (!node.has_node_alias() || !node.has_listening_addresses()) {
+        return Err(LightningError::PaymentNotDispatched(
+            "announce_unavailable: public channel announcement requires a node alias and nonempty listening addresses".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn refuse_exact_funding_rate(rate: Option<f32>) -> Result<(), LightningError> {
+    // Only estimator-selected funding policies are supported. An exact caller
+    // rate cannot promise final sat/vB after transaction rounding/dust change.
+    if rate.is_some() {
+        return Err(LightningError::PaymentNotDispatched(
+            "LDK cannot enforce an exact caller-supplied funding fee rate; use funding_priority".into(),
+        ));
+    }
+    Ok(())
 }

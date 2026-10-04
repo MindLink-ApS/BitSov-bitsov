@@ -1,6 +1,5 @@
 //! Exercise the authenticated API through the node's real provider wrappers.
-#[path = "../../../konsensus-api/tests/common/mod.rs"]
-mod common;
+use super::test_common as common;
 
 use super::*;
 use axum::body::Body;
