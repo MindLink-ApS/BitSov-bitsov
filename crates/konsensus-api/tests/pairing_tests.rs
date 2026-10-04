@@ -1280,6 +1280,17 @@ async fn elevation_status_is_private_on_remote_and_loopback() {
                 }
             }
             if owner_control {
+                let cancelled = service.create_elevation_request(&a, vec![Scope::Spend]).unwrap();
+                service.cancel_pending(&a, &cancelled.op_id).unwrap();
+                // Voluntary withdrawal removes the operation entirely; neither
+                // client can subsequently query it (unlike lockout's lost status).
+                for token in [&token_a, &token_b] {
+                    let response = app.clone().oneshot(Request::builder()
+                        .uri(format!("/api/v1/pair/elevation/{}", cancelled.op_id))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty()).unwrap()).await.unwrap();
+                    assert_eq!(response.status(), StatusCode::NOT_FOUND, "cancelled request privacy");
+                }
                 let op = service.create_elevation_request(&a, vec![Scope::Spend]).unwrap();
                 for _ in 0..3 {
                     let _ = service.grant_elevation(&op.op_id, "WRONG",
