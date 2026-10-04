@@ -383,7 +383,7 @@ impl<S: Storage> EncryptedStorage<S> {
         decrypt: impl Fn(&R) -> Result<T, StorageError>,
     ) -> Result<crate::StorageList<T>, StorageError>
     where
-        C: ToString,
+        C: Clone + ToString,
         F: Fn(u32, Option<crate::ListCursor<C>>) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<R>, StorageError>>,
     {
@@ -392,7 +392,8 @@ impl<S: Storage> EncryptedStorage<S> {
         let mut result = crate::StorageList::readable(Vec::new());
         while result.items.len() < limit as usize && scanned < budget {
             let batch_limit = limit.min(budget - scanned);
-            let rows = fetch(batch_limit, cursor.take()).await?;
+            // Keep the last processed position if the next fetch is empty.
+            let rows = fetch(batch_limit, cursor.clone()).await?;
             let exhausted = rows.len() < batch_limit as usize;
             for row in rows {
                 let at = position(&row);
@@ -411,11 +412,13 @@ impl<S: Storage> EncryptedStorage<S> {
                 if result.items.len() == limit as usize { break; }
             }
             if exhausted { break; }
-            if scanned == budget && result.items.len() < limit as usize {
-                result.continuation = cursor.as_ref().map(|at| crate::ListCursor {
-                    timestamp: at.timestamp.to_string(), id: at.id.clone(),
-                });
-            }
+        }
+        // Even an exhausted scan must let clients advance past unreadable rows.
+        // Only a subsequent empty scan without omissions is unambiguous exhaustion.
+        if result.unreadable_count > 0 || (scanned == budget && result.items.len() < limit as usize) {
+            result.continuation = cursor.map(|at| crate::ListCursor {
+                timestamp: at.timestamp.to_string(), id: at.id,
+            });
         }
         self.record_list_health(&result);
         Ok(result)

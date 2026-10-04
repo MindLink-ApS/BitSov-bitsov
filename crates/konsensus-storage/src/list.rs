@@ -5,7 +5,8 @@
 pub struct StorageList<T> {
     pub items: Vec<T>,
     pub unreadable_count: u64,
-    /// Set when the bounded scan stops before filling the readable page.
+    /// Last processed raw row when rows were unreadable or the scan budget was
+    /// reached before filling the readable page. Does not guarantee more rows.
     pub continuation: Option<ListCursor<String>>,
     /// Lossless positions of readable rows, aligned with `items` for paged scans.
     pub readable_cursors: Vec<ListCursor<String>>,

@@ -1,8 +1,8 @@
-//! Per-IP rate limiting middleware.
+//! Per-IP and authenticated remote-pairing rate limiting middleware.
 //!
 //! Uses a sliding window counter to enforce requests-per-second limits.
-//! Each client IP gets its own bucket. Expired entries are periodically
-//! cleaned up to prevent memory growth.
+//! Local client IPs and remote pairings get separate buckets. Expired entries
+//! are periodically cleaned up to prevent memory growth.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -15,6 +15,90 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+/// Server-owned association between a tunnel's internal TCP peer and the
+/// pairing authenticated by Noise. Never populated from HTTP headers or JWTs.
+#[derive(Default)]
+pub struct RemoteTunnelClients {
+    clients: Mutex<HashMap<SocketAddr, Arc<str>>>,
+}
+
+impl RemoteTunnelClients {
+    /// Register before forwarding any HTTP bytes. Keep the guard alive for the
+    /// tunnel's lifetime; dropping it removes the association even on cancellation.
+    pub fn register(
+        self: &Arc<Self>,
+        peer: SocketAddr,
+        client_id: String,
+    ) -> RemoteTunnelRegistration {
+        let client_id: Arc<str> = client_id.into();
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer, client_id.clone());
+        RemoteTunnelRegistration {
+            clients: self.clone(),
+            peer,
+            client_id,
+        }
+    }
+}
+
+/// Removes the tunnel identity when its bridge is dropped.
+#[must_use = "keep this guard alive until the tunnel closes"]
+pub struct RemoteTunnelRegistration {
+    clients: Arc<RemoteTunnelClients>,
+    peer: SocketAddr,
+    client_id: Arc<str>,
+}
+
+impl Drop for RemoteTunnelRegistration {
+    fn drop(&mut self) {
+        let mut clients = self
+            .clients
+            .clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A stale guard must not remove a later registration for a reused peer.
+        if clients
+            .get(&self.peer)
+            .is_some_and(|id| Arc::ptr_eq(id, &self.client_id))
+        {
+            clients.remove(&self.peer);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RemotePairingRateLimitKey(Arc<str>);
+
+/// Install outside the remote router's rate limiter. Unregistered connections
+/// fail closed, including direct local connections to the internal listener.
+pub async fn remote_tunnel_identity(
+    State(clients): State<Arc<RemoteTunnelClients>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let client = connect_info.and_then(|peer| {
+        clients
+            .clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&peer.0)
+            .cloned()
+    });
+    let Some(client) = client else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tunnel identity unavailable",
+        )
+            .into_response();
+    };
+    req.extensions_mut()
+        .insert(RemotePairingRateLimitKey(client));
+    next.run(req).await
+}
 
 /// Shared rate limiter state.
 ///
@@ -148,9 +232,10 @@ impl RateLimiter {
     }
 }
 
-/// Axum middleware that enforces per-IP rate limiting.
+/// Axum middleware that enforces per-IP or authenticated per-pairing limits.
 ///
-/// Extracts the client IP from the connection info and checks against
+/// Uses the server-owned tunnel identity when present, otherwise the client IP
+/// from connection info. Pairing buckets survive tunnel reconnects. Checks against
 /// the rate limiter. Returns 429 Too Many Requests if the limit is exceeded.
 ///
 /// # Fail-closed on a missing client IP
@@ -200,7 +285,11 @@ pub async fn rate_limit_middleware(
         }
     };
 
-    if !limiter.check(ip) {
+    let allowed = match req.extensions().get::<RemotePairingRateLimitKey>() {
+        Some(client) => limiter.check_key(&format!("pairing:{}", client.0)),
+        None => limiter.check(ip),
+    };
+    if !allowed {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", "1")],
@@ -429,6 +518,107 @@ mod tests {
         assert!(
             buckets.is_empty(),
             "IP-less requests must not allocate any rate-limit bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_budgets_follow_pairings_across_connections_and_ignore_headers() {
+        let clients = Arc::new(RemoteTunnelClients::default());
+        let limiter = Arc::new(RateLimiter::with_window(2, Duration::from_secs(60)));
+        let app = middleware_router(limiter).layer(axum::middleware::from_fn_with_state(
+            clients.clone(),
+            remote_tunnel_identity,
+        ));
+        let a1 = "127.0.0.1:40001".parse().unwrap();
+        let a2 = "127.0.0.1:40002".parse().unwrap();
+        let b = "127.0.0.1:40003".parse().unwrap();
+        let _a1 = clients.register(a1, "pair-a".into());
+        let a2_guard = clients.register(a2, "pair-a".into());
+        let _b = clients.register(b, "pair-b".into());
+        for (peer, expected) in [
+            (a1, StatusCode::OK),
+            (a2, StatusCode::OK),
+            (a1, StatusCode::TOO_MANY_REQUESTS),
+            (b, StatusCode::OK),
+        ] {
+            let response = tunnel_request(&app, peer).await;
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(response.headers()["retry-after"], "1");
+            }
+        }
+        drop(a2_guard);
+        let a3 = "127.0.0.1:40004".parse().unwrap();
+        let _a3 = clients.register(a3, "pair-a".into());
+        assert_eq!(
+            tunnel_request(&app, a3).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(tunnel_request(&app, b).await.status(), StatusCode::OK);
+    }
+
+    async fn tunnel_request(app: &Router, peer: SocketAddr) -> Response {
+        let mut request = HttpRequest::builder()
+            .uri("/")
+            // Neither claimed identity nor forwarded IP may choose the bucket.
+            .header("x-pairing-client-id", "forged-client")
+            .header("x-forwarded-for", "198.51.100.1")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        app.clone().oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn unregistered_and_closed_tunnels_fail_closed_without_spending_quota() {
+        let clients = Arc::new(RemoteTunnelClients::default());
+        let limiter = Arc::new(RateLimiter::with_window(1, Duration::from_secs(60)));
+        let app = middleware_router(limiter.clone()).layer(axum::middleware::from_fn_with_state(
+            clients.clone(),
+            remote_tunnel_identity,
+        ));
+        let peer = "127.0.0.1:40001".parse().unwrap();
+        assert_eq!(
+            tunnel_request(&app, peer).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let registration = clients.register(peer, "pair-a".into());
+        assert_eq!(tunnel_request(&app, peer).await.status(), StatusCode::OK);
+        drop(registration);
+        assert_eq!(
+            tunnel_request(&app, peer).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(clients.clients.lock().unwrap().is_empty());
+        // Remote callers never charge the genuine local listener's IP bucket.
+        assert!(limiter.check(peer.ip()));
+        let response = app
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn stale_registration_cannot_remove_reused_peers_new_identity() {
+        let clients = Arc::new(RemoteTunnelClients::default());
+        let app = middleware_router(Arc::new(RateLimiter::with_window(
+            1,
+            Duration::from_secs(60),
+        )))
+        .layer(axum::middleware::from_fn_with_state(
+            clients.clone(),
+            remote_tunnel_identity,
+        ));
+        let peer = "127.0.0.1:40001".parse().unwrap();
+        let old = clients.register(peer, "pair-a".into());
+        assert_eq!(tunnel_request(&app, peer).await.status(), StatusCode::OK);
+        let _new = clients.register(peer, "pair-b".into());
+        drop(old);
+        assert_eq!(tunnel_request(&app, peer).await.status(), StatusCode::OK);
+        assert_eq!(
+            tunnel_request(&app, peer).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
         );
     }
 }

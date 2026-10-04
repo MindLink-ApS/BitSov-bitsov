@@ -130,6 +130,14 @@ still requires settlement, and the OS-account trust boundary is explicit.
 
 ### Remote spend requests and price preparation
 
+Remote HTTP requests share a rate-limit bucket per authenticated pairing,
+including across simultaneous tunnels and reconnects. Separate pairings do not
+consume each other's allowance or the owner-local IP allowance. The Noise bridge
+registers each internal connection's pairing in server-owned state before
+forwarding bytes; HTTP headers cannot select the bucket. Unregistered internal
+connections fail closed, and closing a tunnel removes its registration. The
+public pre-authentication handshake limiter remains per IP.
+
 An already paired remote client can use these Noise-tunnel HTTP routes with
 exactly the same JWT, live pairing binding and `read` scope checks as loopback:
 

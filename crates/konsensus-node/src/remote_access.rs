@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::Verifier;
 use konsensus_api::pairing::{PairedClient, PairingService};
+use konsensus_api::rate_limit::RemoteTunnelClients;
 use konsensus_api::remote_access::{self as wire, AuthRequest, AuthResponse, PairLink, VERSION};
 use konsensus_core::NodeIdentity;
 use konsensus_crypto::noise::{NoiseSession, MAX_NOISE_MSG_LEN};
@@ -109,6 +110,7 @@ pub struct RemoteAccessServer {
     identity: Arc<NodeIdentity>,
     pairing: Arc<PairingService>,
     internal_api: SocketAddr,
+    tunnel_clients: Arc<RemoteTunnelClients>,
     pairing_code: Arc<Mutex<Option<ActivePairingCode>>>,
     pair_link_path: Option<std::path::PathBuf>,
     pairing_deadline: Option<tokio::time::Instant>,
@@ -120,6 +122,7 @@ impl RemoteAccessServer {
         identity: Arc<NodeIdentity>,
         pairing: Arc<PairingService>,
         internal_api: SocketAddr,
+        tunnel_clients: Arc<RemoteTunnelClients>,
     ) -> Result<Self> {
         let listen_addr = config
             .listen_addr
@@ -176,6 +179,7 @@ impl RemoteAccessServer {
             identity,
             pairing,
             internal_api,
+            tunnel_clients,
             pairing_code: Arc::new(Mutex::new(pairing_code)),
             pair_link_path,
             pairing_deadline,
@@ -240,6 +244,7 @@ impl RemoteAccessServer {
                     let pairing = Arc::clone(&self.pairing);
                     let pairing_code = Arc::clone(&self.pairing_code);
                     let internal_api = self.internal_api;
+                    let tunnel_clients = Arc::clone(&self.tunnel_clients);
                     let connection_shutdown = shutdown.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
@@ -249,6 +254,7 @@ impl RemoteAccessServer {
                             pairing,
                             pairing_code,
                             internal_api,
+                            tunnel_clients,
                             connection_shutdown,
                         ).await {
                             debug!(%peer_addr, %error, "remote access connection closed");
@@ -284,6 +290,7 @@ async fn handle_connection(
     pairing: Arc<PairingService>,
     pairing_code: Arc<Mutex<Option<ActivePairingCode>>>,
     internal_api: SocketAddr,
+    tunnel_clients: Arc<RemoteTunnelClients>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut authority_changes = pairing.subscribe_authority_changes();
@@ -351,6 +358,9 @@ async fn handle_connection(
     let internal = TcpStream::connect(internal_api)
         .await
         .context("could not connect to internal remote API")?;
+    // The server supplies the pairing, never an HTTP header. Registration must
+    // precede the first forwarded byte so Axum can resolve every request.
+    let _registration = tunnel_clients.register(internal.local_addr()?, client.client_id.clone());
     let (mut internal_reader, mut internal_writer) = internal.into_split();
     let mut internal_buf = vec![0u8; wire::MAX_TUNNEL_PLAINTEXT];
     info!(client_id = %client.client_id, "remote access tunnel authenticated");
@@ -978,6 +988,7 @@ mod tests {
             Arc::clone(&node),
             Arc::clone(&pairing),
             internal_addr,
+            Arc::new(RemoteTunnelClients::default()),
         )
         .await
         .unwrap();
