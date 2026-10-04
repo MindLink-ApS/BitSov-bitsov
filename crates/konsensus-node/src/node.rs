@@ -194,7 +194,6 @@ impl KonsensusNode {
                 lsp_address,
                 lsp_token,
                 listening_address,
-                advertised_address: _,
                 ..
             } => {
                 let data_dir = config
