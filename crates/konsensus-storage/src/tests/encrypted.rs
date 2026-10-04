@@ -1474,7 +1474,7 @@ async fn refill_preserves_tied_messages_across_all_scopes() {
         let page = store.message_page_with_diagnostics(&scope, 2, None, None).await.unwrap();
         assert_eq!(page.items.iter().map(|m| m.id).collect::<Vec<_>>(), vec![messages[0].id, messages[13].id]);
         assert_eq!(page.unreadable_count, 12);
-        assert!(page.continuation.is_none());
+        assert_eq!(page.continuation.unwrap().id, messages[13].id.to_hex());
         let after_first = crate::ListCursor { timestamp: 20, id: messages[0].id.to_hex() };
         let capped = store.message_page_with_diagnostics(&scope, 1, None, Some(&after_first)).await.unwrap();
         assert!(capped.items.is_empty());
@@ -1486,7 +1486,7 @@ async fn refill_preserves_tied_messages_across_all_scopes() {
         let rest = store.message_page_with_diagnostics(&scope, 1, None, Some(&resume)).await.unwrap();
         assert_eq!(rest.items[0].id, messages[13].id);
         assert_eq!(rest.unreadable_count, 2);
-        assert!(rest.continuation.is_none());
+        assert_eq!(rest.continuation.unwrap().id, messages[13].id.to_hex());
     }
     assert_eq!(store.inner().get_messages_for_recipient(&recipient, 100, None).await.unwrap().len(), 14);
 }
@@ -1516,7 +1516,7 @@ async fn file_refill_bounds_and_continues_with_equal_created_at() {
     let rest = store.file_page_with_diagnostics(1, Some(&at)).await.unwrap();
     assert_eq!(rest.items[0].id, "01");
     assert_eq!(rest.unreadable_count, 2);
-    assert!(rest.continuation.is_none());
+    assert_eq!(rest.continuation.unwrap().id, "01");
     assert!(store.list_files_with_diagnostics(0).await.unwrap().items.is_empty());
     assert_eq!(store.inner().list_files(100).await.unwrap().len(), 14);
 }
