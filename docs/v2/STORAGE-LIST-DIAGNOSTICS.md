@@ -28,13 +28,15 @@ Successful list reads and resync discovery expose per-scan diagnostics in header
 - `X-BitSov-Unreadable-Count: <count>` appears only when the count is greater than 0.
 - `X-BitSov-Storage-Key-Mismatch: true` appears only when the scan sets the warning.
 - `X-BitSov-Oldest-Scanned-Timestamp` and `X-BitSov-Oldest-Scanned-Id` appear when
-  the raw scan budget is reached before filling the readable page. They identify
-  the last processed raw row, including an unreadable row. A short/empty body
+  the scan skips unreadable rows, or reaches its raw scan budget before filling
+  the readable page. They identify the last processed raw row, including an
+  unreadable row. A short/empty body
   with these headers does **not** mean history has ended.
 - `X-BitSov-Next-Before` and `X-BitSov-Next-Before-Id` provide the next request's
   safe cursor for messages, search, files and resync. Normally this is the raw
-  scan boundary. Search truncation or staged-file merging can put it earlier so
-  following it cannot skip readable rows that have not been returned. These
+  scan boundary, even when that scan exhausted the source after skipping rows.
+  Search truncation or staged-file merging can put it earlier so following it
+  cannot skip readable rows that have not been returned. These
   headers also appear on full file pages (preserving timestamp precision) and
   truncated healthy search pages.
 
@@ -45,9 +47,19 @@ HTTP/1.1 200 OK
 Content-Type: application/json
 X-BitSov-Unreadable-Count: 2
 X-BitSov-Storage-Key-Mismatch: true
+X-BitSov-Oldest-Scanned-Timestamp: 1700000000000
+X-BitSov-Oldest-Scanned-Id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+X-BitSov-Next-Before: 1700000000000
+X-BitSov-Next-Before-Id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 []
 ```
+
+Follow the cursor even if the array is empty: a cursor reports progress through
+stored rows, not a guarantee that older readable rows exist. The next request
+can return an empty array without unreadable or cursor headers, identifying true
+end-of-history. A client that ignores all headers cannot distinguish these two
+empty arrays; preserving the array body requires it to adopt this header contract.
 
 Healthy exhausted scans omit diagnostic and continuation headers. A scan below
 the mismatch threshold sends the unreadable count without a mismatch warning.

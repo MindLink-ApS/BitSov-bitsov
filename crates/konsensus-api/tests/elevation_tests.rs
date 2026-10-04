@@ -1674,3 +1674,25 @@ fn pending_elevation_cap_survives_restart_and_releases_granted_and_expired_slots
     service.create_elevation_request(&a.client_id, vec![Scope::Spend]).unwrap();
     assert_eq!(service.reload_from_disk().unwrap().pending_elevations.len(), 1);
 }
+
+
+#[test]
+fn concurrent_elevation_requests_cannot_exceed_one_clients_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _) = owner_run_service(tmp.path());
+    let a = pair(&service, &client_key(1), "client A");
+    let barrier = std::sync::Barrier::new(12);
+    let admitted = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..12).map(|_| scope.spawn(|| {
+            barrier.wait();
+            service.create_elevation_request(&a.client_id, vec![Scope::Spend])
+        })).collect();
+        threads.into_iter().filter_map(|thread| match thread.join().unwrap() {
+            Ok(op) => Some(op),
+            Err(PairingError::TooManyPending) => None,
+            other => panic!("unexpected request result: {other:?}"),
+        }).count()
+    });
+    assert_eq!(admitted, 4);
+    assert_eq!(service.reload_from_disk().unwrap().pending_elevations.len(), 4);
+}
