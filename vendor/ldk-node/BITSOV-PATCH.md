@@ -382,9 +382,11 @@ its channel balances shift (outbound on one side, inbound on the other) and may 
 rebalancing; it can be probed, which reveals coarse capacity on its private channels to
 the payer; forwarded HTLCs lock liquidity until they settle or time out (bounded by
 LDK's CLTV limits and max-HTLC-in-flight settings); it earns LDK's default forwarding
-fee (base 1000 msat, 0 ppm, unless configured otherwise). It never signs anything new
-and never spends its own funds without a matching incoming HTLC. Disk admission does
-not gate forwarded HTLCs (they're not new local state the node chooses to create).
+fee (base 1000 msat, 0 ppm, unless configured otherwise). Forwarding signs the usual
+new commitment transactions on both channels, but it gives the hub no new signing role
+or custody, and it never sends its own funds without a matching incoming HTLC. Disk
+admission does not gate forwarded HTLCs: monitor updates are still written, but ldk-node
+raises no event for a plain forward, so the gate never sees it.
 
 Doctrine: 1 holds (every routed act is still a payment that settles end to end); 2
 holds (no node or channel announcement; Bitcoin stays settlement infrastructure); 3 and
