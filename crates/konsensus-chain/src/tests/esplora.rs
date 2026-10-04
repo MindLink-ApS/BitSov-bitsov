@@ -1,6 +1,9 @@
 use super::*;
 use axum::{extract::Path, routing::get, Router};
 
+#[path = "height_cache.rs"]
+mod height_cache;
+
 /// Start a mock Esplora server and return (config, server_handle).
 async fn mock_esplora() -> (EsploraConfig, tokio::task::JoinHandle<()>) {
     let app = Router::new()
@@ -492,9 +495,10 @@ async fn issue204_primary_429_uses_fallback_and_shares_bounded_cooldown() {
         .run(false, || async { panic!("shared cooldown bypassed") })
         .await
         .is_err());
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
     assert_eq!(provider.get_block_height().await.unwrap(), 850124);
     assert_eq!(provider.estimate_fee(6).await.unwrap().sat_per_vbyte, 5.0);
-    tokio::time::advance(std::time::Duration::from_secs(299)).await;
+    tokio::time::advance(std::time::Duration::from_secs(269)).await;
     assert!(ldk_limiter
         .run(false, || async { panic!("retried early") })
         .await

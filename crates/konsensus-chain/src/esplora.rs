@@ -27,11 +27,16 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Duration;
+use tokio::{sync::Mutex, time::Instant};
 use tracing::{debug, instrument};
 
 use konsensus_core::traits::chain::{
     BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel,
 };
+
+/// Maximum age of a cached tip height, shared by callers of one provider.
+const TIP_HEIGHT_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Configuration for the Esplora provider.
 #[derive(Debug, Clone)]
@@ -73,6 +78,7 @@ pub struct EsploraProvider {
     active: AtomicUsize,
     transport: Option<Arc<dyn HttpTransport>>,
     bearer: Option<Arc<dyn HttpTransport>>,
+    tip_height: Mutex<Option<(u64, Instant)>>,
 }
 
 /// JSON response from `/api/block/{hash}`.
@@ -146,6 +152,7 @@ impl EsploraProvider {
             active: AtomicUsize::new(0),
             transport: None,
             bearer: None,
+            tip_height: Mutex::new(None),
         }
     }
 
@@ -245,6 +252,15 @@ impl ChainProvider for EsploraProvider {
 
     #[instrument(skip(self))]
     async fn get_block_height(&self) -> Result<u64, ChainError> {
+        // Hold the async lock through refresh so concurrent callers share its
+        // result. Check freshness after locking; never fall back to stale data.
+        let mut cached = self.tip_height.lock().await;
+        if let Some((height, fetched_at)) = *cached {
+            if fetched_at.elapsed() < TIP_HEIGHT_CACHE_TTL {
+                return Ok(height);
+            }
+        }
+
         let height = self
             .get_parsed("/blocks/tip/height", |text| {
                 let height = text
@@ -258,6 +274,7 @@ impl ChainProvider for EsploraProvider {
             })
             .await?;
 
+        *cached = Some((height, Instant::now()));
         debug!(height, "got block height");
         Ok(height)
     }
