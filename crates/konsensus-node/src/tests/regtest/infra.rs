@@ -258,6 +258,7 @@ pub async fn lightning(dir: &std::path::Path, chain: &Chain) -> (Arc<LdkProvider
 pub fn lightning_config(dir: &std::path::Path, url: &str) -> konsensus_lightning::LdkConfig {
     let (mnemonic, _) = NodeIdentity::generate().unwrap();
     konsensus_lightning::LdkConfig {
+        esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,
         bitcoind: None,

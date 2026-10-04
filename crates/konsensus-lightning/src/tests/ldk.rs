@@ -85,6 +85,7 @@ fn convert_direction_mapping() {
 #[test]
 fn ldk_config_construction() {
     let config = LdkConfig {
+        esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,
         bitcoind: None,
@@ -179,6 +180,7 @@ fn ldk_entropy_is_64_bytes() {
 #[tokio::test]
 async fn invalid_mnemonic_errors() {
     let config = LdkConfig {
+        esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,
         bitcoind: None,
@@ -1046,5 +1048,88 @@ fn actual_fee_conversion_preserves_zero_and_unknown() {
         assert_eq!(result.fee_msat, fee);
         assert_eq!(result.amount_msat, 1000);
         assert_eq!(result.status, PaymentStatus::Settled);
+    }
+}
+
+fn ready_sync_status(now: u64) -> ldk_node::NodeStatus {
+    ldk_node::NodeStatus {
+        chain_sync_failure: None,
+        is_running: true,
+        current_best_block: ldk_node::lightning::chain::BestBlock::from_network(
+            bitcoin::Network::Regtest,
+        ),
+        latest_lightning_wallet_sync_timestamp: Some(now),
+        latest_onchain_wallet_sync_timestamp: Some(now),
+        latest_fee_rate_cache_update_timestamp: Some(now),
+        latest_rgs_snapshot_timestamp: None,
+        latest_pathfinding_scores_sync_timestamp: None,
+        latest_node_announcement_broadcast_timestamp: None,
+        latest_channel_monitor_archival_height: None,
+    }
+}
+
+#[test]
+fn sync_readiness_uses_two_configured_periods_for_each_update() {
+    let now = 10_000;
+    for intervals in [
+        BackgroundSyncConfig::default(),
+        BackgroundSyncConfig {
+            onchain_wallet_sync_interval_secs: 600,
+            lightning_wallet_sync_interval_secs: 60,
+            fee_rate_cache_update_interval_secs: 1800,
+        },
+    ] {
+        for (wallet, period) in [
+            (0, intervals.onchain_wallet_sync_interval_secs),
+            (1, intervals.lightning_wallet_sync_interval_secs),
+            (2, intervals.fee_rate_cache_update_interval_secs),
+        ] {
+            for (age, expected) in [(period, true), (period * 2, true), (period * 2 + 1, false)] {
+                let mut status = ready_sync_status(now);
+                let timestamp = match wallet {
+                    0 => &mut status.latest_onchain_wallet_sync_timestamp,
+                    1 => &mut status.latest_lightning_wallet_sync_timestamp,
+                    _ => &mut status.latest_fee_rate_cache_update_timestamp,
+                };
+                *timestamp = Some(now - age);
+                assert_eq!(
+                    sync_status_is_ready(&status, (None, None), &intervals, now),
+                    expected,
+                    "wallet {wallet}, period {period}, age {age}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn sync_readiness_still_requires_running_and_post_startup_syncs() {
+    let now = 10_000;
+    let intervals = BackgroundSyncConfig::default();
+    let mut status = ready_sync_status(now);
+    assert!(sync_status_is_ready(&status, (None, None), &intervals, now));
+    for baseline in [(Some(now), None), (None, Some(now))] {
+        assert!(!sync_status_is_ready(&status, baseline, &intervals, now));
+    }
+    status.is_running = false;
+    assert!(!sync_status_is_ready(
+        &status,
+        (None, None),
+        &intervals,
+        now
+    ));
+    for wallet in 0..3 {
+        let mut status = ready_sync_status(now);
+        match wallet {
+            0 => status.latest_onchain_wallet_sync_timestamp = None,
+            1 => status.latest_lightning_wallet_sync_timestamp = None,
+            _ => status.latest_fee_rate_cache_update_timestamp = None,
+        }
+        assert!(!sync_status_is_ready(
+            &status,
+            (None, None),
+            &intervals,
+            now
+        ));
     }
 }

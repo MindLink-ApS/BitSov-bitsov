@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use bip39::Mnemonic;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use ldk_node::config::EsploraSyncConfig;
+use ldk_node::config::{BackgroundSyncConfig, EsploraSyncConfig};
 use ldk_node::lightning_invoice::{
     Bolt11InvoiceDescription as LdkInvoiceDescription, Description as LdkDescription,
 };
@@ -74,6 +74,8 @@ pub struct LdkConfig {
     /// caused by mempool.space fee-fetch timeouts), `LdkProvider::new`
     /// switches to this URL on preflight or actual startup fee-fetch failure.
     pub esplora_url_fallback: Option<String>,
+    /// Optional background polling overrides, used only with Esplora.
+    pub esplora_sync_intervals: EsploraSyncIntervals,
     /// Owner-only OAuth credentials for the primary Esplora source.
     pub credentials_file: Option<PathBuf>,
     /// Optional RapidGossipSync server URL.
@@ -86,6 +88,78 @@ pub struct LdkConfig {
     pub lsp_token: Option<String>,
     /// Listening address for Lightning P2P (e.g., "0.0.0.0:9735").
     pub listening_address: Option<String>,
+}
+
+/// Independent Esplora polling overrides. Omitted values retain LDK's defaults.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EsploraSyncIntervals {
+    pub onchain_wallet_sync_interval_secs: Option<u64>,
+    pub lightning_wallet_sync_interval_secs: Option<u64>,
+    pub fee_rate_cache_update_interval_secs: Option<u64>,
+}
+
+impl EsploraSyncIntervals {
+    /// Validate before starting any network work, keeping background sync enabled.
+    pub fn to_sync_config(self) -> Result<EsploraSyncConfig, LightningError> {
+        let mut background = BackgroundSyncConfig::default();
+        for (field, value, target) in [
+            (
+                "onchain_wallet_sync_interval_secs",
+                self.onchain_wallet_sync_interval_secs,
+                &mut background.onchain_wallet_sync_interval_secs,
+            ),
+            (
+                "lightning_wallet_sync_interval_secs",
+                self.lightning_wallet_sync_interval_secs,
+                &mut background.lightning_wallet_sync_interval_secs,
+            ),
+            (
+                "fee_rate_cache_update_interval_secs",
+                self.fee_rate_cache_update_interval_secs,
+                &mut background.fee_rate_cache_update_interval_secs,
+            ),
+        ] {
+            if let Some(value) = value {
+                if !(10..=3600).contains(&value) {
+                    return Err(LightningError::InvalidStartupConfig(format!(
+                        "lightning.{field} must be between 10 and 3600 seconds (inclusive)"
+                    )));
+                }
+                *target = value;
+            }
+        }
+        Ok(EsploraSyncConfig {
+            background_sync_config: Some(background),
+        })
+    }
+}
+
+fn sync_status_is_ready(
+    status: &ldk_node::NodeStatus,
+    baseline: (Option<u64>, Option<u64>),
+    sync_intervals: &BackgroundSyncConfig,
+    now: u64,
+) -> bool {
+    // Require both wallets to synchronize in this startup, and revoke readiness
+    // if updates stop. Allow two normal sync periods before declaring stale.
+    let fresh = |timestamp: Option<u64>, period: u64| {
+        timestamp.is_some_and(|t| now.saturating_sub(t) <= period.saturating_mul(2))
+    };
+    status.is_running
+        && status.latest_lightning_wallet_sync_timestamp != baseline.0
+        && status.latest_onchain_wallet_sync_timestamp != baseline.1
+        && fresh(
+            status.latest_fee_rate_cache_update_timestamp,
+            sync_intervals.fee_rate_cache_update_interval_secs,
+        )
+        && fresh(
+            status.latest_lightning_wallet_sync_timestamp,
+            sync_intervals.lightning_wallet_sync_interval_secs,
+        )
+        && fresh(
+            status.latest_onchain_wallet_sync_timestamp,
+            sync_intervals.onchain_wallet_sync_interval_secs,
+        )
 }
 
 /// Application keysend TLV type carrying the BitSov payment→envelope *binding*
@@ -264,6 +338,7 @@ fn inbound_payment_from_received_event(
 /// payment capability, not just whether the LDK node is running.
 pub struct LdkProvider {
     sync_baseline: (Option<u64>, Option<u64>),
+    sync_intervals: BackgroundSyncConfig,
     routing_fee_policy: konsensus_core::traits::lightning::RoutingFeePolicy,
     liquidity: Option<LiquidityClient>,
     liquidity_info: LiquidityInfo,
@@ -415,6 +490,12 @@ impl LdkProvider {
         // The parsed `bip39::Mnemonic` (built with the `zeroize` feature) is
         // itself `ZeroizeOnDrop`.
         let mnemonic_phrase = Zeroizing::new(std::mem::take(&mut config.mnemonic));
+        let esplora_sync_config = config.esplora_sync_intervals.to_sync_config()?;
+        let sync_intervals = if config.bitcoind.is_some() || config.electrum.is_some() {
+            BackgroundSyncConfig::default()
+        } else {
+            esplora_sync_config.background_sync_config.expect("background sync is enabled")
+        };
         let mnemonic = Mnemonic::from_str(&mnemonic_phrase)
             .map_err(|e| LightningError::InvalidStartupConfig(format!("invalid mnemonic: {e}")))?;
 
@@ -637,6 +718,7 @@ impl LdkProvider {
         }
 
         let provider = Self {
+            sync_intervals,
             sync_baseline: (baseline.latest_lightning_wallet_sync_timestamp, baseline.latest_onchain_wallet_sync_timestamp),
             routing_fee_policy: Default::default(),
             liquidity,
@@ -673,6 +755,7 @@ impl LdkProvider {
         let (outgoing_tx, _) = broadcast::channel(OUTGOING_BROADCAST_CAPACITY);
         Self {
             sync_baseline: (None, None),
+            sync_intervals: BackgroundSyncConfig::default(),
             routing_fee_policy: Default::default(),
             liquidity: None,
             liquidity_info: LiquidityInfo::default(),
@@ -1123,16 +1206,7 @@ impl LightningProvider for LdkProvider {
     async fn money_ready(&self) -> bool {
         let status = self.node.status();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        // Require both wallets to synchronize in this startup, and revoke readiness
-        // if updates stop. Allow two normal sync periods before declaring stale.
-        let fresh = |timestamp: Option<u64>, max_age: u64| timestamp.is_some_and(|t|
-            now.saturating_sub(t) <= max_age);
-        status.is_running
-            && status.latest_lightning_wallet_sync_timestamp != self.sync_baseline.0
-            && status.latest_onchain_wallet_sync_timestamp != self.sync_baseline.1
-            && fresh(status.latest_fee_rate_cache_update_timestamp, 1200)
-            && fresh(status.latest_lightning_wallet_sync_timestamp, 60)
-            && fresh(status.latest_onchain_wallet_sync_timestamp, 160)
+        sync_status_is_ready(&status, self.sync_baseline, &self.sync_intervals, now)
     }
 
     fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy { self.routing_fee_policy }
@@ -1753,6 +1827,7 @@ async fn start_esplora_with_retry(
     started: Instant,
     auth_transport: Option<Arc<konsensus_chain::bearer::BearerFailover>>,
 ) -> Result<(LdkNode, String, ldk_node::NodeStatus), LightningError> {
+    let sync_config = config.esplora_sync_intervals.to_sync_config()?;
     const BUDGET: Duration = Duration::from_secs(60);
     const FEE_WINDOW: Duration = Duration::from_secs(5);
     const DELAYS: [u64; 4] = [2, 4, 8, 8];
@@ -1765,9 +1840,9 @@ async fn start_esplora_with_retry(
         }
         if node.is_none() {
             if let Some(transport) = auth_transport.as_ref().filter(|_| endpoint == config.esplora_url) {
-                builder.set_chain_source_esplora_with_transport(endpoint.clone(), Some(EsploraSyncConfig::default()), transport.clone());
+                builder.set_chain_source_esplora_with_transport(endpoint.clone(), Some(sync_config), transport.clone());
             } else {
-                builder.set_chain_source_esplora(endpoint.clone(), Some(EsploraSyncConfig::default()));
+                builder.set_chain_source_esplora(endpoint.clone(), Some(sync_config));
             }
             node = Some(builder.build().map_err(startup_build_error)?);
         }

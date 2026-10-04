@@ -23,6 +23,40 @@ owner status. If no nonzero height is available, pricing returns `not_ready`
 and the node does not publish a height-zero price table. A sender keeps a
 cached peer offer only while its block and time validity still hold.
 
+## Low-traffic Esplora profile
+
+For `[lightning] backend = "ldk"`, three optional settings control background
+Esplora polling. Each accepts an integer from **10 through 3600 seconds**.
+Omitted settings retain LDK's defaults independently: on-chain wallet **80 s**,
+Lightning wallet **30 s**, and fee-rate cache **600 s**. Unknown keys are rejected.
+The intervals apply to plain and authenticated Esplora, including fallbacks;
+they do not change Bitcoin Core, Electrum, or the separate `[chain]` polling.
+Restart the node after editing its configuration.
+
+To reduce requests to a quota-limited Esplora API, add these settings to your
+existing `[lightning]` table (keep your network, URLs and credentials settings):
+
+```toml
+[lightning]
+backend = "ldk"
+onchain_wallet_sync_interval_secs = 600
+lightning_wallet_sync_interval_secs = 60
+fee_rate_cache_update_interval_secs = 1800
+```
+
+The on-chain wallet queries the chain tip and each revealed address on every
+sync, so a longer interval substantially reduces traffic as addresses accumulate.
+This profile is not a total request cap: startup, explicit wallet operations,
+Lightning chain monitoring and the separate chain provider also make requests.
+
+**Trade-off:** on-chain receives can show up to approximately **10 minutes later**
+under normal connectivity. Lightning payments over existing channels are
+unaffected; these settings control chain polling, not Lightning payment handling.
+Channel confirmations and other on-chain events can take longer to be noticed,
+and fee estimates refresh less often. Readiness still requires both wallets to
+sync after startup and expires after two configured sync periods without a
+successful update, so normal gaps between scheduled polls do not disable payments.
+
 ## Own Bitcoin Core
 
 Run Bitcoin Core with RPC enabled (`server=1`). A pruned node can use
