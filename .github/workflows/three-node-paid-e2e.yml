@@ -71,6 +71,13 @@ jobs:
         run: cargo fetch --locked
       - name: Runner lifecycle tests
         run: python3 scripts/regress/test_regtest_e2e_runner.py -v
+      - name: Production private hub forwarding (#225)
+        shell: bash
+        env:
+          REGTEST_TEST: 'regtest_e2e::private_forwarding::'
+        run: |
+          set -euo pipefail
+          scripts/regress/regtest_e2e.sh 2>&1 | tee private-forwarding.log
       - name: Three-node paid E2E (skip is a CI failure)
         shell: bash
         run: |
@@ -96,5 +103,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: three-node-regtest-log
-          path: regtest.log
+          path: |
+            regtest.log
+            private-forwarding.log
           if-no-files-found: ignore

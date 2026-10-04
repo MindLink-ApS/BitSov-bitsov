@@ -357,3 +357,22 @@ vendor-client fixture; adapter tests still check both aggregate balance views.
 Doctrine: 1 and 5 hold (settlement and self-custody preserved); 2 holds (Bitcoin
 remains chain/admission infrastructure); 3 and 4 unchanged; 6 holds (explicit
 rate-limit diagnostics and no claim of live incident resolution).
+
+
+## Opt-in private-channel forwarding (#225, 2026-10-05)
+
+`Config::accept_forwards_to_priv_channels` defaults to false. When explicitly
+true, `default_user_config` enables only the matching LDK flag, after the
+`may_announce_channel` guard. With no node alias, `announce_for_forwarding`
+stays false and `force_announced_channel_preference` stays true. Existing
+announcement eligibility and LSPS2/async-server overrides are unchanged.
+BitSov exposes this as `[lightning] forward_to_private_channels = true` and
+passes it through `LdkConfig`; no alias is set.
+
+The vendor policy unit test covers both flag values with and without listening
+addresses. The `regtest-e2e` scenario
+`private_forwarding::production_hub_private_forwarding_is_opt_in` builds the
+hub through production `LdkProvider::new`, with no LSPS2 service: disabled
+forwarding must produce `PrivateChannelForward` after dispatch; enabled
+forwarding must settle A→hub→B over unannounced channels at the exact hop fee.
+The scenario is compiled locally; execution requires the CI regtest daemons.
