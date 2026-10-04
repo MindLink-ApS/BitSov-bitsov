@@ -385,8 +385,9 @@ LDK's CLTV limits and max-HTLC-in-flight settings); it earns LDK's default forwa
 fee (base 1000 msat, 0 ppm, unless configured otherwise). Forwarding signs the usual
 new commitment transactions on both channels, but it gives the hub no new signing role
 or custody, and it never sends its own funds without a matching incoming HTLC. Disk
-admission does not gate forwarded HTLCs: monitor updates are still written, but ldk-node
-raises no event for a plain forward, so the gate never sees it.
+admission does not gate forwarded HTLCs: monitor updates are still written; the only event
+ldk-node raises for a forward (PaymentForwarded) arrives after settlement, and the gate
+hooks only PaymentClaimable and OpenChannelRequest, so it never gates a forward.
 
 Doctrine: 1 holds (every routed act is still a payment that settles end to end); 2
 holds (no node or channel announcement; Bitcoin stays settlement infrastructure); 3 and
