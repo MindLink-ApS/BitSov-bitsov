@@ -426,6 +426,15 @@ pub enum LightningConfig {
         /// never imposed on an existing configuration.
         #[serde(default)]
         esplora_url_fallback: Option<String>,
+        /// Esplora on-chain wallet polling interval (10..=3600 seconds; LDK default 80).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        onchain_wallet_sync_interval_secs: Option<u64>,
+        /// Esplora Lightning wallet polling interval (10..=3600 seconds; LDK default 30).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lightning_wallet_sync_interval_secs: Option<u64>,
+        /// Esplora fee-cache refresh interval (10..=3600 seconds; LDK default 600).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fee_rate_cache_update_interval_secs: Option<u64>,
         /// Owner-only OAuth client credentials for the primary Esplora source.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credentials_file: Option<PathBuf>,
@@ -456,6 +465,23 @@ pub enum LightningConfig {
 }
 
 impl LightningConfig {
+    /// Keep the TOML fields explicit so `deny_unknown_fields` remains effective.
+    pub(crate) fn esplora_sync_intervals(&self) -> konsensus_lightning::ldk::EsploraSyncIntervals {
+        match self {
+            Self::Ldk {
+                onchain_wallet_sync_interval_secs,
+                lightning_wallet_sync_interval_secs,
+                fee_rate_cache_update_interval_secs,
+                ..
+            } => konsensus_lightning::ldk::EsploraSyncIntervals {
+                onchain_wallet_sync_interval_secs: *onchain_wallet_sync_interval_secs,
+                lightning_wallet_sync_interval_secs: *lightning_wallet_sync_interval_secs,
+                fee_rate_cache_update_interval_secs: *fee_rate_cache_update_interval_secs,
+            },
+            _ => Default::default(),
+        }
+    }
+
     /// Check if this is the mock provider.
     pub fn is_mock(&self) -> bool {
         matches!(self, Self::Mock { .. } | Self::SharedMock { .. })
@@ -1154,6 +1180,7 @@ impl NodeConfig {
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         self.validate_routing_fee_backend()?;
+        self.lightning.esplora_sync_intervals().to_sync_config()?;
         self.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?;
         self.network.stun_server_addr().map_err(|e| anyhow::anyhow!(e))?;
         // Check mnemonic file exists and is readable
@@ -1547,6 +1574,9 @@ impl NodeConfig {
                     esplora_url: FRESH_LDK_PRIMARY.to_string(),
                     esplora_url_fallback: Some(FRESH_LDK_FALLBACK.to_string()),
                     credentials_file: None,
+                    onchain_wallet_sync_interval_secs: None,
+                    lightning_wallet_sync_interval_secs: None,
+                    fee_rate_cache_update_interval_secs: None,
                     rgs_url: None,
                     lsp_node_id: None,
                     lsp_address: None,

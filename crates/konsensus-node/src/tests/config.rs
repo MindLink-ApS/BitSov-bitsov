@@ -2697,3 +2697,97 @@ fn oauth_credentials_files_are_explicit_and_optional() {
     let ldk: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
     assert!(matches!(ldk, LightningConfig::Ldk { credentials_file: None, .. }));
 }
+
+#[test]
+fn ldk_sync_intervals_parse_and_round_trip() {
+    let input = r#"
+backend = "ldk"
+onchain_wallet_sync_interval_secs = 600
+lightning_wallet_sync_interval_secs = 60
+fee_rate_cache_update_interval_secs = 1800
+"#;
+    let lightning: LightningConfig = toml::from_str(input).expect("accept optional sync intervals");
+    let output = toml::to_string(&lightning).unwrap();
+    for setting in [
+        "onchain_wallet_sync_interval_secs = 600",
+        "lightning_wallet_sync_interval_secs = 60",
+        "fee_rate_cache_update_interval_secs = 1800",
+    ] {
+        assert!(output.contains(setting), "missing {setting}: {output}");
+    }
+}
+
+#[test]
+fn ldk_sync_intervals_validate_each_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic = dir.path().join("mnemonic");
+    std::fs::write(&mnemonic, "test mnemonic").unwrap();
+    for field in [
+        "onchain_wallet_sync_interval_secs",
+        "lightning_wallet_sync_interval_secs",
+        "fee_rate_cache_update_interval_secs",
+    ] {
+        for value in [0, 9, 10, 3600, 3601, i64::MAX] {
+            let mut config =
+                NodeConfig::default_for_tier(NodeTier::Full, mnemonic.clone(), dir.path());
+            config.lightning =
+                toml::from_str(&format!("backend = \"ldk\"\n{field} = {value}\n")).unwrap();
+            let result = config.validate();
+            if (10..=3600).contains(&value) {
+                result.unwrap_or_else(|e| panic!("{field}={value}: {e}"));
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(field), "{field}={value}: {error}");
+                assert!(error.contains("10") && error.contains("3600"), "{error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn ldk_sync_intervals_reject_bad_types_and_unknown_keys() {
+    for field in [
+        "onchain_wallet_sync_interval_secs",
+        "lightning_wallet_sync_interval_secs",
+        "fee_rate_cache_update_interval_secs",
+    ] {
+        for value in ["-1", "10.5", "true", "\"600\""] {
+            assert!(toml::from_str::<LightningConfig>(&format!(
+                "backend = \"ldk\"\n{field} = {value}\n"
+            ))
+            .is_err());
+        }
+        assert!(toml::from_str::<LightningConfig>(&format!(
+            "backend = \"ldk\"\n{field}_typo = 600\n"
+        ))
+        .is_err());
+    }
+}
+
+#[test]
+fn ldk_sync_intervals_reach_esplora_config_with_independent_defaults() {
+    use ldk_node::config::{BackgroundSyncConfig, EsploraSyncConfig};
+    let omitted: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
+    assert_eq!(
+        omitted.esplora_sync_intervals().to_sync_config().unwrap(),
+        EsploraSyncConfig::default()
+    );
+    let serialized = toml::to_string(&omitted).unwrap();
+    assert!(!serialized.contains("_interval_secs"));
+    for (settings, expected) in [
+        ("", (80, 30, 600)),
+        ("onchain_wallet_sync_interval_secs = 600", (600, 30, 600)),
+        ("lightning_wallet_sync_interval_secs = 60", (80, 60, 600)),
+        ("fee_rate_cache_update_interval_secs = 1800", (80, 30, 1800)),
+        ("onchain_wallet_sync_interval_secs = 600\nlightning_wallet_sync_interval_secs = 60\nfee_rate_cache_update_interval_secs = 1800", (600, 60, 1800)),
+    ] {
+        let lightning: LightningConfig = toml::from_str(&format!("backend = 'ldk'\n{settings}")).unwrap();
+        assert_eq!(lightning.esplora_sync_intervals().to_sync_config().unwrap(), EsploraSyncConfig {
+            background_sync_config: Some(BackgroundSyncConfig {
+                onchain_wallet_sync_interval_secs: expected.0,
+                lightning_wallet_sync_interval_secs: expected.1,
+                fee_rate_cache_update_interval_secs: expected.2,
+            }),
+        });
+    }
+}

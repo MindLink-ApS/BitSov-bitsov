@@ -195,6 +195,7 @@ impl KonsensusNode {
                 lsp_token,
                 listening_address,
                 advertised_address: _,
+                ..
             } => {
                 let data_dir = config
                     .identity
@@ -224,6 +225,7 @@ impl KonsensusNode {
                     passphrase: Some(config.identity.passphrase.clone()).filter(|s| !s.is_empty()),
                     network: network.clone(),
                     esplora_url: esplora_url.clone(),
+                    esplora_sync_intervals: config.lightning.esplora_sync_intervals(),
                     esplora_url_fallback: esplora_url_fallback.clone(),
                     credentials_file: credentials_file.clone(),
                     rgs_url: rgs_url.clone(),
