@@ -376,3 +376,18 @@ hub through production `LdkProvider::new`, with no LSPS2 service: disabled
 forwarding must produce `PrivateChannelForward` after dispatch; enabled
 forwarding must settle A→hub→B over unannounced channels at the exact hop fee.
 The scenario is compiled locally; execution requires the CI regtest daemons.
+
+Forwarding exposure on a hub that opts in: peers can route payments through it, so
+its channel balances shift (outbound on one side, inbound on the other) and may need
+rebalancing; it can be probed, which reveals coarse capacity on its private channels to
+the payer; forwarded HTLCs lock liquidity until they settle or time out (bounded by
+LDK's CLTV limits and max-HTLC-in-flight settings); it earns LDK's default forwarding
+fee (base 1000 msat, 0 ppm, unless configured otherwise). It never signs anything new
+and never spends its own funds without a matching incoming HTLC. Disk admission does
+not gate forwarded HTLCs (they're not new local state the node chooses to create).
+
+Doctrine: 1 holds (every routed act is still a payment that settles end to end); 2
+holds (no node or channel announcement; Bitcoin stays settlement infrastructure); 3 and
+4 unchanged (no new server role; the hub is an ordinary peer the users already pay); 5
+holds (self-custody unchanged; the hub never takes custody of forwarded value); 6 holds
+(the exposure above is documented and default-off).

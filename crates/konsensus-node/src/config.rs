@@ -451,6 +451,8 @@ pub enum LightningConfig {
         #[serde(default)]
         lsp_token: Option<String>,
         /// Opt in to routing payments into private channels without announcing this node.
+        /// Hub nodes only: balances shift with forwarded payments, the node can be probed, and
+        /// forwarded HTLCs hold liquidity until resolved (see docs/regtest-e2e.md).
         #[serde(default)]
         forward_to_private_channels: bool,
         /// Listening address for Lightning P2P (e.g., "0.0.0.0:9735").

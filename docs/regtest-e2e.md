@@ -53,6 +53,13 @@ backend = "ldk"
 forward_to_private_channels = true
 ```
 
+What this changes for that hub: payments between its peers can route through it, so its
+channel balances move and may need rebalancing; payers can probe it (coarse capacity of
+its private channels becomes inferable); forwarded HTLCs hold liquidity until settled or
+timed out, within LDK's CLTV and in-flight limits; and it charges LDK's default
+forwarding fee. Nothing is announced, and it never spends its own funds without a
+matching incoming HTLC. Enable it only on the node that acts as the hub.
+
 Omitting the flag or setting it to false retains existing behavior. This setting
 does not announce the node or its channels. The older LSPS2-backed scenario
 above remains as separate coverage. The scheduled/manual three-node paid regtest
