@@ -11,6 +11,8 @@ use std::time::Duration;
 mod app;
 #[path = "regtest/infra.rs"]
 mod infra;
+#[path = "regtest/private_forwarding.rs"]
+mod private_forwarding;
 #[cfg(unix)]
 #[path = "regtest/three_node.rs"]
 mod three_node;
@@ -1958,6 +1960,7 @@ async fn bitcoind_chain_source_pruned_and_full() {
         assert!(!provider.is_tx_confirmed(txid, 2).await.unwrap());
         assert_eq!(provider.chain_view().trust_level, "own_node");
         let ldk = LdkProvider::new(konsensus_lightning::LdkConfig {
+            forward_to_private_channels: false,
             esplora_sync_intervals: Default::default(),
             logging: Default::default(),
             electrum: None,

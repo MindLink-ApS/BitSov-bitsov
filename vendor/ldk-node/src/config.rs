@@ -110,6 +110,7 @@ pub(crate) const EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS: u64 = 5;
 /// | `log_dir_path`                         | None               |
 /// | `network`                              | Bitcoin            |
 /// | `listening_addresses`                  | None               |
+/// | `accept_forwards_to_priv_channels`     | false              |
 /// | `node_alias`                           | None               |
 /// | `default_cltv_expiry_delta`            | 144                |
 /// | `onchain_wallet_sync_interval_secs`    | 80                 |
@@ -126,6 +127,9 @@ pub(crate) const EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS: u64 = 5;
 ///
 /// [`Node`]: crate::Node
 pub struct Config {
+	/// Opt in to forwarding payments into private channels, even without a node alias.
+	/// Defaults to false. This does not enable node or channel announcements.
+	pub accept_forwards_to_priv_channels: bool,
     /// Optional local disk admission check. False rejects unpaid incoming HTLCs
     /// and new inbound channels, without affecting settlement recovery or closes.
     pub work_admission: Option<WorkAdmissionCheck>,
@@ -205,6 +209,7 @@ impl Default for Config {
 	fn default() -> Self {
 		Self {
 			work_admission: None,
+			accept_forwards_to_priv_channels: false,
 			storage_dir_path: DEFAULT_STORAGE_DIR_PATH.to_string(),
 			network: DEFAULT_NETWORK,
 			listening_addresses: None,
@@ -347,6 +352,12 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 		user_config.accept_forwards_to_priv_channels = false;
 		user_config.channel_handshake_config.announce_for_forwarding = false;
 		user_config.channel_handshake_limits.force_announced_channel_preference = true;
+	}
+
+	// BitSov: private hubs may forward without becoming announcement-capable.
+	// Apply only the opt-in so an unset flag preserves upstream behavior.
+	if config.accept_forwards_to_priv_channels {
+		user_config.accept_forwards_to_priv_channels = true;
 	}
 
 	user_config
@@ -574,6 +585,29 @@ mod tests {
 	use std::str::FromStr;
 
 	use super::{may_announce_channel, AnnounceError, Config, NodeAlias, SocketAddress};
+
+	#[test]
+	fn private_forwarding_preserves_announcement_restrictions() {
+		assert!(!Config::default().accept_forwards_to_priv_channels);
+		for enabled in [false, true] {
+			for listening_addresses in [
+				None,
+				Some(vec![SocketAddress::from_str("127.0.0.1:9735").unwrap()]),
+			] {
+				let config = Config {
+					accept_forwards_to_priv_channels: enabled,
+					listening_addresses,
+					..Default::default()
+				};
+				let user = super::default_user_config(&config);
+				assert_eq!(user.accept_forwards_to_priv_channels, enabled);
+				assert!(!user.channel_handshake_config.announce_for_forwarding);
+				assert!(user.channel_handshake_limits.force_announced_channel_preference);
+				assert!(config.node_alias.is_none());
+				assert!(may_announce_channel(&config).is_err());
+			}
+		}
+	}
 
 	#[test]
 	fn node_announce_channel() {

@@ -81,6 +81,7 @@ impl Drop for Fixture {
 
 fn config(dir: &tempfile::TempDir, url: &str) -> LdkConfig {
     LdkConfig {
+        forward_to_private_channels: false,
         esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,

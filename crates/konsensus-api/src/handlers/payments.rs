@@ -301,7 +301,7 @@ async fn pay_invoice(
     }
     let fee_paid_msat = fee_paid_msat(&state.lightning_backend, &details);
     let preimage = details.preimage.unwrap_or_else(|| {
-        tracing::warn!(payment_hash = %details.payment_hash, "payment succeeded but no preimage returned");
+        tracing::debug!(payment_hash = %details.payment_hash, "payment pending; no preimage available yet");
         String::new()
     });
 

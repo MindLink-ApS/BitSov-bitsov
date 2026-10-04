@@ -2791,3 +2791,28 @@ fn ldk_sync_intervals_reach_esplora_config_with_independent_defaults() {
         });
     }
 }
+
+#[test]
+fn private_forwarding_is_opt_in_and_round_trips() {
+    for (setting, expected) in [
+        ("", false),
+        ("forward_to_private_channels = false", false),
+        ("forward_to_private_channels = true", true),
+    ] {
+        let config: LightningConfig = toml::from_str(&format!("backend = 'ldk'\n{setting}")).unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        let table: toml::Value = toml::from_str(&serialized).unwrap();
+        assert_eq!(table["forward_to_private_channels"].as_bool(), Some(expected));
+        let round_trip: LightningConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(toml::to_string(&round_trip).unwrap(), serialized);
+    }
+}
+
+#[test]
+fn private_forwarding_rejects_non_boolean_values() {
+    for value in ["1", "'true'", "[]"] {
+        assert!(toml::from_str::<LightningConfig>(&format!(
+            "backend = 'ldk'\nforward_to_private_channels = {value}"
+        )).is_err());
+    }
+}
