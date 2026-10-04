@@ -540,6 +540,29 @@ mod bitsov_request_tests {
 		assert!(matches!(result, Ok(Err(esplora_client::Error::Reqwest(ref error))) if error.is_timeout()));
 		assert_eq!(started.elapsed(), Duration::from_secs(10));
 	}
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_funding_presence_check_hits_client_deadline() {
+        use bitcoin::hashes::Hash;
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = crate::Builder::new();
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().to_owned());
+        let node = builder.build().unwrap();
+        let mut source = EsploraChainSource::new("http://funding.invalid".into(),
+            HashMap::new(), EsploraSyncConfig::default(), node.fee_estimator.clone(),
+            node.kv_store.clone(), node.config.clone(), node.logger.clone(), node.node_metrics.clone()).unwrap();
+        let http = esplora_http_client_builder(HashMap::new()).unwrap()
+            .no_proxy().dns_resolver(Arc::new(HangingResolver)).build().unwrap();
+        // No per-request timeout here: exercise the production reqwest client
+        // deadline through funding_present, including its error mapping.
+        source.esplora_client = EsploraAsyncClient::from_client("http://funding.invalid".into(), http)
+            .with_transport(source.rate_limit.clone());
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(11), source.funding_present(Txid::all_zeros())).await;
+        assert_eq!(result, Ok(Err(Error::TxSyncFailed)));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
+
 }
 
 #[cfg(test)]

@@ -1168,11 +1168,13 @@ async fn start_node_services<'a>(
             let internal_addr = internal_listener
                 .local_addr()
                 .context("failed to read internal remote API address")?;
+            let tunnel_clients = Arc::new(konsensus_api::rate_limit::RemoteTunnelClients::default());
             let server = remote_access::RemoteAccessServer::bind(
                 &config.remote_access,
                 Arc::clone(node.identity()),
                 Arc::clone(&pairing_service),
                 internal_addr,
+                Arc::clone(&tunnel_clients),
             )
             .await?;
             let public_addr = server.local_addr()?;
@@ -1195,6 +1197,10 @@ async fn start_node_services<'a>(
                 Arc::clone(&api_state),
                 remote_limiter,
             )
+            .layer(axum::middleware::from_fn_with_state(
+                tunnel_clients,
+                konsensus_api::rate_limit::remote_tunnel_identity,
+            ))
             .into_make_service_with_connect_info::<std::net::SocketAddr>();
             let mut internal_shutdown = node.shutdown_rx();
             let internal_handle = tokio::spawn(async move {
