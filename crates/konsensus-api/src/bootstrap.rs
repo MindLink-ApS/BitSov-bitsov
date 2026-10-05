@@ -236,7 +236,7 @@ fn is_readable_sqlite(path: &Path) -> bool {
 }
 
 /// Why a node refuses to start, and what the operator should actually run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Refusal {
     /// Stable machine-readable reason.
     pub reason: &'static str,
@@ -942,12 +942,15 @@ impl FromRequestParts<Arc<BootstrapState>> for BootstrapAuth {
 /// `GET /api/v1/bootstrap/state` response.
 #[derive(Debug, Serialize)]
 pub struct BootstrapStateResponse {
-    /// `"bootstrap"` or `"initialized"`.
+    /// `"bootstrap"`, `"initialized"`, or `"refused"` (operator repair required).
     pub state: &'static str,
     /// Whether a first-run restore is available.
     pub can_restore: bool,
     /// Whether a first-run create is available.
     pub can_create: bool,
+    /// Why bootstrap is refused and the concrete operator repair action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<Refusal>,
     /// Explicit local ceremony availability, with no secret material.
     pub local_owner: LocalOwnerState,
 }
@@ -963,22 +966,39 @@ pub struct LocalOwnerState {
     pub pending: bool,
 }
 
-async fn bootstrap_state(State(state): State<Arc<BootstrapState>>) -> Json<BootstrapStateResponse> {
-    let open = !state.is_committed();
+async fn bootstrap_state(
+    State(state): State<Arc<BootstrapState>>,
+) -> Result<Json<BootstrapStateResponse>, BootstrapError> {
+    // Match ensure_open: an unsuccessful post-rename commit is not committed,
+    // but its on-disk identity still closes bootstrap and requires repair.
+    let mode = if state.is_committed() {
+        StartupMode::Initialized
+    } else {
+        classify(
+            &DataDirProbe::inspect(&state.layout).map_err(|e| commit_error_response(e.into()))?,
+        )
+    };
+    let open = mode == StartupMode::Bootstrap;
+    let (status, refusal) = match mode {
+        StartupMode::Bootstrap => ("bootstrap", None),
+        StartupMode::Initialized => ("initialized", None),
+        StartupMode::Refuse(refusal) => ("refused", Some(refusal)),
+    };
     let mut pending = state.pending.lock().unwrap();
     if pending.as_ref().is_some_and(PendingIdentity::expired) {
         *pending = None;
     }
-    Json(BootstrapStateResponse {
-        state: if open { "bootstrap" } else { "initialized" },
+    Ok(Json(BootstrapStateResponse {
+        state: status,
         can_restore: open,
         can_create: open,
+        refusal,
         local_owner: LocalOwnerState {
             available: state.local.is_some(),
             enroll_device: state.local.as_ref().is_some_and(|l| l.enroll_device),
             pending: pending.is_some(),
         },
-    })
+    }))
 }
 
 async fn livez() -> &'static str {
