@@ -86,6 +86,7 @@ fn convert_direction_mapping() {
 fn ldk_config_construction() {
     let mut config = LdkConfig {
         forward_to_private_channels: false,
+        lsps2_service: Default::default(),
         esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,
@@ -189,6 +190,7 @@ fn ldk_entropy_is_64_bytes() {
 async fn invalid_mnemonic_errors() {
     let config = LdkConfig {
         forward_to_private_channels: false,
+        lsps2_service: Default::default(),
         esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,

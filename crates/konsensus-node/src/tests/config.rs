@@ -2816,3 +2816,50 @@ fn private_forwarding_rejects_non_boolean_values() {
         )).is_err());
     }
 }
+
+#[test]
+fn lsps2_service_is_opt_in_and_round_trips() {
+    let omitted: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
+    let table: toml::Value = toml::from_str(&toml::to_string(&omitted).unwrap()).unwrap();
+    assert_eq!(table["lsps2_service"]["enabled"].as_bool(), Some(false));
+    let config: LightningConfig = toml::from_str("backend = 'ldk'\n[lsps2_service]\nenabled = true\nrequire_token = 'pilot-secret'\nforwarding_fee_ppm = 500\nforwarding_fee_base_msat = 1000").unwrap();
+    let serialized = toml::to_string(&config).unwrap();
+    let round_trip: LightningConfig = toml::from_str(&serialized).unwrap();
+    assert_eq!(toml::to_string(&round_trip).unwrap(), serialized);
+    assert!(!format!("{config:?}").contains("pilot-secret"));
+}
+
+#[test]
+fn lsps2_service_rejects_unknown_or_mistyped_fields() {
+    for settings in [
+        "enabled = 'true'",
+        "forwarding_fee_ppm = -1",
+        "forwarding_fee_base_msat = 4294967296",
+        "advertise_service = true",
+        "client_trusts_lsp = true",
+        "require_tokne = 'secret'",
+    ] {
+        assert!(
+            toml::from_str::<LightningConfig>(&format!(
+                "backend = 'ldk'\n[lsps2_service]\n{settings}"
+            ))
+            .is_err(),
+            "{settings}"
+        );
+    }
+}
+
+#[test]
+fn lsps2_service_validation_precedes_node_startup() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/nonexistent-mnemonic"),
+        Path::new("/tmp"),
+    );
+    config.lightning = toml::from_str("backend = 'ldk'\n[lsps2_service]\nenabled = true\nrequire_token = 'secret'\n[liquidity]\nenabled = true").unwrap();
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("mutually exclusive"));
+}

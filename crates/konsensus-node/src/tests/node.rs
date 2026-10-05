@@ -480,6 +480,7 @@ async fn offline_fee_barrier_preserves_local_identity_and_storage() {
     let expected = *KonsensusNode::from_config(config.clone(), None).await.unwrap().node_id();
     config.lightning = LightningConfig::Ldk {
         forward_to_private_channels: false,
+        lsps2_service: Default::default(),
         onchain_wallet_sync_interval_secs: None,
         lightning_wallet_sync_interval_secs: None,
         fee_rate_cache_update_interval_secs: None,
