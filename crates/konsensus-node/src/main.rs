@@ -1548,6 +1548,8 @@ async fn start_node_services<'a>(
 
     // Session/control event handler — E2EE negotiation, pricing, invoices, peer exchange, gossip
     let session_handle = tokio::spawn(session_handler::run(session_handler::SessionHandlerDeps {
+        content_server: content_server.clone(),
+        front_door: api_state.front_door.clone(),
         min_admission_cost_msat: node.gate().min_admission_cost_msat(),
         privacy: config.privacy.clone(),
         peer_exchange_floor: config.payment_gate.min_admission_cost_msat.unwrap_or(0),

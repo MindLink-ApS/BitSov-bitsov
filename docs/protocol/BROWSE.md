@@ -7,7 +7,7 @@ Every **GAP** marks where the code does not yet meet this spec.
 
 Browse means fetching another node's public surface by its node id: its
 profile card, its media and a small site. It works directly between the two
-nodes, with no third-party server. Every read is a paid act, bound to the node
+nodes, with no third-party server. Every content read is a paid act, bound to the node
 that serves it. Bitcoin pays for the read. It never names the node, lists it
 anywhere, or records who reads whom.
 
@@ -44,28 +44,30 @@ A node id resolves to a reachable node in this order:
    name registry. If you do not hold a card or an address for a node id, you
    cannot browse it. You get its card out of band.
 
-## 3. Decision: a 1-sat porch read, not a free read
+## 3. Decision: a 1-sat content read with free metadata preflight
 
 **A porch read costs at least 1 sat (1,000 msat), paid to the node that
 serves it. It is single-use and settled before the node answers. There are no
-free reads.** The owner may charge more. The card advertises the price
-(`prices.page_msat`) and the manifest can set a price per page. The receiving
+free content reads.** A path-specific availability/price quote is free for
+already-admitted contacts (§4); it carries no page body. The owner may charge more. The card advertises the price
+(`prices.page_msat`) and the manifest reports the page price. Per-page manifest overrides do not
+currently determine the kind-500 payment. The receiving
 gate's default price for the web-content kinds is 1,000 msat
 (`pricing.web_content_msat`).
 
 ### Why not free
 
-- **Doctrine.** No payment, no packet. A free read is an unpaid packet that
-  the node answers, which turns the membrane into a wall with a hole in it.
+- **Doctrine.** Content still requires a fresh payment. The bounded metadata
+  exchange only tells an admitted contact whether to buy a read; it grants no
+  admission, content, payment proof, or reusable read authority.
 - **Sybil resistance.** Node ids cost nothing to mint, so a per-id limit on
   free reads is no limit. A per-IP limit punishes users behind NAT, CGNAT or
   Tor. Payment is the only limiter that needs no identity.
 - **Scraping.** Free reads would let anyone harvest a node's site, CV and
   contact hints at zero cost, which is exactly the "free = sell the user"
   pattern the node exists to replace.
-- **The card needs no free lane.** The card already travels free as a link.
-  The only thing a free read would add is freshness. Freshness is not worth an
-  unpaid lane, because a card expires after 7 days anyway.
+- **The card body needs no free lane.** The quote reveals only availability
+  and price; a fresh signed card body still requires a paid read.
 
 ### Why 1 sat
 
@@ -109,6 +111,92 @@ node issue invoices for reads.
 
 ## 4. Wire
 
+### Quote before payment (`porch_quote_v1`)
+
+`PorchQuoteRequest {request_id, path}` and `PorchQuoteResponse {request_id,
+path, status, amount_msat, admission_required}` are Noise control frames, not page envelopes.
+Metadata is answered only on a currently privileged connection (paid admission
+or the recipient's explicit whitelist). A reader's local admission-payment
+marker is not proof of the recipient's whitelist decision. Paths use the
+same flat allowlist, containment and size limits as GET. No directory listing,
+body, signature, invoice, or payment proof is returned. An absent card, disabled
+site, missing file, directory, or zero-byte file returns `NotFound` and no price.
+Oversized or unsafe files are unavailable. A metadata check does not read or
+validate a file's UTF-8 body.
+
+For `Ok`, the recipient quotes its current kind-500 tariff with the gate's
+admission-cost and 1,000-msat Porch floors. This version quotes the public
+(no trust discount) tariff. It persists that per-sender/kind offer for five
+minutes before returning it, using the existing durable delivery-price store.
+Explicit operator prices and chain-aware adjustments determine new quotes.
+`web.page_price_msat` is a legacy setting, not a separate charge override.
+
+**Tariff-raise limitation (v1):** a raise does **not** supersede previously
+issued delivery offers. A custom client can still clear the kind-500 gate by
+paying an older, lower offer before its expiry, without fetching a new quote.
+The free porch quote's payment window is five minutes; kind-500 offers from
+ordinary price tables/responses can last up to one hour. The store uses the
+lowest applicable unexpired sender/kind or category offer. Expiry is inclusive
+in whole seconds and is checked against the recipient wallet's settlement
+timestamp, not the envelope timestamp. A payment settled within that window
+can be delivered for up to one hour after settlement. Restarting or publishing
+a higher quote does not revoke the old one. The gate's current admission and
+one-sat floors still apply.
+
+Safe supersession is deferred: the shared offer store has no quote provenance,
+tariff revision/effective time, or request/payment binding, and chain-aware
+prices have no atomic durable raise event. Deleting lower offers or always
+requiring the current tariff would also reject already-settled reads awaiting
+delivery. Correct supersession needs durable tariff epochs plus a way to bind
+payments to offers and distinguish pre-raise settlement from later redemption,
+including concurrent updates and restart. Operators must allow the outstanding
+offer windows to drain before relying on a raised tariff as a hard minimum.
+The regression `porch_tariff_raise_keeps_old_offer_for_payments_before_and_after_raise`
+exercises both payment orderings, the expiry boundaries, and the rejection of
+already-paid reads if the old offer is deleted. This is a documented limitation,
+not a guarantee that custom clients pay the latest quote.
+
+The reader correlates the reply to its own node, the authenticated peer,
+request id, and exact path. Pending requests are capped at 256 and removed on
+completion, cancellation or timeout (five seconds). The server permits at most
+16 quotes per peer per one-second window with at most 256 active peer entries.
+Request IDs and paths are bounded at wire decoding to 64 and 128 bytes before
+queueing. Responses use the bounded control writer. Unprivileged requests get
+only `admission_required: true`, `Forbidden`, and no price; no availability is
+looked up. Refusals are separately limited to four per source IP and 32 globally
+per second with at most 1,024 source entries, using the existing refusal limiter.
+Rate-limited requests receive no response. Quotes never promote a connection or
+spend money.
+
+`POST /api/v1/browse/quote {node_id, path, max_routing_fee_msat?}` requires local
+read authority and returns `status`, optional `amount_msat` (recipient principal),
+`max_routing_fee_msat` and `max_total_msat` (principal plus routing allowance).
+Missing pages return HTTP 200 with `NotFound`, null principal and zero total.
+A quote is advisory and does not authorize payment.
+
+Every single-peer kind-500 compose, including `/browse/fetch`, obtains a fresh
+quote before reserving spend or creating a payment. It pays the returned price,
+never the reader's own price or a cached peer fallback. Caller caps, spend grants,
+recipient settlement and single-use replay checks still apply. A fresh `NotFound`
+refuses fetch with HTTP 404, reason `porch_not_found`, before any payment.
+Other unavailable statuses refuse with `porch_unavailable`. Reconnect requires
+explicit admission (`readmission_required`). The separate `porch_quote_v1`
+capability is advertised in Hello and `/status`; absent capability or timeout
+fails closed (`porch_quote_unavailable`), with no legacy paid-fetch fallback.
+Both endpoints must be upgraded for this safe fetch flow.
+Room compose refuses page and manifest kinds 500, 501, and 510 with HTTP 400,
+reason `porch_room`, before quoting, reserving spend, paying, or fan-out.
+
+**Availability race:** quotes do not reserve a content snapshot. Fetch rechecks
+after a user previews a quote, but removal, unreadable content, disconnect, or
+malicious behavior after the final preflight can still cause a paid failure.
+There is no atomic payment/delivery guarantee or automatic refund. Such failures
+remain explicitly reported as paid and are never automatically retried. Older
+senders that send paid envelopes directly still receive the existing bound
+`NotFound` response; this upgrade cannot undo payments they already dispatched.
+
+### Paid content
+
 - **Request.** Kind 500 `PageRequest {request_id, path, method: "GET"}`. It
   is E2EE and paid at the recipient's web-content price.
 - **Reply.** Kind 501 `PageResponse {request_id, status, content_type, body,
@@ -133,9 +221,9 @@ Porch paths:
 | `/<name>.md`, `/<name>.txt` | `[web] content_dir`: flat names only, the same rule the owner's page API enforces | `text/markdown`, `text/plain` |
 | Anything else | Nothing. That includes subdirectories, hidden files, other extensions, `front-door.seq` and `*.tmp`. | `NotFound` reply |
 
-A paid read for a path that does not exist still gets a `NotFound` reply,
-including when `[web]` is disabled. The reader paid for an answer, and an
-honest "nothing here" is that answer.
+A missing path is normally refused by preflight before paying. A legacy paid
+request or a page removed after preflight still gets a bound `NotFound` reply,
+including when `[web]` is disabled; its payment is not refunded.
 
 Porch content is markdown or plain text, rendered locally by the reader. A
 remote node never supplies HTML or scripts. Links on a card are never fetched
@@ -238,9 +326,10 @@ The transport's 16 MiB frame limit is never approached.
   `web.page_price_msat` are 1,000 msat (they were 50).
 - **Reader:**
   - `POST /api/v1/browse/fetch {node_id, path, max_total_msat?,
-    max_routing_fee_msat?}` pays for one read through compose's own spend
+    max_routing_fee_msat?}` preflights the path, then pays for one read through compose's own spend
     path, waits for the bound reply, verifies and caches a card, and returns
     the body.
+  - `POST /api/v1/browse/quote` previews availability and price without paying.
   - `GET /api/v1/browse/cards` lists the cached cards.
   - `/api/v1/status` advertises `porch_read_v1`, and so does the federation
     Hello (peers list it as `Custom("porch_read_v1")`), so a reader's app
@@ -258,9 +347,10 @@ The transport's 16 MiB frame limit is never approached.
 - **Card relay by peers** (§5) is not built.
 - **The card cache lives in memory only.** It is lost on restart.
 - **Invoice throttle** (§7): no per-peer throttle on porch invoices.
-- **App.** Discover still offers paste plus Knock only. A "Browse" view that
-  calls `/browse/fetch` is not built. Until it is, the app must not imply that
-  it fetches content across nodes.
+- **App integration.** Apps should use the path-specific quote and distinguish
+  recipient principal, routing allowance, and actual paid fees. Older apps may
+  still preview cached prices and may treat new prepayment refusals as unknown
+  outcomes. See `NOTES-PORCH.md` for the walkthrough app trace.
 
 ## 10. Invariants (tested)
 
@@ -275,3 +365,17 @@ The transport's 16 MiB frame limit is never approached.
 - The serving node answers only the card path and flat `.md`/`.txt` pages. It
   never serves `front-door.seq`, hidden files, subdirectories or HTML
   (`content_server` tests). No reply body exceeds 256 KiB.
+
+- Missing/empty paths and an unpublished card are refused before payment;
+  a quote returns no content or invoice (`porch_quote_reports_availability_and_price_without_paying`,
+  `porch_preflight_checks_missing_empty_oversize_and_unsafe_paths`).
+- A cached million-msat price cannot override the fresh recipient quote;
+  a caller cap still prevents payment and a preview is rechecked at fetch
+  (`porch_read_pays_once_and_returns_the_verified_card`,
+  `porch_quote_rechecks_deleted_page_and_enforces_payment_cap`).
+- A whitelisted connection needs no redundant admission, while an unadmitted
+  reconnect spends nothing (`whitelisted_porch_contact_does_not_need_a_second_admission`,
+  `reconnect_requires_explicit_knock_before_browse_and_pays_nothing`).
+- Wrong-peer/node/path or replayed quote responses cannot complete another
+  waiter; oversized fields fail decoding before queueing (`quote_correlation_rejects_wrong_peer_node_path_and_replay`,
+  `porch_quote_rejects_oversized_fields_before_dispatch`).

@@ -1400,6 +1400,134 @@ async fn queued_paid_proof_honours_offered_price_before_acceptance() {
         Some(&wallet), 0.0, Some(bob.node_id()), konsensus_message::ReachabilityMode::PriceOpen, false).await.is_err(), "renewing the wrapper cannot renew an expired offer");
 }
 
+/// Characterize the documented v1 limit: offers have no tariff revision or
+/// request/payment binding, so a raise cannot distinguish an in-flight paid
+/// read from a custom client's later payment against the same old offer.
+#[tokio::test]
+async fn porch_tariff_raise_keeps_old_offer_for_payments_before_and_after_raise() {
+    use konsensus_core::gate::{GateConfig, GateRejection};
+    use konsensus_core::traits::pricing::PricingEngine;
+
+    let alice = alice_identity();
+    let bob = bob_identity();
+    for paid_before_raise in [true, false] {
+        let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+        let wallet = konsensus_lightning::MockLightningProvider::new();
+        let pricing = MutableDeliveryPrice(std::sync::atomic::AtomicU64::new(1000));
+        let issued = crate::peer_exchange::now();
+        let old_price = pricing.get_price_msat(500).await.unwrap();
+        db.record_delivery_prices(
+            alice.node_id(),
+            &[("kind:500".into(), old_price)],
+            &[],
+            issued,
+            issued + 300,
+        )
+        .await
+        .unwrap();
+        let earlier_payment = if paid_before_raise {
+            Some(wallet.inject_inbound_keysend(1000, None).await)
+        } else {
+            None
+        };
+        pricing.0.store(2000, std::sync::atomic::Ordering::SeqCst);
+        // Even publishing a higher offer does not revoke the earlier one.
+        db.record_delivery_prices(
+            alice.node_id(),
+            &[("kind:500".into(), 2000)],
+            &[],
+            issued,
+            issued + 3600,
+        )
+        .await
+        .unwrap();
+        let hash = match earlier_payment {
+            Some(hash) => hash,
+            None => wallet.inject_inbound_keysend(1000, None).await,
+        };
+        let paid = wallet.get_payment_status(&hash).await.unwrap();
+        let proof = PaymentProof::new(
+            hex::decode(hash).unwrap().try_into().unwrap(),
+            hex::decode(paid.preimage.unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            1000,
+        );
+        let mut env = UkmEnvelopeBuilder::new(
+            500,
+            *alice.node_id(),
+            Recipient::Node(*bob.node_id()),
+            vec![1],
+            proof,
+        )
+        .build();
+        env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
+        let gate = PaymentGate::with_config(GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        });
+        let nonce = konsensus_storage::StorageNonceAdapter::new(db.clone());
+        assert!(!gate
+            .validate_received_paid_envelope(
+                &env,
+                &nonce,
+                &pricing,
+                None,
+                Some(&wallet),
+                0.0,
+                Some(bob.node_id())
+            )
+            .await
+            .unwrap());
+        // Whole-second offer expiry is inclusive. A payment after expiry only
+        // qualifies for the higher quote; timely payments retain one hour to deliver.
+        assert_eq!(
+            db.delivery_price_floor(&env, issued + 300, issued + 300)
+                .await
+                .unwrap(),
+            Some(1000)
+        );
+        assert_eq!(
+            db.delivery_price_floor(&env, issued + 301, issued + 301)
+                .await
+                .unwrap(),
+            Some(2000)
+        );
+        assert_eq!(
+            db.delivery_price_floor(&env, issued + 300, issued + 3900)
+                .await
+                .unwrap(),
+            Some(1000)
+        );
+        assert_eq!(
+            db.delivery_price_floor(&env, issued + 300, issued + 3901)
+                .await
+                .unwrap(),
+            None
+        );
+        // Deleting the old offer would reject even a payment settled BEFORE
+        // the raise, which is why supersession needs a richer protocol/store.
+        sqlx::query("DELETE FROM delivery_price_quotes WHERE amount_msat = 1000")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            gate.validate_received_paid_envelope(
+                &env,
+                &nonce,
+                &pricing,
+                None,
+                Some(&wallet),
+                0.0,
+                Some(bob.node_id())
+            )
+            .await,
+            Err(GateRejection::InsufficientPayment { .. })
+        ));
+    }
+}
+
 #[tokio::test]
 async fn category_offer_binds_original_kind_exclusion_after_tariffs_converge() {
     category_offer_kind_transition(2000, 3000, 3000, false).await;

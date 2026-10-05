@@ -207,6 +207,9 @@ pub enum ControlEvent {
         privileged: bool,
     },
 
+    /// Porch metadata requests require admission; replies require correlation.
+    PorchQuote { peer_id: NodeId, frame: Box<Frame>, privileged: bool, source_ip: std::net::IpAddr },
+
     /// Quote negotiation and paid redemption have their own per-act gate.
     PeerExchangeAct { peer_id: NodeId, frame: Box<Frame> },
 

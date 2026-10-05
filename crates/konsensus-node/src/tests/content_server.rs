@@ -169,7 +169,11 @@ fn manifest_lists_files() {
 #[test]
 fn manifest_extracts_h1_title() {
     let (dir, server) = setup();
-    std::fs::write(dir.path().join("post.md"), "# My Great Post\n\nContent here.").unwrap();
+    std::fs::write(
+        dir.path().join("post.md"),
+        "# My Great Post\n\nContent here.",
+    )
+    .unwrap();
 
     let manifest = server.build_manifest(0, 50);
     assert_eq!(manifest.pages.len(), 1);
@@ -446,8 +450,16 @@ fn only_flat_visible_pages_are_served() {
             accept: vec![],
         };
         let resp = server.handle_request(&req);
-        assert_eq!(resp.status, PageStatus::NotFound, "{name} must not be served");
-        assert!(resp.body.len() < 32, "{name} leaked content: {:?}", resp.body);
+        assert_eq!(
+            resp.status,
+            PageStatus::NotFound,
+            "{name} must not be served"
+        );
+        assert!(
+            resp.body.len() < 32,
+            "{name} leaked content: {:?}",
+            resp.body
+        );
     }
     let manifest = server.build_manifest(0, 1_000);
     assert!(manifest.pages.is_empty(), "{:?}", manifest.pages);
@@ -491,7 +503,11 @@ fn manifest_empty_directory() {
 #[test]
 fn manifest_file_without_h1_uses_filename() {
     let (dir, server) = setup();
-    std::fs::write(dir.path().join("no-heading.md"), "Just some text without a heading.").unwrap();
+    std::fs::write(
+        dir.path().join("no-heading.md"),
+        "Just some text without a heading.",
+    )
+    .unwrap();
 
     let manifest = server.build_manifest(0, 50);
     assert_eq!(manifest.pages.len(), 1);
@@ -595,7 +611,11 @@ fn extract_title_ignores_mid_line_hash() {
     .unwrap();
 
     let manifest = server.build_manifest(0, 50);
-    let page = manifest.pages.iter().find(|p| p.path == "/tricky.md").unwrap();
+    let page = manifest
+        .pages
+        .iter()
+        .find(|p| p.path == "/tricky.md")
+        .unwrap();
     assert_eq!(page.title, "Real Title");
 }
 
@@ -603,11 +623,22 @@ fn extract_title_ignores_mid_line_hash() {
 #[test]
 fn extract_title_no_h1_falls_back_to_filename() {
     let (dir, server) = setup();
-    std::fs::write(dir.path().join("no-heading.md"), "Just body text.\nNo heading here.").unwrap();
+    std::fs::write(
+        dir.path().join("no-heading.md"),
+        "Just body text.\nNo heading here.",
+    )
+    .unwrap();
 
     let manifest = server.build_manifest(0, 50);
-    let page = manifest.pages.iter().find(|p| p.path == "/no-heading.md").unwrap();
-    assert_eq!(page.title, "no-heading.md", "should fall back to filename when no H1");
+    let page = manifest
+        .pages
+        .iter()
+        .find(|p| p.path == "/no-heading.md")
+        .unwrap();
+    assert_eq!(
+        page.title, "no-heading.md",
+        "should fall back to filename when no H1"
+    );
 }
 
 /// Filename with spaces is served correctly.
@@ -659,8 +690,11 @@ fn manifest_capped_at_max_pages() {
     // Create more files than MAX_MANIFEST_PAGES
     let count = MAX_MANIFEST_PAGES + 50;
     for i in 0..count {
-        std::fs::write(dir.path().join(format!("page_{i:05}.md")), format!("# Page {i}"))
-            .unwrap();
+        std::fs::write(
+            dir.path().join(format!("page_{i:05}.md")),
+            format!("# Page {i}"),
+        )
+        .unwrap();
     }
 
     let manifest = server.build_manifest(0, 50);
@@ -676,4 +710,28 @@ fn manifest_under_cap_returns_all() {
 
     let manifest = server.build_manifest(0, 50);
     assert_eq!(manifest.pages.len(), 5);
+}
+
+#[test]
+fn porch_preflight_checks_missing_empty_oversize_and_unsafe_paths() {
+    let (dir, server) = setup();
+    std::fs::write(dir.path().join("page.md"), "hello").unwrap();
+    std::fs::write(dir.path().join("empty.md"), "").unwrap();
+    std::fs::write(dir.path().join("large.md"), "x".repeat(1025)).unwrap();
+    std::fs::create_dir(dir.path().join("dir.md")).unwrap();
+    assert_eq!(server.page_status("/page.md"), PageStatus::Ok);
+    assert_eq!(server.page_status("/missing.md"), PageStatus::NotFound);
+    assert_eq!(server.page_status("/empty.md"), PageStatus::NotFound);
+    assert_eq!(server.page_status("/dir.md"), PageStatus::NotFound);
+    assert_eq!(server.page_status("/large.md"), PageStatus::PayloadTooLarge);
+    assert_eq!(server.page_status("/../page.md"), PageStatus::Forbidden);
+    assert_eq!(server.page_status("/page.html"), PageStatus::NotFound);
+    #[cfg(unix)]
+    {
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.md"), dir.path().join("link.md"))
+            .unwrap();
+        assert_eq!(server.page_status("/link.md"), PageStatus::Forbidden);
+    }
 }

@@ -57,6 +57,8 @@ pub struct LdkConfig {
     pub electrum: Option<konsensus_chain::ElectrumConfig>,
     /// Explicit LSPS2 provider registry (off by default).
     pub liquidity: LiquidityConfig,
+    /// Opt-in hub service; mutually exclusive with the LSPS2 client.
+    pub lsps2_service: crate::lsps2_service::Lsps2ServiceConfig,
     /// Path to store LDK state (channel monitors, network graph, scorer, etc.).
     pub storage_dir: PathBuf,
     /// Directory where encrypted SCB snapshots are rotated.
@@ -509,8 +511,11 @@ impl LdkProvider {
         let sync_intervals = if config.bitcoind.is_some() || config.electrum.is_some() {
             BackgroundSyncConfig::default()
         } else {
-            esplora_sync_config.background_sync_config.expect("background sync is enabled")
+            esplora_sync_config
+                .background_sync_config
+                .expect("background sync is enabled")
         };
+        let lsps2_service = config.lsps2_service.to_ldk(config.liquidity.enabled)?;
         let mnemonic = Mnemonic::from_str(&mnemonic_phrase)
             .map_err(|e| LightningError::InvalidStartupConfig(format!("invalid mnemonic: {e}")))?;
 
@@ -591,6 +596,10 @@ impl LdkProvider {
             builder.set_gossip_source_rgs(rgs_url.clone());
         } else {
             builder.set_gossip_source_p2p();
+        }
+
+        if let Some(service) = lsps2_service {
+            builder.set_liquidity_provider_lsps2(service);
         }
 
         let mut log_level = ldk_node::config::DEFAULT_LOG_LEVEL;
@@ -700,6 +709,7 @@ impl LdkProvider {
             Arc::clone(&scb_producer),
             inbound_tx.clone(),
             outgoing_tx.clone(),
+            config.lsps2_service.clone(),
         );
         Self::spawn_scb_timer(Arc::clone(&drainer_shutdown), scb_producer);
 
@@ -832,6 +842,7 @@ impl LdkProvider {
         scb_producer: Arc<ScbProducer>,
         inbound_tx: broadcast::Sender<InboundPayment>,
         outgoing_tx: broadcast::Sender<String>,
+        lsps2_service: crate::lsps2_service::Lsps2ServiceConfig,
     ) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ldk_node::Event>(64);
 
@@ -839,10 +850,22 @@ impl LdkProvider {
         let drain_node = Arc::clone(&node);
         let drain_shutdown = Arc::clone(&shutdown);
         tokio::task::spawn_blocking(move || {
+            // Sweep on startup too: a crash can happen after LDK persists the
+            // channel but before the application handles ChannelReady.
+            let mut tariff_retry = crate::lsps2_service::TariffRetry::new(Instant::now());
             while !drain_shutdown.load(Ordering::Relaxed) {
+                tariff_retry
+                    .apply_if_due(Instant::now(), || lsps2_service.apply_tariffs(&drain_node));
                 let mut drained_any = false;
                 while let Some(event) = drain_node.next_event() {
                     drained_any = true;
+                    if matches!(event, ldk_node::Event::ChannelReady { .. }) {
+                        tariff_retry.request(Instant::now());
+                    }
+                    // Also service retries under a continuously busy event queue.
+                    // Failures never hold ChannelReady or unrelated payment events.
+                    tariff_retry
+                        .apply_if_due(Instant::now(), || lsps2_service.apply_tariffs(&drain_node));
                     if tx.blocking_send(event).is_err() {
                         // Consumer dropped (shutdown or panic) — exit cleanly.
                         debug!("LDK event drainer: consumer gone, exiting");

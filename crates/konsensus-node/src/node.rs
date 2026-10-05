@@ -185,6 +185,7 @@ impl KonsensusNode {
             }
             LightningConfig::Ldk {
                 liquidity,
+                lsps2_service,
                 network,
                 esplora_url,
                 esplora_url_fallback,
@@ -218,6 +219,7 @@ impl KonsensusNode {
                         _ => None,
                     },
                     liquidity: liquidity.clone(),
+                    lsps2_service: lsps2_service.clone(),
                     storage_dir: ldk_storage_dir,
                     scb_backup_dir: Some(std::path::PathBuf::from(&config.backup.scb_dir)),
                     scb_rotation_count: config.backup.rotation_count,
@@ -655,6 +657,7 @@ pub(crate) fn default_advertised_capabilities(relay_enabled: bool) -> Vec<Capabi
         Capability::Custom(konsensus_core::payloads::call::MEETING_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::content::PORCH_READ_CAPABILITY.to_string()),
+        Capability::Custom(konsensus_core::payloads::content::PORCH_QUOTE_CAPABILITY.to_string()),
     ];
     if relay_enabled {
         caps.push(Capability::Relay);

@@ -297,3 +297,25 @@ names every failure. Clippy passed offline for both crates/all targets with
 `-D warnings`; the existing sqlx-postgres future-compatibility notice remains.
 Source review approved the code change. Core/electrs runtime was not run and no
 network was contacted.
+
+## Hub LSPS2 provider
+
+The same entry point also runs
+`regtest_e2e::three_node::lsps2_service::hub_jit_then_stateless_admission`:
+three production `LdkProvider` nodes (sponsor → hub → app), no pre-opened app
+channel, existing LSPS2 client negotiation, a JIT top-up within 60 seconds, then
+separate stateless admission payments from and to the app. Assertions cover the
+opening fee, inbound from overprovisioning, positive hub forwarding fees within
+the ALL-IN allowance, no admission skim, disconnected-provider refusal and
+post-restart tariff recovery. The client's on-chain anchor reserve is funded;
+the test does not claim an empty wallet can receive an anchor channel.
+
+Run only this case with the usual fixture environment:
+
+```sh
+REGTEST_TEST=regtest_e2e::three_node::lsps2_service:: \
+  scripts/regress/regtest_e2e.sh
+```
+
+See [hub and app config examples](LSPS2-LIQUIDITY.md#hub-provider-pilot) for the
+opt-in service. The #190 funding policy and vendor code remain unchanged.
