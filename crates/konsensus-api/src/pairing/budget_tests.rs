@@ -156,7 +156,8 @@ fn local_device_grant_dispatch_and_staging_keep_deadlines_and_deployment_gates()
     drop(owner);
     let service = PairingService::open(dir.path(), "identity".into(), false)
         .unwrap()
-        .with_local_owner_device();
+        .with_local_owner_device()
+        .with_owner_approval_key(ed25519_dalek::SigningKey::from_bytes(&[14; 32]).verifying_key());
     let binding = auth::PairingBinding {
         client_id: client.client_id.clone(),
         epoch: client.epoch,

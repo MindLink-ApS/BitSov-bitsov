@@ -268,6 +268,7 @@ async fn local_mode_reports_authority_and_keeps_http_enrollment_closed() {
         PairingService::open(tmp.path(), fp, false)
             .unwrap()
             .with_local_owner_device()
+            .with_owner_approval_key(SigningKey::from_bytes(&[14; 32]).verifying_key())
             .without_stdout_code(),
     );
     let state = Arc::new(AppState {
@@ -290,7 +291,7 @@ async fn local_mode_reports_authority_and_keeps_http_enrollment_closed() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(keys["owner_control"], false);
     assert_eq!(keys["local_owner_device"], true);
-    assert_eq!(keys["device_approvals"], "owner_key_unavailable");
+    assert_eq!(keys["device_approvals"], "enabled");
     let (status, _) = call(
         &state,
         "POST",

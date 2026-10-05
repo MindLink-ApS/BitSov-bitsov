@@ -258,3 +258,110 @@ fn local_owner_flag_cannot_enter_legacy_plaintext_bootstrap() {
         assert!(!dir.path().join(path).exists(), "unexpected {path}");
     }
 }
+
+fn directory_snapshot(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut snapshot = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            snapshot.insert(path.clone(), Vec::new());
+            snapshot.extend(directory_snapshot(&path));
+        } else {
+            snapshot.insert(path.clone(), std::fs::read(path).unwrap());
+        }
+    }
+    snapshot
+}
+
+#[test]
+fn local_owner_unavailable_verifier_refuses_start_without_writing_files() {
+    for case in [
+        "plaintext",
+        "wrong-password",
+        "plaintext-sibling",
+        "unusable-seed",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = init(dir.path(), false);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let config_path = dir.path().join("konsensus.toml");
+        let mut config: toml::Value = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse()
+            .unwrap();
+        config["network"]["listen_addr"] = "127.0.0.1:0".into();
+        let api_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        config["api"]["listen_addr"] = api_port.local_addr().unwrap().to_string().into();
+        drop(api_port);
+        if matches!(case, "plaintext" | "plaintext-sibling") {
+            std::fs::write(dir.path().join("mnemonic.txt"),
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
+        }
+        if case == "plaintext" {
+            config["identity"]["mnemonic_file"] =
+                dir.path().join("mnemonic.txt").to_str().unwrap().into();
+            std::fs::remove_file(dir.path().join("mnemonic.enc")).unwrap();
+        } else if case == "unusable-seed" {
+            std::fs::write(dir.path().join("mnemonic.enc"), b"invalid encrypted seed").unwrap();
+        }
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let before = directory_snapshot(dir.path());
+        let output = tempfile::tempfile().unwrap();
+        let mut child = bin()
+            .args([
+                "start",
+                "--local-owner-device",
+                "--password-fd",
+                "0",
+                "--config",
+            ])
+            .arg(&config_path)
+            .stdin(Stdio::piped())
+            .stdout(output.try_clone().unwrap())
+            .stderr(output.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        let password = if case == "wrong-password" {
+            "wrong-password"
+        } else {
+            PASSWORD
+        };
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(password.as_bytes())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("{case}: local owner startup must refuse without a verifier");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        use std::os::unix::fs::FileExt;
+        let mut bytes = vec![0; output.metadata().unwrap().len() as usize];
+        output.read_exact_at(&mut bytes, 0).unwrap();
+        no_secret(&bytes);
+        let log = String::from_utf8_lossy(&bytes);
+        assert!(!status.success(), "{case}: {log}");
+        assert!(
+            log.contains("--local-owner-device requires an available owner verifier"),
+            "{case}: {log}"
+        );
+        assert_eq!(
+            directory_snapshot(dir.path()),
+            before,
+            "{case}: refused startup wrote files"
+        );
+    }
+}

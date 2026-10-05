@@ -68,11 +68,16 @@ that are not on the curve.
 for an existing enrolled key. It requires a descriptor password and an encrypted
 seed with no plaintext sibling; only the owner verifying key survives startup.
 It never enables enrollment, console grants, front-door, replacement or
-first-contact approval. Local spend scopes, staging and dispatch require a live
-`device:` grant with a `recipients_only` budget. Console grants on disk stay
-inactive. See [password input](../operations/password-input.md) for launcher
-trust and release requirements. `DeviceKey.enrolled_by` defaults to `console`
+first-contact approval. Local spend scopes, staging and dispatch require an
+owner verifier and a live `device:` grant with a `recipients_only` budget. Startup
+refuses local mode before writing files if the owner verifier cannot be derived.
+Console grants on disk stay inactive. See
+[password input](../operations/password-input.md) for launcher trust and release
+requirements. `DeviceKey.enrolled_by` defaults to `console`
 for older records and is informational; it grants no authority.
+
+In local mode, `apply_relation_intent` clears the budgets on all other grants
+for that client, including console grants.
 
 A relation grant is the client's one budget grant, marked `recipients_only`:
 

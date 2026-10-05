@@ -903,6 +903,7 @@ impl PairingService {
     fn permits_spend_grant(&self, grant: &SpendGrant) -> bool {
         self.owner_control_enabled
             || (self.local_owner_device
+                && self.owner_approval_key.is_some()
                 && grant.granted_by.starts_with("device:")
                 && grant
                     .budget

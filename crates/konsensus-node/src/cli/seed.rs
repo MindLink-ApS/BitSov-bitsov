@@ -565,14 +565,8 @@ mod tests {
         let (_dir, config, _) = node();
         let before = NodeConfig::load_before_identity_validation(&config).unwrap();
         assert_eq!(
-            crate::owner_approval_key(
-                &before,
-                None,
-                crate::PasswordSource::Typed,
-                &node_id(),
-                false
-            )
-            .unwrap_err(),
+            crate::owner_approval_key(&before, None, crate::PasswordSource::Typed, false)
+                .unwrap_err(),
             SEED_NOT_ENCRYPTED
         );
         encrypt_seed(&config, pw("correct horse battery")).unwrap();
@@ -581,7 +575,6 @@ mod tests {
             &after,
             Some("correct horse battery"),
             crate::PasswordSource::Typed,
-            &node_id(),
             false,
         )
         .expect("after seed encrypt and a typed start, device approvals are on");

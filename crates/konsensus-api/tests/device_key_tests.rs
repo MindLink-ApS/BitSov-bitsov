@@ -710,6 +710,42 @@ fn token_scopes(service: &PairingService, client: &PairedClient) -> Vec<Scope> {
 }
 
 #[test]
+fn local_owner_without_verifier_cannot_spend_stored_device_grants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (console, _, client, device, key_id) = registered(tmp.path());
+    drop(console);
+    let local = local_run(tmp.path());
+    let i = intent(&key_id, PEER, 10_000, 1_000);
+    let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    local
+        .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
+        .unwrap();
+    assert!(token_scopes(&local, &client).contains(&Scope::Spend));
+    drop(local);
+
+    // Exercise both a missing verifier and one explicitly disabled after installation.
+    for disabled in [false, true] {
+        let service = PairingService::open(tmp.path(), fingerprint(), false)
+            .unwrap()
+            .with_local_owner_device()
+            .without_stdout_code();
+        let service = if disabled {
+            service
+                .with_owner_approval_key(owner_key().verifying_key())
+                .with_device_authority_disabled(device::OWNER_KEY_UNAVAILABLE)
+        } else {
+            service
+        };
+        let reservation = service.reserve_spend(&client.client_id, client.epoch, charge(PEER, 1));
+        let scopes = token_scopes(&service, &client);
+        assert!(
+            matches!(reservation, Err(BudgetRefusal::NoGrant)) && !scopes.contains(&Scope::Spend),
+            "unavailable verifier must block reservation and spend scope: {reservation:?}, {scopes:?}"
+        );
+    }
+}
+
+#[test]
 fn local_owner_accepts_console_enrolled_key_but_restart_without_flag_refuses() {
     let tmp = tempfile::tempdir().unwrap();
     let (console, _, client, device, key_id) = registered(tmp.path());
