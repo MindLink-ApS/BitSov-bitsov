@@ -62,6 +62,7 @@ sqlx.workspace = true
 lightning-invoice.workspace = true
 
 [dev-dependencies]
+ring = "0.17"
 log = "0.4"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 async-trait.workspace = true

@@ -44,10 +44,10 @@ run Rust destructors.
 
 Descriptor input alone is **non-interactive**: Touch ID device approvals remain
 off with `seed_password_not_typed`, just as with `--password-file`. The explicit
-live-start exception is described below. The node does not implement Keychain
+explicit local-owner exception is described below. The node does not implement Keychain
 access.
 
-For an **already initialized** local node with a console-enrolled owner device,
+For an initialized local node with a first-run or console-enrolled owner device,
 start with `--password-fd 0 --local-owner-device` to enable device-signed,
 recipient-bound spend envelopes. This flag is required on every start; it is
 not a config setting. It requires `--password-fd` and conflicts with
@@ -60,15 +60,23 @@ Console-enrolled device records work unchanged; their owner signatures are
 verified on every intent. A restart without the flag disables descriptor-based
 device approval again (`seed_password_not_typed`) and honours no spend grants.
 
-This mode opens no control socket. Enrollment, console grants, elevation,
+This mode opens no control socket. Later enrollment, console grants, elevation,
 front-door, identity replacement, pairing-window control and first-contact
 approval retain their console-only rules. Only live `device:` grants with
 `recipients_only` budgets supply spend scope and spending authority; `cli`
 grants on disk remain inactive. Caps and dispatch deadlines still apply.
-PR A refuses `--local-owner-device` on an uninitialized directory, before
-serving HTTP, so it cannot silently fall into plaintext bootstrap. Ordinary
-bootstrap HTTP identity creation is unchanged; encrypted first-run HTTP
-enrollment and device delegation are separate work.
+On a positively empty directory, `--password-fd` retains the password in
+zeroizing memory for encrypted bootstrap. Adding `--local-owner-device` enables
+first-run owner enrollment: create a pending identity, record the phrase once,
+and finalize with three backup words and the device's P-256 possession proof.
+The password is never an HTTP field. Empty passwords are rejected before serving.
+Without the enrollment flag, encrypted two-phase creation is available without
+a device. Legacy HTTP create/restore also write `identity/mnemonic.enc` whenever
+a startup password is supplied (including flag/file passwords, which still
+confer no local owner authority). With no password they retain plaintext behavior.
+After finalize the process exits; the launcher restarts explicitly with the same
+password and flag. Device delegation remains separate work.
+See [the ceremony and crash rules](../security/pairing.md#two-phase-local-bootstrap).
 
 The launcher must protect its Keychain password: anyone with that password and
 the seed can derive the owner signing key. Release of the Mac launcher requires

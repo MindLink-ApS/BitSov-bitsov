@@ -43,7 +43,7 @@ use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use zeroize::Zeroizing;
 
@@ -371,12 +371,100 @@ pub struct CommitOutcome {
 }
 
 /// Hook after rebind and before `NODE_INITIALIZED` (clippy::type_complexity).
-type BeforeMarkerHook<'a> =
-    dyn Fn(&CommitOutcome) -> Result<(), CommitError> + 'a;
+type BeforeMarkerHook<'a> = dyn Fn(&CommitOutcome) -> Result<(), CommitError> + 'a;
 
 /// Owned, thread-safe [`BeforeMarkerHook`] for [`BootstrapState`].
-type BeforeMarkerHookOwned =
-    Arc<dyn Fn(&CommitOutcome) -> Result<(), CommitError> + Send + Sync>;
+type BeforeMarkerHookOwned = Arc<dyn Fn(&CommitOutcome) -> Result<(), CommitError> + Send + Sync>;
+
+/// Encryption supplied by the node crate; the API never receives the password.
+pub type EncryptSeedHook = dyn Fn(&str, &Path) -> Result<PathBuf, CommitError> + Send + Sync;
+/// Transient owner signing supplied by the node crate.
+pub type SignOwnerHook = dyn Fn(&str, &str, &str) -> Result<String, CommitError> + Send + Sync;
+
+/// Local first-run capabilities. Captured passwords must be zeroizing.
+pub struct LocalOwnerHooks {
+    /// Write and fsync staging/mnemonic.enc with owner-only permissions.
+    pub encrypt_seed: Box<EncryptSeedHook>,
+    /// Sign the canonical owner approval; discard the derived signing key.
+    pub sign_owner_approval: Box<SignOwnerHook>,
+    /// Require enrollment of the first owner device.
+    pub enroll_device: bool,
+}
+
+// No Debug/Clone: the only retained phrase buffer zeroizes on drop, including
+// cancellation, expiry, failed backup, shutdown and commit errors.
+#[derive(zeroize::ZeroizeOnDrop)]
+struct PendingIdentity {
+    ceremony_id: String,
+    mnemonic: Zeroizing<String>,
+    node_id: String,
+    fingerprint: String,
+    client_id: String,
+    #[zeroize(skip)]
+    created_at: tokio::time::Instant,
+    backup_check: [usize; 3],
+    failed_backup_attempts: u8,
+}
+
+impl PendingIdentity {
+    fn expired(&self) -> bool {
+        self.created_at.elapsed() >= std::time::Duration::from_secs(30 * 60)
+    }
+}
+
+/// One-time phrase response; never logged or retained as a response cache.
+#[derive(Serialize)]
+pub struct CreatePendingResponse {
+    /// Random ceremony handle.
+    pub ceremony_id: String,
+    /// Pending node identity.
+    pub node_id: String,
+    /// Shown exactly once.
+    pub mnemonic: Zeroizing<String>,
+    /// Unix expiry, for the UI. Enforcement uses a monotonic clock.
+    pub expires_at: i64,
+    /// Three distinct zero-based word positions.
+    pub backup_check: [usize; 3],
+}
+
+/// Device proof of possession; it is not owner approval.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceEnrollment {
+    /// Uncompressed SEC1 P-256 point, hex.
+    pub public_key: String,
+    /// Visible device label.
+    pub name: String,
+    /// DER signature over registration_message, hex.
+    pub proof: String,
+}
+
+/// No password is accepted over HTTP.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeBody {
+    /// Handle from create-pending.
+    pub ceremony_id: String,
+    /// Words at the requested positions, in order.
+    pub backup_words: [Zeroizing<String>; 3],
+    /// Required only in enrollment mode.
+    pub device: Option<DeviceEnrollment>,
+}
+
+/// Terminal local first-run result. Contains no phrase.
+#[derive(Serialize)]
+pub struct FinalizeResponse {
+    /// Committed node id.
+    pub node_id: String,
+    /// The supervisor must restart explicitly.
+    pub restart_required: bool,
+    /// Enrolled device key id, if requested.
+    pub device_key_id: Option<String>,
+    /// Display fingerprint of the device key.
+    pub device_fingerprint: Option<String>,
+    /// Committed encrypted seed path.
+    pub mnemonic_path: String,
+}
 
 /// Errors from the transition.
 #[derive(Debug, thiserror::Error)]
@@ -446,6 +534,22 @@ pub fn commit_first_run_with_before_marker(
     fault: CommitFault,
     before_marker: Option<&BeforeMarkerHook<'_>>,
 ) -> Result<CommitOutcome, CommitError> {
+    commit_first_run_local(layout, mnemonic, pairing, fault, before_marker, None, None)
+}
+
+fn commit_first_run_local(
+    layout: &DataDirLayout,
+    mnemonic: &str,
+    pairing: Option<&PairingService>,
+    fault: CommitFault,
+    before_marker: Option<&BeforeMarkerHook<'_>>,
+    local: Option<&LocalOwnerHooks>,
+    device: Option<pairing::device::DeviceKey>,
+) -> Result<CommitOutcome, CommitError> {
+    // A failed post-rename attempt never reopens bootstrap in this process.
+    if classify(&DataDirProbe::inspect(layout)?) != StartupMode::Bootstrap {
+        return Err(CommitError::Conflict);
+    }
     let identity = konsensus_core::NodeIdentity::from_mnemonic(mnemonic, "")
         .map_err(|e| CommitError::InvalidMnemonic(e.to_string()))?;
     let node_id = identity.node_id().to_hex();
@@ -459,7 +563,16 @@ pub fn commit_first_run_with_before_marker(
         .join(format!("{STAGING_PREFIX}{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&staging)?;
     pairing::restrict_dir(&staging)?;
-    pairing::write_protected(&staging.join("mnemonic.txt"), mnemonic.as_bytes())?;
+    let mnemonic_name = if let Some(hooks) = local {
+        let path = (hooks.encrypt_seed)(mnemonic, &staging)?;
+        if path != staging.join("mnemonic.enc") || staging.join("mnemonic.txt").exists() {
+            return Err(CommitError::Io("invalid encrypted seed output".into()));
+        }
+        "mnemonic.enc"
+    } else {
+        pairing::write_protected(&staging.join("mnemonic.txt"), mnemonic.as_bytes())?;
+        "mnemonic.txt"
+    };
     pairing::write_protected(
         &staging.join("identity.json"),
         serde_json::json!({
@@ -498,10 +611,17 @@ pub fn commit_first_run_with_before_marker(
             .map_err(|e| CommitError::Pairing(e.to_string()))?;
     }
 
+    if let Some(record) = device {
+        pairing
+            .ok_or_else(|| CommitError::Pairing("pairing unavailable".into()))?
+            .install_first_run_device_key(record)
+            .map_err(|e| CommitError::Pairing(e.to_string()))?;
+    }
+
     let outcome = CommitOutcome {
         node_id,
         identity_fingerprint: fingerprint.clone(),
-        mnemonic_path: target.join("mnemonic.txt"),
+        mnemonic_path: target.join(mnemonic_name),
     };
 
     // Align any operator config with the committed mnemonic *before* the
@@ -553,6 +673,8 @@ pub struct BootstrapState {
     /// Optional durable work that must complete before the marker is published
     /// (e.g. aligning the operator's config file with the committed mnemonic).
     before_marker: Option<BeforeMarkerHookOwned>,
+    local: Option<LocalOwnerHooks>,
+    pending: Mutex<Option<PendingIdentity>>,
 }
 
 impl BootstrapState {
@@ -570,6 +692,8 @@ impl BootstrapState {
             outcome: Mutex::new(None),
             started_at: Instant::now(),
             before_marker: None,
+            local: None,
+            pending: Mutex::new(None),
         }
     }
 
@@ -580,6 +704,149 @@ impl BootstrapState {
     {
         self.before_marker = Some(Arc::new(hook));
         self
+    }
+
+    /// Enable encrypted two-phase bootstrap with node-supplied hooks.
+    pub fn with_local_owner(mut self, hooks: LocalOwnerHooks) -> Self {
+        self.local = Some(hooks);
+        self
+    }
+
+    fn ensure_open(&self) -> Result<(), CommitError> {
+        if self.is_committed()
+            || classify(&DataDirProbe::inspect(&self.layout)?) != StartupMode::Bootstrap
+        {
+            return Err(CommitError::Conflict);
+        }
+        Ok(())
+    }
+
+    fn commit_locked(
+        &self,
+        mnemonic: &str,
+        fault: CommitFault,
+        device: Option<pairing::device::DeviceKey>,
+    ) -> Result<CommitOutcome, CommitError> {
+        let outcome = commit_first_run_local(
+            &self.layout,
+            mnemonic,
+            Some(&self.pairing),
+            fault,
+            self.before_marker
+                .as_ref()
+                .map(|h| h.as_ref() as &BeforeMarkerHook<'_>),
+            self.local.as_ref(),
+            device,
+        )?;
+        *self.outcome.lock().unwrap() = Some(outcome.clone());
+        self.committed.store(true, Ordering::SeqCst);
+        Ok(outcome)
+    }
+
+    /// Finish a pending ceremony under the same single-flight lock as legacy
+    /// commits. Faults are explicit test inputs, never HTTP parameters.
+    pub fn finalize(
+        &self,
+        client_id: &str,
+        body: FinalizeBody,
+        fault: CommitFault,
+    ) -> Result<FinalizeResponse, (StatusCode, String)> {
+        let _guard = self
+            .transition
+            .try_lock()
+            .map_err(|_| ceremony_error(StatusCode::CONFLICT, "ceremony_in_progress"))?;
+        self.ensure_open().map_err(commit_error_response)?;
+        let hooks = self
+            .local
+            .as_ref()
+            .ok_or_else(|| ceremony_error(StatusCode::CONFLICT, "password_unavailable"))?;
+        let mut slot = self.pending.lock().unwrap();
+        let pending = slot
+            .as_mut()
+            .ok_or_else(|| ceremony_error(StatusCode::GONE, "ceremony_lost"))?;
+        if pending.client_id != client_id {
+            return Err(ceremony_error(
+                StatusCode::FORBIDDEN,
+                "ceremony_client_mismatch",
+            ));
+        }
+        if pending.expired() {
+            *slot = None;
+            return Err(ceremony_error(StatusCode::GONE, "ceremony_expired"));
+        }
+        if pending.ceremony_id != body.ceremony_id {
+            return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
+        }
+        if hooks.enroll_device != body.device.is_some() {
+            return Err(ceremony_error(
+                StatusCode::BAD_REQUEST,
+                "device_requirement_mismatch",
+            ));
+        }
+        let words: Vec<_> = pending.mnemonic.split_whitespace().collect();
+        if !pending
+            .backup_check
+            .iter()
+            .zip(&body.backup_words)
+            .all(|(i, word)| words[*i] == word.as_str())
+        {
+            pending.failed_backup_attempts += 1;
+            if pending.failed_backup_attempts >= 3 {
+                *slot = None;
+                return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
+            }
+            return Err(ceremony_error(
+                StatusCode::BAD_REQUEST,
+                "backup_check_failed",
+            ));
+        }
+        let device = if let Some(device) = body.device {
+            let mut record = self
+                .pairing
+                .prepare_first_run_device_key(
+                    client_id,
+                    &pending.fingerprint,
+                    &device.public_key,
+                    &device.name,
+                    &device.proof,
+                )
+                .map_err(|e| {
+                    if matches!(e, PairingError::BadProof) {
+                        ceremony_error(StatusCode::FORBIDDEN, "bad_device_proof")
+                    } else {
+                        pairing_error_response(e)
+                    }
+                })?;
+            let message = pairing::device::owner_approval_message(
+                &pending.fingerprint,
+                &record.client_pubkey,
+                record.epoch,
+                &record.public_key,
+            );
+            record.owner_approval =
+                (hooks.sign_owner_approval)(&pending.mnemonic, &pending.node_id, &message)
+                    .map_err(commit_error_response)?;
+            Some(record)
+        } else {
+            None
+        };
+        let device_key_id = device.as_ref().map(|d| d.key_id.clone());
+        // From here even a failed commit consumes the phrase. A post-rename
+        // failure additionally requires explicit repair, never a retry.
+        let pending = slot.take().unwrap();
+        drop(slot);
+        let outcome = self
+            .commit_locked(&pending.mnemonic, fault, device)
+            .map_err(commit_error_response)?;
+        Ok(FinalizeResponse {
+            node_id: outcome.node_id,
+            restart_required: true,
+            device_fingerprint: device_key_id
+                .as_deref()
+                .map(pairing::device::key_fingerprint),
+            device_key_id,
+            mnemonic_path: outcome.mnemonic_path.display().to_string(),
+        })
     }
 
     /// Has the transition committed?
@@ -605,26 +872,15 @@ impl BootstrapState {
             .transition
             .try_lock()
             .map_err(|_| CommitError::Conflict)?;
-        if self.committed.load(Ordering::SeqCst) {
+        self.ensure_open()?;
+        let mut pending = self.pending.lock().unwrap();
+        if pending.as_ref().is_some_and(PendingIdentity::expired) {
+            *pending = None;
+        }
+        if pending.is_some() {
             return Err(CommitError::Conflict);
         }
-        let outcome = match &self.before_marker {
-            Some(hook) => commit_first_run_with_before_marker(
-                &self.layout,
-                mnemonic,
-                Some(&self.pairing),
-                fault,
-                Some(hook.as_ref()),
-            )?,
-            None => {
-                commit_first_run_with_fault(&self.layout, mnemonic, Some(&self.pairing), fault)?
-            }
-        };
-        self.committed.store(true, Ordering::SeqCst);
-        if let Ok(mut slot) = self.outcome.lock() {
-            *slot = Some(outcome.clone());
-        }
-        Ok(outcome)
+        self.commit_locked(mnemonic, fault, None)
     }
 }
 
@@ -668,6 +924,12 @@ impl FromRequestParts<Arc<BootstrapState>> for BootstrapAuth {
         }
         let client_id = claims.cid.clone().ok_or_else(unauthorized)?;
         let epoch = claims.epc.ok_or_else(unauthorized)?;
+        if (state.is_committed() || state.transition.try_lock().is_err())
+            && (parts.uri.path() == "/api/v1/identity/finalize"
+                || parts.uri.path().starts_with("/api/v1/identity/pending/"))
+        {
+            return Err((StatusCode::CONFLICT, "already initialized").into_response());
+        }
         state
             .pairing
             .verify_token_binding(&client_id, epoch, "", &claims.scp)
@@ -686,14 +948,36 @@ pub struct BootstrapStateResponse {
     pub can_restore: bool,
     /// Whether a first-run create is available.
     pub can_create: bool,
+    /// Explicit local ceremony availability, with no secret material.
+    pub local_owner: LocalOwnerState,
+}
+
+/// Public local ceremony status.
+#[derive(Debug, Serialize)]
+pub struct LocalOwnerState {
+    /// An encryption password was supplied at startup.
+    pub available: bool,
+    /// First owner enrollment is required.
+    pub enroll_device: bool,
+    /// A phrase is held in memory awaiting backup proof.
+    pub pending: bool,
 }
 
 async fn bootstrap_state(State(state): State<Arc<BootstrapState>>) -> Json<BootstrapStateResponse> {
     let open = !state.is_committed();
+    let mut pending = state.pending.lock().unwrap();
+    if pending.as_ref().is_some_and(PendingIdentity::expired) {
+        *pending = None;
+    }
     Json(BootstrapStateResponse {
         state: if open { "bootstrap" } else { "initialized" },
         can_restore: open,
         can_create: open,
+        local_owner: LocalOwnerState {
+            available: state.local.is_some(),
+            enroll_device: state.local.as_ref().is_some_and(|l| l.enroll_device),
+            pending: pending.is_some(),
+        },
     })
 }
 
@@ -868,7 +1152,7 @@ pub struct FirstRunRestoreBody {
 }
 
 /// Terminal response from a first-run create or restore.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct FirstRunResponse {
     /// Node id of the committed identity.
     pub node_id: String,
@@ -876,7 +1160,7 @@ pub struct FirstRunResponse {
     pub restart_required: bool,
     /// For a create, the phrase the user must write down. Absent on restore.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mnemonic: Option<String>,
+    pub mnemonic: Option<Zeroizing<String>>,
 }
 
 fn commit_error_response(e: CommitError) -> BootstrapError {
@@ -916,6 +1200,7 @@ async fn first_run_create(
 ) -> Result<Json<FirstRunResponse>, BootstrapError> {
     let (mnemonic, _identity) = konsensus_core::NodeIdentity::generate()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mnemonic = Zeroizing::new(mnemonic);
     let outcome = state
         .transition(&mnemonic, CommitFault::None)
         .map_err(commit_error_response)?;
@@ -926,6 +1211,103 @@ async fn first_run_create(
         // loopback. The phrase is never logged and never sent anywhere else.
         mnemonic: Some(mnemonic),
     }))
+}
+
+fn ceremony_error(status: StatusCode, code: &str) -> BootstrapError {
+    (status, code.into())
+}
+
+async fn create_pending(
+    auth: BootstrapAuth,
+    State(state): State<Arc<BootstrapState>>,
+) -> Result<Json<CreatePendingResponse>, BootstrapError> {
+    use rand::seq::SliceRandom;
+    let _guard = state
+        .transition
+        .try_lock()
+        .map_err(|_| ceremony_error(StatusCode::CONFLICT, "ceremony_in_progress"))?;
+    state.ensure_open().map_err(commit_error_response)?;
+    if state.local.is_none() {
+        return Err(ceremony_error(StatusCode::CONFLICT, "password_unavailable"));
+    }
+    let mut slot = state.pending.lock().unwrap();
+    if slot.as_ref().is_some_and(PendingIdentity::expired) {
+        *slot = None;
+    }
+    if slot.is_some() {
+        return Err(ceremony_error(StatusCode::CONFLICT, "ceremony_in_progress"));
+    }
+    let (mnemonic, identity) = konsensus_core::NodeIdentity::generate().map_err(|_| {
+        ceremony_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "identity_generation_failed",
+        )
+    })?;
+    let mnemonic = Zeroizing::new(mnemonic);
+    let node_id = identity.node_id().to_hex();
+    let ceremony_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut indices: Vec<usize> = (0..mnemonic.split_whitespace().count()).collect();
+    indices.shuffle(&mut rand::thread_rng());
+    let backup_check = [indices[0], indices[1], indices[2]];
+    *slot = Some(PendingIdentity {
+        ceremony_id: ceremony_id.clone(),
+        mnemonic: mnemonic.clone(),
+        node_id: node_id.clone(),
+        fingerprint: pairing::identity_fingerprint(&node_id),
+        client_id: auth.client_id,
+        created_at: tokio::time::Instant::now(),
+        backup_check,
+        failed_backup_attempts: 0,
+    });
+    Ok(Json(CreatePendingResponse {
+        ceremony_id,
+        node_id,
+        mnemonic,
+        expires_at: chrono::Utc::now().timestamp() + 1800,
+        backup_check,
+    }))
+}
+
+async fn finalize(
+    auth: BootstrapAuth,
+    State(state): State<Arc<BootstrapState>>,
+    Json(body): Json<FinalizeBody>,
+) -> Result<Json<FinalizeResponse>, BootstrapError> {
+    state
+        .finalize(&auth.client_id, body, CommitFault::None)
+        .map(Json)
+}
+
+async fn cancel_pending(
+    auth: BootstrapAuth,
+    State(state): State<Arc<BootstrapState>>,
+    axum::extract::Path(ceremony_id): axum::extract::Path<String>,
+) -> Result<StatusCode, BootstrapError> {
+    let _guard = state
+        .transition
+        .try_lock()
+        .map_err(|_| ceremony_error(StatusCode::CONFLICT, "ceremony_in_progress"))?;
+    state.ensure_open().map_err(commit_error_response)?;
+    let mut slot = state.pending.lock().unwrap();
+    if let Some(pending) = slot.as_ref() {
+        if pending.client_id != auth.client_id {
+            return Err(ceremony_error(
+                StatusCode::FORBIDDEN,
+                "ceremony_client_mismatch",
+            ));
+        }
+        if pending.expired() {
+            *slot = None;
+            return Err(ceremony_error(StatusCode::GONE, "ceremony_expired"));
+        }
+        // A client that lost create-pending's response has no ceremony handle.
+        // The authenticated, same-client alias recovers without re-showing it.
+        if ceremony_id != "current" && ceremony_id != pending.ceremony_id {
+            return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
+        }
+    }
+    *slot = None;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Build the bootstrap router — a **separate, small router**.
@@ -940,7 +1322,17 @@ async fn first_run_create(
 /// "looks like a funded node" surface this design avoids. An unrouted path
 /// answers 404 because the capability genuinely does not exist yet.
 pub fn build_bootstrap_router(state: Arc<BootstrapState>) -> Router {
-    Router::new()
+    let mut router = Router::new();
+    if state.local.is_some() {
+        router = router
+            .route("/api/v1/identity/create-pending", post(create_pending))
+            .route("/api/v1/identity/finalize", post(finalize))
+            .route(
+                "/api/v1/identity/pending/:ceremony_id",
+                delete(cancel_pending),
+            );
+    }
+    router
         .route("/livez", get(livez))
         .route("/api/v1/bootstrap/state", get(bootstrap_state))
         .route("/api/v1/pair/request", post(pair_request))

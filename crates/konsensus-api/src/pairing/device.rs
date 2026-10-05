@@ -266,6 +266,71 @@ fn is_hex(s: &str, len: usize) -> bool {
 }
 
 impl PairingService {
+    /// Bootstrap-only preparation. Validate possession before any identity
+    /// write; the node supplies owner approval separately.
+    pub(crate) fn prepare_first_run_device_key(
+        &self,
+        client_id: &str,
+        fingerprint: &str,
+        public_key: &str,
+        name: &str,
+        proof: &str,
+    ) -> Result<DeviceKey, PairingError> {
+        let public_key = public_key.to_ascii_lowercase();
+        let raw = parse_public_key(&public_key)?;
+        let name = clean_name(name)?;
+        verify_p256(
+            &raw,
+            registration_message(fingerprint, client_id, &public_key).as_bytes(),
+            proof,
+        )?;
+        let inner = self.lock();
+        if !inner.identity_fingerprint.is_empty() || inner.file.clients.len() != 1 {
+            return Err(PairingError::OwnerChannelUnavailable);
+        }
+        let client = &inner.file.clients[0];
+        if client.client_id != client_id || !client.scopes.contains(&Scope::Identity) {
+            return Err(PairingError::OwnerChannelUnavailable);
+        }
+        Ok(DeviceKey {
+            key_id: key_id_for(&raw),
+            client_id: client_id.into(),
+            public_key,
+            name,
+            registered_at: chrono::Utc::now().timestamp(),
+            epoch: client.epoch,
+            client_pubkey: client.client_pubkey.clone(),
+            owner_approval: String::new(),
+            enrolled_by: "local_first_run".into(),
+        })
+    }
+
+    /// Called only by the bootstrap commit, after rebind (which clears keys).
+    /// Repeat the client/epoch checks under the persistence lock.
+    pub(crate) fn install_first_run_device_key(
+        &self,
+        record: DeviceKey,
+    ) -> Result<(), PairingError> {
+        let mut inner = self.lock();
+        if inner.identity_fingerprint.is_empty()
+            || inner.file.clients.len() != 1
+            || !inner.file.device_keys.is_empty()
+            || record.owner_approval.is_empty()
+        {
+            return Err(PairingError::OwnerChannelUnavailable);
+        }
+        let client = &inner.file.clients[0];
+        if client.client_id != record.client_id
+            || client.epoch != record.epoch
+            || client.client_pubkey != record.client_pubkey
+        {
+            return Err(PairingError::OwnerChannelUnavailable);
+        }
+        inner.file.device_keys.push(record);
+        self.persist(&mut inner.file)?;
+        Ok(())
+    }
+
     /// A paired client asks the owner to register a device key. Writes **no**
     /// authority. `proof_hex` must be the key's signature over
     /// [`registration_message`], so a client cannot register a key it does

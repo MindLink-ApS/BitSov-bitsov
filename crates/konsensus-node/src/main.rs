@@ -877,20 +877,19 @@ async fn cmd_start(
     let data_dir = owner_cmd::data_dir_of(config_path);
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
-            // PR A is live-start only. Never silently discard the local owner's
-            // password and enter the legacy plaintext HTTP ceremony.
-            if local_owner_device {
-                anyhow::bail!(
-                    "--local-owner-device requires an initialized encrypted identity; \
-                     initialize with `konsensus init --password-fd <n>` and enroll the device \
-                     through the owner console before using local owner mode"
-                );
+            let local = password.map(|password| owner_cmd::LocalOwnerBootstrap {
+                password,
+                enroll_device: local_owner_device,
+            });
+            if local_owner_device
+                && (password_source != PasswordSource::Descriptor || local.is_none())
+            {
+                anyhow::bail!("--local-owner-device requires --password-fd");
             }
-            drop(password);
             file_logging
                 .enable(&config_path.with_file_name("node.log"), config.logging)
                 .context("failed to initialize bounded node logging")?;
-            return owner_cmd::serve_bootstrap_mode(config_path, &config).await;
+            return owner_cmd::serve_bootstrap_mode(config_path, &config, local).await;
         }
         konsensus_api::bootstrap::StartupMode::Initialized => {}
         // `prepare_start` has already turned this into an error.

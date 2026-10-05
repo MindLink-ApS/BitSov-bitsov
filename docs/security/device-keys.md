@@ -36,6 +36,13 @@ Now:
    app revokes its own key). An epoch bump or revoking the pairing also
    retires the device's keys.
 
+On a positively empty local node, [two-phase bootstrap](pairing.md#two-phase-local-bootstrap)
+can enroll the first device with `--password-fd --local-owner-device`. After
+backup confirmation and P-256 possession proof, the node transiently derives
+the same owner signing key and signs the same approval tuple. The seed is
+persisted only as `mnemonic.enc`; the record says `enrolled_by: local_first_run`.
+Later device enrollment still requires the owner console.
+
 ## API
 
 | Route | Who | Effect |
@@ -67,7 +74,7 @@ that are not on the curve.
 `--local-owner-device` is an explicit live-start alternative to owner-run mode
 for an existing enrolled key. It requires a descriptor password and an encrypted
 seed with no plaintext sibling; only the owner verifying key survives startup.
-It never enables enrollment, console grants, front-door, replacement or
+On live starts it never enables enrollment, console grants, front-door, replacement or
 first-contact approval. Local spend scopes, staging and dispatch require an
 owner verifier and a live `device:` grant with a `recipients_only` budget. Startup
 refuses local mode before writing files if the owner verifier cannot be derived.

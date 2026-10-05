@@ -838,6 +838,50 @@ pub(crate) fn align_config_mnemonic(config_path: &Path, mnemonic_path: &Path) ->
     Ok(())
 }
 
+/// Startup-only password handoff. Never accepted from HTTP or configuration.
+pub struct LocalOwnerBootstrap {
+    pub password: zeroize::Zeroizing<String>,
+    pub enroll_device: bool,
+}
+
+impl LocalOwnerBootstrap {
+    fn into_hooks(self) -> Result<bootstrap::LocalOwnerHooks> {
+        // write_mnemonic intentionally supports plaintext for an empty password;
+        // this ceremony must never reach that fallback.
+        anyhow::ensure!(
+            !self.password.is_empty(),
+            "bootstrap password must not be empty"
+        );
+        let password = std::sync::Arc::new(self.password);
+        let signing_password = password.clone();
+        Ok(bootstrap::LocalOwnerHooks {
+            encrypt_seed: Box::new(move |phrase, staging| {
+                let path = crate::mnemonic_crypto::write_mnemonic(
+                    &staging.join("mnemonic.enc"),
+                    phrase,
+                    Some(password.as_str()),
+                )
+                .map_err(|_| bootstrap::CommitError::Io("seed encryption failed".into()))?;
+                std::fs::File::open(&path)?.sync_all()?;
+                Ok(path)
+            }),
+            sign_owner_approval: Box::new(move |phrase, node_id, message| {
+                let secret =
+                    crate::mnemonic_crypto::owner_secret(signing_password.as_str(), node_id)
+                        .map_err(|_| {
+                            bootstrap::CommitError::Io("owner key derivation failed".into())
+                        })?;
+                let key = konsensus_core::OwnerApprovalKey::from_mnemonic(phrase, "", &secret)
+                    .map_err(|_| {
+                        bootstrap::CommitError::Io("owner key derivation failed".into())
+                    })?;
+                Ok(hex::encode(key.sign(message.as_bytes()).to_bytes()))
+            }),
+            enroll_device: self.enroll_device,
+        })
+    }
+}
+
 /// Serve the identity-free bootstrap API.
 ///
 /// Returns the committed identity when a first-run create or restore lands. The
@@ -848,7 +892,11 @@ pub(crate) fn align_config_mnemonic(config_path: &Path, mnemonic_path: &Path) ->
 /// durably aligns that file with the committed mnemonic **before** publishing
 /// the success marker, so a completed bootstrap is always restartable with the
 /// same filename.
-pub async fn serve_bootstrap_mode(config_path: &Path, config: &NodeConfig) -> Result<()> {
+pub async fn serve_bootstrap_mode(
+    config_path: &Path,
+    config: &NodeConfig,
+    local: Option<LocalOwnerBootstrap>,
+) -> Result<()> {
     if !config.identity.passphrase.is_empty() {
         anyhow::bail!(
             "bootstrap does not support identity.passphrase: first-run commit derives with an \
@@ -858,6 +906,11 @@ pub async fn serve_bootstrap_mode(config_path: &Path, config: &NodeConfig) -> Re
         );
     }
     let api_addr = config.api.listen_addr;
+    anyhow::ensure!(
+        api_addr.ip().is_loopback(),
+        "bootstrap requires a loopback API listen address"
+    );
+    let hooks = local.map(LocalOwnerBootstrap::into_hooks).transpose()?;
     let data_dir = data_dir_of(config_path);
     let layout = configured_layout(&data_dir, config);
     std::fs::create_dir_all(&data_dir)
@@ -872,15 +925,15 @@ pub async fn serve_bootstrap_mode(config_path: &Path, config: &NodeConfig) -> Re
             .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?,
     );
     let align_path = config_path.to_path_buf();
-    let state = std::sync::Arc::new(
-        konsensus_api::bootstrap::BootstrapState::new(layout, pairing).with_before_marker(
-            move |outcome| {
-                align_config_mnemonic(&align_path, &outcome.mnemonic_path).map_err(|e| {
-                    konsensus_api::bootstrap::CommitError::Io(e.to_string())
-                })
-            },
-        ),
-    );
+    let mut state = konsensus_api::bootstrap::BootstrapState::new(layout, pairing)
+        .with_before_marker(move |outcome| {
+            align_config_mnemonic(&align_path, &outcome.mnemonic_path)
+                .map_err(|e| konsensus_api::bootstrap::CommitError::Io(e.to_string()))
+        });
+    if let Some(hooks) = hooks {
+        state = state.with_local_owner(hooks);
+    }
+    let state = std::sync::Arc::new(state);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
@@ -1221,6 +1274,172 @@ mod startup_tests {
             err.to_string().contains("passphrase"),
             "expected passphrase refusal, got: {err}"
         );
+    }
+
+    #[test]
+    fn encrypted_bootstrap_hooks_reject_empty_password_and_sign_owner() {
+        use zeroize::Zeroizing;
+        assert!(LocalOwnerBootstrap {
+            password: Zeroizing::new(String::new()),
+            enroll_device: true
+        }
+        .into_hooks()
+        .is_err());
+        let password = "bootstrap-test-password";
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = LocalOwnerBootstrap {
+            password: Zeroizing::new(password.into()),
+            enroll_device: true,
+        }
+        .into_hooks()
+        .unwrap();
+        let path = (hooks.encrypt_seed)(phrase, dir.path()).unwrap();
+        assert_eq!(path, dir.path().join("mnemonic.enc"));
+        assert!(!dir.path().join("mnemonic.txt").exists());
+        assert_eq!(
+            crate::mnemonic_crypto::read_mnemonic(&path, Some(password))
+                .unwrap()
+                .as_str(),
+            phrase
+        );
+        let node_id = konsensus_core::NodeIdentity::from_mnemonic(phrase, "")
+            .unwrap()
+            .node_id()
+            .to_hex();
+        let secret = crate::mnemonic_crypto::owner_secret(password, &node_id).unwrap();
+        let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(phrase, "", &secret).unwrap();
+        let sig = (hooks.sign_owner_approval)(phrase, &node_id, "bound owner message").unwrap();
+        konsensus_api::pairing::device::verify_owner_approval(
+            &owner.verifying_key(),
+            "bound owner message",
+            &sig,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_crash_repair_preserves_pairing_and_config_safety_gates() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use konsensus_api::{auth::Scope, pairing};
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        for before_rebind in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("custom.toml");
+            let config = NodeConfig::default_for_tier(
+                NodeTier::Full,
+                dir.path().join("original.txt"),
+                dir.path(),
+            );
+            config.save(&config_path).unwrap();
+            let original_config = std::fs::read(&config_path).unwrap();
+            let pairing = std::sync::Arc::new(
+                PairingService::open(dir.path(), String::new(), false)
+                    .unwrap()
+                    .without_stdout_code(),
+            );
+            let key = SigningKey::from_bytes(&[51; 32]);
+            let public = hex::encode(key.verifying_key().to_bytes());
+            let request = pairing.request_pairing("app", &public).unwrap();
+            let challenge =
+                std::fs::read(pairing.dir().join(format!("challenge-{}", request.pair_id)))
+                    .unwrap();
+            let sig = hex::encode(
+                key.sign(&PairingService::proof_message(
+                    &request.pair_id,
+                    &public,
+                    &challenge,
+                ))
+                .to_bytes(),
+            );
+            let client = pairing
+                .confirm_pairing(&request.pair_id, &sig, pairing::bootstrap_pairing_scopes())
+                .unwrap();
+            let hooks = LocalOwnerBootstrap {
+                password: zeroize::Zeroizing::new("crash-test-password".into()),
+                enroll_device: true,
+            }
+            .into_hooks()
+            .unwrap();
+            let state =
+                bootstrap::BootstrapState::new(configured_layout(dir.path(), &config), pairing)
+                    .with_local_owner(hooks)
+                    .with_before_marker(|_| {
+                        Err(bootstrap::CommitError::Io(
+                            "injected pre-config failure".into(),
+                        ))
+                    });
+            let fault = if before_rebind {
+                bootstrap::CommitFault::AbortAfterRename
+            } else {
+                bootstrap::CommitFault::None
+            };
+            assert!(state.transition(phrase, fault).is_err());
+            assert!(!state.layout.marker().exists());
+            assert!(state.pairing.device_keys().is_empty());
+            drop(state);
+            assert!(prepare_start(&config_path).is_err());
+            assert!(cmd_repair_mark_initialized(&config_path, false).is_err());
+            cmd_repair_mark_initialized(&config_path, true).unwrap();
+            assert_eq!(
+                std::fs::read(&config_path).unwrap(),
+                original_config,
+                "repair only writes marker"
+            );
+            assert!(
+                prepare_start(&config_path).is_err(),
+                "repair must not guess a new config path"
+            );
+            align_config_mnemonic(&config_path, &dir.path().join("identity/mnemonic.enc")).unwrap();
+            let (mode, repaired) = prepare_start(&config_path).unwrap();
+            assert_eq!(mode, StartupMode::Initialized);
+            let node_id = konsensus_core::NodeIdentity::from_mnemonic(phrase, "")
+                .unwrap()
+                .node_id()
+                .to_hex();
+            let fp = pairing::identity_fingerprint(&node_id);
+            let verifier = crate::owner_approval_key(
+                &repaired,
+                Some("crash-test-password"),
+                crate::PasswordSource::Descriptor,
+                true,
+            )
+            .unwrap();
+            let live = PairingService::open(dir.path(), fp, false)
+                .unwrap()
+                .with_local_owner_device()
+                .with_owner_approval_key(verifier);
+            assert!(live.device_keys().is_empty());
+            let challenge = live.issue_token_challenge(&client.client_id).unwrap();
+            let sig = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
+            let token = live.issue_token(
+                &node_id,
+                "test-secret-at-least-32-bytes-long",
+                &client.client_id,
+                &challenge,
+                &sig,
+            );
+            if before_rebind {
+                assert!(
+                    matches!(token, Err(pairing::PairingError::PairingInvalid(_))),
+                    "old empty fingerprint requires explicit owner recovery"
+                );
+            } else {
+                let token = token.unwrap();
+                assert!(token.scopes.contains(&Scope::Read));
+                assert!(token.scopes.contains(&Scope::Receive));
+                assert!(!token.scopes.contains(&Scope::Identity));
+                assert!(!token.scopes.contains(&Scope::Spend));
+            }
+        }
     }
 
     #[test]
