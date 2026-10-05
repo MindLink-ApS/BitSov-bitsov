@@ -197,6 +197,10 @@ min_channel_lifetime = 144
 max_client_to_self_delay = 2016
 min_payment_size_msat = 10000000
 max_payment_size_msat = 1000000000
+funding_priority = "normal" # economy=144, normal=12, fast=6 block estimate
+max_funding_fee_sats = 10000
+max_concurrent_jit_opens = 4
+max_jit_capital_sats = 10000000
 forwarding_fee_ppm = 500
 forwarding_fee_base_msat = 1000
 ```
@@ -245,8 +249,8 @@ update with exponential backoff from 250 ms to a 30-second cap, logging a warnin
 on each failure while continuing event delivery and acknowledgement. The pending
 retry remains scheduled until it succeeds; new ready events do not bypass its
 backoff. Ready channels are also scanned on restart.
-LDK exposes no JIT-origin marker: while service mode is enabled, the scan targets
-private outbound ready channels with **0 base / 0 ppm** and
+For compatibility with pre-patch channels, while service mode is enabled the
+tariff scan continues to target private outbound ready channels with **0 base / 0 ppm** and
 **`confirmations_required == Some(0)`**, matching the service’s zero-conf opens.
 Normal BitSov manual opens have a nonzero base and are untouched; confirmed
 channels with manually zeroed fees are also untouched. Externally configured free
@@ -262,17 +266,80 @@ For a 2,001-msat admission, the example hub tariff is 1,001 msat, below the
 5,000-msat allowance. Operators must price for their intended payment range;
 an excessive tariff causes ordinary capped payments to fail, not wider caps.
 
-The service is alpha upstream. Its channel opens still use LDK's legacy funding
-path, **not the #190 priority/cap policy**. Insufficient hub funds, disconnection
-or an upstream create-channel error can leave a top-up pending until timeout;
-this change adds no retry for those upstream opening failures. Reconcile before
-reissuing a top-up. No vendor code or admission policy is changed. A hub observes
-both endpoints of payments routed between its own leaves, and is an availability
-dependency; this pilot provides neither social-graph privacy nor automatic failover.
+The service is alpha upstream. BitSov's marked vendor patch now uses the #190
+fresh estimator and owner-selected priority for JIT opens. It persists that
+policy before negotiation and checks the **actual complete transaction fee before
+signing** against `max_funding_fee_sats`. A request persists its original fee
+allowance so raising the configured cap after restart cannot widen its reservation. A missing policy fails closed. Retries
+keep the selected rate and cap; they never escalate fees. A funding-construction
+refusal is terminal, including a transaction that exceeds the cap.
+
+Concurrent reservations/negotiations are limited to `max_concurrent_jit_opens`
+(1–1024). Ready channels free a concurrent slot. `max_jit_capital_sats` bounds
+conservative committed exposure: full channel capacity plus the configured
+anchor reserve and full funding-fee ceiling for each request. Both monetary
+caps must be positive, the fee cap cannot exceed the capital cap, and the capital
+cap cannot exceed Bitcoin's supply. Reservations are written before dispatch;
+duplicated events do not allocate twice. Lowering caps on restart refuses waiting
+requests until exposure fits; it never closes already funded channels.
+
+Peer-offline, insufficient-funds and `create_channel` errors are logged and retried
+from a durable journal: at most five attempts, delays of 2, 4, 8 and 8 seconds,
+and a 60-second deadline from initial reservation. Restart does not reset the
+attempts or deadline. Exhaustion fails the held HTLCs and abandons the intercept
+SCID; retries never discard those HTLCs early. No automatic reconnect address is
+invented; the client must reconnect. A write-ahead dispatch record prevents a
+second open after an ambiguous crash. An uncertain dispatch keeps its slot and
+capital reserved for operator reconciliation; deleting state is unsafe.
+
+Funded capital remains reserved after close until its monitor is archived and
+tracked sweeps complete. Pre-patch live private outbound zero-conf channels also
+count, including externally configured manual channels matching that signature.
+An untracked closed monitor/sweep lacks reliable JIT attribution: conservatively,
+it reserves the whole configured capital budget until resolved. This can block
+new JIT opens while an unrelated old channel is closing. The journal retains up
+to 4,096 request tombstones to prevent replay and refuses new requests when full;
+this is a bounded pilot, requiring operator migration before that lifetime limit.
+
+Durability begins when the vendor handler journals the request. Upstream
+lightning-liquidity 0.2.0 has a separate pre-delivery event/peer-state persistence
+window, with no event acknowledgment API. This patch does not claim to repair
+that dependency's crash window. Reconcile pending top-ups before reissuing them.
+The hub remains a graph observer and availability dependency; this pilot provides
+neither social-graph privacy nor automatic failover. Admission policy is unchanged.
+
+### Hub telemetry
+
+The existing node `/metrics` Prometheus endpoint exports these unlabeled series
+while service mode is enabled (sampled once per second):
+
+| Metric | Meaning |
+| --- | --- |
+| `konsensus_lsps2_opens_total` | Durable count of JIT channels observed ready |
+| `konsensus_lsps2_opening_fees_earned_msat_total` | Observed settled opening skim, capped at each request's quoted opening fee |
+| `konsensus_lsps2_capital_locked_sats` | Conservative capital reservation described above, including fee/anchor allowances |
+| `konsensus_lsps2_pending_opens` | Reserved/negotiating or uncertain opens |
+| `konsensus_lsps2_failed_opens_total` | Durable failed attempts, pre-ready closures and cap/deadline refusals |
+| `konsensus_lsps2_open_retries_total` | Durable retry attempts after the first attempt |
+| `konsensus_lsps2_tariff_retries_total` | Tariff failures that schedule another attempt; process lifetime counter |
+
+Opening-fee telemetry accumulates `PaymentForwarded.skimmed_fee_msat`, including
+multipart payments; quotes, unpaid opens and ordinary admission do not earn it.
+LDK does not expose an HTLC identifier on this event. Replayed partial multipart
+forwards can advance the counter early, but cannot raise it above that request's
+fee. These are at-least-once operational metrics, **not an accounting ledger**.
+Open/failure/revenue totals survive restart; tariff retry totals reset on restart.
+No tokens, payment identifiers or peer keys appear as metric labels.
 
 The real `regtest_e2e::three_node::lsps2_service::hub_jit_then_stateless_admission`
 scenario runs in the [three-node paid suite](three-node-paid-e2e.md). It uses the
 production hub constructor and client, asserts a disconnected-provider refusal,
-then bounds negotiation/open/settlement to 60 seconds. It verifies opening-fee
-accounting, overprovisioned inbound, tariff recovery after restart, and separate
+then bounds negotiation/open/settlement to 60 seconds. It forces insufficient hub funds and verifies a bounded retry after funding,
+the actual funding transaction fee cap, durable hub counters, overprovisioned inbound,
+tariff recovery after restart, and separate
 stateless admission payments in both directions with exact principal and fees.
+
+The regtest hub uses an explicit deterministic fee-estimate endpoint because a
+fresh regtest chain lacks estimator history. All chain queries, transactions,
+channel negotiation and settlement still use real local Core/electrs. Production
+continues to refuse missing or stale estimates; the fixture does not relax that rule.

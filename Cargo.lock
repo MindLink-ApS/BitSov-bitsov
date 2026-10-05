@@ -2121,6 +2121,8 @@ dependencies = [
  "konsensus-storage",
  "ldk-node",
  "lightning-invoice",
+ "metrics",
+ "metrics-exporter-prometheus",
  "mockall",
  "mockito",
  "rand 0.8.6",

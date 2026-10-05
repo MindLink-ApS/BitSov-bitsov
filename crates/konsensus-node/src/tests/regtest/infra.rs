@@ -269,7 +269,8 @@ pub fn lightning_config(dir: &std::path::Path, url: &str) -> konsensus_lightning
         passphrase: None,
         network: "regtest".into(),
         esplora_url: url.to_owned(),
-        esplora_url_fallback: None, credentials_file: None,
+        esplora_url_fallback: None,
+        credentials_file: None,
         rgs_url: None,
         lsp_node_id: None,
         lsp_address: None,
@@ -297,6 +298,10 @@ pub async fn router(dir: &std::path::Path, chain: &Chain) -> (Arc<ldk_node::Node
         .set_chain_source_esplora(chain.url.clone(), None)
         .set_entropy_seed_bytes(seed)
         .set_liquidity_provider_lsps2(ldk_node::liquidity::LSPS2ServiceConfig {
+            funding_priority: ldk_node::funding::FundingPriority::Normal,
+            max_funding_fee_sats: 10_000,
+            max_concurrent_jit_opens: 4,
+            max_jit_capital_sats: 10_000_000,
             require_token: Some("regtest-routing-only".into()),
             advertise_service: false,
             channel_opening_fee_ppm: 0,

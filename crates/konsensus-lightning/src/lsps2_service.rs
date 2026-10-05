@@ -18,6 +18,10 @@ pub struct Lsps2ServiceConfig {
     pub max_client_to_self_delay: u32,
     pub min_payment_size_msat: u64,
     pub max_payment_size_msat: u64,
+    pub funding_priority: konsensus_core::traits::lightning::FundingPriority,
+    pub max_funding_fee_sats: u64,
+    pub max_concurrent_jit_opens: u32,
+    pub max_jit_capital_sats: u64,
     pub forwarding_fee_ppm: u32,
     pub forwarding_fee_base_msat: u32,
 }
@@ -34,6 +38,10 @@ impl Default for Lsps2ServiceConfig {
             max_client_to_self_delay: 2016,
             min_payment_size_msat: 10_000_000,
             max_payment_size_msat: 1_000_000_000,
+            funding_priority: Default::default(),
+            max_funding_fee_sats: 10_000,
+            max_concurrent_jit_opens: 4,
+            max_jit_capital_sats: 10_000_000,
             forwarding_fee_ppm: 500,
             forwarding_fee_base_msat: 1000,
         }
@@ -107,7 +115,25 @@ impl Lsps2ServiceConfig {
                 "lifetime must be positive; client delay must be 1..=65535 blocks",
             ));
         }
+        if !(1..=1024).contains(&self.max_concurrent_jit_opens)
+            || self.max_jit_capital_sats == 0
+            || self.max_jit_capital_sats > 2_100_000_000_000_000
+            || self.max_funding_fee_sats == 0
+            || self.max_funding_fee_sats > self.max_jit_capital_sats
+        {
+            return Err(invalid("concurrent JIT opens must be 1..=1024; 0 < funding fee cap <= capital cap <= Bitcoin supply"));
+        }
+        use konsensus_core::traits::lightning::FundingPriority;
+        let funding_priority = match self.funding_priority {
+            FundingPriority::Economy => ldk_node::funding::FundingPriority::Economy,
+            FundingPriority::Normal => ldk_node::funding::FundingPriority::Normal,
+            FundingPriority::Fast => ldk_node::funding::FundingPriority::Fast,
+        };
         Ok(Some(ldk_node::liquidity::LSPS2ServiceConfig {
+            funding_priority,
+            max_funding_fee_sats: self.max_funding_fee_sats,
+            max_concurrent_jit_opens: self.max_concurrent_jit_opens,
+            max_jit_capital_sats: self.max_jit_capital_sats,
             require_token: self.require_token.clone(),
             advertise_service: false,
             channel_opening_fee_ppm: self.channel_opening_fee_ppm,
@@ -130,8 +156,8 @@ impl Lsps2ServiceConfig {
         confirmations_required: Option<u32>,
         mut config: ChannelConfig,
     ) -> Option<ChannelConfig> {
-        // LDK 0.7 exposes no JIT-origin marker. Its service creates private,
-        // outbound zero-conf 0/0 channels. Require that entire signature so
+        // Preserve reconciliation for pre-patch private outbound zero-conf
+        // service channels. Require their entire 0/0 signature so
         // ordinary confirmed channels with manually zeroed fees are untouched.
         if !self.enabled
             || !outbound
@@ -173,6 +199,19 @@ impl Lsps2ServiceConfig {
     }
 }
 
+/// Export through the same process-wide recorder as the node's `/metrics`.
+/// Counters use durable absolute totals; gauges reflect reserved exposure.
+pub(crate) fn record_metrics(node: &ldk_node::Node) {
+    let m = node.lsps2_service_metrics();
+    metrics::counter!("konsensus_lsps2_opens_total").absolute(m.opens);
+    metrics::counter!("konsensus_lsps2_opening_fees_earned_msat_total")
+        .absolute(m.opening_fees_earned_msat);
+    metrics::counter!("konsensus_lsps2_failed_opens_total").absolute(m.failed_opens);
+    metrics::counter!("konsensus_lsps2_open_retries_total").absolute(m.open_retries);
+    metrics::gauge!("konsensus_lsps2_capital_locked_sats").set(m.capital_locked_sats as f64);
+    metrics::gauge!("konsensus_lsps2_pending_opens").set(m.pending_opens as f64);
+}
+
 /// Schedule reconciliation without holding the event queue on update failures.
 /// A new ChannelReady must not bypass an already pending retry's backoff.
 pub(crate) struct TariffRetry {
@@ -206,6 +245,7 @@ impl TariffRetry {
                 self.delay = Duration::from_millis(250);
             }
             Err(error) => {
+                metrics::counter!("konsensus_lsps2_tariff_retries_total").increment(1);
                 let delay = self.delay;
                 tracing::warn!(%error, retry_in_ms = delay.as_millis(),
                     "LDK: LSPS2 forwarding tariff update failed; continuing event delivery while retry is pending");
@@ -225,6 +265,58 @@ mod tests {
             enabled: true,
             require_token: Some("private-pilot".into()),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lsps2_metrics_use_existing_prometheus_recorder() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = ldk_node::Builder::new();
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+        builder.set_entropy_seed_bytes([99; 64]);
+        let node = builder.build_with_fs_store().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            record_metrics(&node);
+            let mut retry = TariffRetry::new(Instant::now());
+            retry.apply_if_due(Instant::now(), || {
+                Err(ldk_node::NodeError::PersistenceFailed)
+            });
+        });
+        let text = handle.render();
+        for series in [
+            "konsensus_lsps2_opens_total 0",
+            "konsensus_lsps2_opening_fees_earned_msat_total 0",
+            "konsensus_lsps2_failed_opens_total 0",
+            "konsensus_lsps2_open_retries_total 0",
+            "konsensus_lsps2_capital_locked_sats 0",
+            "konsensus_lsps2_pending_opens 0",
+            "konsensus_lsps2_tariff_retries_total 1",
+        ] {
+            assert!(text.contains(series), "missing {series}: {text}");
+        }
+    }
+
+    #[test]
+    fn lsps2_owner_open_policy_and_caps_are_validated() {
+        let config: Lsps2ServiceConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true, "require_token": "pilot",
+            "funding_priority": "economy", "max_funding_fee_sats": 2000,
+            "max_concurrent_jit_opens": 2, "max_jit_capital_sats": 500000
+        }))
+        .expect("owner can set funding policy and exposure caps");
+        assert!(config.to_ldk(false).is_ok());
+        for (key, value) in [
+            ("max_concurrent_jit_opens", 0),
+            ("max_concurrent_jit_opens", 1025),
+            ("max_jit_capital_sats", 0),
+            ("max_funding_fee_sats", 0),
+        ] {
+            let mut json = serde_json::to_value(&config).unwrap();
+            json[key] = value.into();
+            let bad: Lsps2ServiceConfig = serde_json::from_value(json).unwrap();
+            assert!(bad.to_ldk(false).is_err(), "accepted invalid {key}");
         }
     }
 

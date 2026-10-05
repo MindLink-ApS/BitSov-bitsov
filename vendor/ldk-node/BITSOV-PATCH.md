@@ -422,3 +422,35 @@ holds (no node or channel announcement; Bitcoin stays settlement infrastructure)
 4 unchanged (no new server role; the hub is an ordinary peer the users already pay); 5
 holds (self-custody unchanged; the hub never takes custody of forwarded value); 6 holds
 (the exposure above is documented and default-off).
+
+## Bounded owner-policy LSPS2 opens (2026-10-05)
+
+`liquidity/jit.rs` replaces the three pre-open failure drops with a durable
+`bitsov_lsps2` journal (`lsps2_open.rs`), five attempts and a 60-second deadline.
+Buy assigns a distinct BSJI policy-bearing user ID; `funding.rs` fails closed
+for missing/corrupt policies under this marker, just as for #190's BSFP IDs.
+The wallet reuses #190's fresh estimator and pre-signing complete-fee cap.
+
+Reservations include full channel capacity, anchor allowance and funding fee
+ceiling. A persisted dispatch fence prevents duplicate opens after uncertainty.
+Lifecycle events persist observations before acknowledgment. Ready channels
+release a concurrent slot; closed channels retain capital through monitor
+archival and sweep completion. Unknown pre-patch closed exposure blocks new
+opens conservatively. Lowered owner caps stop waiting work after restart.
+
+No upstream HTLC/admission or fee-authority rules change. Exhaustion calls
+upstream `channel_open_failed` then `channel_open_abandoned`, only after definite
+pre-dispatch failure. Pending retries retain their intercepted payments. The
+4,096-record journal retains tombstones and fails closed on corruption/write
+failure. The upstream event-delivery crash window is unchanged: durability
+starts at the vendor handler, not at liquidity-manager enqueue.
+
+`Node::lsps2_service_metrics` exposes durable counters and conservative gauges;
+BitSov publishes these through its existing Prometheus recorder. Settled skim
+accumulates across MPP forwards, bounded by the quote; LDK has no HTLC ID for
+exact replay deduplication, so this is at-least-once telemetry, not a ledger.
+See `docs/LSPS2-LIQUIDITY.md` for settings, units and conservative limitations.
+
+Tests: vendor `bitsov_jit`, `funding`, `bitsov_money_tests`; application LSPS2
+configuration/tariff tests; real `hub_jit_then_stateless_admission` regtest with
+insufficient hub funds, retry recovery, fee-cap and restart telemetry checks.

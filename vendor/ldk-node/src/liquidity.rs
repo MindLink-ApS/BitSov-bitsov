@@ -7,6 +7,8 @@
 
 //! Objects related to liquidity management.
 
+mod jit;
+
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, RwLock};
@@ -36,7 +38,6 @@ use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceCo
 use lightning_liquidity::lsps2::utils::compute_opening_fee;
 use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
 use lightning_types::payment::PaymentHash;
-use rand::Rng;
 use tokio::sync::oneshot;
 
 use crate::builder::BuildError;
@@ -101,6 +102,15 @@ struct LSPS2Service {
 /// [bLIP-52 / LSPS2]: https://github.com/lightning/blips/blob/master/blip-0052.md
 #[derive(Debug, Clone)]
 pub struct LSPS2ServiceConfig {
+	// BITSOV-PATCH: owner funding policy and bounded service exposure.
+	/// Estimator target used for JIT funding transactions.
+	pub funding_priority: crate::funding::FundingPriority,
+	/// Absolute funding transaction fee cap, enforced before signing.
+	pub max_funding_fee_sats: u64,
+	/// Maximum reserved/negotiating JIT opens (ready channels no longer count).
+	pub max_concurrent_jit_opens: u32,
+	/// Maximum reserved capital including channel capacity, anchors and fee caps.
+	pub max_jit_capital_sats: u64,
 	/// A token we may require to be sent by the clients.
 	///
 	/// If set, only requests matching this token will be accepted.
@@ -267,7 +277,13 @@ where
 			.map_err(|_| BuildError::ReadFailed)?,
 		);
 
+		// BITSOV-PATCH: corrupt/unreadable exposure state refuses startup.
+		let jit_journal = crate::lsps2_open::Journal::load(self.kv_store.as_ref())
+			.map_err(|_| BuildError::ReadFailed)?;
 		Ok(LiquiditySource {
+			kv_store: self.kv_store,
+			jit_journal: Mutex::new(jit_journal),
+			untracked_jit_closure: Mutex::new(false),
 			lsps1_client: self.lsps1_client,
 			lsps2_client: self.lsps2_client,
 			lsps2_service: self.lsps2_service,
@@ -286,6 +302,9 @@ pub(crate) struct LiquiditySource<L: Deref>
 where
 	L::Target: LdkLogger,
 {
+	kv_store: Arc<DynStore>,
+	jit_journal: Mutex<crate::lsps2_open::Journal>,
+	untracked_jit_closure: Mutex<bool>,
 	lsps1_client: Option<LSPS1Client>,
 	lsps2_client: Option<LSPS2Client>,
 	lsps2_service: Option<LSPS2Service>,
@@ -386,7 +405,21 @@ where
 	}
 
 	pub(crate) async fn handle_next_event(&self) {
-		match self.liquidity_manager.next_event_async().await {
+		// BITSOV-PATCH: only cancel the wait, never an in-progress handler.
+		let event = match tokio::time::timeout(
+			Duration::from_secs(1),
+			self.liquidity_manager.next_event_async(),
+		)
+		.await
+		{
+			Ok(event) => event,
+			Err(_) => return,
+		};
+		self.handle_liquidity_event(event).await;
+	}
+
+	pub(crate) async fn handle_liquidity_event(&self, event: LiquidityEvent) {
+		match event {
 			LiquidityEvent::LSPS1Client(LSPS1ClientEvent::SupportedOptionsReady {
 				request_id,
 				counterparty_node_id,
@@ -642,7 +675,7 @@ where
 						return;
 					};
 
-					let user_channel_id: u128 = rand::rng().random();
+					let user_channel_id = crate::funding::new_jit_channel_id();
 					let intercept_scid = self.channel_manager.get_intercept_scid();
 
 					if let Some(payment_size_msat) = payment_size_msat {
@@ -687,127 +720,43 @@ where
 								e
 							);
 							return;
-						},
+						}
 					}
 				} else {
 					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as LSPS2 liquidity service was not configured.",);
 					return;
 				}
-			},
+			}
 			LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
 				their_network_key,
 				amt_to_forward_msat,
-				opening_fee_msat: _,
+				opening_fee_msat,
 				user_channel_id,
-				intercept_scid: _,
+				..
 			}) => {
-				if self.liquidity_manager.lsps2_service_handler().is_none() {
-					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as LSPS2 liquidity service was not configured.",);
-					return;
-				};
-
-				let service_config = if let Some(service_config) =
-					self.lsps2_service.as_ref().map(|s| s.service_config.clone())
-				{
-					service_config
-				} else {
-					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as LSPS2 liquidity service was not configured.",);
-					return;
-				};
-
-				let init_features = if let Some(peer_manager) =
-					self.peer_manager.read().unwrap().as_ref()
-				{
-					// Fail if we're not connected to the prospective channel partner.
-					if let Some(peer) = peer_manager.peer_by_node_id(&their_network_key) {
-						peer.init_features
-					} else {
-						// TODO: We just silently fail here. Eventually we will need to remember
-						// the pending requests and regularly retry opening the channel until we
-						// succeed.
-						log_error!(
-							self.logger,
-							"Failed to open LSPS2 channel to {} due to peer not being not connected.",
-							their_network_key,
-						);
-						return;
-					}
-				} else {
-					debug_assert!(false, "Failed to handle LSPS2ServiceEvent as peer manager isn't available. This should never happen.",);
-					log_error!(self.logger, "Failed to handle LSPS2ServiceEvent as peer manager isn't available. This should never happen.",);
-					return;
-				};
-
-				// Fail if we have insufficient onchain funds available.
-				let over_provisioning_msat = (amt_to_forward_msat
-					* service_config.channel_over_provisioning_ppm as u64)
-					/ 1_000_000;
-				let channel_amount_sats = (amt_to_forward_msat + over_provisioning_msat) / 1000;
-				let cur_anchor_reserve_sats =
-					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
-				let spendable_amount_sats =
-					self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
-				let required_funds_sats = channel_amount_sats
-					+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
-						if init_features.requires_anchors_zero_fee_htlc_tx()
-							&& !c.trusted_peers_no_reserve.contains(&their_network_key)
-						{
-							c.per_channel_reserve_sats
-						} else {
-							0
-						}
-					});
-				if spendable_amount_sats < required_funds_sats {
-					log_error!(self.logger,
-						"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
-						spendable_amount_sats, channel_amount_sats
-					);
-					// TODO: We just silently fail here. Eventually we will need to remember
-					// the pending requests and regularly retry opening the channel until we
-					// succeed.
-					return;
-				}
-
-				let mut config = self.channel_manager.get_current_config().clone();
-
-				// We set these LSP-specific values during Node building, here we're making sure it's actually set.
-				debug_assert_eq!(
-					config
-						.channel_handshake_config
-						.max_inbound_htlc_value_in_flight_percent_of_channel,
-					100
-				);
-				debug_assert!(config.accept_forwards_to_priv_channels);
-
-				// We set the forwarding fee to 0 for now as we're getting paid by the channel fee.
-				//
-				// TODO: revisit this decision eventually.
-				config.channel_config.forwarding_fee_base_msat = 0;
-				config.channel_config.forwarding_fee_proportional_millionths = 0;
-
-				match self.channel_manager.create_channel(
+				// BITSOV-PATCH: reserve durably before any wallet/channel side effect.
+				if let Err(error) = self.reserve_jit_open(
 					their_network_key,
-					channel_amount_sats,
-					0,
+					amt_to_forward_msat,
+					opening_fee_msat,
 					user_channel_id,
-					None,
-					Some(config),
 				) {
-					Ok(_) => {},
-					Err(e) => {
-						// TODO: We just silently fail here. Eventually we will need to remember
-						// the pending requests and regularly retry opening the channel until we
-						// succeed.
-						log_error!(
-							self.logger,
-							"Failed to open LSPS2 channel to {}: {:?}",
-							their_network_key,
-							e
-						);
-						return;
-					},
+					log_error!(
+						self.logger,
+						"LSPS2 open {} not dispatched: {:?}",
+						user_channel_id,
+						error
+					);
+					if let Some(handler) = self.liquidity_manager.lsps2_service_handler() {
+						let _ = handler
+							.channel_open_failed(&their_network_key, user_channel_id)
+							.await;
+						let _ = handler
+							.channel_open_abandoned(&their_network_key, user_channel_id)
+							.await;
+					}
 				}
-			},
+			}
 			LiquidityEvent::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
 				request_id,
 				counterparty_node_id,
@@ -1389,12 +1338,28 @@ where
 	}
 
 	pub(crate) async fn handle_payment_forwarded(
-		&self, next_channel_id: Option<ChannelId>, skimmed_fee_msat: u64,
-	) {
+		&self,
+		next_channel_id: Option<ChannelId>,
+		next_user_channel_id: Option<u128>,
+		skimmed_fee_msat: u64,
+	) -> Result<(), Error> {
 		if let Some(next_channel_id) = next_channel_id {
+			// Record only settled skim, and deduplicate replay by channel.
+			if self.lsps2_service.is_some() && skimmed_fee_msat > 0 {
+				self.jit_journal
+					.lock()
+					.unwrap()
+					.update(self.kv_store.as_ref(), |j| {
+						if let Some(id) = next_user_channel_id {
+							j.observe(id, next_channel_id.to_string(), true);
+						}
+						j.forwarded(&next_channel_id.to_string(), skimmed_fee_msat);
+					})?;
+			}
 			if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
-				if let Err(e) =
-					lsps2_service_handler.payment_forwarded(next_channel_id, skimmed_fee_msat).await
+				if let Err(e) = lsps2_service_handler
+					.payment_forwarded(next_channel_id, skimmed_fee_msat)
+					.await
 				{
 					log_error!(
 						self.logger,
@@ -1404,6 +1369,7 @@ where
 				}
 			}
 		}
+		Ok(())
 	}
 }
 

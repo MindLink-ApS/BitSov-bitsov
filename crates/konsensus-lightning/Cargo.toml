@@ -20,6 +20,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+metrics.workspace = true
 chrono.workspace = true
 hex.workspace = true
 rand.workspace = true
@@ -36,6 +37,7 @@ rusqlite = "0.31"
 electrsd = { version = "0.36", features = ["corepc-node_28_2", "esplora_a33e97e1"], optional = true }
 
 [dev-dependencies]
+metrics-exporter-prometheus.workspace = true
 mockall.workspace = true
 mockito = "1"
 tokio = { workspace = true, features = ["test-util"] }

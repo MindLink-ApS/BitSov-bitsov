@@ -275,6 +275,19 @@ impl Wallet {
 		self.create_funding_with_policy(output_script, amount, fee_rate, None, locktime)
 	}
 
+	// BITSOV-PATCH: use exactly the #190 fresh estimator and policy validation.
+	pub(crate) fn jit_funding_policy(
+		&self,
+		priority: crate::funding::FundingPriority,
+		cap: u64,
+	) -> Result<crate::funding::FundingPolicy, Error> {
+		crate::funding::FundingPolicy::new(
+			priority,
+			self.fee_estimator.funding_rate(priority.target())?,
+			Some(cap),
+		)
+	}
+
     pub(crate) fn record_funding_failure(&self, id: u128, error: Error) -> Result<(), Error> {
         let store = Arc::clone(&self.persister.lock().unwrap().kv_store);
         crate::funding::record_failure(store.as_ref(), id, error)
