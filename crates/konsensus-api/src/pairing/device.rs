@@ -91,6 +91,13 @@ pub struct DeviceKey {
     /// written into `data_dir` by anyone but the owner authorizes nothing.
     #[serde(default)]
     pub owner_approval: String,
+    /// Informational provenance only; the owner signature remains the authority.
+    #[serde(default = "console_enrollment")]
+    pub enrolled_by: String,
+}
+
+fn console_enrollment() -> String {
+    "console".into()
 }
 
 /// A device key awaiting the owner's one-time approval. Durable: a node
@@ -486,6 +493,7 @@ impl PairingService {
             epoch,
             client_pubkey,
             owner_approval: owner_signature.to_ascii_lowercase(),
+            enrolled_by: console_enrollment(),
         };
         let before = inner.file.clone();
         inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
@@ -592,7 +600,7 @@ impl PairingService {
         intent: &RelationIntent,
         signature_hex: &str,
     ) -> Result<GrantView, PairingError> {
-        if !self.owner_control_enabled {
+        if !self.owner_control_enabled && !self.local_owner_device {
             return Err(PairingError::OwnerChannelUnavailable);
         }
         self.device_authority()?;
@@ -861,6 +869,7 @@ mod tests {
                 public_key: hex::encode(&public),
                 name: "mac".into(),
                 registered_at: 0,
+                enrolled_by: console_enrollment(),
                 epoch: client.epoch,
                 client_pubkey: cpub.clone(),
                 owner_approval: hex::encode(

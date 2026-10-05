@@ -55,8 +55,13 @@ pub fn not_found(request_id: String) -> PageResponse {
 /// until it expires, or `NotFound` when none is published.
 ///
 /// [`PORCH_CARD_PATH`]: konsensus_core::payloads::content::PORCH_CARD_PATH
-pub fn card_response(request_id: String, card: Option<&FrontDoorCard>, now_unix: u64) -> PageResponse {
-    let Some((card, body)) = card.and_then(|c| serde_json::to_string(c).ok().map(|b| (c, b))) else {
+pub fn card_response(
+    request_id: String,
+    card: Option<&FrontDoorCard>,
+    now_unix: u64,
+) -> PageResponse {
+    let Some((card, body)) = card.and_then(|c| serde_json::to_string(c).ok().map(|b| (c, b)))
+    else {
         return not_found(request_id);
     };
     PageResponse {
@@ -118,6 +123,27 @@ impl ContentServer {
         }
         config.max_file_size = config.max_file_size.min(DEFAULT_MAX_FILE_SIZE);
         Ok(Self { config })
+    }
+
+    /// Metadata-only preflight. Uses the same path and size limits as GET.
+    pub fn page_status(&self, path: &str) -> PageStatus {
+        if let Err(status) = self.validate_path(path) {
+            return status;
+        }
+        if !is_site_page(path) {
+            return PageStatus::NotFound;
+        }
+        let resolved = match self.resolve_path(path) {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        match std::fs::metadata(resolved) {
+            Ok(meta) if meta.is_file() && meta.len() > self.config.max_file_size => {
+                PageStatus::PayloadTooLarge
+            }
+            Ok(meta) if meta.is_file() && meta.len() > 0 => PageStatus::Ok,
+            _ => PageStatus::NotFound,
+        }
     }
 
     /// Handle a page request and return a page response.
@@ -447,7 +473,10 @@ impl ContentServer {
             }
         };
         let mut bytes = Vec::with_capacity(MAX_TITLE_SCAN_BYTES);
-        if let Err(e) = file.take(MAX_TITLE_SCAN_BYTES as u64).read_to_end(&mut bytes) {
+        if let Err(e) = file
+            .take(MAX_TITLE_SCAN_BYTES as u64)
+            .read_to_end(&mut bytes)
+        {
             warn!(path = %path.display(), error = %e, "failed to scan file for title extraction");
             return None;
         }

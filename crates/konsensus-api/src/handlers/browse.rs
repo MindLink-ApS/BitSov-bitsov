@@ -92,6 +92,7 @@ pub struct CardsResponse {
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/browse/fetch", post(fetch))
+        .route("/api/v1/browse/quote", post(quote))
         .route("/api/v1/browse/cards", get(cards))
 }
 
@@ -116,7 +117,10 @@ impl InFlight {
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        Self::set().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+        Self::set()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
     }
 }
 
@@ -136,7 +140,12 @@ fn view(card: FrontDoorCard, network: Option<&str>, stale: bool) -> Result<CardV
     let link = card
         .to_link()
         .map_err(|e| ApiError::Internal(format!("card link: {e}")))?;
-    Ok(CardView { card, link, fresh, stale })
+    Ok(CardView {
+        card,
+        link,
+        fresh,
+        stale,
+    })
 }
 
 /// The plaintext of the kind-501 reply bound to `request` from `peer`. Only
@@ -150,10 +159,11 @@ async fn bound_reply(
     tokio::time::timeout(REPLY_TIMEOUT, async {
         loop {
             match replies.recv().await {
-                Ok(m) if m.envelope.kind == KIND_PAGE_RESPONSE
-                    && m.envelope.sender == *peer
-                    && konsensus_core::is_web_service_reply(&m.envelope)
-                    && m.envelope.references.contains(request) =>
+                Ok(m)
+                    if m.envelope.kind == KIND_PAGE_RESPONSE
+                        && m.envelope.sender == *peer
+                        && konsensus_core::is_web_service_reply(&m.envelope)
+                        && m.envelope.references.contains(request) =>
                 {
                     return m.plaintext.clone();
                 }
@@ -184,8 +194,10 @@ async fn fetch(
         .map_err(|e| ApiError::BadRequest(format!("invalid node_id: {e}")))?;
     let ours = *state.identity.node_id();
     if peer == ours {
-        return Err(ApiError::BadRequest("porch_own_node: this is your own node".into())
-            .with_reason("porch_own_node"));
+        return Err(
+            ApiError::BadRequest("porch_own_node: this is your own node".into())
+                .with_reason("porch_own_node"),
+        );
     }
     if !state.transport.is_connected(&peer).await {
         return Err(ApiError::Conflict(
@@ -246,13 +258,16 @@ async fn fetch(
         ApiError::Transport(format!("porch_reply_invalid: paid {paid} msat, {what}"))
             .with_reason("porch_reply_invalid")
     };
-    let page: PageResponse =
-        serde_json::from_str(&text).map_err(|e| bad_reply(format!("reply is not a page response: {e}")))?;
+    let page: PageResponse = serde_json::from_str(&text)
+        .map_err(|e| bad_reply(format!("reply is not a page response: {e}")))?;
     if page.request_id != request_id {
         return Err(bad_reply("reply names another request".into()));
     }
     if page.body.len() > MAX_PORCH_BODY_BYTES {
-        return Err(bad_reply(format!("body of {} bytes exceeds {MAX_PORCH_BODY_BYTES}", page.body.len())));
+        return Err(bad_reply(format!(
+            "body of {} bytes exceeds {MAX_PORCH_BODY_BYTES}",
+            page.body.len()
+        )));
     }
 
     let card = if req.path == PORCH_CARD_PATH && page.status == PageStatus::Ok {
@@ -270,7 +285,11 @@ async fn fetch(
             .await
             .offer(card.clone())
             .map_err(|e| bad_reply(format!("card: {e}")))?;
-        Some(view(card, state.introduction.network.as_deref(), matches!(offer, Offer::Stale { .. }))?)
+        Some(view(
+            card,
+            state.introduction.network.as_deref(),
+            matches!(offer, Offer::Stale { .. }),
+        )?)
     } else {
         None
     };
@@ -300,4 +319,291 @@ async fn cards(
         .map(|card| view(card, network, false))
         .collect::<Result<_, _>>()?;
     Ok(Json(CardsResponse { cards }))
+}
+
+/// Metadata only. No invoice, body, or payment proof is returned by a quote.
+#[derive(Debug, Serialize)]
+pub struct QuoteResponse {
+    pub node_id: String,
+    pub path: String,
+    pub status: PageStatus,
+    pub amount_msat: Option<u64>,
+    pub max_routing_fee_msat: u64,
+    pub max_total_msat: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuoteRequest {
+    pub node_id: String,
+    pub path: String,
+    pub max_routing_fee_msat: Option<u64>,
+}
+
+type QuoteKey = (NodeId, NodeId, String);
+type QuoteAnswer = (PageStatus, Option<u64>, bool);
+type QuoteWaiters =
+    std::collections::HashMap<QuoteKey, (String, tokio::sync::oneshot::Sender<QuoteAnswer>)>;
+
+fn quote_waiters() -> &'static Mutex<QuoteWaiters> {
+    static WAITERS: OnceLock<Mutex<QuoteWaiters>> = OnceLock::new();
+    WAITERS.get_or_init(Default::default)
+}
+
+struct PendingQuote(QuoteKey);
+impl Drop for PendingQuote {
+    fn drop(&mut self) {
+        quote_waiters()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Only a response from the queried Noise peer, for this node/request/path,
+/// completes a waiter. The peer need not have bought admission in reverse.
+pub fn receive_quote(
+    ours: NodeId,
+    peer: NodeId,
+    request_id: String,
+    path: String,
+    status: PageStatus,
+    amount: Option<u64>,
+    admission_required: bool,
+) {
+    let key = (ours, peer, request_id);
+    let mut waiters = quote_waiters().lock().unwrap_or_else(|e| e.into_inner());
+    if waiters
+        .get(&key)
+        .is_some_and(|(expected, _)| expected == &path)
+    {
+        if let Some((_, tx)) = waiters.remove(&key) {
+            let _ = tx.send((status, amount, admission_required));
+        }
+    }
+}
+
+async fn quote(
+    _auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<QuoteRequest>,
+) -> Result<Json<QuoteResponse>, ApiError> {
+    let peer = NodeId::from_hex(&req.node_id).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(
+        peer_quote(&state, peer, &req.path, req.max_routing_fee_msat).await?,
+    ))
+}
+
+/// Fresh preflight; never use our own price as a fallback for a peer's page.
+pub(crate) async fn peer_quote(
+    state: &AppState,
+    peer: NodeId,
+    path: &str,
+    fee_cap: Option<u64>,
+) -> Result<QuoteResponse, ApiError> {
+    if !is_porch_path(path) {
+        return Err(
+            ApiError::BadRequest("invalid porch path; nothing paid".into())
+                .with_reason("porch_path_invalid"),
+        );
+    }
+    let ours = *state.identity.node_id();
+    if peer == ours {
+        return Err(
+            ApiError::BadRequest("cannot quote own porch".into()).with_reason("porch_own_node")
+        );
+    }
+    if !state.transport.is_connected(&peer).await {
+        return Err(
+            ApiError::Conflict("peer not connected; nothing paid".into())
+                .with_reason("porch_unreachable"),
+        );
+    }
+    if !state.session_manager.has_session(&peer).await {
+        return Err(
+            ApiError::Conflict("Knock first; nothing paid".into()).with_reason("porch_knock_first")
+        );
+    }
+    let capability = format!(
+        "Custom(\"{}\")",
+        konsensus_core::payloads::content::PORCH_QUOTE_CAPABILITY
+    );
+    if !state
+        .transport
+        .peer_info(&peer)
+        .await
+        .is_some_and(|info| info.capabilities.contains(&capability))
+    {
+        return Err(
+            ApiError::Conflict("peer needs porch_quote_v1; nothing paid".into())
+                .with_reason("porch_quote_unavailable"),
+        );
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let key = (ours, peer, request_id.clone());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut waiters = quote_waiters().lock().unwrap_or_else(|e| e.into_inner());
+        if waiters.len() >= 256 {
+            return Err(
+                ApiError::Conflict("too many porch quotes; nothing paid".into())
+                    .with_reason("porch_busy"),
+            );
+        }
+        waiters.insert(key.clone(), (path.into(), tx));
+    }
+    let _pending = PendingQuote(key);
+    let frame = konsensus_message::Frame::PorchQuoteRequest {
+        request_id,
+        path: path.into(),
+    };
+    let bytes = frame
+        .to_bytes()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let exchange = async {
+        state
+            .transport
+            .send_raw_frame(&peer, &bytes)
+            .await
+            .map_err(|e| ApiError::Transport(e.to_string()))?;
+        rx.await
+            .map_err(|_| ApiError::Transport("porch quote closed".into()))
+    };
+    let (status, amount_msat, admission_required) =
+        tokio::time::timeout(Duration::from_secs(5), exchange)
+            .await
+            .map_err(|_| {
+                ApiError::Conflict(
+                    "no porch quote received; peer may need upgrading; nothing paid".into(),
+                )
+                .with_reason("porch_quote_unavailable")
+            })??;
+    if admission_required {
+        if status != PageStatus::Forbidden || amount_msat.is_some() {
+            return Err(
+                ApiError::Conflict("invalid admission refusal; nothing paid".into())
+                    .with_reason("porch_quote_invalid"),
+            );
+        }
+        return Err(ApiError::PriceCapExceeded(
+            "recipient requires explicit admission; nothing paid".into(),
+        )
+        .with_reason("readmission_required"));
+    }
+    if (status == PageStatus::Ok && amount_msat.is_none_or(|n| n < 1_000))
+        || (status != PageStatus::Ok && amount_msat.is_some())
+    {
+        return Err(
+            ApiError::Conflict("invalid porch quote; nothing paid".into())
+                .with_reason("porch_quote_invalid"),
+        );
+    }
+    let principal = amount_msat.unwrap_or(0);
+    let fee = if principal == 0 {
+        0
+    } else {
+        state
+            .lightning
+            .routing_fee_policy()
+            .ceiling(principal, fee_cap)
+    };
+    let total = principal
+        .checked_add(fee)
+        .ok_or_else(|| ApiError::PriceCapExceeded("porch quote overflow".into()))?;
+    Ok(QuoteResponse {
+        node_id: peer.to_hex(),
+        path: path.into(),
+        status,
+        amount_msat,
+        max_routing_fee_msat: fee,
+        max_total_msat: total,
+    })
+}
+
+pub(crate) async fn page_price(
+    state: &AppState,
+    peer: NodeId,
+    plaintext: &str,
+    fee_cap: Option<u64>,
+) -> Result<u64, ApiError> {
+    let request: PageRequest = serde_json::from_str(plaintext)
+        .map_err(|e| ApiError::BadRequest(format!("invalid page request: {e}")))?;
+    if request.method != "GET" {
+        return Err(ApiError::BadRequest(
+            "porch supports GET only; nothing paid".into(),
+        ));
+    }
+    let quote = peer_quote(state, peer, &request.path, fee_cap).await?;
+    match quote.status {
+        PageStatus::Ok => {
+            crate::error::require_money_ready(state).await?;
+            Ok(quote.amount_msat.expect("validated positive quote"))
+        }
+        PageStatus::NotFound => Err(ApiError::NotFound(
+            "page absent or empty; nothing paid".into(),
+        )
+        .with_reason("porch_not_found")),
+        _ => Err(ApiError::Conflict("page unavailable; nothing paid".into())
+            .with_reason("porch_unavailable")),
+    }
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn quote_correlation_rejects_wrong_peer_node_path_and_replay() {
+        let ours = NodeId::from_bytes([1; 32]);
+        let peer = NodeId::from_bytes([2; 32]);
+        let other = NodeId::from_bytes([3; 32]);
+        let id = uuid::Uuid::new_v4().to_string();
+        let key = (ours, peer, id.clone());
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        quote_waiters()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (PORCH_CARD_PATH.into(), tx));
+        let pending = PendingQuote(key.clone());
+        for (node, sender, path) in [
+            (other, peer, PORCH_CARD_PATH),
+            (ours, other, PORCH_CARD_PATH),
+            (ours, peer, "/wrong.md"),
+        ] {
+            receive_quote(
+                node,
+                sender,
+                id.clone(),
+                path.into(),
+                PageStatus::Ok,
+                Some(1000),
+                false,
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        receive_quote(
+            ours,
+            peer,
+            id.clone(),
+            PORCH_CARD_PATH.into(),
+            PageStatus::NotFound,
+            None,
+            false,
+        );
+        assert_eq!(rx.await.unwrap(), (PageStatus::NotFound, None, false));
+        receive_quote(
+            ours,
+            peer,
+            id,
+            PORCH_CARD_PATH.into(),
+            PageStatus::Ok,
+            Some(1000),
+            false,
+        );
+        assert!(!quote_waiters().lock().unwrap().contains_key(&key));
+        drop(pending);
+    }
 }

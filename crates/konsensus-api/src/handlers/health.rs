@@ -266,6 +266,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
             super::introduction::CAPABILITY,
             super::front_door::CAPABILITY,
             super::browse::CAPABILITY,
+            konsensus_core::payloads::content::PORCH_QUOTE_CAPABILITY,
             super::liquidity::CAPABILITY,
             super::sponsor::CAPABILITY,
             konsensus_core::payloads::call::MEETING_CAPABILITY,

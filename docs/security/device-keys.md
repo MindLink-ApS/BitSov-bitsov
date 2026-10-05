@@ -40,7 +40,7 @@ Now:
 
 | Route | Who | Effect |
 |---|---|---|
-| `GET /api/v1/pair/device-keys` | paired | `{node, client_id, owner_control, device_keys}`. `node` and `client_id` are part of every message the device signs |
+| `GET /api/v1/pair/device-keys` | paired | `{node, client_id, owner_control, local_owner_device, device_approvals, device_keys}`. `node` and `client_id` are part of every message the device signs |
 | `POST /api/v1/pair/device-key` | paired | `{public_key, name, proof}`. Creates a *pending* registration and nothing else |
 | `GET/DELETE /api/v1/pair/device-key/{op}` | paired, own | status (`pending/registered/expired/lost/absent`) / cancel |
 | `DELETE /api/v1/pair/device-keys/{key_id}` | paired, own | retire own key; its envelopes end |
@@ -63,6 +63,21 @@ Signatures are ECDSA P-256/SHA-256, DER encoded, which is what CryptoKit's
 that are not on the curve.
 
 ## Enforcement
+
+`--local-owner-device` is an explicit live-start alternative to owner-run mode
+for an existing enrolled key. It requires a descriptor password and an encrypted
+seed with no plaintext sibling; only the owner verifying key survives startup.
+It never enables enrollment, console grants, front-door, replacement or
+first-contact approval. Local spend scopes, staging and dispatch require an
+owner verifier and a live `device:` grant with a `recipients_only` budget. Startup
+refuses local mode before writing files if the owner verifier cannot be derived.
+Console grants on disk stay inactive. See
+[password input](../operations/password-input.md) for launcher trust and release
+requirements. `DeviceKey.enrolled_by` defaults to `console`
+for older records and is informational; it grants no authority.
+
+In local mode, `apply_relation_intent` clears the budgets on all other grants
+for that client, including console grants.
 
 A relation grant is the client's one budget grant, marked `recipients_only`:
 
@@ -89,7 +104,8 @@ A relation grant is the client's one budget grant, marked `recipients_only`:
 
 An intent is refused, and nothing is written, when any of these holds:
 
-- the node was not started in owner-run mode;
+- the node was neither started in owner-run mode nor started with
+  `--password-fd <n> --local-owner-device`;
 - the key is unknown, revoked, belongs to another client, or was registered
   at an older epoch;
 - the signature does not verify for this node and this client;

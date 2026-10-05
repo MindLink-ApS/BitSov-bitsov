@@ -8,6 +8,21 @@ this before swapping a long-lived data directory onto the new binary. Fresh
 `konsensus init` installs do not need the retained-node repair steps. For VMs, also read **VM / multi-host
 upgrade rules** and **Encrypted seed / custody** below.
 
+## Opt-in local owner devices (unreleased)
+
+Existing console-enrolled devices can use `start --password-fd <n>
+--local-owner-device` on an initialized node. Supply the flag on every launch;
+there is no config migration or stored authority flag. It requires an encrypted
+seed without a plaintext sibling. Existing device records without `enrolled_by`
+read as `console`; the owner signature remains mandatory. Never install an
+owner public key file as a replacement for startup derivation.
+
+Without this flag, descriptor passwords keep `seed_password_not_typed` and
+sidecar grants remain inactive. The mode does not open `control.sock`, enroll
+new devices, enable console grants or alter remote rules. The flag is refused
+on uninitialized directories in PR A; ordinary first-run HTTP bootstrap is unchanged. Review [password input](operations/password-input.md),
+including the Mac launcher's signing/hardened-runtime release requirement.
+
 ## rc7 → rc8 procedure
 
 1. Record the installed version and config path. Stop the node cleanly; keep its
@@ -432,3 +447,30 @@ keep current payment, replay, pairing and LDK state; roll forward after the firs
 rc8 LDK start. Disabling a new opt-in does not undo already settled payments,
 issued quotes, or persisted authorizations. This release does not provide a
 reverse protocol or schema migration.
+
+
+### Porch availability quotes
+
+Upgrade both reader and serving node for `porch_quote_v1`. The node now checks
+availability and the recipient's current price before any single-peer kind-500
+payment, including `/api/v1/browse/fetch`. An older serving node fails closed
+before payment. Content remains paid and single-use; quotes return no content.
+Room compose rejects page/manifest kinds 500, 501, and 510 before payment
+(HTTP 400, `porch_room`); use a single peer for these messages.
+
+**Raising a tariff does not revoke outstanding offers.** A custom client can
+pay the older kind-500 price until its offer expires: five minutes for a porch
+quote, up to one hour for ordinary price offers. Timely settled payments have
+up to one further hour to deliver. These offers survive restart. Safely
+superseding them requires tariff/payment bindings that v1 does not store;
+deleting them would also reject reads already paid before the raise. See the
+[tariff-raise limitation](protocol/BROWSE.md#quote-before-payment-porch_quote_v1)
+before treating a higher configured tariff as an immediate hard minimum.
+
+Applications can call `POST /api/v1/browse/quote` with `node_id` and `path` to
+preview availability, principal, and the routing ceiling. Handle HTTP 404
+`porch_not_found` and the `porch_quote_unavailable`, `porch_quote_invalid`, and
+`porch_unavailable` reasons as prepayment refusals. Do not auto-retry paid
+failures. The safe default remains **1,000 msat = 1 sat**; explicit operator
+prices are preserved. See [BROWSE.md](protocol/BROWSE.md) and
+[NOTES-PORCH.md](../NOTES-PORCH.md) for compatibility and availability limits.
