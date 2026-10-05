@@ -440,6 +440,17 @@ Upgrade both reader and serving node for `porch_quote_v1`. The node now checks
 availability and the recipient's current price before any single-peer kind-500
 payment, including `/api/v1/browse/fetch`. An older serving node fails closed
 before payment. Content remains paid and single-use; quotes return no content.
+Room compose rejects page/manifest kinds 500, 501, and 510 before payment
+(HTTP 400, `porch_room`); use a single peer for these messages.
+
+**Raising a tariff does not revoke outstanding offers.** A custom client can
+pay the older kind-500 price until its offer expires: five minutes for a porch
+quote, up to one hour for ordinary price offers. Timely settled payments have
+up to one further hour to deliver. These offers survive restart. Safely
+superseding them requires tariff/payment bindings that v1 does not store;
+deleting them would also reject reads already paid before the raise. See the
+[tariff-raise limitation](protocol/BROWSE.md#quote-before-payment-porch_quote_v1)
+before treating a higher configured tariff as an immediate hard minimum.
 
 Applications can call `POST /api/v1/browse/quote` with `node_id` and `path` to
 preview availability, principal, and the routing ceiling. Handle HTTP 404

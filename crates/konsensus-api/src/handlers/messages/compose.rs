@@ -3228,6 +3228,20 @@ pub(super) async fn compose_message_with_policy(
     if req.is_room && crate::calls::is_call_kind(req.kind) {
         return Err(ApiError::BadRequest("calls are 1:1; a room cannot be called".into()).with_reason("call_room"));
     }
+    if req.is_room
+        && matches!(
+            req.kind,
+            konsensus_core::kind::KIND_PAGE_REQUEST
+                | konsensus_core::kind::KIND_PAGE_RESPONSE
+                | konsensus_core::kind::KIND_WEB_MANIFEST
+        )
+    {
+        return Err(ApiError::BadRequest(
+            "page and manifest messages require a single peer; room compose is not supported"
+                .into(),
+        )
+        .with_reason("porch_room"));
+    }
 
     // Parse references (shared by peer and room paths)
     let references: Vec<MessageId> = req

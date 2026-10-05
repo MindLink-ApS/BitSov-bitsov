@@ -128,8 +128,33 @@ For `Ok`, the recipient quotes its current kind-500 tariff with the gate's
 admission-cost and 1,000-msat Porch floors. This version quotes the public
 (no trust discount) tariff. It persists that per-sender/kind offer for five
 minutes before returning it, using the existing durable delivery-price store.
-Explicit operator prices and chain-aware adjustments remain authoritative.
+Explicit operator prices and chain-aware adjustments determine new quotes.
 `web.page_price_msat` is a legacy setting, not a separate charge override.
+
+**Tariff-raise limitation (v1):** a raise does **not** supersede previously
+issued delivery offers. A custom client can still clear the kind-500 gate by
+paying an older, lower offer before its expiry, without fetching a new quote.
+The free porch quote's payment window is five minutes; kind-500 offers from
+ordinary price tables/responses can last up to one hour. The store uses the
+lowest applicable unexpired sender/kind or category offer. Expiry is inclusive
+in whole seconds and is checked against the recipient wallet's settlement
+timestamp, not the envelope timestamp. A payment settled within that window
+can be delivered for up to one hour after settlement. Restarting or publishing
+a higher quote does not revoke the old one. The gate's current admission and
+one-sat floors still apply.
+
+Safe supersession is deferred: the shared offer store has no quote provenance,
+tariff revision/effective time, or request/payment binding, and chain-aware
+prices have no atomic durable raise event. Deleting lower offers or always
+requiring the current tariff would also reject already-settled reads awaiting
+delivery. Correct supersession needs durable tariff epochs plus a way to bind
+payments to offers and distinguish pre-raise settlement from later redemption,
+including concurrent updates and restart. Operators must allow the outstanding
+offer windows to drain before relying on a raised tariff as a hard minimum.
+The regression `porch_tariff_raise_keeps_old_offer_for_payments_before_and_after_raise`
+exercises both payment orderings, the expiry boundaries, and the rejection of
+already-paid reads if the old offer is deleted. This is a documented limitation,
+not a guarantee that custom clients pay the latest quote.
 
 The reader correlates the reply to its own node, the authenticated peer,
 request id, and exact path. Pending requests are capped at 256 and removed on
@@ -159,6 +184,8 @@ explicit admission (`readmission_required`). The separate `porch_quote_v1`
 capability is advertised in Hello and `/status`; absent capability or timeout
 fails closed (`porch_quote_unavailable`), with no legacy paid-fetch fallback.
 Both endpoints must be upgraded for this safe fetch flow.
+Room compose refuses page and manifest kinds 500, 501, and 510 with HTTP 400,
+reason `porch_room`, before quoting, reserving spend, paying, or fan-out.
 
 **Availability race:** quotes do not reserve a content snapshot. Fetch rechecks
 after a user previews a quote, but removal, unreadable content, disconnect, or

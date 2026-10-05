@@ -329,6 +329,11 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                                             let price = konsensus_core::gate::price_with_floor_msat(kind, base, min_admission_cost_msat);
                                             // Persist the offered price before replying so a price change
                                             // during payment cannot invalidate the paid request.
+                                            // V1 cannot supersede this on a tariff raise without
+                                            // also invalidating already-settled reads: offers lack
+                                            // tariff revisions and request/payment bindings.
+                                            // Custom clients can pay the old offer until expiry;
+                                            // see BROWSE.md's tariff-raise limitation.
                                             let unix = crate::peer_exchange::now();
                                             if storage.record_delivery_prices(&peer_id, &[(format!("kind:{kind}"), price)], &[], unix, unix.saturating_add(300)).await.is_ok() {
                                                 Some(price)
