@@ -1882,3 +1882,126 @@ mod not_dispatched;
 
 #[path = "budget_grant/readmission_reprice.rs"]
 mod readmission_reprice;
+
+#[tokio::test]
+async fn local_owner_http_intent_spends_and_restart_without_flag_stops_it() {
+    use konsensus_api::pairing::device::{
+        intent_message, owner_approval_message, registration_message,
+    };
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+    let mut fx = fixture().await;
+    let fp = fx.service.bound_fingerprint();
+    let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "", &[9; 32],
+    ).unwrap();
+    let console = PairingService::open(fx.tmp.path(), fp.clone(), true)
+        .unwrap()
+        .with_owner_console(Box::new(fx.console.clone()))
+        .with_owner_approval_key(owner.verifying_key())
+        .without_stdout_code();
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let device =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let public = hex::encode(device.public_key().as_ref());
+    let sign = |message: &str| hex::encode(device.sign(&rng, message.as_bytes()).unwrap().as_ref());
+    let op = console
+        .request_device_key(
+            &fx.client_id,
+            &public,
+            "local Mac",
+            &sign(&registration_message(&fp, &fx.client_id, &public)),
+        )
+        .unwrap();
+    let approval = hex::encode(
+        owner
+            .sign(owner_approval_message(&fp, &op.client_pubkey, op.epoch, &public).as_bytes())
+            .to_bytes(),
+    );
+    let registered = console
+        .approve_device_key(&op.op_id, &fx.console.owner_code(&op.op_id), &approval)
+        .unwrap();
+    drop(console);
+    fx.service = Arc::new(
+        PairingService::open(fx.tmp.path(), fp.clone(), false)
+            .unwrap()
+            .with_local_owner_device()
+            .with_owner_approval_key(owner.verifying_key())
+            .without_stdout_code(),
+    );
+    fx.state = Arc::new(AppState {
+        pairing: Some(fx.service.clone()),
+        ..(*fx.state).clone()
+    });
+    let read = fx.token().await;
+    let intent = pairing::RelationIntent {
+        device_key_id: registered.key_id,
+        peer: fx.peer.to_hex(),
+        level: 1,
+        budget_msat: 2_500,
+        per_act_max_msat: 1_000,
+        window_secs: 60,
+        issued_at: chrono::Utc::now().timestamp(),
+        nonce: "ac".repeat(16),
+    };
+    let body =
+        json!({"intent": intent, "signature": sign(&intent_message(&fp, &fx.client_id, &intent))});
+    let (status, response) = fx
+        .call(
+            "POST",
+            "/api/v1/pair/relation-intent",
+            Some(body.clone()),
+            Some(&read),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let spend = fx.token().await;
+    let (status, response) = fx.compose(&spend).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(fx.wallet.money(), 1);
+    assert_eq!(fx.used(), 1_000);
+
+    // Use a fresh nonce so restart refusal cannot be explained by replay checks.
+    let fresh = pairing::RelationIntent {
+        nonce: "ad".repeat(16),
+        ..intent
+    };
+    let body =
+        json!({"intent": fresh, "signature": sign(&intent_message(&fp, &fx.client_id, &fresh))});
+
+    // Restart retains grants and device records but loses both local opt-in and
+    // the descriptor-derived owner verifier. Neither a fresh nor old token pays.
+    fx.service = Arc::new(
+        PairingService::open(fx.tmp.path(), fp, false)
+            .unwrap()
+            .with_device_authority_disabled(pairing::device::SEED_PASSWORD_NOT_TYPED)
+            .without_stdout_code(),
+    );
+    fx.state = Arc::new(AppState {
+        pairing: Some(fx.service.clone()),
+        ..(*fx.state).clone()
+    });
+    let read = fx.token().await;
+    let (status, keys) = fx
+        .call("GET", "/api/v1/pair/device-keys", None, Some(&read))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(keys["local_owner_device"], false);
+    assert_eq!(keys["device_approvals"], "seed_password_not_typed");
+    let (status, _) = fx
+        .call(
+            "POST",
+            "/api/v1/pair/relation-intent",
+            Some(body),
+            Some(&read),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for token in [&read, &spend] {
+        let (status, _) = fx.compose(token).await;
+        assert!(!status.is_success());
+    }
+    assert_eq!(fx.wallet.money(), 1);
+    assert_eq!(fx.used(), 1_000);
+}

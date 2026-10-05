@@ -564,11 +564,27 @@ mod tests {
         use konsensus_api::pairing::device::SEED_NOT_ENCRYPTED;
         let (_dir, config, _) = node();
         let before = NodeConfig::load_before_identity_validation(&config).unwrap();
-        assert_eq!(crate::owner_approval_key(&before, None, true, &node_id()).unwrap_err(), SEED_NOT_ENCRYPTED);
+        assert_eq!(
+            crate::owner_approval_key(
+                &before,
+                None,
+                crate::PasswordSource::Typed,
+                &node_id(),
+                false
+            )
+            .unwrap_err(),
+            SEED_NOT_ENCRYPTED
+        );
         encrypt_seed(&config, pw("correct horse battery")).unwrap();
         let after = NodeConfig::load_before_identity_validation(&config).unwrap();
-        crate::owner_approval_key(&after, Some("correct horse battery"), true, &node_id())
-            .expect("after seed encrypt and a typed start, device approvals are on");
+        crate::owner_approval_key(
+            &after,
+            Some("correct horse battery"),
+            crate::PasswordSource::Typed,
+            &node_id(),
+            false,
+        )
+        .expect("after seed encrypt and a typed start, device approvals are on");
     }
 
     /// Point the config at `path` by editing the file directly: a config save

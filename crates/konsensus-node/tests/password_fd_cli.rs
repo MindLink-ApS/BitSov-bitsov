@@ -131,59 +131,130 @@ fn init_encrypts_and_start_decrypts_from_a_single_handoff_without_logging_it() {
             String::from_utf8_lossy(&out.stderr)
         );
 
-        // Redirect both output streams to a file so a child cannot block on a
-        // full output pipe. A guard always kills/reaps it, including on panic.
-        let output = tempfile::tempfile().unwrap();
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        writer.write_all(PASSWORD.as_bytes()).unwrap();
-        drop(writer);
-        let fd = reader.as_raw_fd();
-        let mut cmd = bin();
-        cmd.args(["start", "--config"]).arg(&config_path);
-        if inherited {
-            cmd.args(["--password-fd", "9"]).stdin(Stdio::null());
-            // SAFETY: same descriptor handoff as in input(), before exec only.
-            unsafe {
-                cmd.pre_exec(move || {
-                    if libc::dup2(fd, 9) == -1 || libc::fcntl(9, libc::F_SETFD, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        } else {
-            cmd.args(["--password-fd", "0"])
-                .stdin(Stdio::from(std::os::fd::OwnedFd::from(
-                    reader.try_clone().unwrap(),
-                )));
-        }
-        cmd.stdout(output.try_clone().unwrap())
-            .stderr(output.try_clone().unwrap());
-        struct Child(std::process::Child);
-        impl Drop for Child {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
         drop(api_port);
-        let mut child = Child(cmd.spawn().unwrap());
-        let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
-            use std::os::unix::fs::FileExt;
-            let mut bytes = vec![0; output.metadata().unwrap().len() as usize];
-            output.read_exact_at(&mut bytes, 0).unwrap();
-            no_secret(&bytes);
-            let log = String::from_utf8_lossy(&bytes);
-            if log.contains("seed_password_not_typed") {
-                assert!(log.contains("node built"));
-                break;
+        // Reuse the same initialized data across starts. Removing the local
+        // flag after an enabled start must return to descriptor refusal.
+        for local_owner in [false, true, false] {
+            // Redirect both output streams to a file so a child cannot block on a
+            // full output pipe. A guard always kills/reaps it, including on panic.
+            let output = tempfile::tempfile().unwrap();
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            writer.write_all(PASSWORD.as_bytes()).unwrap();
+            drop(writer);
+            let fd = reader.as_raw_fd();
+            let mut cmd = bin();
+            cmd.args(["start", "--config"]).arg(&config_path);
+            if local_owner {
+                cmd.arg("--local-owner-device");
             }
-            assert!(child.0.try_wait().unwrap().is_none(), "node exited: {log}");
-            assert!(Instant::now() < deadline, "startup timed out: {log}");
-            std::thread::sleep(Duration::from_millis(50));
+            if inherited {
+                cmd.args(["--password-fd", "9"]).stdin(Stdio::null());
+                // SAFETY: same descriptor handoff as in input(), before exec only.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if libc::dup2(fd, 9) == -1 || libc::fcntl(9, libc::F_SETFD, 0) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            } else {
+                cmd.args(["--password-fd", "0"])
+                    .stdin(Stdio::from(std::os::fd::OwnedFd::from(
+                        reader.try_clone().unwrap(),
+                    )));
+            }
+            cmd.stdout(output.try_clone().unwrap())
+                .stderr(output.try_clone().unwrap());
+            struct Child(std::process::Child);
+            impl Drop for Child {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = Child(cmd.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                use std::os::unix::fs::FileExt;
+                let mut bytes = vec![0; output.metadata().unwrap().len() as usize];
+                output.read_exact_at(&mut bytes, 0).unwrap();
+                no_secret(&bytes);
+                let log = String::from_utf8_lossy(&bytes);
+                if log.contains("API server listening") {
+                    assert!(log.contains("node built"));
+                    if local_owner {
+                        assert!(log.contains("device approvals (Touch ID) enabled"), "{log}");
+                        assert!(!log.contains("seed_password_not_typed"), "{log}");
+                    } else {
+                        assert!(log.contains("seed_password_not_typed"), "{log}");
+                    }
+                    assert!(!dir.path().join("control.sock").exists());
+                    break;
+                }
+                assert!(child.0.try_wait().unwrap().is_none(), "node exited: {log}");
+                assert!(Instant::now() < deadline, "startup timed out: {log}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            drop(child);
+            no_secret(&std::fs::read(dir.path().join("node.log")).unwrap());
         }
-        drop(child);
-        no_secret(&std::fs::read(dir.path().join("node.log")).unwrap());
+    }
+}
+
+#[test]
+fn local_owner_flag_cannot_enter_legacy_plaintext_bootstrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = tempfile::tempfile().unwrap();
+    let mut child = bin()
+        .args([
+            "start",
+            "--local-owner-device",
+            "--password-fd",
+            "0",
+            "--config",
+        ])
+        .arg(dir.path().join("konsensus.toml"))
+        .stdin(Stdio::piped())
+        .stdout(output.try_clone().unwrap())
+        .stderr(output.try_clone().unwrap())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(PASSWORD.as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("local owner bootstrap must refuse before serving HTTP");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    use std::os::unix::fs::FileExt;
+    let mut bytes = vec![0; output.metadata().unwrap().len() as usize];
+    output.read_exact_at(&mut bytes, 0).unwrap();
+    no_secret(&bytes);
+    assert!(!status.success());
+    let log = String::from_utf8_lossy(&bytes);
+    assert!(
+        log.contains("--local-owner-device requires an initialized encrypted identity"),
+        "{log}"
+    );
+    for path in [
+        "identity",
+        "mnemonic.txt",
+        "mnemonic.enc",
+        "NODE_INITIALIZED",
+        "pairing",
+    ] {
+        assert!(!dir.path().join(path).exists(), "unexpected {path}");
     }
 }

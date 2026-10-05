@@ -20,11 +20,11 @@ use konsensus_api::auth::Scope;
 use konsensus_api::control::{self, ControlContext, ControlRequest, ControlResponse};
 use konsensus_api::pairing::device::{self, intent_message, owner_approval_message, registration_message};
 use konsensus_api::pairing::PendingDeviceKey;
-use konsensus_core::OwnerApprovalKey;
 use konsensus_api::pairing::{
     self, DeviceKeyStatus, PairedClient, PairingError, PairingService, RelationIntent,
 };
 use konsensus_api::spend_budget::{BudgetRefusal, Charge};
+use konsensus_core::OwnerApprovalKey;
 
 const MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -677,5 +677,226 @@ fn a_node_running_from_a_plaintext_seed_disables_device_authority_node_wide() {
     assert!(matches!(err, PairingError::DeviceApprovalsDisabled(device::SEED_NOT_ENCRYPTED)), "{err}");
     // POSITIVE CONTROL: the same state with the node started from the encrypted seed.
     let (service, _) = owner_run(tmp.path());
-    service.apply_relation_intent(&client.client_id, client.epoch, &i, &s).unwrap();
+    service
+        .apply_relation_intent(&client.client_id, client.epoch, &i, &s)
+        .unwrap();
+}
+
+fn local_run(dir: &std::path::Path) -> PairingService {
+    PairingService::open(dir, fingerprint(), false)
+        .unwrap()
+        .with_local_owner_device()
+        .with_owner_approval_key(owner_key().verifying_key())
+        .without_stdout_code()
+}
+
+fn token_scopes(service: &PairingService, client: &PairedClient) -> Vec<Scope> {
+    let challenge = service.issue_token_challenge(&client.client_id).unwrap();
+    let signature = hex::encode(
+        SigningKey::from_bytes(&[1; 32])
+            .sign(challenge.as_bytes())
+            .to_bytes(),
+    );
+    service
+        .issue_token(
+            "node",
+            "test-secret-at-least-32-bytes-long!",
+            &client.client_id,
+            &challenge,
+            &signature,
+        )
+        .unwrap()
+        .scopes
+}
+
+#[test]
+fn local_owner_accepts_console_enrolled_key_but_restart_without_flag_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (console, _, client, device, key_id) = registered(tmp.path());
+    assert_eq!(console.device_keys()[0].enrolled_by, "console");
+    drop(console);
+    let local = local_run(tmp.path());
+    assert!(!local.owner_control_enabled());
+    let i = intent(&key_id, PEER, 10_000, 1_000);
+    let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    local
+        .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
+        .unwrap();
+    assert!(token_scopes(&local, &client).contains(&Scope::Spend));
+    local
+        .reserve_spend(&client.client_id, client.epoch, charge(PEER, 1_000))
+        .unwrap();
+    assert!(matches!(
+        local.reserve_spend(&client.client_id, client.epoch, charge(OTHER, 1)),
+        Err(BudgetRefusal::Recipient { .. })
+    ));
+    drop(local);
+    let local = local_run(tmp.path());
+    assert!(
+        local
+            .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
+            .is_err(),
+        "nonce survives restart"
+    );
+    drop(local);
+    let restarted = PairingService::open(tmp.path(), fingerprint(), false)
+        .unwrap()
+        .with_device_authority_disabled(device::SEED_PASSWORD_NOT_TYPED)
+        .without_stdout_code();
+    assert_eq!(
+        restarted.device_authority_off(),
+        Some(device::SEED_PASSWORD_NOT_TYPED)
+    );
+    assert!(matches!(
+        restarted.apply_relation_intent(&client.client_id, client.epoch, &i, &sig),
+        Err(PairingError::OwnerChannelUnavailable)
+    ));
+    assert!(!token_scopes(&restarted, &client).contains(&Scope::Spend));
+    assert!(matches!(
+        restarted.reserve_spend(&client.client_id, client.epoch, charge(PEER, 1)),
+        Err(BudgetRefusal::NoGrant)
+    ));
+}
+
+#[test]
+fn local_owner_reverifies_approval_client_epoch_and_revocation() {
+    for mutation in [
+        "owner_approval",
+        "client_pubkey",
+        "epoch",
+        "revoked",
+        "legacy",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, _, client, device, key_id) = registered(tmp.path());
+        drop(service);
+        let path = tmp.path().join("pairing/clients.json");
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        match mutation {
+            "owner_approval" => file["device_keys"][0][mutation] = "00".repeat(64).into(),
+            "client_pubkey" => file["device_keys"][0][mutation] = "ff".repeat(32).into(),
+            "epoch" => file["device_keys"][0][mutation] = (client.epoch + 1).into(),
+            "revoked" => file["device_keys"] = serde_json::json!([]),
+            "legacy" => {
+                file["device_keys"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("enrolled_by");
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let local = local_run(tmp.path());
+        let i = intent(&key_id, PEER, 10_000, 1_000);
+        let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+        let result = local.apply_relation_intent(&client.client_id, client.epoch, &i, &sig);
+        if mutation == "legacy" {
+            result.unwrap();
+            assert_eq!(local.device_keys()[0].enrolled_by, "console");
+        } else {
+            assert!(
+                matches!(result, Err(PairingError::NotGrantable(_))),
+                "{mutation}: {result:?}"
+            );
+            assert!(local.grant_view_for(&client.client_id).is_none());
+            assert!(matches!(
+                local.reserve_spend(&client.client_id, client.epoch, charge(PEER, 1)),
+                Err(BudgetRefusal::NoGrant)
+            ));
+        }
+    }
+}
+
+#[test]
+fn local_owner_honours_only_recipient_bound_device_grants_from_disk() {
+    for (granted_by, recipients_only, allowed) in [
+        ("cli", true, false),
+        ("device:test", false, false),
+        ("device:test", true, true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, _, client, device, key_id) = registered(tmp.path());
+        let i = intent(&key_id, PEER, 10_000, 1_000);
+        service
+            .apply_relation_intent(
+                &client.client_id,
+                client.epoch,
+                &i,
+                &device.sign(&intent_message(&fingerprint(), &client.client_id, &i)),
+            )
+            .unwrap();
+        drop(service);
+        let path = tmp.path().join("pairing/clients.json");
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["grants"][0]["granted_by"] = granted_by.into();
+        file["grants"][0]["budget"]["recipients_only"] = recipients_only.into();
+        file["grants"][0]["scopes"] = serde_json::json!(["spend", "front_door"]);
+        file["clients"][0]["scopes"] =
+            serde_json::json!(["read", "receive", "spend", "front_door"]);
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let local = local_run(tmp.path());
+        let scopes = token_scopes(&local, &client);
+        assert_eq!(scopes.contains(&Scope::Spend), allowed);
+        assert!(!scopes.contains(&Scope::FrontDoor));
+        let result = local.reserve_spend(&client.client_id, client.epoch, charge(PEER, 1));
+        if allowed {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(BudgetRefusal::NoGrant)));
+        }
+        assert_eq!(local.grant_view_for(&client.client_id).is_some(), allowed);
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["grants"][0]["budget"]["used_msat"], u64::from(allowed));
+    }
+}
+
+#[test]
+fn local_owner_cannot_use_console_only_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _, client, device, _) = registered(tmp.path());
+    drop(service);
+    let local = local_run(tmp.path());
+    assert!(matches!(
+        local.request_device_key(
+            &client.client_id,
+            &device.public_hex(),
+            "mac",
+            &device.proof(&client.client_id)
+        ),
+        Err(PairingError::OwnerChannelUnavailable)
+    ));
+    assert!(matches!(
+        local.approve_device_key("op", "code", "sig"),
+        Err(PairingError::OwnerChannelUnavailable)
+    ));
+    assert!(matches!(
+        local.create_elevation_request(&client.client_id, vec![Scope::Spend]),
+        Err(PairingError::OwnerApprovalUnavailable)
+    ));
+    assert!(matches!(
+        local.grant_elevation(
+            "op",
+            "code",
+            konsensus_api::spend_budget::GrantTerms::new(1000)
+        ),
+        Err(PairingError::OwnerChannelUnavailable)
+    ));
+    assert!(matches!(
+        local.grant_front_door("op", "code", 60),
+        Err(PairingError::OwnerChannelUnavailable)
+    ));
+    assert!(matches!(
+        local.approve_replacement("op", "code"),
+        Err(PairingError::OwnerChannelUnavailable)
+    ));
+    assert!(matches!(
+        local.grant_first_contact(&client.client_id, "op", PEER, 1, None),
+        Err(BudgetRefusal::NoGrant)
+    ));
+    assert_eq!(local.reissue_owner_challenges().unwrap(), 0);
+    assert!(local.pending_device_keys().is_empty());
+    assert!(local.grant_view_for(&client.client_id).is_none());
 }

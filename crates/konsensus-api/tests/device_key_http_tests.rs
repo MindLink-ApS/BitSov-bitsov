@@ -146,7 +146,12 @@ async fn register_device_over_http(headless: bool) {
     assert!(!approval_path.exists());
     let (_, keys) = call(&state, "GET", "/api/v1/pair/device-keys", None, Some(&read_token)).await;
     assert_eq!(keys["device_keys"].as_array().unwrap().len(), 1, "{keys}");
-    assert_eq!((keys["node"].as_str(), keys["client_id"].as_str()), (Some(fp.as_str()), Some(client.client_id.as_str())));
+    assert_eq!(keys["owner_control"], true);
+    assert_eq!(keys["local_owner_device"], false);
+    assert_eq!(
+        (keys["node"].as_str(), keys["client_id"].as_str()),
+        (Some(fp.as_str()), Some(client.client_id.as_str()))
+    );
 
     // A bad signature is a 403 for this request, never a 401 that re-pairs.
     let key_id = reg["key_id"].as_str().unwrap().to_string();
@@ -225,5 +230,83 @@ async fn a_plaintext_seed_node_says_why_touch_id_is_off() {
         Some(json!({"public_key": public, "name": "MacBook", "proof": proof})), Some(token)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["reason"], "seed_not_encrypted", "{body}");
-    assert!(body["error"].as_str().unwrap().contains("Encrypt your recovery phrase"), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Encrypt your recovery phrase"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn local_mode_reports_authority_and_keeps_http_enrollment_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = test_state();
+    let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
+    let owner = PairingService::open(tmp.path(), fp.clone(), true)
+        .unwrap()
+        .without_stdout_code();
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let pubkey = hex::encode(key.verifying_key().to_bytes());
+    let outcome = owner.request_pairing("desktop app", &pubkey).unwrap();
+    let challenge =
+        std::fs::read(owner.dir().join(format!("challenge-{}", outcome.pair_id))).unwrap();
+    let sig = hex::encode(
+        key.sign(&PairingService::proof_message(
+            &outcome.pair_id,
+            &pubkey,
+            &challenge,
+        ))
+        .to_bytes(),
+    );
+    let client = owner
+        .confirm_pairing(&outcome.pair_id, &sig, pairing::default_pairing_scopes())
+        .unwrap();
+    drop(owner);
+    let service = Arc::new(
+        PairingService::open(tmp.path(), fp, false)
+            .unwrap()
+            .with_local_owner_device()
+            .without_stdout_code(),
+    );
+    let state = Arc::new(AppState {
+        pairing: Some(Arc::clone(&service)),
+        data_dir: Some(tmp.path().to_path_buf()),
+        ..(*base).clone()
+    });
+    let challenge = service.issue_token_challenge(&client.client_id).unwrap();
+    let sig = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
+    let (_, tok) = call(
+        &state,
+        "POST",
+        "/api/v1/pair/token",
+        Some(json!({"client_id": client.client_id, "challenge": challenge, "signature": sig})),
+        None,
+    )
+    .await;
+    let token = tok["token"].as_str().unwrap();
+    let (status, keys) = call(&state, "GET", "/api/v1/pair/device-keys", None, Some(token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(keys["owner_control"], false);
+    assert_eq!(keys["local_owner_device"], true);
+    assert_eq!(keys["device_approvals"], "owner_key_unavailable");
+    let (status, _) = call(
+        &state,
+        "POST",
+        "/api/v1/pair/device-key",
+        Some(json!({"public_key": "04", "name": "mac", "proof": "00"})),
+        Some(token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for route in [
+        "/api/v1/pair/device-key/op/approve",
+        "/api/v1/pair/device-key/op/delegate",
+    ] {
+        let (status, _) = call(&state, "POST", route, Some(json!({})), Some(token)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    assert!(service.pending_device_keys().is_empty());
+    assert!(service.device_keys().is_empty());
 }

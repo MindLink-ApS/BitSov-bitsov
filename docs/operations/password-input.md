@@ -42,7 +42,41 @@ including on ordinary errors and cancellation. OS pipe buffers and the sender's
 memory remain the sender/OS's responsibility; abrupt process termination cannot
 run Rust destructors.
 
-Descriptor input is **non-interactive**: Touch ID device approvals remain off
-with `seed_password_not_typed`, just as with `--password-file`. This handoff does
-not change owner-channel authority or implement Keychain access in the node.
-It applies to CLI init/start; bootstrap HTTP identity creation is unchanged.
+Descriptor input alone is **non-interactive**: Touch ID device approvals remain
+off with `seed_password_not_typed`, just as with `--password-file`. The explicit
+live-start exception is described below. The node does not implement Keychain
+access.
+
+For an **already initialized** local node with a console-enrolled owner device,
+start with `--password-fd 0 --local-owner-device` to enable device-signed,
+recipient-bound spend envelopes. This flag is required on every start; it is
+not a config setting. It requires `--password-fd` and conflicts with
+`--password`, `--password-file`, and `--owner-control`.
+
+The seed must be encrypted with no sibling `mnemonic.txt`. At startup the node
+derives the owner verifying key from the seed and password, then drops the
+password and owner signing key. No owner public key is trusted from disk.
+Console-enrolled device records work unchanged; their owner signatures are
+verified on every intent. A restart without the flag disables descriptor-based
+device approval again (`seed_password_not_typed`) and honours no spend grants.
+
+This mode opens no control socket. Enrollment, console grants, elevation,
+front-door, identity replacement, pairing-window control and first-contact
+approval retain their console-only rules. Only live `device:` grants with
+`recipients_only` budgets supply spend scope and spending authority; `cli`
+grants on disk remain inactive. Caps and dispatch deadlines still apply.
+PR A refuses `--local-owner-device` on an uninitialized directory, before
+serving HTTP, so it cannot silently fall into plaintext bootstrap. Ordinary
+bootstrap HTTP identity creation is unchanged; encrypted first-run HTTP
+enrollment and device delegation are separate work.
+
+The launcher must protect its Keychain password: anyone with that password and
+the seed can derive the owner signing key. Release of the Mac launcher requires
+Developer ID signing and hardened runtime; an unsigned build must label the
+badge **local owner (unsigned app)**. The node cannot attest that a registered
+P-256 key lives in Secure Enclave hardware.
+
+Persisted spend grants remain trusted state: the `device:` provenance prefix
+and budget fields are not signed grants. A writer of `pairing/clients.json` can
+forge those fields. Owner signatures protect device registration records, not
+the grant ledger; this mode retains that existing account-layer limitation.
