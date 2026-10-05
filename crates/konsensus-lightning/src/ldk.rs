@@ -853,7 +853,12 @@ impl LdkProvider {
             // Sweep on startup too: a crash can happen after LDK persists the
             // channel but before the application handles ChannelReady.
             let mut tariff_retry = crate::lsps2_service::TariffRetry::new(Instant::now());
+            let mut next_metrics = Instant::now();
             while !drain_shutdown.load(Ordering::Relaxed) {
+                if lsps2_service.enabled && Instant::now() >= next_metrics {
+                    crate::lsps2_service::record_metrics(&drain_node);
+                    next_metrics = Instant::now() + Duration::from_secs(1);
+                }
                 tariff_retry
                     .apply_if_due(Instant::now(), || lsps2_service.apply_tariffs(&drain_node));
                 let mut drained_any = false;

@@ -71,8 +71,19 @@ impl FundingPolicy {
 }
 
 // Mark policy-bearing IDs so a missing row after restart MUST fail closed. Legacy
-// channels (including LSPS) retain their existing default funding behavior.
+// channels retain their existing default funding behavior.
 const PREFIX: u128 = 0x42534650_u128 << 96;
+// BITSOV-PATCH: LSPS2 IDs carry a distinct, fail-closed funding-policy marker.
+const JIT_PREFIX: u128 = 0x42534a49_u128 << 96;
+pub(crate) fn new_jit_channel_id() -> u128 {
+	JIT_PREFIX | (rand::random::<u128>() & !MASK)
+}
+pub(crate) fn is_jit_channel_id(id: u128) -> bool {
+	id & MASK == JIT_PREFIX
+}
+fn has_policy(id: u128) -> bool {
+	id & MASK == PREFIX || is_jit_channel_id(id)
+}
 const MASK: u128 = u128::MAX << 96;
 pub(crate) fn new_policy_channel_id() -> u128 {
 	PREFIX | (rand::random::<u128>() & !MASK)
@@ -91,7 +102,7 @@ pub(crate) fn save(store: &DynStore, id: u128, policy: &FundingPolicy) -> Result
 		.map_err(|_| Error::PersistenceFailed)
 }
 pub(crate) fn load(store: &DynStore, id: u128) -> Result<Option<FundingPolicy>, Error> {
-	if id & MASK != PREFIX {
+	if !has_policy(id) {
 		return Ok(None);
 	}
 	let bytes = lightning::util::persist::KVStoreSync::read(store, NAMESPACE, "", &id.to_string())
@@ -165,7 +176,7 @@ mod tests {
 // Failures recorded before LDK closes the unfunded channel let the owner see the
 // reason even when the asynchronous channel has already disappeared.
 pub(crate) fn record_failure(store: &DynStore, id: u128, error: Error) -> Result<(), Error> {
-	if id & MASK != PREFIX || failure(store, id)?.is_some() {
+	if !has_policy(id) || failure(store, id)?.is_some() {
 		return Ok(());
 	}
 	lightning::util::persist::KVStoreSync::write(
@@ -178,7 +189,9 @@ pub(crate) fn record_failure(store: &DynStore, id: u128, error: Error) -> Result
 	.map_err(|_| Error::PersistenceFailed)
 }
 pub(crate) fn failure(store: &DynStore, id: u128) -> Result<Option<String>, Error> {
-	if id & MASK != PREFIX { return Ok(None); }
+	if !has_policy(id) {
+		return Ok(None);
+	}
 	match lightning::util::persist::KVStoreSync::read(
 		store,
 		"bitsov_funding_failure",

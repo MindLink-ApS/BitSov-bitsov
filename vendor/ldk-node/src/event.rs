@@ -1434,8 +1434,13 @@ where
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					let skimmed_fee_msat = skimmed_fee_msat.unwrap_or(0);
 					liquidity_source
-						.handle_payment_forwarded(next_channel_id, skimmed_fee_msat)
-						.await;
+						.handle_payment_forwarded(
+							next_channel_id,
+							next_user_channel_id,
+							skimmed_fee_msat,
+						)
+						.await
+						.map_err(|_| ReplayEvent())?;
 				}
 
 				let event = Event::PaymentForwarded {
@@ -1463,6 +1468,13 @@ where
 				funding_txo,
 				..
 			} => {
+				// BITSOV-PATCH: persist lifecycle observations before acknowledging LDK.
+				if let Some(source) = self.liquidity_source.as_ref() {
+					source
+						.observe_jit_channel(user_channel_id, channel_id, false, false)
+						.map_err(|_| ReplayEvent())?;
+				}
+
 				log_info!(
 					self.logger,
 					"New channel {} with counterparty {} has been created and is pending confirmation on chain.",
@@ -1524,6 +1536,13 @@ where
 				funding_txo,
 				..
 			} => {
+				// BITSOV-PATCH: persist lifecycle observations before acknowledging LDK.
+				if let Some(source) = self.liquidity_source.as_ref() {
+					source
+						.observe_jit_channel(user_channel_id, channel_id, true, false)
+						.map_err(|_| ReplayEvent())?;
+				}
+
 				if let Some(funding_txo) = funding_txo {
 					log_info!(
 						self.logger,
@@ -1568,7 +1587,19 @@ where
 				counterparty_node_id,
 				..
 			} => {
-				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
+				// BITSOV-PATCH: persist lifecycle observations before acknowledging LDK.
+				if let Some(source) = self.liquidity_source.as_ref() {
+					source
+						.observe_jit_channel(user_channel_id, channel_id, false, true)
+						.map_err(|_| ReplayEvent())?;
+				}
+
+				log_info!(
+					self.logger,
+					"Channel {} closed due to: {}",
+					channel_id,
+					reason
+				);
 
 				let event = Event::ChannelClosed {
 					channel_id,

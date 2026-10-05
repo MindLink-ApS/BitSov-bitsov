@@ -3,15 +3,61 @@ use super::super::*;
 use konsensus_lightning::liquidity::{LiquidityConfig, LspConfig};
 use konsensus_lightning::lsps2_service::Lsps2ServiceConfig;
 
+// Fresh regtest chains have no fee-estimation history. Supply an explicit
+// deterministic estimator response; every wallet/chain/broadcast request still
+// goes to the real electrs/Core fixture. Production must reject missing estimates.
+struct FeeSource(tokio::task::JoinHandle<()>);
+impl Drop for FeeSource {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+async fn fee_source(upstream: String) -> (String, FeeSource) {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let router = axum::Router::new()
+        .route(
+            "/fee-estimates",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"6": 3.0, "12": 2.0, "144": 1.0}))
+            }),
+        )
+        .route(
+            "/*path",
+            axum::routing::any(
+                move |axum::extract::Path(path): axum::extract::Path<String>,
+                      method: axum::http::Method,
+                      body: axum::body::Bytes| {
+                    let client = client.clone();
+                    let url = format!("{upstream}/{path}");
+                    async move {
+                        let response = client.request(method, url).body(body).send().await.unwrap();
+                        (response.status(), response.bytes().await.unwrap())
+                    }
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (url, FeeSource(task))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local Bitcoin Core and electrs; scripts/regress/three_node_paid_e2e.sh"]
 async fn hub_jit_then_stateless_admission() {
     let chain = infra::Chain::start().await;
     let dirs = [(); 3].map(|_| tempfile::tempdir().unwrap());
-    let mut hub_config = infra::lightning_config(dirs[0].path(), &chain.url);
+    let (fee_url, _fee_source) = fee_source(chain.url.clone()).await;
+    let mut hub_config = infra::lightning_config(dirs[0].path(), &fee_url);
     hub_config.lsps2_service = Lsps2ServiceConfig {
         enabled: true,
         require_token: Some("regtest-private-pilot".into()),
+        funding_priority: konsensus_core::traits::lightning::FundingPriority::Economy,
+        max_funding_fee_sats: 2000,
+        max_concurrent_jit_opens: 1,
+        max_jit_capital_sats: 250000,
         forwarding_fee_ppm: 500,
         forwarding_fee_base_msat: 1000,
         ..Default::default()
@@ -45,12 +91,27 @@ async fn hub_jit_then_stateless_admission() {
     assert!(client.node().list_channels().is_empty());
     let hub = LdkProvider::new(hub_config.clone()).await.unwrap();
     let (sponsor, _) = infra::lightning(dirs[2].path(), &chain).await;
-    for node in [client.node(), hub.node(), sponsor.node()] {
+    for node in [client.node(), sponsor.node()] {
         // The client's on-chain funds preserve the anchor reserve; they do not
         // create a channel or substitute for the sponsor's Lightning top-up.
         chain.fund(node).await;
         assert!(node.config().node_alias.is_none());
     }
+    // Fund only the hub's inbound anchor reserve at first. JIT must fail
+    // without dropping its held payment, then recover once wallet funds arrive.
+    let hub_funding_addr = hub.node().onchain_payment().new_address().unwrap();
+    let _: serde_json::Value = chain
+        .bitcoin
+        .client
+        .call(
+            "sendtoaddress",
+            &[
+                serde_json::json!(hub_funding_addr.to_string()),
+                serde_json::json!(0.0005),
+            ],
+        )
+        .unwrap();
+    chain.mine(&[hub.node()], 6).await;
     sponsor
         .open_channel(&hub_id.to_string(), &hub_addr, 1_000_000, false, None)
         .await
@@ -74,6 +135,27 @@ async fn hub_jit_then_stateless_admission() {
             .pay_invoice_with_fee_limit(&invoice.bolt11, 5000)
             .await
             .unwrap();
+        wait("durable insufficient-funds open failure", || async {
+            hub.node().lsps2_service_metrics().failed_opens > 0
+        })
+        .await;
+        let pending = hub.node().lsps2_service_metrics();
+        assert_eq!(pending.pending_opens, 1);
+        assert_eq!(pending.opens, 0);
+        assert_eq!(pending.opening_fees_earned_msat, 0);
+        assert!(pending.capital_locked_sats <= 250000);
+        let _: serde_json::Value = chain
+            .bitcoin
+            .client
+            .call(
+                "sendtoaddress",
+                &[
+                    serde_json::json!(hub_funding_addr.to_string()),
+                    serde_json::json!(0.03),
+                ],
+            )
+            .unwrap();
+        chain.mine(&[hub.node()], 1).await;
         // Existing client trust flow observes the funding transaction before
         // claiming. Drive the real chain source while the zero-conf JIT opens.
         wait("JIT settlement", || async {
@@ -90,7 +172,57 @@ async fn hub_jit_then_stateless_admission() {
         invoice
     })
     .await
-    .expect("JIT quote/open/settlement must complete within 60 seconds");
+    .unwrap_or_else(|error| {
+        eprintln!(
+            "hub JIT metrics at timeout: {:?}",
+            hub.node().lsps2_service_metrics()
+        );
+        fn dump_logs(path: &std::path::Path) {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        dump_logs(&entry.path());
+                    } else if entry.file_name().to_string_lossy().contains("log") {
+                        if let Ok(log) = std::fs::read_to_string(entry.path()) {
+                            eprintln!("{}: {}", entry.path().display(), log);
+                        }
+                    }
+                }
+            }
+        }
+        dump_logs(dirs[0].path());
+        panic!("JIT quote/open/settlement must complete within 60 seconds: {error}");
+    });
+    wait("hub earned skim metrics", || async {
+        hub.node().lsps2_service_metrics().opening_fees_earned_msat == 1000000
+    })
+    .await;
+    let hub_metrics = hub.node().lsps2_service_metrics();
+    assert_eq!(hub_metrics.opens, 1);
+    assert_eq!(hub_metrics.pending_opens, 0);
+    assert!(hub_metrics.failed_opens >= 1 && hub_metrics.open_retries >= 1);
+    assert_eq!(hub_metrics.capital_locked_sats, 225000); // 198k channel + 25k reserve + 2k fee cap
+    let funding_outpoint = hub
+        .node()
+        .list_channels()
+        .into_iter()
+        .find(|c| c.counterparty_node_id == client.node().node_id())
+        .unwrap()
+        .funding_txo
+        .unwrap();
+    let entry: serde_json::Value = chain
+        .bitcoin
+        .client
+        .call(
+            "getmempoolentry",
+            &[serde_json::json!(funding_outpoint.txid.to_string())],
+        )
+        .unwrap();
+    let fee_sats = (entry["fees"]["base"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+    assert!(
+        fee_sats > 0 && fee_sats <= 2000,
+        "JIT funding exceeds owner's absolute cap: {fee_sats}"
+    );
     let receipt = client
         .liquidity_receipt(&funding.payment_hash)
         .await
@@ -164,6 +296,19 @@ async fn hub_jit_then_stateless_admission() {
     })
     .await;
 
+    let restored = hub.node().lsps2_service_metrics();
+    assert_eq!(restored.opens, hub_metrics.opens);
+    assert_eq!(
+        restored.opening_fees_earned_msat,
+        hub_metrics.opening_fees_earned_msat
+    );
+    assert_eq!(
+        restored.capital_locked_sats,
+        hub_metrics.capital_locked_sats
+    );
+    assert_eq!(restored.failed_opens, hub_metrics.failed_opens);
+    assert_eq!(restored.open_retries, hub_metrics.open_retries);
+
     // Both directions use fresh, ordinary stateless admission quotes. The app
     // pays from its JIT balance; receiving on the overprovisioned side earns
     // the hub its configured positive tariff without skimming the principal.
@@ -229,6 +374,11 @@ async fn hub_jit_then_stateless_admission() {
             invoice.payment_hash
         );
     }
+    assert_eq!(
+        hub.node().lsps2_service_metrics().opening_fees_earned_msat,
+        1000000,
+        "ordinary admission must not add any opening skim revenue"
+    );
     client.shutdown().await.unwrap();
     sponsor.shutdown().await.unwrap();
     hub.shutdown().await.unwrap();

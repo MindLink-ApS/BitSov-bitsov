@@ -87,6 +87,8 @@ mod error;
 mod event;
 mod fee_estimator;
 pub mod funding;
+mod lsps2_open;
+pub use lsps2_open::LSPS2ServiceMetrics;
 mod ffi;
 mod gossip;
 pub mod graph;
@@ -667,6 +669,8 @@ impl Node {
 			let mut stop_liquidity_handler = self.stop_sender.subscribe();
 			let liquidity_handler = Arc::clone(&liquidity_source);
 			let liquidity_logger = Arc::clone(&self.logger);
+			let liquidity_monitor = Arc::clone(&self.chain_monitor);
+			let liquidity_sweeper = Arc::clone(&self.output_sweeper);
 			self.runtime.spawn_background_task(async move {
 				loop {
 					tokio::select! {
@@ -677,7 +681,13 @@ impl Node {
 							);
 							return;
 						}
-						_ = liquidity_handler.handle_next_event() => {}
+						_ = liquidity_handler.handle_next_event() => {
+							let mut retained = liquidity_monitor.list_monitors().into_iter()
+								.map(|id| id.to_string()).collect::<std::collections::HashSet<_>>();
+							retained.extend(liquidity_sweeper.tracked_spendable_outputs().into_iter()
+								.filter_map(|output| output.channel_id.map(|id| id.to_string())));
+							liquidity_handler.maintain_jit_opens(&retained).await;
+						}
 					}
 				}
 			});
@@ -1179,6 +1189,13 @@ impl Node {
 				Err(Error::ChannelCreationFailed)
 			},
 		}
+	}
+
+	/// Durable LSPS2 service counters and conservative reserved capital.
+	pub fn lsps2_service_metrics(&self) -> LSPS2ServiceMetrics {
+		self.liquidity_source
+			.as_ref()
+			.map_or_else(LSPS2ServiceMetrics::default, |source| source.jit_metrics())
 	}
 
 	/// Read the current funding estimate. Missing/stale estimates are refused.
