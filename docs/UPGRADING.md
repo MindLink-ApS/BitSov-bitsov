@@ -191,7 +191,7 @@ Migrations **020–028** apply at first open on the new binary (rc7 ends at **01
 Confirm the live schema before upgrade; never run the old binary against the new
 SQL after migrations have applied.
 
-## Encrypted seed, `--password-file`, and custody labeling
+## Encrypted seed, password input, and custody labeling
 
 Seed encrypt and `--password-file` shipped in #153. Custody labeling and
 the remote-signer design note shipped in #154.
@@ -200,6 +200,11 @@ the remote-signer design note shipped in #154.
   cannot type into that prompt. For an encrypted seed under systemd, use the opt-in
   `--password-file <path>` (regular file, mode `0600`, owner-only, **no symlink**).
   Starting this way leaves Touch ID approvals off (`seed_password_not_typed`).
+- Launchers can use `init --password-fd <n>` (implies encryption) and
+  `start --password-fd <n>` to hand over a password through a pipe; `0` means
+  stdin. Write once, then close the writer for EOF. This avoids argv and a
+  plaintext password file, and still leaves Touch ID approvals off. See
+  [the handoff contract](operations/password-input.md) for limits and conflicts.
 - A password file is readable by any process running as that user (including a paired
   app). It protects against **other OS users**, not same-user compromise.
 - An encrypted seed on a VM the operator controls is **not** self-custody of a

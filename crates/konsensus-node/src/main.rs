@@ -2,36 +2,37 @@
 //!
 //! Entry point for `konsensus init` and `konsensus start`.
 
+mod admission_quotes;
 mod cli;
-mod logging;
 mod config;
-mod contracts;
 mod content_server;
+mod contracts;
+mod delivery_prices;
+mod guarded_lightning;
 mod housekeeping;
+mod invoice_refusals;
+mod logging;
 mod mnemonic_crypto;
 mod msg_handler;
-mod delivery_prices;
 mod node;
-mod safety;
-mod guarded_lightning;
 mod onboarding;
+#[path = "cli/owner.rs"]
+mod owner_cmd;
+mod password;
+mod peer_exchange;
 mod pending_handler;
 mod profile_handler;
 mod relay;
 mod remote_access;
-mod session_handler;
-mod peer_exchange;
-mod stun;
-mod admission_quotes;
-mod invoice_refusals;
+mod safety;
 #[path = "cli/scb_restore.rs"]
 mod scb_restore;
-#[path = "cli/whitelist.rs"]
-mod whitelist_cmd;
-#[path = "cli/owner.rs"]
-mod owner_cmd;
 #[path = "cli/seed.rs"]
 mod seed_cmd;
+mod session_handler;
+mod stun;
+#[path = "cli/whitelist.rs"]
+mod whitelist_cmd;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,12 +41,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
+use zeroize::Zeroizing;
 
-use konsensus_core::traits::transport::MessageTransport;
-use konsensus_core::types::NodeId;
 use crate::cli::{Cli, Command, RepairCommand, ScbCommand, WhitelistCommand};
 use crate::config::{NodeConfig, NodeTier};
 use crate::node::KonsensusNode;
+use konsensus_core::traits::transport::MessageTransport;
+use konsensus_core::types::NodeId;
 
 /// Bridges `konsensus_storage::Storage` → `konsensus_crypto::SessionStore`.
 ///
@@ -90,9 +92,7 @@ impl konsensus_crypto::SessionStore for StorageSessionAdapter {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
-    async fn list_sessions(
-        &self,
-    ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
         self.storage
             .list_sessions()
             .await
@@ -106,11 +106,26 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Init { dir, non_interactive, tier, encrypt } => {
-            cmd_init(&dir, non_interactive, tier.as_deref(), encrypt)?;
+        Command::Init {
+            dir,
+            non_interactive,
+            tier,
+            encrypt,
+            password_fd,
+        } => {
+            let password = password_fd.map(password::read_password_fd).transpose()?;
+            cmd_init(&dir, non_interactive, tier.as_deref(), encrypt, password)?;
         }
-        Command::Start { config, password, password_file, admission_mode, owner_control } => {
-            let from_file = match &password_file {
+        Command::Start {
+            config,
+            password,
+            password_file,
+            password_fd,
+            admission_mode,
+            owner_control,
+        } => {
+            let password = password.map(Zeroizing::new);
+            let password = match &password_file {
                 Some(path) => {
                     eprintln!(
                         "WARNING: reading the recovery-phrase password from {}. Any program running as \
@@ -120,15 +135,26 @@ async fn main() -> Result<()> {
                     );
                     Some(seed_cmd::read_password_file(path)?)
                 }
-                None => None,
+                None => match password_fd {
+                    Some(fd) => Some(password::read_password_fd(fd)?),
+                    None => password,
+                },
             };
-            let password = password.as_deref().or(from_file.as_deref().map(|p| p.as_str()));
-            cmd_start(&config, password, admission_mode.as_deref(), owner_control, &file_logging).await?;
+            cmd_start(
+                &config,
+                password,
+                admission_mode.as_deref(),
+                owner_control,
+                &file_logging,
+            )
+            .await?;
         }
         Command::Approve { command } => {
             owner_cmd::cmd_approve(command).await?;
         }
-        Command::Seed { command: cli::SeedCommand::Encrypt { config } } => {
+        Command::Seed {
+            command: cli::SeedCommand::Encrypt { config },
+        } => {
             seed_cmd::cmd_seed_encrypt(&config)?;
         }
         Command::Device { command } => {
@@ -137,17 +163,44 @@ async fn main() -> Result<()> {
         Command::PairStatus { config } => {
             owner_cmd::cmd_pair_status(&config).await?;
         }
-        Command::Grant { op_id, budget, for_, per_call, recipient, yes: _, config, allow_liquidity_fees } => {
-            let flags = owner_cmd::GrantFlags { allow_liquidity_fees, budget_sats: budget, window: for_, per_call_sats: per_call, recipients: recipient };
+        Command::Grant {
+            op_id,
+            budget,
+            for_,
+            per_call,
+            recipient,
+            yes: _,
+            config,
+            allow_liquidity_fees,
+        } => {
+            let flags = owner_cmd::GrantFlags {
+                allow_liquidity_fees,
+                budget_sats: budget,
+                window: for_,
+                per_call_sats: per_call,
+                recipients: recipient,
+            };
             owner_cmd::cmd_grant(&config, &op_id, flags).await?;
         }
-        Command::GrantRevoke { client_id, all, config } => {
+        Command::GrantRevoke {
+            client_id,
+            all,
+            config,
+        } => {
             owner_cmd::cmd_grant_revoke(&config, client_id.as_deref(), all).await?;
         }
-        Command::ApproveReplacement { op_id, mnemonic, config } => {
+        Command::ApproveReplacement {
+            op_id,
+            mnemonic,
+            config,
+        } => {
             owner_cmd::cmd_approve_replacement(&config, &op_id, mnemonic.as_deref()).await?;
         }
-        Command::PairRevoke { client_id, keep_pairing, config } => {
+        Command::PairRevoke {
+            client_id,
+            keep_pairing,
+            config,
+        } => {
             owner_cmd::cmd_pair_revoke(&config, &client_id, keep_pairing).await?;
         }
         Command::PairWindow { seconds, config } => {
@@ -158,10 +211,19 @@ async fn main() -> Result<()> {
                 owner_cmd::cmd_repair_mark_initialized(&config, confirm)?;
             }
         },
-        Command::Restore { dir, mnemonic, tier, encrypt } => {
+        Command::Restore {
+            dir,
+            mnemonic,
+            tier,
+            encrypt,
+        } => {
             cmd_restore(&dir, mnemonic.as_deref(), tier.as_deref(), encrypt)?;
         }
-        Command::NodeId { mnemonic, config, passphrase } => {
+        Command::NodeId {
+            mnemonic,
+            config,
+            passphrase,
+        } => {
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
             cmd_node_id(&mnemonic_path, &passphrase)?;
         }
@@ -215,7 +277,14 @@ async fn main() -> Result<()> {
 }
 
 /// `konsensus init` — generate identity and create config file.
-fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: Option<Option<String>>) -> Result<()> {
+fn cmd_init(
+    dir: &Path,
+    non_interactive: bool,
+    tier_arg: Option<&str>,
+    encrypt: Option<Option<String>>,
+    password: Option<Zeroizing<String>>,
+) -> Result<()> {
+    let encrypt = encrypt.map(|value| value.map(Zeroizing::new));
     use crate::config::NodeTier;
 
     // Create directory if needed
@@ -251,8 +320,8 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
     };
 
     // Generate new identity
-    let (mnemonic, identity) = konsensus_core::NodeIdentity::generate()
-        .context("failed to generate identity")?;
+    let (mnemonic, identity) =
+        konsensus_core::NodeIdentity::generate().context("failed to generate identity")?;
 
     // In interactive mode, display the mnemonic and require 3-word confirmation.
     // Relay/cloud compatibility never means operator-held keys.
@@ -260,28 +329,31 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
         confirm_mnemonic_backup(&mnemonic)?;
     }
 
-    // Determine encryption password
-    let password: Option<String> = match &encrypt {
-        Some(Some(pw)) => Some(pw.clone()),
-        Some(None) if !non_interactive => {
-            // Prompt for password interactively
+    // Descriptor input implies encryption; clap rejects combining it with
+    // --encrypt. All owned password buffers are scrubbed on errors as well.
+    let password = match (password, encrypt) {
+        (Some(pw), _) | (None, Some(Some(pw))) => Some(pw),
+        (None, Some(None)) if !non_interactive => {
             println!("Enter a password to encrypt your mnemonic (leave empty for plaintext):");
-            let mut pw = String::new();
-            std::io::stdin().read_line(&mut pw)?;
-            let pw = pw.trim().to_string();
-            if pw.is_empty() { None } else { Some(pw) }
+            let mut raw = Zeroizing::new(String::new());
+            std::io::stdin().read_line(&mut raw)?;
+            let pw = Zeroizing::new(raw.trim().to_owned());
+            if pw.is_empty() {
+                None
+            } else {
+                Some(pw)
+            }
         }
         _ => None,
     };
-    let password_ref = password.as_deref();
 
-    // Write mnemonic to file (encrypted if password provided)
     let final_mnemonic_path = mnemonic_crypto::write_mnemonic(
         &mnemonic_path,
         &mnemonic,
-        password_ref,
+        password.as_deref().map(String::as_str),
     )
     .with_context(|| format!("failed to write mnemonic to {}", mnemonic_path.display()))?;
+    drop(password); // Last use: do not retain the password during config I/O.
 
     // Generate tier-specific config
     let config = NodeConfig::default_for_tier(tier, final_mnemonic_path.clone(), dir);
@@ -329,7 +401,9 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
             println!("Next steps:");
             println!("  1. Use embedded LDK or set up your own LND for Lightning payments");
             println!("  2. Edit {} to configure:", config_path.display());
-            println!("     - Keep lightning backend 'ldk', or use 'lnd' for direct LND REST access");
+            println!(
+                "     - Keep lightning backend 'ldk', or use 'lnd' for direct LND REST access"
+            );
             println!("     - Chain backend is set to 'esplora'; use your own provider for full sovereignty");
             println!("     - Storage encryption is ON by default");
             println!("  3. Run: konsensus start -c {}", config_path.display());
@@ -340,7 +414,12 @@ fn cmd_init(dir: &Path, non_interactive: bool, tier_arg: Option<&str>, encrypt: 
 }
 
 /// `konsensus restore` — recover a node from an existing mnemonic.
-fn cmd_restore(dir: &Path, mnemonic_arg: Option<&str>, tier_arg: Option<&str>, encrypt: Option<Option<String>>) -> Result<()> {
+fn cmd_restore(
+    dir: &Path,
+    mnemonic_arg: Option<&str>,
+    tier_arg: Option<&str>,
+    encrypt: Option<Option<String>>,
+) -> Result<()> {
     use crate::config::NodeTier;
 
     std::fs::create_dir_all(dir)
@@ -375,7 +454,12 @@ fn cmd_restore(dir: &Path, mnemonic_arg: Option<&str>, tier_arg: Option<&str>, e
                  A standard recovery phrase is 12 or 24 words."
             );
         }
-        if word_count != 12 && word_count != 15 && word_count != 18 && word_count != 21 && word_count != 24 {
+        if word_count != 12
+            && word_count != 15
+            && word_count != 18
+            && word_count != 21
+            && word_count != 24
+        {
             anyhow::bail!(
                 "invalid word count ({word_count}). BIP-39 mnemonics must be \
                  12, 15, 18, 21, or 24 words."
@@ -385,11 +469,10 @@ fn cmd_restore(dir: &Path, mnemonic_arg: Option<&str>, tier_arg: Option<&str>, e
     };
 
     // Derive identity — validates BIP-39 checksum and derives all keys
-    let identity = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, "")
-        .context(
-            "invalid mnemonic — BIP-39 checksum failed. Please check for \
-             typos or missing/extra words in your recovery phrase."
-        )?;
+    let identity = konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, "").context(
+        "invalid mnemonic — BIP-39 checksum failed. Please check for \
+             typos or missing/extra words in your recovery phrase.",
+    )?;
 
     // Select tier
     let tier = if let Some(t) = tier_arg {
@@ -397,7 +480,10 @@ fn cmd_restore(dir: &Path, mnemonic_arg: Option<&str>, tier_arg: Option<&str>, e
             "cloud" => NodeTier::Cloud,
             "light" => NodeTier::Light,
             "full" => NodeTier::Full,
-            other => anyhow::bail!("unknown tier '{}'. Valid options: cloud, light, full", other),
+            other => anyhow::bail!(
+                "unknown tier '{}'. Valid options: cloud, light, full",
+                other
+            ),
         }
     } else {
         prompt_tier_selection()?
@@ -413,15 +499,20 @@ fn cmd_restore(dir: &Path, mnemonic_arg: Option<&str>, tier_arg: Option<&str>, e
             io::stdout().flush()?;
             io::stdin().lock().read_line(&mut pw)?;
             let pw = pw.trim().to_string();
-            if pw.is_empty() { None } else { Some(pw) }
+            if pw.is_empty() {
+                None
+            } else {
+                Some(pw)
+            }
         }
         _ => None,
     };
     let password_ref = password.as_deref();
 
     // Write mnemonic to file
-    let final_mnemonic_path = mnemonic_crypto::write_mnemonic(&mnemonic_path, &mnemonic, password_ref)
-        .with_context(|| format!("failed to write mnemonic to {}", mnemonic_path.display()))?;
+    let final_mnemonic_path =
+        mnemonic_crypto::write_mnemonic(&mnemonic_path, &mnemonic, password_ref)
+            .with_context(|| format!("failed to write mnemonic to {}", mnemonic_path.display()))?;
 
     // Generate tier-specific config
     let config = NodeConfig::default_for_tier(tier, final_mnemonic_path.clone(), dir);
@@ -577,7 +668,10 @@ fn confirm_mnemonic_backup(mnemonic: &str) -> Result<()> {
 
         if attempt < max_attempts {
             println!();
-            println!("  One or more words didn't match. Please try again ({}/{}).", attempt, max_attempts);
+            println!(
+                "  One or more words didn't match. Please try again ({}/{}).",
+                attempt, max_attempts
+            );
             println!();
         }
     }
@@ -594,10 +688,7 @@ fn confirm_mnemonic_backup(mnemonic: &str) -> Result<()> {
 /// When `--config` is provided, reads the config file and extracts
 /// `identity.mnemonic_file`. This is more ergonomic for scripts that
 /// already know the config path but not the mnemonic location.
-fn resolve_mnemonic_path(
-    mnemonic: Option<PathBuf>,
-    config: Option<PathBuf>,
-) -> Result<PathBuf> {
+fn resolve_mnemonic_path(mnemonic: Option<PathBuf>, config: Option<PathBuf>) -> Result<PathBuf> {
     match (mnemonic, config) {
         (Some(m), _) => Ok(m),
         (None, Some(c)) => {
@@ -686,7 +777,9 @@ fn owner_approval_key(
     password_typed: bool,
     node_id_hex: &str,
 ) -> std::result::Result<ed25519_dalek::VerifyingKey, &'static str> {
-    use konsensus_api::pairing::device::{OWNER_KEY_UNAVAILABLE, SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
+    use konsensus_api::pairing::device::{
+        OWNER_KEY_UNAVAILABLE, SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED,
+    };
     let path = &config.identity.mnemonic_file;
     if !mnemonic_crypto::is_encrypted_path(path) || path.with_extension("txt").exists() {
         return Err(SEED_NOT_ENCRYPTED);
@@ -695,8 +788,10 @@ fn owner_approval_key(
         return Err(SEED_PASSWORD_NOT_TYPED);
     }
     let password = password.ok_or(OWNER_KEY_UNAVAILABLE)?;
-    let mnemonic = mnemonic_crypto::read_mnemonic(path, Some(password)).map_err(|_| OWNER_KEY_UNAVAILABLE)?;
-    let secret = mnemonic_crypto::owner_secret(password, node_id_hex).map_err(|_| OWNER_KEY_UNAVAILABLE)?;
+    let mnemonic =
+        mnemonic_crypto::read_mnemonic(path, Some(password)).map_err(|_| OWNER_KEY_UNAVAILABLE)?;
+    let secret =
+        mnemonic_crypto::owner_secret(password, node_id_hex).map_err(|_| OWNER_KEY_UNAVAILABLE)?;
     konsensus_core::OwnerApprovalKey::from_mnemonic(&mnemonic, &config.identity.passphrase, &secret)
         .map(|k| k.verifying_key())
         .map_err(|_| OWNER_KEY_UNAVAILABLE)
@@ -722,19 +817,20 @@ fn custody_mode(config: &NodeConfig) -> konsensus_api::custody::CustodyMode {
 /// `konsensus start` — boot the node.
 async fn cmd_start(
     config_path: &Path,
-    password: Option<&str>,
+    password: Option<Zeroizing<String>>,
     admission_mode: Option<&str>,
     owner_control: bool,
     file_logging: &logging::FileLogging,
 ) -> Result<()> {
-    // A password given by flag or file was not typed here; see owner_approval_key.
+    // A password given by flag, file or descriptor was not typed here; see owner_approval_key.
     let password_typed = password.is_none();
     // Relative configs must become absolute before any parent()/data_dir use.
     let config_path = owner_cmd::absolute_config_path(config_path)?;
     let config_path = config_path.as_path();
     let (startup_mode, mut config) = owner_cmd::prepare_start(config_path)
         .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
-    file_logging.enable(&config_path.with_file_name("node.log"), config.logging)
+    file_logging
+        .enable(&config_path.with_file_name("node.log"), config.logging)
         .context("failed to initialize bounded node logging")?;
 
     // ── First-run / partial-state gate (#76) ───────────────────────
@@ -749,6 +845,7 @@ async fn cmd_start(
     let data_dir = owner_cmd::data_dir_of(config_path);
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
+            drop(password);
             return owner_cmd::serve_bootstrap_mode(config_path, &config).await;
         }
         konsensus_api::bootstrap::StartupMode::Initialized => {}
@@ -781,18 +878,19 @@ async fn cmd_start(
     // If the mnemonic file is encrypted and no password was provided via CLI,
     // prompt interactively. This avoids silently using an empty password which
     // would produce a decryption error.
-    let mnemonic_password: Option<String> = if mnemonic_crypto::is_encrypted_path(&config.identity.mnemonic_file) {
+    let mnemonic_password = if mnemonic_crypto::is_encrypted_path(&config.identity.mnemonic_file) {
         match password {
-            Some(pw) => Some(pw.to_string()),
+            Some(pw) => Some(pw),
             None => {
                 eprintln!("Encrypted mnemonic file detected. Enter password:");
-                let pw = rpassword::read_password()
-                    .context("failed to read password from stdin")?;
-                Some(pw)
+                Some(Zeroizing::new(
+                    rpassword::read_password().context("failed to read password from terminal")?,
+                ))
             }
         }
     } else {
-        password.map(String::from)
+        drop(password);
+        None
     };
 
     info!(
@@ -808,9 +906,7 @@ async fn cmd_start(
     // Poll signals independently of startup/cleanup I/O so the process deadline
     // also covers a stalled startup and Tokio's blocking-pool teardown.
     let signal_task = tokio::spawn(shutdown_signal()?);
-    let shutdown_signal = async move {
-        signal_task.await.context("shutdown signal task failed")?
-    };
+    let shutdown_signal = async move { signal_task.await.context("shutdown signal task failed")? };
     tokio::pin!(shutdown_signal);
     let node = tokio::select! {
         biased;
@@ -819,7 +915,7 @@ async fn cmd_start(
             info!(code = "BOOT_CANCELLED", "startup cancelled before readiness");
             return Ok(());
         }
-        result = KonsensusNode::from_config(config.clone(), mnemonic_password.as_deref()) => {
+        result = KonsensusNode::from_config(config.clone(), mnemonic_password.as_deref().map(String::as_str)) => {
             result.context("failed to build node")?
         }
     };
@@ -827,10 +923,21 @@ async fn cmd_start(
     info!(node_id = %node.node_id(), "node built");
 
     let services = start_node_services(
-        &node, &config, config_path, data_dir, mnemonic_password.as_deref(),
-        password_typed, owner_control,
+        &node,
+        &config,
+        config_path,
+        data_dir,
+        mnemonic_password,
+        password_typed,
+        owner_control,
     );
-    run_node_lifecycle(services, &mut shutdown_signal, || node.shutdown(), node.lightning().as_ref()).await?;
+    run_node_lifecycle(
+        services,
+        &mut shutdown_signal,
+        || node.shutdown(),
+        node.lightning().as_ref(),
+    )
+    .await?;
     info!("konsensus node stopped");
     Ok(())
 }
@@ -842,7 +949,7 @@ async fn start_node_services<'a>(
     config: &'a NodeConfig,
     config_path: &Path,
     data_dir: PathBuf,
-    mnemonic_password: Option<&str>,
+    mnemonic_password: Option<Zeroizing<String>>,
     password_typed: bool,
     owner_control: bool,
 ) -> Result<(
@@ -858,8 +965,7 @@ async fn start_node_services<'a>(
         Ok(balance_msat) => {
             info!(
                 backend = lightning_backend,
-                balance_msat,
-                "lightning health check passed"
+                balance_msat, "lightning health check passed"
             );
         }
         Err(e) => {
@@ -919,19 +1025,16 @@ async fn start_node_services<'a>(
 
     // Build API state
     let (ws_tx, _ws_rx) = broadcast::channel::<Arc<konsensus_api::state::WsMessage>>(512);
-    let (ws_delivery_tx, _ws_delivery_rx) = broadcast::channel::<Arc<konsensus_api::state::WsDeliveryStatus>>(128);
+    let (ws_delivery_tx, _ws_delivery_rx) =
+        broadcast::channel::<Arc<konsensus_api::state::WsDeliveryStatus>>(128);
 
     // JWT secret: use configured value, or derive deterministically from identity
     // so that tokens survive node restarts without exposing secrets in config.
-    let jwt_secret = config
-        .api
-        .jwt_secret
-        .clone()
-        .unwrap_or_else(|| {
-            let derived = node.identity().derive_jwt_secret();
-            debug!("derived JWT secret from node identity (tokens survive restart)");
-            hex::encode(derived)
-        });
+    let jwt_secret = config.api.jwt_secret.clone().unwrap_or_else(|| {
+        let derived = node.identity().derive_jwt_secret();
+        debug!("derived JWT secret from node identity (tokens survive restart)");
+        hex::encode(derived)
+    });
 
     // Rate limiter
     let rate_limiter = Arc::new(konsensus_api::RateLimiter::new(config.api.rate_limit_rps));
@@ -1012,10 +1115,11 @@ async fn start_node_services<'a>(
     // Otherwise they are off node-wide, with the reason the app shows.
     let device_authority = owner_approval_key(
         config,
-        mnemonic_password,
+        mnemonic_password.as_deref().map(String::as_str),
         password_typed,
         &node.identity().node_id().to_hex(),
     );
+    drop(mnemonic_password); // Last use, before serving the long-running node.
     let pairing_service = Arc::new({
         let service = konsensus_api::pairing::PairingService::open(
             &data_dir,
@@ -1052,14 +1156,13 @@ async fn start_node_services<'a>(
 
     // Calls: bind the owner's STUN responder before the API reports its port.
     // A configured address that cannot be bound fails boot, like the P2P port.
-    let stun_socket = match config.calls.stun_listen {
-        Some(addr) => Some(
-            stun::bind(addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("[calls] stun_listen {addr} could not be bound: {e}"))?,
-        ),
-        None => None,
-    };
+    let stun_socket =
+        match config.calls.stun_listen {
+            Some(addr) => Some(stun::bind(addr).await.map_err(|e| {
+                anyhow::anyhow!("[calls] stun_listen {addr} could not be bound: {e}")
+            })?),
+            None => None,
+        };
 
     // Peer endpoint for introductions and front-door cards. A configured one
     // (advertised_addr, else a concrete listen_addr) is final. Otherwise, with
@@ -1075,14 +1178,21 @@ async fn start_node_services<'a>(
         configured_source,
         discovered: Default::default(),
     };
-    let stun_discovery = match (&introduction.configured_endpoint, config.network.stun_server_addr()) {
+    let stun_discovery = match (
+        &introduction.configured_endpoint,
+        config.network.stun_server_addr(),
+    ) {
         (None, Ok(Some(server))) => {
-            introduction.set_discovered(konsensus_api::handlers::introduction::PeerEndpointView::missing(
-                konsensus_api::handlers::introduction::reason::STUN_PENDING,
-            ));
+            introduction.set_discovered(
+                konsensus_api::handlers::introduction::PeerEndpointView::missing(
+                    konsensus_api::handlers::introduction::reason::STUN_PENDING,
+                ),
+            );
             let peer_port = config.network.listen_addr.port();
             let family = stun::ListenerFamily::of(config.network.listen_addr);
-            let first = stun::discover_peer_endpoint(&server, peer_port, stun::ATTEMPT_TIMEOUT, family).await;
+            let first =
+                stun::discover_peer_endpoint(&server, peer_port, stun::ATTEMPT_TIMEOUT, family)
+                    .await;
             let ok = stun::record(&introduction, first);
             Some((server, peer_port, family, ok))
         }
@@ -1098,7 +1208,8 @@ async fn start_node_services<'a>(
         pricing: Arc::clone(node.pricing()),
         gate: Arc::clone(node.gate()),
         peer_registry: Arc::clone(node.peer_registry()),
-        transport: Arc::clone(node.transport()) as Arc<dyn konsensus_core::traits::transport::MessageTransport>,
+        transport: Arc::clone(node.transport())
+            as Arc<dyn konsensus_core::traits::transport::MessageTransport>,
         session_manager,
         jwt_secret,
         file_staging: Default::default(),
@@ -1153,75 +1264,81 @@ async fn start_node_services<'a>(
         ),
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
-        stun_port: stun_socket.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()),
+        stun_port: stun_socket
+            .as_ref()
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.port()),
         custody_mode: custody_mode(config),
     });
 
     // Public remote access is Noise only. Decrypted bytes go to an ephemeral
     // loopback router that deliberately omits `/api/v1/auth/local`.
-    let (remote_internal_handle, remote_access_handle) =
-        if config.remote_access.listen_addr.is_some() {
-            let internal_listener =
-                tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-                    .await
-                    .context("failed to bind internal remote API listener")?;
-            let internal_addr = internal_listener
-                .local_addr()
-                .context("failed to read internal remote API address")?;
-            let tunnel_clients = Arc::new(konsensus_api::rate_limit::RemoteTunnelClients::default());
-            let server = remote_access::RemoteAccessServer::bind(
-                &config.remote_access,
-                Arc::clone(node.identity()),
-                Arc::clone(&pairing_service),
-                internal_addr,
-                Arc::clone(&tunnel_clients),
-            )
-            .await?;
-            let public_addr = server.local_addr()?;
-            if let Some(path) = server.pair_link_path() {
-                let expires_secs = server
-                    .pairing_expires_in()
-                    .map_or(0, |duration| duration.as_secs());
-                println!(
-                    "Remote pairing is available once at protected file {} (expires in {} seconds).",
-                    path.display(),
-                    expires_secs
-                );
-            }
-            info!(%public_addr, "remote access Noise listener started");
+    let (remote_internal_handle, remote_access_handle) = if config
+        .remote_access
+        .listen_addr
+        .is_some()
+    {
+        let internal_listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .context("failed to bind internal remote API listener")?;
+        let internal_addr = internal_listener
+            .local_addr()
+            .context("failed to read internal remote API address")?;
+        let tunnel_clients = Arc::new(konsensus_api::rate_limit::RemoteTunnelClients::default());
+        let server = remote_access::RemoteAccessServer::bind(
+            &config.remote_access,
+            Arc::clone(node.identity()),
+            Arc::clone(&pairing_service),
+            internal_addr,
+            Arc::clone(&tunnel_clients),
+        )
+        .await?;
+        let public_addr = server.local_addr()?;
+        if let Some(path) = server.pair_link_path() {
+            let expires_secs = server
+                .pairing_expires_in()
+                .map_or(0, |duration| duration.as_secs());
+            println!(
+                "Remote pairing is available once at protected file {} (expires in {} seconds).",
+                path.display(),
+                expires_secs
+            );
+        }
+        info!(%public_addr, "remote access Noise listener started");
 
-            let remote_limiter = Arc::new(konsensus_api::RateLimiter::new(
-                config.api.rate_limit_rps,
-            ));
-            let remote_router = konsensus_api::build_remote_router_with_limiter(
-                Arc::clone(&api_state),
-                remote_limiter,
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                tunnel_clients,
-                konsensus_api::rate_limit::remote_tunnel_identity,
-            ))
-            .into_make_service_with_connect_info::<std::net::SocketAddr>();
-            let mut internal_shutdown = node.shutdown_rx();
-            let internal_handle = tokio::spawn(async move {
-                if let Err(error) = axum::serve(internal_listener, remote_router)
-                    .with_graceful_shutdown(async move {
-                        let _ = internal_shutdown.changed().await;
-                    })
-                    .await
-                {
-                    error!(%error, "internal remote API listener failed");
-                }
-            });
-            let remote_handle = tokio::spawn(server.serve(node.shutdown_rx()));
-            (Some(internal_handle), Some(remote_handle))
-        } else {
-            (None, None)
-        };
+        let remote_limiter = Arc::new(konsensus_api::RateLimiter::new(config.api.rate_limit_rps));
+        let remote_router =
+            konsensus_api::build_remote_router_with_limiter(Arc::clone(&api_state), remote_limiter)
+                .layer(axum::middleware::from_fn_with_state(
+                    tunnel_clients,
+                    konsensus_api::rate_limit::remote_tunnel_identity,
+                ))
+                .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let mut internal_shutdown = node.shutdown_rx();
+        let internal_handle = tokio::spawn(async move {
+            if let Err(error) = axum::serve(internal_listener, remote_router)
+                .with_graceful_shutdown(async move {
+                    let _ = internal_shutdown.changed().await;
+                })
+                .await
+            {
+                error!(%error, "internal remote API listener failed");
+            }
+        });
+        let remote_handle = tokio::spawn(server.serve(node.shutdown_rx()));
+        (Some(internal_handle), Some(remote_handle))
+    } else {
+        (None, None)
+    };
 
     // Calls: the owner's STUN binding responder, if configured.
     let stun_handle = stun_socket.map(|socket| {
-        tokio::spawn(stun::serve(socket, stun::Limits::default(), node.shutdown_rx()))
+        tokio::spawn(stun::serve(
+            socket,
+            stun::Limits::default(),
+            node.shutdown_rx(),
+        ))
     });
 
     let stun_discovery_handle = stun_discovery.map(|(server, peer_port, family, ok)| {
@@ -1246,28 +1363,28 @@ async fn start_node_services<'a>(
     // schema — that is the operator's `[MANUAL]` CREATE TABLE migration, and a
     // missing file/schema fails boot loudly rather than silently degrading.
     let relay_engine = if config.relay.enabled {
-        let store: Arc<dyn relay::RelayBindingStore> =
-            match config.relay.durable_db_path.as_deref() {
-                Some(path) => {
-                    let pool = relay::open_durable_pool(path).await.map_err(|e| {
-                        anyhow::anyhow!(
-                            "[relay] durable_db_path is set to {} but the durable store could \
+        let store: Arc<dyn relay::RelayBindingStore> = match config.relay.durable_db_path.as_deref()
+        {
+            Some(path) => {
+                let pool = relay::open_durable_pool(path).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "[relay] durable_db_path is set to {} but the durable store could \
                              not be opened ({e:?}) — run the [MANUAL] CREATE TABLE migration first",
-                            path.display()
-                        )
-                    })?;
-                    info!(path = %path.display(), "[relay] using DURABLE SQLite store");
-                    Arc::new(relay::SqliteRelayStore::new(pool))
-                }
-                None => {
-                    warn!(
-                        "[relay] enabled with a NON-DURABLE in-memory store — held mail is LOST \
+                        path.display()
+                    )
+                })?;
+                info!(path = %path.display(), "[relay] using DURABLE SQLite store");
+                Arc::new(relay::SqliteRelayStore::new(pool))
+            }
+            None => {
+                warn!(
+                    "[relay] enabled with a NON-DURABLE in-memory store — held mail is LOST \
                          on restart; smoke-test only (set [relay] durable_db_path for production \
                          relay)"
-                    );
-                    Arc::new(relay::InMemoryRelayStore::new())
-                }
-            };
+                );
+                Arc::new(relay::InMemoryRelayStore::new())
+            }
+        };
         Some(Arc::new(relay::RelayEngine::new(
             store,
             relay::RelayPolicy::inert_default(),
@@ -1279,16 +1396,25 @@ async fn start_node_services<'a>(
     // Calls: settle or release call reservations a crash left (from the
     // operation journal) before the receive loop and the outbox resend start.
     match konsensus_api::calls::recover(node.storage().as_ref()).await {
-        Ok((committed, released)) if committed + released > 0 => info!(committed, released, "recovered call reservations"),
+        Ok((committed, released)) if committed + released > 0 => {
+            info!(committed, released, "recovered call reservations")
+        }
         Ok(_) => {}
-        Err(e) => warn!(error = %e, "call state recovery failed; reservations stay for a same-operation retry"),
+        Err(e) => {
+            warn!(error = %e, "call state recovery failed; reservations stay for a same-operation retry")
+        }
     }
     // Incoming call signals still held were never admitted (refusal cleanup
     // failed, or a crash): withdraw them before anything can read them.
     match konsensus_api::calls::withdraw_held(node.storage().as_ref(), true).await {
-        Ok(n) if n > 0 => warn!(withdrawn = n, "withdrew call signals whose admission never finished"),
+        Ok(n) if n > 0 => warn!(
+            withdrawn = n,
+            "withdrew call signals whose admission never finished"
+        ),
         Ok(_) => {}
-        Err(e) => warn!(error = %e, "held call signals not withdrawn yet; they stay invisible until the next sweep"),
+        Err(e) => {
+            warn!(error = %e, "held call signals not withdrawn yet; they stay invisible until the next sweep")
+        }
     }
 
     // Incoming message handler (routes P2P messages through payment gate to storage + WS)
@@ -1302,9 +1428,9 @@ async fn start_node_services<'a>(
         chain: Arc::clone(node.chain()),
         peer_registry: Arc::clone(node.peer_registry()),
         session_manager: Arc::clone(&api_state.session_manager),
-        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(
-            Arc::clone(node.storage()),
-        )),
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(Arc::clone(
+            node.storage(),
+        ))),
         content_server: content_server.clone(),
         front_door: api_state.front_door.clone(),
         routing: Arc::clone(node.routing()),
@@ -1336,8 +1462,9 @@ async fn start_node_services<'a>(
 
     let (auto_channel_tx, auto_channel_rx) =
         tokio::sync::mpsc::channel::<onboarding::auto_channel::AutoChannelEvent>(64);
-    let auto_channel_notifier =
-        Arc::new(onboarding::notify::LocalUiNotifier::new(ws_delivery_tx.clone()));
+    let auto_channel_notifier = Arc::new(onboarding::notify::LocalUiNotifier::new(
+        ws_delivery_tx.clone(),
+    ));
     let auto_channel_handle = tokio::spawn(onboarding::auto_channel::run(
         onboarding::auto_channel::AutoChannelDeps {
             storage: Arc::clone(node.storage()),
@@ -1402,8 +1529,8 @@ async fn start_node_services<'a>(
                 mnemonic_path: config.identity.mnemonic_file.clone(),
                 replacement_guard: owner_cmd::replacement_guard(&data_dir, config),
             });
-            let server = konsensus_api::control::ControlServer::bind(&data_dir, ctx)
-                .with_context(|| {
+            let server =
+                konsensus_api::control::ControlServer::bind(&data_dir, ctx).with_context(|| {
                     format!(
                         "failed to bind the owner control socket at {}",
                         data_dir.join(konsensus_api::control::SOCKET_FILE).display()
@@ -1413,7 +1540,11 @@ async fn start_node_services<'a>(
                 socket = %server.path().display(),
                 "owner-run mode: elevation can be granted at this socket"
             );
-            tokio::spawn(server.with_approval_state(Arc::clone(&api_state)).serve(node.shutdown_rx()));
+            tokio::spawn(
+                server
+                    .with_approval_state(Arc::clone(&api_state))
+                    .serve(node.shutdown_rx()),
+            );
         }
         #[cfg(not(unix))]
         {
@@ -1573,27 +1704,77 @@ async fn start_node_services<'a>(
 
         // The lifecycle gives snapshots and task joins 10s; the final grant
         // prune runs separately even if this future is dropped at the deadline.
-        if let Err(e) = msg_handle.await { warn!(error = %e, "message handler task panicked"); }
-        if let Err(e) = pending_handle.await { warn!(error = %e, "pending delivery task panicked"); }
-        if let Err(e) = auto_channel_handle.await { warn!(error = %e, "auto-channel task panicked"); }
-        if let Err(e) = session_handle.await { warn!(error = %e, "session handler task panicked"); }
-        if let Err(e) = nonce_cleanup_handle.await { warn!(error = %e, "nonce cleanup task panicked"); }
-        if let Err(e) = pending_cleanup_handle.await { warn!(error = %e, "pending cleanup task panicked"); }
-        if let Err(e) = timestamps_cleanup_handle.await { warn!(error = %e, "timestamps cleanup task panicked"); }
-        if let Err(e) = retention_handle.await { warn!(error = %e, "retention cleanup task panicked"); }
-        if let Err(e) = price_refresh_handle.await { warn!(error = %e, "price refresh task panicked"); }
-        if let Err(e) = gossip_eviction_handle.await { warn!(error = %e, "gossip eviction task panicked"); }
-        if let Err(e) = peer_ln_cleanup_handle.await { warn!(error = %e, "peer_ln_pubkeys cleanup task panicked"); }
-        if let Err(e) = invoice_req_cleanup_handle.await { warn!(error = %e, "invoice_requests cleanup task panicked"); }
-        if let Err(e) = fiat_snapshot_handle.await { warn!(error = %e, "fiat rate snapshot task panicked"); }
-        if let Err(e) = hosting_payment_handle.await { warn!(error = %e, "operator hosting payment task panicked"); }
-        if let Err(e) = whitelist_backup_handle.await { warn!(error = %e, "whitelist backup task panicked"); }
-        if let Err(e) = api_handle.await { warn!(error = %e, "API server task panicked"); }
-        if let Err(e) = grant_cleanup_handle.await { warn!(error = %e, "grant cleanup task panicked"); }
-        if let Some(h) = stun_discovery_handle { if let Err(e) = h.await { warn!(error = %e, "STUN discovery task panicked"); } }
-        if let Some(h) = stun_handle { if let Err(e) = h.await { warn!(error = %e, "STUN responder task panicked"); } }
-        if let Some(h) = remote_access_handle { if let Err(e) = h.await { warn!(error = %e, "remote access task panicked"); } }
-        if let Some(h) = remote_internal_handle { if let Err(e) = h.await { warn!(error = %e, "internal remote API task panicked"); } }
+        if let Err(e) = msg_handle.await {
+            warn!(error = %e, "message handler task panicked");
+        }
+        if let Err(e) = pending_handle.await {
+            warn!(error = %e, "pending delivery task panicked");
+        }
+        if let Err(e) = auto_channel_handle.await {
+            warn!(error = %e, "auto-channel task panicked");
+        }
+        if let Err(e) = session_handle.await {
+            warn!(error = %e, "session handler task panicked");
+        }
+        if let Err(e) = nonce_cleanup_handle.await {
+            warn!(error = %e, "nonce cleanup task panicked");
+        }
+        if let Err(e) = pending_cleanup_handle.await {
+            warn!(error = %e, "pending cleanup task panicked");
+        }
+        if let Err(e) = timestamps_cleanup_handle.await {
+            warn!(error = %e, "timestamps cleanup task panicked");
+        }
+        if let Err(e) = retention_handle.await {
+            warn!(error = %e, "retention cleanup task panicked");
+        }
+        if let Err(e) = price_refresh_handle.await {
+            warn!(error = %e, "price refresh task panicked");
+        }
+        if let Err(e) = gossip_eviction_handle.await {
+            warn!(error = %e, "gossip eviction task panicked");
+        }
+        if let Err(e) = peer_ln_cleanup_handle.await {
+            warn!(error = %e, "peer_ln_pubkeys cleanup task panicked");
+        }
+        if let Err(e) = invoice_req_cleanup_handle.await {
+            warn!(error = %e, "invoice_requests cleanup task panicked");
+        }
+        if let Err(e) = fiat_snapshot_handle.await {
+            warn!(error = %e, "fiat rate snapshot task panicked");
+        }
+        if let Err(e) = hosting_payment_handle.await {
+            warn!(error = %e, "operator hosting payment task panicked");
+        }
+        if let Err(e) = whitelist_backup_handle.await {
+            warn!(error = %e, "whitelist backup task panicked");
+        }
+        if let Err(e) = api_handle.await {
+            warn!(error = %e, "API server task panicked");
+        }
+        if let Err(e) = grant_cleanup_handle.await {
+            warn!(error = %e, "grant cleanup task panicked");
+        }
+        if let Some(h) = stun_discovery_handle {
+            if let Err(e) = h.await {
+                warn!(error = %e, "STUN discovery task panicked");
+            }
+        }
+        if let Some(h) = stun_handle {
+            if let Err(e) = h.await {
+                warn!(error = %e, "STUN responder task panicked");
+            }
+        }
+        if let Some(h) = remote_access_handle {
+            if let Err(e) = h.await {
+                warn!(error = %e, "remote access task panicked");
+            }
+        }
+        if let Some(h) = remote_internal_handle {
+            if let Err(e) = h.await {
+                warn!(error = %e, "internal remote API task panicked");
+            }
+        }
         Ok(())
     };
     let finalize = move || {
@@ -1643,7 +1824,9 @@ fn shutdown_signal() -> Result<impl std::future::Future<Output = Result<()>>> {
             signal = sigterm.recv() => { signal.context("SIGTERM stream closed")?; }
         }
         #[cfg(not(unix))]
-        tokio::signal::ctrl_c().await.context("failed to listen for Ctrl+C")?;
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to listen for Ctrl+C")?;
         arm_shutdown_deadline();
         Ok(())
     })
@@ -1795,16 +1978,26 @@ mod whitelist_replay_tests {
 
     #[async_trait]
     impl MessageTransport for RecordingTransport {
-        async fn send(&self, _peer: &NodeId, _envelope: &UkmEnvelope) -> Result<(), TransportError> {
-            Err(TransportError::Other("not implemented in test transport".into()))
+        async fn send(
+            &self,
+            _peer: &NodeId,
+            _envelope: &UkmEnvelope,
+        ) -> Result<(), TransportError> {
+            Err(TransportError::Other(
+                "not implemented in test transport".into(),
+            ))
         }
 
         async fn recv(&self) -> Result<UkmEnvelope, TransportError> {
-            Err(TransportError::Other("not implemented in test transport".into()))
+            Err(TransportError::Other(
+                "not implemented in test transport".into(),
+            ))
         }
 
         async fn connect(&self, _peer: &NodeId, _addr: &str) -> Result<(), TransportError> {
-            Err(TransportError::Other("not implemented in test transport".into()))
+            Err(TransportError::Other(
+                "not implemented in test transport".into(),
+            ))
         }
 
         async fn disconnect(&self, _peer: &NodeId) -> Result<(), TransportError> {
@@ -1953,9 +2146,10 @@ mod whitelist_replay_tests {
             b.list_peers().await.unwrap().is_empty(),
             "fresh node must start with an empty whitelist"
         );
-        let restored = crate::whitelist_cmd::read_whitelist_backup(b.as_ref(), &backup_key, &sidecar)
-            .await
-            .expect("read sidecar");
+        let restored =
+            crate::whitelist_cmd::read_whitelist_backup(b.as_ref(), &backup_key, &sidecar)
+                .await
+                .expect("read sidecar");
         assert_eq!(restored, 1, "the REST peer row is restored");
 
         // Gate half: the REST peer lands in the boot-loaded gate whitelist (P3-2).
@@ -1971,14 +2165,10 @@ mod whitelist_replay_tests {
         // SCB alone lost.
         let transport = RecordingTransport::default();
         let registry = tokio::sync::RwLock::new(registry);
-        let replayed = replay_accepted_invite_whitelist(
-            b.as_ref(),
-            &transport,
-            &registry,
-            1_900_000_000,
-        )
-        .await
-        .expect("replay invites");
+        let replayed =
+            replay_accepted_invite_whitelist(b.as_ref(), &transport, &registry, 1_900_000_000)
+                .await
+                .expect("replay invites");
         assert_eq!(replayed, 1, "the accepted invite is replayed");
         assert!(
             registry.read().await.whitelist().contains(&inviter),
@@ -2058,31 +2248,47 @@ mod owner_key_startup_tests {
 
     fn config(password: Option<&str>) -> (tempfile::TempDir, NodeConfig) {
         let dir = tempfile::tempdir().unwrap();
-        let path = mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password).unwrap();
+        let path =
+            mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password)
+                .unwrap();
         let config = NodeConfig::default_for_tier(crate::config::NodeTier::Light, path, dir.path());
         (dir, config)
     }
 
     fn node_id() -> String {
-        konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "").unwrap().node_id().to_hex()
+        konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "")
+            .unwrap()
+            .node_id()
+            .to_hex()
     }
 
     #[test]
     fn device_approvals_stay_off_unless_the_seed_is_encrypted_and_the_password_typed() {
         // Plaintext seed: off, whatever the password.
         let (_d, plain) = config(None);
-        assert_eq!(owner_approval_key(&plain, None, true, &node_id()).unwrap_err(), SEED_NOT_ENCRYPTED);
+        assert_eq!(
+            owner_approval_key(&plain, None, true, &node_id()).unwrap_err(),
+            SEED_NOT_ENCRYPTED
+        );
         // Encrypted, but a plaintext copy is still beside it: off.
         let (dir, enc) = config(Some("correct horse"));
         std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
-        assert_eq!(owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap_err(), SEED_NOT_ENCRYPTED);
+        assert_eq!(
+            owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap_err(),
+            SEED_NOT_ENCRYPTED
+        );
         std::fs::remove_file(dir.path().join("mnemonic.txt")).unwrap();
         // Encrypted, password from a flag or file: off.
-        assert_eq!(owner_approval_key(&enc, Some("correct horse"), false, &node_id()).unwrap_err(), SEED_PASSWORD_NOT_TYPED);
+        assert_eq!(
+            owner_approval_key(&enc, Some("correct horse"), false, &node_id()).unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
         // Encrypted and typed: on, and it is exactly the key the owner CLI signs with.
         let node_key = owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap();
         let secret = mnemonic_crypto::owner_secret("correct horse", &node_id()).unwrap();
-        let cli_key = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &secret).unwrap().verifying_key();
+        let cli_key = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &secret)
+            .unwrap()
+            .verifying_key();
         assert_eq!(node_key, cli_key);
         // A wrong password yields no key at all.
         assert!(owner_approval_key(&enc, Some("wrong"), true, &node_id()).is_err());
@@ -2095,12 +2301,15 @@ mod owner_key_startup_tests {
         let (_d, enc) = config(Some("correct horse"));
         let node_key = owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap();
         for guess in [[0u8; 32], [1u8; 32]] {
-            let from_seed_only = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &guess).unwrap();
+            let from_seed_only =
+                konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &guess).unwrap();
             assert_ne!(from_seed_only.verifying_key(), node_key);
         }
         let other_password = mnemonic_crypto::owner_secret("another password", &node_id()).unwrap();
         assert_ne!(
-            konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &other_password).unwrap().verifying_key(),
+            konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &other_password)
+                .unwrap()
+                .verifying_key(),
             node_key
         );
     }
@@ -2116,7 +2325,9 @@ mod custody_mode_tests {
 
     fn config(password: Option<&str>, tier: NodeTier) -> (tempfile::TempDir, NodeConfig) {
         let dir = tempfile::tempdir().unwrap();
-        let path = mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password).unwrap();
+        let path =
+            mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password)
+                .unwrap();
         let config = NodeConfig::default_for_tier(tier, path, dir.path());
         (dir, config)
     }
@@ -2161,12 +2372,12 @@ mod custody_mode_tests {
     fn hosted_is_read_from_the_identity_section_and_omitted_when_false() {
         let (_d, c) = config(None, NodeTier::Light);
         let text = toml::to_string(&c).unwrap();
-        assert!(!text.contains("hosted"), "a default config does not mention hosted");
-        let hosted: NodeConfig = toml::from_str(&text.replace(
-            "[identity]\n",
-            "[identity]\nhosted = true\n",
-        ))
-        .unwrap();
+        assert!(
+            !text.contains("hosted"),
+            "a default config does not mention hosted"
+        );
+        let hosted: NodeConfig =
+            toml::from_str(&text.replace("[identity]\n", "[identity]\nhosted = true\n")).unwrap();
         assert!(hosted.identity.hosted);
         assert_eq!(custody_mode(&hosted), CustodyMode::HostedCustody);
     }

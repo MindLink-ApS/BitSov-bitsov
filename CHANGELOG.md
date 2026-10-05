@@ -3,6 +3,13 @@
 All notable BitSov node (`konsensus`) releases are documented here. Pre-rc8 notes
 also live on the corresponding GitHub pre-release pages.
 
+## Unreleased
+
+- Add `init/start --password-fd <n>` (`0` = stdin) for one-shot launcher password
+  handoff, with bounded UTF-8 input, mutually exclusive password sources, and
+  zeroizing buffers discarded after use. Descriptor passwords retain the existing
+  non-interactive Touch ID restrictions. See [password input](docs/operations/password-input.md).
+
 ## [0.3.0-rc8] — 2026-10-02 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Source range: `v0.3.0-rc7` (`958e399`) →
