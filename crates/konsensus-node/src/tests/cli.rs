@@ -2,6 +2,44 @@ use super::*;
 use clap::Parser;
 
 #[test]
+fn password_fd_is_available_for_start_and_init() {
+    for command in ["start", "init"] {
+        for fd in ["0", "3"] {
+            assert!(Cli::try_parse_from(["konsensus", command, "--password-fd", fd]).is_ok());
+        }
+    }
+}
+
+#[test]
+fn password_fd_rejects_invalid_numbers_and_other_password_sources() {
+    for command in ["start", "init"] {
+        for fd in ["-1", "2147483648", "stdin", ""] {
+            assert!(Cli::try_parse_from(["konsensus", command, "--password-fd", fd]).is_err());
+        }
+    }
+    for source in ["--password", "--password-file"] {
+        assert!(Cli::try_parse_from([
+            "konsensus",
+            "start",
+            "--password-fd",
+            "0",
+            source,
+            "secret"
+        ])
+        .is_err());
+    }
+    assert!(Cli::try_parse_from([
+        "konsensus",
+        "init",
+        "--password-fd",
+        "0",
+        "--encrypt",
+        "secret"
+    ])
+    .is_err());
+}
+
+#[test]
 fn parse_init_defaults() {
     let cli = Cli::parse_from(["konsensus", "init"]);
     match cli.command {
@@ -10,6 +48,7 @@ fn parse_init_defaults() {
             non_interactive,
             tier,
             encrypt,
+            ..
         } => {
             assert_eq!(dir, PathBuf::from("."));
             assert!(!non_interactive);
@@ -39,6 +78,7 @@ fn parse_init_all_flags() {
             non_interactive,
             tier,
             encrypt,
+            ..
         } => {
             assert_eq!(dir, PathBuf::from("/data/node"));
             assert!(non_interactive);
@@ -223,6 +263,7 @@ fn parse_restore_defaults() {
             mnemonic,
             tier,
             encrypt,
+            ..
         } => {
             assert_eq!(dir, PathBuf::from("."));
             assert!(mnemonic.is_none());
@@ -628,19 +669,37 @@ fn owner_approval_config_preserves_non_utf8_paths() {
 
 #[test]
 fn parse_seed_encrypt_and_password_file() {
-    let cli = Cli::parse_from(["konsensus", "seed", "encrypt", "--config", "/n/konsensus.toml"]);
+    let cli = Cli::parse_from([
+        "konsensus",
+        "seed",
+        "encrypt",
+        "--config",
+        "/n/konsensus.toml",
+    ]);
     assert!(matches!(
         cli.command,
         Command::Seed { command: crate::cli::SeedCommand::Encrypt { ref config } } if config == &PathBuf::from("/n/konsensus.toml")
     ));
     let cli = Cli::parse_from(["konsensus", "start", "--password-file", "/n/pw"]);
     match cli.command {
-        Command::Start { password_file, password, .. } => {
+        Command::Start {
+            password_file,
+            password,
+            ..
+        } => {
             assert_eq!(password_file, Some(PathBuf::from("/n/pw")));
             assert!(password.is_none());
         }
         _ => panic!("expected Start"),
     }
     // Not both.
-    assert!(Cli::try_parse_from(["konsensus", "start", "--password", "x", "--password-file", "/n/pw"]).is_err());
+    assert!(Cli::try_parse_from([
+        "konsensus",
+        "start",
+        "--password",
+        "x",
+        "--password-file",
+        "/n/pw"
+    ])
+    .is_err());
 }

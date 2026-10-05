@@ -34,6 +34,11 @@ pub enum Command {
         /// If set without a value, prompts for the password interactively.
         #[arg(long)]
         encrypt: Option<Option<String>>,
+
+        /// Encrypt using a password read once to EOF from an inherited descriptor
+        /// (0 = stdin). UTF-8, at most 4096 bytes; trailing CR/LF is removed.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with = "encrypt")]
+        password_fd: Option<i32>,
     },
 
     /// Start the node using an existing configuration.
@@ -54,6 +59,12 @@ pub enum Command {
         /// it protects the seed from other OS users only.
         #[arg(long)]
         password_file: Option<PathBuf>,
+
+        /// Read the password once to EOF from an inherited descriptor (0 = stdin).
+        /// UTF-8, at most 4096 bytes; trailing CR/LF is removed. Does not enable
+        /// Touch ID approvals. Nonzero descriptors require Unix.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with_all = ["password", "password_file"])]
+        password_fd: Option<i32>,
 
         /// Override admission mode for this run: `whitelist` (default) or `price-open`.
         /// Operator-selectable price-admission mode; this is NOT an open network.

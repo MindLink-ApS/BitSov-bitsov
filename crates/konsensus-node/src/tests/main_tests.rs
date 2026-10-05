@@ -20,7 +20,7 @@ fn init_light_tier_creates_config_and_mnemonic() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("light"), None)?;
+    cmd_init(&dir, true, Some("light"), None, None)?;
 
     let config_path = dir.join("konsensus.toml");
     let mnemonic_path = dir.join("mnemonic.txt");
@@ -42,9 +42,12 @@ fn init_full_tier_creates_config() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("full"), None)?;
+    cmd_init(&dir, true, Some("full"), None, None)?;
     let config_path = dir.join("konsensus.toml");
-    assert!(config_path.exists(), "full-tier config file must be written");
+    assert!(
+        config_path.exists(),
+        "full-tier config file must be written"
+    );
 
     // Genome #56: a fresh full-tier init must LOAD — `NodeConfig::load` runs
     // `validate()`, which fail-closes on a P2P/Lightning port collision. Until #56
@@ -77,7 +80,7 @@ fn init_cloud_tier_creates_config() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("cloud"), None)?;
+    cmd_init(&dir, true, Some("cloud"), None, None)?;
 
     let config = crate::config::NodeConfig::load(&dir.join("konsensus.toml"))?;
     assert_eq!(config.tier, crate::config::NodeTier::Cloud);
@@ -89,10 +92,10 @@ fn init_rejects_already_initialized() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("light"), None)?;
+    cmd_init(&dir, true, Some("light"), None, None)?;
 
     // Second init must fail
-    let err = cmd_init(&dir, true, Some("light"), None).unwrap_err();
+    let err = cmd_init(&dir, true, Some("light"), None, None).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("already initialized"),
@@ -106,7 +109,7 @@ fn init_rejects_unknown_tier() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    let err = cmd_init(&dir, true, Some("enterprise"), None).unwrap_err();
+    let err = cmd_init(&dir, true, Some("enterprise"), None, None).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("unknown tier"),
@@ -121,7 +124,7 @@ fn init_non_interactive_defaults_to_light() -> Result<()> {
     let dir = tmp.path().join("node");
 
     // non_interactive=true, tier_arg=None → defaults to Light
-    cmd_init(&dir, true, None, None)?;
+    cmd_init(&dir, true, None, None, None)?;
 
     let config = crate::config::NodeConfig::load(&dir.join("konsensus.toml"))?;
     assert_eq!(config.tier, crate::config::NodeTier::Light);
@@ -133,12 +136,21 @@ fn init_with_encryption_creates_enc_file() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("light"), Some(Some("test-pw".to_string())))?;
+    cmd_init(
+        &dir,
+        true,
+        Some("light"),
+        Some(Some("test-pw".to_string())),
+        None,
+    )?;
 
     let enc_path = dir.join("mnemonic.enc");
     let plain_path = dir.join("mnemonic.txt");
     assert!(enc_path.exists(), "encrypted mnemonic file must exist");
-    assert!(!plain_path.exists(), "plaintext mnemonic should not exist when encrypted");
+    assert!(
+        !plain_path.exists(),
+        "plaintext mnemonic should not exist when encrypted"
+    );
 
     // Verify it's actually encrypted (not valid UTF-8 plaintext)
     let raw = std::fs::read(&enc_path)?;
@@ -186,8 +198,13 @@ fn restore_rejects_invalid_mnemonic() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    let err = cmd_restore(&dir, Some("invalid mnemonic words that are not bip39"), Some("light"), None)
-        .unwrap_err();
+    let err = cmd_restore(
+        &dir,
+        Some("invalid mnemonic words that are not bip39"),
+        Some("light"),
+        None,
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("invalid mnemonic") || msg.contains("could not derive"),
@@ -363,7 +380,7 @@ fn init_then_node_id_matches() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("light"), None)?;
+    cmd_init(&dir, true, Some("light"), None, None)?;
 
     // Read the generated mnemonic
     let mnemonic = std::fs::read_to_string(dir.join("mnemonic.txt"))?;
@@ -387,7 +404,7 @@ fn restore_produces_same_identity_as_original() -> Result<()> {
     // Init a node
     let tmp1 = TempDir::new()?;
     let dir1 = tmp1.path().join("node");
-    cmd_init(&dir1, true, Some("light"), None)?;
+    cmd_init(&dir1, true, Some("light"), None, None)?;
 
     // Read the generated mnemonic
     let mnemonic = std::fs::read_to_string(dir1.join("mnemonic.txt"))?;
@@ -413,16 +430,13 @@ fn restore_produces_same_identity_as_original() -> Result<()> {
 
 #[tokio::test]
 async fn session_adapter_save_load_roundtrip() -> Result<()> {
-    let storage = Arc::new(
-        konsensus_storage::SqliteStorage::in_memory().await?,
-    );
+    let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await?);
     let adapter = StorageSessionAdapter {
         storage: storage as Arc<dyn konsensus_storage::Storage>,
     };
 
-    let peer_id = NodeId::from_hex(
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    )?;
+    let peer_id =
+        NodeId::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
     let state = b"test-session-state-bytes";
 
     // Save
@@ -440,16 +454,13 @@ async fn session_adapter_save_load_roundtrip() -> Result<()> {
 
 #[tokio::test]
 async fn session_adapter_delete() -> Result<()> {
-    let storage = Arc::new(
-        konsensus_storage::SqliteStorage::in_memory().await?,
-    );
+    let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await?);
     let adapter = StorageSessionAdapter {
         storage: storage as Arc<dyn konsensus_storage::Storage>,
     };
 
-    let peer_id = NodeId::from_hex(
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    )?;
+    let peer_id =
+        NodeId::from_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")?;
 
     // Save then delete
     konsensus_crypto::SessionStore::save_session(&adapter, &peer_id, b"data")
@@ -469,19 +480,15 @@ async fn session_adapter_delete() -> Result<()> {
 
 #[tokio::test]
 async fn session_adapter_list() -> Result<()> {
-    let storage = Arc::new(
-        konsensus_storage::SqliteStorage::in_memory().await?,
-    );
+    let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await?);
     let adapter = StorageSessionAdapter {
         storage: storage as Arc<dyn konsensus_storage::Storage>,
     };
 
-    let peer1 = NodeId::from_hex(
-        "1111111111111111111111111111111111111111111111111111111111111111",
-    )?;
-    let peer2 = NodeId::from_hex(
-        "2222222222222222222222222222222222222222222222222222222222222222",
-    )?;
+    let peer1 =
+        NodeId::from_hex("1111111111111111111111111111111111111111111111111111111111111111")?;
+    let peer2 =
+        NodeId::from_hex("2222222222222222222222222222222222222222222222222222222222222222")?;
 
     konsensus_crypto::SessionStore::save_session(&adapter, &peer1, b"s1")
         .await
@@ -501,16 +508,13 @@ async fn session_adapter_list() -> Result<()> {
 
 #[tokio::test]
 async fn session_adapter_load_nonexistent_returns_none() -> Result<()> {
-    let storage = Arc::new(
-        konsensus_storage::SqliteStorage::in_memory().await?,
-    );
+    let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await?);
     let adapter = StorageSessionAdapter {
         storage: storage as Arc<dyn konsensus_storage::Storage>,
     };
 
-    let peer_id = NodeId::from_hex(
-        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    )?;
+    let peer_id =
+        NodeId::from_hex("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")?;
 
     let loaded = konsensus_crypto::SessionStore::load_session(&adapter, &peer_id)
         .await
@@ -521,16 +525,13 @@ async fn session_adapter_load_nonexistent_returns_none() -> Result<()> {
 
 #[tokio::test]
 async fn session_adapter_overwrite() -> Result<()> {
-    let storage = Arc::new(
-        konsensus_storage::SqliteStorage::in_memory().await?,
-    );
+    let storage = Arc::new(konsensus_storage::SqliteStorage::in_memory().await?);
     let adapter = StorageSessionAdapter {
         storage: storage as Arc<dyn konsensus_storage::Storage>,
     };
 
-    let peer_id = NodeId::from_hex(
-        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-    )?;
+    let peer_id =
+        NodeId::from_hex("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")?;
 
     // Save initial state
     konsensus_crypto::SessionStore::save_session(&adapter, &peer_id, b"version1")
@@ -560,7 +561,13 @@ fn init_encrypted_then_read_with_wrong_password_fails() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("light"), Some(Some("correct-pw".to_string())))?;
+    cmd_init(
+        &dir,
+        true,
+        Some("light"),
+        Some(Some("correct-pw".to_string())),
+        None,
+    )?;
 
     let enc_path = dir.join("mnemonic.enc");
     let err = mnemonic_crypto::read_mnemonic(&enc_path, Some("wrong-pw"));
