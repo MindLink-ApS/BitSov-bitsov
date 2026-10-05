@@ -86,6 +86,7 @@ mod data_store;
 mod error;
 mod event;
 mod fee_estimator;
+pub mod funding;
 mod ffi;
 mod gossip;
 pub mod graph;
@@ -1109,10 +1110,12 @@ impl Node {
 		Ok(())
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn open_channel_inner(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
 		announce_for_forwarding: bool,
+		funding_policy: Option<funding::FundingPolicy>,
 	) -> Result<UserChannelId, Error> {
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
@@ -1146,7 +1149,13 @@ impl Node {
 		}
 
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
-		let user_channel_id: u128 = rand::rng().random();
+		let user_channel_id: u128 = if let Some(policy) = funding_policy {
+			let id = funding::new_policy_channel_id();
+			funding::save(self.kv_store.as_ref(), id, &policy)?;
+			id
+		} else {
+			rand::rng().random()
+		};
 
 		match self.channel_manager.create_channel(
 			peer_info.node_id,
@@ -1170,6 +1179,25 @@ impl Node {
 				Err(Error::ChannelCreationFailed)
 			},
 		}
+	}
+
+	/// Read the current funding estimate. Missing/stale estimates are refused.
+	pub fn funding_fee_quote(&self, priority: funding::FundingPriority, max_fee_sats: Option<u64>) -> Result<funding::FundingPolicy, Error> {
+		let rate = self.fee_estimator.funding_rate(priority.target())?;
+		funding::FundingPolicy::new(priority, rate, max_fee_sats)
+	}
+
+    /// Construction failure for a policy-bearing channel; no funding tx was dispatched.
+    pub fn channel_funding_failure(&self, id: UserChannelId) -> Result<Option<String>, Error> {
+        funding::failure(self.kv_store.as_ref(), id.0)
+    }
+
+	/// Open using an estimator-selected policy, durably pinned before negotiation.
+	pub fn open_channel_with_funding_policy(&self, node_id: PublicKey, address: SocketAddress,
+		amount_sats: u64, announce: bool, policy: funding::FundingPolicy,
+	) -> Result<UserChannelId, Error> {
+		if announce { may_announce_channel(&self.config).map_err(|_| Error::ChannelCreationFailed)?; }
+		self.open_channel_inner(node_id, address, amount_sats, None, None, announce, Some(policy))
 	}
 
 	fn check_sufficient_funds_for_channel(
@@ -1245,6 +1273,7 @@ impl Node {
 			push_to_counterparty_msat,
 			channel_config,
 			false,
+			None,
 		)
 	}
 
@@ -1285,6 +1314,7 @@ impl Node {
 			push_to_counterparty_msat,
 			channel_config,
 			true,
+			None,
 		)
 	}
 

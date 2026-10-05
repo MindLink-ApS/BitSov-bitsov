@@ -449,6 +449,16 @@ impl LightningProvider for RecoveringLightning {
         self.backend()?.open_channel_with_status(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb).await
     }
 
+    async fn funding_fee_quote(&self, options: konsensus_core::traits::lightning::FundingOptions) -> Result<konsensus_core::traits::lightning::FundingFeeEstimate, LightningError> {
+        self.backend()?.funding_fee_quote(options).await
+    }
+
+    async fn open_channel_with_funding(&self, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
+        announce: bool, options: konsensus_core::traits::lightning::FundingOptions,
+    ) -> Result<konsensus_core::traits::lightning::ChannelOpenResult, LightningError> {
+        self.backend()?.open_channel_with_funding(peer_pubkey, peer_addr, amount_sats, announce, options).await
+    }
+
     fn local_spend_diagnostics(&self) -> konsensus_core::traits::lightning::LocalSpendDiagnostics {
         self.state.read().unwrap().backend.as_ref().map(|p| p.local_spend_diagnostics()).unwrap_or_default()
     }

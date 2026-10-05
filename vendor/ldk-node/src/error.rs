@@ -117,6 +117,8 @@ pub enum Error {
 	InvalidDateTime,
 	/// The given fee rate is invalid.
 	InvalidFeeRate,
+	/// The unsigned funding transaction exceeds the owner's absolute fee cap.
+	FundingFeeCapExceeded,
 	/// A payment with the given hash has already been initiated.
 	DuplicatePayment,
 	/// The provided offer was denonminated in an unsupported currency.
@@ -191,6 +193,7 @@ impl fmt::Display for Error {
 			Self::InvalidQuantity => write!(f, "The given quantity is invalid."),
 			Self::InvalidNodeAlias => write!(f, "The given node alias is invalid."),
 			Self::InvalidDateTime => write!(f, "The given date time is invalid."),
+			Self::FundingFeeCapExceeded => write!(f, "Funding fee exceeds max_funding_fee_sats; no funding transaction signed."),
 			Self::InvalidFeeRate => write!(f, "The given fee rate is invalid."),
 			Self::DuplicatePayment => {
 				write!(f, "A payment with the given hash has already been initiated.")

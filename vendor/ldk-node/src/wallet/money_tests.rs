@@ -791,3 +791,201 @@ async fn signed_pending_funding_keeps_rebroadcasting_with_bounded_backoff() {
     // Scheduling never releases wallet ownership or treats a refusal as settlement.
     assert!(node.local_spend_reservations().iter().any(|reservation| reservation.txid == tx.compute_txid()));
 }
+
+#[test]
+fn funding_policy_survives_restart_and_cache_increase_with_hard_cap() {
+	use crate::funding::{FundingPriority, FundingPolicy};
+	let dir = tempfile::tempdir().unwrap();
+	let id = crate::funding::new_policy_channel_id();
+	{
+		let node = node(dir.path());
+		fund(&node.wallet);
+		let policy = FundingPolicy::new(FundingPriority::Fast, FeeRate::from_sat_per_kwu(1250), Some(1)).unwrap();
+		crate::funding::save(node.kv_store.as_ref(), id, &policy).unwrap();
+	}
+	let node = node(dir.path());
+	node.fee_estimator.set_test_fee_rate_cache(std::collections::HashMap::from([
+		(ConfirmationTarget::OnchainPayment, FeeRate::from_sat_per_kwu(25000)),
+	]));
+	let script = node.wallet.get_new_address().unwrap().script_pubkey();
+	let err = node.wallet.create_channel_funding_transaction(script.clone(), Amount::from_sat(80_000), id, LockTime::ZERO).unwrap_err();
+	assert_eq!(err, Error::FundingFeeCapExceeded);
+	assert!(node.wallet.local_spends.lock().unwrap().reservations().is_empty());
+	let mut policy = crate::funding::load(node.kv_store.as_ref(), id).unwrap().unwrap();
+	assert_eq!(policy.fee_rate.to_sat_per_kwu(), 1250);
+	policy.max_fee_sats = Some(2000);
+	crate::funding::save(node.kv_store.as_ref(), id, &policy).unwrap();
+	let tx = node.wallet.create_channel_funding_transaction(script, Amount::from_sat(80_000), id, LockTime::ZERO).unwrap();
+	let wallet = node.wallet.inner.lock().unwrap();
+	let fee = wallet.calculate_fee(&tx).unwrap().to_sat();
+	assert!(fee <= 2000);
+	assert!(fee * 4 >= tx.weight().to_wu() * 5, "fee={fee}, weight={}", tx.weight());
+	assert!(fee < tx.vsize() as u64 * 6);
+}
+
+#[test]
+fn missing_or_corrupt_funding_policy_never_falls_back() {
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	let id = crate::funding::new_policy_channel_id();
+	let script = node.wallet.get_new_address().unwrap().script_pubkey();
+	assert!(node.wallet.create_channel_funding_transaction(script.clone(), Amount::from_sat(80_000), id, LockTime::ZERO).is_err());
+	lightning::util::persist::KVStoreSync::write(node.kv_store.as_ref(), "bitsov_funding", "", &id.to_string(), vec![1, 2]).unwrap();
+	assert!(node.wallet.create_channel_funding_transaction(script, Amount::from_sat(80_000), id, LockTime::ZERO).is_err());
+}
+
+#[test]
+fn funding_absolute_cap_accepts_exact_fee_and_refuses_one_sat_less() {
+	use crate::funding::{FundingPriority, FundingPolicy};
+	let build = |cap| {
+		let dir = tempfile::tempdir().unwrap();
+		let node = node(dir.path());
+		fund(&node.wallet);
+		let id = crate::funding::new_policy_channel_id();
+		let policy = FundingPolicy::new(FundingPriority::Normal, FeeRate::from_sat_per_kwu(1250), cap).unwrap();
+		crate::funding::save(node.kv_store.as_ref(), id, &policy).unwrap();
+		let script = node.wallet.get_new_address().unwrap().script_pubkey();
+		let result = node.wallet.create_channel_funding_transaction(script, Amount::from_sat(80_000), id, LockTime::ZERO);
+		match result {
+			Ok(tx) => Ok(node.wallet.inner.lock().unwrap().calculate_fee(&tx).unwrap().to_sat()),
+			Err(error) => {
+				assert!(node.wallet.local_spends.lock().unwrap().reservations().is_empty());
+				Err(error)
+			},
+		}
+	};
+	let fee = build(None).unwrap();
+	assert_eq!(build(Some(fee)), Ok(fee));
+	assert_eq!(build(Some(fee - 1)), Err(Error::FundingFeeCapExceeded));
+}
+
+#[test]
+fn funding_quotes_and_channel_policies_are_independent() {
+	use crate::funding::FundingPriority;
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	node.fee_estimator.set_test_fee_rate_cache(std::collections::HashMap::from([
+		(ConfirmationTarget::ChannelFunding, FeeRate::from_sat_per_kwu(1254)),
+		(ConfirmationTarget::OnchainPayment, FeeRate::from_sat_per_kwu(3000)),
+	]));
+	let normal = node.funding_fee_quote(FundingPriority::Normal, Some(2000)).unwrap();
+	let fast = node.funding_fee_quote(FundingPriority::Fast, Some(4000)).unwrap();
+	assert_eq!(normal.estimated_fee_rate_sat_per_kwu(), 1254);
+	assert_eq!(fast.estimated_fee_rate_sat_per_kwu(), 3000);
+	let normal_id = crate::funding::new_policy_channel_id();
+	let fast_id = crate::funding::new_policy_channel_id();
+	crate::funding::save(node.kv_store.as_ref(), normal_id, &normal).unwrap();
+	crate::funding::save(node.kv_store.as_ref(), fast_id, &fast).unwrap();
+	let normal_script = node.wallet.get_new_address().unwrap().script_pubkey();
+	let fast_script = node.wallet.get_new_address().unwrap().script_pubkey();
+	let a = node.wallet.create_channel_funding_transaction(normal_script, Amount::from_sat(80_000), normal_id, LockTime::ZERO).unwrap();
+	let b = node.wallet.create_channel_funding_transaction(fast_script, Amount::from_sat(80_000), fast_id, LockTime::ZERO).unwrap();
+	assert_distinct_inputs(&a, &b);
+	let wallet = node.wallet.inner.lock().unwrap();
+	let a_fee = wallet.calculate_fee(&a).unwrap().to_sat();
+	let b_fee = wallet.calculate_fee(&b).unwrap().to_sat();
+	assert!(a_fee <= 2000 && b_fee <= 4000);
+	assert!(a_fee < b_fee);
+}
+
+#[test]
+fn funding_failure_reason_survives_restart() {
+	let dir = tempfile::tempdir().unwrap();
+	let id = crate::funding::new_policy_channel_id();
+	{
+		let node = node(dir.path());
+		assert!(node.channel_funding_failure(crate::UserChannelId(id)).unwrap().is_none());
+		node.wallet.record_funding_failure(id, Error::FundingFeeCapExceeded).unwrap();
+	}
+	let node = node(dir.path());
+	let reason = node.channel_funding_failure(crate::UserChannelId(id)).unwrap().unwrap();
+	assert!(reason.contains("max_funding_fee_sats"));
+}
+
+#[test]
+fn funding_failure_is_terminal_across_restart_even_if_wallet_recovers() {
+	use crate::funding::{FundingPriority, FundingPolicy};
+	let dir = tempfile::tempdir().unwrap();
+	let id = crate::funding::new_policy_channel_id();
+	{
+		let node = node(dir.path());
+		let policy = FundingPolicy::new(FundingPriority::Normal, FeeRate::from_sat_per_kwu(1250), None).unwrap();
+		crate::funding::save(node.kv_store.as_ref(), id, &policy).unwrap();
+		// Model a construction failure already reported to the owner. Test the
+		// terminal wallet policy, not LDK event persistence (FundingGenerationReady
+		// itself is not persisted by this pinned LDK version).
+		node.wallet.record_funding_failure(id, Error::InsufficientFunds).unwrap();
+	}
+	let node = node(dir.path());
+	fund(&node.wallet); // wallet can now fund, but the refused opening must not
+	let script = node.wallet.get_new_address().unwrap().script_pubkey();
+	let result = node.wallet.create_channel_funding_transaction(script, Amount::from_sat(80_000), id, LockTime::ZERO);
+	assert!(result.is_err(), "a refused opening was funded on a repeated construction attempt");
+	assert!(node.wallet.local_spends.lock().unwrap().reservations().is_empty());
+	node.wallet.record_funding_failure(id, Error::WalletOperationFailed).unwrap();
+	let reason = node.channel_funding_failure(crate::UserChannelId(id)).unwrap().unwrap();
+	assert_eq!(reason, Error::InsufficientFunds.to_string(), "retain the first refusal reason");
+}
+
+/// Exercise the real Esplora empty-response conversion and legacy BDK funding
+/// construction without starting a node, binding sockets, or using real funds.
+#[tokio::test]
+async fn default_funding_with_empty_non_mainnet_esplora_estimates() {
+	#[derive(Debug)]
+	struct EmptyEstimates;
+	impl esplora_client::r#async::HttpTransport for EmptyEstimates {
+		fn execute(
+			&self,
+			request: reqwest::RequestBuilder,
+		) -> std::pin::Pin<
+			Box<
+				dyn std::future::Future<Output = Result<reqwest::Response, esplora_client::Error>>
+					+ Send
+					+ '_,
+			>,
+		> {
+			assert_eq!(request.build().unwrap().url().path(), "/fee-estimates");
+			Box::pin(async {
+				Ok(http::Response::builder()
+					.status(200)
+					.body("{}")
+					.unwrap()
+					.into())
+			})
+		}
+	}
+	for network in [bitcoin::Network::Regtest, bitcoin::Network::Signet] {
+		let dir = tempfile::tempdir().unwrap();
+		let mut builder = crate::Builder::new();
+		builder.set_network(network);
+		builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+		builder.set_chain_source_esplora_with_transport(
+			"http://unused.invalid".into(),
+			None,
+			Arc::new(EmptyEstimates),
+		);
+		let node = builder.build_with_fs_store().unwrap();
+		node.chain_source.update_fee_rate_estimates().await.unwrap();
+		assert!(node
+			.funding_fee_quote(crate::funding::FundingPriority::Normal, None)
+			.is_err());
+		fund(&node.wallet);
+		let script = node.wallet.get_new_address().unwrap().script_pubkey();
+		let tx = node
+			.wallet
+			.create_channel_funding_transaction(
+				script,
+				Amount::from_sat(80_000),
+				42,
+				LockTime::ZERO,
+			)
+			.unwrap();
+		assert!(tx.input.iter().all(|input| !input.witness.is_empty()));
+		assert!(node
+			.local_spend_reservations()
+			.iter()
+			.any(|r| r.txid == tx.compute_txid()));
+	}
+}

@@ -327,15 +327,16 @@ impl EsploraChainSource {
 		let confirmation_targets = get_all_conf_targets();
 
 		let mut new_fee_rate_cache = HashMap::with_capacity(10);
+		let mut funding_targets = std::collections::HashSet::new();
 		for target in confirmation_targets {
 			let num_blocks = get_num_block_defaults_for_target(target);
 
 			// Convert the retrieved fee rate and fall back to 1 sat/vb if we fail or it
 			// yields less than that. This is mostly necessary to continue on
 			// `signet`/`regtest` where we might not get estimates (or bogus values).
-			let converted_estimate_sat_vb =
-				esplora_client::convert_fee_rate(num_blocks, estimates.clone())
-					.map_or(1.0, |converted| converted.max(1.0));
+			let raw_estimate = esplora_client::convert_fee_rate(num_blocks, estimates.clone());
+            if crate::fee_estimator::usable_funding_estimate(raw_estimate.map(f64::from)) { funding_targets.insert(target); }
+            let converted_estimate_sat_vb = raw_estimate.map_or(1.0, |converted| converted.max(1.0));
 
 			let fee_rate = FeeRate::from_sat_per_kwu((converted_estimate_sat_vb * 250.0) as u64);
 
@@ -353,7 +354,7 @@ impl EsploraChainSource {
 			);
 		}
 
-		self.fee_estimator.set_fee_rate_cache(new_fee_rate_cache);
+		self.fee_estimator.set_fee_rate_cache(new_fee_rate_cache, funding_targets);
 
 		log_info!(
 			self.logger,

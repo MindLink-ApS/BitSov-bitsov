@@ -1199,7 +1199,20 @@ fn build_with_store_internal(
 		},
 	};
 	let tx_broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
-	let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+	// Match the effective chain-source refresh cadence, including defaults when
+	// background sync is disabled (manually populated quotes still expire).
+	let background_sync = match chain_data_source_config {
+		Some(ChainDataSourceConfig::Esplora { sync_config, .. }) => {
+			sync_config.unwrap_or_default().background_sync_config
+		},
+		Some(ChainDataSourceConfig::Electrum { sync_config, .. }) => {
+			sync_config.unwrap_or_default().background_sync_config
+		},
+		_ => None,
+	}.unwrap_or_default();
+	let fee_estimator = Arc::new(OnchainFeeEstimator::new(
+		background_sync.fee_rate_cache_update_interval_secs,
+	));
 
 	let payment_store = match io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)) {
 		Ok(payments) => Arc::new(PaymentStore::new(

@@ -1142,3 +1142,42 @@ fn sync_readiness_still_requires_running_and_post_startup_syncs() {
         ));
     }
 }
+
+#[test]
+fn owner_funding_priorities_reach_the_expected_ldk_targets() {
+    use konsensus_core::traits::lightning::FundingPriority;
+    for (priority, blocks) in [(FundingPriority::Economy, 144), (FundingPriority::Normal, 12), (FundingPriority::Fast, 6)] {
+        assert_eq!(super::ldk_funding_priority(priority).confirmation_target_blocks(), blocks);
+    }
+}
+
+// A stopped real node lets us observe dispatch without opening sockets. Missing
+// estimates must not replace the legacy backend result with a quote refusal.
+#[tokio::test]
+async fn default_open_reaches_ldk_without_fee_estimates() {
+    for network in [
+        bitcoin::Network::Regtest,
+        bitcoin::Network::Signet,
+        bitcoin::Network::Bitcoin,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = ldk_node::Builder::new();
+        builder.set_network(network);
+        builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+        let node = Arc::new(builder.build().unwrap());
+        let peer = node.node_id().to_string();
+        let provider = LdkProvider::from_node(node);
+        assert!(matches!(
+            provider.funding_fee_quote(Default::default()).await,
+            Err(LightningError::PaymentNotDispatched(_))
+        ));
+        let result = provider
+            .open_channel_with_status(&peer, "127.0.0.1:9735", 100_000, false, None)
+            .await;
+        assert!(
+            matches!(result, Err(LightningError::Backend(ref reason))
+            if reason.contains(&ldk_node::NodeError::NotRunning.to_string())),
+            "{result:?}"
+        );
+    }
+}
