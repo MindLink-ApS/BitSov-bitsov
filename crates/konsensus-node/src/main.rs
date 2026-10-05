@@ -123,7 +123,17 @@ async fn main() -> Result<()> {
             password_fd,
             admission_mode,
             owner_control,
+            local_owner_device,
         } => {
+            let password_source = if password_fd.is_some() {
+                PasswordSource::Descriptor
+            } else if password_file.is_some() {
+                PasswordSource::File
+            } else if password.is_some() {
+                PasswordSource::Flag
+            } else {
+                PasswordSource::None
+            };
             let password = password.map(Zeroizing::new);
             let password = match &password_file {
                 Some(path) => {
@@ -143,8 +153,10 @@ async fn main() -> Result<()> {
             cmd_start(
                 &config,
                 password,
+                password_source,
                 admission_mode.as_deref(),
                 owner_control,
+                local_owner_device,
                 &file_logging,
             )
             .await?;
@@ -765,17 +777,35 @@ fn sign_auth_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) 
     Ok(hex::encode(signature.to_bytes()))
 }
 
+/// Provenance is authority: descriptor input is trusted only with the explicit
+/// local owner device flag. It never enables console authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PasswordSource {
+    Typed,
+    Descriptor,
+    Flag,
+    File,
+    None,
+}
+
+/// Authority selected for this invocation, never loaded from configuration.
+struct StartAuthority {
+    device_authority: std::result::Result<ed25519_dalek::VerifyingKey, &'static str>,
+    owner_control: bool,
+    local_owner_device: bool,
+}
+
 /// The owner-approval public key, or why device approvals stay off.
 ///
 /// Only an encrypted recovery phrase, with no plaintext copy beside it, whose
-/// password was typed at this start, yields a key: then a same-user program
-/// holding the files (or an old plaintext copy) cannot derive it, because the
-/// key also needs the password (see `mnemonic_crypto::owner_secret`).
+/// password was typed or supplied by descriptor with explicit local owner
+/// authority, yields a key. The local launcher must protect the password:
+/// seed plus password derives the key (see `mnemonic_crypto::owner_secret`).
 fn owner_approval_key(
     config: &NodeConfig,
     password: Option<&str>,
-    password_typed: bool,
-    node_id_hex: &str,
+    source: PasswordSource,
+    local_owner_device: bool,
 ) -> std::result::Result<ed25519_dalek::VerifyingKey, &'static str> {
     use konsensus_api::pairing::device::{
         OWNER_KEY_UNAVAILABLE, SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED,
@@ -784,14 +814,19 @@ fn owner_approval_key(
     if !mnemonic_crypto::is_encrypted_path(path) || path.with_extension("txt").exists() {
         return Err(SEED_NOT_ENCRYPTED);
     }
-    if !password_typed {
+    if source != PasswordSource::Typed
+        && !(source == PasswordSource::Descriptor && local_owner_device)
+    {
         return Err(SEED_PASSWORD_NOT_TYPED);
     }
     let password = password.ok_or(OWNER_KEY_UNAVAILABLE)?;
     let mnemonic =
         mnemonic_crypto::read_mnemonic(path, Some(password)).map_err(|_| OWNER_KEY_UNAVAILABLE)?;
-    let secret =
-        mnemonic_crypto::owner_secret(password, node_id_hex).map_err(|_| OWNER_KEY_UNAVAILABLE)?;
+    let identity =
+        konsensus_core::NodeIdentity::from_mnemonic(&mnemonic, &config.identity.passphrase)
+            .map_err(|_| OWNER_KEY_UNAVAILABLE)?;
+    let secret = mnemonic_crypto::owner_secret(password, &identity.node_id().to_hex())
+        .map_err(|_| OWNER_KEY_UNAVAILABLE)?;
     konsensus_core::OwnerApprovalKey::from_mnemonic(&mnemonic, &config.identity.passphrase, &secret)
         .map(|k| k.verifying_key())
         .map_err(|_| OWNER_KEY_UNAVAILABLE)
@@ -818,20 +853,17 @@ fn custody_mode(config: &NodeConfig) -> konsensus_api::custody::CustodyMode {
 async fn cmd_start(
     config_path: &Path,
     password: Option<Zeroizing<String>>,
+    mut password_source: PasswordSource,
     admission_mode: Option<&str>,
     owner_control: bool,
+    local_owner_device: bool,
     file_logging: &logging::FileLogging,
 ) -> Result<()> {
-    // A password given by flag, file or descriptor was not typed here; see owner_approval_key.
-    let password_typed = password.is_none();
     // Relative configs must become absolute before any parent()/data_dir use.
     let config_path = owner_cmd::absolute_config_path(config_path)?;
     let config_path = config_path.as_path();
     let (startup_mode, mut config) = owner_cmd::prepare_start(config_path)
         .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
-    file_logging
-        .enable(&config_path.with_file_name("node.log"), config.logging)
-        .context("failed to initialize bounded node logging")?;
 
     // ── First-run / partial-state gate (#76) ───────────────────────
     // Before any component is built, classify the data directory from file
@@ -845,7 +877,19 @@ async fn cmd_start(
     let data_dir = owner_cmd::data_dir_of(config_path);
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
+            // PR A is live-start only. Never silently discard the local owner's
+            // password and enter the legacy plaintext HTTP ceremony.
+            if local_owner_device {
+                anyhow::bail!(
+                    "--local-owner-device requires an initialized encrypted identity; \
+                     initialize with `konsensus init --password-fd <n>` and enroll the device \
+                     through the owner console before using local owner mode"
+                );
+            }
             drop(password);
+            file_logging
+                .enable(&config_path.with_file_name("node.log"), config.logging)
+                .context("failed to initialize bounded node logging")?;
             return owner_cmd::serve_bootstrap_mode(config_path, &config).await;
         }
         konsensus_api::bootstrap::StartupMode::Initialized => {}
@@ -883,15 +927,36 @@ async fn cmd_start(
             Some(pw) => Some(pw),
             None => {
                 eprintln!("Encrypted mnemonic file detected. Enter password:");
-                Some(Zeroizing::new(
-                    rpassword::read_password().context("failed to read password from terminal")?,
-                ))
+                let password =
+                    rpassword::read_password().context("failed to read password from terminal")?;
+                password_source = PasswordSource::Typed;
+                Some(Zeroizing::new(password))
             }
         }
     } else {
         drop(password);
         None
     };
+
+    // Validate explicit local authority before file logging, state-generation
+    // markers, wallet/storage construction or listeners can write/start.
+    let device_authority = owner_approval_key(
+        &config,
+        mnemonic_password.as_deref().map(String::as_str),
+        password_source,
+        local_owner_device,
+    );
+    if local_owner_device {
+        if let Err(reason) = device_authority {
+            anyhow::bail!(
+                "--local-owner-device requires an available owner verifier ({reason}): {}",
+                konsensus_api::pairing::device::device_approvals_off_message(reason)
+            );
+        }
+    }
+    file_logging
+        .enable(&config_path.with_file_name("node.log"), config.logging)
+        .context("failed to initialize bounded node logging")?;
 
     info!(
         config = %config_path.display(),
@@ -922,14 +987,17 @@ async fn cmd_start(
 
     info!(node_id = %node.node_id(), "node built");
 
+    drop(mnemonic_password); // Last use: retain only the public owner verifier.
     let services = start_node_services(
         &node,
         &config,
         config_path,
         data_dir,
-        mnemonic_password,
-        password_typed,
-        owner_control,
+        StartAuthority {
+            device_authority,
+            owner_control,
+            local_owner_device,
+        },
     );
     run_node_lifecycle(
         services,
@@ -949,14 +1017,17 @@ async fn start_node_services<'a>(
     config: &'a NodeConfig,
     config_path: &Path,
     data_dir: PathBuf,
-    mnemonic_password: Option<Zeroizing<String>>,
-    password_typed: bool,
-    owner_control: bool,
+    authority: StartAuthority,
 ) -> Result<(
     impl std::future::Future<Output = Result<()>>,
     impl std::future::Future<Output = Result<()>> + 'a,
     impl FnOnce() -> Result<()>,
 )> {
+    let StartAuthority {
+        device_authority,
+        owner_control,
+        local_owner_device,
+    } = authority;
     // ── Lightning health check ─────────────────────────────────────
     // Verify Lightning connectivity at startup so users get a clear
     // error message if their wallet is misconfigured.
@@ -1106,20 +1177,10 @@ async fn start_node_services<'a>(
     // different identity is rejected outright at token issuance rather than
     // downgraded. `owner_control` decides whether elevation can EVER be
     // written on this node: with the flag off there is no control socket, and
-    // every grant-writing call refuses. There is no config key, debug mode or
-    // trusted-client list that widens it.
+    // console grant-writing calls refuse. Local device envelopes have their
+    // own explicit flag; neither authority can be enabled through config.
     let identity_fingerprint =
         konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
-    // Device approvals (Touch ID) need an owner key a same-user program cannot
-    // derive: from an encrypted seed whose password was typed at this start.
-    // Otherwise they are off node-wide, with the reason the app shows.
-    let device_authority = owner_approval_key(
-        config,
-        mnemonic_password.as_deref().map(String::as_str),
-        password_typed,
-        &node.identity().node_id().to_hex(),
-    );
-    drop(mnemonic_password); // Last use, before serving the long-running node.
     let pairing_service = Arc::new({
         let service = konsensus_api::pairing::PairingService::open(
             &data_dir,
@@ -1129,6 +1190,11 @@ async fn start_node_services<'a>(
         .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?
         // The owner command the app and console show names this exact config.
         .with_owner_config(config_path.to_path_buf());
+        let service = if local_owner_device {
+            service.with_local_owner_device()
+        } else {
+            service
+        };
         match device_authority {
             Ok(key) => {
                 info!("device approvals (Touch ID) enabled: owner key from the encrypted seed");
@@ -1514,7 +1580,7 @@ async fn start_node_services<'a>(
 
     // ── Owner control socket (#76) ──────────────────────────────────
     // Started ONLY under `--owner-control`. This is the single channel that can
-    // write a spend grant or execute a live-identity replacement, and it is a
+    // write a console spend grant or execute a live-identity replacement, and it is a
     // Unix socket at mode 0600 rather than an HTTP route precisely because the
     // requesting app could call an HTTP route.
     //
@@ -2269,31 +2335,116 @@ mod owner_key_startup_tests {
         // Plaintext seed: off, whatever the password.
         let (_d, plain) = config(None);
         assert_eq!(
-            owner_approval_key(&plain, None, true, &node_id()).unwrap_err(),
+            owner_approval_key(&plain, None, PasswordSource::Typed, false).unwrap_err(),
             SEED_NOT_ENCRYPTED
         );
         // Encrypted, but a plaintext copy is still beside it: off.
         let (dir, enc) = config(Some("correct horse"));
         std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
         assert_eq!(
-            owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap_err(),
+            owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false)
+                .unwrap_err(),
             SEED_NOT_ENCRYPTED
         );
         std::fs::remove_file(dir.path().join("mnemonic.txt")).unwrap();
         // Encrypted, password from a flag or file: off.
         assert_eq!(
-            owner_approval_key(&enc, Some("correct horse"), false, &node_id()).unwrap_err(),
+            owner_approval_key(
+                &enc,
+                Some("correct horse"),
+                PasswordSource::Descriptor,
+                false
+            )
+            .unwrap_err(),
             SEED_PASSWORD_NOT_TYPED
         );
         // Encrypted and typed: on, and it is exactly the key the owner CLI signs with.
-        let node_key = owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap();
+        let node_key =
+            owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false).unwrap();
         let secret = mnemonic_crypto::owner_secret("correct horse", &node_id()).unwrap();
         let cli_key = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &secret)
             .unwrap()
             .verifying_key();
         assert_eq!(node_key, cli_key);
         // A wrong password yields no key at all.
-        assert!(owner_approval_key(&enc, Some("wrong"), true, &node_id()).is_err());
+        assert!(owner_approval_key(&enc, Some("wrong"), PasswordSource::Typed, false).is_err());
+    }
+
+    #[test]
+    fn local_owner_authority_cannot_be_enabled_by_config() {
+        let (_dir, cfg) = config(None);
+        let mut value = toml::Value::try_from(&cfg).unwrap();
+        let _: NodeConfig = value.clone().try_into().unwrap();
+        value
+            .as_table_mut()
+            .unwrap()
+            .insert("local_owner_device".into(), true.into());
+        let error = value.try_into::<NodeConfig>().unwrap_err().to_string();
+        assert!(
+            error.contains("unknown field `local_owner_device`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn local_descriptor_derives_the_typed_key_only_with_explicit_authority() {
+        let (dir, enc) = config(Some("correct horse"));
+        let typed =
+            owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false).unwrap();
+        assert_eq!(
+            owner_approval_key(
+                &enc,
+                Some("correct horse"),
+                PasswordSource::Descriptor,
+                true
+            )
+            .unwrap(),
+            typed
+        );
+        for source in [
+            PasswordSource::Descriptor,
+            PasswordSource::Flag,
+            PasswordSource::File,
+            PasswordSource::None,
+        ] {
+            assert_eq!(
+                owner_approval_key(&enc, Some("correct horse"), source, false).unwrap_err(),
+                SEED_PASSWORD_NOT_TYPED
+            );
+        }
+        for source in [
+            PasswordSource::Flag,
+            PasswordSource::File,
+            PasswordSource::None,
+        ] {
+            assert_eq!(
+                owner_approval_key(&enc, Some("correct horse"), source, true).unwrap_err(),
+                SEED_PASSWORD_NOT_TYPED
+            );
+        }
+        assert!(owner_approval_key(&enc, Some("wrong"), PasswordSource::Descriptor, true).is_err());
+        std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
+        assert_eq!(
+            owner_approval_key(
+                &enc,
+                Some("correct horse"),
+                PasswordSource::Descriptor,
+                true
+            )
+            .unwrap_err(),
+            SEED_NOT_ENCRYPTED
+        );
+        let (_dir, plain) = config(None);
+        assert_eq!(
+            owner_approval_key(
+                &plain,
+                Some("correct horse"),
+                PasswordSource::Descriptor,
+                true
+            )
+            .unwrap_err(),
+            SEED_NOT_ENCRYPTED
+        );
     }
 
     #[test]
@@ -2301,7 +2452,8 @@ mod owner_key_startup_tests {
         // Whoever copied mnemonic.txt before `seed encrypt` has the seed but not
         // the password; the owner key needs both.
         let (_d, enc) = config(Some("correct horse"));
-        let node_key = owner_approval_key(&enc, Some("correct horse"), true, &node_id()).unwrap();
+        let node_key =
+            owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false).unwrap();
         for guess in [[0u8; 32], [1u8; 32]] {
             let from_seed_only =
                 konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &guess).unwrap();

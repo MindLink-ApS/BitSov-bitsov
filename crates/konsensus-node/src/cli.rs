@@ -61,10 +61,15 @@ pub enum Command {
         password_file: Option<PathBuf>,
 
         /// Read the password once to EOF from an inherited descriptor (0 = stdin).
-        /// UTF-8, at most 4096 bytes; trailing CR/LF is removed. Does not enable
-        /// Touch ID approvals. Nonzero descriptors require Unix.
+        /// UTF-8, at most 4096 bytes; trailing CR/LF is removed. Touch ID requires
+        /// --local-owner-device too. Nonzero descriptors require Unix.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with_all = ["password", "password_file"])]
         password_fd: Option<i32>,
+
+        /// Enable existing owner-approved devices to sign recipient-bound spend envelopes.
+        /// Requires a descriptor password and an encrypted seed; does not open a console.
+        #[arg(long, requires = "password_fd", conflicts_with_all = ["password", "password_file", "owner_control"])]
+        local_owner_device: bool,
 
         /// Override admission mode for this run: `whitelist` (default) or `price-open`.
         /// Operator-selectable price-admission mode; this is NOT an open network.
@@ -73,14 +78,15 @@ pub enum Command {
         admission_mode: Option<String>,
 
         /// Run in OWNER mode: create `<data-dir>/control.sock` (mode 0600), the
-        /// only channel that can grant `spend` or replace a live identity (#76).
+        /// channel for console spend grants and live identity replacement (#76).
         ///
         /// Off by default, and deliberately explicit. A packaged sidecar app
         /// launches the node without this flag and is therefore a
         /// `read` + `receive` client that may request elevation and can never
         /// obtain it — the app owns the node's stdout and data directory, so no
         /// node-emitted secret could exclude it anyway. To spend from a client,
-        /// run the node yourself with this flag and grant deliberately.
+        /// run the node yourself with this flag and grant deliberately. Existing
+        /// owner devices can instead use --local-owner-device's limited envelopes.
         #[arg(long)]
         owner_control: bool,
     },
@@ -561,5 +567,50 @@ fn approval_code(value: &str) -> Result<String, String> {
         Ok(value)
     } else {
         Err("code must be exactly six ASCII digits".into())
+    }
+}
+
+#[cfg(test)]
+mod local_owner_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn local_owner_requires_descriptor_and_excludes_console_and_other_password_sources() {
+        assert!(Cli::try_parse_from([
+            "konsensus",
+            "start",
+            "--password-fd",
+            "0",
+            "--local-owner-device"
+        ])
+        .is_ok());
+        for args in [
+            vec!["--local-owner-device"],
+            vec!["--local-owner-device", "--password", "secret"],
+            vec!["--local-owner-device", "--password-file", "secret.txt"],
+            vec![
+                "--local-owner-device",
+                "--password-fd",
+                "0",
+                "--owner-control",
+            ],
+            vec![
+                "--local-owner-device",
+                "--password-fd",
+                "0",
+                "--password",
+                "secret",
+            ],
+            vec![
+                "--local-owner-device",
+                "--password-fd",
+                "0",
+                "--password-file",
+                "secret.txt",
+            ],
+        ] {
+            assert!(Cli::try_parse_from([vec!["konsensus", "start"], args].concat()).is_err());
+        }
     }
 }

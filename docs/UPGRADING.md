@@ -8,6 +8,21 @@ this before swapping a long-lived data directory onto the new binary. Fresh
 `konsensus init` installs do not need the retained-node repair steps. For VMs, also read **VM / multi-host
 upgrade rules** and **Encrypted seed / custody** below.
 
+## Opt-in local owner devices (unreleased)
+
+Existing console-enrolled devices can use `start --password-fd <n>
+--local-owner-device` on an initialized node. Supply the flag on every launch;
+there is no config migration or stored authority flag. It requires an encrypted
+seed without a plaintext sibling. Existing device records without `enrolled_by`
+read as `console`; the owner signature remains mandatory. Never install an
+owner public key file as a replacement for startup derivation.
+
+Without this flag, descriptor passwords keep `seed_password_not_typed` and
+sidecar grants remain inactive. The mode does not open `control.sock`, enroll
+new devices, enable console grants or alter remote rules. The flag is refused
+on uninitialized directories in PR A; ordinary first-run HTTP bootstrap is unchanged. Review [password input](operations/password-input.md),
+including the Mac launcher's signing/hardened-runtime release requirement.
+
 ## rc7 → rc8 procedure
 
 1. Record the installed version and config path. Stop the node cleanly; keep its

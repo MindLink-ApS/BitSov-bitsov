@@ -181,3 +181,17 @@ They cannot prove that local malware "can only read the balance". Any process ca
 `/auth/local` and obtain `read` + `receive` — which means reading history and generating
 addresses. The blast radius is reduced; it is not eliminated, and nobody should describe it as
 eliminated until pairing constrains *who* may obtain a token at all.
+
+## Explicit local owner device starts
+
+`start --password-fd <n> --local-owner-device` can add `spend` to a paired
+client only from a live `device:` grant with a recipient-only budget, bound to
+the same identity and epoch. Base pairing scopes cannot smuggle in grantable
+scopes. This mode never adds `front_door` or honours console (`cli`) grants.
+Device intents require an owner-approved device signature; startup derives the
+owner verifying key from the encrypted seed and descriptor password.
+
+The flag is absent by default and has no config equivalent. Console-only
+operations and the remote router's allowlist and scope rules are unchanged.
+No control socket is bound. Restarting without the flag restores the existing
+sidecar read/receive restrictions. See [device keys](device-keys.md).

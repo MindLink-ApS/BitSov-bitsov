@@ -152,6 +152,7 @@ async fn list_device_keys(
         "node": svc.bound_fingerprint(),
         "client_id": binding.client_id,
         "owner_control": svc.owner_control_enabled(),
+        "local_owner_device": svc.local_owner_device(),
         // "enabled", or the reason code device approvals are off node-wide.
         "device_approvals": svc.device_authority_off().unwrap_or("enabled"),
         "device_keys": keys,

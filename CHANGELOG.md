@@ -5,9 +5,16 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Add opt-in live-start `--local-owner-device` with `--password-fd`: derive the
+  owner verifying key at startup and allow existing owner-approved devices to
+  sign recipient-bound spend envelopes without console authority. Console-only
+  and remote rules stay unchanged. Device listing reports the local mode;
+  older device records default to `enrolled_by: "console"`. See
+  [password input](docs/operations/password-input.md) for limits and launcher trust.
+
 - Add `init/start --password-fd <n>` (`0` = stdin) for one-shot launcher password
   handoff, with bounded UTF-8 input, mutually exclusive password sources, and
-  zeroizing buffers discarded after use. Descriptor passwords retain the existing
+  zeroizing buffers discarded after use. Descriptor passwords alone retain the existing
   non-interactive Touch ID restrictions. See [password input](docs/operations/password-input.md).
 
 ## [0.3.0-rc8] — 2026-10-02 (prep; not tagged yet)

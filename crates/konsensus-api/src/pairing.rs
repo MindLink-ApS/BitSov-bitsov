@@ -58,12 +58,12 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{self, Scope, TokenError};
 
 pub mod device;
-pub use device::{
-    DeviceKey, DeviceKeyStatus, PendingDeviceKey, RelationIntent, device_confirmation_phrase,
-};
 use crate::spend_budget::{
     BudgetRefusal, Charge, GrantBudget, GrantTerms, GrantView, Reservation,
     MAX_SPEND_GRANT_TTL_SECS,
+};
+pub use device::{
+    device_confirmation_phrase, DeviceKey, DeviceKeyStatus, PendingDeviceKey, RelationIntent,
 };
 
 /// Length of the pairing challenge written under `data_dir`.
@@ -612,11 +612,11 @@ pub struct PairingService {
     inner: Mutex<Inner>,
     grant_changes: tokio::sync::Notify,
     authority_changes: tokio::sync::watch::Sender<u64>,
-    /// Whether the owner control socket exists in this deployment. When false,
-    /// every grant-writing and approval-consuming call refuses outright
-    /// (`OwnerChannelUnavailable`) — there is no debug flag, config switch or
-    /// trusted-client list that widens this.
+    /// Whether the owner control socket exists in this deployment. Console
+    /// grants and approvals require this independently of local device authority.
     owner_control_enabled: bool,
+    /// Explicit live-start authority for device-signed recipient envelopes only.
+    local_owner_device: bool,
     /// Whether a safe protected-file instruction is written to stdout. The
     /// code/challenge itself is never printed.
     print_pairing_instruction: bool,
@@ -875,6 +875,7 @@ impl PairingService {
             grant_changes: tokio::sync::Notify::new(),
             authority_changes,
             owner_control_enabled,
+            local_owner_device: false,
             print_pairing_instruction: true,
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
             owner_config: None,
@@ -885,6 +886,29 @@ impl PairingService {
         // pre-G1 grant, must not survive the restart on disk either.
         service.prune_expired_grants()?;
         Ok(service)
+    }
+
+    /// Enable device-signed recipient envelopes without enabling the owner console.
+    pub fn with_local_owner_device(mut self) -> Self {
+        self.local_owner_device = true;
+        self
+    }
+
+    /// Whether this process explicitly enables local owner devices.
+    pub fn local_owner_device(&self) -> bool {
+        self.local_owner_device
+    }
+
+    /// Deployment gate shared by scopes, grant views, staging, reservation and dispatch.
+    fn permits_spend_grant(&self, grant: &SpendGrant) -> bool {
+        self.owner_control_enabled
+            || (self.local_owner_device
+                && self.owner_approval_key.is_some()
+                && grant.granted_by.starts_with("device:")
+                && grant
+                    .budget
+                    .as_ref()
+                    .is_some_and(|budget| budget.recipients_only))
     }
 
     /// Supply a trusted owner-console transport (also used by disposable test
@@ -1804,9 +1828,6 @@ impl PairingService {
     /// Binding and grant are checked under the same lock as revoke/replacement;
     /// a new grant for the same client must not inherit the old grant's bytes.
     pub(crate) fn live_spend_grant_id(&self, binding: &auth::PairingBinding) -> Option<String> {
-        if !self.owner_control_enabled {
-            return None;
-        }
         let inner = self.lock();
         if inner.identity_fingerprint != binding.fingerprint
             || !inner.file.clients.iter().any(|client| {
@@ -1818,35 +1839,31 @@ impl PairingService {
             return None;
         }
         let now = chrono::Utc::now().timestamp();
-        inner.file.grants.iter().find(|grant| {
-            grant.client_id == binding.client_id
-                && grant.epoch == binding.epoch
-                && grant.identity_fingerprint == binding.fingerprint
-                && grant.scopes.contains(&Scope::Spend)
-                && grant.is_live(now)
-        }).map(|grant| grant.op_id.clone())
+        inner
+            .file
+            .grants
+            .iter()
+            .find(|grant| {
+                self.permits_spend_grant(grant)
+                    && grant.client_id == binding.client_id
+                    && grant.epoch == binding.epoch
+                    && grant.identity_fingerprint == binding.fingerprint
+                    && grant.scopes.contains(&Scope::Spend)
+                    && grant.is_live(now)
+            })
+            .map(|grant| grant.op_id.clone())
     }
 
     /// The scopes a pairing actually carries **in this deployment**, computed
     /// identically at issuance and at per-request verification.
     ///
-    /// A durable grant is honoured only while an owner control socket exists.
-    /// The grant file is shared by every process that opens the same data
-    /// directory, so an owner-run node that granted `spend` and a packaged
-    /// sidecar reopening that directory afterwards see the same record; the
-    /// sidecar must not honour it (elevation lock: a sidecar is read+receive
-    /// only). The grant is left on disk untouched — it is the owner's, and it
-    /// applies again the next time the owner runs the node with the control
-    /// socket — it simply never reaches a sidecar token.
-    ///
-    /// Belt and braces: in sidecar mode every grantable scope is stripped from
-    /// the result even if a hand-edited pairing record carries one, because the
-    /// only way such a scope can legitimately exist is an owner grant.
+    /// Console grants require owner control. A local owner device start can
+    /// honour only device-granted, recipient-only spend budgets. Grantable
+    /// scopes embedded in a base pairing record never widen sidecar authority.
     fn effective_scopes(&self, inner: &Inner, record: &PairedClient, now_unix: i64) -> Vec<Scope> {
         let mut scopes = record.scopes.clone();
         if !self.owner_control_enabled {
             scopes.retain(|s| !grantable_scopes().contains(s));
-            return scopes;
         }
         for grant in &inner.file.grants {
             if grant.client_id == record.client_id
@@ -1855,18 +1872,22 @@ impl PairingService {
                 && grant.identity_fingerprint == inner.identity_fingerprint
             {
                 for s in &grant.scopes {
-                    if !scopes.contains(s) {
+                    if !scopes.contains(s)
+                        && (self.owner_control_enabled
+                            || (*s == Scope::Spend && self.permits_spend_grant(grant)))
+                    {
                         scopes.push(*s);
                     }
                 }
             }
         }
-        let front_door = inner.file.front_door_grants.iter().any(|g| {
-            g.client_id == record.client_id
-                && g.is_live(now_unix)
-                && g.epoch == record.epoch
-                && g.identity_fingerprint == inner.identity_fingerprint
-        });
+        let front_door = self.owner_control_enabled
+            && inner.file.front_door_grants.iter().any(|g| {
+                g.client_id == record.client_id
+                    && g.is_live(now_unix)
+                    && g.epoch == record.epoch
+                    && g.identity_fingerprint == inner.identity_fingerprint
+            });
         if front_door && !scopes.contains(&Scope::FrontDoor) {
             scopes.push(Scope::FrontDoor);
         }
@@ -2639,7 +2660,6 @@ impl PairingService {
         authority: ReservationAuthority<'_>,
         mut clock: impl FnMut() -> i64,
     ) -> Result<Reservation, BudgetRefusal> {
-        if !self.owner_control_enabled { return Err(BudgetRefusal::NoGrant); }
         let now = clock();
         let fingerprint = inner.identity_fingerprint.clone();
         let current_epoch = inner
@@ -2652,8 +2672,14 @@ impl PairingService {
             return Err(BudgetRefusal::NoGrant);
         }
         let Some(idx) = inner.file.grants.iter().position(|g| {
-            if authority.expected_op_id.is_some_and(|op_id| g.op_id != op_id) { return false; }
-            g.client_id == client_id
+            if authority
+                .expected_op_id
+                .is_some_and(|op_id| g.op_id != op_id)
+            {
+                return false;
+            }
+            self.permits_spend_grant(g)
+                && g.client_id == client_id
                 && g.epoch == epoch
                 && g.identity_fingerprint == fingerprint
                 && g.is_live(now)
@@ -3102,27 +3128,27 @@ impl PairingService {
     ) -> Result<T, BudgetRefusal> {
         let inner = self.lock();
         let now = clock();
-        let valid = self.owner_control_enabled
-            && inner.file.grants.iter().any(|g| {
-                g.op_id == reservation.op_id
-                    && g.budget.as_ref().is_some_and(|b| {
-                        // A relation grant lives until its latest envelope, so
-                        // each recipient's own deadline is rechecked here, at
-                        // dispatch: an expired peer never pays on a live one's time.
-                        b.pending
-                            .get(&reservation.id)
-                            .is_some_and(|recipients| b.envelopes_live(recipients.keys(), now))
-                    })
-                    && g.client_id == reservation.client_id
-                    && g.identity_fingerprint == inner.identity_fingerprint
-                    && g.scopes.contains(&Scope::Spend)
-                    && g.is_live(now)
-                    && inner.file.clients.iter().any(|c| {
-                        c.client_id == g.client_id
-                            && c.epoch == g.epoch
-                            && c.identity_fingerprint == inner.identity_fingerprint
-                    })
-            });
+        let valid = inner.file.grants.iter().any(|g| {
+            self.permits_spend_grant(g)
+                && g.op_id == reservation.op_id
+                && g.budget.as_ref().is_some_and(|b| {
+                    // A relation grant lives until its latest envelope, so
+                    // each recipient's own deadline is rechecked here, at
+                    // dispatch: an expired peer never pays on a live one's time.
+                    b.pending
+                        .get(&reservation.id)
+                        .is_some_and(|recipients| b.envelopes_live(recipients.keys(), now))
+                })
+                && g.client_id == reservation.client_id
+                && g.identity_fingerprint == inner.identity_fingerprint
+                && g.scopes.contains(&Scope::Spend)
+                && g.is_live(now)
+                && inner.file.clients.iter().any(|c| {
+                    c.client_id == g.client_id
+                        && c.epoch == g.epoch
+                        && c.identity_fingerprint == inner.identity_fingerprint
+                })
+        });
         if !valid {
             return Err(BudgetRefusal::NoGrant);
         }
@@ -3234,12 +3260,14 @@ impl PairingService {
 
     /// A client's live grant, if it holds one in this deployment.
     pub fn grant_view_for(&self, client_id: &str) -> Option<GrantView> {
-        if !self.owner_control_enabled {
-            return None;
-        }
-        self.grant_views()
-            .into_iter()
-            .find(|g| g.client_id == client_id)
+        let inner = self.lock();
+        let now = chrono::Utc::now().timestamp();
+        inner
+            .file
+            .grants
+            .iter()
+            .filter(|g| g.client_id == client_id && g.is_live(now) && self.permits_spend_grant(g))
+            .find_map(grant_view)
     }
 
     // ── Durable persistence ────────────────────────────────────────

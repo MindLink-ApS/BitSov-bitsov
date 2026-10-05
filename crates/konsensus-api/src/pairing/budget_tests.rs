@@ -134,3 +134,80 @@ fn expiry_during_temp_file_sync_is_pruned_before_publish() {
 fn expiry_during_rename_sync_is_pruned_before_return() {
     expiry_during_reservation_persistence(3);
 }
+
+#[test]
+fn local_device_grant_dispatch_and_staging_keep_deadlines_and_deployment_gates() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = first_contact_service(dir.path());
+    let client = owner.snapshot().clients[0].clone();
+    let now = chrono::Utc::now().timestamp();
+    let peer = "aa".repeat(32);
+    {
+        let mut inner = owner.lock();
+        let grant = &mut inner.file.grants[0];
+        grant.granted_by = "device:test".into();
+        let budget = grant.budget.as_mut().unwrap();
+        budget.recipients_only = true;
+        budget.per_recipient_msat.insert(peer.clone(), 1000);
+        budget.per_act_max_by_recipient.insert(peer.clone(), 1000);
+        budget.recipient_expires_at.insert(peer.clone(), now + 60);
+        owner.persist(&mut inner.file).unwrap();
+    }
+    drop(owner);
+    let service = PairingService::open(dir.path(), "identity".into(), false)
+        .unwrap()
+        .with_local_owner_device()
+        .with_owner_approval_key(ed25519_dalek::SigningKey::from_bytes(&[14; 32]).verifying_key());
+    let binding = auth::PairingBinding {
+        client_id: client.client_id.clone(),
+        epoch: client.epoch,
+        fingerprint: "identity".into(),
+    };
+    assert_eq!(
+        service.live_spend_grant_id(&binding).as_deref(),
+        Some("grant")
+    );
+    let reservation = service
+        .reserve_spend(
+            &client.client_id,
+            client.epoch,
+            vec![Charge {
+                recipient: peer,
+                amount_msat: 1,
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .with_spend_authority_at(&reservation, || now, || 42)
+            .unwrap(),
+        42
+    );
+    assert!(matches!(
+        service.with_spend_authority_at(
+            &reservation,
+            || now + 60,
+            || panic!("expired envelope dispatched")
+        ),
+        Err(BudgetRefusal::NoGrant)
+    ));
+    for (source, recipients_only) in [("cli", true), ("device:test", false)] {
+        let mut inner = service.lock();
+        inner.file.grants[0].granted_by = source.into();
+        inner.file.grants[0]
+            .budget
+            .as_mut()
+            .unwrap()
+            .recipients_only = recipients_only;
+        drop(inner);
+        assert!(service.live_spend_grant_id(&binding).is_none());
+        assert!(matches!(
+            service.with_spend_authority_at(
+                &reservation,
+                || now,
+                || panic!("forbidden grant dispatched")
+            ),
+            Err(BudgetRefusal::NoGrant)
+        ));
+    }
+}
