@@ -657,6 +657,7 @@ pub(crate) fn default_advertised_capabilities(relay_enabled: bool) -> Vec<Capabi
         Capability::Custom(konsensus_core::payloads::call::MEETING_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::content::PORCH_READ_CAPABILITY.to_string()),
+        Capability::Custom(konsensus_core::payloads::content::PORCH_QUOTE_CAPABILITY.to_string()),
     ];
     if relay_enabled {
         caps.push(Capability::Relay);

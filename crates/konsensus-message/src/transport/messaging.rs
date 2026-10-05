@@ -697,6 +697,11 @@ pub(super) fn spawn_reader_task(
                         warn!(peer = %peer_id, error = %e, "failed to send PriceResponseReceived control event");
                     }
                 }
+                frame @ (Frame::PorchQuoteRequest { .. } | Frame::PorchQuoteResponse { .. }) => {
+                    let _ = control_tx.send(ControlEvent::PorchQuote {
+                        peer_id, frame: Box::new(frame), privileged, source_ip,
+                    }).await;
+                }
                 frame @ (Frame::PeerExchangeQuoteRequest
                     | Frame::PeerExchangeQuote { .. }
                     | Frame::PeerExchangePaidRequest { .. }

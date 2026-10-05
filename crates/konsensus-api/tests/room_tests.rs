@@ -17,6 +17,65 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn porch_room_compose_refuses_page_and_manifest_kinds_before_payment() {
+    let lightning = Arc::new(CountingLightning::default());
+    let mut state = test_state_with_lightning(lightning.clone());
+    let member = setup_e2ee_session_with_mnemonic(
+        &state.session_manager,
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+    )
+    .await;
+    let transport = Arc::new(ConnectedStubTransport::new(
+        vec![member],
+        state.invoice_requests.clone(),
+    ));
+    Arc::get_mut(&mut state).unwrap().transport = transport.clone();
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(member, "02aaaa".repeat(5));
+    let room = Room::new("porch-refusal".into(), *state.identity.node_id());
+    state.storage.create_room(&room).await.unwrap();
+    state
+        .storage
+        .add_room_member(&room.id, &member)
+        .await
+        .unwrap();
+    // No peer price: this used to fall back to our own tariff and pay.
+    for kind in [500, 501, 510] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/messages/compose")
+            .header("authorization", auth_header(&state))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "recipient": room.id.to_string(), "is_room": true, "kind": kind,
+                    "plaintext": r#"{"request_id":"room","path":"/index.md","method":"GET"}"#,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = build_router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lightning.money(), 0, "kind {kind} must not pay: {body}");
+        assert_eq!(lightning.invoices(), 0);
+        assert!(transport.sent_envelopes.lock().unwrap().is_empty());
+        assert_eq!(status, StatusCode::BAD_REQUEST, "kind {kind}: {body}");
+        assert_eq!(body["reason"], "porch_room", "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("single peer"),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn rooms_crud() {
     let state = test_state();
     let auth = auth_header(&state);

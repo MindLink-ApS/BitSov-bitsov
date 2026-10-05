@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 /// An older node leaves a paid `/front-door.json` read unanswered, so apps must
 /// not send it one.
 pub const PORCH_READ_CAPABILITY: &str = "porch_read_v1";
+/// Path-specific metadata quotes before paid reads.
+pub const PORCH_QUOTE_CAPABILITY: &str = "porch_quote_v1";
 
 /// Porch path of the owner's published front-door card (BROWSE.md §4).
 pub const PORCH_CARD_PATH: &str = "/front-door.json";
