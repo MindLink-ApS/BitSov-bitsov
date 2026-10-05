@@ -138,6 +138,12 @@ fn finalize_body(p: &Value) -> Value {
 async fn pending_is_memory_only_and_finalize_is_terminal() {
     let dir = tempfile::tempdir().unwrap();
     let (state, token, _) = setup(dir.path());
+    let (status, response) = call(&state, "", "GET", "/api/v1/bootstrap/state", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["state"], "bootstrap");
+    assert_eq!(response["can_create"], true);
+    assert_eq!(response["can_restore"], true);
+    assert!(response.get("refusal").is_none());
     let before = snapshot(dir.path());
     let (status, p) = call(
         &state,
@@ -180,6 +186,12 @@ async fn pending_is_memory_only_and_finalize_is_terminal() {
             .any(|w| w == p["mnemonic"].as_str().unwrap().as_bytes()));
     }
     assert!(state.is_committed());
+    let (status, response) = call(&state, "", "GET", "/api/v1/bootstrap/state", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["state"], "initialized");
+    assert_eq!(response["can_create"], false);
+    assert_eq!(response["can_restore"], false);
+    assert!(response.get("refusal").is_none());
     assert_eq!(
         call(&state, &token, "POST", "/api/v1/identity/finalize", body)
             .await
@@ -482,7 +494,15 @@ async fn faults_never_write_plaintext_or_install_device_before_rename() {
                 .any(|w| w == p["mnemonic"].as_str().unwrap().as_bytes()));
         }
         let probe = bootstrap::DataDirProbe::inspect(&state.layout).unwrap();
+        let (status, response) =
+            call(&state, "", "GET", "/api/v1/bootstrap/state", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["local_owner"]["pending"], false);
         if fault == bootstrap::CommitFault::AbortBeforeRename {
+            assert_eq!(response["state"], "bootstrap");
+            assert_eq!(response["can_create"], true);
+            assert_eq!(response["can_restore"], true);
+            assert!(response.get("refusal").is_none());
             assert_eq!(
                 bootstrap::classify(&probe),
                 bootstrap::StartupMode::Bootstrap
@@ -498,6 +518,20 @@ async fn faults_never_write_plaintext_or_install_device_before_rename() {
             .await;
             assert_ne!(fresh["mnemonic"], p["mnemonic"]);
         } else {
+            // This unauthenticated probe must not expose disk or repair diagnostics.
+            assert_eq!(
+                response,
+                json!({
+                    "state": "refused",
+                    "can_create": false,
+                    "can_restore": false,
+                    "local_owner": {
+                        "available": true,
+                        "enroll_device": true,
+                        "pending": false
+                    }
+                })
+            );
             match bootstrap::classify(&probe) {
                 bootstrap::StartupMode::Refuse(r) => {
                     assert_eq!(r.reason, "identity_without_marker")
@@ -518,6 +552,57 @@ async fn faults_never_write_plaintext_or_install_device_before_rename() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn device_install_failure_reports_refusal_without_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, token, client) = setup_mode(dir.path(), true);
+    let mut hooks = test_hooks(true);
+    // The device installer rejects an empty owner approval after the rename.
+    hooks.sign_owner_approval = Box::new(|_, _, _| Ok(String::new()));
+    let state = Arc::new(Arc::try_unwrap(state).ok().unwrap().with_local_owner(hooks));
+    let (status, pending) = call(
+        &state,
+        &token,
+        "POST",
+        "/api/v1/identity/create-pending",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (body, _) = device_body(&pending, &client);
+    let (status, _) = call(&state, &token, "POST", "/api/v1/identity/finalize", body).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(state.layout.identity_dir().join("mnemonic.enc").exists());
+    assert!(!state.layout.marker().exists());
+    assert!(!state.is_committed());
+    assert!(state.pairing.device_keys().is_empty());
+
+    let (status, response) = call(&state, "", "GET", "/api/v1/bootstrap/state", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["local_owner"]["pending"], false);
+    // This unauthenticated probe must not expose disk or repair diagnostics.
+    assert_eq!(
+        response,
+        json!({
+            "state": "refused",
+            "can_create": false,
+            "can_restore": false,
+            "local_owner": {
+                "available": true,
+                "enroll_device": true,
+                "pending": false
+            }
+        })
+    );
+    assert!(matches!(
+        state.transition(
+            pending["mnemonic"].as_str().unwrap(),
+            bootstrap::CommitFault::None,
+        ),
+        Err(bootstrap::CommitError::Conflict)
+    ));
 }
 
 #[tokio::test]
