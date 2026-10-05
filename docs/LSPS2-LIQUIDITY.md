@@ -8,7 +8,8 @@ still need their own settled, recipient-bound, single-use payment.
 This is an owner-initiated pilot, disabled by default. LDK Node 0.7.0 already
 uses `lightning-liquidity` 0.2.0 (Cargo.lock); this change connects its fixed-amount
 LSPS2 `get_info` / `buy` / `receive_via_jit_channel` flow to BitSov's fee authority.
-No separate node, seed, wallet, provider service, or dependency fork is introduced.
+The client uses the same node, seed and wallet. An optional hub provider service is
+described below; no dependency fork is introduced.
 
 ## Operator configuration
 
@@ -172,3 +173,106 @@ separately from the workspace because the vendor crate is excluded as a member.
 The workspace suite does not require the optional downloaded-bitcoind integration
 feature or any real funds. Mock success is not proof of channel-opening mainnet
 compatibility or independent-provider availability.
+
+## Hub provider pilot
+
+A BitSov hub can serve the existing app client with the vendored LDK 0.7 LSPS2
+service. This is **off by default** and mutually exclusive with
+`lightning.liquidity.enabled` on the same node. Keep your chain settings and
+add the following to the hub's LDK configuration; replace the token before use:
+
+```toml
+[lightning]
+backend = "ldk"
+network = "regtest" # use the same network as the apps and funding payer
+listening_address = "0.0.0.0:9735"
+
+[lightning.lsps2_service]
+enabled = true
+require_token = "<replace-with-private-per-hub-pilot-token>"
+channel_opening_fee_ppm = 10000
+min_channel_opening_fee_msat = 1000000
+channel_over_provisioning_ppm = 1000000
+min_channel_lifetime = 144
+max_client_to_self_delay = 2016
+min_payment_size_msat = 10000000
+max_payment_size_msat = 1000000000
+forwarding_fee_ppm = 500
+forwarding_fee_base_msat = 1000
+```
+
+These are configurable pilot defaults, not a production pricing recommendation.
+The token is a required nonempty shared pilot gate, compared as a string by LDK;
+it is not user authentication. Protect the config file. Debug output redacts it.
+Service advertising is always off. LDK's service role enables forwarding into
+private channels even with `forward_to_private_channels = false`; no alias or
+public channel is added. The service uses `client_trusts_lsp = false`, compatible
+with our existing client waiting for the funding transaction before claiming.
+Clients still explicitly trust this LSP for zero-conf channels.
+
+On each app use the existing registry, pointing to this hub (no service block):
+
+```toml
+[lightning.liquidity]
+enabled = true
+selected_provider = "<hub-lowercase-compressed-Lightning-public-key>"
+
+[[lightning.liquidity.providers]]
+node_id = "<hub-lowercase-compressed-Lightning-public-key>"
+address = "hub.example:9735"
+token = "<same-private-per-hub-pilot-token>"
+```
+
+Startup requires opening ppm below 1,000,000, forwarding ppm at most 1,000,000,
+and overprovisioning at most 10,000,000. The payment range must satisfy
+`0 < min <= max <= 100000000000` msat, and the minimum opening fee must be below
+the minimum payment. Lifetime must be positive; client delay is 1–65,535 blocks.
+The forwarding base and ppm cannot both be zero. Unknown service fields fail
+parsing. Omit the block or set `enabled = false` to leave the service inactive.
+
+The opening fee is `max(min_fee_msat, ceil(gross_msat * opening_ppm / 1000000))`.
+It is deducted only from the JIT **funding** payment. The example charges
+1,000,000 msat from a 100,000,000-msat top-up and forwards 99,000,000 msat to the
+app. Overprovisioning of 1,000,000 ppm adds another 99,000,000 msat of hub capital
+to the channel, providing inbound capacity for later receipts, less reserves.
+Hub on-chain funds, transaction fees and applicable anchor reserves are required;
+app anchor reserves are not waived.
+
+LDK initially creates service channels with zero forwarding fees. After
+`ChannelReady`, BitSov applies the configured base and ppm with
+`update_channel_config`, preserving other channel settings. It retries a failed
+update with exponential backoff from 250 ms to a 30-second cap, logging a warning
+on each failure while continuing event delivery and acknowledgement. The pending
+retry remains scheduled until it succeeds; new ready events do not bypass its
+backoff. Ready channels are also scanned on restart.
+LDK exposes no JIT-origin marker: while service mode is enabled, the scan targets
+private outbound ready channels with **0 base / 0 ppm** and
+**`confirmations_required == Some(0)`**, matching the service’s zero-conf opens.
+Normal BitSov manual opens have a nonzero base and are untouched; confirmed
+channels with manually zeroed fees are also untouched. Externally configured free
+private outbound zero-conf channels still match this signature. Existing nonzero
+tariffs survive restart unchanged; changes to these service tariff settings price new/unpriced
+channels, not all existing channels.
+
+Admission remains a separate, fresh stateless BOLT11 quote paid over the usable
+channel. It receives its entire principal; it never uses the JIT intercept SCID
+or pays an opening-fee skim. Forwarding fees are paid by the sender under the
+unchanged ALL-IN allowance `min(max(5000, floor(principal * 1%)), 10000)` msat.
+For a 2,001-msat admission, the example hub tariff is 1,001 msat, below the
+5,000-msat allowance. Operators must price for their intended payment range;
+an excessive tariff causes ordinary capped payments to fail, not wider caps.
+
+The service is alpha upstream. Its channel opens still use LDK's legacy funding
+path, **not the #190 priority/cap policy**. Insufficient hub funds, disconnection
+or an upstream create-channel error can leave a top-up pending until timeout;
+this change adds no retry for those upstream opening failures. Reconcile before
+reissuing a top-up. No vendor code or admission policy is changed. A hub observes
+both endpoints of payments routed between its own leaves, and is an availability
+dependency; this pilot provides neither social-graph privacy nor automatic failover.
+
+The real `regtest_e2e::three_node::lsps2_service::hub_jit_then_stateless_admission`
+scenario runs in the [three-node paid suite](three-node-paid-e2e.md). It uses the
+production hub constructor and client, asserts a disconnected-provider refusal,
+then bounds negotiation/open/settlement to 60 seconds. It verifies opening-fee
+accounting, overprovisioned inbound, tariff recovery after restart, and separate
+stateless admission payments in both directions with exact principal and fees.

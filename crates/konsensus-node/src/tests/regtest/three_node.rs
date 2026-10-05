@@ -11,6 +11,9 @@ use std::path::Path;
 #[path = "fault_proxy.rs"]
 mod fault_proxy;
 
+#[path = "lsps2_service.rs"]
+mod lsps2_service;
+
 const APPROVAL: &str = "Atlas run 2 #15 / run 3 #2: remote elevation + headless owner approval";
 const QUOTE: &str = "Atlas runs 1–2: read-scope quote and paid receipt blocked";
 const SYNC: &str = "Atlas run 2 #13 / run 4 steps 1,3: 429 stalls and silent recipient timeout";

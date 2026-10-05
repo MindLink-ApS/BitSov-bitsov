@@ -244,3 +244,8 @@ app recognizes the structured `not_dispatched` contract, releases its local
 reservation and abandons the journal. That change should test invoice pay
 and keysend, allow a subsequent spend, and retain journals for ambiguous
 502 responses. No app behavior is changed by this genome PR.
+
+The production [hub LSPS2 regression](three-node-paid-e2e.md#hub-lsps2-provider)
+now exercises actual JIT service/client negotiation, overprovisioning and
+stateless admission with a configured positive forwarding tariff. It is separate
+from the legacy routing-only service fixture and the #225 opt-in control above.

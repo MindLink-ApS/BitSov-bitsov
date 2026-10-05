@@ -101,4 +101,6 @@ CI runs the PostgreSQL tests in the separate, non-blocking
 
 MIT
 
+Hub operators can opt into the [LSPS2 provider pilot](docs/LSPS2-LIQUIDITY.md#hub-provider-pilot) for app JIT funding, with opening fees and a configurable post-open forwarding tariff. It is disabled by default; admission remains a separate stateless payment.
+
 For long-running nodes, see [bounded file and service logging](docs/operations/LOGGING.md): `node.log` and `ldk_node.log` default to 10 MiB × 5 files each. Remove legacy stdout redirection into these managed files.

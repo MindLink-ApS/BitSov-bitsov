@@ -407,6 +407,9 @@ pub enum LightningConfig {
         /// Bounded LSPS2 bootstrap; disabled unless explicitly enabled.
         #[serde(default)]
         liquidity: konsensus_lightning::liquidity::LiquidityConfig,
+        /// Opt-in hub JIT provider and post-open forwarding tariff.
+        #[serde(default)]
+        lsps2_service: konsensus_lightning::lsps2_service::Lsps2ServiceConfig,
         /// Bitcoin network: "bitcoin", "testnet", "signet", "regtest".
         #[serde(default = "default_ldk_network")]
         network: String,
@@ -1185,6 +1188,14 @@ impl NodeConfig {
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         self.validate_routing_fee_backend()?;
+        if let LightningConfig::Ldk {
+            lsps2_service,
+            liquidity,
+            ..
+        } = &self.lightning
+        {
+            lsps2_service.to_ldk(liquidity.enabled)?;
+        }
         self.lightning.esplora_sync_intervals().to_sync_config()?;
         self.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?;
         self.network.stun_server_addr().map_err(|e| anyhow::anyhow!(e))?;
@@ -1587,6 +1598,7 @@ impl NodeConfig {
                     lsp_address: None,
                     lsp_token: None,
                     liquidity: Default::default(),
+                    lsps2_service: Default::default(),
                     forward_to_private_channels: false,
                     listening_address: Some("0.0.0.0:9735".to_string()),
                     advertised_address: None,

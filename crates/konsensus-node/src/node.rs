@@ -185,6 +185,7 @@ impl KonsensusNode {
             }
             LightningConfig::Ldk {
                 liquidity,
+                lsps2_service,
                 network,
                 esplora_url,
                 esplora_url_fallback,
@@ -218,6 +219,7 @@ impl KonsensusNode {
                         _ => None,
                     },
                     liquidity: liquidity.clone(),
+                    lsps2_service: lsps2_service.clone(),
                     storage_dir: ldk_storage_dir,
                     scb_backup_dir: Some(std::path::PathBuf::from(&config.backup.scb_dir)),
                     scb_rotation_count: config.backup.rotation_count,
