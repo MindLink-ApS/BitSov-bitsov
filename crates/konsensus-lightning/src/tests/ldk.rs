@@ -84,7 +84,8 @@ fn convert_direction_mapping() {
 
 #[test]
 fn ldk_config_construction() {
-    let config = LdkConfig {
+    let mut config = LdkConfig {
+        forward_to_private_channels: false,
         esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,
@@ -106,6 +107,13 @@ fn ldk_config_construction() {
     };
     assert_eq!(config.network, "regtest");
     assert!(config.lsp_node_id.is_none());
+    for enabled in [false, true] {
+        config.forward_to_private_channels = enabled;
+        let node_config = config.node_config(None);
+        assert_eq!(node_config.accept_forwards_to_priv_channels, enabled);
+        assert!(node_config.node_alias.is_none());
+        assert!(node_config.announcement_addresses.is_none());
+    }
 }
 
 // ─── derive_ldk_entropy Tests ──────────────────────────────────────
@@ -180,6 +188,7 @@ fn ldk_entropy_is_64_bytes() {
 #[tokio::test]
 async fn invalid_mnemonic_errors() {
     let config = LdkConfig {
+        forward_to_private_channels: false,
         esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,

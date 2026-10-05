@@ -34,6 +34,37 @@ channels (`LdkConfig` has no node alias), so C runs in LSPS2-service mode, the
 role an LSP plays for a private BitSov node. No client requests a JIT channel;
 the service role only enables forwarding.
 
+## Production private hub regression (#225)
+
+`private_forwarding::production_hub_private_forwarding_is_opt_in` adds a
+separate A→hub→B scenario built entirely through `LdkProvider::new`, including
+the hub. It uses no LSPS2 service, alias, or announced channel. Fresh topologies
+exercise both settings: the default rejects a dispatched payment with
+`PrivateChannelForward`; the opt-in settles at both endpoints and charges the
+hub's exact positive forwarding fee. It also checks the invoice's private route
+hint so a missing route cannot masquerade as the expected rejection.
+
+To enable routing on a production private hub, add this to its existing LDK
+configuration and restart the node:
+
+```toml
+[lightning]
+backend = "ldk"
+forward_to_private_channels = true
+```
+
+What this changes for that hub: payments between its peers can route through it, so its
+channel balances move and may need rebalancing; payers can probe it (coarse capacity of
+its private channels becomes inferable); forwarded HTLCs hold liquidity until settled or
+timed out, within LDK's CLTV and in-flight limits; and it charges LDK's default
+forwarding fee. Nothing is announced, and it never spends its own funds without a
+matching incoming HTLC. Enable it only on the node that acts as the hub.
+
+Omitting the flag or setting it to false retains existing behavior. This setting
+does not announce the node or its channels. The older LSPS2-backed scenario
+above remains as separate coverage. The scheduled/manual three-node paid regtest
+workflow runs this new scenario explicitly before its paid-flow tests.
+
 ## Run
 
 Prerequisites: Rust/Cargo, Python 3, Bitcoin Core, and the Esplora-compatible

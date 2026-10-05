@@ -47,6 +47,8 @@ use konsensus_core::traits::lightning::{
 /// Configuration for the embedded LDK Lightning provider.
 #[derive(Debug, Clone)]
 pub struct LdkConfig {
+    /// Opt in to forwarding into private channels, without enabling announcements.
+    pub forward_to_private_channels: bool,
     /// Shared per-file diagnostic log limits.
     pub logging: konsensus_core::logging::LoggingConfig,
     /// Own Bitcoin Core overrides Esplora, including probes and fallback.
@@ -88,6 +90,19 @@ pub struct LdkConfig {
     pub lsp_token: Option<String>,
     /// Listening address for Lightning P2P (e.g., "0.0.0.0:9735").
     pub listening_address: Option<String>,
+}
+
+impl LdkConfig {
+    fn node_config(
+        &self,
+        admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> ldk_node::config::Config {
+        ldk_node::config::Config {
+            accept_forwards_to_priv_channels: self.forward_to_private_channels,
+            work_admission: admission.map(ldk_node::config::WorkAdmissionCheck::new),
+            ..Default::default()
+        }
+    }
 }
 
 /// Independent Esplora polling overrides. Omitted values retain LDK's defaults.
@@ -558,10 +573,7 @@ impl LdkProvider {
             LDK_KDF_CONTEXT,
         );
 
-        let mut builder = LdkBuilder::from_config(ldk_node::config::Config {
-            work_admission: admission.map(ldk_node::config::WorkAdmissionCheck::new),
-            ..Default::default()
-        });
+        let mut builder = LdkBuilder::from_config(config.node_config(admission));
         builder.set_network(network);
         builder.set_entropy_seed_bytes(*ldk_seed);
         builder.set_storage_dir_path(
