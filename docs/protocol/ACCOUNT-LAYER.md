@@ -97,7 +97,7 @@ bitsov-relation-intent-v1\nnode:{fp}\nclient:{client_id}\ndevice:{key_id}\npeer:
 | `reason` | when | the app shows |
 |---|---|---|
 | `seed_not_encrypted` | plaintext `mnemonic.txt`, or a plaintext copy beside the `.enc` | "Encrypt your recovery phrase to enable Touch ID approvals." |
-| `seed_password_not_typed` | started with `--password` or `--password-file` | "Restart the node and type the password to enable Touch ID approvals." |
+| `seed_password_not_typed` | started with `--password`, `--password-file`, or `--password-fd` | "Restart the node and type the password to enable Touch ID approvals." |
 | `owner_key_unavailable` | no owner key at start (for example a wrong password) | "Touch ID approvals are off on this node." |
 
 Why the gate lives in the node, and why the key needs the password:
@@ -150,7 +150,7 @@ Why the gate lives in the node, and why the key needs the password:
   The running-node check can only see an owner-run node (its control socket), so stop the node yourself first. On SSDs, APFS snapshots and Time Machine, older copies of the plaintext can persist; they hold the same words as the owner's written backup, which stays the recovery.
 - **Starting an encrypted node.** `konsensus start` prompts for the password on the terminal. That includes a dev node the app launches: the prompt appears in the terminal that started the app.
 - **Password file (opt-in).** `--password-file <path>` reads the password from a file instead. It must be a regular file owned by the current user, with no group or other permissions. Symlinks are refused, and the opened file is checked against the one inspected. Starting this way leaves **Touch ID approvals off** (`seed_password_not_typed`), because the password was not typed. The node warns that any program running as this user, including a paired app, can read it. With it, the owner key is protected from **other OS users only**, the same as a plaintext seed against a same-user app. `konsensus device approve` never reads it; it always prompts.
-- **GAP.** An app launched from Finder has no terminal to prompt on. It would need the password file, with the weaker boundary above, or a remote signer (§7). An encrypted mnemonic (`.enc`) or a remote signer (§7) closes this.
+- **Password descriptor.** A launcher without a terminal can pass a Keychain-held password using `init --password-fd <n>` and `start --password-fd <n>` (`0` = stdin). The node reads once to EOF and zeroizes its password buffers after use. This avoids argv and a plaintext password file; it still leaves Touch ID approvals off (`seed_password_not_typed`). See [the handoff contract](../operations/password-input.md).
 - **GAP.** The file-key tier and its label are not built. Today a Mac without a usable Touch ID falls back to the console grant.
 
 ## 5. The profile card is the public profile
