@@ -291,8 +291,13 @@ checks discard it with `410 ceremony_lost`. It expires after 30 monotonic minute
 and is discarded on the next touch (`410 ceremony_expired` on finalize).
 Cancellation, shutdown and failures drop zeroizing buffers. A fresh ceremony
 always generates a fresh phrase. There is no resend or mnemonic-reveal route.
-`GET /api/v1/bootstrap/state` exposes only
-`local_owner: {available, enroll_device, pending}` alongside the existing state.
+`GET /api/v1/bootstrap/state` is unauthenticated. It exposes only `state`,
+`can_create`, `can_restore`, and `local_owner: {available, enroll_device, pending}`.
+If an interrupted commit requires repair, it returns `state: "refused"` with
+`can_create: false` and `can_restore: false`, including before a restart. It
+does not expose a refusal object, reason, disk-state details, or repair text.
+Detailed refusal diagnostics and repair guidance remain in the CLI/stderr
+startup refusal; operators can restart the node to obtain them.
 
 Finalize, cancel, and legacy commits share a single-flight lock. A concurrent
 finalize or cancel after commit begins returns `409`; successful commit is

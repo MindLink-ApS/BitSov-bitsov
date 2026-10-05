@@ -939,7 +939,8 @@ impl FromRequestParts<Arc<BootstrapState>> for BootstrapAuth {
     }
 }
 
-/// `GET /api/v1/bootstrap/state` response.
+/// Unauthenticated `GET /api/v1/bootstrap/state` response.
+/// Refusal diagnostics and repair guidance belong in the CLI/stderr output.
 #[derive(Debug, Serialize)]
 pub struct BootstrapStateResponse {
     /// `"bootstrap"`, `"initialized"`, or `"refused"` (operator repair required).
@@ -948,9 +949,6 @@ pub struct BootstrapStateResponse {
     pub can_restore: bool,
     /// Whether a first-run create is available.
     pub can_create: bool,
-    /// Why bootstrap is refused and the concrete operator repair action.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refusal: Option<Refusal>,
     /// Explicit local ceremony availability, with no secret material.
     pub local_owner: LocalOwnerState,
 }
@@ -979,10 +977,10 @@ async fn bootstrap_state(
         )
     };
     let open = mode == StartupMode::Bootstrap;
-    let (status, refusal) = match mode {
-        StartupMode::Bootstrap => ("bootstrap", None),
-        StartupMode::Initialized => ("initialized", None),
-        StartupMode::Refuse(refusal) => ("refused", Some(refusal)),
+    let status = match mode {
+        StartupMode::Bootstrap => "bootstrap",
+        StartupMode::Initialized => "initialized",
+        StartupMode::Refuse(_) => "refused",
     };
     let mut pending = state.pending.lock().unwrap();
     if pending.as_ref().is_some_and(PendingIdentity::expired) {
@@ -992,7 +990,6 @@ async fn bootstrap_state(
         state: status,
         can_restore: open,
         can_create: open,
-        refusal,
         local_owner: LocalOwnerState {
             available: state.local.is_some(),
             enroll_device: state.local.as_ref().is_some_and(|l| l.enroll_device),

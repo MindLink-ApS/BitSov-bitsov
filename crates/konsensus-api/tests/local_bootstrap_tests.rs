@@ -518,14 +518,20 @@ async fn faults_never_write_plaintext_or_install_device_before_rename() {
             .await;
             assert_ne!(fresh["mnemonic"], p["mnemonic"]);
         } else {
-            assert_eq!(response["state"], "refused");
-            assert_eq!(response["can_create"], false);
-            assert_eq!(response["can_restore"], false);
-            assert_eq!(response["refusal"]["reason"], "identity_without_marker");
-            assert!(response["refusal"]["repair"]
-                .as_str()
-                .unwrap()
-                .contains("konsensus repair mark-initialized"));
+            // This unauthenticated probe must not expose disk or repair diagnostics.
+            assert_eq!(
+                response,
+                json!({
+                    "state": "refused",
+                    "can_create": false,
+                    "can_restore": false,
+                    "local_owner": {
+                        "available": true,
+                        "enroll_device": true,
+                        "pending": false
+                    }
+                })
+            );
             match bootstrap::classify(&probe) {
                 bootstrap::StartupMode::Refuse(r) => {
                     assert_eq!(r.reason, "identity_without_marker")
@@ -575,15 +581,21 @@ async fn device_install_failure_reports_refusal_without_restart() {
 
     let (status, response) = call(&state, "", "GET", "/api/v1/bootstrap/state", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(response["state"], "refused");
-    assert_eq!(response["can_create"], false);
-    assert_eq!(response["can_restore"], false);
     assert_eq!(response["local_owner"]["pending"], false);
-    assert_eq!(response["refusal"]["reason"], "identity_without_marker");
-    assert!(response["refusal"]["repair"]
-        .as_str()
-        .unwrap()
-        .contains("konsensus repair mark-initialized"));
+    // This unauthenticated probe must not expose disk or repair diagnostics.
+    assert_eq!(
+        response,
+        json!({
+            "state": "refused",
+            "can_create": false,
+            "can_restore": false,
+            "local_owner": {
+                "available": true,
+                "enroll_device": true,
+                "pending": false
+            }
+        })
+    );
     assert!(matches!(
         state.transition(
             pending["mnemonic"].as_str().unwrap(),
