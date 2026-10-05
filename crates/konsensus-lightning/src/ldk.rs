@@ -852,26 +852,20 @@ impl LdkProvider {
         tokio::task::spawn_blocking(move || {
             // Sweep on startup too: a crash can happen after LDK persists the
             // channel but before the application handles ChannelReady.
-            let mut reconcile_tariffs = true;
+            let mut tariff_retry = crate::lsps2_service::TariffRetry::new(Instant::now());
             while !drain_shutdown.load(Ordering::Relaxed) {
-                if reconcile_tariffs {
-                    if let Err(e) = lsps2_service.apply_tariffs(&drain_node) {
-                        warn!(error = %e, "LDK: retrying LSPS2 forwarding tariff update");
-                        std::thread::sleep(Duration::from_millis(250));
-                        continue;
-                    }
-                    reconcile_tariffs = false;
-                }
+                tariff_retry
+                    .apply_if_due(Instant::now(), || lsps2_service.apply_tariffs(&drain_node));
                 let mut drained_any = false;
                 while let Some(event) = drain_node.next_event() {
                     drained_any = true;
                     if matches!(event, ldk_node::Event::ChannelReady { .. }) {
-                        if let Err(e) = lsps2_service.apply_tariffs(&drain_node) {
-                            warn!(error = %e, "LDK: retaining ChannelReady until tariff update succeeds");
-                            reconcile_tariffs = true;
-                            break;
-                        }
+                        tariff_retry.request(Instant::now());
                     }
+                    // Also service retries under a continuously busy event queue.
+                    // Failures never hold ChannelReady or unrelated payment events.
+                    tariff_retry
+                        .apply_if_due(Instant::now(), || lsps2_service.apply_tariffs(&drain_node));
                     if tx.blocking_send(event).is_err() {
                         // Consumer dropped (shutdown or panic) — exit cleanly.
                         debug!("LDK event drainer: consumer gone, exiting");

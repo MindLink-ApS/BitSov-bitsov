@@ -241,12 +241,17 @@ app anchor reserves are not waived.
 LDK initially creates service channels with zero forwarding fees. After
 `ChannelReady`, BitSov applies the configured base and ppm with
 `update_channel_config`, preserving other channel settings. It retries a failed
-update before acknowledging that event and scans ready channels on restart.
+update with exponential backoff from 250 ms to a 30-second cap, logging a warning
+on each failure while continuing event delivery and acknowledgement. The pending
+retry remains scheduled until it succeeds; new ready events do not bypass its
+backoff. Ready channels are also scanned on restart.
 LDK exposes no JIT-origin marker: while service mode is enabled, the scan targets
-private outbound ready channels with **0 base / 0 ppm**. Normal BitSov manual
-opens have a nonzero base and are untouched; externally configured free private
-outbound channels also match this signature. Existing nonzero tariffs survive
-restart unchanged; changes to these service tariff settings price new/unpriced
+private outbound ready channels with **0 base / 0 ppm** and
+**`confirmations_required == Some(0)`**, matching the service’s zero-conf opens.
+Normal BitSov manual opens have a nonzero base and are untouched; confirmed
+channels with manually zeroed fees are also untouched. Externally configured free
+private outbound zero-conf channels still match this signature. Existing nonzero
+tariffs survive restart unchanged; changes to these service tariff settings price new/unpriced
 channels, not all existing channels.
 
 Admission remains a separate, fresh stateless BOLT11 quote paid over the usable

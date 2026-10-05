@@ -3,6 +3,7 @@
 use konsensus_core::traits::lightning::LightningError;
 use ldk_node::config::ChannelConfig;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 /// Pilot service terms. Opening fees apply only to JIT funding, never admission.
 #[derive(Clone, Serialize, Deserialize)]
@@ -126,14 +127,17 @@ impl Lsps2ServiceConfig {
         outbound: bool,
         announced: bool,
         ready: bool,
+        confirmations_required: Option<u32>,
         mut config: ChannelConfig,
     ) -> Option<ChannelConfig> {
         // LDK 0.7 exposes no JIT-origin marker. Its service creates private,
-        // outbound 0/0 channels; normal BitSov opens use a nonzero base fee.
+        // outbound zero-conf 0/0 channels. Require that entire signature so
+        // ordinary confirmed channels with manually zeroed fees are untouched.
         if !self.enabled
             || !outbound
             || announced
             || !ready
+            || confirmations_required != Some(0)
             || config.forwarding_fee_base_msat != 0
             || config.forwarding_fee_proportional_millionths != 0
         {
@@ -145,7 +149,7 @@ impl Lsps2ServiceConfig {
     }
 
     /// Idempotent startup/event reconciliation. Existing nonzero tariffs and
-    /// every other channel parameter are preserved. Retry failures before ack.
+    /// every other channel parameter are preserved. The drainer schedules retries.
     pub(crate) fn apply_tariffs(&self, node: &ldk_node::Node) -> Result<(), ldk_node::NodeError> {
         if !self.enabled {
             return Ok(());
@@ -155,6 +159,7 @@ impl Lsps2ServiceConfig {
                 channel.is_outbound,
                 channel.is_announced,
                 channel.is_channel_ready,
+                channel.confirmations_required,
                 channel.config,
             ) {
                 node.update_channel_config(
@@ -168,6 +173,49 @@ impl Lsps2ServiceConfig {
     }
 }
 
+/// Schedule reconciliation without holding the event queue on update failures.
+/// A new ChannelReady must not bypass an already pending retry's backoff.
+pub(crate) struct TariffRetry {
+    next_attempt: Option<Instant>,
+    delay: Duration,
+}
+
+impl TariffRetry {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            next_attempt: Some(now),
+            delay: Duration::from_millis(250),
+        }
+    }
+
+    pub(crate) fn request(&mut self, now: Instant) {
+        self.next_attempt.get_or_insert(now);
+    }
+
+    pub(crate) fn apply_if_due(
+        &mut self,
+        now: Instant,
+        apply: impl FnOnce() -> Result<(), ldk_node::NodeError>,
+    ) {
+        if self.next_attempt.is_none_or(|next| now < next) {
+            return;
+        }
+        match apply() {
+            Ok(()) => {
+                self.next_attempt = None;
+                self.delay = Duration::from_millis(250);
+            }
+            Err(error) => {
+                let delay = self.delay;
+                tracing::warn!(%error, retry_in_ms = delay.as_millis(),
+                    "LDK: LSPS2 forwarding tariff update failed; continuing event delivery while retry is pending");
+                self.next_attempt = Some(now + delay);
+                self.delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +226,60 @@ mod tests {
             require_token: Some("private-pilot".into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn lsps2_tariff_retry_backs_off_without_holding_event_delivery() {
+        let mut now = Instant::now();
+        let mut retry = TariffRetry::new(now);
+        let mut attempts = 0;
+        for delay_ms in [250, 500, 1000, 2000, 4000, 8000, 16000, 30000, 30000] {
+            retry.apply_if_due(now, || {
+                attempts += 1;
+                Err(ldk_node::NodeError::PersistenceFailed)
+            });
+            // Event draining can continue as soon as this attempt returns.
+            // Repeated ChannelReady events must not reset the pending delay.
+            let before_due = now + Duration::from_millis(delay_ms - 1);
+            retry.request(before_due);
+            retry.apply_if_due(before_due, || panic!("retried before backoff elapsed"));
+            now += Duration::from_millis(delay_ms);
+        }
+        assert_eq!(attempts, 9);
+        let mut recovered = false;
+        retry.apply_if_due(now, || {
+            recovered = true;
+            Ok(())
+        });
+        assert!(recovered, "retry must become due even at the backoff cap");
+        retry.apply_if_due(now + Duration::from_secs(60), || {
+            panic!("retried after success")
+        });
+    }
+
+    #[test]
+    fn lsps2_tariff_retry_resets_after_recovery_for_new_channels() {
+        let now = Instant::now();
+        let mut retry = TariffRetry::new(now);
+        retry.apply_if_due(now, || Err(ldk_node::NodeError::PersistenceFailed));
+        let now = now + Duration::from_millis(250);
+        retry.apply_if_due(now, || Err(ldk_node::NodeError::PersistenceFailed));
+        let now = now + Duration::from_millis(500);
+        retry.apply_if_due(now, || Ok(()));
+        retry.request(now);
+        retry.apply_if_due(now, || Err(ldk_node::NodeError::PersistenceFailed));
+        retry.apply_if_due(now + Duration::from_millis(249), || {
+            panic!("retried too soon")
+        });
+        let mut recovered = false;
+        retry.apply_if_due(now + Duration::from_millis(250), || {
+            recovered = true;
+            Ok(())
+        });
+        assert!(
+            recovered,
+            "a new channel must start with the initial backoff"
+        );
     }
 
     #[test]
@@ -255,6 +357,32 @@ mod tests {
     }
 
     #[test]
+    fn lsps2_service_tariff_leaves_ordinary_default_channel_untouched() {
+        let config = ChannelConfig::default();
+        assert_eq!(config.forwarding_fee_base_msat, 1000);
+        assert_eq!(config.forwarding_fee_proportional_millionths, 0);
+        for confirmations in [Some(0), Some(6), None] {
+            assert!(enabled()
+                .tariff(true, false, true, confirmations, config)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn lsps2_service_tariff_leaves_confirmed_free_channel_untouched() {
+        let config = ChannelConfig {
+            forwarding_fee_base_msat: 0,
+            forwarding_fee_proportional_millionths: 0,
+            ..Default::default()
+        };
+        for confirmations in [Some(1), Some(6), None] {
+            assert!(enabled()
+                .tariff(true, false, true, confirmations, config)
+                .is_none());
+        }
+    }
+
+    #[test]
     fn lsps2_service_tariff_preserves_other_channel_settings() {
         let service = enabled();
         let original = ldk_node::config::ChannelConfig {
@@ -263,7 +391,9 @@ mod tests {
             cltv_expiry_delta: 144,
             ..Default::default()
         };
-        let changed = service.tariff(true, false, true, original).unwrap();
+        let changed = service
+            .tariff(true, false, true, Some(0), original)
+            .unwrap();
         assert_eq!(changed.cltv_expiry_delta, 144);
         assert_eq!(
             changed.forwarding_fee_base_msat,
@@ -273,12 +403,20 @@ mod tests {
             changed.forwarding_fee_proportional_millionths,
             service.forwarding_fee_ppm
         );
-        assert!(service.tariff(true, false, true, changed).is_none());
-        assert!(service.tariff(false, false, true, original).is_none());
-        assert!(service.tariff(true, true, true, original).is_none());
-        assert!(service.tariff(true, false, false, original).is_none());
+        assert!(service
+            .tariff(true, false, true, Some(0), changed)
+            .is_none());
+        assert!(service
+            .tariff(false, false, true, Some(0), original)
+            .is_none());
+        assert!(service
+            .tariff(true, true, true, Some(0), original)
+            .is_none());
+        assert!(service
+            .tariff(true, false, false, Some(0), original)
+            .is_none());
         assert!(Lsps2ServiceConfig::default()
-            .tariff(true, false, true, original)
+            .tariff(true, false, true, Some(0), original)
             .is_none());
     }
 }
