@@ -1462,6 +1462,8 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
     let (pending, _pending_rx) = mpsc::channel(8);
     let (auto, _auto_rx) = mpsc::channel(8);
     let worker = tokio::spawn(run(SessionHandlerDeps {
+        content_server: None,
+        front_door: Default::default(),
         min_admission_cost_msat: 0,
         privacy: Default::default(),
         peer_exchange_floor: 0,

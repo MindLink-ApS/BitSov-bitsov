@@ -38,6 +38,8 @@ use crate::onboarding::funding_poll;
 
 /// All dependencies needed by the session/control event handler task.
 pub(crate) struct SessionHandlerDeps {
+    pub content_server: Option<Arc<crate::content_server::ContentServer>>,
+    pub front_door: konsensus_api::handlers::front_door::FrontDoorStore,
     pub privacy: crate::config::PrivacyConfig,
     pub peer_exchange_floor: u64,
     pub transport: Arc<NoiseTransport>,
@@ -135,6 +137,7 @@ fn refuse_unpaid_control(event: &ControlEvent, membrane: &Membrane) -> bool {
 /// Runs the session/control event handler loop.
 pub(crate) async fn run(deps: SessionHandlerDeps) {
     let SessionHandlerDeps {
+        content_server, front_door,
         privacy,
         peer_exchange_floor,
         transport,
@@ -175,6 +178,8 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         std::collections::HashMap::new();
     let mut last_admission_refusal = crate::invoice_refusals::RefusalLimits::default();
     let mut delivery_budget = DeliveryConfirmationBudget::default();
+    let mut porch_refusals = crate::invoice_refusals::RefusalLimits::default();
+    let mut porch_quotes = std::collections::HashMap::<NodeId, (tokio::time::Instant, u32)>::new();
     let mut exchange_quotes = std::collections::HashMap::<NodeId, tokio::time::Instant>::new();
     let exchange_nonces = konsensus_storage::StorageNonceAdapter::new(storage.clone());
     let mut admission_quotes = crate::admission_quotes::AdmissionQuotes::default();
@@ -288,6 +293,58 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             peer_id, prices, block_height, valid_blocks, trust_discount, privileged,
                             &peer_prices,
                         ).await;
+                    }
+
+                    ControlEvent::PorchQuote { peer_id, frame, privileged, source_ip } => {
+                        match *frame {
+                            Frame::PorchQuoteRequest { request_id, path } => {
+                                use konsensus_core::payloads::content::{is_porch_path, PageStatus, PORCH_CARD_PATH};
+                                if request_id.len() > 64 || !is_porch_path(&path) { continue; }
+                                if !privileged {
+                                    if porch_refusals.permit(source_ip, tokio::time::Instant::now()) {
+                                        let refusal = Frame::PorchQuoteResponse {
+                                            request_id, path, status: PageStatus::Forbidden,
+                                            amount_msat: None, admission_required: true,
+                                        };
+                                        let _ = transport.enqueue_control_frame(&peer_id, &refusal).await;
+                                    }
+                                    continue;
+                                }
+                                // Bound work and memory, including for admitted peers.
+                                let now = tokio::time::Instant::now();
+                                porch_quotes.retain(|_, (start, _)| now.duration_since(*start).as_secs() < 1);
+                                if !porch_quotes.contains_key(&peer_id) && porch_quotes.len() >= 256 { continue; }
+                                let entry = porch_quotes.entry(peer_id).or_insert((now, 0));
+                                if entry.1 >= 16 { continue; }
+                                entry.1 += 1;
+                                let mut status = if path == PORCH_CARD_PATH {
+                                    if front_door.card.lock().await.is_some() { PageStatus::Ok } else { PageStatus::NotFound }
+                                } else {
+                                    content_server.as_ref().map_or(PageStatus::NotFound, |cs| cs.page_status(&path))
+                                };
+                                let amount_msat = if status == PageStatus::Ok {
+                                    let kind = konsensus_core::kind::KIND_PAGE_REQUEST;
+                                    match pricing.get_price_msat(kind).await {
+                                        Ok(base) => {
+                                            let price = konsensus_core::gate::price_with_floor_msat(kind, base, min_admission_cost_msat);
+                                            // Persist the offered price before replying so a price change
+                                            // during payment cannot invalidate the paid request.
+                                            let unix = crate::peer_exchange::now();
+                                            if storage.record_delivery_prices(&peer_id, &[(format!("kind:{kind}"), price)], &[], unix, unix.saturating_add(300)).await.is_ok() {
+                                                Some(price)
+                                            } else { status = PageStatus::InternalError; None }
+                                        }
+                                        Err(_) => { status = PageStatus::InternalError; None }
+                                    }
+                                } else { None };
+                                let response = Frame::PorchQuoteResponse { request_id, path, status, amount_msat, admission_required: false };
+                                let _ = transport.enqueue_control_frame(&peer_id, &response).await;
+                            }
+                            Frame::PorchQuoteResponse { request_id, path, status, amount_msat, admission_required } => {
+                                konsensus_api::handlers::browse::receive_quote(our_node_id, peer_id, request_id, path, status, amount_msat, admission_required);
+                            }
+                            _ => {}
+                        }
                     }
 
                     ControlEvent::PriceQueryReceived { peer_id, kind, privileged } => {

@@ -3436,6 +3436,9 @@ pub(super) async fn compose_peer(
     references: Vec<MessageId>, operation: super::operations::Operation,
     policy: ComposePolicy,
 ) -> Result<Json<ComposeResponse>, ApiError> {
+    let policy = if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
+        ComposePolicy { allow_initial_admission: false, allow_readmission: false }
+    } else { policy };
     let sender = *state.identity.node_id();
         // ── Peer compose: existing single-recipient path ──
         let peer_id = NodeId::from_hex(&req.recipient)
@@ -3454,7 +3457,11 @@ pub(super) async fn compose_peer(
         let recipient = Recipient::Node(peer_id);
 
         let height = if state.lightning.money_ready().await { state.chain.get_block_height().await.unwrap_or(0) } else { 0 };
-        let mut price_msat = quoted_price(&state, &peer_id, req.kind, height).await?;
+        let mut price_msat = if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
+            crate::handlers::browse::page_price(&state, peer_id, &req.plaintext, req.max_routing_fee_msat).await?
+        } else {
+            quoted_price(&state, &peer_id, req.kind, height).await?
+        };
         let mut cap = req.max_total_msat;
         if let Some(per) = &req.max_recipient_msat {
             let recipient_cap = *per.get(&peer_id.to_hex()).ok_or_else(|| ApiError::PriceCapExceeded("recipient cap missing".into()))?;

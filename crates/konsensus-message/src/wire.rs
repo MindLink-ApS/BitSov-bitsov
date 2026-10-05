@@ -907,6 +907,24 @@ pub enum Frame {
         block_height: u64,
     },
 
+    /// Metadata only; admitted contacts may check one path before paying.
+    PorchQuoteRequest {
+        #[serde(deserialize_with = "bounded::limited_string::<_, 64>")]
+        request_id: String,
+        #[serde(deserialize_with = "bounded::limited_string::<_, 128>")]
+        path: String,
+    },
+    PorchQuoteResponse {
+        #[serde(deserialize_with = "bounded::limited_string::<_, 64>")]
+        request_id: String,
+        #[serde(deserialize_with = "bounded::limited_string::<_, 128>")]
+        path: String,
+        status: konsensus_core::payloads::content::PageStatus,
+        amount_msat: Option<u64>,
+        /// Fixed refusal, with Forbidden status and no price or metadata.
+        admission_required: bool,
+    },
+
     /// Legacy unpaid request, retained for decode compatibility. Always refused:
     /// connection privilege never authorizes registry export.
     PeerExchangeRequest,
@@ -2834,5 +2852,27 @@ mod tests {
     #[test]
     fn frame_byte_caps_are_one_constant() {
         assert_eq!(MAX_FRAME_SIZE, MAX_FRAME_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod porch_quote_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn porch_quote_rejects_oversized_fields_before_dispatch() {
+        for response in [false, true] {
+            for (id_len, path_len, accepted) in [(64, 128, true), (65, 128, false), (64, 129, false)] {
+                let request_id = "r".repeat(id_len);
+                let path = "p".repeat(path_len);
+                let frame = if response {
+                    Frame::PorchQuoteResponse { request_id, path, status: konsensus_core::payloads::content::PageStatus::Ok, amount_msat: Some(1000), admission_required: false }
+                } else {
+                    Frame::PorchQuoteRequest { request_id, path }
+                };
+                let decoded = Frame::from_bytes(&frame.to_bytes().unwrap());
+                assert_eq!(decoded.is_ok(), accepted, "response={response}, id={id_len}, path={path_len}");
+            }
+        }
     }
 }

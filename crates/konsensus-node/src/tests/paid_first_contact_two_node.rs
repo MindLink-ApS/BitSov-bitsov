@@ -412,6 +412,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             admission_mode: ReachabilityMode::PriceOpen,
             whitelist: spec.whitelist,
+            capabilities: crate::node::default_advertised_capabilities(false),
             ..Default::default()
         },
     ));
@@ -521,7 +522,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         peer_registry: Arc::clone(&registry),
         session_manager: Arc::clone(&sessions),
         nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(Arc::clone(&storage))),
-        content_server: Some(content_server),
+        content_server: Some(content_server.clone()),
         front_door: front_door.clone(),
         routing: Arc::clone(&routing),
         identity: Arc::clone(&identity),
@@ -538,6 +539,8 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
     let (auto_channel_tx, auto_rx) = mpsc::channel(64);
     std::mem::forget((pending_rx, auto_rx));
     tokio::spawn(run_session_handler(SessionHandlerDeps {
+        content_server: Some(content_server.clone()),
+        front_door: front_door.clone(),
         min_admission_cost_msat: 0,
         privacy: Default::default(),
         peer_exchange_floor: 0,
