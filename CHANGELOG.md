@@ -5,6 +5,11 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Add encrypted two-phase local bootstrap with a one-time in-memory phrase,
+  backup confirmation, P-256 possession and node-signed first owner enrollment.
+  Commit the encrypted seed and config before the initialization marker; keep
+  cancellation, expiry and interrupted commits fail-closed. Legacy HTTP
+  create/restore now encrypt whenever a startup password is supplied.
 - Add opt-in live-start `--local-owner-device` with `--password-fd`: derive the
   owner verifying key at startup and allow existing owner-approved devices to
   sign recipient-bound spend envelopes without console authority. Console-only

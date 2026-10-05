@@ -202,63 +202,6 @@ fn init_encrypts_and_start_decrypts_from_a_single_handoff_without_logging_it() {
     }
 }
 
-#[test]
-fn local_owner_flag_cannot_enter_legacy_plaintext_bootstrap() {
-    let dir = tempfile::tempdir().unwrap();
-    let output = tempfile::tempfile().unwrap();
-    let mut child = bin()
-        .args([
-            "start",
-            "--local-owner-device",
-            "--password-fd",
-            "0",
-            "--config",
-        ])
-        .arg(dir.path().join("konsensus.toml"))
-        .stdin(Stdio::piped())
-        .stdout(output.try_clone().unwrap())
-        .stderr(output.try_clone().unwrap())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(PASSWORD.as_bytes())
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("local owner bootstrap must refuse before serving HTTP");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    use std::os::unix::fs::FileExt;
-    let mut bytes = vec![0; output.metadata().unwrap().len() as usize];
-    output.read_exact_at(&mut bytes, 0).unwrap();
-    no_secret(&bytes);
-    assert!(!status.success());
-    let log = String::from_utf8_lossy(&bytes);
-    assert!(
-        log.contains("--local-owner-device requires an initialized encrypted identity"),
-        "{log}"
-    );
-    for path in [
-        "identity",
-        "mnemonic.txt",
-        "mnemonic.enc",
-        "NODE_INITIALIZED",
-        "pairing",
-    ] {
-        assert!(!dir.path().join(path).exists(), "unexpected {path}");
-    }
-}
-
 fn directory_snapshot(dir: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
     let mut snapshot = std::collections::BTreeMap::new();
     for entry in std::fs::read_dir(dir).unwrap() {

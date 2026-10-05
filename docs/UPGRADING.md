@@ -18,9 +18,11 @@ read as `console`; the owner signature remains mandatory. Never install an
 owner public key file as a replacement for startup derivation.
 
 Without this flag, descriptor passwords keep `seed_password_not_typed` and
-sidecar grants remain inactive. The mode does not open `control.sock`, enroll
-new devices, enable console grants or alter remote rules. The flag is refused
-on uninitialized directories in PR A; ordinary first-run HTTP bootstrap is unchanged. Review [password input](operations/password-input.md),
+sidecar grants remain inactive. The live mode does not open `control.sock`, enroll
+new devices, enable console grants or alter remote rules. On a positively empty
+directory it now enables encrypted two-phase bootstrap and one first owner
+device enrollment. Legacy create/restore encrypt when a startup password is
+present; no-password bootstrap retains its existing behavior. Review [password input](operations/password-input.md),
 including the Mac launcher's signing/hardened-runtime release requirement.
 
 ## rc7 → rc8 procedure

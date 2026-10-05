@@ -249,6 +249,75 @@ directory that startup reports and never consumes; a crash after it refuses and
 demands repair. The node is never auto-started into live operation by an API
 call.
 
+## Two-phase local bootstrap
+
+Start a positively empty, loopback-only node with `--password-fd 0
+--local-owner-device`. The launcher stores its generated password in Keychain
+before spawning, writes it once to the pipe, closes the pipe, and erases its
+copy. Neither the password nor the authority flag is stored in config. A
+configured identity passphrase is refused. Local first-run trust is the root
+of approval; the node cannot attest Secure Enclave hardware.
+
+After the normal bootstrap pairing, use its `bst` token with `identity` scope:
+
+1. `POST /api/v1/identity/create-pending` returns `ceremony_id`, `node_id`,
+   `mnemonic`, `expires_at` and three distinct zero-based `backup_check` indices.
+   The phrase is returned only here and stays in zeroizing memory. This call
+   creates no files. A second pending request returns `409 ceremony_in_progress`.
+2. Record the phrase, then `POST /api/v1/identity/finalize` with `ceremony_id`,
+   `backup_words` (the three lowercase words, in index order), and `device`:
+   `{public_key, name, proof}`. The key is 65-byte uncompressed SEC1 P-256, hex;
+   the proof is a hex DER P-256/SHA-256 signature over `registration_message`
+   from the device protocol, bound to the pending identity's fingerprint and
+   the paired `client_id`. No password field is accepted. Missing device is
+   `400`; invalid possession or the wrong fingerprint is `403`.
+3. Finalize returns `node_id`, `restart_required: true`, `device_key_id`,
+   `device_fingerprint`, and `mnemonic_path`, never the phrase. Bootstrap exits;
+   explicitly restart with the same descriptor password and local-owner flag.
+
+The node validates possession, derives the owner signing key transiently from
+seed and password, and signs the standard Ed25519 owner approval tuple. It
+stages `mnemonic.enc` and identity metadata, fsyncs, renames to `identity/`,
+rebinds pairing, installs the owner-signed device record with
+`enrolled_by: local_first_run`, aligns config to the encrypted seed, and writes
+`NODE_INITIALIZED` last. The client and epoch are checked again under the pairing
+lock. A P-256 proof alone never becomes durable owner authority.
+
+The pending ceremony belongs to one client. A different client is forbidden.
+`DELETE /api/v1/identity/pending/{ceremony_id}` discards it. Use the same-client
+`DELETE /api/v1/identity/pending/current` alias if the create response or app
+state was lost; this never reveals the phrase. Three failed backup
+checks discard it with `410 ceremony_lost`. It expires after 30 monotonic minutes
+and is discarded on the next touch (`410 ceremony_expired` on finalize).
+Cancellation, shutdown and failures drop zeroizing buffers. A fresh ceremony
+always generates a fresh phrase. There is no resend or mnemonic-reveal route.
+`GET /api/v1/bootstrap/state` exposes only
+`local_owner: {available, enroll_device, pending}` alongside the existing state.
+
+Finalize, cancel, and legacy commits share a single-flight lock. A concurrent
+finalize or cancel after commit begins returns `409`; successful commit is
+terminal and invalidates bootstrap authority. A lost finalize response is
+resolved by reading `bootstrap/state` while the listener remains open or by
+restarting; the device key id can be computed from the public key. No API call
+starts live services. Legacy create/restore cannot bypass a pending ceremony.
+
+Without a startup password the new routes are absent. A descriptor password
+without `--local-owner-device` enables encryption but requires `device` to be
+absent (`400` otherwise); it confers no owner authority on later starts. Legacy
+create/restore remain terminal and now encrypt whenever a password is present.
+
+Interrupted staging is ignored and reported, never adopted. After rename,
+any failure requires explicit repair; the current process also refuses to start
+another ceremony. `repair mark-initialized --confirm` still writes only the
+marker. **If the crash preceded config alignment, the operator must also align
+`identity.mnemonic_file` to `identity/mnemonic.enc` before live startup**; repair
+does not silently rewrite config. A crash before pairing rebind also leaves the
+old empty-fingerprint pairing unusable: token issuance fails closed. Recover
+that pairing explicitly through the owner console (revoke and re-pair); repair
+never silently rebinds it. After rebind, a missing device record leaves only
+read/receive authority. Enroll through the owner console; the HTTP bootstrap
+routes never reopen and the phrase is never shown again.
+
 ## Unchanged
 
 Protocol admission is untouched and remains governed by settled payment at the
