@@ -326,7 +326,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                                     let kind = konsensus_core::kind::KIND_PAGE_REQUEST;
                                     match pricing.get_price_msat(kind).await {
                                         Ok(base) => {
-                                            let price = konsensus_core::gate::price_with_floor_msat(kind, base, min_admission_cost_msat);
+                                            let price = konsensus_core::gate::price_with_floor_msat(base, min_admission_cost_msat);
                                             // Persist the offered price before replying so a price change
                                             // during payment cannot invalidate the paid request.
                                             // V1 cannot supersede this on a tariff raise without
