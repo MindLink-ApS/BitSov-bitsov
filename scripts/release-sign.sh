@@ -18,6 +18,13 @@ KEY_FPR=B299274C200301714DC6F51A7C2D6F8AC842EF6E
 ASSETS=(bitsov-darwin-aarch64 bitsov-darwin-x86_64 bitsov-linux-aarch64 bitsov-linux-x86_64 bitsov-windows-x86_64)
 
 die() { echo "release-sign: $*" >&2; exit 1; }
+# A good signature from the pinned key: VALIDSIG for it, and none of the
+# expired/revoked/bad markers gpg would also print.
+signed_by_key() {
+  local status; status=$(cat)
+  grep -q "VALIDSIG $KEY_FPR" <<<"$status" \
+    && ! grep -qE "^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG|EXPSIG|BADSIG|ERRSIG)" <<<"$status"
+}
 [ $# -eq 2 ] || die "usage: $0 <tag> <commit-on-main>"
 TAG=$1 COMMIT=$2
 [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]] || die "tag must look like v0.3.0 or v0.3.0-rc9"
@@ -32,11 +39,11 @@ git merge-base --is-ancestor "$FULL" origin/main || die "$FULL is not on origin/
 # 1. Signed tag
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   [ "$(git rev-parse "$TAG^{commit}")" = "$FULL" ] || die "tag $TAG exists on a different commit"
-  git verify-tag --raw "$TAG" 2>&1 | grep -q "VALIDSIG $KEY_FPR" || die "existing tag $TAG is not signed by $KEY_FPR"
+  git verify-tag --raw "$TAG" 2>&1 | signed_by_key || die "existing tag $TAG is not validly signed by $KEY_FPR"
   echo "tag $TAG already exists and is signed; continuing"
 else
   git tag -s -u "$KEY_FPR" "$TAG" "$FULL" -m "BitSov $TAG"
-  git verify-tag --raw "$TAG" 2>&1 | grep -q "VALIDSIG $KEY_FPR" || die "fresh tag failed verification"
+  git verify-tag --raw "$TAG" 2>&1 | signed_by_key || die "fresh tag failed verification"
   git push origin "refs/tags/$TAG"
 fi
 
@@ -44,11 +51,13 @@ fi
 echo "waiting for CI on $TAG…"
 RUN=""
 for _ in $(seq 1 60); do
-  RUN=$(gh run list --repo "$REPO" --workflow ci.yml --branch "$TAG" --limit 1 --json databaseId -q '.[0].databaseId' || true)
+  RUN=$(gh run list --repo "$REPO" --workflow ci.yml --branch "$TAG" --event push --limit 1 --json databaseId -q '.[0].databaseId' || true)
   [ -n "$RUN" ] && break
   sleep 10
 done
 [ -n "$RUN" ] || die "no CI run found for $TAG"
+RUN_SHA=$(gh run view "$RUN" --repo "$REPO" --json headSha -q .headSha)
+[ "$RUN_SHA" = "$FULL" ] || die "CI run $RUN built $RUN_SHA, not the tagged commit $FULL"
 gh run watch "$RUN" --repo "$REPO" --exit-status >/dev/null || die "CI run $RUN failed; nothing signed"
 
 # 3. Download and verify
@@ -58,6 +67,7 @@ gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft | grep -qx true
 for a in "${ASSETS[@]}"; do
   gh release download "$TAG" --repo "$REPO" --pattern "$a" --pattern "$a.sha256" --clobber
   expected=$(awk '{print $1; exit}' "$a.sha256")
+  [ "$(awk '{print $2; exit}' "$a.sha256" | sed 's/^\*//')" = "$a" ] || die "$a.sha256 names a different file"
   actual=$(shasum -a 256 "$a" | awk '{print $1}')
   [[ $expected =~ ^[0-9a-f]{64}$ ]] || die "$a.sha256 is malformed"
   [ "$expected" = "$actual" ] || die "$a: expected $expected, got $actual"
@@ -66,7 +76,7 @@ done
 
 # 4. Sign, verify, attach
 gpg --armor --detach-sign --local-user "$KEY_FPR" --output SHA256SUMS.asc SHA256SUMS
-gpg --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null | grep -q "VALIDSIG $KEY_FPR" || die "signature check failed"
+gpg --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>&1 | signed_by_key || die "signature check failed"
 gh release upload "$TAG" SHA256SUMS SHA256SUMS.asc --repo "$REPO" --clobber
 
 echo
