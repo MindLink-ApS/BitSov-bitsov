@@ -404,31 +404,48 @@ impl LdkProvider {
     /// A monitor can survive funding that never reached the chain. Value a
     /// removed channel only after checking its funding, without changing LDK's
     /// monitor/recovery state. Queries use the configured backend exclusively.
-    async fn funded_balances(&self, channels: &[ldk_node::ChannelDetails]) -> Result<ldk_node::BalanceDetails, LightningError> {
+    async fn funded_balances(
+        &self,
+        channels: &[ldk_node::ChannelDetails],
+    ) -> Result<ldk_node::BalanceDetails, LightningError> {
         let mut balances = self.node.list_balances();
         let open: std::collections::HashSet<_> = channels.iter().map(|ch| ch.channel_id).collect();
         crate::balance::verify_closed_funding(&mut balances, &open, |channel_id| async move {
-            let funding = self.node.channel_funding_outpoint(channel_id)
-                .ok_or_else(|| LightningError::Backend("channel funding monitor unavailable".into()))?;
+            let funding = self
+                .node
+                .channel_funding_outpoint(channel_id)
+                .ok_or_else(|| {
+                    LightningError::Backend("channel funding monitor unavailable".into())
+                })?;
             self.funding_present(&funding.txid.to_string()).await
-        }).await?;
+        })
+        .await?;
         Ok(balances)
     }
 
     async fn funding_present(&self, txid: &str) -> Result<bool, LightningError> {
-        let txid = txid.parse().map_err(|_| LightningError::Backend("invalid funding txid".into()))?;
-        self.node.funding_present(txid).await.map_err(|error| LightningError::Backend(format!("funding presence unavailable: {error}")))
+        let txid = txid
+            .parse()
+            .map_err(|_| LightningError::Backend("invalid funding txid".into()))?;
+        self.node.funding_present(txid).await.map_err(|error| {
+            LightningError::Backend(format!("funding presence unavailable: {error}"))
+        })
     }
 
     /// Configure the ordinary payment fee ceiling before sharing this provider.
-    pub fn with_routing_fee_policy(mut self, policy: konsensus_core::traits::lightning::RoutingFeePolicy) -> Self {
+    pub fn with_routing_fee_policy(
+        mut self,
+        policy: konsensus_core::traits::lightning::RoutingFeePolicy,
+    ) -> Self {
         self.routing_fee_policy = policy;
         self
     }
 
     async fn pay_invoice_routed(
-        &self, bolt11: &str,
-        max_fee_msat: u64, fresh_hash: bool,
+        &self,
+        bolt11: &str,
+        max_fee_msat: u64,
+        fresh_hash: bool,
     ) -> Result<PaymentDetails, LightningError> {
         let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11
             .parse()
@@ -437,16 +454,29 @@ impl LdkProvider {
         let payment_hash_hex = hex::encode(AsRef::<[u8]>::as_ref(invoice.payment_hash()));
         let amount_msat = invoice.amount_milli_satoshis().unwrap_or(0);
 
-        let _dispatch = INVOICE_DISPATCH_LOCK.lock()
-            .map_err(|_| LightningError::PaymentNotDispatched("invoice dispatch lock poisoned".into()))?;
-        let payment_id_bytes: [u8; 32] = AsRef::<[u8]>::as_ref(invoice.payment_hash()).try_into()
-            .map_err(|_| LightningError::PaymentNotDispatched("invalid payment hash".into()))?;
+        let _dispatch = INVOICE_DISPATCH_LOCK.lock().map_err(|_| {
+            LightningError::PaymentNotDispatched("invoice dispatch lock poisoned".into())
+        })?;
+        let payment_id_bytes: [u8; 32] =
+            AsRef::<[u8]>::as_ref(invoice.payment_hash())
+                .try_into()
+                .map_err(|_| LightningError::PaymentNotDispatched("invalid payment hash".into()))?;
         if fresh_hash
-            && self.node.payment(&ldk_node::lightning::ln::channelmanager::PaymentId(payment_id_bytes)).is_some() {
-            return Err(LightningError::PaymentNotDispatched("capped payments require a fresh invoice hash".into()));
+            && self
+                .node
+                .payment(&ldk_node::lightning::ln::channelmanager::PaymentId(
+                    payment_id_bytes,
+                ))
+                .is_some()
+        {
+            return Err(LightningError::PaymentNotDispatched(
+                "capped payments require a fresh invoice hash".into(),
+            ));
         }
-        let payment_id = dispatch_invoice_with_fee_limit(&invoice, max_fee_msat,
-            |invoice, route| self.node.bolt11_payment().send(invoice, route))
+        let payment_id =
+            dispatch_invoice_with_fee_limit(&invoice, max_fee_msat, |invoice, route| {
+                self.node.bolt11_payment().send(invoice, route)
+            })
             .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         // Successful send — ensure the capability flag is set
@@ -476,11 +506,16 @@ impl LdkProvider {
         })
     }
 
-
-    fn stored_payment(&self, hash: &str) -> Result<ldk_node::payment::PaymentDetails, LightningError> {
+    fn stored_payment(
+        &self,
+        hash: &str,
+    ) -> Result<ldk_node::payment::PaymentDetails, LightningError> {
         let bytes = hex::decode(hash).map_err(|_| LightningError::PaymentNotFound(hash.into()))?;
-        let id: [u8; 32] = bytes.try_into().map_err(|_| LightningError::PaymentNotFound(hash.into()))?;
-        self.node.payment(&ldk_node::lightning::ln::channelmanager::PaymentId(id))
+        let id: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| LightningError::PaymentNotFound(hash.into()))?;
+        self.node
+            .payment(&ldk_node::lightning::ln::channelmanager::PaymentId(id))
             .ok_or_else(|| LightningError::PaymentNotFound(hash.into()))
     }
 
@@ -498,9 +533,35 @@ impl LdkProvider {
 
     /// Node-local disk policy, checked before inbound settlement and channel acceptance.
     pub async fn new_with_work_admission(
-        mut config: LdkConfig,
+        config: LdkConfig,
         admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> Result<Self, LightningError> {
+        Self::new_inner(config, admission, false).await
+    }
+
+    /// Owner-console maintenance only. Caller holds the existing live-state
+    /// process lease; keep it captured by `deny_work` until LDK has stopped.
+    pub async fn new_for_move_home(
+        mut config: LdkConfig,
+        deny_work: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Self, LightningError> {
+        config.liquidity = Default::default();
+        config.lsps2_service = Default::default();
+        config.lsp_node_id = None;
+        config.lsp_address = None;
+        config.lsp_token = None;
+        config.forward_to_private_channels = false;
+        Self::new_inner(config, Some(deny_work), true).await
+    }
+
+    async fn new_inner(
+        mut config: LdkConfig,
+        admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        moving_home: bool,
+    ) -> Result<Self, LightningError> {
+        if !moving_home {
+            ensure_no_move_home(&config.storage_dir)?;
+        }
         // Move the plaintext seed phrase out of `config` into a `Zeroizing`
         // wrapper so the inbound `String` copy is scrubbed from memory when
         // this function returns (HARD-9), regardless of which branch we take.
@@ -535,10 +596,22 @@ impl LdkProvider {
         let ldk_seed = Zeroizing::new(derive_ldk_entropy(&*bip39_seed));
 
         let network = parse_network(&config.network)?;
-        let auth = config.credentials_file.as_deref()
-            .map(konsensus_chain::bearer::BearerAuth::from_file).transpose()
+        let auth = config
+            .credentials_file
+            .as_deref()
+            .map(konsensus_chain::bearer::BearerAuth::from_file)
+            .transpose()
             .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
-        let auth_transport = auth.as_ref().map(|auth| konsensus_chain::bearer::BearerFailover::new(auth.clone(), &config.esplora_url, config.esplora_url_fallback.iter().cloned().collect())).transpose()
+        let auth_transport = auth
+            .as_ref()
+            .map(|auth| {
+                konsensus_chain::bearer::BearerFailover::new(
+                    auth.clone(),
+                    &config.esplora_url,
+                    config.esplora_url_fallback.iter().cloned().collect(),
+                )
+            })
+            .transpose()
             .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
         if config.bitcoind.is_some() && config.electrum.is_some() {
             return Err(LightningError::InvalidStartupConfig(
@@ -551,8 +624,12 @@ impl LdkProvider {
                 validate_startup_url("esplora_url_fallback", url)?;
             }
         }
-        let bitcoind = config.bitcoind.clone().map(konsensus_chain::BitcoindProvider::new)
-            .transpose().map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
+        let bitcoind = config
+            .bitcoind
+            .clone()
+            .map(konsensus_chain::BitcoindProvider::new)
+            .transpose()
+            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
         let electrum = config
             .electrum
             .clone()
@@ -578,7 +655,9 @@ impl LdkProvider {
             LDK_KDF_CONTEXT,
         );
 
-        let mut builder = LdkBuilder::from_config(config.node_config(admission));
+        let mut node_config = config.node_config(admission);
+        node_config.cooperative_close_only = moving_home;
+        let mut builder = LdkBuilder::from_config(node_config);
         builder.set_network(network);
         builder.set_entropy_seed_bytes(*ldk_seed);
         builder.set_storage_dir_path(
@@ -607,15 +686,24 @@ impl LdkProvider {
         // The old singleton fields never enabled invoice issuance. Require the
         // new explicit switch, and reject ambiguous migrations instead of silently
         // choosing a peer. Existing operators get a clear configuration error.
-        if config.lsp_node_id.is_some() || config.lsp_address.is_some() || config.lsp_token.is_some() {
+        if config.lsp_node_id.is_some()
+            || config.lsp_address.is_some()
+            || config.lsp_token.is_some()
+        {
             return Err(LightningError::InvalidStartupConfig("migrate legacy lsp_* fields to liquidity.providers and explicitly enable liquidity".into()));
         }
-        if let Some(lsp) = config.liquidity.selected().map_err(|e| {
-            LightningError::InvalidStartupConfig(e.to_string())
-        })? {
+        if let Some(lsp) = config
+            .liquidity
+            .selected()
+            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?
+        {
             builder.set_liquidity_source_lsps2(
-                lsp.node_id.parse().map_err(|_| LightningError::InvalidStartupConfig("invalid LSP key".into()))?,
-                lsp.address.parse().map_err(|_| LightningError::InvalidStartupConfig("invalid LSP address".into()))?,
+                lsp.node_id
+                    .parse()
+                    .map_err(|_| LightningError::InvalidStartupConfig("invalid LSP key".into()))?,
+                lsp.address.parse().map_err(|_| {
+                    LightningError::InvalidStartupConfig("invalid LSP address".into())
+                })?,
                 lsp.token.clone(),
             );
             // LDK logs the full JIT invoice at INFO. Private previews must never
@@ -633,13 +721,15 @@ impl LdkProvider {
 
         // Listening address for Lightning P2P
         if let Some(ref addr) = config.listening_address {
-            let socket_addr = addr
-                .parse()
-                .map_err(|e| LightningError::InvalidStartupConfig(format!("invalid listening address: {e}")))?;
+            let socket_addr = addr.parse().map_err(|e| {
+                LightningError::InvalidStartupConfig(format!("invalid listening address: {e}"))
+            })?;
             builder
                 .set_listening_addresses(vec![socket_addr])
                 .map_err(|e| {
-                    LightningError::InvalidStartupConfig(format!("failed to set listening address: {e}"))
+                    LightningError::InvalidStartupConfig(format!(
+                        "failed to set listening address: {e}"
+                    ))
                 })?;
         }
 
@@ -647,33 +737,48 @@ impl LdkProvider {
         // includes preflight; only the two Esplora fee-barrier errors are retried.
         let started = Instant::now();
         let (node, _, baseline) = if let Some(rpc) = &config.bitcoind {
-            let (user, password) = rpc.credentials()
+            let (user, password) = rpc
+                .credentials()
                 .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
             builder.set_chain_source_bitcoind_rpc(
-                rpc.rpc_host.clone(), rpc.rpc_port, user.to_string(), password.to_string(),
+                rpc.rpc_host.clone(),
+                rpc.rpc_port,
+                user.to_string(),
+                password.to_string(),
             );
             let node = builder.build().map_err(startup_build_error)?;
             let baseline = node.status();
-            node.start().map_err(|_| LightningError::ChainSourceUnavailable { network: config.network.clone(), service: "bitcoind".into(), attempts: 1, elapsed_ms: started.elapsed().as_millis() as u64, cause: "Bitcoin Core RPC startup failed".into() })?;
+            node.start()
+                .map_err(|_| LightningError::ChainSourceUnavailable {
+                    network: config.network.clone(),
+                    service: "bitcoind".into(),
+                    attempts: 1,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    cause: "Bitcoin Core RPC startup failed".into(),
+                })?;
             tokio::task::yield_now().await;
             (node, String::new(), baseline)
         } else if let Some(server) = &config.electrum {
             builder.set_chain_source_electrum(server.server_url.clone(), None);
             let node = builder.build().map_err(startup_build_error)?;
             let baseline = node.status();
-            node.start().map_err(|_| LightningError::ChainSourceUnavailable {
-                network: config.network.clone(),
-                service: "electrum".into(),
-                attempts: 1,
-                elapsed_ms: started.elapsed().as_millis() as u64,
-                cause: "Electrum startup failed".into(),
-            })?;
+            node.start()
+                .map_err(|_| LightningError::ChainSourceUnavailable {
+                    network: config.network.clone(),
+                    service: "electrum".into(),
+                    attempts: 1,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    cause: "Electrum startup failed".into(),
+                })?;
             tokio::task::yield_now().await;
             (node, String::new(), baseline)
         } else {
             // Authenticated sources use LDK's real fee barrier as the probe, with live auth.
-            let chosen = if auth_transport.is_some() { config.esplora_url.clone() } else {
-                select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref()).await
+            let chosen = if auth_transport.is_some() {
+                config.esplora_url.clone()
+            } else {
+                select_esplora_endpoint(&config.esplora_url, config.esplora_url_fallback.as_deref())
+                    .await
             };
             start_esplora_with_retry(builder, &config, chosen, started, auth_transport).await?
         };
@@ -713,9 +818,12 @@ impl LdkProvider {
         );
         Self::spawn_scb_timer(Arc::clone(&drainer_shutdown), scb_producer);
 
-        let liquidity = config.liquidity.selected()?.map(|p| LiquidityClient::new(
-            p.node_id.clone(), Arc::new(LdkJitBackend(Arc::clone(&node))),
-        ));
+        let liquidity = config.liquidity.selected()?.map(|p| {
+            LiquidityClient::new(
+                p.node_id.clone(),
+                Arc::new(LdkJitBackend(Arc::clone(&node))),
+            )
+        });
         let bitcoind = bitcoind.map(Arc::new);
         if bitcoind.is_some() || electrum.is_some() {
             let rpc = bitcoind.clone();
@@ -725,27 +833,45 @@ impl LdkProvider {
                 let server = server.clone();
                 async move {
                     if let Some(rpc) = rpc {
-                        rpc.funding_present(&txid.to_string()).await.map_err(|_| ldk_node::NodeError::TxSyncFailed)
+                        rpc.funding_present(&txid.to_string())
+                            .await
+                            .map_err(|_| ldk_node::NodeError::TxSyncFailed)
                     } else if let Some(server) = server {
                         // Detached Electrum work retains its permit after outer cancellation.
-                        static VERIFY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-                        let permit = VERIFY.acquire().await.map_err(|_| ldk_node::NodeError::TxSyncFailed)?;
+                        static VERIFY: tokio::sync::Semaphore =
+                            tokio::sync::Semaphore::const_new(1);
+                        let permit = VERIFY
+                            .acquire()
+                            .await
+                            .map_err(|_| ldk_node::NodeError::TxSyncFailed)?;
                         tokio::spawn(async move {
                             let _permit = permit;
-                            server.funding_present(&txid.to_string()).await.map_err(|_| ldk_node::NodeError::TxSyncFailed)
-                        }).await.map_err(|_| ldk_node::NodeError::TxSyncFailed)?
-                    } else { Err(ldk_node::NodeError::TxSyncFailed) }
+                            server
+                                .funding_present(&txid.to_string())
+                                .await
+                                .map_err(|_| ldk_node::NodeError::TxSyncFailed)
+                        })
+                        .await
+                        .map_err(|_| ldk_node::NodeError::TxSyncFailed)?
+                    } else {
+                        Err(ldk_node::NodeError::TxSyncFailed)
+                    }
                 }
             });
         }
 
         let provider = Self {
             sync_intervals,
-            sync_baseline: (baseline.latest_lightning_wallet_sync_timestamp, baseline.latest_onchain_wallet_sync_timestamp),
+            sync_baseline: (
+                baseline.latest_lightning_wallet_sync_timestamp,
+                baseline.latest_onchain_wallet_sync_timestamp,
+            ),
             routing_fee_policy: Default::default(),
             liquidity,
             liquidity_info: config.liquidity.info(),
-            onchain_operations: crate::onchain::OnchainOperations::new(node.onchain_operation_lock()),
+            onchain_operations: crate::onchain::OnchainOperations::new(
+                node.onchain_operation_lock(),
+            ),
             node,
             payment_capable: AtomicBool::new(true),
             bitcoind,
@@ -756,9 +882,16 @@ impl LdkProvider {
         };
         // Reconcile durable reservations against the selected chain source on
         // startup, then retry periodically. Source failure never unlocks coins.
-        let mut cursor = None;
-        crate::onchain::reconcile_local_spends(&provider.node, &provider.chain_visibility(), &mut cursor).await;
-        provider.spawn_reservation_reconciler(cursor);
+        if !moving_home {
+            let mut cursor = None;
+            crate::onchain::reconcile_local_spends(
+                &provider.node,
+                &provider.chain_visibility(),
+                &mut cursor,
+            )
+            .await;
+            provider.spawn_reservation_reconciler(cursor);
+        }
         Ok(provider)
     }
 
@@ -781,7 +914,9 @@ impl LdkProvider {
             routing_fee_policy: Default::default(),
             liquidity: None,
             liquidity_info: LiquidityInfo::default(),
-            onchain_operations: crate::onchain::OnchainOperations::new(node.onchain_operation_lock()),
+            onchain_operations: crate::onchain::OnchainOperations::new(
+                node.onchain_operation_lock(),
+            ),
             node,
             payment_capable: AtomicBool::new(true),
             bitcoind: None,
@@ -809,7 +944,9 @@ impl LdkProvider {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                if shutdown.load(Ordering::Relaxed) { break; }
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 crate::onchain::reconcile_local_spends(&node, &chain, &mut cursor).await;
             }
         });
@@ -1214,7 +1351,9 @@ impl Drop for LdkProvider {
     fn drop(&mut self) {
         self.drainer_shutdown.store(true, Ordering::Relaxed);
         match self.node.stop() {
-            Ok(()) => warn!("LDK node stopped in Drop — panic-path fallback; explicit shutdown did not stop it"),
+            Ok(()) => warn!(
+                "LDK node stopped in Drop — panic-path fallback; explicit shutdown did not stop it"
+            ),
             // stop() is not idempotent: this is the expected result after
             // LightningProvider::shutdown has already persisted and stopped it.
             Err(ldk_node::NodeError::NotRunning) => debug!("LDK node already stopped before Drop"),
@@ -1245,24 +1384,45 @@ impl LightningProvider for LdkProvider {
 
     async fn money_ready(&self) -> bool {
         let status = self.node.status();
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         sync_status_is_ready(&status, self.sync_baseline, &self.sync_intervals, now)
     }
 
-    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy { self.routing_fee_policy }
-    fn liquidity_info(&self) -> LiquidityInfo { self.liquidity_info.clone() }
+    fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy {
+        self.routing_fee_policy
+    }
+    fn liquidity_info(&self) -> LiquidityInfo {
+        self.liquidity_info.clone()
+    }
 
-    async fn quote_liquidity(&self, owner: &str, gross_msat: u64, max_fee_msat: u64) -> Result<LiquidityQuote, LightningError> {
-        self.liquidity.as_ref().ok_or_else(|| LightningError::Backend("LSPS2 liquidity disabled".into()))?
-            .quote(owner, gross_msat, max_fee_msat).await
+    async fn quote_liquidity(
+        &self,
+        owner: &str,
+        gross_msat: u64,
+        max_fee_msat: u64,
+    ) -> Result<LiquidityQuote, LightningError> {
+        self.liquidity
+            .as_ref()
+            .ok_or_else(|| LightningError::Backend("LSPS2 liquidity disabled".into()))?
+            .quote(owner, gross_msat, max_fee_msat)
+            .await
     }
 
     fn liquidity_quote(&self, owner: &str, id: &str) -> Result<LiquidityQuote, LightningError> {
-        self.liquidity.as_ref().ok_or_else(|| LightningError::Backend("LSPS2 liquidity disabled".into()))?.terms(owner, id)
+        self.liquidity
+            .as_ref()
+            .ok_or_else(|| LightningError::Backend("LSPS2 liquidity disabled".into()))?
+            .terms(owner, id)
     }
 
     async fn accept_liquidity(&self, owner: &str, id: &str) -> Result<Invoice, LightningError> {
-        self.liquidity.as_ref().ok_or_else(|| LightningError::PaymentNotDispatched("LSPS2 liquidity disabled".into()))?.accept(owner, id)
+        self.liquidity
+            .as_ref()
+            .ok_or_else(|| LightningError::PaymentNotDispatched("LSPS2 liquidity disabled".into()))?
+            .accept(owner, id)
     }
 
     async fn is_funding_payment(&self, hash: &str) -> Result<bool, LightningError> {
@@ -1270,7 +1430,10 @@ impl LightningProvider for LdkProvider {
         Ok(matches!(details.kind, LdkPaymentKind::Bolt11Jit { .. }))
     }
 
-    async fn liquidity_receipt(&self, hash: &str) -> Result<Option<LiquidityReceipt>, LightningError> {
+    async fn liquidity_receipt(
+        &self,
+        hash: &str,
+    ) -> Result<Option<LiquidityReceipt>, LightningError> {
         let p = self.stored_payment(hash)?;
         jit_receipt(&p)
     }
@@ -1343,7 +1506,9 @@ impl LightningProvider for LdkProvider {
             LdkDescription::new(description.to_owned())
                 .map_err(|e| LightningError::InvoiceCreation(e.to_string()))?,
         );
-        let signed = self.node.bolt11_payment()
+        let signed = self
+            .node
+            .bolt11_payment()
             .receive_stateless(amount_msat, &desc, expiry_secs)
             .map_err(|e| LightningError::InvoiceCreation(e.to_string()))?;
         Ok(Invoice {
@@ -1357,13 +1522,21 @@ impl LightningProvider for LdkProvider {
     }
 
     async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
-        let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11.parse()
+        let invoice: ldk_node::lightning_invoice::Bolt11Invoice = bolt11
+            .parse()
             .map_err(|e| LightningError::InvalidBolt11(format!("{e}")))?;
-        let amount = invoice.amount_milli_satoshis().ok_or_else(|| LightningError::PaymentNotDispatched("amountless invoice".into()))?;
-        self.pay_invoice_routed(bolt11, self.routing_fee_policy.ceiling(amount, None), false).await
+        let amount = invoice
+            .amount_milli_satoshis()
+            .ok_or_else(|| LightningError::PaymentNotDispatched("amountless invoice".into()))?;
+        self.pay_invoice_routed(bolt11, self.routing_fee_policy.ceiling(amount, None), false)
+            .await
     }
 
-    async fn pay_invoice_with_fee_limit(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentDetails, LightningError> {
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        bolt11: &str,
+        max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
         self.pay_invoice_routed(bolt11, max_fee_msat, true).await
     }
 
@@ -1482,19 +1655,33 @@ impl LightningProvider for LdkProvider {
         amount_msat: u64,
         memo: Option<&str>,
     ) -> Result<PaymentDetails, LightningError> {
-        self.keysend_with_fee_limit(dest_pubkey, amount_msat, memo, self.routing_fee_policy.ceiling(amount_msat, None)).await
+        self.keysend_with_fee_limit(
+            dest_pubkey,
+            amount_msat,
+            memo,
+            self.routing_fee_policy.ceiling(amount_msat, None),
+        )
+        .await
     }
 
     async fn keysend_with_fee_limit(
-        &self, dest_pubkey: &str, amount_msat: u64, _memo: Option<&str>, max_fee_msat: u64,
+        &self,
+        dest_pubkey: &str,
+        amount_msat: u64,
+        _memo: Option<&str>,
+        max_fee_msat: u64,
     ) -> Result<PaymentDetails, LightningError> {
-        let pubkey: bitcoin::secp256k1::PublicKey = dest_pubkey
-            .parse()
-            .map_err(|e| LightningError::PaymentNotDispatched(format!("invalid destination pubkey: {e}")))?;
+        let pubkey: bitcoin::secp256k1::PublicKey = dest_pubkey.parse().map_err(|e| {
+            LightningError::PaymentNotDispatched(format!("invalid destination pubkey: {e}"))
+        })?;
 
-        let payment_id = dispatch_keysend_with_fee_limit(amount_msat, pubkey, max_fee_msat,
-            |amount, dest, route| self.node.spontaneous_payment().send(amount, dest, route))
-            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
+        let payment_id = dispatch_keysend_with_fee_limit(
+            amount_msat,
+            pubkey,
+            max_fee_msat,
+            |amount, dest, route| self.node.spontaneous_payment().send(amount, dest, route),
+        )
+        .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         // Successful send — ensure the capability flag is set
         self.payment_capable.store(true, Ordering::Relaxed);
@@ -1546,9 +1733,20 @@ impl LightningProvider for LdkProvider {
             .parse()
             .map_err(|e| LightningError::Backend(format!("invalid destination pubkey: {e}")))?;
 
-        let payment_id = dispatch_keysend_with_fee_limit(amount_msat, pubkey, self.routing_fee_policy.ceiling(amount_msat, None),
-            |amount, dest, route| self.node.spontaneous_payment().send_with_custom_tlvs(amount, dest, route, custom_tlvs))
-            .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
+        let payment_id = dispatch_keysend_with_fee_limit(
+            amount_msat,
+            pubkey,
+            self.routing_fee_policy.ceiling(amount_msat, None),
+            |amount, dest, route| {
+                self.node.spontaneous_payment().send_with_custom_tlvs(
+                    amount,
+                    dest,
+                    route,
+                    custom_tlvs,
+                )
+            },
+        )
+        .map_err(|e| classify_dispatch_error(e, &self.payment_capable))?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1698,7 +1896,16 @@ impl LightningProvider for LdkProvider {
         announce: bool,
         fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
-        Ok(self.open_channel_with_status(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb).await?.channel_id)
+        Ok(self
+            .open_channel_with_status(
+                peer_pubkey,
+                peer_addr,
+                amount_sats,
+                announce,
+                fee_rate_sat_per_vb,
+            )
+            .await?
+            .channel_id)
     }
 
     async fn open_channel_with_status(
@@ -1743,12 +1950,22 @@ impl LightningProvider for LdkProvider {
         }).await
     }
 
-    async fn funding_fee_quote(&self, options: konsensus_core::traits::lightning::FundingOptions) -> Result<konsensus_core::traits::lightning::FundingFeeEstimate, LightningError> {
-        Ok(funding_estimate(&select_funding_policy(&self.node, options)?))
+    async fn funding_fee_quote(
+        &self,
+        options: konsensus_core::traits::lightning::FundingOptions,
+    ) -> Result<konsensus_core::traits::lightning::FundingFeeEstimate, LightningError> {
+        Ok(funding_estimate(&select_funding_policy(
+            &self.node, options,
+        )?))
     }
 
-    async fn open_channel_with_funding(&self, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
-        announce: bool, options: konsensus_core::traits::lightning::FundingOptions,
+    async fn open_channel_with_funding(
+        &self,
+        peer_pubkey: &str,
+        peer_addr: &str,
+        amount_sats: u64,
+        announce: bool,
+        options: konsensus_core::traits::lightning::FundingOptions,
     ) -> Result<konsensus_core::traits::lightning::ChannelOpenResult, LightningError> {
         let node = self.node.clone();
         let chain = self.chain_visibility();
@@ -1799,19 +2016,31 @@ impl LightningProvider for LdkProvider {
         use konsensus_core::traits::lightning::{LocalSpendDiagnostics, LocalSpendReservation};
         LocalSpendDiagnostics {
             unreadable_rows: self.node.local_spend_unreadable_rows(),
-            reservations: self.node.local_spend_reservations().into_iter().map(|r| LocalSpendReservation {
-                txid: r.txid.to_string(), created_at: r.created_at, last_seen_at: r.last_seen_at,
-            }).collect(),
+            reservations: self
+                .node
+                .local_spend_reservations()
+                .into_iter()
+                .map(|r| LocalSpendReservation {
+                    txid: r.txid.to_string(),
+                    created_at: r.created_at,
+                    last_seen_at: r.last_seen_at,
+                })
+                .collect(),
         }
     }
 
     async fn release_local_spend(&self, txid: &str) -> Result<(), LightningError> {
-        let txid = txid.parse().map_err(|_| LightningError::Backend("invalid reservation txid".into()))?;
+        let txid = txid
+            .parse()
+            .map_err(|_| LightningError::Backend("invalid reservation txid".into()))?;
         let node = self.node.clone();
         let chain = self.chain_visibility();
-        self.onchain_operations.run(async move {
-            crate::onchain::release_local_spend_with(node, txid, |id| chain.tx_visible(id)).await
-        }).await
+        self.onchain_operations
+            .run(async move {
+                crate::onchain::release_local_spend_with(node, txid, |id| chain.tx_visible(id))
+                    .await
+            })
+            .await
     }
 
     async fn close_channel(
@@ -1867,7 +2096,6 @@ impl LightningProvider for LdkProvider {
             })
             .await
     }
-
 }
 
 // --- Helper functions ---
@@ -1931,8 +2159,15 @@ async fn start_esplora_with_retry(
             break;
         }
         if node.is_none() {
-            if let Some(transport) = auth_transport.as_ref().filter(|_| endpoint == config.esplora_url) {
-                builder.set_chain_source_esplora_with_transport(endpoint.clone(), Some(sync_config), transport.clone());
+            if let Some(transport) = auth_transport
+                .as_ref()
+                .filter(|_| endpoint == config.esplora_url)
+            {
+                builder.set_chain_source_esplora_with_transport(
+                    endpoint.clone(),
+                    Some(sync_config),
+                    transport.clone(),
+                );
             } else {
                 builder.set_chain_source_esplora(endpoint.clone(), Some(sync_config));
             }
@@ -2040,7 +2275,9 @@ fn parse_network(network: &str) -> Result<bitcoin::Network, LightningError> {
         "testnet" | "testnet3" => Ok(bitcoin::Network::Testnet),
         "signet" => Ok(bitcoin::Network::Signet),
         "regtest" => Ok(bitcoin::Network::Regtest),
-        other => Err(LightningError::InvalidStartupConfig(format!("unknown network: {other}"))),
+        other => Err(LightningError::InvalidStartupConfig(format!(
+            "unknown network: {other}"
+        ))),
     }
 }
 
@@ -2107,9 +2344,12 @@ fn convert_payment_details(details: &ldk_node::payment::PaymentDetails) -> Payme
         .unwrap_or_default();
 
     let preimage = if details.status == LdkPaymentStatus::Succeeded
-        && !matches!(details.kind, LdkPaymentKind::Bolt11Jit { .. }) {
+        && !matches!(details.kind, LdkPaymentKind::Bolt11Jit { .. })
+    {
         preimage_from_kind(&details.kind).map(|p| hex::encode(p.0))
-    } else { None };
+    } else {
+        None
+    };
 
     PaymentDetails {
         payment_hash,
@@ -2306,61 +2546,116 @@ struct LdkJitBackend(Arc<LdkNode>);
 
 #[async_trait]
 impl JitBackend for LdkJitBackend {
-    async fn prepare(&self, gross_msat: u64, max_fee_msat: u64, expiry_secs: u32) -> Result<(Invoice, u64), LightningError> {
+    async fn prepare(
+        &self,
+        gross_msat: u64,
+        max_fee_msat: u64,
+        expiry_secs: u32,
+    ) -> Result<(Invoice, u64), LightningError> {
         let node = Arc::clone(&self.0);
         tokio::task::spawn_blocking(move || {
             let description = "BitSov wallet funding";
-            let desc = LdkInvoiceDescription::Direct(LdkDescription::new(description.into())
-                .map_err(|_| LightningError::InvoiceCreation("invalid funding description".into()))?);
+            let desc =
+                LdkInvoiceDescription::Direct(LdkDescription::new(description.into()).map_err(
+                    |_| LightningError::InvoiceCreation("invalid funding description".into()),
+                )?);
             // Internally: lightning_liquidity::lsps2 client get_info -> fee
             // selection/absolute limit -> buy -> persisted Bolt11Jit record.
-            let inv = node.bolt11_payment().receive_via_jit_channel(gross_msat, &desc, expiry_secs, Some(max_fee_msat))
+            let inv = node
+                .bolt11_payment()
+                .receive_via_jit_channel(gross_msat, &desc, expiry_secs, Some(max_fee_msat))
                 .map_err(|e| LightningError::InvoiceCreation(e.to_string()))?;
             let hash_bytes: [u8; 32] = *AsRef::<[u8; 32]>::as_ref(inv.payment_hash());
-            let stored = node.payment(&ldk_node::lightning::ln::channelmanager::PaymentId(hash_bytes))
+            let stored = node
+                .payment(&ldk_node::lightning::ln::channelmanager::PaymentId(
+                    hash_bytes,
+                ))
                 .ok_or_else(|| LightningError::Backend("JIT purpose was not persisted".into()))?;
             let fee = match stored.kind {
-                LdkPaymentKind::Bolt11Jit { lsp_fee_limits, .. } => lsp_fee_limits.max_total_opening_fee_msat
+                LdkPaymentKind::Bolt11Jit { lsp_fee_limits, .. } => lsp_fee_limits
+                    .max_total_opening_fee_msat
                     .ok_or_else(|| LightningError::Backend("missing fixed JIT fee".into()))?,
-                _ => return Err(LightningError::Backend("missing JIT payment purpose".into())),
+                _ => {
+                    return Err(LightningError::Backend(
+                        "missing JIT payment purpose".into(),
+                    ))
+                }
             };
-            Ok((Invoice { bolt11: inv.to_string(), payment_hash: hex::encode(hash_bytes), amount_msat: gross_msat,
-                description: description.into(), expiry_secs, created_at: inv.duration_since_epoch().as_secs() }, fee))
-        }).await.map_err(|_| LightningError::Backend("JIT worker failed".into()))?
+            Ok((
+                Invoice {
+                    bolt11: inv.to_string(),
+                    payment_hash: hex::encode(hash_bytes),
+                    amount_msat: gross_msat,
+                    description: description.into(),
+                    expiry_secs,
+                    created_at: inv.duration_since_epoch().as_secs(),
+                },
+                fee,
+            ))
+        })
+        .await
+        .map_err(|_| LightningError::Backend("JIT worker failed".into()))?
     }
 }
 
-fn jit_receipt(p: &ldk_node::payment::PaymentDetails) -> Result<Option<LiquidityReceipt>, LightningError> {
-    if let LdkPaymentKind::Bolt11Jit { counterparty_skimmed_fee_msat, .. } = p.kind {
+fn jit_receipt(
+    p: &ldk_node::payment::PaymentDetails,
+) -> Result<Option<LiquidityReceipt>, LightningError> {
+    if let LdkPaymentKind::Bolt11Jit {
+        counterparty_skimmed_fee_msat,
+        ..
+    } = p.kind
+    {
         if p.status == LdkPaymentStatus::Succeeded {
             // The vendored handler records each eligible JIT attempt's skim,
             // including zero. Older zero-fee receipts may still contain None.
             let fee = counterparty_skimmed_fee_msat.unwrap_or(0);
-            let net = p.amount_msat.ok_or_else(|| LightningError::Backend("missing settled JIT amount".into()))?;
-            let gross = net.checked_add(fee).ok_or_else(|| LightningError::Backend("JIT amount overflow".into()))?;
-            return Ok(Some(LiquidityReceipt { net_received_msat: net, lsp_fee_msat: fee, gross_msat: gross }));
+            let net = p
+                .amount_msat
+                .ok_or_else(|| LightningError::Backend("missing settled JIT amount".into()))?;
+            let gross = net
+                .checked_add(fee)
+                .ok_or_else(|| LightningError::Backend("JIT amount overflow".into()))?;
+            return Ok(Some(LiquidityReceipt {
+                net_received_msat: net,
+                lsp_fee_msat: fee,
+                gross_msat: gross,
+            }));
         }
     }
     Ok(None)
 }
 
 /// Always provide an explicit LDK override: its default includes a 50,000 msat floor.
-fn routing_fee_parameters(max_fee_msat: u64) -> ldk_node::lightning::routing::router::RouteParametersConfig {
+fn routing_fee_parameters(
+    max_fee_msat: u64,
+) -> ldk_node::lightning::routing::router::RouteParametersConfig {
     ldk_node::lightning::routing::router::RouteParametersConfig {
-        max_total_routing_fee_msat: Some(max_fee_msat), ..Default::default()
+        max_total_routing_fee_msat: Some(max_fee_msat),
+        ..Default::default()
     }
 }
 
 // Small dispatch seams let tests capture the exact arguments delivered to LDK.
 fn dispatch_invoice_with_fee_limit<T>(
-    invoice: &ldk_node::lightning_invoice::Bolt11Invoice, max_fee_msat: u64,
-    send: impl FnOnce(&ldk_node::lightning_invoice::Bolt11Invoice, Option<ldk_node::lightning::routing::router::RouteParametersConfig>) -> T,
+    invoice: &ldk_node::lightning_invoice::Bolt11Invoice,
+    max_fee_msat: u64,
+    send: impl FnOnce(
+        &ldk_node::lightning_invoice::Bolt11Invoice,
+        Option<ldk_node::lightning::routing::router::RouteParametersConfig>,
+    ) -> T,
 ) -> T {
     send(invoice, Some(routing_fee_parameters(max_fee_msat)))
 }
 fn dispatch_keysend_with_fee_limit<T>(
-    amount: u64, dest: bitcoin::secp256k1::PublicKey, max_fee_msat: u64,
-    send: impl FnOnce(u64, bitcoin::secp256k1::PublicKey, Option<ldk_node::lightning::routing::router::RouteParametersConfig>) -> T,
+    amount: u64,
+    dest: bitcoin::secp256k1::PublicKey,
+    max_fee_msat: u64,
+    send: impl FnOnce(
+        u64,
+        bitcoin::secp256k1::PublicKey,
+        Option<ldk_node::lightning::routing::router::RouteParametersConfig>,
+    ) -> T,
 ) -> T {
     send(amount, dest, Some(routing_fee_parameters(max_fee_msat)))
 }
@@ -2369,7 +2664,10 @@ fn dispatch_keysend_with_fee_limit<T>(
 /// only for RetryableSendFailure BEFORE any HTLC dispatch (including RouteNotFound).
 /// PersistenceFailed can occur after dispatch; DuplicatePayment can refer to an
 /// earlier live attempt. Neither proves that the liability is absent.
-fn classify_dispatch_error(error: ldk_node::NodeError, payment_capable: &AtomicBool) -> LightningError {
+fn classify_dispatch_error(
+    error: ldk_node::NodeError,
+    payment_capable: &AtomicBool,
+) -> LightningError {
     use ldk_node::NodeError::*;
     match error {
         PaymentSendingFailed | InvalidInvoice | InvalidAmount | InvalidCustomTlvs | NotRunning => {
@@ -2389,9 +2687,13 @@ fn classify_dispatch_error(error: ldk_node::NodeError, payment_capable: &AtomicB
 trait ChannelOpener {
     fn has_node_alias(&self) -> bool;
     fn has_listening_addresses(&self) -> bool;
-    fn open_with_funding_policy(&self, peer: bitcoin::secp256k1::PublicKey,
-        addr: ldk_node::lightning::ln::msgs::SocketAddress, amount_sats: u64,
-        announce: bool, policy: ldk_node::funding::FundingPolicy,
+    fn open_with_funding_policy(
+        &self,
+        peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress,
+        amount_sats: u64,
+        announce: bool,
+        policy: ldk_node::funding::FundingPolicy,
     ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError>;
 
     fn open_channel(
@@ -2418,12 +2720,17 @@ impl ChannelOpener for LdkNode {
     }
 
     fn has_listening_addresses(&self) -> bool {
-        self.listening_addresses().is_some_and(|addrs| !addrs.is_empty())
+        self.listening_addresses()
+            .is_some_and(|addrs| !addrs.is_empty())
     }
 
-    fn open_with_funding_policy(&self, peer: bitcoin::secp256k1::PublicKey,
-        addr: ldk_node::lightning::ln::msgs::SocketAddress, amount_sats: u64,
-        announce: bool, policy: ldk_node::funding::FundingPolicy,
+    fn open_with_funding_policy(
+        &self,
+        peer: bitcoin::secp256k1::PublicKey,
+        addr: ldk_node::lightning::ln::msgs::SocketAddress,
+        amount_sats: u64,
+        announce: bool,
+        policy: ldk_node::funding::FundingPolicy,
     ) -> Result<ldk_node::UserChannelId, ldk_node::NodeError> {
         self.open_channel_with_funding_policy(peer, addr, amount_sats, announce, policy)
     }
@@ -2463,8 +2770,12 @@ fn open_ldk_channel(
 }
 
 fn open_ldk_channel_with_policy(
-    node: &impl ChannelOpener, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
-    announce: bool, policy: Option<ldk_node::funding::FundingPolicy>,
+    node: &impl ChannelOpener,
+    peer_pubkey: &str,
+    peer_addr: &str,
+    amount_sats: u64,
+    announce: bool,
+    policy: Option<ldk_node::funding::FundingPolicy>,
 ) -> Result<String, LightningError> {
     validate_channel_announcement(node, announce)?;
     use std::str::FromStr;
@@ -2510,25 +2821,38 @@ fn open_ldk_channel_with_policy(
     Ok(channel_id)
 }
 
-fn select_funding_policy(node: &LdkNode, options: konsensus_core::traits::lightning::FundingOptions) -> Result<ldk_node::funding::FundingPolicy, LightningError> {
+fn select_funding_policy(
+    node: &LdkNode,
+    options: konsensus_core::traits::lightning::FundingOptions,
+) -> Result<ldk_node::funding::FundingPolicy, LightningError> {
     node.funding_fee_quote(ldk_funding_priority(options.priority), options.max_funding_fee_sats).map_err(|error| LightningError::PaymentNotDispatched(format!(
         "funding estimate unavailable or invalid (fresh LDK estimate and valid fee cap required): {error}"
     )))
 }
 
-fn funding_estimate(policy: &ldk_node::funding::FundingPolicy) -> konsensus_core::traits::lightning::FundingFeeEstimate {
-    use konsensus_core::traits::lightning::{FundingPriority as Core, FundingFeeEstimate};
+fn funding_estimate(
+    policy: &ldk_node::funding::FundingPolicy,
+) -> konsensus_core::traits::lightning::FundingFeeEstimate {
+    use konsensus_core::traits::lightning::{FundingFeeEstimate, FundingPriority as Core};
     use ldk_node::funding::FundingPriority as Ldk;
-    let priority = match policy.priority() { Ldk::Economy => Core::Economy, Ldk::Normal => Core::Normal, Ldk::Fast => Core::Fast };
+    let priority = match policy.priority() {
+        Ldk::Economy => Core::Economy,
+        Ldk::Normal => Core::Normal,
+        Ldk::Fast => Core::Fast,
+    };
     let blocks = policy.priority().confirmation_target_blocks();
-    FundingFeeEstimate { priority, confirmation_target_blocks: blocks,
+    FundingFeeEstimate {
+        priority,
+        confirmation_target_blocks: blocks,
         expected_confirmation_minutes: blocks * 10,
         estimated_fee_rate_sat_per_vb: policy.estimated_fee_rate_sat_per_kwu() as f64 / 250.0,
         max_funding_fee_sats: policy.max_fee_sats(),
     }
 }
 
-fn ldk_funding_priority(priority: konsensus_core::traits::lightning::FundingPriority) -> ldk_node::funding::FundingPriority {
+fn ldk_funding_priority(
+    priority: konsensus_core::traits::lightning::FundingPriority,
+) -> ldk_node::funding::FundingPriority {
     use konsensus_core::traits::lightning::FundingPriority as Core;
     use ldk_node::funding::FundingPriority as Ldk;
     match priority {
@@ -2538,7 +2862,10 @@ fn ldk_funding_priority(priority: konsensus_core::traits::lightning::FundingPrio
     }
 }
 
-fn validate_channel_announcement(node: &impl ChannelOpener, announce: bool) -> Result<(), LightningError> {
+fn validate_channel_announcement(
+    node: &impl ChannelOpener,
+    announce: bool,
+) -> Result<(), LightningError> {
     // Preserve the existing announcement refusal before estimating or dispatching.
     if announce && (!node.has_node_alias() || !node.has_listening_addresses()) {
         return Err(LightningError::PaymentNotDispatched(
@@ -2553,8 +2880,23 @@ fn refuse_exact_funding_rate(rate: Option<f32>) -> Result<(), LightningError> {
     // rate cannot promise final sat/vB after transaction rounding/dust change.
     if rate.is_some() {
         return Err(LightningError::PaymentNotDispatched(
-            "LDK cannot enforce an exact caller-supplied funding fee rate; use funding_priority".into(),
+            "LDK cannot enforce an exact caller-supplied funding fee rate; use funding_priority"
+                .into(),
         ));
+    }
+    Ok(())
+}
+
+/// Migration consent remains attached to this store even after completion.
+/// Fail before building LDK: normal startup must not reopen channels or spend.
+pub fn ensure_no_move_home(storage_dir: &std::path::Path) -> Result<(), LightningError> {
+    if storage_dir
+        .join(crate::move_home::JOURNAL_FILE)
+        .try_exists()
+        .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?
+    {
+        return Err(LightningError::InvalidStartupConfig(
+            "move-home migration journal exists; resume `konsensus move-home` with the original destination. Do not delete the journal or restore historical state.".into()));
     }
     Ok(())
 }

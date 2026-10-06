@@ -64,7 +64,7 @@ pub async fn cmd_whitelist_backup(
         out_path.display()
     );
     println!(
-        "Keep this alongside scb-latest.aes; restore with `konsensus whitelist restore` after `scb restore`."
+        "Keep this alongside scb-latest.aes; restore relationships explicitly with `konsensus whitelist restore`; channel SCB restore is disabled."
     );
     Ok(())
 }
@@ -123,7 +123,9 @@ pub async fn write_whitelist_backup(
     let backup = WhitelistBackup::collect(storage, now_unix)
         .await
         .context("failed to collect whitelist state from storage")?;
-    let sealed = backup.seal(key).context("failed to seal whitelist backup")?;
+    let sealed = backup
+        .seal(key)
+        .context("failed to seal whitelist backup")?;
 
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -142,7 +144,7 @@ pub async fn write_whitelist_backup(
 
 /// `konsensus whitelist restore` — decrypt the sidecar and re-insert the
 /// whitelist state into the configured storage DB. Idempotent; intended to run
-/// on fresh hardware after `scb restore` so the node re-admits invite-onboarded
+/// on fresh hardware independently of the disabled channel SCB restore so the node re-admits invite-onboarded
 /// peers (the P3-2 boot-load then loads them into the gate whitelist).
 pub async fn cmd_whitelist_restore(
     config_path: &Path,
@@ -232,17 +234,18 @@ mod tests {
     #[tokio::test]
     async fn written_file_is_ciphertext_not_plaintext() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = konsensus_storage::SqliteStorage::open(
-            dir.path().join("t.db").to_str().unwrap(),
-        )
-        .await
-        .unwrap();
+        let storage =
+            konsensus_storage::SqliteStorage::open(dir.path().join("t.db").to_str().unwrap())
+                .await
+                .unwrap();
         let mut peer = Peer::new(NodeId::from_bytes([1u8; 32]));
         peer.display_name = Some("recognizable-name".into());
         storage.upsert_peer(&peer).await.unwrap();
 
         let out = dir.path().join("whitelist-latest.aes");
-        write_whitelist_backup(&storage, &[7u8; 32], &out).await.unwrap();
+        write_whitelist_backup(&storage, &[7u8; 32], &out)
+            .await
+            .unwrap();
         let bytes = std::fs::read(&out).unwrap();
         assert!(
             !bytes

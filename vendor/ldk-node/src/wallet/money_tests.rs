@@ -300,10 +300,14 @@ fn advance_confirmations(wallet: &Wallet, via_blocks: bool, through: u32) {
 			wallet.block_connected(&block, height);
 		} else {
 			let tip = wallet.inner.lock().unwrap().latest_checkpoint();
-			wallet.apply_update(Update {
-				chain: Some(tip.push(bdk_chain::BlockId { height, hash: block.block_hash() }).unwrap()),
-				..Default::default()
-			}).unwrap();
+			wallet
+				.apply_update(Update {
+					chain: Some(
+						tip.push(bdk_chain::BlockId { height, hash: block.block_hash() }).unwrap(),
+					),
+					..Default::default()
+				})
+				.unwrap();
 		}
 	}
 }
@@ -325,18 +329,36 @@ fn shallow_reorg_retains_input_reservations_across_restart_and_eviction() {
 	block.txdata.clear();
 	node.wallet.block_connected(&block, 2);
 	node.wallet.apply_mempool_txs(vec![(first.clone(), local_spends::now())], vec![]).unwrap();
-	assert!(node.wallet.inner.lock().unwrap().transactions()
+	assert!(node
+		.wallet
+		.inner
+		.lock()
+		.unwrap()
+		.transactions()
 		.any(|tx| tx.tx_node.txid == first.compute_txid() && !tx.chain_position.is_confirmed()));
 	drop(node);
 	let node = self::node(dir.path());
 	// Even if the reorged mempool spend later disappears from BDK's view,
 	// its input must remain unavailable to both ordinary and bump builders.
-	node.wallet.apply_mempool_txs(vec![], vec![(first.compute_txid(), local_spends::now() + 1)]).unwrap();
-	assert!(node.wallet.create_funding_transaction(
-		ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([9; 32])),
-		Amount::from_sat(80_000), ConfirmationTarget::ChannelFunding, LockTime::ZERO,
-	).is_err(), "shallow reorg unlocked a signed spend's input");
-	assert!(node.wallet.list_confirmed_utxos_inner().unwrap().iter()
+	node.wallet
+		.apply_mempool_txs(vec![], vec![(first.compute_txid(), local_spends::now() + 1)])
+		.unwrap();
+	assert!(
+		node.wallet
+			.create_funding_transaction(
+				ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([9; 32])),
+				Amount::from_sat(80_000),
+				ConfirmationTarget::ChannelFunding,
+				LockTime::ZERO,
+			)
+			.is_err(),
+		"shallow reorg unlocked a signed spend's input"
+	);
+	assert!(node
+		.wallet
+		.list_confirmed_utxos_inner()
+		.unwrap()
+		.iter()
 		.all(|utxo| first.input.iter().all(|i| i.previous_output != utxo.outpoint)));
 	assert!(node.local_spend_reservations().iter().any(|r| r.txid == first.compute_txid()));
 }
@@ -350,10 +372,14 @@ fn source_absence_cannot_release_shallow_confirmed_spends_or_replacements() {
 			fund(&node.wallet);
 			let first = if replacement {
 				node.wallet.sign_psbt_inner(bump_psbt(&node.wallet)).unwrap()
-			} else { funding(&node.wallet, 2) };
+			} else {
+				funding(&node.wallet, 2)
+			};
 			let confirmed = if replacement {
 				node.wallet.sign_psbt_inner(bump_psbt(&node.wallet)).unwrap()
-			} else { first.clone() };
+			} else {
+				first.clone()
+			};
 			let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
 			block.header.prev_blockhash = node.wallet.current_best_block().block_hash;
 			block.txdata = vec![confirmed];
@@ -384,8 +410,10 @@ fn reservation_cleanup_waits_for_finality_on_both_sync_paths() {
 		block.txdata = vec![first.clone()];
 		node.wallet.block_connected(&block, 2);
 		advance_confirmations(&node.wallet, via_blocks, ANTI_REORG_DELAY);
-		assert!(node.local_spend_reservations().iter().any(|r| r.txid == first.compute_txid()),
-			"reservation removed one confirmation before finality");
+		assert!(
+			node.local_spend_reservations().iter().any(|r| r.txid == first.compute_txid()),
+			"reservation removed one confirmation before finality"
+		);
 		drop(node);
 		let node = self::node(dir.path());
 		let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -396,10 +424,14 @@ fn reservation_cleanup_waits_for_finality_on_both_sync_paths() {
 			node.wallet.block_connected(&block, height);
 		} else {
 			let tip = node.wallet.inner.lock().unwrap().latest_checkpoint();
-			node.wallet.apply_update(Update {
-				chain: Some(tip.push(bdk_chain::BlockId { height, hash: block.block_hash() }).unwrap()),
-				..Default::default()
-			}).unwrap();
+			node.wallet
+				.apply_update(Update {
+					chain: Some(
+						tip.push(bdk_chain::BlockId { height, hash: block.block_hash() }).unwrap(),
+					),
+					..Default::default()
+				})
+				.unwrap();
 		}
 		assert!(node.local_spend_reservations().is_empty());
 		drop(node);
@@ -440,10 +472,17 @@ fn finalized_bump_replacement_releases_unused_fee_input() {
 	node.wallet.block_connected(&block, 2);
 	advance_confirmations(&node.wallet, true, ANTI_REORG_DELAY);
 	assert_eq!(node.local_spend_reservations().len(), 2);
-	assert!(node.wallet.create_funding_transaction(
-		ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([9; 32])),
-		Amount::from_sat(80_000), ConfirmationTarget::ChannelFunding, LockTime::ZERO,
-	).is_err(), "replacement freed fee input before finality");
+	assert!(
+		node.wallet
+			.create_funding_transaction(
+				ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([9; 32])),
+				Amount::from_sat(80_000),
+				ConfirmationTarget::ChannelFunding,
+				LockTime::ZERO,
+			)
+			.is_err(),
+		"replacement freed fee input before finality"
+	);
 	let mut final_block = block.clone();
 	final_block.header.prev_blockhash = node.wallet.current_best_block().block_hash;
 	final_block.txdata.clear();
@@ -593,11 +632,9 @@ fn failed_bdk_persist_does_not_pin_prebroadcast_funding() {
 	let replacement = KVStoreWalletPersister::new(store.clone(), node.logger.clone());
 	let original = std::mem::replace(&mut *node.wallet.persister.lock().unwrap(), replacement);
 	assert!(small_funding(&node.wallet).is_err());
-	assert!(
-		lightning::util::persist::KVStoreSync::list(&*store, "bitsov_local_spends", "")
-			.unwrap()
-			.is_empty()
-	);
+	assert!(lightning::util::persist::KVStoreSync::list(&*store, "bitsov_local_spends", "")
+		.unwrap()
+		.is_empty());
 	*node.wallet.persister.lock().unwrap() = original;
 	let first = funding(&node.wallet, 2);
 	let second = funding(&node.wallet, 3);
@@ -648,17 +685,11 @@ fn stranded_send_released_after_window_and_restart_reconciliation() {
 		// lookup is required, so source outages cannot unlock uncertain spends.
 		assert!(small_funding(&node.wallet).is_err());
 		node.reconcile_local_spend(txid, false).unwrap();
-		assert!(node
-			.local_spend_reservations()
-			.iter()
-			.all(|r| r.txid != txid));
+		assert!(node.local_spend_reservations().iter().all(|r| r.txid != txid));
 		let next = funding(&node.wallet, 4);
 		assert!(next.input.iter().all(|i| i.previous_output.txid != txid));
 		drop(node);
-		assert!(self::node(dir.path())
-			.local_spend_reservations()
-			.iter()
-			.all(|r| r.txid != txid));
+		assert!(self::node(dir.path()).local_spend_reservations().iter().all(|r| r.txid != txid));
 	}
 }
 
@@ -671,10 +702,7 @@ fn recent_sighting_extends_window_and_absence_before_window_retains_inputs() {
 	let now = local_spends::now();
 	age_reservation(&node, txid, now - 172_800, Some(now - 60));
 	node.reconcile_local_spend(txid, false).unwrap();
-	assert!(node
-		.local_spend_reservations()
-		.iter()
-		.any(|r| r.txid == txid));
+	assert!(node.local_spend_reservations().iter().any(|r| r.txid == txid));
 	node.reconcile_local_spend(txid, true).unwrap();
 	assert!(
 		node.local_spend_reservations()
@@ -698,14 +726,8 @@ fn owner_release_recycles_only_requested_reservation_and_survives_restart() {
 	drop(node);
 	let node = self::node(dir.path());
 	assert_eq!(node.local_spend_reservations().len(), 1);
-	assert_eq!(
-		node.local_spend_reservations()[0].txid,
-		second.compute_txid()
-	);
-	assert_eq!(
-		funding(&node.wallet, 4).input[0].previous_output,
-		first.input[0].previous_output
-	);
+	assert_eq!(node.local_spend_reservations()[0].txid, second.compute_txid());
+	assert_eq!(funding(&node.wallet, 4).input[0].previous_output, first.input[0].previous_output);
 }
 
 #[test]
@@ -718,14 +740,8 @@ fn legacy_reservation_age_is_migrated_once_and_finality_removes_record() {
 	let store = node.wallet.persister.lock().unwrap().kv_store.clone();
 	let mut legacy = vec![0, 0];
 	legacy.extend(bitcoin::consensus::serialize(&tx));
-	KVStoreSync::write(
-		&*store,
-		"bitsov_local_spends",
-		"",
-		&tx.compute_txid().to_string(),
-		legacy,
-	)
-	.unwrap();
+	KVStoreSync::write(&*store, "bitsov_local_spends", "", &tx.compute_txid().to_string(), legacy)
+		.unwrap();
 	drop(node);
 	let node = self::node(dir.path());
 	let created = node.local_spend_reservations()[0].created_at;
@@ -755,67 +771,78 @@ fn owner_release_keeps_retry_record_if_bdk_eviction_persist_fails() {
 	assert!(node.release_local_spend(first.compute_txid()).is_err());
 	drop(node);
 	let node = self::node(dir.path());
-	assert!(node
-		.local_spend_reservations()
-		.iter()
-		.any(|r| r.txid == first.compute_txid()));
+	assert!(node.local_spend_reservations().iter().any(|r| r.txid == first.compute_txid()));
 	assert!(small_funding(&node.wallet).is_err());
 	node.release_local_spend(first.compute_txid()).unwrap();
-	assert_eq!(
-		funding(&node.wallet, 4).input[0].previous_output,
-		first.input[0].previous_output
-	);
+	assert_eq!(funding(&node.wallet, 4).input[0].previous_output, first.input[0].previous_output);
 }
 
 #[tokio::test(start_paused = true)]
 async fn signed_pending_funding_keeps_rebroadcasting_with_bounded_backoff() {
-    use lightning::chain::chaininterface::BroadcasterInterface;
-    let dir = tempfile::tempdir().unwrap();
-    let node = node(dir.path());
-    fund(&node.wallet);
-    let tx = funding(&node.wallet, 2);
-    assert!(tx.input.iter().all(|input| !input.witness.is_empty()));
-    let mut queue = node.tx_broadcaster.get_broadcast_queue().await;
-    node.tx_broadcaster.broadcast_transactions(&[&tx]);
-    assert_eq!(queue.try_recv().unwrap(), vec![tx.clone()]);
-    node.tx_broadcaster.broadcast_completed(&[tx.compute_txid()]);
-    for delay in [30, 60, 120, 240, 300, 300] {
-        tokio::time::advance(std::time::Duration::from_secs(delay - 1)).await;
-        node.tx_broadcaster.broadcast_transactions(&[&tx]);
-        assert!(queue.try_recv().is_err());
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        node.tx_broadcaster.broadcast_transactions(&[&tx]);
-        assert_eq!(queue.try_recv().unwrap(), vec![tx.clone()]);
-        node.tx_broadcaster.broadcast_completed(&[tx.compute_txid()]);
-    }
-    // Scheduling never releases wallet ownership or treats a refusal as settlement.
-    assert!(node.local_spend_reservations().iter().any(|reservation| reservation.txid == tx.compute_txid()));
+	use lightning::chain::chaininterface::BroadcasterInterface;
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	let tx = funding(&node.wallet, 2);
+	assert!(tx.input.iter().all(|input| !input.witness.is_empty()));
+	let mut queue = node.tx_broadcaster.get_broadcast_queue().await;
+	node.tx_broadcaster.broadcast_transactions(&[&tx]);
+	assert_eq!(queue.try_recv().unwrap(), vec![tx.clone()]);
+	node.tx_broadcaster.broadcast_completed(&[tx.compute_txid()]);
+	for delay in [30, 60, 120, 240, 300, 300] {
+		tokio::time::advance(std::time::Duration::from_secs(delay - 1)).await;
+		node.tx_broadcaster.broadcast_transactions(&[&tx]);
+		assert!(queue.try_recv().is_err());
+		tokio::time::advance(std::time::Duration::from_secs(1)).await;
+		node.tx_broadcaster.broadcast_transactions(&[&tx]);
+		assert_eq!(queue.try_recv().unwrap(), vec![tx.clone()]);
+		node.tx_broadcaster.broadcast_completed(&[tx.compute_txid()]);
+	}
+	// Scheduling never releases wallet ownership or treats a refusal as settlement.
+	assert!(node
+		.local_spend_reservations()
+		.iter()
+		.any(|reservation| reservation.txid == tx.compute_txid()));
 }
 
 #[test]
 fn funding_policy_survives_restart_and_cache_increase_with_hard_cap() {
-	use crate::funding::{FundingPriority, FundingPolicy};
+	use crate::funding::{FundingPolicy, FundingPriority};
 	let dir = tempfile::tempdir().unwrap();
 	let id = crate::funding::new_policy_channel_id();
 	{
 		let node = node(dir.path());
 		fund(&node.wallet);
-		let policy = FundingPolicy::new(FundingPriority::Fast, FeeRate::from_sat_per_kwu(1250), Some(1)).unwrap();
+		let policy =
+			FundingPolicy::new(FundingPriority::Fast, FeeRate::from_sat_per_kwu(1250), Some(1))
+				.unwrap();
 		crate::funding::save(node.kv_store.as_ref(), id, &policy).unwrap();
 	}
 	let node = node(dir.path());
-	node.fee_estimator.set_test_fee_rate_cache(std::collections::HashMap::from([
-		(ConfirmationTarget::OnchainPayment, FeeRate::from_sat_per_kwu(25000)),
-	]));
+	node.fee_estimator.set_test_fee_rate_cache(std::collections::HashMap::from([(
+		ConfirmationTarget::OnchainPayment,
+		FeeRate::from_sat_per_kwu(25000),
+	)]));
 	let script = node.wallet.get_new_address().unwrap().script_pubkey();
-	let err = node.wallet.create_channel_funding_transaction(script.clone(), Amount::from_sat(80_000), id, LockTime::ZERO).unwrap_err();
+	let err = node
+		.wallet
+		.create_channel_funding_transaction(
+			script.clone(),
+			Amount::from_sat(80_000),
+			id,
+			LockTime::ZERO,
+		)
+		.unwrap_err();
 	assert_eq!(err, Error::FundingFeeCapExceeded);
 	assert!(node.wallet.local_spends.lock().unwrap().reservations().is_empty());
 	let mut policy = crate::funding::load(node.kv_store.as_ref(), id).unwrap().unwrap();
 	assert_eq!(policy.fee_rate.to_sat_per_kwu(), 1250);
 	policy.max_fee_sats = Some(2000);
 	crate::funding::save(node.kv_store.as_ref(), id, &policy).unwrap();
-	let tx = node.wallet.create_channel_funding_transaction(script, Amount::from_sat(80_000), id, LockTime::ZERO).unwrap();
+	let tx = node
+		.wallet
+		.create_channel_funding_transaction(script, Amount::from_sat(80_000), id, LockTime::ZERO)
+		.unwrap();
 	let wallet = node.wallet.inner.lock().unwrap();
 	let fee = wallet.calculate_fee(&tx).unwrap().to_sat();
 	assert!(fee <= 2000);
@@ -830,29 +857,54 @@ fn missing_or_corrupt_funding_policy_never_falls_back() {
 	fund(&node.wallet);
 	let id = crate::funding::new_policy_channel_id();
 	let script = node.wallet.get_new_address().unwrap().script_pubkey();
-	assert!(node.wallet.create_channel_funding_transaction(script.clone(), Amount::from_sat(80_000), id, LockTime::ZERO).is_err());
-	lightning::util::persist::KVStoreSync::write(node.kv_store.as_ref(), "bitsov_funding", "", &id.to_string(), vec![1, 2]).unwrap();
-	assert!(node.wallet.create_channel_funding_transaction(script, Amount::from_sat(80_000), id, LockTime::ZERO).is_err());
+	assert!(node
+		.wallet
+		.create_channel_funding_transaction(
+			script.clone(),
+			Amount::from_sat(80_000),
+			id,
+			LockTime::ZERO
+		)
+		.is_err());
+	lightning::util::persist::KVStoreSync::write(
+		node.kv_store.as_ref(),
+		"bitsov_funding",
+		"",
+		&id.to_string(),
+		vec![1, 2],
+	)
+	.unwrap();
+	assert!(node
+		.wallet
+		.create_channel_funding_transaction(script, Amount::from_sat(80_000), id, LockTime::ZERO)
+		.is_err());
 }
 
 #[test]
 fn funding_absolute_cap_accepts_exact_fee_and_refuses_one_sat_less() {
-	use crate::funding::{FundingPriority, FundingPolicy};
+	use crate::funding::{FundingPolicy, FundingPriority};
 	let build = |cap| {
 		let dir = tempfile::tempdir().unwrap();
 		let node = node(dir.path());
 		fund(&node.wallet);
 		let id = crate::funding::new_policy_channel_id();
-		let policy = FundingPolicy::new(FundingPriority::Normal, FeeRate::from_sat_per_kwu(1250), cap).unwrap();
+		let policy =
+			FundingPolicy::new(FundingPriority::Normal, FeeRate::from_sat_per_kwu(1250), cap)
+				.unwrap();
 		crate::funding::save(node.kv_store.as_ref(), id, &policy).unwrap();
 		let script = node.wallet.get_new_address().unwrap().script_pubkey();
-		let result = node.wallet.create_channel_funding_transaction(script, Amount::from_sat(80_000), id, LockTime::ZERO);
+		let result = node.wallet.create_channel_funding_transaction(
+			script,
+			Amount::from_sat(80_000),
+			id,
+			LockTime::ZERO,
+		);
 		match result {
 			Ok(tx) => Ok(node.wallet.inner.lock().unwrap().calculate_fee(&tx).unwrap().to_sat()),
 			Err(error) => {
 				assert!(node.wallet.local_spends.lock().unwrap().reservations().is_empty());
 				Err(error)
-			},
+			}
 		}
 	};
 	let fee = build(None).unwrap();
@@ -880,8 +932,24 @@ fn funding_quotes_and_channel_policies_are_independent() {
 	crate::funding::save(node.kv_store.as_ref(), fast_id, &fast).unwrap();
 	let normal_script = node.wallet.get_new_address().unwrap().script_pubkey();
 	let fast_script = node.wallet.get_new_address().unwrap().script_pubkey();
-	let a = node.wallet.create_channel_funding_transaction(normal_script, Amount::from_sat(80_000), normal_id, LockTime::ZERO).unwrap();
-	let b = node.wallet.create_channel_funding_transaction(fast_script, Amount::from_sat(80_000), fast_id, LockTime::ZERO).unwrap();
+	let a = node
+		.wallet
+		.create_channel_funding_transaction(
+			normal_script,
+			Amount::from_sat(80_000),
+			normal_id,
+			LockTime::ZERO,
+		)
+		.unwrap();
+	let b = node
+		.wallet
+		.create_channel_funding_transaction(
+			fast_script,
+			Amount::from_sat(80_000),
+			fast_id,
+			LockTime::ZERO,
+		)
+		.unwrap();
 	assert_distinct_inputs(&a, &b);
 	let wallet = node.wallet.inner.lock().unwrap();
 	let a_fee = wallet.calculate_fee(&a).unwrap().to_sat();
@@ -906,12 +974,14 @@ fn funding_failure_reason_survives_restart() {
 
 #[test]
 fn funding_failure_is_terminal_across_restart_even_if_wallet_recovers() {
-	use crate::funding::{FundingPriority, FundingPolicy};
+	use crate::funding::{FundingPolicy, FundingPriority};
 	let dir = tempfile::tempdir().unwrap();
 	let id = crate::funding::new_policy_channel_id();
 	{
 		let node = node(dir.path());
-		let policy = FundingPolicy::new(FundingPriority::Normal, FeeRate::from_sat_per_kwu(1250), None).unwrap();
+		let policy =
+			FundingPolicy::new(FundingPriority::Normal, FeeRate::from_sat_per_kwu(1250), None)
+				.unwrap();
 		crate::funding::save(node.kv_store.as_ref(), id, &policy).unwrap();
 		// Model a construction failure already reported to the owner. Test the
 		// terminal wallet policy, not LDK event persistence (FundingGenerationReady
@@ -921,7 +991,12 @@ fn funding_failure_is_terminal_across_restart_even_if_wallet_recovers() {
 	let node = node(dir.path());
 	fund(&node.wallet); // wallet can now fund, but the refused opening must not
 	let script = node.wallet.get_new_address().unwrap().script_pubkey();
-	let result = node.wallet.create_channel_funding_transaction(script, Amount::from_sat(80_000), id, LockTime::ZERO);
+	let result = node.wallet.create_channel_funding_transaction(
+		script,
+		Amount::from_sat(80_000),
+		id,
+		LockTime::ZERO,
+	);
 	assert!(result.is_err(), "a refused opening was funded on a repeated construction attempt");
 	assert!(node.wallet.local_spends.lock().unwrap().reservations().is_empty());
 	node.wallet.record_funding_failure(id, Error::WalletOperationFailed).unwrap();
@@ -947,13 +1022,7 @@ async fn default_funding_with_empty_non_mainnet_esplora_estimates() {
 			>,
 		> {
 			assert_eq!(request.build().unwrap().url().path(), "/fee-estimates");
-			Box::pin(async {
-				Ok(http::Response::builder()
-					.status(200)
-					.body("{}")
-					.unwrap()
-					.into())
-			})
+			Box::pin(async { Ok(http::Response::builder().status(200).body("{}").unwrap().into()) })
 		}
 	}
 	for network in [bitcoin::Network::Regtest, bitcoin::Network::Signet] {
@@ -968,9 +1037,7 @@ async fn default_funding_with_empty_non_mainnet_esplora_estimates() {
 		);
 		let node = builder.build_with_fs_store().unwrap();
 		node.chain_source.update_fee_rate_estimates().await.unwrap();
-		assert!(node
-			.funding_fee_quote(crate::funding::FundingPriority::Normal, None)
-			.is_err());
+		assert!(node.funding_fee_quote(crate::funding::FundingPriority::Normal, None).is_err());
 		fund(&node.wallet);
 		let script = node.wallet.get_new_address().unwrap().script_pubkey();
 		let tx = node
@@ -983,9 +1050,146 @@ async fn default_funding_with_empty_non_mainnet_esplora_estimates() {
 			)
 			.unwrap();
 		assert!(tx.input.iter().all(|input| !input.witness.is_empty()));
-		assert!(node
-			.local_spend_reservations()
-			.iter()
-			.any(|r| r.txid == tx.compute_txid()));
+		assert!(node.local_spend_reservations().iter().any(|r| r.txid == tx.compute_txid()));
+	}
+}
+
+fn move_home_destination() -> Address {
+	let key = bitcoin::secp256k1::PublicKey::from_secret_key(
+		&Secp256k1::new(),
+		&SecretKey::from_slice(&[91; 32]).unwrap(),
+	);
+	Address::p2wpkh(&bitcoin::CompressedPublicKey(key), bitcoin::Network::Regtest)
+}
+
+#[test]
+fn move_home_preview_is_deterministic_and_does_not_reserve_coins() {
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	let destination = move_home_destination();
+	let rate = FeeRate::from_sat_per_vb(2).unwrap();
+	let (tx, fee) = node.wallet.prepare_move_home(&destination, rate).unwrap();
+	let second = node.wallet.prepare_move_home(&destination, rate).unwrap();
+	assert_eq!((tx.clone(), fee), second);
+	assert_eq!(tx.input.len(), 2);
+	assert_eq!(tx.output.len(), 1);
+	assert_eq!(tx.output[0].script_pubkey, destination.script_pubkey());
+	assert_eq!(tx.output[0].value.to_sat() + fee, 300_000);
+	assert!(fee >= (rate * tx.weight()).to_sat());
+	assert!(node.local_spend_reservations().is_empty());
+	assert_eq!(node.list_balances().total_onchain_balance_sats, 300_000);
+}
+
+#[test]
+fn move_home_replay_survives_wallet_restart_and_owns_same_inputs() {
+	let dir = tempfile::tempdir().unwrap();
+	let destination = move_home_destination();
+	let (tx, fee) = {
+		let node = node(dir.path());
+		fund(&node.wallet);
+		let (tx, fee) = node
+			.wallet
+			.prepare_move_home(&destination, FeeRate::from_sat_per_vb(2).unwrap())
+			.unwrap();
+		node.wallet.replay_move_home(&tx, &destination, fee).unwrap();
+		(tx, fee)
+	};
+	let node = node(dir.path());
+	node.wallet.replay_move_home(&tx, &destination, fee).unwrap();
+	assert_eq!(node.local_spend_reservations().len(), 1);
+	assert_eq!(node.local_spend_reservations()[0].txid, tx.compute_txid());
+	assert!(small_funding(&node.wallet).is_err());
+	assert_eq!(node.wallet.move_home_confirmations(tx.compute_txid()), 0);
+}
+
+#[test]
+fn move_home_refuses_wrong_fee_address_and_self_destination() {
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	let destination = move_home_destination();
+	let rate = FeeRate::from_sat_per_vb(2).unwrap();
+	let own = node.wallet.get_new_address().unwrap();
+	assert!(node.wallet.prepare_move_home(&own, rate).is_err());
+	let (tx, fee) = node.wallet.prepare_move_home(&destination, rate).unwrap();
+	assert!(node.wallet.replay_move_home(&tx, &destination, fee + 1).is_err());
+	assert!(node.wallet.replay_move_home(&tx, &own, fee).is_err());
+	assert!(node.local_spend_reservations().is_empty());
+}
+
+#[test]
+fn move_home_refuses_preexisting_spend_reservations() {
+	let dir = tempfile::tempdir().unwrap();
+	let node = node(dir.path());
+	fund(&node.wallet);
+	let _pending = funding(&node.wallet, 2);
+	assert!(node
+		.wallet
+		.prepare_move_home(&move_home_destination(), FeeRate::from_sat_per_vb(2).unwrap())
+		.is_err());
+}
+
+#[test]
+fn move_home_replay_refuses_conflicted_or_replaced_inputs() {
+	for already_replayed in [false, true] {
+		for confirmed in [false, true] {
+			let dir = tempfile::tempdir().unwrap();
+			let node = node(dir.path());
+			fund(&node.wallet);
+			let destination = move_home_destination();
+			let (tx, fee) = node
+				.wallet
+				.prepare_move_home(&destination, FeeRate::from_sat_per_vb(2).unwrap())
+				.unwrap();
+			if already_replayed {
+				node.wallet
+					.replay_move_home(&tx, &destination, fee)
+					.unwrap();
+			}
+			let mut replacement = tx.clone();
+			replacement.output[0].value -= Amount::from_sat(1000);
+			let mut tx_update = bdk_chain::TxUpdate::default();
+			let tip = node.wallet.inner.lock().unwrap().latest_checkpoint();
+			let block = bdk_chain::BlockId {
+				height: 2,
+				hash: bitcoin::BlockHash::from_byte_array([2; 32]),
+			};
+			if confirmed {
+				tx_update.anchors.insert((
+					bdk_chain::ConfirmationBlockTime {
+						block_id: block,
+						confirmation_time: 2,
+					},
+					replacement.compute_txid(),
+				));
+			} else {
+				tx_update
+					.seen_ats
+					.insert((replacement.compute_txid(), local_spends::now() + 100));
+			}
+			tx_update.txs.push(Arc::new(replacement));
+			node.wallet
+				.apply_update(Update {
+					tx_update,
+					chain: Some(tip.push(block).unwrap()),
+					..Default::default()
+				})
+				.unwrap();
+			assert_eq!(node.wallet.move_home_confirmations(tx.compute_txid()), 0);
+			let before = node.local_spend_reservations();
+			assert_eq!(
+				node.wallet.replay_move_home(&tx, &destination, fee),
+				Err(Error::MoveHomeSweepUnavailable),
+				"replayed={already_replayed}, confirmed conflict={confirmed}"
+			);
+			assert_eq!(node.local_spend_reservations().len(), before.len());
+			drop(node);
+			let restarted = self::node(dir.path());
+			assert_eq!(
+				restarted.wallet.replay_move_home(&tx, &destination, fee),
+				Err(Error::MoveHomeSweepUnavailable)
+			);
+		}
 	}
 }
