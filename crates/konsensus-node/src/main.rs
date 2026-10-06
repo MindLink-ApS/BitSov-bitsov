@@ -943,6 +943,13 @@ async fn cmd_start(
         konsensus_api::bootstrap::StartupMode::Refuse(_) => unreachable!(),
     }
 
+    // Refuse a conflicting hub-service role before locking, not after the owner unlocks.
+    let channel_peers = if password_source == PasswordSource::RemoteUnlock {
+        guarded_lightning::ChannelPeers::hub_only(&config.lightning)?
+    } else {
+        guarded_lightning::ChannelPeers::Any
+    };
+
     let password = if password_source == PasswordSource::RemoteUnlock {
         // No node, wallet, peer transport or live API exists before this returns.
         let signal = shutdown_signal()?;
@@ -1023,6 +1030,13 @@ async fn cmd_start(
         sovereignty_tier = ?config.tier.to_sovereignty_tier(),
         "starting konsensus node"
     );
+    if let Some(hubs) = channel_peers.allowlist() {
+        info!(
+            code = konsensus_core::traits::lightning::HUB_ONLY_WHILE_LOCKABLE,
+            hubs = hubs.len(),
+            "remote unlock: new channels limited to the configured hub/LSP"
+        );
+    }
 
     // Install shutdown handling before construction: startup may now be waiting
     // in bounded chain-source backoff. Dropping construction cancels that retry;
@@ -1039,7 +1053,7 @@ async fn cmd_start(
             info!(code = "BOOT_CANCELLED", "startup cancelled before readiness");
             return Ok(());
         }
-        result = KonsensusNode::from_config(config.clone(), mnemonic_password.as_deref().map(String::as_str)) => {
+        result = KonsensusNode::from_config_with_channel_peers(config.clone(), mnemonic_password.as_deref().map(String::as_str), channel_peers) => {
             result.context("failed to build node")?
         }
     };

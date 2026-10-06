@@ -60,9 +60,63 @@ state and deadlines. Outgoing HTLCs also resolve on-chain through the peer.
 Unlock promptly after every restart; do not treat these estimates as guarantees.
 
 LDK has no watchtower client here, and creating a justice transaction requires
-keys: there is no keyless watch-only protection. Keep channels only with the
-reputable hub while this gap exists. A later change may negotiate an inbound
-`our_to_self_delay` of at least 288 blocks; this release does not set that value.
+keys: there is no keyless watch-only protection. Started with `--remote-unlock`,
+the node therefore opens and accepts new channels only with the configured
+hub/LSPs (see [hub-only channels](#hub-only-channels-hub_only_while_lockable)).
+A longer breach window (below) gives more time to unlock but does not lift that
+rule.
+
+### Longer breach window (optional)
+
+You can ask channel peers for a longer window to respond to a revoked state:
+
+```toml
+[lightning]
+backend = "ldk"
+our_to_self_delay_blocks = 288  # about two days
+```
+
+The value is the number of blocks a peer must wait before it can claim its own
+balance after it force-closes. During that wait the unlocked node can punish an
+old state, so 288 gives roughly two days to unlock instead of one. It applies to
+channels opened after the change, in both directions (including channels the
+hub opens to you); existing channels keep the value they were opened with.
+Accepted values are 144 to 2016 blocks; others are refused at startup. Omitting
+the key keeps LDK's default of 144, the behaviour of earlier releases.
+
+The peer must agree. LDK peers accept up to 2016 by default; a peer with a
+lower limit refuses the channel, and the open fails rather than falling back to
+144. A larger value delays the peer's funds after its force-close, so some peers
+may prefer not to accept it. It does not delay your own funds when you
+force-close; that wait is set by the peer. It is not a watchtower: if the box
+stays locked or offline for longer than the window, the risk above still
+applies.
+
+## Hub-only channels: `HUB_ONLY_WHILE_LOCKABLE`
+
+Started with `--remote-unlock`, the node opens and accepts new channels only with
+the hub/LSP node ids listed under `[lightning.liquidity] providers` (every listed
+provider, not only `selected_provider`). The rule holds for the whole run, after
+unlock too, because the next reboot leaves every channel unwatched again:
+
+- Owner `POST /api/v1/payments/open-channel` to any other peer returns 403 with
+  `"code": "HUB_ONLY_WHILE_LOCKABLE"` and `"retry_allowed": false`. Nothing is
+  dialed, funded or signed.
+- The onboarding auto-channel worker gets the same refusal and leaves the invite
+  pending.
+- Inbound channel requests from any other peer are rejected before acceptance
+  (`HUB_ONLY_WHILE_LOCKABLE: refusing inbound channel` in `ldk_node.log`).
+  The hub's LSPS2 JIT channels are accepted as before.
+- `[lightning.lsps2_service] enabled = true` opens channels to arbitrary clients,
+  so `--remote-unlock` refuses to start with it.
+- With no provider listed, or with a non-LDK backend, every new channel is refused.
+
+Existing channels, payments, forwarding and closes are unaffected. The flag does
+not close channels a node opened during an earlier start without it; close any
+non-hub channels before relying on remote unlock. A start without
+`--remote-unlock` keeps the previous behaviour. The rule relaxes only once
+watchtowers exist that are not the channel's counterparty; a hub-run tower cannot
+guard against the hub itself.
 
 Peers get connection refused while the node is locked. The tier-2 relay is not a
 session forwarder and does not queue messages for it. Paid messages are not

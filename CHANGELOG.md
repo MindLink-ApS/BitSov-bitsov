@@ -5,33 +5,145 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
-- Add `start --remote-unlock`: an encrypted home node can wait after reboot for
-  an existing owner-approved device over the pinned box-static Noise tunnel.
-  Locked nodes serve four routes only, do not receive messages or watch Lightning
-  channels, and never persist the unlock password. See [the home-node runbook](docs/operations/home-node.md).
-- Remote first run: `start --remote-unlock --local-owner-device` on a positively
-  empty data dir serves two-phase bootstrap over the box-static Noise tunnel to
-  the one client that consumed a pre-bootstrap `pair-ticket`. `create-pending`
-  takes a `password_commitment`, and `finalize` takes the password over the
-  tunnel only (`400 tunnel_required` on loopback). The commit writes only
-  `mnemonic.enc`, records `enrolled_by: "remote_first_run"`, writes signed public
-  identity metadata, returns the box proof, and exits 75 so `Restart=on-failure`
-  restarts into locked mode for the first remote unlock. Legacy create/restore
-  are not routed in this mode. See [remote first run](docs/security/pairing.md#remote-first-run-over-the-tunnel).
+- Optional `[lightning] our_to_self_delay_blocks` (144 to 2016) sets the breach
+  window peers must accept on new channels, inbound and outbound. Home nodes
+  that may stay locked can set 288 (about two days). Omitting it keeps LDK's 144;
+  existing channels keep their negotiated value. See [the home-node runbook](docs/operations/home-node.md#longer-breach-window-optional).
 
-## [0.3.0-rc9] — 2026-10-06 (prep; not tagged yet)
+## [0.3.0-rc10] — 2026-10-06 (prep; not tagged yet)
+
+**Pre-release.** Not for production use. Covers the 14 merged commits from
+`v0.3.0-rc9` (`cd75c69`) through **#257** (`1ae4e62`), including #250
+(`a0062b2`), #251 (`29385e7`), #252 (`64b4542`), #256 (`d59031f`) and #257
+(`1ae4e62`).
+Signing checklist: [`docs/releases/v0.3.0-rc10.md`](docs/releases/v0.3.0-rc10.md).
+Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
+
+### Security
+
+- DoS edge on the unpaid peer doorway (#250). Per-IP and per-IPv6-/64
+  connection and handshake token buckets, per-source and global concurrency
+  caps, and bounded source tables apply before any Noise work, in both
+  `whitelist` and `price_open` modes. New `[dos_edge]` table; partial tables
+  inherit defaults. **`cookie_mode` now defaults to `adaptive`** (was
+  `disabled`): under load, unverified sources must echo a stateless `BSc1`
+  cookie before the node does DH work. Peers that cannot answer a cookie cannot
+  connect while cookies are demanded. The old IPv4 /24 aggregation is removed.
+  This does not make a distributed flood starvation-proof; keep upstream
+  firewall/SYN protection. See [docs/operations/dos-edge.md](docs/operations/dos-edge.md).
+- `scripts/release-sign.sh <tag> <commit-on-main>` does the operator's signing in
+  one run: signed tag (or verify an existing one), wait for the exact-commit tag
+  CI, check every draft binary against its `.sha256`, then write, sign, verify
+  and attach `SHA256SUMS`/`SHA256SUMS.asc`. It never publishes. It refuses
+  expired, revoked or bad signatures (#242). A non-UTF-8 locale `unbound TAG`
+  abort is fixed, and the script is exercised offline in PR CI across three
+  locales (#243).
+
+### Money
+
+- Every paid admission must carry at least **1,000 msat (1 sat)**, enforced
+  after discounts and on previously issued delivery quotes. Bound web replies
+  and accepted-envelope retries keep their existing handling. Older or custom
+  senders paying 1–999 msat are now refused (#245, T18).
+- Every advertised price (peer price tables, delivery prices and front-door
+  quotes) passes the same admission floor the gate enforces, so advertised and
+  enforced prices cannot drift (#248, T18b).
+- First-contact prices (introduction card, front-door defaults, stateless quote)
+  include `min_admission_cost_msat` when it exceeds `chat_msat`. A stranger is
+  no longer refused after paying an understated quote. A zero chat price now
+  quotes 1 sat instead of a free message (#253, T18c).
+- **SCB restore is locked**, including preview and `--confirm`, with no bypass.
+  Starting historical channel state could broadcast a revoked commitment. New
+  owner-console `konsensus move-home` moves funds from a healthy node's current
+  live state: cooperative close, separately consented force-close of named
+  channels, and exact amount/fee sweep confirmation. Its journal
+  `ldk/move-home.json` blocks normal startup until the move completes.
+  **State generation rises to 2.** Whitelist sidecars are restored with
+  `konsensus whitelist restore`, and export restore steps now point to
+  move-home. Lightning 0.2.2 is vendored with narrow, documented patches (#246;
+  #157).
+
+### Pairing and home node
+
+- Seed-independent X25519 box transport key (`pairing/box-transport.key`,
+  0600), signed by the node identity on every unlocked start and recorded in
+  `identity/identity.json`. Successful remote auth carries the proof, so
+  existing clients can pin it under their trusted `node_id`. The live responder
+  stays on the seed-derived static. Publishing the key needs hard links, so it
+  fails on a data directory on exFAT/FAT (#244, U1).
+- `start --remote-unlock`: after a reboot an encrypted home node waits for an
+  existing owner-approved device over the pinned box-static Noise tunnel.
+  Locked nodes serve four routes only, do not receive messages or watch
+  Lightning channels, and never persist the unlock password. Wrong unlocks are
+  limited per key and per process. The systemd example now runs
+  `--remote-unlock --local-owner-device` instead of `--owner-control` (#247, U2).
+  See [the home-node runbook](docs/operations/home-node.md).
+- Owner-device delegation (#251, PR C). In `--local-owner-device`
+  mode the owner signing key stays in zeroizing memory, so an enrolled owner
+  device can approve another device. It signs the exact
+  `bitsov-owner-delegation-v1` tuple via
+  `POST /api/v1/pair/device-key/{op_id}/delegate`, and the new record shows
+  `enrolled_by: "device:<approver>"`. Console `device revoke` and epoch bumps
+  retire delegated keys. `GET /api/v1/pair/device-keys` adds
+  `owner_device_count`; the app must keep a non-phone owner device.
+- One-shot pairing tickets (#252, P1):
+  `konsensus pair-ticket --config <cfg> [--qr] [--ttl 24h]` writes a file-backed
+  `read+receive` ticket (TTL in `s`/`m`/`h`/`d` up to 365 days, survives
+  restart, refused while locked) and prints the URI or a terminal QR only to
+  the CLI's own stdout. Optional `[node] hosted_by` display label (1–64
+  printable characters) appears in tickets, `/api/v1/node/lock` and
+  `/api/v1/health`. It is display only and does not imply `identity.hosted`
+  custody.
+- Remote first run (#256, P2; merge `d59031f`):
+  `start --remote-unlock --local-owner-device` on a positively empty data
+  directory serves two-phase bootstrap over the box-static Noise tunnel to the
+  one client that consumed a pre-bootstrap `pair-ticket`. `create-pending`
+  takes a `password_commitment` and `finalize` takes the password over the
+  tunnel only (`400 tunnel_required` on loopback). The commit writes only
+  `mnemonic.enc`, records `enrolled_by: "remote_first_run"`, writes signed
+  public identity metadata, returns the box proof, and exits 75 so
+  `Restart=on-failure` restarts into locked mode for the first remote unlock.
+  Legacy create/restore are not routed in this mode. See
+  [remote first run](docs/security/pairing.md#remote-first-run-over-the-tunnel).
+- Hub-only channels while a node can sit locked (#257; merge `1ae4e62`). For
+  the whole `start --remote-unlock` run, after unlock too, new channels in
+  either direction are limited to the node ids under `[lightning.liquidity]
+  providers` until a watchtower exists. Other API and auto-channel opens are
+  refused with `HUB_ONLY_WHILE_LOCKABLE` (API 403, `retry_allowed: false`)
+  before anything is dialed or funded. Inbound requests from other peers are
+  rejected before acceptance; the hub's LSPS2 JIT channels still pass. With no
+  provider listed, or a non-LDK backend, every new channel is refused.
+  `[lightning.lsps2_service] enabled = true` cannot start with the flag.
+  Existing channels are not closed. Starts without the flag are unchanged. See
+  [hub-only channels](docs/operations/home-node.md#hub-only-channels-hub_only_while_lockable).
+
+### Docs
+
+- Reaching a home node off the LAN over Tailscale: listeners and
+  advertised addresses on the tailnet address, `[api]` on loopback, what the
+  tailnet can see, and that the hub never relays for its LSP role. Port mapping
+  and Tor are documented as not shipped (#254;
+  [docs/operations/reachability.md](docs/operations/reachability.md)).
+- rc10 release notes and signing checklist, plus an rc9 → rc10 upgrade
+  procedure with every new config key and the state-generation-2 rollback rule.
+
+### Upgrade and version
+
+- **State generation 2:** the first rc10 node start raises `STATE_GENERATION`.
+  rc9 then refuses the data directory with `state_generation_newer`. Roll
+  forward only.
+- No numbered SQL migration since rc9 (still **001–028**).
+- `[dos_edge]` and `[node]` are new tables, and NodeConfig rejects unknown
+  fields, so rc9 will not parse a config that uses them.
+- Workspace version is `0.3.0-rc10` (all 13 packages).
+
+## [0.3.0-rc9] — 2026-10-06
 
 **Pre-release.** Not for production use. Covers all 32 merged commits from
 `v0.3.0-rc8` (`f125aab`) through **#240** (`7fde729`). Full notes and the executed
 upgrade check: [`docs/releases/v0.3.0-rc9.md`](docs/releases/v0.3.0-rc9.md).
 
 ### Local owner and encrypted bootstrap
-
-- Local owner devices can approve another device through P-256 delegation bound
-  to the exact node, pairing, epoch, new key, operation and nonce. Local starts
-  retain the owner signing key in zeroizing memory; console revoke and epoch
-  bumps retire delegated keys. The device list reports `owner_device_count`
-  for the app warning and rule that a phone must never be the sole owner device.
 
 - `init/start --password-fd <n>` reads a bounded, one-shot UTF-8 password from an
   inherited descriptor (`0` = stdin), with mutually exclusive password sources

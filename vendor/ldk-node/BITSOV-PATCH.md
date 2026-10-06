@@ -472,3 +472,58 @@ before enqueueing. Replay permits inputs spent by that same canonical sweep,
 but returns `MoveHomeSweepUnavailable` with operator guidance for missing inputs
 or inputs spent by a conflict/replacement. Queueing is not confirmation. Real BDK
 tests cover this boundary in wallet/money_tests.rs.
+
+## Configurable `our_to_self_delay` (watchtower W0)
+
+Upstream `default_user_config` leaves `ChannelHandshakeConfig::our_to_self_delay`
+at LDK's `BREAKDOWN_TIMEOUT` (144 blocks) and offers no knob. `Config::our_to_self_delay:
+Option<u16>` defaults to `None`, which keeps that value. When set,
+`default_user_config` copies it into the handshake config after the existing
+announcement and forwarding adjustments. Every channel-creation path starts
+from that `UserConfig`: `Node::open_channel` (outbound), inbound acceptance in
+`event.rs` (its `ChannelConfigOverrides` only override the in-flight percentage),
+and the LSPS2 service open in `liquidity/jit.rs` (`get_current_config`).
+
+The value is the delay a counterparty must wait before claiming its `to_local`
+output after a unilateral close, so it is our window to punish a revoked state.
+It is fixed per channel at open; existing channels keep their negotiated value.
+The vendor does not range-check it: LDK refuses channels below 144, and a peer
+refuses values above its `their_to_self_delay` limit (LDK default 2016). BitSov
+exposes it as `[lightning] our_to_self_delay_blocks` and rejects values outside
+144..=2016 at config validation and again before `LdkProvider` builds the node.
+Our own force-close outputs wait on the peer's delay, which this setting does
+not change.
+
+No commitment, revocation, monitor or HTLC logic changes.
+
+    cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib bitsov_our_to_self_delay
+
+The unit test checks the unset default (144), applied values (144, 288, 2016),
+and that anchors and the inbound `their_to_self_delay` limit are unchanged. Not
+yet covered: a regtest scenario asserting the counterparty's
+`ChannelDetails::force_close_spend_delay` equals the configured value for
+inbound and outbound channels.
+
+## Hub-only channels while lockable (2026-10-06)
+
+`Config::channel_peer_allowlist` defaults to `None` (unchanged behavior). When
+set, `event.rs` rejects an `OpenChannelRequest` from any unlisted counterparty
+right after the disk admission check, using the same pre-acceptance rejection
+(no funding transaction exists), and logs `HUB_ONLY_WHILE_LOCKABLE`.
+`open_channel_inner` (plain, announced and funding-policy opens) returns
+`ChannelCreationFailed` for an unlisted peer before connecting or reserving
+funds. Existing channels, splices, forwards, closes and claims are unaffected.
+The LSPS2 service open path (`liquidity/jit.rs`) is not gated here; BitSov
+refuses to configure the service together with an allowlist.
+
+BitSov sets the allowlist for `start --remote-unlock` from the configured
+`[lightning.liquidity] providers`, because a locked node runs no ChainMonitor
+(see `docs/operations/home-node.md`).
+
+    cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib bitsov_channel_peers
+
+The regression exchanges real `open_channel` messages between unstarted,
+unfunded in-memory nodes and feeds the resulting request to the production
+handler: a listed hub is accepted, an unlisted peer is rejected (and cannot be
+accepted later), and no allowlist accepts as before. Outbound opens to an
+unlisted peer fail before the running check; listed peers reach it unchanged.

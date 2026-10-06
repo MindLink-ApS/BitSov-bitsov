@@ -86,7 +86,9 @@ fn convert_direction_mapping() {
 fn ldk_config_construction() {
     let mut config = LdkConfig {
         forward_to_private_channels: false,
+        our_to_self_delay_blocks: None,
         lsps2_service: Default::default(),
+        channel_peers: None,
         esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,
@@ -114,6 +116,22 @@ fn ldk_config_construction() {
         assert_eq!(node_config.accept_forwards_to_priv_channels, enabled);
         assert!(node_config.node_alias.is_none());
         assert!(node_config.announcement_addresses.is_none());
+    }
+    assert_eq!(config.node_config(None).our_to_self_delay, None);
+    config.our_to_self_delay_blocks = Some(288);
+    assert_eq!(config.node_config(None).our_to_self_delay, Some(288));
+}
+
+#[test]
+fn our_to_self_delay_bounds() {
+    assert_eq!(OUR_TO_SELF_DELAY_BLOCKS, 144..=2016);
+    for accepted in [None, Some(144), Some(288), Some(2016)] {
+        validate_our_to_self_delay(accepted).unwrap();
+    }
+    for refused in [0, 143, 2017, u16::MAX] {
+        let error = validate_our_to_self_delay(Some(refused)).unwrap_err();
+        assert!(matches!(error, LightningError::InvalidStartupConfig(_)));
+        assert!(error.to_string().contains(&format!("got {refused}")), "{error}");
     }
 }
 
@@ -190,7 +208,9 @@ fn ldk_entropy_is_64_bytes() {
 async fn invalid_mnemonic_errors() {
     let config = LdkConfig {
         forward_to_private_channels: false,
+        our_to_self_delay_blocks: None,
         lsps2_service: Default::default(),
+        channel_peers: None,
         esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,
@@ -214,6 +234,84 @@ async fn invalid_mnemonic_errors() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("invalid mnemonic"));
+}
+
+#[tokio::test]
+async fn out_of_range_our_to_self_delay_refuses_startup() {
+    let config = LdkConfig {
+        forward_to_private_channels: false,
+        our_to_self_delay_blocks: Some(143),
+        lsps2_service: Default::default(),
+        channel_peers: None,
+        esplora_sync_intervals: Default::default(),
+        logging: Default::default(),
+        electrum: None,
+        bitcoind: None,
+        liquidity: Default::default(),
+        storage_dir: PathBuf::from("/tmp/ldk_test"),
+        scb_backup_dir: None,
+        scb_rotation_count: 24,
+        mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string(),
+        passphrase: None,
+        network: "regtest".to_string(),
+        esplora_url: "http://localhost:3002".to_string(),
+        esplora_url_fallback: None, credentials_file: None,
+        rgs_url: None,
+        lsp_node_id: None,
+        lsp_address: None,
+        lsp_token: None,
+        listening_address: None,
+    };
+    let err = LdkProvider::new(config).await.unwrap_err();
+    assert!(matches!(err, LightningError::InvalidStartupConfig(_)));
+    assert!(err.to_string().contains("our_to_self_delay_blocks"), "{err}");
+}
+
+#[tokio::test]
+async fn hub_only_allowlist_parses_hub_keys_and_refuses_the_hub_service() {
+    use konsensus_core::traits::lightning::HUB_ONLY_WHILE_LOCKABLE;
+    let hub = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string();
+    assert!(channel_peer_allowlist(None, true).unwrap().is_none(), "no allowlist leaves the service role unchanged");
+    let parsed = channel_peer_allowlist(Some(std::slice::from_ref(&hub)), false).unwrap().unwrap();
+    assert_eq!(parsed.iter().map(|k| k.to_string()).collect::<Vec<_>>(), vec![hub.clone()]);
+    assert_eq!(channel_peer_allowlist(Some(&[]), false).unwrap(), Some(vec![]), "no hub configured refuses every peer");
+    for error in [
+        channel_peer_allowlist(Some(&["not-a-key".into()]), false).unwrap_err(),
+        channel_peer_allowlist(Some(std::slice::from_ref(&hub)), true).unwrap_err(),
+    ] {
+        assert!(matches!(&error, LightningError::InvalidStartupConfig(m) if m.starts_with(HUB_ONLY_WHILE_LOCKABLE)), "{error}");
+    }
+    // Wired before any key derivation or network work.
+    let config = LdkConfig {
+        forward_to_private_channels: false,
+        our_to_self_delay_blocks: None,
+        lsps2_service: crate::lsps2_service::Lsps2ServiceConfig {
+            enabled: true,
+            require_token: Some("pilot".into()),
+            ..Default::default()
+        },
+        channel_peers: Some(vec![hub]),
+        esplora_sync_intervals: Default::default(),
+        logging: Default::default(),
+        electrum: None,
+        bitcoind: None,
+        liquidity: Default::default(),
+        storage_dir: PathBuf::from("/tmp/ldk_test_hub_only"),
+        scb_backup_dir: None,
+        scb_rotation_count: 24,
+        mnemonic: "not a valid mnemonic".to_string(),
+        passphrase: None,
+        network: "regtest".to_string(),
+        esplora_url: "http://localhost:3002".to_string(),
+        esplora_url_fallback: None, credentials_file: None,
+        rgs_url: None,
+        lsp_node_id: None,
+        lsp_address: None,
+        lsp_token: None,
+        listening_address: None,
+    };
+    let error = LdkProvider::new(config).await.err().unwrap();
+    assert!(error.to_string().contains(HUB_ONLY_WHILE_LOCKABLE), "{error}");
 }
 
 #[test]

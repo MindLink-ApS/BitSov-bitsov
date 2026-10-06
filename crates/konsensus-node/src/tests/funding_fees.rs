@@ -112,6 +112,7 @@ async fn call(
     let provider = Arc::new(GuardedLightning {
         inner: recovering.clone(),
         disk: Arc::new(DiskGuard::new(dir.path().into(), 0)),
+        channel_peers: Default::default(),
         _state_guard: Arc::new(
             crate::safety::ensure_generation(dir.path(), crate::safety::STATE_GENERATION).unwrap(),
         ),
@@ -269,6 +270,7 @@ async fn disk_admission_blocks_all_funding_entry_points_before_backend() {
     let provider = GuardedLightning {
         inner: recovering.clone(),
         disk: Arc::new(DiskGuard::new(dir.path().into(), u64::MAX)),
+        channel_peers: Default::default(),
         _state_guard: Arc::new(
             crate::safety::ensure_generation(dir.path(), crate::safety::STATE_GENERATION).unwrap(),
         ),

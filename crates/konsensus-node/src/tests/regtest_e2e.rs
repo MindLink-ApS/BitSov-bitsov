@@ -1968,7 +1968,9 @@ async fn bitcoind_chain_source_pruned_and_full() {
         assert_eq!(provider.chain_view().trust_level, "own_node");
         let ldk = LdkProvider::new(konsensus_lightning::LdkConfig {
             forward_to_private_channels: false,
+            our_to_self_delay_blocks: None,
             lsps2_service: Default::default(),
+            channel_peers: None,
             esplora_sync_intervals: Default::default(),
             logging: Default::default(),
             electrum: None,

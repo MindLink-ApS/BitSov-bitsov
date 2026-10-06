@@ -129,6 +129,7 @@ pub async fn run(args: MoveHomeArgs) -> Result<()> {
         },
         liquidity: Default::default(),
         lsps2_service: Default::default(),
+        channel_peers: None,
         storage_dir: storage_dir.clone(),
         scb_backup_dir: Some(PathBuf::from(&config.backup.scb_dir)),
         scb_rotation_count: config.backup.rotation_count,
@@ -145,6 +146,7 @@ pub async fn run(args: MoveHomeArgs) -> Result<()> {
         lsp_token: None,
         listening_address: listening_address.clone(),
         forward_to_private_channels: false,
+        our_to_self_delay_blocks: None,
     };
     // Refuse a changed plan BEFORE constructing LDK, including reconnects.
     let seed = zeroize::Zeroizing::new(konsensus_lightning::scb_restore::derive_ldk_entropy_seed(
