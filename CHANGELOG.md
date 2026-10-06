@@ -3,24 +3,109 @@
 All notable BitSov node (`konsensus`) releases are documented here. Pre-rc8 notes
 also live on the corresponding GitHub pre-release pages.
 
-## Unreleased
+## [0.3.0-rc9] — 2026-10-06 (prep; not tagged yet)
 
-- Add encrypted two-phase local bootstrap with a one-time in-memory phrase,
-  backup confirmation, P-256 possession and node-signed first owner enrollment.
-  Commit the encrypted seed and config before the initialization marker; keep
-  cancellation, expiry and interrupted commits fail-closed. Legacy HTTP
-  create/restore now encrypt whenever a startup password is supplied.
-- Add opt-in live-start `--local-owner-device` with `--password-fd`: derive the
-  owner verifying key at startup and allow existing owner-approved devices to
-  sign recipient-bound spend envelopes without console authority. Console-only
-  and remote rules stay unchanged. Device listing reports the local mode;
-  older device records default to `enrolled_by: "console"`. See
-  [password input](docs/operations/password-input.md) for limits and launcher trust.
+**Pre-release.** Not for production use. Covers all 31 merged commits from
+`v0.3.0-rc8` (`f125aab`) through **#238** (`788eea3`). Full notes and the executed
+upgrade check: [`docs/releases/v0.3.0-rc9.md`](docs/releases/v0.3.0-rc9.md).
 
-- Add `init/start --password-fd <n>` (`0` = stdin) for one-shot launcher password
-  handoff, with bounded UTF-8 input, mutually exclusive password sources, and
-  zeroizing buffers discarded after use. Descriptor passwords alone retain the existing
-  non-interactive Touch ID restrictions. See [password input](docs/operations/password-input.md).
+### Local owner and encrypted bootstrap
+
+- `init/start --password-fd <n>` reads a bounded, one-shot UTF-8 password from an
+  inherited descriptor (`0` = stdin), with mutually exclusive password sources
+  and zeroizing buffers (#232). Descriptor input alone retains
+  `seed_password_not_typed`; it does not enable device approval.
+- Opt-in `start --password-fd <n> --local-owner-device` derives owner authority
+  at startup for existing owner-approved devices' recipient-bound spend
+  envelopes (#235). Requires an encrypted seed without a plaintext sibling,
+  opens no console socket, and must be supplied on every launch. Older device
+  records default to `enrolled_by: "console"`; console and remote rules remain.
+- Encrypted two-phase local bootstrap returns a pending phrase once, then
+  requires backup-word confirmation and, in enrollment mode, P-256 possession
+  plus node-signed first owner enrollment (#237). Seed, pairing and config are
+  committed before `NODE_INITIALIZED`; finalize exits for an explicit restart.
+  **Legacy HTTP create/restore also write `mnemonic.enc` whenever a startup
+  password is present**, including flag/file input without local owner mode.
+  No-password bootstrap retains plaintext behavior; existing seeds are not
+  automatically converted.
+- After an interrupted local-owner commit, `/api/v1/bootstrap/state` reports
+  `refused` and disables create/restore even before restart (#238). Public state
+  contains no disk diagnostics or repair instructions; restart CLI diagnostics
+  explain the refusal. Repair remains explicit and writes only the marker.
+
+### Lightning and funding
+
+- Opt-in hub LSPS2 provider with opening skim, channel overprovisioning and a
+  nonzero forwarding tariff (#233). Requires LDK and a private pilot token;
+  off by default, mutually exclusive with the LSPS2 client. Service mode enables
+  private-channel forwarding; opening fees buy liquidity, never admission.
+- Durable JIT funding fee, concurrency and capital caps, bounded open retries,
+  tariff retries/restart recovery and hub metrics (#236). Ambiguous dispatch
+  retains reservations. **Upstream lightning-liquidity's pre-delivery crash
+  window remains**; telemetry is at-least-once, not an accounting ledger.
+- Owner channel opens gain `economy`/`normal`/`fast` funding priorities, preview,
+  and optional whole-transaction fee caps checked before signing (#224; #190).
+  Missing/stale estimates refuse; no automatic fee escalation.
+- On-chain opens/sends/closes/bumps serialize and persist local-spend reservations
+  through cancellation, restart, eviction and shallow reorgs (#191; #189).
+  Slow funding visibility can return successful `pending_visibility`; uncertainty
+  is not permission to repeat an open. Owner release requires proven absence.
+- Ordinary hub forwarding into unannounced channels is opt-in via
+  `forward_to_private_channels = true`, default false (#226; #225).
+  Closing balances exclude unfunded channels only on proven absence (#192).
+
+### Porch
+
+- `porch_quote_v1` checks availability and the recipient's current price before
+  single-peer kind-500 payments, including Browse (#234). Old serving nodes fail
+  closed; room compose rejects kinds 500/501/510 before payment. Default
+  web-content pricing remains 1 sat; valid higher configured prices remain. Retained
+  values below 1000 msat must be raised or removed before startup.
+- **Superseding old Porch quotes is deferred.** Raised tariffs do not revoke
+  persisted offers: five-minute Porch quotes or ordinary offers up to one hour,
+  with up to one further hour for delivery after timely settlement. See the
+  release notes before relying on a raised tariff as a hard minimum.
+
+### Pairing, storage and operations
+
+- Remote pairings can request spend elevation and read first-contact quotes;
+  approval/grant authority stays local (#192). Headless approvals use owner-only
+  files, including device approvals and restart reissue; unavailable delivery
+  returns `409 owner_approval_unavailable` (#194, #197). Paired clients can poll
+  their own recipient-bound first-contact approval state (#211; #205).
+- Remote handshake budgets decay and return bounded, unauthenticated retry hints
+  (#214; #208); post-handshake quotas bind to the authenticated pairing and
+  survive reconnects (#220; #193).
+- Unreadable at-rest rows no longer fail whole lists. Preserve response bodies,
+  expose diagnostic/continuation headers, refill bounded pages, and retain
+  cursors across all-unreadable pages; strict item reads and backups stay strict
+  (#187, #221; #186, #188).
+- Chain sync has bounded independent retries, cancellation-safe ownership,
+  shared Esplora rate-limit cooldowns and bounded transaction rebroadcasts;
+  ghost funding is suppressed only on proven absence (#196, #200).
+- Admission readiness refusals precede invoice creation; shared height caches,
+  fallback on unavailable height, zero-height price rejection and sanitized
+  privileged refusal codes improve readiness handling (#198, #202, #210, #218).
+- Optional file-backed OAuth for an explicitly selected Esplora API, with token
+  refresh, fallback, bounded timeouts/backoff and preserved upstream status
+  (#215, #217; #209, #216). No paid provider is enabled by default.
+- Configurable LDK Esplora sync intervals support an opt-in low-traffic profile;
+  existing defaults remain 80/30/600 seconds (#223).
+- Initialized-node SIGTERM/SIGINT handling uses bounded shutdown (30-second
+  process deadline; excludes bootstrap/password input); service example allows
+  45 seconds (#212; #206). Node and LDK logs rotate by size,
+  default 10 MiB × 5 files each; remove external `node.log` redirection
+  (#213; #207).
+- Three-node paid regtest harness and idle-link/ghost-retry fixes (#201, #203).
+  Real regtest scenarios remain separate from ordinary workspace tests.
+
+### Upgrade and version
+
+- Workspace and all 13 lockfile package versions: `0.3.0-rc9`.
+- No new numbered SQL migrations since rc8 (still **001–028**); rc7 applies
+  **020–028**. New journals/device metadata still require preserving current
+  state and rolling forward after LDK starts. See [UPGRADING](docs/UPGRADING.md)
+  for rc7 → rc9, rc8 → rc9 and explicit `NODE_INITIALIZED` consent repair.
 
 ## [0.3.0-rc8] — 2026-10-02 (prep; not tagged yet)
 
