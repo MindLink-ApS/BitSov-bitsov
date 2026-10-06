@@ -190,6 +190,85 @@ async fn register_device_over_http(headless: bool) {
     assert_eq!(status, StatusCode::OK);
     let (_, gone) = call(&state, "GET", &format!("/api/v1/pair/device-key/{op2}"), None, Some(&read_token)).await;
     assert_eq!(gone["status"], "absent");
+
+    // Local restart retains the signer and accepts only a device delegation.
+    let local = Arc::new(
+        PairingService::open(tmp.path(), fp.clone(), false)
+            .unwrap()
+            .with_local_owner_device()
+            .with_owner_signing_key(owner)
+            .without_stdout_code(),
+    );
+    let local_state = Arc::new(AppState {
+        pairing: Some(local.clone()),
+        ..(*state).clone()
+    });
+    let (_, keys) = call(
+        &local_state,
+        "GET",
+        "/api/v1/pair/device-keys",
+        None,
+        Some(&read_token),
+    )
+    .await;
+    assert_eq!(keys["owner_device_count"], 1);
+    let (status, reg) = call(
+        &local_state,
+        "POST",
+        "/api/v1/pair/device-key",
+        Some(json!({"public_key": other_pub, "name": "phone", "proof": proof})),
+        Some(&read_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reg}");
+    let op = reg["op_id"].as_str().unwrap();
+    let msg = reg["delegation_message"].as_str().unwrap();
+    assert!(msg.starts_with("bitsov-owner-delegation-v1\nnode:"));
+    let (_, pending) = call(
+        &local_state,
+        "GET",
+        &format!("/api/v1/pair/device-key/{op}"),
+        None,
+        Some(&read_token),
+    )
+    .await;
+    assert_eq!(pending["delegation_message"], msg);
+    let uri = format!("/api/v1/pair/device-key/{op}/delegate");
+    let body = json!({"approver_key_id": intent.device_key_id, "signature": sign(msg)});
+    let (status, _) = call(&local_state, "POST", &uri, Some(body.clone()), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call(
+        &local_state,
+        "POST",
+        &uri,
+        Some(json!({"approver_key_id": intent.device_key_id, "signature": sign("wrong tuple")})),
+        Some(&read_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(local.device_keys().len(), 1);
+    let (status, approved) = call(
+        &local_state,
+        "POST",
+        &uri,
+        Some(body.clone()),
+        Some(&read_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{approved}");
+    assert_eq!(approved["status"], "registered");
+    assert_eq!(approved["key_id"], reg["key_id"]);
+    let (_, keys) = call(
+        &local_state,
+        "GET",
+        "/api/v1/pair/device-keys",
+        None,
+        Some(&read_token),
+    )
+    .await;
+    assert_eq!(keys["owner_device_count"], 2);
+    let (status, _) = call(&local_state, "POST", &uri, Some(body), Some(&read_token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -240,7 +319,7 @@ async fn a_plaintext_seed_node_says_why_touch_id_is_off() {
 }
 
 #[tokio::test]
-async fn local_mode_reports_authority_and_keeps_http_enrollment_closed() {
+async fn local_mode_reports_owner_count_and_requires_delegation() {
     let tmp = tempfile::tempdir().unwrap();
     let base = test_state();
     let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
@@ -292,6 +371,7 @@ async fn local_mode_reports_authority_and_keeps_http_enrollment_closed() {
     assert_eq!(keys["owner_control"], false);
     assert_eq!(keys["local_owner_device"], true);
     assert_eq!(keys["device_approvals"], "enabled");
+    assert_eq!(keys["owner_device_count"], 0);
     let (status, _) = call(
         &state,
         "POST",
@@ -300,11 +380,8 @@ async fn local_mode_reports_authority_and_keeps_http_enrollment_closed() {
         Some(token),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    for route in [
-        "/api/v1/pair/device-key/op/approve",
-        "/api/v1/pair/device-key/op/delegate",
-    ] {
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for route in ["/api/v1/pair/device-key/op/approve"] {
         let (status, _) = call(&state, "POST", route, Some(json!({})), Some(token)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }

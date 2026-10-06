@@ -432,6 +432,7 @@ impl KonsensusNode {
             version: 2,
             admission_mode: config.admission_mode,
             cookie_mode: config.cookie_mode,
+            dos_edge: config.dos_edge.clone(),
         };
 
         let transport = Arc::new(NoiseTransport::new(Arc::clone(&identity), transport_config));

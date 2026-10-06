@@ -11,9 +11,9 @@ mod delivery_prices;
 mod guarded_lightning;
 mod housekeeping;
 mod invoice_refusals;
-mod logging;
 #[path = "cli/locked.rs"]
 mod locked_cmd;
+mod logging;
 mod mnemonic_crypto;
 #[path = "cli/move_home.rs"]
 mod move_home_cmd;
@@ -35,6 +35,8 @@ mod scb_restore;
 mod seed_cmd;
 mod session_handler;
 mod stun;
+#[path = "cli/ticket.rs"]
+mod ticket_cmd;
 #[path = "cli/whitelist.rs"]
 mod whitelist_cmd;
 
@@ -221,6 +223,9 @@ async fn main() -> Result<()> {
             config,
         } => {
             owner_cmd::cmd_pair_revoke(&config, &client_id, keep_pairing).await?;
+        }
+        Command::PairTicket { config, qr, ttl } => {
+            ticket_cmd::cmd_pair_ticket(&config, qr, ttl)?;
         }
         Command::PairWindow { seconds, config } => {
             owner_cmd::cmd_pair_window(&config, seconds).await?;
@@ -799,12 +804,26 @@ enum PasswordSource {
 
 /// Authority selected for this invocation, never loaded from configuration.
 struct StartAuthority {
-    device_authority: std::result::Result<ed25519_dalek::VerifyingKey, &'static str>,
+    device_authority: std::result::Result<OwnerDeviceAuthority, &'static str>,
     owner_control: bool,
     local_owner_device: bool,
 }
 
-/// The owner-approval public key, or why device approvals stay off.
+/// Private signing material is retained only for explicit local delegation.
+struct OwnerDeviceAuthority {
+    verifying_key: ed25519_dalek::VerifyingKey,
+    signing_key: Option<konsensus_core::OwnerApprovalKey>,
+}
+
+impl std::fmt::Debug for OwnerDeviceAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnerDeviceAuthority")
+            .field("verifying_key", &self.verifying_key)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The owner authority, or why device approvals stay off.
 ///
 /// Only an encrypted recovery phrase, with no plaintext copy beside it, whose
 /// password was typed, supplied by descriptor, or remotely unlocked with explicit
@@ -815,7 +834,7 @@ fn owner_approval_key(
     password: Option<&str>,
     source: PasswordSource,
     local_owner_device: bool,
-) -> std::result::Result<ed25519_dalek::VerifyingKey, &'static str> {
+) -> std::result::Result<OwnerDeviceAuthority, &'static str> {
     use konsensus_api::pairing::device::{
         OWNER_KEY_UNAVAILABLE, SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED,
     };
@@ -840,7 +859,10 @@ fn owner_approval_key(
     let secret = mnemonic_crypto::owner_secret(password, &identity.node_id().to_hex())
         .map_err(|_| OWNER_KEY_UNAVAILABLE)?;
     konsensus_core::OwnerApprovalKey::from_mnemonic(&mnemonic, &config.identity.passphrase, &secret)
-        .map(|k| k.verifying_key())
+        .map(|key| OwnerDeviceAuthority {
+            verifying_key: key.verifying_key(),
+            signing_key: local_owner_device.then_some(key),
+        })
         .map_err(|_| OWNER_KEY_UNAVAILABLE)
 }
 
@@ -1015,7 +1037,7 @@ async fn cmd_start(
 
     info!(node_id = %node.node_id(), "node built");
 
-    drop(mnemonic_password); // Last use: retain only the public owner verifier.
+    drop(mnemonic_password); // Local mode retains only the zeroizing signer, not the password.
     let services = start_node_services(
         &node,
         &config,
@@ -1217,7 +1239,8 @@ async fn start_node_services<'a>(
         )
         .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?
         // The owner command the app and console show names this exact config.
-        .with_owner_config(config_path.to_path_buf());
+        .with_owner_config(config_path.to_path_buf())
+        .with_hosted_by(config.node.hosted_by.clone());
         let service = if local_owner_device {
             service.with_local_owner_device()
         } else {
@@ -1226,7 +1249,11 @@ async fn start_node_services<'a>(
         match device_authority {
             Ok(key) => {
                 info!("device approvals (Touch ID) enabled: owner key from the encrypted seed");
-                service.with_owner_approval_key(key)
+                if let Some(signer) = key.signing_key {
+                    service.with_owner_signing_key(signer)
+                } else {
+                    service.with_owner_approval_key(key.verifying_key)
+                }
             }
             Err(reason) => {
                 warn!(
@@ -2395,9 +2422,34 @@ mod owner_key_startup_tests {
         let cli_key = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &secret)
             .unwrap()
             .verifying_key();
-        assert_eq!(node_key, cli_key);
+        assert_eq!(node_key.verifying_key, cli_key);
         // A wrong password yields no key at all.
         assert!(owner_approval_key(&enc, Some("wrong"), PasswordSource::Typed, false).is_err());
+    }
+
+    #[test]
+    fn only_local_owner_start_retains_the_delegation_signer() {
+        let (_dir, enc) = config(Some("correct horse"));
+        let typed =
+            owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false).unwrap();
+        assert!(typed.signing_key.is_none());
+        let local = owner_approval_key(
+            &enc,
+            Some("correct horse"),
+            PasswordSource::Descriptor,
+            true,
+        )
+        .unwrap();
+        let signer = local
+            .signing_key
+            .as_ref()
+            .expect("local delegation needs the signer");
+        assert_eq!(signer.verifying_key(), typed.verifying_key);
+        let message = b"local owner delegation startup wiring";
+        typed
+            .verifying_key
+            .verify_strict(message, &signer.sign(message))
+            .unwrap();
     }
 
     #[test]
@@ -2430,8 +2482,9 @@ mod owner_key_startup_tests {
                 PasswordSource::Descriptor,
                 true
             )
-            .unwrap(),
-            typed
+            .unwrap()
+            .verifying_key,
+            typed.verifying_key
         );
         for source in [
             PasswordSource::Descriptor,
@@ -2489,14 +2542,14 @@ mod owner_key_startup_tests {
         for guess in [[0u8; 32], [1u8; 32]] {
             let from_seed_only =
                 konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &guess).unwrap();
-            assert_ne!(from_seed_only.verifying_key(), node_key);
+            assert_ne!(from_seed_only.verifying_key(), node_key.verifying_key);
         }
         let other_password = mnemonic_crypto::owner_secret("another password", &node_id()).unwrap();
         assert_ne!(
             konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &other_password)
                 .unwrap()
                 .verifying_key(),
-            node_key
+            node_key.verifying_key
         );
     }
 }

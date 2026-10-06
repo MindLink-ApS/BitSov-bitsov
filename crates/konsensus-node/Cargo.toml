@@ -12,6 +12,8 @@ path = "src/main.rs"
 regtest-e2e = ["dep:corepc-node"]
 
 [dependencies]
+# Terminal-only QR encoder: no image, SVG or picture dependencies.
+qrcode = { version = "=0.14.1", default-features = false }
 corepc-node = { version = "0.10.1", optional = true }
 konsensus-core = { path = "../konsensus-core" }
 konsensus-chain = { path = "../konsensus-chain" }
@@ -62,6 +64,8 @@ sqlx.workspace = true
 lightning-invoice.workspace = true
 
 [dev-dependencies]
+# Decode terminal output in the P1 regression; no image stack.
+quircs = "=0.10.3"
 ring = "0.17"
 log = "0.4"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }

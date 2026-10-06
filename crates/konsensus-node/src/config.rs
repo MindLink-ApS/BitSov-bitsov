@@ -90,10 +90,64 @@ impl NodeTier {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDisplayConfig {
+    pub hosted_by: Option<String>,
+}
+
+const HOSTED_BY_MAX_CHARS: usize = 64;
+
+impl NodeDisplayConfig {
+    /// The label is served unauthenticated and embedded in QR tickets, so it is
+    /// rejected rather than rewritten: bounded, trimmed, and free of control,
+    /// bidi-override and zero-width characters that could disguise the box.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let Some(label) = self.hosted_by.as_deref() else {
+            return Ok(());
+        };
+        if label.trim().is_empty() {
+            anyhow::bail!("[node].hosted_by must not be empty; omit it to show no label");
+        }
+        if label.trim() != label {
+            anyhow::bail!("[node].hosted_by must not start or end with whitespace");
+        }
+        if label.chars().count() > HOSTED_BY_MAX_CHARS {
+            anyhow::bail!("[node].hosted_by must be at most {HOSTED_BY_MAX_CHARS} characters");
+        }
+        if label.chars().any(|c| c.is_control() || is_invisible_format(c)) {
+            anyhow::bail!(
+                "[node].hosted_by must contain only printable characters (no control, \
+                 bidi-override or zero-width characters)"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
 /// Top-level node configuration, matching `konsensus.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    /// Display metadata only; independent of identity.hosted custody.
+    #[serde(default)]
+    pub node: NodeDisplayConfig,
+
     /// Size limits for node.log and ldk_node.log.
     #[serde(default)]
     pub logging: konsensus_core::logging::LoggingConfig,
@@ -169,16 +223,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub admission_mode: konsensus_message::ReachabilityMode,
 
-    /// Pre-Noise anti-DoS cookie (doorway hardening #2) — `disabled` (default) or
-    /// `required`. When `required`, this node demands a stateless return-
-    /// routability cookie before it spends a Noise DH on an inbound connection
-    /// (operator opt-in; availability defense, never admission — it changes no
-    /// payment-gate semantics). `#[serde(default)]` is MANDATORY (`NodeConfig` is
-    /// `deny_unknown_fields`) so every existing `konsensus.toml` that omits this
-    /// field keeps parsing. Reuses the re-exported `konsensus_message::CookieMode`
-    /// so config and transport never diverge.
+    /// Pre-Noise cookie posture: adaptive (default), required, or disabled.
     #[serde(default)]
     pub cookie_mode: konsensus_message::CookieMode,
+
+    /// Bounds on unpaid TCP connection and handshake work.
+    #[serde(default)]
+    pub dos_edge: konsensus_message::DosEdgeConfig,
 
     /// Onboarding channel-open subsidy (R1-a) — OFF by default.
     ///
@@ -1187,7 +1238,9 @@ impl NodeConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.dos_edge.validate().map_err(anyhow::Error::msg)?;
         self.validate_routing_fee_backend()?;
+        self.node.validate()?;
         if let LightningConfig::Ldk {
             lsps2_service,
             liquidity,
@@ -1616,6 +1669,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            node: NodeDisplayConfig::default(),
             logging: Default::default(),
             privacy: PrivacyConfig::default(),
             disk_free_floor_bytes: default_disk_free_floor_bytes(),
@@ -1660,7 +1714,8 @@ impl NodeConfig {
             // M1a: closed mesh by default (fail-closed). Operators opt into
             // price-admission via konsensus.toml or `--admission-mode price-open`.
             admission_mode: konsensus_message::ReachabilityMode::Whitelist,
-            cookie_mode: konsensus_message::CookieMode::Disabled,
+            cookie_mode: konsensus_message::CookieMode::default(),
+            dos_edge: Default::default(),
             // R1-a: onboarding channel-open subsidy OFF by default — generated
             // configs never auto-spend operator sats on invite membership.
             onboarding_subsidy: SubsidyConfig::default(),

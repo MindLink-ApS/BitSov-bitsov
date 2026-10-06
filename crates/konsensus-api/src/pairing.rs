@@ -607,6 +607,7 @@ fn scope_list(scopes: &[Scope]) -> String {
 /// file, which is what makes "exactly one consumption can succeed" true rather
 /// than merely likely.
 pub struct PairingService {
+    hosted_by: Option<String>,
     dir: PathBuf,
     file_path: PathBuf,
     box_transport_secret: zeroize::Zeroizing<[u8; 32]>,
@@ -616,7 +617,7 @@ pub struct PairingService {
     /// Whether the owner control socket exists in this deployment. Console
     /// grants and approvals require this independently of local device authority.
     owner_control_enabled: bool,
-    /// Explicit live-start authority for device-signed recipient envelopes only.
+    /// Explicit live-start authority for device envelopes and signed delegation.
     local_owner_device: bool,
     /// Whether a safe protected-file instruction is written to stdout. The
     /// code/challenge itself is never printed.
@@ -627,6 +628,8 @@ pub struct PairingService {
     /// Public half of the seed-derived owner-approval key. Device keys are
     /// honoured only under its signature. Never read from `data_dir`.
     owner_approval_key: Option<ed25519_dalek::VerifyingKey>,
+    /// Startup-only local delegation signer; its private material zeroizes on drop.
+    owner_signing_key: Option<konsensus_core::OwnerApprovalKey>,
     /// Why device authority is off, if it is. Fail closed: off until startup
     /// supplies an owner key derived from a protected seed.
     device_authority_off: Option<&'static str>,
@@ -860,6 +863,7 @@ impl PairingService {
         let box_transport_secret = load_box_transport_key(&dir)?;
         let (authority_changes, _) = tokio::sync::watch::channel(0);
         let service = Self {
+            hosted_by: None,
             dir,
             file_path,
             box_transport_secret,
@@ -883,6 +887,7 @@ impl PairingService {
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
             owner_config: None,
             owner_approval_key: None,
+            owner_signing_key: None,
             device_authority_off: Some(device::OWNER_KEY_UNAVAILABLE),
         };
         // A grant that expired while the node was down, or an unmetered
@@ -902,7 +907,7 @@ impl PairingService {
         x25519_dalek::PublicKey::from(&secret).to_bytes()
     }
 
-    /// Enable device-signed recipient envelopes without enabling the owner console.
+    /// Enable device envelopes and delegation without enabling the owner console.
     pub fn with_local_owner_device(mut self) -> Self {
         self.local_owner_device = true;
         self
@@ -1177,8 +1182,18 @@ impl PairingService {
     /// The owner-approval public key, derived from the running identity's
     /// seed (`NodeIdentity::owner_approval_public`).
     pub fn with_owner_approval_key(mut self, key: ed25519_dalek::VerifyingKey) -> Self {
+        self.owner_signing_key = None;
         self.owner_approval_key = Some(key);
         self.device_authority_off = None;
+        self
+    }
+
+    /// Retain the seed-derived signing key only for explicitly enabled local
+    /// delegation. No key material is serialized into pairing state.
+    pub fn with_owner_signing_key(mut self, key: konsensus_core::OwnerApprovalKey) -> Self {
+        self.owner_approval_key = Some(key.verifying_key());
+        self.device_authority_off = None;
+        self.owner_signing_key = self.local_owner_device.then_some(key);
         self
     }
 
@@ -1186,6 +1201,7 @@ impl PairingService {
     /// the reason the app shows (e.g. [`device::SEED_NOT_ENCRYPTED`]).
     pub fn with_device_authority_disabled(mut self, reason: &'static str) -> Self {
         self.owner_approval_key = None;
+        self.owner_signing_key = None;
         self.device_authority_off = Some(reason);
         self
     }
@@ -1289,13 +1305,35 @@ impl PairingService {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
+    /// Cosmetic box label, never an authority or custody input.
+    pub fn with_hosted_by(mut self, hosted_by: Option<String>) -> Self {
+        self.hosted_by = hosted_by;
+        self
+    }
+
+    pub fn hosted_by(&self) -> Option<&str> {
+        self.hosted_by.as_deref()
+    }
+
+    pub fn remote_access_link_path(&self) -> PathBuf {
+        self.dir.join("remote-access-link")
+    }
+
     /// Store the one-shot remote pairing link under the protected pairing
     /// directory. The link is intentionally never returned by an HTTP route or
     /// written to stdout/journald.
     pub fn write_remote_access_link(&self, link: &str) -> Result<PathBuf, PairingError> {
         let path = self.dir.join("remote-access-link");
-        write_protected(&path, link.as_bytes())?;
-        fsync_dir(&self.dir)?;
+        let temporary = self
+            .dir
+            .join(format!(".remote-access-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> io::Result<()> {
+            write_protected(&temporary, link.as_bytes())?;
+            std::fs::rename(&temporary, &path)?;
+            fsync_dir_strict(&self.dir)
+        })();
+        let _ = std::fs::remove_file(temporary);
+        result?;
         Ok(path)
     }
 
@@ -1303,7 +1341,7 @@ impl PairingService {
     pub fn remove_remote_access_link(&self) -> Result<(), PairingError> {
         let path = self.dir.join("remote-access-link");
         match std::fs::remove_file(path) {
-            Ok(()) => fsync_dir(&self.dir)?,
+            Ok(()) => fsync_dir_strict(&self.dir)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -1539,6 +1577,28 @@ impl PairingService {
         client_pubkey_hex: &str,
         remote_transport_pubkey: &[u8; 32],
     ) -> Result<PairedClient, PairingError> {
+        self.create_remote_pairing(name, client_pubkey_hex, remote_transport_pubkey, true)
+    }
+
+    /// Same pairing, authorized by a consumed one-shot enrollment ticket from
+    /// the protected `remote-access-link` file. The ticket is its own grant:
+    /// it neither needs nor opens the local `/pair/request` window.
+    pub fn create_ticket_remote_pairing(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        remote_transport_pubkey: &[u8; 32],
+    ) -> Result<PairedClient, PairingError> {
+        self.create_remote_pairing(name, client_pubkey_hex, remote_transport_pubkey, false)
+    }
+
+    fn create_remote_pairing(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        remote_transport_pubkey: &[u8; 32],
+        require_window: bool,
+    ) -> Result<PairedClient, PairingError> {
         let normalized_pubkey = client_pubkey_hex.to_ascii_lowercase();
         parse_pubkey(&normalized_pubkey)?;
         let remote_hex = hex::encode(remote_transport_pubkey);
@@ -1546,7 +1606,12 @@ impl PairingService {
         let now = chrono::Utc::now().timestamp();
 
         let mut inner = self.lock();
-        if !Self::open_inner(&inner) {
+        let open = if require_window {
+            Self::open_inner(&inner)
+        } else {
+            !inner.pairing_closed
+        };
+        if !open {
             return Err(PairingError::Closed);
         }
         if inner.file.clients.iter().any(|client| {
@@ -3704,7 +3769,7 @@ fn sanitize_name(name: &str) -> String {
 
 /// Never truncate or silently replace a persistent transport key. Unlike a
 /// disposable challenge, rotating this secret invalidates clients' box pins.
-fn load_box_transport_key(dir: &Path) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
+pub fn load_box_transport_key(dir: &Path) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
     load_box_transport_key_with_sync(dir, fsync_dir_strict)
 }
 

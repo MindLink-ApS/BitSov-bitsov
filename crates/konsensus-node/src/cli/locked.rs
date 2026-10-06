@@ -114,7 +114,8 @@ pub async fn serve_locked_mode(
     )?;
     let pairing = Arc::new(
         PairingService::open(&data_dir, metadata.identity_fingerprint, false)?
-            .with_pairing_closed(),
+            .with_pairing_closed()
+            .with_hosted_by(config.node.hosted_by.clone()),
     );
     let identity = read_identity(&data_dir, &pairing)?;
     let clients = Arc::new(RemoteTunnelClients::default());

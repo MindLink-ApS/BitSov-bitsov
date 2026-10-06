@@ -43,6 +43,7 @@ fn make_transport(identity: &Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Arc<N
         version: 2,
         admission_mode: konsensus_message::ReachabilityMode::Whitelist,
         cookie_mode: Default::default(),
+        dos_edge: Default::default(),
     };
     Arc::new(NoiseTransport::new(Arc::clone(identity), config))
 }

@@ -18,6 +18,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
     )
     .unwrap();
     NodeConfig {
+        node: Default::default(),
         logging: Default::default(),
         privacy: Default::default(),
         disk_free_floor_bytes: 0,
@@ -47,6 +48,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
         peers: Vec::new(),
         admission_mode: konsensus_message::ReachabilityMode::Whitelist,
         cookie_mode: konsensus_message::CookieMode::Disabled,
+        dos_edge: Default::default(),
         onboarding_subsidy: crate::config::SubsidyConfig::default(),
         sponsor: crate::config::SponsorConfig::default(),
         relay: RelayConfig::default(),
@@ -57,6 +59,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
 /// Helper: create a config struct for snapshot tests (no temp dir needed).
 fn snapshot_config(storage: StorageConfig) -> NodeConfig {
     NodeConfig {
+        node: Default::default(),
         logging: Default::default(),
         privacy: Default::default(),
         disk_free_floor_bytes: 0,
@@ -82,6 +85,7 @@ fn snapshot_config(storage: StorageConfig) -> NodeConfig {
         peers: Vec::new(),
         admission_mode: konsensus_message::ReachabilityMode::Whitelist,
         cookie_mode: konsensus_message::CookieMode::Disabled,
+        dos_edge: Default::default(),
         onboarding_subsidy: crate::config::SubsidyConfig::default(),
         sponsor: crate::config::SponsorConfig::default(),
         relay: RelayConfig::default(),
