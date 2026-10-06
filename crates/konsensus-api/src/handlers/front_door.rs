@@ -445,7 +445,7 @@ async fn put_front_door(
         .get_price_msat(konsensus_core::kind::KIND_CHAT)
         .await
         .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
-    let (default_admission, default_message) = first_contact_prices(chat);
+    let (default_admission, default_message) = first_contact_prices(chat, state.gate.min_admission_cost_msat());
     let page_msat = porch_page_price(state.pricing.as_ref(), &state.gate).await?;
     let height = state.chain.get_block_height().await.unwrap_or(0);
 

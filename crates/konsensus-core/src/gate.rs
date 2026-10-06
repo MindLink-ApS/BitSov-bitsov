@@ -3439,6 +3439,41 @@ mod tests {
             "a floor below the base price must not lower required, got: {result:?}"
         );
     }
+
+    /// A stranger who pays exactly what the card and stateless quote say is
+    /// admitted, including when the cost floor sits above the chat price.
+    #[tokio::test]
+    async fn first_contact_prices_pass_gate_with_cost_floor_above_base() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        for (base, cost_floor) in [
+            (0, 0),
+            (1, 0),
+            (10_000, 0),
+            (0, 5_000),
+            (10, 5_000),
+            (4_999, 5_000),
+            (10_000, 25_000),
+        ] {
+            let gate = PaymentGate::with_config(GateConfig {
+                min_admission_cost_msat: cost_floor,
+                ..Default::default()
+            });
+            let pricing = MockPricing { price_msat: base };
+            let (admission, message) =
+                crate::introduction::first_contact_prices(base, cost_floor);
+            for paid in [admission, message] {
+                let envelope = make_signed_envelope(&identity, paid);
+                let result = gate
+                    .verify(&envelope, &MockNonceStore::new(), &pricing, None, None, 0.0, None)
+                    .await;
+                assert!(
+                    result.is_ok(),
+                    "base={base}, floor={cost_floor}, paid={paid}: {result:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn settled_bootstrap_funding_never_admits_a_message() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
