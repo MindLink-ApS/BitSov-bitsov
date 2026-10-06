@@ -33,3 +33,7 @@ to pass for the exact flow being shipped.
 
 Private distribution must not become the canonical source of protocol releases.
 The open-core release remains canonical.
+
+## Operator signing (one command)
+
+`scripts/release-sign.sh <tag> <commit-on-main>` is the operator's single step per release. It creates and pushes the GPG-signed tag (or verifies an existing one), waits for the tag's CI run, downloads every binary from the draft and checks it against its `.sha256`, writes `SHA256SUMS`, signs it with the release key (`B299274C200301714DC6F51A7C2D6F8AC842EF6E`, the same key as `RELEASE_KEY.asc`), verifies the signature, and attaches `SHA256SUMS` and `SHA256SUMS.asc` to the draft. The key never leaves the operator's machine, and the script never publishes.
