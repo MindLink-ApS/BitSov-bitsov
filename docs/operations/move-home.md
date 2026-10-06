@@ -68,8 +68,9 @@ its final drain. The only external migration recipient is your address.
 
 ## Unresponsive peers: explicit force-close
 
-First attempt a cooperative close. If a named peer remains disconnected, stop
-the maintenance command with Ctrl-C and resume with the same plan plus:
+Prefer a cooperative close first. If a peer stays disconnected or stays connected
+but stalls closing negotiation, stop the maintenance command with Ctrl-C and
+resume with the same plan plus:
 
 ```sh
 konsensus move-home --config /path/to/konsensus.toml \
@@ -79,12 +80,15 @@ konsensus move-home --config /path/to/konsensus.toml \
 
 Use the `user_channel_id` shown as `id` in the channel preview; repeat
 `--force-close` to name several channels. The command additionally requires the
-exact `FORCE CLOSE …` line on the console. It refuses unknown channels, channels
-without a prior cooperative attempt, and currently connected peers. There is no
-automatic fee-negotiation timeout escalation. A narrow patch to the exact
+exact `FORCE CLOSE …` line on the console. It refuses unknown channels. This
+separate consent permits force-close regardless of connection state or whether
+a cooperative request succeeded; disconnected peers cannot accept that request.
+Successful cooperative requests are recorded, and channels already shutting
+down are left to negotiate without repeated close requests or journal writes.
+There is no automatic fee-negotiation timeout escalation. A narrow patch to the exact
 pinned Lightning 0.2.2 enables this policy before every maintenance startup
-(see `vendor/lightning/BITSOV-PATCH.md`). A connected but stalled peer remains pending;
-this interface deliberately does not force-close it.
+(see `vendor/lightning/BITSOV-PATCH.md`). A connected but stalled peer remains
+pending until it finishes negotiation or the owner explicitly authorizes force-close.
 
 Force-close uses current live state and can cost more, require a CSV delay, and
 leave HTLCs unresolved for much longer. Existing LDK protocol behavior can still
@@ -103,6 +107,11 @@ Signed sweep bytes and consent are fsynced before any broadcast. On a crash or
 unknown broadcast result, resume rebroadcasts **that same transaction**, never
 a replacement send to a different address. Zero confirmations means locally
 queued, mempool/unconfirmed, or unknown; it is not a claim of chain acceptance.
+If a sweep input is missing or spent by a conflicting/replacement transaction,
+replay stops with the sweep ID and an error instead of reporting zero confirmations
+forever. Keep the journal and live store, synchronize the chain view, and investigate
+the sweep and its input transactions. Resume only after resolving the cause; this
+command does not automatically replace the approved sweep or clear its reservation.
 Completion requires a successful chain sync, no remaining channels/claims/sweeps/
 wallet balance, and at least six confirmations for every migration sweep.
 

@@ -21,8 +21,8 @@ procedure. Whitelist sidecars must now be restored explicitly with
 To move funds from a healthy node, stop the normal service and follow
 [close and send home](operations/move-home.md). This owner-console command uses
 current live state, cooperative closure, separate force-close consent for named
-disconnected peers, and exact sweep amount/fee confirmation. It records
-`ldk/move-home.json` beside the live LDK database. Keep this journal together
+channels regardless of peer connection state, and exact sweep amount/fee
+confirmation. It records `ldk/move-home.json` beside the live LDK database. Keep this journal together
 with the live store: it binds the destination and records signed transactions
 for idempotent replay. Normal startup refuses while the journal exists,
 including after completion; resume the maintenance command instead. Do not

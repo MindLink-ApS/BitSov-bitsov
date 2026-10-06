@@ -461,9 +461,14 @@ The root and this standalone crate patch `lightning` to the exact 0.2.2 source
 in `../lightning`; see its BITSOV-PATCH.md for provenance and the narrow changes.
 `Config::cooperative_close_only` defaults false and applies that runtime policy
 before startup. Migration closes retain peer addresses across restarts.
+`move_home_closing_channels` exposes live shutdown state so the job can avoid
+reissuing cooperative requests, including after a restart. Explicitly authorized
+force-closes work regardless of peer connection state.
 `move_home_balances` reads monitor claims/events, then sweeper outputs, then
 wallet balances; wallet errors fail closed. `prepare_move_home` signs without
 reserving/broadcasting; `replay_move_home` validates the single destination,
 owned inputs and fee, then durably reserves the exact approved transaction
-before enqueueing. Queueing is not confirmation. Real BDK tests cover this
-boundary in wallet/money_tests.rs.
+before enqueueing. Replay permits inputs spent by that same canonical sweep,
+but returns `MoveHomeSweepUnavailable` with operator guidance for missing inputs
+or inputs spent by a conflict/replacement. Queueing is not confirmation. Real BDK
+tests cover this boundary in wallet/money_tests.rs.

@@ -60,6 +60,7 @@ pub struct Channel {
     pub id: String,
     pub peer: String,
     pub connected: bool,
+    pub shutting_down: bool,
 }
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
@@ -226,13 +227,8 @@ impl Job {
     ) -> Result<()> {
         let snapshot = backend.snapshot()?;
         for id in selected {
-            if !self.state.cooperative_attempted.contains(id)
-                || !snapshot
-                    .channels
-                    .iter()
-                    .any(|ch| &ch.id == id && !ch.connected)
-            {
-                return Err(format!("force-close {id} requires a previous cooperative attempt and a currently disconnected peer").into());
+            if !snapshot.channels.iter().any(|ch| &ch.id == id) {
+                return Err(format!("force-close {id} requires a named live channel").into());
             }
         }
         let mut next = self.state.clone();
@@ -278,16 +274,22 @@ impl Job {
         let snapshot = backend.snapshot()?;
         let mut close_errors = vec![];
         for channel in &snapshot.channels {
-            let force = self.state.force_approved.contains(&channel.id) && !channel.connected;
-            if let Err(error) = backend.close(channel, force) {
-                close_errors.push(format!("{}: {error}", channel.id));
+            let force = self.state.force_approved.contains(&channel.id);
+            // Read live LDK shutdown state, including after a crash between
+            // dispatch and journal persistence. Old journals may have recorded
+            // failed attempts, so the journal alone cannot suppress a retry.
+            if !force && channel.shutting_down {
+                continue;
             }
-            // Consent to cooperative closes is already durable in begin(). Mark
-            // the attempt only AFTER dispatch; a crash before this write merely
-            // repeats a cooperative attempt, never enables force prematurely.
-            let mut next = self.state.clone();
-            next.cooperative_attempted.insert(channel.id.clone());
-            self.persist(next)?;
+            match backend.close(channel, force) {
+                Err(error) => close_errors.push(format!("{}: {error}", channel.id)),
+                Ok(()) if !force && !self.state.cooperative_attempted.contains(&channel.id) => {
+                    let mut next = self.state.clone();
+                    next.cooperative_attempted.insert(channel.id.clone());
+                    self.persist(next)?;
+                }
+                Ok(()) => {}
+            }
         }
         if snapshot.waiting_for_channels() {
             return Ok(Progress::Waiting {

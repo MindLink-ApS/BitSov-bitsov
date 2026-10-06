@@ -28,7 +28,7 @@ pub struct MoveHomeArgs {
     /// Begin/resume after a destination-bound owner-console confirmation. Default: preview.
     #[arg(long)]
     pub confirm: bool,
-    /// Named user_channel_id to force-close after a prior cooperative attempt; disconnected peers only.
+    /// Named user_channel_id to force-close with separate consent, regardless of peer connection.
     #[arg(long, requires_all = ["confirm", "confirm_force_close"])]
     pub force_close: Vec<String>,
     /// Additional authorization gate; also requires a separate typed console confirmation.

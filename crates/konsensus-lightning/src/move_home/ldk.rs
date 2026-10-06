@@ -8,6 +8,7 @@ impl Backend for LdkBackend<'_> {
     fn snapshot(&self) -> Result<Snapshot> {
         let (balances, pending_monitor_events) = self.node.move_home_balances()?;
         let peers = self.node.list_peers();
+        let closing = self.node.move_home_closing_channels();
         let (minimum, normal) = self.node.move_home_close_fee_rates();
         let mut estimated_close_fee_min_sats = 0u64;
         let mut estimated_close_fee_max_sats = 0u64;
@@ -33,6 +34,7 @@ impl Backend for LdkBackend<'_> {
                 .map(|ch| Channel {
                     id: ch.user_channel_id.to_string(),
                     peer: ch.counterparty_node_id.to_string(),
+                    shutting_down: closing.contains(&ch.user_channel_id),
                     connected: peers
                         .iter()
                         .any(|p| p.node_id == ch.counterparty_node_id && p.is_connected),
@@ -60,20 +62,7 @@ impl Backend for LdkBackend<'_> {
     fn close(&self, channel: &Channel, force: bool) -> Result<()> {
         let id = ldk_node::UserChannelId(channel.id.parse()?);
         let peer = channel.peer.parse()?;
-        if force {
-            // Recheck at dispatch, in case the peer reconnected since the preview.
-            if self
-                .node
-                .list_peers()
-                .iter()
-                .any(|p| p.node_id == peer && p.is_connected)
-            {
-                return Err("peer reconnected; refusing force-close".into());
-            }
-            self.node.close_channel_for_move_home(&id, peer, true)?;
-        } else {
-            self.node.close_channel_for_move_home(&id, peer, false)?;
-        }
+        self.node.close_channel_for_move_home(&id, peer, force)?;
         Ok(())
     }
     fn prepare_sweep(&self, plan: &Plan) -> Result<Sweep> {
@@ -90,8 +79,10 @@ impl Backend for LdkBackend<'_> {
     }
     fn broadcast(&mut self, sweep: &Sweep, plan: &Plan) -> Result<()> {
         sweep.validate(plan)?;
+        let tx = sweep.tx()?;
         self.node
-            .replay_move_home(&sweep.tx()?, &plan.address()?, sweep.fee_sats)?;
+            .replay_move_home(&tx, &plan.address()?, sweep.fee_sats)
+            .map_err(|error| format!("Sweep {}: {error}", tx.compute_txid()))?;
         Ok(())
     }
     fn confirmations(&self, sweep: &Sweep) -> Result<u32> {

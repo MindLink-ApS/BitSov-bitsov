@@ -1695,6 +1695,15 @@ impl Node {
 		self.close_channel_internal(user_channel_id, counterparty_node_id, true, reason, false)
 	}
 
+	/// Channels already shutting down in the current live channel manager.
+	pub fn move_home_closing_channels(&self) -> Vec<UserChannelId> {
+		self.channel_manager.list_channels().iter().filter_map(|channel| {
+			channel.channel_shutdown_state
+				.filter(|state| *state != ChannelShutdownState::NotShuttingDown)
+				.map(|_| UserChannelId(channel.user_channel_id))
+		}).collect()
+	}
+
 	/// Retain addresses so interrupted migration negotiation can reconnect.
 	pub fn close_channel_for_move_home(
 		&self,

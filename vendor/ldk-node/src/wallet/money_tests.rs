@@ -1129,3 +1129,67 @@ fn move_home_refuses_preexisting_spend_reservations() {
 		.prepare_move_home(&move_home_destination(), FeeRate::from_sat_per_vb(2).unwrap())
 		.is_err());
 }
+
+#[test]
+fn move_home_replay_refuses_conflicted_or_replaced_inputs() {
+	for already_replayed in [false, true] {
+		for confirmed in [false, true] {
+			let dir = tempfile::tempdir().unwrap();
+			let node = node(dir.path());
+			fund(&node.wallet);
+			let destination = move_home_destination();
+			let (tx, fee) = node
+				.wallet
+				.prepare_move_home(&destination, FeeRate::from_sat_per_vb(2).unwrap())
+				.unwrap();
+			if already_replayed {
+				node.wallet
+					.replay_move_home(&tx, &destination, fee)
+					.unwrap();
+			}
+			let mut replacement = tx.clone();
+			replacement.output[0].value -= Amount::from_sat(1000);
+			let mut tx_update = bdk_chain::TxUpdate::default();
+			let tip = node.wallet.inner.lock().unwrap().latest_checkpoint();
+			let block = bdk_chain::BlockId {
+				height: 2,
+				hash: bitcoin::BlockHash::from_byte_array([2; 32]),
+			};
+			if confirmed {
+				tx_update.anchors.insert((
+					bdk_chain::ConfirmationBlockTime {
+						block_id: block,
+						confirmation_time: 2,
+					},
+					replacement.compute_txid(),
+				));
+			} else {
+				tx_update
+					.seen_ats
+					.insert((replacement.compute_txid(), local_spends::now() + 100));
+			}
+			tx_update.txs.push(Arc::new(replacement));
+			node.wallet
+				.apply_update(Update {
+					tx_update,
+					chain: Some(tip.push(block).unwrap()),
+					..Default::default()
+				})
+				.unwrap();
+			assert_eq!(node.wallet.move_home_confirmations(tx.compute_txid()), 0);
+			let before = node.local_spend_reservations();
+			assert_eq!(
+				node.wallet.replay_move_home(&tx, &destination, fee),
+				Err(Error::MoveHomeSweepUnavailable),
+				"replayed={already_replayed}, confirmed conflict={confirmed}"
+			);
+			assert_eq!(node.local_spend_reservations().len(), before.len());
+			drop(node);
+			let restarted = self::node(dir.path());
+			assert_eq!(
+				restarted.wallet.replay_move_home(&tx, &destination, fee),
+				Err(Error::MoveHomeSweepUnavailable)
+			);
+		}
+	}
+}

@@ -76,9 +76,30 @@ impl Wallet {
 		}
 		let owned =
 			wallet.list_output().map(|u| u.outpoint).collect::<std::collections::HashSet<_>>();
-		if tx.input.iter().any(|i| !owned.contains(&i.previous_output) || i.witness.is_empty()) {
+		if tx.input.iter().any(|i| i.witness.is_empty()) {
 			return Err(Error::WalletOperationFailed);
 		}
+		if tx.input.iter().any(|i| !owned.contains(&i.previous_output)) {
+			return Err(Error::MoveHomeSweepUnavailable);
+		}
+
+		// A previously replayed sweep spends its own inputs. Accept it only
+		// while it remains canonical; otherwise every input must still be
+		// unspent. list_output alone also includes coins spent by conflicts.
+		if wallet.get_tx(tx.compute_txid()).is_none() {
+			let unspent = wallet
+				.list_unspent()
+				.map(|u| u.outpoint)
+				.collect::<std::collections::HashSet<_>>();
+			if tx
+				.input
+				.iter()
+				.any(|i| !unspent.contains(&i.previous_output))
+			{
+				return Err(Error::MoveHomeSweepUnavailable);
+			}
+		}
+
 		// record_outgoing_transaction is idempotent by txid; a crash here can only
 		// lead to replay of the same transaction saved in the migration journal.
 		self.record_outgoing_transaction(&mut wallet, tx, false)?;

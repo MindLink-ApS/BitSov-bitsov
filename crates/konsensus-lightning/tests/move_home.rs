@@ -10,13 +10,23 @@ struct Fake {
     closes: std::cell::RefCell<Vec<(String, bool)>>,
     sent: Vec<Sweep>,
     confirmations: u32,
+    close_fails: bool,
+    closing: std::cell::RefCell<BTreeSet<String>>,
 }
 impl Backend for Fake {
     fn snapshot(&self) -> Result<Snapshot> {
-        Ok(self.snapshot.clone())
+        let mut snapshot = self.snapshot.clone();
+        for channel in &mut snapshot.channels {
+            channel.shutting_down |= self.closing.borrow().contains(&channel.id);
+        }
+        Ok(snapshot)
     }
     fn close(&self, channel: &Channel, force: bool) -> Result<()> {
         self.closes.borrow_mut().push((channel.id.clone(), force));
+        if self.close_fails {
+            return Err("peer disconnected".into());
+        }
+        self.closing.borrow_mut().insert(channel.id.clone());
         Ok(())
     }
     fn prepare_sweep(&self, plan: &Plan) -> Result<Sweep> {
@@ -129,32 +139,142 @@ fn pending_claims_and_reserves_prevent_sweep() {
     }
 }
 #[test]
-fn force_requires_previous_cooperative_attempt_and_disconnected_named_channel() {
+fn named_force_consent_escapes_connected_stalled_negotiation_and_survives_restart() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut job = Job::begin(&tmp.path().join(JOURNAL_FILE), plan()).unwrap();
-    let channel = Channel {
+    let path = tmp.path().join(JOURNAL_FILE);
+    let mut job = Job::begin(&path, plan()).unwrap();
+    let mut backend = Fake::default();
+    backend.snapshot.channels.push(Channel {
         id: "1".into(),
         peer: "p".into(),
-        connected: false,
-    };
-    let mut backend = Fake::default();
-    backend.snapshot.channels.push(channel);
-    let selected = BTreeSet::from(["1".to_owned()]);
-    assert!(job.approve_force(&selected, &backend).is_err());
+        connected: true,
+        ..Default::default()
+    });
+    backend.snapshot.channels.push(Channel {
+        id: "2".into(),
+        peer: "q".into(),
+        connected: true,
+        ..Default::default()
+    });
     job.advance(&mut backend).unwrap();
-    backend.snapshot.channels[0].connected = true;
-    assert!(job.approve_force(&selected, &backend).is_err());
-    backend.snapshot.channels[0].connected = false;
+    job.advance(&mut backend).unwrap(); // A connected peer never finishes negotiation.
+    assert!(backend.closes.borrow().iter().all(|(_, force)| !force));
     assert!(job
         .approve_force(&BTreeSet::from(["unknown".into()]), &backend)
         .is_err());
-    job.approve_force(&selected, &backend).unwrap();
+    job.approve_force(&BTreeSet::from(["1".into()]), &backend)
+        .unwrap();
+    let mut job = Job::load(&path, &plan()).unwrap().unwrap();
+    job.advance(&mut backend).unwrap();
+    let forced: Vec<_> = backend
+        .closes
+        .borrow()
+        .iter()
+        .filter(|(_, force)| *force)
+        .cloned()
+        .collect();
+    assert_eq!(forced, vec![("1".into(), true)]);
+}
+
+#[test]
+fn failed_cooperative_close_is_not_recorded_and_can_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(JOURNAL_FILE);
+    let mut job = Job::begin(&path, plan()).unwrap();
+    let mut backend = Fake {
+        close_fails: true,
+        ..Default::default()
+    };
+    backend.snapshot.channels.push(Channel {
+        id: "1".into(),
+        ..Default::default()
+    });
+    let original = std::fs::read(&path).unwrap();
+    let Progress::Waiting { close_errors, .. } = job.advance(&mut backend).unwrap() else {
+        panic!()
+    };
+    assert_eq!(close_errors.len(), 1);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    backend.close_fails = false;
+    job.advance(&mut backend).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(state["cooperative_attempted"], serde_json::json!(["1"]));
+    assert_eq!(backend.closes.borrow().len(), 2);
+}
+
+#[test]
+fn disconnected_peer_can_be_explicitly_forced_even_when_cooperative_close_failed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut job = Job::begin(&tmp.path().join(JOURNAL_FILE), plan()).unwrap();
+    let mut backend = Fake {
+        close_fails: true,
+        ..Default::default()
+    };
+    backend.snapshot.channels.push(Channel {
+        id: "1".into(),
+        ..Default::default()
+    });
+    job.advance(&mut backend).unwrap();
+    job.approve_force(&BTreeSet::from(["1".into()]), &backend)
+        .unwrap();
+    backend.close_fails = false;
     job.advance(&mut backend).unwrap();
     assert_eq!(
         *backend.closes.borrow(),
         vec![("1".into(), false), ("1".into(), true)]
     );
 }
+
+#[test]
+fn successful_cooperative_close_is_not_reissued_or_persisted_on_later_ticks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(JOURNAL_FILE);
+    let mut job = Job::begin(&path, plan()).unwrap();
+    let mut backend = Fake::default();
+    backend.snapshot.channels.push(Channel {
+        id: "1".into(),
+        connected: true,
+        ..Default::default()
+    });
+    job.advance(&mut backend).unwrap();
+    let mut job = Job::load(&path, &plan()).unwrap().unwrap();
+    // A later tick must not even try to write the journal.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    for _ in 0..3 {
+        let Progress::Waiting { close_errors, .. } = job.advance(&mut backend).unwrap() else {
+            panic!()
+        };
+        assert!(close_errors.is_empty());
+    }
+    assert_eq!(*backend.closes.borrow(), vec![("1".into(), false)]);
+}
+#[test]
+fn live_shutdown_state_overrides_missing_or_legacy_attempt_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(JOURNAL_FILE);
+    let mut job = Job::begin(&path, plan()).unwrap();
+    let mut backend = Fake::default();
+    backend.snapshot.channels.push(Channel {
+        id: "1".into(),
+        shutting_down: true,
+        ..Default::default()
+    });
+    // Crash after LDK persisted shutdown but before the job recorded success.
+    let original = std::fs::read(&path).unwrap();
+    job.advance(&mut backend).unwrap();
+    assert!(backend.closes.borrow().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    // Older versions recorded failed requests. They must not suppress a retry.
+    let mut state: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    state["cooperative_attempted"] = serde_json::json!(["1"]);
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let mut job = Job::load(&path, &plan()).unwrap().unwrap();
+    backend.snapshot.channels[0].shutting_down = false;
+    job.advance(&mut backend).unwrap();
+    assert_eq!(*backend.closes.borrow(), vec![("1".into(), false)]);
+}
+
 #[test]
 fn corrupt_journal_never_becomes_fresh_job() {
     let tmp = tempfile::tempdir().unwrap();
