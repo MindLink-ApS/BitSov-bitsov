@@ -27,6 +27,12 @@ upgrade check: [`docs/releases/v0.3.0-rc9.md`](docs/releases/v0.3.0-rc9.md).
 
 ### Local owner and encrypted bootstrap
 
+- Local owner devices can approve another device through P-256 delegation bound
+  to the exact node, pairing, epoch, new key, operation and nonce. Local starts
+  retain the owner signing key in zeroizing memory; console revoke and epoch
+  bumps retire delegated keys. The device list reports `owner_device_count`
+  for the app warning and rule that a phone must never be the sole owner device.
+
 - `init/start --password-fd <n>` reads a bounded, one-shot UTF-8 password from an
   inherited descriptor (`0` = stdin), with mutually exclusive password sources
   and zeroizing buffers (#232). Descriptor input alone retains

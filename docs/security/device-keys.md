@@ -22,7 +22,7 @@ Now:
    password is typed at the prompt. It refuses a plaintext phrase before asking
    anything. The CLI also signs the registration with the seed-derived
    **owner-approval key**, over `client_pubkey`, `epoch`, the node and the
-   device key. The node keeps only that key's public half and re-verifies the
+   device key. Outside local-owner mode the node keeps only that key's public half and re-verifies the
    signature on every use, so a device-key record written into `data_dir`
    without that signature authorizes nothing. This covers device-key records
    only: spend grants in the same file are not yet signed
@@ -43,14 +43,66 @@ the same owner signing key and signs the same approval tuple. The seed is
 persisted only as `mnemonic.enc`; the record says `enrolled_by: local_first_run`.
 [Remote first run](pairing.md#remote-first-run-over-the-tunnel) does the same
 over the box-static tunnel and records `enrolled_by: remote_first_run`.
-Later device enrollment still requires the owner console.
+Later enrollment can use the owner console or an existing owner device's
+signature in local-owner mode.
+
+### Delegating another owner device
+
+On `--local-owner-device` starts the node retains the seed-derived owner
+signing key in zeroizing memory for the life of the service. A new paired
+device requests enrollment with its P-256 possession proof. The response and
+pending status include `delegation_message`: the exact UTF-8 bytes below
+(no trailing newline). The app presents these terms on an already enrolled
+owner device for approval; it must verify the node and new device fingerprint
+before signing, rather than blindly signing bytes supplied by another device.
+
+```text
+bitsov-owner-delegation-v1
+node:{fp}
+client_pubkey:{new pairing public key}
+epoch:{new pairing epoch}
+device_key:{new SEC1 uncompressed public key hex}
+op_id:{pending operation id}
+nonce:{server-issued 16-byte lowercase hex nonce}
+```
+
+The approver sends `{approver_key_id, signature}` to
+`POST /api/v1/pair/device-key/{op_id}/delegate`, using **the approver's paired
+token**. The target may belong to another paired client. The signature is
+P-256/SHA-256 DER hex. The node re-verifies the approver's owner approval and
+current epoch, verifies the exact pending tuple, then signs the standard
+`owner_approval_message` and records `enrolled_by: "device:<approver_key_id>"`.
+The pending request and nonce are consumed atomically with enrollment. They
+survive restart until expiry or cancellation; legacy requests with no nonce
+need a fresh request for delegation. Replays, changed tuples and revoked
+approvers fail. Console-only and ordinary sidecar starts refuse delegation.
+Console `device revoke` and pairing epoch bumps retire delegated keys and
+end their envelopes exactly as for console-enrolled keys. Provenance is
+informational, so revoking an approver does not cascade to previously approved
+keys on other pairings; revoke those keys explicitly when needed.
+
+### Keep a second owner device
+
+`GET /api/v1/pair/device-keys` reports `owner_device_count`, a **node-wide**
+count of distinct owner-approved keys bound to current paired-client epochs.
+Revoked, stale, unverified and tampered records do not count. If startup cannot
+supply the owner verifier, the verified count is zero. The listed
+`device_keys` remain scoped to the requesting client.
+
+The app must warn when the count is one, and **the phone must never be the
+only owner device**: enroll and retain a Mac or another non-phone owner device
+before enabling phone ownership, and prevent app flows that leave only the
+phone. The node cannot infer hardware type from a P-256 key or device name;
+the count supports this app rule, rather than attesting a device's hardware.
+Console recovery and revocation remain available even for the last key.
 
 ## API
 
 | Route | Who | Effect |
 |---|---|---|
-| `GET /api/v1/pair/device-keys` | paired | `{node, client_id, owner_control, local_owner_device, device_approvals, device_keys}`. `node` and `client_id` are part of every message the device signs |
+| `GET /api/v1/pair/device-keys` | paired | `{node, client_id, owner_control, local_owner_device, owner_device_count, device_approvals, device_keys}`. `node` and `client_id` are part of every message the device signs |
 | `POST /api/v1/pair/device-key` | paired | `{public_key, name, proof}`. Creates a *pending* registration and nothing else |
+| `POST /api/v1/pair/device-key/{op}/delegate` | local mode, approver paired token + enrolled device signature | approves the exact pending tuple |
 | `GET/DELETE /api/v1/pair/device-key/{op}` | paired, own | status (`pending/registered/expired/lost/absent`) / cancel |
 | `DELETE /api/v1/pair/device-keys/{key_id}` | paired, own | retire own key; its envelopes end |
 | `POST /api/v1/pair/relation-intent` | paired + device signature | opens or renews one peer's envelope |
@@ -75,8 +127,9 @@ that are not on the curve.
 
 `--local-owner-device` is an explicit live-start alternative to owner-run mode
 for an existing enrolled key. It requires a descriptor password and an encrypted
-seed with no plaintext sibling; only the owner verifying key survives startup.
-On live starts it never enables enrollment, console grants, front-door, replacement or
+seed with no plaintext sibling; the owner signing key stays in zeroizing memory
+for delegation. Enrollment requires an existing owner device signature.
+It never enables console grants, front-door, replacement or
 first-contact approval. Local spend scopes, staging and dispatch require an
 owner verifier and a live `device:` grant with a `recipients_only` budget. Startup
 refuses local mode before writing files if the owner verifier cannot be derived.

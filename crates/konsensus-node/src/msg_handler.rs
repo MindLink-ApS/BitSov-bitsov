@@ -1210,7 +1210,7 @@ async fn priced_manifest(
     let kind = konsensus_core::kind::KIND_PAGE_RESPONSE;
     let base = pricing.get_price_msat(kind).await.ok()?;
     let discounted = konsensus_pricing::peer_prices::apply_trust_discount(base, trust_discount);
-    Some(content.build_manifest(block_height, gate.price_with_floor_msat(kind, discounted)))
+    Some(content.build_manifest(block_height, gate.price_with_floor_msat(discounted)))
 }
 
 async fn priced_card_response(

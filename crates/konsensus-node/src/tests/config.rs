@@ -416,9 +416,8 @@ backend = "sqlite"
 }
 
 #[test]
-fn cookie_mode_defaults_to_disabled_when_omitted() {
-    // Off-by-default invariant for doorway hardening #2: a config that omits
-    // cookie_mode yields Disabled (handshake byte-identical to pre-cookie).
+fn cookie_mode_defaults_to_adaptive_when_omitted() {
+    // Old configuration files get adaptive cookies without changing idle handshakes.
     let toml = r#"
 [identity]
 mnemonic_file = "/var/konsensus/mnemonic.txt"
@@ -436,7 +435,7 @@ backend = "mock"
 backend = "sqlite"
 "#;
     let config: NodeConfig = toml::from_str(toml).unwrap();
-    assert_eq!(config.cookie_mode, konsensus_message::CookieMode::Disabled);
+    assert_eq!(config.cookie_mode, konsensus_message::CookieMode::Adaptive);
 }
 
 #[test]
@@ -2903,4 +2902,23 @@ fn lsps2_service_validation_precedes_node_startup() {
         .unwrap_err()
         .to_string()
         .contains("mutually exclusive"));
+}
+
+#[test]
+fn dos_edge_partial_config_uses_defaults_and_rejects_typos() {
+    let limits: konsensus_message::DosEdgeConfig = toml::from_str(
+        "max_handshakes = 16\ncookie_threshold = 8\nconnections_per_second = 3.0"
+    ).unwrap();
+    assert_eq!(limits.max_handshakes, 16);
+    assert_eq!(limits.cookie_threshold, 8);
+    assert_eq!(limits.connection_burst, 40);
+    assert!(limits.validate().is_ok());
+    assert!(toml::from_str::<konsensus_message::DosEdgeConfig>("max_handshake = 16").is_err());
+}
+
+#[test]
+fn node_validation_rejects_unsafe_dos_edge_before_startup() {
+    let mut config = NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/tmp/unused-mnemonic"), std::path::Path::new("/tmp/unused-dos-edge"));
+    config.dos_edge.cookie_threshold = config.dos_edge.max_handshakes;
+    assert!(config.validate().unwrap_err().to_string().contains("dos_edge"));
 }

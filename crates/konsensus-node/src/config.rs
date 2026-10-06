@@ -223,16 +223,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub admission_mode: konsensus_message::ReachabilityMode,
 
-    /// Pre-Noise anti-DoS cookie (doorway hardening #2) — `disabled` (default) or
-    /// `required`. When `required`, this node demands a stateless return-
-    /// routability cookie before it spends a Noise DH on an inbound connection
-    /// (operator opt-in; availability defense, never admission — it changes no
-    /// payment-gate semantics). `#[serde(default)]` is MANDATORY (`NodeConfig` is
-    /// `deny_unknown_fields`) so every existing `konsensus.toml` that omits this
-    /// field keeps parsing. Reuses the re-exported `konsensus_message::CookieMode`
-    /// so config and transport never diverge.
+    /// Pre-Noise cookie posture: adaptive (default), required, or disabled.
     #[serde(default)]
     pub cookie_mode: konsensus_message::CookieMode,
+
+    /// Bounds on unpaid TCP connection and handshake work.
+    #[serde(default)]
+    pub dos_edge: konsensus_message::DosEdgeConfig,
 
     /// Onboarding channel-open subsidy (R1-a) — OFF by default.
     ///
@@ -1241,6 +1238,7 @@ impl NodeConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.dos_edge.validate().map_err(anyhow::Error::msg)?;
         self.validate_routing_fee_backend()?;
         self.node.validate()?;
         if let LightningConfig::Ldk {
@@ -1716,7 +1714,8 @@ impl NodeConfig {
             // M1a: closed mesh by default (fail-closed). Operators opt into
             // price-admission via konsensus.toml or `--admission-mode price-open`.
             admission_mode: konsensus_message::ReachabilityMode::Whitelist,
-            cookie_mode: konsensus_message::CookieMode::Disabled,
+            cookie_mode: konsensus_message::CookieMode::default(),
+            dos_edge: Default::default(),
             // R1-a: onboarding channel-open subsidy OFF by default — generated
             // configs never auto-spend operator sats on invite membership.
             onboarding_subsidy: SubsidyConfig::default(),
