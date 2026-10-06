@@ -639,5 +639,5 @@ pub async fn porch_page_price(
         .get_price_msat(kind)
         .await
         .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
-    Ok(gate.price_with_floor_msat(kind, base))
+    Ok(gate.price_with_floor_msat(base))
 }

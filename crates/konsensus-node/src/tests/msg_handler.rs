@@ -2326,7 +2326,7 @@ async fn discounted_kind_offer_survives_price_rise() {
 async fn porch_adverts_match_durable_offer_and_gate() {
     for kind in [500, 501, 502, 510, 599] {
         for send_response in [false, true] {
-            for (base, expected) in [(1000, if kind <= 501 { 1000 } else { 500 }), (3000, 1500)] {
+            for (base, expected) in [(1000, 1000), (3000, 1500)] {
                 discounted_kind_offer_case(kind, base, 0.5, expected, send_response, 0).await;
             }
         }
@@ -2489,8 +2489,8 @@ async fn discounted_kind_offer_case(
     );
 
     let wallet = konsensus_lightning::MockLightningProvider::new();
-    // As on the compose path, a sub-sat advert still needs a full-sat payment.
-    let paid_msat = offered.max(1_000);
+    // Pay exactly the advertised amount: the advert must already satisfy the gate.
+    let paid_msat = offered;
     let hash = wallet.inject_inbound_keysend(paid_msat, None).await;
     let settled = wallet.get_payment_status(&hash).await.unwrap();
     let proof = PaymentProof::new(

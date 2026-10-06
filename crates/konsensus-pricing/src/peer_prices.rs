@@ -72,20 +72,15 @@ impl PeerPriceEntry {
     /// Look up the discounted price for a specific message kind.
     ///
     /// Applies the peer's trust discount to the base price:
-    /// `discounted = base * (1 - trust_discount)`, then the gate's porch-read floor.
+    /// `discounted = base * (1 - trust_discount)`, then the gate's paid-admission floor.
     /// Returns `None` if the kind's category isn't in the peer's table.
     pub fn get_discounted_price_for_kind(&self, kind: u16) -> Option<u64> {
         self.get_price_for_kind(kind).map(|base| {
             let discounted = apply_trust_discount(base, self.trust_discount);
-            if konsensus_core::gate::porch_read_floor_msat(kind) > 0 {
-                konsensus_core::gate::price_with_floor_msat(
-                    kind,
-                    discounted,
-                    self.prices.get(ADMISSION_FLOOR_KEY).copied().unwrap_or(0),
-                )
-            } else {
-                discounted
-            }
+            konsensus_core::gate::price_with_floor_msat(
+                discounted,
+                self.prices.get(ADMISSION_FLOOR_KEY).copied().unwrap_or(0),
+            )
         })
     }
 

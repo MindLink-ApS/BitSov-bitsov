@@ -31,17 +31,8 @@ pub const DELIVERY_PRICE_WINDOW_SECS: u64 = 3600;
 
 /// Resolve the final paid-admission price after discount, for acceptance and adverts.
 /// Every kind requires at least one sat; operator costs can only raise that floor.
-pub fn price_with_floor_msat(_kind: u16, discounted: u64, min_admission_cost_msat: u64) -> u64 {
+pub fn price_with_floor_msat(discounted: u64, min_admission_cost_msat: u64) -> u64 {
     discounted.max(min_admission_cost_msat).max(1_000)
-}
-
-/// Non-discountable Porch minimum used to identify Porch-specific advert handling.
-/// The paid-admission floor applies to every kind independently of this helper.
-pub fn porch_read_floor_msat(kind: u16) -> u64 {
-    match kind {
-        crate::kind::KIND_PAGE_REQUEST | crate::kind::KIND_PAGE_RESPONSE => 1_000,
-        _ => 0,
-    }
 }
 
 /// Why the gate rejected a message.
@@ -594,7 +585,7 @@ impl PaymentGate {
                     .await
                     .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
                 let Some(required) =
-                    quoted.map(|price| self.price_with_floor_msat(envelope.kind, price))
+                    quoted.map(|price| self.price_with_floor_msat(price))
                 else {
                     return Err(rejection);
                 };
@@ -717,8 +708,8 @@ impl PaymentGate {
     }
 
     /// Absolute floors apply to both current prices and earlier delivery quotes.
-    pub fn price_with_floor_msat(&self, kind: u16, discounted: u64) -> u64 {
-        price_with_floor_msat(kind, discounted, self.config.min_admission_cost_msat)
+    pub fn price_with_floor_msat(&self, discounted: u64) -> u64 {
+        price_with_floor_msat(discounted, self.config.min_admission_cost_msat)
     }
 
     /// Admission floor carried in peer price tables without a trust discount.
@@ -792,7 +783,7 @@ impl PaymentGate {
         // resolved `required_msat` is returned to and re-enforced by the
         // settlement layer, the floor binds the settled amount too — a sender
         // cannot under-claim below cost and pass settlement in isolation.
-        let required_msat = self.price_with_floor_msat(envelope.kind, discounted_msat);
+        let required_msat = self.price_with_floor_msat(discounted_msat);
 
         if required_msat > discounted_msat {
             debug!(

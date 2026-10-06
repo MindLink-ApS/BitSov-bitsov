@@ -1,7 +1,6 @@
 //! Durable recipient offers for paid messages waiting in a sender's outbox.
 use konsensus_core::{
-    gate::{porch_read_floor_msat, price_with_floor_msat},
-    kind::{KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE},
+    gate::price_with_floor_msat,
     traits::transport::TransportError,
     NodeId,
 };
@@ -67,10 +66,6 @@ pub(crate) async fn send_price_frame(
                             .iter()
                             .filter(|(category, _)| category.as_str() != ADMISSION_FLOOR_KEY)
                             .map(|(category, price)| {
-                                let kind = category
-                                    .strip_prefix("kind:")
-                                    .and_then(|kind| kind.parse::<u16>().ok())
-                                    .unwrap_or(0);
                                 (
                                     // Per-kind entries (`kind:400`) keep their scope.
                                     if category.starts_with("kind:") {
@@ -78,43 +73,15 @@ pub(crate) async fn send_price_frame(
                                     } else {
                                         format!("category:{category}")
                                     },
-                                    advertised_price(
-                                        kind,
-                                        *price,
-                                        discount,
-                                        min_admission_cost_msat,
-                                    ),
+                                    advertised_price(*price, discount, min_admission_cost_msat),
                                 )
                             }),
                     );
-                    let mut excluded = pricing.category_price_overrides().ok_or_else(|| {
+                    pricing.category_price_overrides().ok_or_else(|| {
                         TransportError::Other(
                             "pricing engine cannot bind category offer applicability".into(),
                         )
-                    })?;
-                    // The rest of web_content retains its discounted price. Bind
-                    // porch reads separately, excluding them from the cheaper
-                    // category quote (the store resolves the minimum offer).
-                    for kind in [KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE] {
-                        let key = format!("kind:{kind}");
-                        if !categories.contains_key(&key) && !excluded.contains(&kind) {
-                            if let Some(base) = categories.get("web_content") {
-                                prices.push((
-                                    key,
-                                    advertised_price(
-                                        kind,
-                                        *base,
-                                        discount,
-                                        min_admission_cost_msat,
-                                    ),
-                                ));
-                            }
-                        }
-                        if !excluded.contains(&kind) {
-                            excluded.push(kind);
-                        }
-                    }
-                    excluded
+                    })?
                 } else {
                     Vec::new()
                 };
@@ -123,11 +90,11 @@ pub(crate) async fn send_price_frame(
                 } = frame
                 {
                     // Keep the wire price raw: PeerPriceCache retains the table discount
-                    // and applies it once, then the porch floor. The durable offer
+                    // and applies it once, then the admission floor. The durable offer
                     // stores that same final price.
                     prices.push((
                         format!("kind:{kind}"),
-                        advertised_price(*kind, *price_msat, discount, min_admission_cost_msat),
+                        advertised_price(*price_msat, discount, min_admission_cost_msat),
                     ));
                 }
                 let now = std::time::SystemTime::now()
@@ -149,13 +116,9 @@ pub(crate) async fn send_price_frame(
         .await
 }
 
-fn advertised_price(kind: u16, base: u64, discount: f64, admission: u64) -> u64 {
+fn advertised_price(base: u64, discount: f64, admission: u64) -> u64 {
     let discounted = apply_trust_discount(base, discount);
-    if porch_read_floor_msat(kind) > 0 {
-        price_with_floor_msat(kind, discounted, admission)
-    } else {
-        discounted
-    }
+    price_with_floor_msat(discounted, admission)
 }
 
 #[cfg(test)]
@@ -163,12 +126,93 @@ mod tests {
     use super::*;
 
     #[test]
-    fn peer_exchange_offer_does_not_apply_porch_or_admission_floor() {
-        for admission in [0, 2000] {
+    fn discounted_offer_applies_admission_floor() {
+        for (admission, expected) in [(0, 1000), (2000, 2000)] {
             assert_eq!(
-                advertised_price(konsensus_core::kind::KIND_PEER_EXCHANGE, 1000, 0.5, admission),
-                500
+                advertised_price(1000, 0.5, admission),
+                expected
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn advertised_prices_pass_gate_for_every_kind() {
+        use konsensus_core::{
+            gate::{GateConfig, PaymentGate},
+            identity::NodeIdentity,
+            PaymentProof, Recipient, Signature, UkmEnvelopeBuilder,
+        };
+        use konsensus_pricing::{peer_prices::PeerPriceEntry, StaticPricingConfig, StaticPricingEngine};
+        use sha2::{Digest, Sha256};
+        use std::time::Instant;
+
+        let sender = NodeIdentity::from_mnemonic(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "",
+        ).unwrap();
+        let preimage = [42; 32];
+        let payment_hash = Sha256::digest(preimage).into();
+        for base in [1, 1000, 3001] {
+            let pricing = StaticPricingEngine::new(StaticPricingConfig {
+                chat_msat: base,
+                longform_msat: base,
+                calendar_msat: base,
+                file_ref_msat: base,
+                control_msat: base,
+                collaboration_msat: base,
+                realtime_signal_msat: base,
+                call_msat: base,
+                app_ext_msat: base,
+                web_content_msat: base,
+                relay_storage_msat: base,
+            });
+            for admission in [0, 2000] {
+                let gate = PaymentGate::with_config(GateConfig {
+                    min_admission_cost_msat: admission,
+                    ..Default::default()
+                });
+                for discount in [0.0, 0.5] {
+                    let mut prices = konsensus_pricing::peer_prices::build_price_table(&pricing).await;
+                    // Relay storage is advertised separately from the standard table.
+                    prices.insert("relay_storage".into(), base);
+                    prices.insert(ADMISSION_FLOOR_KEY.into(), admission);
+                    let entry = PeerPriceEntry {
+                        prices,
+                        block_height: 1,
+                        valid_blocks: 144,
+                        received_at: Instant::now(),
+                        trust_discount: discount,
+                    };
+                    // Exercise every u16 kind through both advert paths. Gate-check
+                    // every built-in kind plus the extension range's endpoints;
+                    // interior extension kinds share the same category price.
+                    for kind in 0..=u16::MAX {
+                        let Some(cached) = entry.get_discounted_price_for_kind(kind) else {
+                            assert!((700..900).contains(&kind), "missing advert for kind={kind}");
+                            continue; // Reserved kinds have no advertised price.
+                        };
+                        let offered = advertised_price(base, discount, admission);
+                        assert_eq!(cached, offered, "kind={kind}, base={base}, discount={discount}, admission={admission}");
+                        assert!(offered >= 1000 && offered >= admission);
+                        if kind > 1000 && kind < u16::MAX {
+                            assert_eq!(entry.get_discounted_price_for_kind(1000), Some(offered));
+                            continue;
+                        }
+                        let mut envelope = UkmEnvelopeBuilder::new(
+                            kind,
+                            *sender.node_id(),
+                            Recipient::Node(NodeId::from_bytes([7; 32])),
+                            vec![1],
+                            PaymentProof::new(payment_hash, preimage, offered),
+                        ).build();
+                        envelope.signature = Signature::from_ed25519(&sender.sign(&envelope.signable_bytes()));
+                        let result = gate.validate_paid_envelope(
+                            &envelope, &pricing, None, None, discount, None,
+                        ).await;
+                        assert!(result.is_ok(), "kind={kind}, base={base}, discount={discount}, admission={admission}: {result:?}");
+                    }
+                }
+            }
         }
     }
 }
