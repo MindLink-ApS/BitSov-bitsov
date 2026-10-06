@@ -607,6 +607,7 @@ fn scope_list(scopes: &[Scope]) -> String {
 /// file, which is what makes "exactly one consumption can succeed" true rather
 /// than merely likely.
 pub struct PairingService {
+    hosted_by: Option<String>,
     dir: PathBuf,
     file_path: PathBuf,
     box_transport_secret: zeroize::Zeroizing<[u8; 32]>,
@@ -862,6 +863,7 @@ impl PairingService {
         let box_transport_secret = load_box_transport_key(&dir)?;
         let (authority_changes, _) = tokio::sync::watch::channel(0);
         let service = Self {
+            hosted_by: None,
             dir,
             file_path,
             box_transport_secret,
@@ -1303,13 +1305,35 @@ impl PairingService {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
+    /// Cosmetic box label, never an authority or custody input.
+    pub fn with_hosted_by(mut self, hosted_by: Option<String>) -> Self {
+        self.hosted_by = hosted_by;
+        self
+    }
+
+    pub fn hosted_by(&self) -> Option<&str> {
+        self.hosted_by.as_deref()
+    }
+
+    pub fn remote_access_link_path(&self) -> PathBuf {
+        self.dir.join("remote-access-link")
+    }
+
     /// Store the one-shot remote pairing link under the protected pairing
     /// directory. The link is intentionally never returned by an HTTP route or
     /// written to stdout/journald.
     pub fn write_remote_access_link(&self, link: &str) -> Result<PathBuf, PairingError> {
         let path = self.dir.join("remote-access-link");
-        write_protected(&path, link.as_bytes())?;
-        fsync_dir(&self.dir)?;
+        let temporary = self
+            .dir
+            .join(format!(".remote-access-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> io::Result<()> {
+            write_protected(&temporary, link.as_bytes())?;
+            std::fs::rename(&temporary, &path)?;
+            fsync_dir_strict(&self.dir)
+        })();
+        let _ = std::fs::remove_file(temporary);
+        result?;
         Ok(path)
     }
 
@@ -1317,7 +1341,7 @@ impl PairingService {
     pub fn remove_remote_access_link(&self) -> Result<(), PairingError> {
         let path = self.dir.join("remote-access-link");
         match std::fs::remove_file(path) {
-            Ok(()) => fsync_dir(&self.dir)?,
+            Ok(()) => fsync_dir_strict(&self.dir)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -1553,6 +1577,74 @@ impl PairingService {
         client_pubkey_hex: &str,
         remote_transport_pubkey: &[u8; 32],
     ) -> Result<PairedClient, PairingError> {
+        self.create_remote_pairing(name, client_pubkey_hex, remote_transport_pubkey, true)
+    }
+
+    /// Same pairing, authorized by a consumed one-shot enrollment ticket from
+    /// the protected `remote-access-link` file. The ticket is its own grant:
+    /// it neither needs nor opens the local `/pair/request` window.
+    pub fn create_ticket_remote_pairing(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        remote_transport_pubkey: &[u8; 32],
+    ) -> Result<PairedClient, PairingError> {
+        self.create_remote_pairing(name, client_pubkey_hex, remote_transport_pubkey, false)
+    }
+
+    /// First-run pairing authorized by a consumed pre-bootstrap ticket over the
+    /// box-static tunnel. It carries [`bootstrap_pairing_scopes`] only while no
+    /// identity is bound and no other client exists; the transition commit
+    /// strips `identity` exactly as it does for a loopback bootstrap pairing.
+    pub fn create_bootstrap_ticket_pairing(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        remote_transport_pubkey: &[u8; 32],
+    ) -> Result<PairedClient, PairingError> {
+        let normalized_pubkey = client_pubkey_hex.to_ascii_lowercase();
+        parse_pubkey(&normalized_pubkey)?;
+        let client_id = client_id_from_pubkey(&normalized_pubkey);
+        let mut inner = self.lock();
+        if inner.pairing_closed
+            || !inner.identity_fingerprint.is_empty()
+            || !inner.file.clients.is_empty()
+        {
+            return Err(PairingError::Closed);
+        }
+        let previous = inner.file.clone();
+        let epoch = {
+            let entry = inner.file.last_epoch.entry(client_id.clone()).or_insert(0);
+            *entry = entry.checked_add(1).ok_or(PairingError::Closed)?;
+            *entry
+        };
+        let record = PairedClient {
+            client_id,
+            name: sanitize_name(name),
+            client_pubkey: normalized_pubkey,
+            remote_transport_pubkey: Some(hex::encode(remote_transport_pubkey)),
+            scopes: bootstrap_pairing_scopes(),
+            epoch,
+            identity_fingerprint: String::new(),
+            created_at: chrono::Utc::now().timestamp(),
+            last_seen: None,
+        };
+        inner.file.clients.push(record.clone());
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = previous;
+            return Err(error);
+        }
+        self.notify_authority_change();
+        Ok(record)
+    }
+
+    fn create_remote_pairing(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        remote_transport_pubkey: &[u8; 32],
+        require_window: bool,
+    ) -> Result<PairedClient, PairingError> {
         let normalized_pubkey = client_pubkey_hex.to_ascii_lowercase();
         parse_pubkey(&normalized_pubkey)?;
         let remote_hex = hex::encode(remote_transport_pubkey);
@@ -1560,7 +1652,12 @@ impl PairingService {
         let now = chrono::Utc::now().timestamp();
 
         let mut inner = self.lock();
-        if !Self::open_inner(&inner) {
+        let open = if require_window {
+            Self::open_inner(&inner)
+        } else {
+            !inner.pairing_closed
+        };
+        if !open {
             return Err(PairingError::Closed);
         }
         if inner.file.clients.iter().any(|client| {
@@ -3718,7 +3815,7 @@ fn sanitize_name(name: &str) -> String {
 
 /// Never truncate or silently replace a persistent transport key. Unlike a
 /// disposable challenge, rotating this secret invalidates clients' box pins.
-fn load_box_transport_key(dir: &Path) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
+pub fn load_box_transport_key(dir: &Path) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
     load_box_transport_key_with_sync(dir, fsync_dir_strict)
 }
 

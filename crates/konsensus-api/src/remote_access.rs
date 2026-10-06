@@ -32,10 +32,23 @@ pub const MAX_AUTH_PLAINTEXT: usize = 8 * 1024;
 pub struct PairLink {
     pub v: u8,
     pub endpoint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub node_id: String,
+    // Keep the live static proof during the U1 transport migration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub transport_pubkey: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub transport_signature: String,
+    #[serde(default)]
+    pub box_transport_pubkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_transport_signature: Option<String>,
     pub code: String,
+    /// Unix seconds; zero identifies a legacy, non-durable link.
+    #[serde(default)]
+    pub expires_at: i64,
+    #[serde(default)]
+    pub hosted_by: Option<String>,
 }
 
 impl PairLink {
@@ -55,7 +68,7 @@ impl PairLink {
             .decode(encoded)
             .map_err(|e| format!("invalid pairing link base64: {e}"))?;
         let link: Self =
-            serde_json::from_slice(&json).map_err(|e| format!("invalid pairing link JSON: {e}"))?;
+            serde_json::from_slice(&json).map_err(|_| "invalid pairing link JSON".to_string())?;
         if link.v != VERSION {
             return Err(format!("unsupported pairing link version {}", link.v));
         }
@@ -75,6 +88,37 @@ pub fn transport_proof_message(node_id_hex: &str, transport_pubkey_hex: &str) ->
 /// Encoding matches transport proofs: lowercase hex keys, base64url-no-pad signature.
 pub fn box_transport_proof_message(node_id_hex: &str, box_transport_pubkey_hex: &str) -> String {
     format!("{BOX_TRANSPORT_PROOF_DOMAIN}:{node_id_hex}:{box_transport_pubkey_hex}")
+}
+
+/// Public, identity-signed fields of `identity/identity.json`: node id,
+/// fingerprint, and both transport proofs. Locked startup and enrollment
+/// tickets read only these; no seed or password material is involved.
+pub fn public_identity_proofs(
+    identity: &konsensus_core::NodeIdentity,
+    box_transport_pubkey: &[u8; 32],
+) -> serde_json::Map<String, serde_json::Value> {
+    let node_id = identity.node_id().to_hex();
+    let sign =
+        |message: String| URL_SAFE_NO_PAD.encode(identity.sign(message.as_bytes()).to_bytes());
+    let transport_pubkey = hex::encode(identity.x25519_public().as_bytes());
+    let box_pubkey = hex::encode(box_transport_pubkey);
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "identity_fingerprint".into(),
+        crate::pairing::identity_fingerprint(&node_id).into(),
+    );
+    fields.insert(
+        "transport_signature".into(),
+        sign(transport_proof_message(&node_id, &transport_pubkey)).into(),
+    );
+    fields.insert("transport_pubkey".into(), transport_pubkey.into());
+    fields.insert(
+        "box_transport_signature".into(),
+        sign(box_transport_proof_message(&node_id, &box_pubkey)).into(),
+    );
+    fields.insert("box_transport_pubkey".into(), box_pubkey.into());
+    fields.insert("node_id".into(), node_id.into());
+    fields
 }
 
 /// First encrypted message after Noise_XX. With `code`, every optional field
@@ -214,6 +258,10 @@ mod tests {
             transport_pubkey: "22".repeat(32),
             transport_signature: "sig".into(),
             code: "code".into(),
+            box_transport_pubkey: "33".repeat(32),
+            box_transport_signature: Some("box-sig".into()),
+            expires_at: 1234567890,
+            hosted_by: Some("My Pi".into()),
         };
         let uri = link.to_uri().unwrap();
         assert!(!uri.contains('='));

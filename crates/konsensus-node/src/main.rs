@@ -11,9 +11,9 @@ mod delivery_prices;
 mod guarded_lightning;
 mod housekeeping;
 mod invoice_refusals;
-mod logging;
 #[path = "cli/locked.rs"]
 mod locked_cmd;
+mod logging;
 mod mnemonic_crypto;
 #[path = "cli/move_home.rs"]
 mod move_home_cmd;
@@ -35,6 +35,8 @@ mod scb_restore;
 mod seed_cmd;
 mod session_handler;
 mod stun;
+#[path = "cli/ticket.rs"]
+mod ticket_cmd;
 #[path = "cli/whitelist.rs"]
 mod whitelist_cmd;
 
@@ -221,6 +223,9 @@ async fn main() -> Result<()> {
             config,
         } => {
             owner_cmd::cmd_pair_revoke(&config, &client_id, keep_pairing).await?;
+        }
+        Command::PairTicket { config, qr, ttl } => {
+            ticket_cmd::cmd_pair_ticket(&config, qr, ttl)?;
         }
         Command::PairWindow { seconds, config } => {
             owner_cmd::cmd_pair_window(&config, seconds).await?;
@@ -878,6 +883,9 @@ fn custody_mode(config: &NodeConfig) -> konsensus_api::custody::CustodyMode {
     }
 }
 
+/// Exit status after a remote first run commits: restart into locked mode.
+const REMOTE_BOOTSTRAP_RESTART_EXIT: i32 = 75;
+
 /// `konsensus start` — boot the node.
 async fn cmd_start(
     config_path: &Path,
@@ -906,15 +914,16 @@ async fn cmd_start(
     let data_dir = owner_cmd::data_dir_of(config_path);
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
-            anyhow::ensure!(
-                password_source != PasswordSource::RemoteUnlock,
-                "remote unlock requires an initialized encrypted node; remote bootstrap is not supported"
-            );
+            // A positively empty directory with --remote-unlock serves the
+            // remote first run; the password then arrives only through
+            // the Noise tunnel and --local-owner-device applies after unlock.
+            let remote = password_source == PasswordSource::RemoteUnlock;
             let local = password.map(|password| owner_cmd::LocalOwnerBootstrap {
                 password,
                 enroll_device: local_owner_device,
             });
             if local_owner_device
+                && !remote
                 && (password_source != PasswordSource::Descriptor || local.is_none())
             {
                 anyhow::bail!("--local-owner-device requires --password-fd");
@@ -922,7 +931,12 @@ async fn cmd_start(
             file_logging
                 .enable(&config_path.with_file_name("node.log"), config.logging)
                 .context("failed to initialize bounded node logging")?;
-            return owner_cmd::serve_bootstrap_mode(config_path, &config, local).await;
+            if owner_cmd::serve_bootstrap_mode(config_path, &config, local, remote).await? {
+                // EX_TEMPFAIL: `Restart=on-failure` restarts the same
+                // `--remote-unlock` command, which now serves locked mode.
+                std::process::exit(REMOTE_BOOTSTRAP_RESTART_EXIT);
+            }
+            return Ok(());
         }
         konsensus_api::bootstrap::StartupMode::Initialized => {}
         // `prepare_start` has already turned this into an error.
@@ -1248,7 +1262,8 @@ async fn start_node_services<'a>(
         )
         .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?
         // The owner command the app and console show names this exact config.
-        .with_owner_config(config_path.to_path_buf());
+        .with_owner_config(config_path.to_path_buf())
+        .with_hosted_by(config.node.hosted_by.clone());
         let service = if local_owner_device {
             service.with_local_owner_device()
         } else {

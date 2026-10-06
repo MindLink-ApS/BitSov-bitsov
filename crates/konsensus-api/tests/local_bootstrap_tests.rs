@@ -1085,3 +1085,404 @@ async fn another_authenticated_client_cannot_finalize_or_cancel() {
     );
     assert_eq!(before, snapshot(dir.path()));
 }
+
+// ── Remote first run (P2): password only through the box-static tunnel ──
+
+const REMOTE_PASSWORD: &str = "remote-first-run-tunnel-secret";
+const TUNNEL_PEER: &str = "127.0.0.1:40001";
+
+/// Owner key derived from the password the hook actually received.
+fn remote_owner_key(phrase: &str, password: &str) -> konsensus_core::OwnerApprovalKey {
+    konsensus_core::OwnerApprovalKey::from_mnemonic(
+        phrase,
+        "",
+        blake3::hash(password.as_bytes()).as_bytes(),
+    )
+    .unwrap()
+}
+
+fn remote_hooks(password: zeroize::Zeroizing<String>) -> LocalOwnerHooks {
+    let password = Arc::new(password);
+    let mut hooks = test_hooks(false);
+    hooks.sign_owner_approval = Box::new(move |phrase, _, msg| {
+        Ok(hex::encode(
+            remote_owner_key(phrase, &password)
+                .sign(msg.as_bytes())
+                .to_bytes(),
+        ))
+    });
+    hooks
+}
+
+struct Remote {
+    state: Arc<BootstrapState>,
+    token: String,
+    client: String,
+    tunnel: Arc<konsensus_api::rate_limit::RemoteTunnelClients>,
+    _registration: konsensus_api::rate_limit::RemoteTunnelRegistration,
+}
+
+fn setup_remote(dir: &std::path::Path) -> Remote {
+    let pairing = Arc::new(
+        PairingService::open(dir, String::new(), false)
+            .unwrap()
+            .without_stdout_code(),
+    );
+    let key = SigningKey::from_bytes(&[9; 32]);
+    let public = hex::encode(key.verifying_key().to_bytes());
+    let client = pairing
+        .create_bootstrap_ticket_pairing("phone", &public, &[0x55; 32])
+        .unwrap();
+    assert_eq!(client.scopes, pairing::bootstrap_pairing_scopes());
+    assert!(
+        !pairing.pairing_open(),
+        "a ticket never opens the local window"
+    );
+    // Bootstrap tickets pair exactly one first client.
+    let second = hex::encode(SigningKey::from_bytes(&[10; 32]).verifying_key().to_bytes());
+    assert!(matches!(
+        pairing.create_bootstrap_ticket_pairing("other", &second, &[0x56; 32]),
+        Err(pairing::PairingError::Closed)
+    ));
+    let tunnel = Arc::new(konsensus_api::rate_limit::RemoteTunnelClients::default());
+    let registration = tunnel.register(TUNNEL_PEER.parse().unwrap(), client.client_id.clone());
+    let state = Arc::new(
+        BootstrapState::new(DataDirLayout::new(dir), pairing).with_remote_owner(
+            bootstrap::RemoteOwner {
+                hooks: Box::new(|password| Ok(remote_hooks(password))),
+                tunnel: tunnel.clone(),
+            },
+        ),
+    );
+    let challenge = state
+        .pairing
+        .issue_token_challenge(&client.client_id)
+        .unwrap();
+    let sig = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
+    let token = state
+        .pairing
+        .issue_bootstrap_token(&state.jwt_secret, &client.client_id, &challenge, &sig)
+        .unwrap()
+        .token;
+    Remote {
+        state,
+        token,
+        client: client.client_id,
+        tunnel,
+        _registration: registration,
+    }
+}
+
+async fn call_via(
+    state: &Arc<BootstrapState>,
+    token: &str,
+    path: &str,
+    body: Value,
+    peer: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    if let Some(peer) = peer {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+                peer.parse().unwrap(),
+            ));
+    }
+    let response = bootstrap::build_bootstrap_router(state.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned())),
+    )
+}
+
+fn commitment(password: &str) -> Value {
+    json!({"password_commitment": blake3::hash(password.as_bytes()).to_hex().to_string()})
+}
+
+#[tokio::test]
+async fn remote_first_run_password_is_tunnel_only_and_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = setup_remote(dir.path());
+    let tunnel = Some(TUNNEL_PEER);
+    let (_, status) = call(&r.state, "", "GET", "/api/v1/bootstrap/state", json!({})).await;
+    assert_eq!(
+        status,
+        json!({"state": "bootstrap", "can_create": true, "can_restore": false,
+               "local_owner": {"available": true, "enroll_device": true, "pending": false, "tunnel_password": true}})
+    );
+    // No startup password: legacy create/restore would write a plaintext seed.
+    for path in ["/api/v1/identity/create", "/api/v1/identity/restore"] {
+        assert_eq!(
+            call_via(&r.state, &r.token, path, json!({}), tunnel)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let before = snapshot(dir.path());
+    let pending_path = "/api/v1/identity/create-pending";
+    // Loopback and an unregistered internal peer are not the tunnel.
+    for peer in [None, Some("127.0.0.1:40002")] {
+        let (status, body) = call_via(
+            &r.state,
+            &r.token,
+            pending_path,
+            commitment(REMOTE_PASSWORD),
+            peer,
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::BAD_REQUEST, json!("tunnel_required"))
+        );
+    }
+    for bad in ["zz".repeat(32), "AB".repeat(32), "ab".into()] {
+        let (status, body) = call_via(
+            &r.state,
+            &r.token,
+            pending_path,
+            json!({"password_commitment": bad}),
+            tunnel,
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (
+                StatusCode::BAD_REQUEST,
+                json!("invalid_password_commitment")
+            )
+        );
+    }
+    let (status, p) = call_via(
+        &r.state,
+        &r.token,
+        pending_path,
+        commitment(REMOTE_PASSWORD),
+        tunnel,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{p}");
+    assert_eq!(before, snapshot(dir.path()));
+
+    let finalize = "/api/v1/identity/finalize";
+    let (mut body, device) = device_body(&p, &r.client);
+    body["password"] = json!(REMOTE_PASSWORD);
+    // The loopback path refuses a password before reading the body.
+    for peer in [None, Some("127.0.0.1:40002")] {
+        let (status, response) = call_via(&r.state, &r.token, finalize, body.clone(), peer).await;
+        assert_eq!(
+            (status, response),
+            (StatusCode::BAD_REQUEST, json!("tunnel_required"))
+        );
+    }
+    let mut missing = body.clone();
+    missing.as_object_mut().unwrap().remove("password");
+    assert_eq!(
+        call_via(&r.state, &r.token, finalize, missing, tunnel).await,
+        (StatusCode::BAD_REQUEST, json!("invalid_finalize_body"))
+    );
+    let mut no_device = body.clone();
+    no_device.as_object_mut().unwrap().remove("device");
+    assert_eq!(
+        call_via(&r.state, &r.token, finalize, no_device, tunnel).await,
+        (
+            StatusCode::BAD_REQUEST,
+            json!("device_requirement_mismatch")
+        )
+    );
+    let mut empty = body.clone();
+    empty["password"] = json!("");
+    assert_eq!(
+        call_via(&r.state, &r.token, finalize, empty, tunnel).await,
+        (StatusCode::BAD_REQUEST, json!("password_required"))
+    );
+    let mut wrong = body.clone();
+    wrong["password"] = json!("not-the-committed-password");
+    assert_eq!(
+        call_via(&r.state, &r.token, finalize, wrong, tunnel).await,
+        (
+            StatusCode::BAD_REQUEST,
+            json!("password_commitment_mismatch")
+        )
+    );
+    assert!(!r.state.is_committed());
+    assert_eq!(before, snapshot(dir.path()));
+    let (_, status) = call(&r.state, "", "GET", "/api/v1/bootstrap/state", json!({})).await;
+    assert_eq!(status["local_owner"]["pending"], true);
+
+    let (status, response) = call_via(&r.state, &r.token, finalize, body, tunnel).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(r.state.is_committed());
+    assert!(dir.path().join("identity/mnemonic.enc").exists());
+    assert!(!dir.path().join("identity/mnemonic.txt").exists());
+    let phrase = p["mnemonic"].as_str().unwrap();
+    for (_, bytes) in snapshot(dir.path()) {
+        for secret in [phrase, REMOTE_PASSWORD] {
+            assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        }
+    }
+    assert!(!response.to_string().contains(REMOTE_PASSWORD));
+
+    let keys = r.state.pairing.device_keys();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].enrolled_by, "remote_first_run");
+    assert_eq!(
+        keys[0].public_key,
+        hex::encode(ring::signature::KeyPair::public_key(&device).as_ref())
+    );
+    let node_id = p["node_id"].as_str().unwrap();
+    let fingerprint = pairing::identity_fingerprint(node_id);
+    let msg = pairing::device::owner_approval_message(
+        &fingerprint,
+        &keys[0].client_pubkey,
+        keys[0].epoch,
+        &keys[0].public_key,
+    );
+    pairing::device::verify_owner_approval(
+        &remote_owner_key(phrase, REMOTE_PASSWORD).verifying_key(),
+        &msg,
+        &keys[0].owner_approval,
+    )
+    .unwrap();
+
+    // Commit strips identity authority but keeps the tunnel binding, and
+    // publishes the signed box key a locked restart verifies.
+    let clients = r.state.pairing.list_clients();
+    assert_eq!(clients[0].scopes, pairing::default_pairing_scopes());
+    assert_eq!(clients[0].identity_fingerprint, fingerprint);
+    assert_eq!(
+        r.state
+            .pairing
+            .validate_remote_transport(&[0x55; 32])
+            .unwrap()
+            .client_id,
+        r.client
+    );
+    let metadata: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("identity/identity.json")).unwrap())
+            .unwrap();
+    assert_eq!(metadata["node_id"], node_id);
+    assert_eq!(metadata["identity_fingerprint"], fingerprint);
+    assert!(metadata["committed_at"].is_i64());
+    let box_key = hex::encode(r.state.pairing.box_transport_pubkey());
+    assert_eq!(metadata["box_transport_pubkey"], box_key);
+    assert_eq!(response["box_transport_pubkey"], box_key);
+    assert_eq!(
+        response["box_transport_signature"],
+        metadata["box_transport_signature"]
+    );
+    let identity = konsensus_core::NodeIdentity::from_mnemonic(phrase, "").unwrap();
+    use base64::Engine as _;
+    let signature = ed25519_dalek::Signature::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(metadata["box_transport_signature"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    identity
+        .ed25519_verifying_key()
+        .verify_strict(
+            konsensus_api::remote_access::box_transport_proof_message(node_id, &box_key).as_bytes(),
+            &signature,
+        )
+        .unwrap();
+    // Bootstrap pairing authority is closed for good once an identity is bound.
+    let late = hex::encode(SigningKey::from_bytes(&[11; 32]).verifying_key().to_bytes());
+    assert!(r
+        .state
+        .pairing
+        .create_bootstrap_ticket_pairing("late", &late, &[0x57; 32])
+        .is_err());
+}
+
+#[tokio::test]
+async fn remote_first_run_rejects_foreign_tunnel_and_repeated_wrong_passwords() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = setup_remote(dir.path());
+    // A tunnel registered to another pairing cannot carry this client's token.
+    let _other = r
+        .tunnel
+        .register("127.0.0.1:40003".parse().unwrap(), "another-client".into());
+    let pending_path = "/api/v1/identity/create-pending";
+    assert_eq!(
+        call_via(
+            &r.state,
+            &r.token,
+            pending_path,
+            commitment(REMOTE_PASSWORD),
+            Some("127.0.0.1:40003")
+        )
+        .await,
+        (StatusCode::BAD_REQUEST, json!("tunnel_required"))
+    );
+    let (_, p) = call_via(
+        &r.state,
+        &r.token,
+        pending_path,
+        commitment(REMOTE_PASSWORD),
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    let (mut body, _) = device_body(&p, &r.client);
+    body["password"] = json!("wrong");
+    let before = snapshot(dir.path());
+    for expected in [
+        (
+            StatusCode::BAD_REQUEST,
+            json!("password_commitment_mismatch"),
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            json!("password_commitment_mismatch"),
+        ),
+        (StatusCode::GONE, json!("ceremony_lost")),
+    ] {
+        assert_eq!(
+            call_via(
+                &r.state,
+                &r.token,
+                "/api/v1/identity/finalize",
+                body.clone(),
+                Some(TUNNEL_PEER)
+            )
+            .await,
+            expected
+        );
+    }
+    body["password"] = json!(REMOTE_PASSWORD);
+    assert_eq!(
+        call_via(
+            &r.state,
+            &r.token,
+            "/api/v1/identity/finalize",
+            body,
+            Some(TUNNEL_PEER)
+        )
+        .await,
+        (StatusCode::GONE, json!("ceremony_lost"))
+    );
+    assert!(!r.state.is_committed());
+    assert_eq!(before, snapshot(dir.path()));
+    assert!(matches!(
+        r.state.transition(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            bootstrap::CommitFault::None
+        ),
+        Err(bootstrap::CommitError::Conflict)
+    ));
+    assert_eq!(before, snapshot(dir.path()));
+}
