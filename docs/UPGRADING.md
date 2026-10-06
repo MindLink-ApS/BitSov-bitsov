@@ -9,6 +9,18 @@ procedure and compatibility inventory remain below for reference. Fresh rc9
 `konsensus init` installs do not need retained-node marker repair. For VMs,
 also read **VM / multi-host upgrade rules** and **Encrypted seed / custody**.
 
+## Paid admission minimum (T18)
+
+Receiving nodes now enforce at least **1,000 msat (1 sat) for every paid
+admission**, including discounted prices and previously issued delivery quotes.
+Higher prices and configured admission costs still apply. Older or custom
+senders that pay 1–999 msat will be rejected even if a price table or old quote
+listed less; update them to pay at least 1,000 msat before retrying. The current
+API compose path already rounds up to whole sats. Zero-priced new admissions also
+require the minimum. Replies bound to an outstanding paid page/manifest request
+and authenticated retries of already accepted envelopes retain their existing
+handling. No storage migration or configuration change is required.
+
 ## rc7 → rc9 procedure
 
 1. Record the installed version, config path and selected chain source. Stop

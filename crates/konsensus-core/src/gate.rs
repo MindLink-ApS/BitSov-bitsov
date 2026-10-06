@@ -29,13 +29,14 @@ use crate::types::{MessageId, NodeId, Nonce, Recipient};
 /// Maximum lifetime of a recipient-issued delivery price offer.
 pub const DELIVERY_PRICE_WINDOW_SECS: u64 = 3600;
 
-/// Resolve the final price after discount, for both acceptance and adverts.
-pub fn price_with_floor_msat(kind: u16, discounted: u64, min_admission_cost_msat: u64) -> u64 {
-    discounted.max(min_admission_cost_msat.max(porch_read_floor_msat(kind)))
+/// Resolve the final paid-admission price after discount, for acceptance and adverts.
+/// Every kind requires at least one sat; operator costs can only raise that floor.
+pub fn price_with_floor_msat(_kind: u16, discounted: u64, min_admission_cost_msat: u64) -> u64 {
+    discounted.max(min_admission_cost_msat).max(1_000)
 }
 
-/// Non-discountable porch-read minimum, shared by the gate and price adverts.
-/// Other kinds retain their existing pricing (no additional floor).
+/// Non-discountable Porch minimum used to identify Porch-specific advert handling.
+/// The paid-admission floor applies to every kind independently of this helper.
 pub fn porch_read_floor_msat(kind: u16) -> u64 {
     match kind {
         crate::kind::KIND_PAGE_REQUEST | crate::kind::KIND_PAGE_RESPONSE => 1_000,
@@ -137,7 +138,6 @@ pub enum GateRejection {
     /// this node made — self-minted or unbound replies are rejected.
     #[error("web reply not bound to a paid request we made")]
     WebReplyUnbound,
-
 }
 
 /// Trait for nonce replay protection storage.
@@ -147,18 +147,32 @@ pub enum GateRejection {
 #[async_trait::async_trait]
 pub trait NonceStore: Send + Sync {
     /// Recipient-issued price floor valid at this inbound proof's settlement time.
-    async fn delivery_price_floor(&self, _envelope: &UkmEnvelope, _paid_at: u64, _now: u64)
-        -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> { Ok(None) }
+    async fn delivery_price_floor(
+        &self,
+        _envelope: &UkmEnvelope,
+        _paid_at: u64,
+        _now: u64,
+    ) -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
 
     /// Exact immutable binding to a previously accepted message. Storage may
     /// backfill a legacy receipt, but must never insert or replay a message.
-    async fn is_paid_envelope_accepted(&self, _envelope: &UkmEnvelope)
-        -> Result<bool, Box<dyn std::error::Error + Send + Sync>> { Ok(false) }
+    async fn is_paid_envelope_accepted(
+        &self,
+        _envelope: &UkmEnvelope,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
+    }
 
     /// Atomically consume both replay keys, or write neither on a duplicate.
     /// Backends without a transaction fail closed.
     async fn check_and_store_paid(
-        &self, _nonce: &Nonce, _payment_hash: &[u8; 32], _sender: &NodeId, _message_id: &MessageId,
+        &self,
+        _nonce: &Nonce,
+        _payment_hash: &[u8; 32],
+        _sender: &NodeId,
+        _message_id: &MessageId,
     ) -> Result<PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
         Err("atomic paid replay protection not implemented".into())
     }
@@ -220,8 +234,10 @@ pub trait NonceStore: Send + Sync {
     async fn take_outstanding_web_request(
         &self,
         _payment_hash: &[u8; 32],
-    ) -> Result<Option<crate::web_reply::OutstandingWebRequest>, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<
+        Option<crate::web_reply::OutstandingWebRequest>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         Ok(None)
     }
 }
@@ -266,8 +282,8 @@ pub struct GateConfig {
     /// rate-limits (#300) and circuit-breaker (#304) bound the *rate* of such
     /// work; this floor *prices* it.
     ///
-    /// Default: `0` (off). With the floor at 0 the price is byte-identical to
-    /// pre-#4 behaviour. The floor is fail-closed-direction: it can only ever
+    /// Default: `0` (no additional operator cost above the 1,000 msat protocol floor).
+    /// The floor is fail-closed-direction: it can only ever
     /// *raise* the required amount, never admit something the base price would
     /// have rejected. The value is an operator-economic decision — left at 0
     /// until an operator sets it to their node's measured per-admission cost.
@@ -280,7 +296,7 @@ impl Default for GateConfig {
             max_message_age_ms: 5 * 60 * 1000, // 5 minutes
             max_future_ms: 5 * 60 * 1000,      // 5 minutes
             verify_lightning_settlement: false,
-            min_admission_cost_msat: 0, // off: floor disabled, no price change
+            min_admission_cost_msat: 0, // no additional operator cost floor
         }
     }
 }
@@ -352,14 +368,23 @@ impl PaymentGate {
         // earlier gives unpaid strangers a durable storage primitive.
         // Nonce and payment-hash insert-or-reject checks still run before any
         // accepted envelope is delivered, including concurrent replays.
-        match nonce_store.check_and_store_paid(
-            &envelope.nonce, &envelope.payment_proof.payment_hash, &envelope.sender, &envelope.id,
-        ).await.map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))? {
-            PaidReplay::Accepted => {},
+        match nonce_store
+            .check_and_store_paid(
+                &envelope.nonce,
+                &envelope.payment_proof.payment_hash,
+                &envelope.sender,
+                &envelope.id,
+            )
+            .await
+            .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?
+        {
+            PaidReplay::Accepted => {}
             PaidReplay::NonceReused => return Err(GateRejection::ReplayDetected),
-            PaidReplay::PaymentReused => return Err(GateRejection::PaymentProofReused {
-                payment_hash: hex::encode(envelope.payment_proof.payment_hash),
-            }),
+            PaidReplay::PaymentReused => {
+                return Err(GateRejection::PaymentProofReused {
+                    payment_hash: hex::encode(envelope.payment_proof.payment_hash),
+                })
+            }
         }
 
         debug!("gate: ALL CHECKS PASSED — message accepted");
@@ -381,7 +406,17 @@ impl PaymentGate {
         // envelope is legitimately addressed to a peer.
         our_node_id: Option<&NodeId>,
     ) -> Result<(), GateRejection> {
-        self.validate_paid_envelope_inner(envelope, pricing, whitelist, lightning, trust_discount, our_node_id, None).await.map(|_| ())
+        self.validate_paid_envelope_inner(
+            envelope,
+            pricing,
+            whitelist,
+            lightning,
+            trust_discount,
+            our_node_id,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Authenticate before consulting immutable receipts; duplicates need no new price or payment.
@@ -400,7 +435,16 @@ impl PaymentGate {
         // envelope is legitimately addressed to a peer.
         our_node_id: Option<&NodeId>,
     ) -> Result<bool, GateRejection> {
-        self.validate_paid_envelope_inner(envelope, pricing, whitelist, lightning, trust_discount, our_node_id, Some(receipts)).await
+        self.validate_paid_envelope_inner(
+            envelope,
+            pricing,
+            whitelist,
+            lightning,
+            trust_discount,
+            our_node_id,
+            Some(receipts),
+        )
+        .await
     }
 
     #[instrument(skip_all, fields(sender = %envelope.sender, kind = envelope.kind, amount_msat = envelope.payment_proof.amount_msat))]
@@ -489,12 +533,18 @@ impl PaymentGate {
 
         if let (Recipient::Node(claimed), Some(ours)) = (&envelope.recipient, our_node_id) {
             if claimed != ours {
-                return Err(GateRejection::RecipientMismatch { claimed: *claimed, ours: *ours });
+                return Err(GateRejection::RecipientMismatch {
+                    claimed: *claimed,
+                    ours: *ours,
+                });
             }
         }
         if let Some(receipts) = receipts {
-            if receipts.is_paid_envelope_accepted(envelope).await
-                .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))? {
+            if receipts
+                .is_paid_envelope_accepted(envelope)
+                .await
+                .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?
+            {
                 return Ok(true);
             }
         }
@@ -528,15 +578,29 @@ impl PaymentGate {
         let required_msat = match self.verify_price(envelope, pricing, trust_discount).await {
             Ok(required) => required,
             Err(rejection @ GateRejection::InsufficientPayment { .. }) => {
-                if envelope.payment_proof.amount_msat == 0 { return Err(rejection); }
-                let (Some(receipts), Some(ln), true) = (receipts, lightning, self.config.verify_lightning_settlement) else { return Err(rejection); };
+                if envelope.payment_proof.amount_msat == 0 {
+                    return Err(rejection);
+                }
+                let (Some(receipts), Some(ln), true) =
+                    (receipts, lightning, self.config.verify_lightning_settlement)
+                else {
+                    return Err(rejection);
+                };
                 // A proof's self-asserted amount/time cannot buy a stale price:
                 // authenticate the full inbound settlement before consulting offers.
                 let settled = self.verify_settlement(envelope, ln, 1, our_node_id).await?;
-                let quoted = receipts.delivery_price_floor(envelope, settled.timestamp, now_ms / 1000).await
+                let quoted = receipts
+                    .delivery_price_floor(envelope, settled.timestamp, now_ms / 1000)
+                    .await
                     .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
-                let Some(required) = quoted.map(|price| self.price_with_floor_msat(envelope.kind, price.max(1))) else { return Err(rejection); };
-                if envelope.payment_proof.amount_msat < required || settled.amount_msat < required { return Err(rejection); }
+                let Some(required) =
+                    quoted.map(|price| self.price_with_floor_msat(envelope.kind, price))
+                else {
+                    return Err(rejection);
+                };
+                if envelope.payment_proof.amount_msat < required || settled.amount_msat < required {
+                    return Err(rejection);
+                }
                 settlement_checked = true;
                 required
             }
@@ -665,9 +729,8 @@ impl PaymentGate {
     /// Verify the payment amount meets the required price.
     ///
     /// Applies plasticity trust discount: `required = base * (1 - discount)`.
-    /// Discount is clamped to \[0.0, 0.5\] and the minimum price is 1 msat
-    /// (payment gate is fail-closed: zero = bypass). Porch reads (500/501)
-    /// require at least 1,000 msat after discount (BROWSE.md §3).
+    /// Discount is clamped to \[0.0, 0.5\]; every paid admission requires
+    /// at least 1,000 msat after discount (Principle 2, DESIGN-REASONING T18).
     ///
     /// On success, returns the resolved `required_msat` (after discount) so the
     /// caller can thread the same price floor into the settlement layer
@@ -695,9 +758,8 @@ impl PaymentGate {
         };
 
         // Apply plasticity trust discount (v2.1): reliable peers pay less.
-        // Clamp discount to [0.0, 0.5], enforce minimum 1 msat.
+        // Clamp discount to [0.0, 0.5]; apply the admission floor below.
         // Fail-safe: NaN or infinite discount → no discount (full price).
-        // NaN bypassing this check would produce 1 msat, weakening the gate.
         let clamped_discount = if trust_discount.is_finite() {
             trust_discount.clamp(0.0, 0.5)
         } else {
@@ -705,7 +767,7 @@ impl PaymentGate {
         };
         let discounted_msat = if clamped_discount > 0.0 {
             let discounted = (base_msat as f64) * (1.0 - clamped_discount);
-            (discounted.ceil() as u64).max(1)
+            discounted.ceil() as u64
         } else {
             base_msat
         };
@@ -724,8 +786,8 @@ impl PaymentGate {
         // Applied AFTER the plasticity discount so a trusted peer's discount can
         // never undercut what it costs to serve them — the floor is an absolute
         // minimum, not a discountable base. Defaults to 0, in which case this
-        // cost floor is a no-op. Porch reads (500/501) additionally have the
-        // non-discountable 1,000 msat protocol floor (BROWSE.md §3).
+        // cost floor is a no-op. Every paid admission additionally has the
+        // non-discountable 1,000 msat protocol floor (DESIGN-REASONING T18).
         // Fail-closed direction: can only RAISE the required amount. Because the
         // resolved `required_msat` is returned to and re-enforced by the
         // settlement layer, the floor binds the settled amount too — a sender
@@ -738,7 +800,7 @@ impl PaymentGate {
                 cost_floor_msat = self.config.min_admission_cost_msat,
                 required_msat,
                 kind = envelope.kind,
-                "price floor applied: resolved price raised to admission or porch floor"
+                "price floor applied: resolved price raised to admission floor"
             );
         }
 
@@ -780,8 +842,11 @@ impl PaymentGate {
     ) -> Result<crate::traits::lightning::PaymentDetails, GateRejection> {
         let payment_hash = hex::encode(envelope.payment_proof.payment_hash);
 
-        if lightning.is_funding_payment(&payment_hash).await
-            .map_err(|e| GateRejection::LightningUnavailable(e.to_string()))? {
+        if lightning
+            .is_funding_payment(&payment_hash)
+            .await
+            .map_err(|e| GateRejection::LightningUnavailable(e.to_string()))?
+        {
             return Err(GateRejection::PaymentSettlementMismatch(
                 "funding payments cannot admit communication".into(),
             ));
@@ -912,12 +977,12 @@ impl Default for PaymentGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UkmEnvelopeBuilder;
     use crate::identity::NodeIdentity;
-    use crate::kind::{KIND_CHAT, KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE, KindCategory};
-    use crate::web_reply::{is_web_service_reply, reply_bound_proof};
+    use crate::kind::{KindCategory, KIND_CHAT, KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE};
     use crate::traits::lightning::{Invoice, LightningError, PaymentDetails, PaymentDirection};
     use crate::types::{PaymentProof, Recipient};
+    use crate::web_reply::{is_web_service_reply, reply_bound_proof};
+    use crate::UkmEnvelopeBuilder;
     use sha2::{Digest, Sha256};
     use std::sync::Mutex;
 
@@ -931,7 +996,8 @@ mod tests {
         quoted_price_msat: Option<u64>,
         seen: Mutex<HashSet<[u8; 24]>>,
         seen_payment_hashes: Mutex<HashSet<[u8; 32]>>,
-        outstanding_web: Mutex<std::collections::HashMap<[u8; 32], crate::web_reply::OutstandingWebRequest>>,
+        outstanding_web:
+            Mutex<std::collections::HashMap<[u8; 32], crate::web_reply::OutstandingWebRequest>>,
     }
 
     impl MockNonceStore {
@@ -956,19 +1022,27 @@ mod tests {
             Ok(self.quoted_price_msat)
         }
 
-    async fn check_and_store_paid(
-        &self, nonce: &crate::Nonce, payment_hash: &[u8; 32],
-        _sender: &crate::NodeId, _message_id: &crate::MessageId,
-    ) -> Result<crate::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::gate::PaidReplay;
-        let mut nonces = self.seen.lock().unwrap();
-        let mut payments = self.seen_payment_hashes.lock().unwrap();
-        let key = *nonce.as_bytes();
-        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
-        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
-        nonces.insert(key); payments.insert(*payment_hash);
-        Ok(PaidReplay::Accepted)
-    }
+        async fn check_and_store_paid(
+            &self,
+            nonce: &crate::Nonce,
+            payment_hash: &[u8; 32],
+            _sender: &crate::NodeId,
+            _message_id: &crate::MessageId,
+        ) -> Result<crate::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
+            use crate::gate::PaidReplay;
+            let mut nonces = self.seen.lock().unwrap();
+            let mut payments = self.seen_payment_hashes.lock().unwrap();
+            let key = *nonce.as_bytes();
+            if nonces.contains(&key) {
+                return Ok(PaidReplay::NonceReused);
+            }
+            if payments.contains(payment_hash) {
+                return Ok(PaidReplay::PaymentReused);
+            }
+            nonces.insert(key);
+            payments.insert(*payment_hash);
+            Ok(PaidReplay::Accepted)
+        }
 
         async fn check_and_store(
             &self,
@@ -994,14 +1068,20 @@ mod tests {
             payment_hash: &[u8; 32],
             request: crate::web_reply::OutstandingWebRequest,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            self.outstanding_web.lock().unwrap().insert(*payment_hash, request);
+            self.outstanding_web
+                .lock()
+                .unwrap()
+                .insert(*payment_hash, request);
             Ok(())
         }
 
         async fn take_outstanding_web_request(
             &self,
             payment_hash: &[u8; 32],
-        ) -> Result<Option<crate::web_reply::OutstandingWebRequest>, Box<dyn std::error::Error + Send + Sync>> {
+        ) -> Result<
+            Option<crate::web_reply::OutstandingWebRequest>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
             Ok(self.outstanding_web.lock().unwrap().remove(payment_hash))
         }
     }
@@ -1067,7 +1147,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LightningProvider for MockLightning {
-        async fn is_funding_payment(&self, _hash: &str) -> Result<bool, LightningError> { Ok(self.funding_only) }
+        async fn is_funding_payment(&self, _hash: &str) -> Result<bool, LightningError> {
+            Ok(self.funding_only)
+        }
         async fn create_invoice(
             &self,
             _amount_msat: u64,
@@ -1159,10 +1241,9 @@ mod tests {
         let sender = *identity.node_id();
         let proof = make_proof(amount_msat);
         let ciphertext = b"encrypted content".to_vec();
-        let mut envelope =
-            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, ciphertext, proof)
-                .timestamp(now_ms())
-                .build();
+        let mut envelope = UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, ciphertext, proof)
+            .timestamp(now_ms())
+            .build();
         let sig = identity.sign(&envelope.signable_bytes());
         envelope.signature = crate::types::Signature::from_ed25519(&sig);
         envelope
@@ -1246,7 +1327,7 @@ mod tests {
             verify_lightning_settlement: true,
             ..Default::default()
         });
-        let lightning = MockLightning::settled(100);
+        let lightning = MockLightning::settled(10_000);
 
         let result = gate
             .verify_settlement(&envelope, &lightning, 100, None)
@@ -1261,11 +1342,11 @@ mod tests {
     #[tokio::test]
     async fn accept_valid_message() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -1282,7 +1363,7 @@ mod tests {
         // Create envelope from Alice but sign with Bob's key
         let sender = *alice.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         let mut envelope =
             UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"data".to_vec(), proof)
@@ -1296,7 +1377,7 @@ mod tests {
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -1308,11 +1389,11 @@ mod tests {
     #[tokio::test]
     async fn reject_replay_attack() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         // First attempt: accept
         let result = gate
@@ -1330,11 +1411,11 @@ mod tests {
     #[tokio::test]
     async fn reject_non_whitelisted_sender() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         // Whitelist with a different node
         let mut whitelist = HashSet::new();
@@ -1358,11 +1439,11 @@ mod tests {
     #[tokio::test]
     async fn accept_whitelisted_sender() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let mut whitelist = HashSet::new();
         whitelist.insert(*identity.node_id());
@@ -1385,11 +1466,11 @@ mod tests {
     #[tokio::test]
     async fn reject_insufficient_payment() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 5); // pays 5 msat
+        let envelope = make_signed_envelope(&identity, 500); // pays 500 msat
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 }; // requires 10 msat
+        let pricing = MockPricing { price_msat: 1_000 }; // requires 1,000 msat
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -1400,8 +1481,8 @@ mod tests {
                 required_msat,
                 paid_msat,
             }) => {
-                assert_eq!(required_msat, 10);
-                assert_eq!(paid_msat, 5);
+                assert_eq!(required_msat, 1_000);
+                assert_eq!(paid_msat, 500);
             }
             other => panic!("expected InsufficientPayment, got: {other:?}"),
         }
@@ -1414,20 +1495,46 @@ mod tests {
             verify_lightning_settlement: true,
             ..Default::default()
         });
-        let pricing = MockPricing { price_msat: 10 };
-        let lightning = MockLightning::settled(100);
+        let pricing = MockPricing { price_msat: 1_000 };
+        let lightning = MockLightning::settled(10_000);
         let nonces = MockNonceStore::new();
         let recipient = NodeId::from_bytes([2; 32]);
-        let first = make_signed_envelope(&identity, 100);
-        gate.verify(&first, &nonces, &pricing, None, Some(&lightning), 0.0, Some(&recipient)).await.unwrap();
+        let first = make_signed_envelope(&identity, 10_000);
+        gate.verify(
+            &first,
+            &nonces,
+            &pricing,
+            None,
+            Some(&lightning),
+            0.0,
+            Some(&recipient),
+        )
+        .await
+        .unwrap();
         for _ in 0..20 {
-            let replay = make_signed_envelope(&identity, 100);
-            let result = gate.verify(&replay, &nonces, &pricing, None, Some(&lightning), 0.0, Some(&recipient)).await;
-            assert!(matches!(result, Err(GateRejection::PaymentProofReused { .. })));
+            let replay = make_signed_envelope(&identity, 10_000);
+            let result = gate
+                .verify(
+                    &replay,
+                    &nonces,
+                    &pricing,
+                    None,
+                    Some(&lightning),
+                    0.0,
+                    Some(&recipient),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(GateRejection::PaymentProofReused { .. })
+            ));
         }
         assert_eq!(nonces.seen_payment_hashes.lock().unwrap().len(), 1);
-        assert_eq!(nonces.seen.lock().unwrap().len(), 1,
-            "single spent payment must not purchase fresh durable nonce rows on rejected envelopes");
+        assert_eq!(
+            nonces.seen.lock().unwrap().len(),
+            1,
+            "single spent payment must not purchase fresh durable nonce rows on rejected envelopes"
+        );
     }
 
     #[tokio::test]
@@ -1437,20 +1544,32 @@ mod tests {
             verify_lightning_settlement: true,
             ..Default::default()
         });
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
         // Both an underpriced proof and a sufficiently priced but unsettled
         // proof must fail before any durable replay record is created.
         for amount in [5, 100] {
             let envelope = make_signed_envelope(&identity, amount);
             let nonces = MockNonceStore::new();
-            let result = gate.verify(
-                &envelope, &nonces, &pricing, None,
-                Some(&MockLightning::pending()), 0.0, None,
-            ).await;
-            assert!(matches!(result,
-                Err(GateRejection::InsufficientPayment { .. }) |
-                Err(GateRejection::PaymentNotSettled(_))));
-            assert!(nonces.seen.lock().unwrap().is_empty(), "unpaid nonce persisted for amount {amount}");
+            let result = gate
+                .verify(
+                    &envelope,
+                    &nonces,
+                    &pricing,
+                    None,
+                    Some(&MockLightning::pending()),
+                    0.0,
+                    None,
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(GateRejection::InsufficientPayment { .. })
+                    | Err(GateRejection::PaymentNotSettled(_))
+            ));
+            assert!(
+                nonces.seen.lock().unwrap().is_empty(),
+                "unpaid nonce persisted for amount {amount}"
+            );
             assert!(nonces.seen_payment_hashes.lock().unwrap().is_empty());
         }
     }
@@ -1466,11 +1585,11 @@ mod tests {
     #[tokio::test]
     async fn whitelisted_sender_underpaying_is_still_rejected() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 5); // pays 5 msat
+        let envelope = make_signed_envelope(&identity, 500); // pays 500 msat
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 }; // requires 10 msat
+        let pricing = MockPricing { price_msat: 1_000 }; // requires 1,000 msat
 
         // Sender IS on the whitelist — Whitelist mode, membership satisfied.
         let mut whitelist = HashSet::new();
@@ -1496,8 +1615,8 @@ mod tests {
                 required_msat,
                 paid_msat,
             }) => {
-                assert_eq!(required_msat, 10);
-                assert_eq!(paid_msat, 5);
+                assert_eq!(required_msat, 1_000);
+                assert_eq!(paid_msat, 500);
             }
             other => panic!(
                 "whitelist must be a filter, not a bypass: a whitelisted underpaying \
@@ -1526,7 +1645,7 @@ mod tests {
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -1538,7 +1657,7 @@ mod tests {
     #[tokio::test]
     async fn verify_lightning_settlement_success() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let config = GateConfig {
             verify_lightning_settlement: true,
@@ -1546,8 +1665,8 @@ mod tests {
         };
         let gate = PaymentGate::with_config(config);
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
-        let lightning = MockLightning::settled(100);
+        let pricing = MockPricing { price_msat: 1_000 };
+        let lightning = MockLightning::settled(10_000);
 
         let result = gate
             .verify(
@@ -1567,7 +1686,7 @@ mod tests {
     #[tokio::test]
     async fn verify_lightning_settlement_failure() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let config = GateConfig {
             verify_lightning_settlement: true,
@@ -1575,7 +1694,7 @@ mod tests {
         };
         let gate = PaymentGate::with_config(config);
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
         let lightning = MockLightning::pending();
 
         let result = gate
@@ -1596,15 +1715,15 @@ mod tests {
     #[tokio::test]
     async fn verify_lightning_settlement_rejects_amount_inflation() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::with_config(GateConfig {
             verify_lightning_settlement: true,
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
-        let lightning = MockLightning::settled(10);
+        let pricing = MockPricing { price_msat: 1_000 };
+        let lightning = MockLightning::settled(1_000);
 
         let result = gate
             .verify(
@@ -1627,15 +1746,15 @@ mod tests {
     #[tokio::test]
     async fn verify_lightning_settlement_rejects_outgoing_payment() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::with_config(GateConfig {
             verify_lightning_settlement: true,
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
-        let mut lightning = MockLightning::settled(100);
+        let pricing = MockPricing { price_msat: 1_000 };
+        let mut lightning = MockLightning::settled(10_000);
         lightning.direction = PaymentDirection::Outgoing;
 
         let result = gate
@@ -1659,15 +1778,15 @@ mod tests {
     #[tokio::test]
     async fn verify_lightning_settlement_rejects_preimage_mismatch() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::with_config(GateConfig {
             verify_lightning_settlement: true,
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
-        let mut lightning = MockLightning::settled(100);
+        let pricing = MockPricing { price_msat: 1_000 };
+        let mut lightning = MockLightning::settled(10_000);
         lightning.preimage = Some([7u8; 32]);
 
         let result = gate
@@ -1691,8 +1810,8 @@ mod tests {
     #[tokio::test]
     async fn verify_lightning_settlement_rejects_payment_hash_reuse() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let first = make_signed_envelope(&identity, 100);
-        let second = make_signed_envelope(&identity, 100);
+        let first = make_signed_envelope(&identity, 10_000);
+        let second = make_signed_envelope(&identity, 10_000);
 
         assert_ne!(
             first.nonce, second.nonce,
@@ -1708,17 +1827,32 @@ mod tests {
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
-        let lightning = MockLightning::settled(100);
+        let pricing = MockPricing { price_msat: 1_000 };
+        let lightning = MockLightning::settled(10_000);
 
-        assert!(
-            gate.verify(&first, &nonce_store, &pricing, None, Some(&lightning), 0.0, None)
-                .await
-                .is_ok()
-        );
+        assert!(gate
+            .verify(
+                &first,
+                &nonce_store,
+                &pricing,
+                None,
+                Some(&lightning),
+                0.0,
+                None
+            )
+            .await
+            .is_ok());
 
         let result = gate
-            .verify(&second, &nonce_store, &pricing, None, Some(&lightning), 0.0, None)
+            .verify(
+                &second,
+                &nonce_store,
+                &pricing,
+                None,
+                Some(&lightning),
+                0.0,
+                None,
+            )
             .await;
 
         assert!(matches!(
@@ -1730,8 +1864,8 @@ mod tests {
     #[tokio::test]
     async fn verify_rejects_payment_hash_reuse_without_settlement_check() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let first = make_signed_envelope(&identity, 100);
-        let second = make_signed_envelope(&identity, 100);
+        let first = make_signed_envelope(&identity, 10_000);
+        let second = make_signed_envelope(&identity, 10_000);
 
         assert_ne!(
             first.nonce, second.nonce,
@@ -1747,13 +1881,12 @@ mod tests {
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
-        assert!(
-            gate.verify(&first, &nonce_store, &pricing, None, None, 0.0, None)
-                .await
-                .is_ok()
-        );
+        assert!(gate
+            .verify(&first, &nonce_store, &pricing, None, None, 0.0, None)
+            .await
+            .is_ok());
 
         let result = gate
             .verify(&second, &nonce_store, &pricing, None, None, 0.0, None)
@@ -1768,7 +1901,7 @@ mod tests {
     #[tokio::test]
     async fn reject_when_lightning_required_but_missing() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let config = GateConfig {
             verify_lightning_settlement: true,
@@ -1776,7 +1909,7 @@ mod tests {
         };
         let gate = PaymentGate::with_config(config);
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -1791,11 +1924,11 @@ mod tests {
     #[tokio::test]
     async fn accept_overpayment() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 1000); // pays 1000 msat
+        let envelope = make_signed_envelope(&identity, 100_000); // pays 100,000 msat
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 }; // only needs 10 msat
+        let pricing = MockPricing { price_msat: 1_000 }; // only needs 1,000 msat
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -1809,7 +1942,7 @@ mod tests {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         // Timestamp 10 minutes in the past (default max is 5 min)
         let old_timestamp = now_ms() - 10 * 60 * 1000;
@@ -1824,7 +1957,7 @@ mod tests {
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -1845,11 +1978,11 @@ mod tests {
     async fn accept_exact_payment() {
         // Payment exactly equals required price — should pass
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 10); // pays exactly 10
+        let envelope = make_signed_envelope(&identity, 1_000); // pays exactly 1,000
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 }; // requires exactly 10
+        let pricing = MockPricing { price_msat: 1_000 }; // requires exactly 1,000
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -1859,8 +1992,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_zero_price_zero_payment() {
-        // Both price and payment are 0 — free message
+    async fn reject_zero_price_zero_payment() {
+        // A zero engine price cannot make a new admission free.
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let envelope = make_signed_envelope(&identity, 0);
 
@@ -1873,85 +2006,106 @@ mod tests {
             .await;
 
         assert!(
-            result.is_ok(),
-            "zero price with zero payment should be accepted"
+            matches!(
+                result,
+                Err(GateRejection::InsufficientPayment {
+                    required_msat: 1_000,
+                    paid_msat: 0,
+                })
+            ),
+            "zero price must still require one sat: {result:?}"
         );
     }
 
     #[tokio::test]
     async fn accept_web_service_reply_bound_to_paid_request() {
         let requester = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let server = NodeIdentity::from_mnemonic(
-            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-            "",
-        )
-        .unwrap();
-        let request_proof = make_proof(50);
-        let mut request = UkmEnvelopeBuilder::new(
-            KIND_PAGE_REQUEST,
-            *requester.node_id(),
-            Recipient::Node(*server.node_id()),
-            b"page-req".to_vec(),
-            request_proof.clone(),
-        )
-        .timestamp(now_ms())
-        .build();
-        request.signature =
-            crate::types::Signature::from_ed25519(&requester.sign(&request.signable_bytes()));
+        let server =
+            NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+                .unwrap();
+        for (request_kind, reply_kind) in [
+            (KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE),
+            (
+                crate::kind::KIND_WEB_MANIFEST,
+                crate::kind::KIND_WEB_MANIFEST,
+            ),
+        ] {
+            for settlement_on in [false, true] {
+                let request_proof = make_proof(5_000);
+                let mut request = UkmEnvelopeBuilder::new(
+                    request_kind,
+                    *requester.node_id(),
+                    Recipient::Node(*server.node_id()),
+                    b"page-req".to_vec(),
+                    request_proof.clone(),
+                )
+                .timestamp(now_ms())
+                .build();
+                request.signature = crate::types::Signature::from_ed25519(
+                    &requester.sign(&request.signable_bytes()),
+                );
 
-        let mut reply = UkmEnvelopeBuilder::new(
-            KIND_PAGE_RESPONSE,
-            *server.node_id(),
-            Recipient::Node(*requester.node_id()),
-            b"page-body".to_vec(),
-            reply_bound_proof(&request.payment_proof),
-        )
-        .references(vec![request.id])
-        .timestamp(now_ms())
-        .build();
-        reply.signature =
-            crate::types::Signature::from_ed25519(&server.sign(&reply.signable_bytes()));
+                let mut reply = UkmEnvelopeBuilder::new(
+                    reply_kind,
+                    *server.node_id(),
+                    Recipient::Node(*requester.node_id()),
+                    b"page-body".to_vec(),
+                    reply_bound_proof(&request.payment_proof),
+                )
+                .references(vec![request.id])
+                .timestamp(now_ms())
+                .build();
+                reply.signature =
+                    crate::types::Signature::from_ed25519(&server.sign(&reply.signable_bytes()));
 
-        assert!(is_web_service_reply(&reply));
+                assert!(is_web_service_reply(&reply));
 
-        let gate = PaymentGate::new(); // settlement verification off
-        let nonce_store = MockNonceStore::new();
-        nonce_store
-            .record_outgoing_web_request(
-                &request.payment_proof.payment_hash,
-                crate::web_reply::OutstandingWebRequest {
-                    request_id: request.id,
-                    peer: *server.node_id(),
-                    expected_reply_kind: KIND_PAGE_RESPONSE,
-                    expires_at_ms: now_ms() + crate::web_reply::OUTSTANDING_TTL_MS,
-                },
-            )
-            .await
-            .unwrap();
-        let pricing = MockPricing { price_msat: 50 }; // reply kind is priced, but reply-bound skips it
-        let result = gate
-            .verify(
-                &reply,
-                &nonce_store,
-                &pricing,
-                None,
-                None,
-                0.0,
-                Some(requester.node_id()),
-            )
-            .await;
-        assert!(result.is_ok(), "bound web reply should be accepted: {result:?}");
+                let gate = PaymentGate::with_config(GateConfig {
+                    verify_lightning_settlement: settlement_on,
+                    ..Default::default()
+                });
+                let mut lightning = MockLightning::settled(5_000);
+                lightning.direction = PaymentDirection::Outgoing;
+                let nonce_store = MockNonceStore::new();
+                nonce_store
+                    .record_outgoing_web_request(
+                        &request.payment_proof.payment_hash,
+                        crate::web_reply::OutstandingWebRequest {
+                            request_id: request.id,
+                            peer: *server.node_id(),
+                            expected_reply_kind: reply_kind,
+                            expires_at_ms: now_ms() + crate::web_reply::OUTSTANDING_TTL_MS,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let pricing = MockPricing { price_msat: 5_000 }; // reply kind is priced, but reply-bound skips it
+                let result = gate
+                    .verify(
+                        &reply,
+                        &nonce_store,
+                        &pricing,
+                        None,
+                        Some(&lightning),
+                        0.0,
+                        Some(requester.node_id()),
+                    )
+                    .await;
+                assert!(
+                    result.is_ok(),
+                    "bound web reply should be accepted: {result:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
     async fn reject_web_reply_when_settlement_on_and_not_our_outgoing() {
         let requester = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let server = NodeIdentity::from_mnemonic(
-            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-            "",
-        )
-        .unwrap();
-        let request_proof = make_proof(50);
+        let server =
+            NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+                .unwrap();
+        let request_proof = make_proof(5_000);
         let mut request = UkmEnvelopeBuilder::new(
             KIND_PAGE_REQUEST,
             *requester.node_id(),
@@ -1994,12 +2148,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let pricing = MockPricing { price_msat: 50 };
+        let pricing = MockPricing { price_msat: 5_000 };
         // Incoming settled ≠ our outgoing payment
         let lightning = MockLightning {
             funding_only: false,
             settled: true,
-            amount_msat: 50,
+            amount_msat: 5_000,
             direction: PaymentDirection::Incoming,
             preimage: Some(request.payment_proof.preimage),
             payment_hash_override: None,
@@ -2025,17 +2179,15 @@ mod tests {
     #[tokio::test]
     async fn probe_prior_outgoing_payment_hash_buys_free_manifest_request_on_real_backend() {
         let requester = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let peer = NodeIdentity::from_mnemonic(
-            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-            "",
-        )
-        .unwrap();
+        let peer =
+            NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+                .unwrap();
         // Simulate a settled outgoing CHAT payment to peer (no outstanding web request).
-        let chat_proof = make_proof(1000);
+        let chat_proof = make_proof(100_000);
         let ln = MockLightning {
             funding_only: false,
             settled: true,
-            amount_msat: 1000,
+            amount_msat: 100_000,
             direction: PaymentDirection::Outgoing,
             preimage: Some(chat_proof.preimage),
             payment_hash_override: Some(hex::encode(chat_proof.payment_hash)),
@@ -2053,10 +2205,13 @@ mod tests {
         forged.signature =
             crate::types::Signature::from_ed25519(&peer.sign(&forged.signable_bytes()));
 
-        let config = GateConfig { verify_lightning_settlement: true, ..Default::default() };
+        let config = GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        };
         let gate = PaymentGate::with_config(config);
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 50 };
+        let pricing = MockPricing { price_msat: 5_000 };
         let result = gate
             .verify(
                 &forged,
@@ -2078,12 +2233,10 @@ mod tests {
     #[tokio::test]
     async fn probe_zero_amount_manifest_request_passes_on_mock() {
         let requester = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let peer = NodeIdentity::from_mnemonic(
-            "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-            "",
-        )
-        .unwrap();
-        let proof = make_proof(50);
+        let peer =
+            NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+                .unwrap();
+        let proof = make_proof(5_000);
         let mut forged = UkmEnvelopeBuilder::new(
             crate::kind::KIND_WEB_MANIFEST,
             *peer.node_id(),
@@ -2099,7 +2252,7 @@ mod tests {
 
         let gate = PaymentGate::new(); // settlement off
         let nonce_store = MockNonceStore::new(); // no outstanding
-        let pricing = MockPricing { price_msat: 50 };
+        let pricing = MockPricing { price_msat: 5_000 };
         let result = gate
             .verify(
                 &forged,
@@ -2115,14 +2268,13 @@ mod tests {
             matches!(
                 result,
                 Err(GateRejection::InsufficientPayment {
-                    required_msat: 50,
+                    required_msat: 5_000,
                     paid_msat: 0
                 })
             ),
             "unbound zero-amount must hit Mock price floor, got {result:?}"
         );
     }
-
 
     #[tokio::test]
     async fn reject_zero_payment_nonzero_price() {
@@ -2131,7 +2283,7 @@ mod tests {
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 1 }; // requires 1 msat
+        let pricing = MockPricing { price_msat: 1_000 }; // requires 1,000 msat
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2142,7 +2294,7 @@ mod tests {
                 required_msat,
                 paid_msat,
             }) => {
-                assert_eq!(required_msat, 1);
+                assert_eq!(required_msat, 1_000);
                 assert_eq!(paid_msat, 0);
             }
             other => panic!("expected InsufficientPayment, got: {other:?}"),
@@ -2155,7 +2307,7 @@ mod tests {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         let mut envelope =
             UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"epoch zero".to_vec(), proof)
@@ -2168,7 +2320,7 @@ mod tests {
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2188,7 +2340,7 @@ mod tests {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         let future_ts = now_ms() + 365 * 24 * 60 * 60 * 1000; // 1 year in the future
         let mut envelope =
@@ -2202,7 +2354,7 @@ mod tests {
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2221,7 +2373,7 @@ mod tests {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         let future_ts = now_ms() + 60 * 1000; // 1 minute ahead
         let mut envelope = UkmEnvelopeBuilder::new(
@@ -2240,7 +2392,7 @@ mod tests {
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2291,13 +2443,13 @@ mod tests {
         // accept paid messages — the gate must reject (NonceCheckFailed) rather
         // than treat the unimplemented economic-replay check as a pass.
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::new();
         let nonce_store = NoPaymentHashOverrideStore {
             seen: Mutex::new(HashSet::new()),
         };
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2313,11 +2465,11 @@ mod tests {
     async fn reject_when_nonce_store_fails() {
         // Fail-closed: nonce store error = rejection
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::new();
         let nonce_store = FailingNonceStore;
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2353,7 +2505,7 @@ mod tests {
     async fn reject_when_pricing_engine_fails() {
         // Fail-closed: pricing engine error = rejection
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
@@ -2400,7 +2552,7 @@ mod tests {
         // Fail-closed: when the pricing engine cannot determine price due to
         // chain unavailability, the gate must reject with PricingFailed.
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 1_000_000); // generous payment
+        let envelope = make_signed_envelope(&identity, 100_000_000); // generous payment
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
@@ -2424,11 +2576,11 @@ mod tests {
     #[tokio::test]
     async fn empty_whitelist_rejects_all() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         // Empty whitelist — no one is allowed
         let whitelist = HashSet::new();
@@ -2517,7 +2669,7 @@ mod tests {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         let mut envelope = UkmEnvelopeBuilder::new(
             crate::kind::KIND_CALL_ANSWER, // forced NotPriceable by the mock pricing engine
@@ -2554,7 +2706,7 @@ mod tests {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         let mut envelope = UkmEnvelopeBuilder::new(
             60000, // unknown kind
@@ -2610,11 +2762,11 @@ mod tests {
     #[tokio::test]
     async fn reject_one_below_required_payment() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 99); // pays 99
+        let envelope = make_signed_envelope(&identity, 9_999); // pays 9,999
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 100 }; // requires 100
+        let pricing = MockPricing { price_msat: 10_000 }; // requires 10,000
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2625,8 +2777,8 @@ mod tests {
                 required_msat,
                 paid_msat,
             }) => {
-                assert_eq!(required_msat, 100);
-                assert_eq!(paid_msat, 99);
+                assert_eq!(required_msat, 10_000);
+                assert_eq!(paid_msat, 9_999);
             }
             other => panic!("expected InsufficientPayment, got: {other:?}"),
         }
@@ -2640,9 +2792,9 @@ mod tests {
     /// end-to-end when that self-asserted amount is below `required_msat`.
     ///
     /// In other words: a sender cannot lower the price by under-claiming. They
-    /// set `payment_proof.amount_msat = 50` and genuinely settle 50 msat on
+    /// set `payment_proof.amount_msat = 5_000` and genuinely settle 5,000 msat on
     /// Lightning (so `verify_settlement`'s `details.amount_msat >= envelope
-    /// claim` check passes), but the kind costs 100 msat. The gate must reject.
+    /// claim` check passes), but the kind costs 10,000 msat. The gate must reject.
     ///
     /// This drives the FULL gate (`verify`) with Lightning settlement
     /// verification ENABLED, so both `verify_price` (step 5) and
@@ -2652,20 +2804,20 @@ mod tests {
     #[tokio::test]
     async fn settlement_consistent_but_below_required_price_rejected_e2e() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        // Sender self-asserts (and genuinely settles) 50 msat...
-        let envelope = make_signed_envelope(&identity, 50);
+        // Sender self-asserts (and genuinely settles) 5,000 msat...
+        let envelope = make_signed_envelope(&identity, 5_000);
 
         let gate = PaymentGate::with_config(GateConfig {
             verify_lightning_settlement: true,
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        // ...but the kind's required price is 100 msat.
-        let pricing = MockPricing { price_msat: 100 };
-        // Backend confirms a settled, incoming 50 msat payment. This is
+        // ...but the kind's required price is 10,000 msat.
+        let pricing = MockPricing { price_msat: 10_000 };
+        // Backend confirms a settled, incoming 5,000 msat payment. This is
         // INTERNALLY CONSISTENT with the envelope claim: settlement would
         // accept it in isolation (details.amount_msat == envelope claim).
-        let lightning = MockLightning::settled(50);
+        let lightning = MockLightning::settled(5_000);
 
         let result = gate
             .verify(
@@ -2686,8 +2838,11 @@ mod tests {
                 required_msat,
                 paid_msat,
             }) => {
-                assert_eq!(required_msat, 100, "required price must be the kind price");
-                assert_eq!(paid_msat, 50, "paid must be the self-asserted claim");
+                assert_eq!(
+                    required_msat, 10_000,
+                    "required price must be the kind price"
+                );
+                assert_eq!(paid_msat, 5_000, "paid must be the self-asserted claim");
             }
             other => panic!(
                 "a self-consistent settlement below the required price must be \
@@ -2779,11 +2934,11 @@ mod tests {
     async fn no_whitelist_accepts_any_sender() {
         // whitelist=None means no whitelist check — any sender passes
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 100);
+        let envelope = make_signed_envelope(&identity, 10_000);
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2805,7 +2960,7 @@ mod tests {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         // Create envelope with INVALID signature (all zeros)
         let envelope =
@@ -2816,7 +2971,7 @@ mod tests {
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         // Whitelist that doesn't include the sender
         let whitelist = HashSet::new();
@@ -2846,7 +3001,7 @@ mod tests {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         // Very old timestamp with invalid signature
         let envelope =
@@ -2856,7 +3011,7 @@ mod tests {
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2874,7 +3029,7 @@ mod tests {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         // 2 minutes old — within default 5-min window, but outside 1-min custom window
         let ts = now_ms() - 2 * 60 * 1000;
@@ -2893,7 +3048,7 @@ mod tests {
         };
         let gate = PaymentGate::with_config(config);
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2910,7 +3065,7 @@ mod tests {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let sender = *identity.node_id();
         let recipient = Recipient::Node(NodeId::from_bytes([2u8; 32]));
-        let proof = make_proof(100);
+        let proof = make_proof(10_000);
 
         // Timestamp 1 minute in the past (well within 5 min window)
         let recent_timestamp = now_ms() - 60 * 1000;
@@ -2925,7 +3080,7 @@ mod tests {
 
         let gate = PaymentGate::new();
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -2937,16 +3092,37 @@ mod tests {
         );
     }
 
-    /// Removing the post-discount porch floor must reject these regressions.
+    // One representative per category, plus both Porch kinds, manifests,
+    // reserved kinds and the upper extension boundary. Priceability remains
+    // the pricing engine's decision; every priced admission pays the floor.
+    const PAID_KINDS: &[u16] = &[
+        KIND_CHAT,
+        100,
+        200,
+        300,
+        400,
+        KIND_PAGE_REQUEST,
+        KIND_PAGE_RESPONSE,
+        crate::kind::KIND_WEB_MANIFEST,
+        600,
+        700,
+        900,
+        1000,
+        u16::MAX,
+    ];
+
+    /// Catch a missing floor, a discountable floor, or a floor that lowers prices.
     #[tokio::test]
-    async fn porch_read_floor_applies_after_discount_and_preserves_higher_prices() {
+    async fn paid_admission_floor_applies_after_discount_and_preserves_higher_prices() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        for kind in [KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE] {
+        for &kind in PAID_KINDS {
             for (base, discount, cost_floor, expected) in [
                 (1_000, 0.5, 0, 1_000),
                 (1_999, 0.5, 0, 1_000),
                 (3_000, 0.5, 0, 1_500),
+                (0, 0.0, 0, 1_000),
                 (1, 0.0, 0, 1_000),
+                (999, 0.0, 0, 1_000),
                 (1_000, 0.5, 2_000, 2_000),
             ] {
                 let gate = PaymentGate::with_config(GateConfig {
@@ -2974,7 +3150,7 @@ mod tests {
 
     /// Exercise real gate validation with settled incoming payments and old quotes.
     #[tokio::test]
-    async fn discounted_porch_reads_require_one_sat_settled_even_with_old_quote() {
+    async fn paid_admissions_require_one_sat_settled_even_with_old_quote() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let recipient = NodeId::from_bytes([2u8; 32]);
         let gate = PaymentGate::with_config(GateConfig {
@@ -2982,9 +3158,9 @@ mod tests {
             ..Default::default()
         });
         let pricing = MockPricing { price_msat: 1_000 };
-        for kind in [KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE] {
+        for &kind in PAID_KINDS {
             for quoted_price_msat in [None, Some(500)] {
-                for amount in [500, 999, 1_000, 1_001] {
+                for amount in [1, 500, 999, 1_000, 1_001] {
                     let mut envelope = make_signed_envelope(&identity, amount);
                     envelope.kind = kind;
                     envelope.signature = crate::types::Signature::from_ed25519(
@@ -3021,9 +3197,8 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
-    async fn porch_quoted_fallback_enforces_admission_floor() {
+    async fn paid_admission_quoted_fallback_enforces_higher_cost_floor() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let gate = PaymentGate::with_config(GateConfig {
             min_admission_cost_msat: 2000,
@@ -3032,12 +3207,13 @@ mod tests {
         });
         let recipient = NodeId::from_bytes([2; 32]);
         let pricing = MockPricing { price_msat: 6000 };
-        for kind in [KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE] {
+        for &kind in PAID_KINDS {
             for amount in [1000, 1999, 2000] {
                 let mut envelope = make_signed_envelope(&identity, amount);
                 envelope.kind = kind;
-                envelope.signature =
-                    crate::types::Signature::from_ed25519(&identity.sign(&envelope.signable_bytes()));
+                envelope.signature = crate::types::Signature::from_ed25519(
+                    &identity.sign(&envelope.signable_bytes()),
+                );
                 let mut nonces = MockNonceStore::new();
                 nonces.quoted_price_msat = Some(500);
                 let result = gate
@@ -3066,11 +3242,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn porch_read_resolved_floor_binds_settlement_independently() {
+    async fn paid_admission_resolved_floor_binds_settlement_independently() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
         let gate = PaymentGate::new();
         let pricing = MockPricing { price_msat: 1_000 };
-        for kind in [KIND_PAGE_REQUEST, KIND_PAGE_RESPONSE] {
+        for &kind in PAID_KINDS {
             let mut envelope = make_signed_envelope(&identity, 1_000);
             envelope.kind = kind;
             let required = gate.verify_price(&envelope, &pricing, 0.5).await.unwrap();
@@ -3093,68 +3269,58 @@ mod tests {
         }
     }
 
+    /// A sender can mint a preimage and sign any claimed amount. Even with
+    /// settlement checks disabled, a sub-sat claim must not buy admission or
+    /// consume durable replay storage.
     #[tokio::test]
-    async fn porch_read_floor_leaves_other_kinds_and_quotes_unchanged() {
+    async fn forged_sub_sat_payment_is_refused_before_replay_storage() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let pricing = MockPricing { price_msat: 100 };
-        let gate = PaymentGate::with_config(GateConfig {
-            verify_lightning_settlement: true,
-            ..Default::default()
-        });
-        for kind in [
-            KIND_CHAT,
-            499,
-            502,
-            crate::kind::KIND_WEB_MANIFEST,
-            599,
-            600,
-            crate::kind::KIND_PEER_EXCHANGE,
-        ] {
-            for (amount, quote) in [(50, None), (25, Some(25))] {
-                let mut envelope = make_signed_envelope(&identity, amount);
-                envelope.kind = kind;
-                envelope.signature = crate::types::Signature::from_ed25519(
-                    &identity.sign(&envelope.signable_bytes()),
-                );
-                let mut nonces = MockNonceStore::new();
-                nonces.quoted_price_msat = quote;
-                let result = gate
-                    .verify(
-                        &envelope,
-                        &nonces,
-                        &pricing,
-                        None,
-                        Some(&MockLightning::settled(amount)),
-                        0.5,
-                        None,
-                    )
-                    .await;
-                assert!(result.is_ok(), "kind={kind}, amount={amount}: {result:?}");
-            }
+        let gate = PaymentGate::new();
+        let pricing = MockPricing { price_msat: 1 };
+        let nonces = MockNonceStore::new();
+        for &kind in PAID_KINDS {
+            let mut envelope = make_signed_envelope(&identity, 999);
+            envelope.kind = kind;
+            envelope.signature =
+                crate::types::Signature::from_ed25519(&identity.sign(&envelope.signable_bytes()));
+            let result = gate
+                .verify(&envelope, &nonces, &pricing, None, None, 0.5, None)
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(GateRejection::InsufficientPayment {
+                        required_msat: 1_000,
+                        paid_msat: 999,
+                    })
+                ),
+                "kind={kind}: {result:?}"
+            );
         }
+        assert!(nonces.seen.lock().unwrap().is_empty());
+        assert!(nonces.seen_payment_hashes.lock().unwrap().is_empty());
     }
 
     // ── Cost floor (doorway hardening #4) ──────────────────────────────
     //
     // The resolved admission price is floored at `min_admission_cost_msat`,
     // the operator-modeled marginal cost of processing one inbound paid
-    // contact. The floor defaults to 0 (off, no price change), can only ever
+    // contact. This additional cost floor defaults to 0, can only ever
     // RAISE the required amount (fail-closed direction), and is applied after
     // the plasticity discount so a trusted peer's discount cannot undercut it.
 
-    /// Floor at 0 (the default) is a pure no-op: a message that pays the base
-    /// price is accepted exactly as before. Pins the non-regression guarantee.
+    /// No additional operator cost: paying the protocol minimum is sufficient.
     #[tokio::test]
     async fn cost_floor_zero_is_a_no_op() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 10);
+        let envelope = make_signed_envelope(&identity, 1_000);
 
         let gate = PaymentGate::with_config(GateConfig {
             min_admission_cost_msat: 0,
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -3171,15 +3337,15 @@ mod tests {
     #[tokio::test]
     async fn cost_floor_rejects_payment_below_cost() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        // Pays 10 — meets the base price, but the node's modeled cost is 50.
-        let envelope = make_signed_envelope(&identity, 10);
+        // Pays 1,000 — meets the base price, but the modeled cost is 5,000.
+        let envelope = make_signed_envelope(&identity, 1_000);
 
         let gate = PaymentGate::with_config(GateConfig {
-            min_admission_cost_msat: 50,
+            min_admission_cost_msat: 5_000,
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -3189,8 +3355,8 @@ mod tests {
             matches!(
                 result,
                 Err(GateRejection::InsufficientPayment {
-                    required_msat: 50,
-                    paid_msat: 10,
+                    required_msat: 5_000,
+                    paid_msat: 1_000,
                 })
             ),
             "payment below the cost floor must be rejected at the floored \
@@ -3203,14 +3369,14 @@ mod tests {
     #[tokio::test]
     async fn cost_floor_accepts_payment_at_the_floor() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 50);
+        let envelope = make_signed_envelope(&identity, 5_000);
 
         let gate = PaymentGate::with_config(GateConfig {
-            min_admission_cost_msat: 50,
+            min_admission_cost_msat: 5_000,
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 10 };
+        let pricing = MockPricing { price_msat: 1_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -3223,20 +3389,19 @@ mod tests {
     }
 
     /// The cost floor is applied AFTER the plasticity trust discount, so even a
-    /// maximally-trusted peer (50% discount) cannot pay below cost. base=100,
-    /// discount=0.5 → discounted=50; floor=80 → required=80; paying the
-    /// discounted 50 is rejected at 80.
+    /// maximally-trusted peer (50% discount) cannot pay below cost. base=10,000,
+    /// discount=0.5 → discounted=5,000; floor=8,000 → required=8,000.
     #[tokio::test]
     async fn cost_floor_cannot_be_undercut_by_trust_discount() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 50);
+        let envelope = make_signed_envelope(&identity, 5_000);
 
         let gate = PaymentGate::with_config(GateConfig {
-            min_admission_cost_msat: 80,
+            min_admission_cost_msat: 8_000,
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 100 };
+        let pricing = MockPricing { price_msat: 10_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.5, None)
@@ -3246,27 +3411,27 @@ mod tests {
             matches!(
                 result,
                 Err(GateRejection::InsufficientPayment {
-                    required_msat: 80,
-                    paid_msat: 50,
+                    required_msat: 8_000,
+                    paid_msat: 5_000,
                 })
             ),
             "trust discount must not undercut the cost floor, got: {result:?}"
         );
     }
 
-    /// A floor BELOW the resolved price never lowers it: base=100, floor=10,
-    /// paying 50 is still rejected at the base 100 (the `.max()` is one-sided).
+    /// A floor BELOW the resolved price never lowers it: base=10,000, floor=1,000,
+    /// paying 5,000 is still rejected at the base 10,000 (the `.max()` is one-sided).
     #[tokio::test]
     async fn cost_floor_never_lowers_an_already_higher_price() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-        let envelope = make_signed_envelope(&identity, 50);
+        let envelope = make_signed_envelope(&identity, 5_000);
 
         let gate = PaymentGate::with_config(GateConfig {
-            min_admission_cost_msat: 10,
+            min_admission_cost_msat: 1_000,
             ..Default::default()
         });
         let nonce_store = MockNonceStore::new();
-        let pricing = MockPricing { price_msat: 100 };
+        let pricing = MockPricing { price_msat: 10_000 };
 
         let result = gate
             .verify(&envelope, &nonce_store, &pricing, None, None, 0.0, None)
@@ -3276,8 +3441,8 @@ mod tests {
             matches!(
                 result,
                 Err(GateRejection::InsufficientPayment {
-                    required_msat: 100,
-                    paid_msat: 50,
+                    required_msat: 10_000,
+                    paid_msat: 5_000,
                 })
             ),
             "a floor below the base price must not lower required, got: {result:?}"
@@ -3290,8 +3455,11 @@ mod tests {
         let gate = PaymentGate::new();
         let mut lightning = MockLightning::settled(100);
         lightning.funding_only = true;
-        let result = gate.verify_settlement(&envelope, &lightning, 10, None).await;
-        assert!(matches!(result, Err(GateRejection::PaymentSettlementMismatch(s)) if s.contains("funding")));
+        let result = gate
+            .verify_settlement(&envelope, &lightning, 10, None)
+            .await;
+        assert!(
+            matches!(result, Err(GateRejection::PaymentSettlementMismatch(s)) if s.contains("funding"))
+        );
     }
-
 }

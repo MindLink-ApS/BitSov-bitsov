@@ -858,8 +858,8 @@ mod replay_e2e {
     async fn replayed_payment_hash_rejected_through_gate_and_sqlite() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
 
-        let first = signed_chat_envelope(&identity, 100);
-        let second = signed_chat_envelope(&identity, 100);
+        let first = signed_chat_envelope(&identity, 1_000);
+        let second = signed_chat_envelope(&identity, 1_000);
 
         // Sanity: fresh nonce, but identical economic proof (payment hash).
         assert_ne!(first.nonce, second.nonce, "envelopes must have distinct nonces");
