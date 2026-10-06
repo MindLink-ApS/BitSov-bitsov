@@ -2508,7 +2508,7 @@ mod tests {
         }
     }
 
-    /// RequestInvoice with zero amount is valid at wire level (free messages).
+    /// RequestInvoice with zero amount is valid at wire level; the gate, not the codec, refuses unpaid messages.
     #[test]
     fn request_invoice_zero_amount_roundtrips() {
         let frame = Frame::RequestInvoice {

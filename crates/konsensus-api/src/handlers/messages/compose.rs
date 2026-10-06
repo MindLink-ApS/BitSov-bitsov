@@ -479,8 +479,8 @@ pub(crate) async fn create_metered_payment_proof(
     kind: Option<u16>,
     charge: &mut FirstContactCharge,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
-    // Zero-price messages get a valid cryptographic proof with zero amount.
-    // The payment gate accepts these for kind-0 (control) messages.
+    // A zero price sends a zero-amount proof and pays nothing. No kind is free
+    // at the receiving gate: it floors every paid admission at 1,000 msat.
     if price_msat == 0 {
         return Ok(generate_valid_proof(0));
     }

@@ -158,15 +158,14 @@ pub struct IntroductionFields {
     pub intro_id: [u8; 16],
 }
 
-/// The first-contact prices a node quotes a stranger for a text message,
-/// given its chat price. Shared by the stateless quote and the introduction
-/// so the card can never advertise a different figure than the quote.
-/// A zero chat price still takes a 1 sat admission invoice; the message is
-/// then free of charge.
-pub fn first_contact_prices(chat_price_msat: u64) -> (u64, u64) {
-    let admission = chat_price_msat.max(1000);
-    let message = if chat_price_msat == 0 { 0 } else { admission };
-    (admission, message)
+/// The first-contact (admission, message) prices a node quotes a stranger for
+/// a text message, given its chat price and admission cost floor. Shared by
+/// the stateless quote and the introduction so the card can never advertise a
+/// different figure than the quote. Both take the gate's floor, so neither is
+/// ever below one sat or `min_admission_cost_msat`.
+pub fn first_contact_prices(chat_price_msat: u64, min_admission_cost_msat: u64) -> (u64, u64) {
+    let price = crate::gate::price_with_floor_msat(chat_price_msat, min_admission_cost_msat);
+    (price, price)
 }
 
 impl Introduction {
@@ -613,9 +612,11 @@ mod tests {
 
     #[test]
     fn first_contact_prices_match_the_quote_rule() {
-        assert_eq!(first_contact_prices(0), (1000, 0));
-        assert_eq!(first_contact_prices(1), (1000, 1000));
-        assert_eq!(first_contact_prices(10_000), (10_000, 10_000));
+        assert_eq!(first_contact_prices(0, 0), (1000, 1000));
+        assert_eq!(first_contact_prices(1, 0), (1000, 1000));
+        assert_eq!(first_contact_prices(10_000, 0), (10_000, 10_000));
+        assert_eq!(first_contact_prices(10_000, 25_000), (25_000, 25_000));
+        assert_eq!(first_contact_prices(30_000, 25_000), (30_000, 30_000));
     }
 
     #[test]
