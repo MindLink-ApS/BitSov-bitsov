@@ -18,6 +18,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
     )
     .unwrap();
     NodeConfig {
+        node: Default::default(),
         logging: Default::default(),
         privacy: Default::default(),
         disk_free_floor_bytes: 0,
@@ -57,6 +58,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
 /// Helper: create a config struct for snapshot tests (no temp dir needed).
 fn snapshot_config(storage: StorageConfig) -> NodeConfig {
     NodeConfig {
+        node: Default::default(),
         logging: Default::default(),
         privacy: Default::default(),
         disk_free_floor_bytes: 0,

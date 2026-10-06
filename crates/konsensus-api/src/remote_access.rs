@@ -32,10 +32,23 @@ pub const MAX_AUTH_PLAINTEXT: usize = 8 * 1024;
 pub struct PairLink {
     pub v: u8,
     pub endpoint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub node_id: String,
+    // Keep the live static proof during the U1 transport migration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub transport_pubkey: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub transport_signature: String,
+    #[serde(default)]
+    pub box_transport_pubkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_transport_signature: Option<String>,
     pub code: String,
+    /// Unix seconds; zero identifies a legacy, non-durable link.
+    #[serde(default)]
+    pub expires_at: i64,
+    #[serde(default)]
+    pub hosted_by: Option<String>,
 }
 
 impl PairLink {
@@ -55,7 +68,7 @@ impl PairLink {
             .decode(encoded)
             .map_err(|e| format!("invalid pairing link base64: {e}"))?;
         let link: Self =
-            serde_json::from_slice(&json).map_err(|e| format!("invalid pairing link JSON: {e}"))?;
+            serde_json::from_slice(&json).map_err(|_| "invalid pairing link JSON".to_string())?;
         if link.v != VERSION {
             return Err(format!("unsupported pairing link version {}", link.v));
         }
@@ -214,6 +227,10 @@ mod tests {
             transport_pubkey: "22".repeat(32),
             transport_signature: "sig".into(),
             code: "code".into(),
+            box_transport_pubkey: "33".repeat(32),
+            box_transport_signature: Some("box-sig".into()),
+            expires_at: 1234567890,
+            hosted_by: Some("My Pi".into()),
         };
         let uri = link.to_uri().unwrap();
         assert!(!uri.contains('='));

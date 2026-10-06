@@ -607,6 +607,7 @@ fn scope_list(scopes: &[Scope]) -> String {
 /// file, which is what makes "exactly one consumption can succeed" true rather
 /// than merely likely.
 pub struct PairingService {
+    hosted_by: Option<String>,
     dir: PathBuf,
     file_path: PathBuf,
     box_transport_secret: zeroize::Zeroizing<[u8; 32]>,
@@ -860,6 +861,7 @@ impl PairingService {
         let box_transport_secret = load_box_transport_key(&dir)?;
         let (authority_changes, _) = tokio::sync::watch::channel(0);
         let service = Self {
+            hosted_by: None,
             dir,
             file_path,
             box_transport_secret,
@@ -1289,13 +1291,35 @@ impl PairingService {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
+    /// Cosmetic box label, never an authority or custody input.
+    pub fn with_hosted_by(mut self, hosted_by: Option<String>) -> Self {
+        self.hosted_by = hosted_by;
+        self
+    }
+
+    pub fn hosted_by(&self) -> Option<&str> {
+        self.hosted_by.as_deref()
+    }
+
+    pub fn remote_access_link_path(&self) -> PathBuf {
+        self.dir.join("remote-access-link")
+    }
+
     /// Store the one-shot remote pairing link under the protected pairing
     /// directory. The link is intentionally never returned by an HTTP route or
     /// written to stdout/journald.
     pub fn write_remote_access_link(&self, link: &str) -> Result<PathBuf, PairingError> {
         let path = self.dir.join("remote-access-link");
-        write_protected(&path, link.as_bytes())?;
-        fsync_dir(&self.dir)?;
+        let temporary = self
+            .dir
+            .join(format!(".remote-access-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> io::Result<()> {
+            write_protected(&temporary, link.as_bytes())?;
+            std::fs::rename(&temporary, &path)?;
+            fsync_dir_strict(&self.dir)
+        })();
+        let _ = std::fs::remove_file(temporary);
+        result?;
         Ok(path)
     }
 
@@ -1303,7 +1327,7 @@ impl PairingService {
     pub fn remove_remote_access_link(&self) -> Result<(), PairingError> {
         let path = self.dir.join("remote-access-link");
         match std::fs::remove_file(path) {
-            Ok(()) => fsync_dir(&self.dir)?,
+            Ok(()) => fsync_dir_strict(&self.dir)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -3704,7 +3728,7 @@ fn sanitize_name(name: &str) -> String {
 
 /// Never truncate or silently replace a persistent transport key. Unlike a
 /// disposable challenge, rotating this secret invalidates clients' box pins.
-fn load_box_transport_key(dir: &Path) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
+pub fn load_box_transport_key(dir: &Path) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
     load_box_transport_key_with_sync(dir, fsync_dir_strict)
 }
 

@@ -30,7 +30,7 @@ client authenticated by the Noise tunnel, even on loopback. The tunnel uses the
 box static and cannot create pairings. There is no `/api/v1/health`, `/auth/local`,
 pairing API, WebSocket, peer TCP listener (normally 9736), Lightning, chain source,
 or gossip. Monitor `/api/v1/node/lock`: it reports `state`, `node_id`, `fingerprint`,
-`locked_since`, process-wide `attempts_left` and `hosted_by` (currently null).
+`locked_since`, process-wide `attempts_left` and the optional `hosted_by` label.
 
 Unlock uses a fresh 32-byte hex challenge, valid for 120 seconds and consumed on
 its first use. The P-256 signature binds the fingerprint, client, pairing epoch,
@@ -74,5 +74,58 @@ endpoint can impersonate the box at the next unlock and capture the password.
 The same risk applies to an untrusted box operator. A secure element or PAKE
 could change this boundary in a future release; neither is implemented here.
 One person's box hosting another person's process remains self-custody in this
-model, distinct from the `identity.hosted` hosted-custody setting. A display label
-for the operator is deferred to the enrollment-ticket work.
+model, distinct from the `identity.hosted` hosted-custody setting.
+
+
+## Enrollment tickets and box labels
+
+On the box, with remote access configured, run:
+
+```sh
+konsensus pair-ticket --config /path/to/konsensus.toml --qr --ttl 24h
+```
+
+The CLI prints a `bitsov://pair/…` URI to its own terminal and, with `--qr`,
+a terminal QR of that same URI. It never needs `--owner-control` or a control
+socket. Package hooks can call this command; keep the output private and out of
+service journals. Anyone who can read the ticket can pair once as `read+receive`.
+Owner-device enrollment still requires delegation from an existing owner device;
+a ticket never grants spend or identity authority on an initialized node.
+
+The protected file `pairing/remote-access-link` (0600) is the ticket authority.
+The daemon reloads atomic replacements within a second and at authentication.
+Issuing a new ticket replaces the previous one. The default lifetime is 24 hours;
+`--ttl` accepts positive `s`, `m`, `h` and `d` durations up to 365 days. Expiry is
+stored as Unix seconds, so a restart never resets it. Unused tickets survive
+shutdown and restarts, including a locked interval, but cannot be used while
+locked. Consumption removes and syncs the file before creating a pairing: a crash
+in that interval burns the ticket, so issue another if necessary. An already
+created pairing can retry a lost response with the same device keys.
+
+`pair-ticket` refuses while locked. Its conservative locked marker remains after
+a stopped/crashed locked run, until a successful unlocked start refreshes public
+identity metadata. For an initialized node, start unlocked with this version once
+before issuing tickets: `identity/identity.json` contains both signed transport
+proofs, and the CLI never reads or decrypts the seed. Pre-bootstrap tickets omit
+`node_id` and identity signatures and carry only the persistent box public key;
+remote bootstrap itself is a separate P2 feature.
+
+The daemon continues to create a five-minute first-pairing ticket when no ticket
+or paired clients exist. It only prints the protected file's path, never its URI
+or code. CLI tickets can open pairing for a second device on a running node.
+
+Set a human-readable box label independently of custody:
+
+```toml
+[node]
+hosted_by = "Rasmus's Pi"
+```
+
+The label appears in tickets, `/api/v1/node/lock` and `/api/v1/health` (`null` when
+unset). Unknown `[node]` fields are rejected. It is display text only: it neither
+sets `identity.hosted` nor changes the sovereignty tier. A box hosting another
+person's self-custody node is not the Cloud hosted-custody tier. Use one process,
+data directory, seed, password, ticket and set of ports per person (for example,
+`konsensus@<name>.service` instances). The OS operator can take a node offline and
+read its encrypted seed, box key and pairing records; the network-impersonation
+risk above still applies per person.

@@ -90,10 +90,20 @@ impl NodeTier {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDisplayConfig {
+    pub hosted_by: Option<String>,
+}
+
 /// Top-level node configuration, matching `konsensus.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    /// Display metadata only; independent of identity.hosted custody.
+    #[serde(default)]
+    pub node: NodeDisplayConfig,
+
     /// Size limits for node.log and ldk_node.log.
     #[serde(default)]
     pub logging: konsensus_core::logging::LoggingConfig,
@@ -1616,6 +1626,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            node: NodeDisplayConfig::default(),
             logging: Default::default(),
             privacy: PrivacyConfig::default(),
             disk_free_floor_bytes: default_disk_free_floor_bytes(),

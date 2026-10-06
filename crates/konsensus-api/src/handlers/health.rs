@@ -132,6 +132,8 @@ pub fn stun_url(endpoint: Option<&str>, stun_port: Option<u16>) -> Option<String
 /// deploy/keepalive probes read (status + counts + availability flags).
 #[derive(Serialize)]
 pub struct PublicHealthResponse {
+    /// Operator-supplied display label, not a custody claim.
+    pub hosted_by: Option<String>,
     /// Always "ok" if the node is running.
     pub status: &'static str,
     /// Number of connected peers (count only — not the peer IDs).
@@ -190,6 +192,7 @@ async fn health(State(state): State<Arc<AppState>>) -> (DataFreshness, Json<Publ
     (
         freshness,
         Json(PublicHealthResponse {
+            hosted_by: state.pairing.as_ref().and_then(|p| p.hosted_by().map(str::to_owned)),
             status: "ok",
             connected_peers: connected.len(),
             e2ee_sessions: session_count,
