@@ -50,7 +50,7 @@ fn signed_envelope(sender: &NodeIdentity, recipient: NodeId, tag: &[u8]) -> UkmE
         use sha2::{Digest, Sha256};
         Sha256::digest(preimage).into()
     };
-    let proof = PaymentProof::new(hash, preimage, 100);
+    let proof = PaymentProof::new(hash, preimage, 1_000);
     let mut env = UkmEnvelopeBuilder::new(
         KIND_CHAT,
         *sender.node_id(),
@@ -137,7 +137,15 @@ async fn restored_invite_peer_is_accepted_by_gate() {
 
     let env = signed_envelope(&peer, *me.node_id(), b"hello-after-restore");
     let result = gate
-        .verify(&env, &nonce_store, &pricing, Some(&whitelist), None, 0.0, None)
+        .verify(
+            &env,
+            &nonce_store,
+            &pricing,
+            Some(&whitelist),
+            None,
+            0.0,
+            None,
+        )
         .await;
     assert!(
         result.is_ok(),

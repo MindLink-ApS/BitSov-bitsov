@@ -11,15 +11,15 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::gate::{GateConfig, GateRejection, NonceStore, PaymentGate};
 use konsensus_core::identity::NodeIdentity;
-use konsensus_core::kind::{KIND_CHAT, KindCategory};
+use konsensus_core::kind::{KindCategory, KIND_CHAT};
 use konsensus_core::traits::lightning::{
     Invoice, LightningError, PaymentDetails, PaymentDirection, PaymentStatus,
 };
 use konsensus_core::traits::pricing::{PricingEngine, PricingError};
 use konsensus_core::types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, Signature};
+use konsensus_core::UkmEnvelopeBuilder;
 
 use sha2::{Digest, Sha256};
 
@@ -42,16 +42,24 @@ impl MockNonceStore {
 #[async_trait::async_trait]
 impl NonceStore for MockNonceStore {
     async fn check_and_store_paid(
-        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
-        _sender: &konsensus_core::NodeId, _message_id: &konsensus_core::MessageId,
+        &self,
+        nonce: &konsensus_core::Nonce,
+        payment_hash: &[u8; 32],
+        _sender: &konsensus_core::NodeId,
+        _message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
         use konsensus_core::gate::PaidReplay;
         let mut nonces = self.seen.lock().unwrap();
         let mut payments = self.seen_payment_hashes.lock().unwrap();
         let key = *nonce.as_bytes();
-        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
-        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
-        nonces.insert(key); payments.insert(*payment_hash);
+        if nonces.contains(&key) {
+            return Ok(PaidReplay::NonceReused);
+        }
+        if payments.contains(payment_hash) {
+            return Ok(PaidReplay::PaymentReused);
+        }
+        nonces.insert(key);
+        payments.insert(*payment_hash);
         Ok(PaidReplay::Accepted)
     }
 
@@ -227,10 +235,15 @@ fn make_signed_envelope_unique_proof(
     let hash: [u8; 32] = Sha256::digest(preimage).into();
     let proof = PaymentProof::new(hash, preimage, amount_msat);
 
-    let mut envelope =
-        UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"encrypted content".to_vec(), proof)
-            .timestamp(now_ms())
-            .build();
+    let mut envelope = UkmEnvelopeBuilder::new(
+        KIND_CHAT,
+        sender,
+        recipient,
+        b"encrypted content".to_vec(),
+        proof,
+    )
+    .timestamp(now_ms())
+    .build();
 
     let signable = envelope.signable_bytes();
     let sig = identity.sign(&signable);
@@ -266,18 +279,17 @@ fn make_signed_envelope_with_nonce(
 #[tokio::test]
 async fn replay_same_envelope_rejected() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 100);
+    let envelope = make_signed_envelope(&identity, 1_000);
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
     let pricing = MockPricing { price_msat: 10 };
 
     // First: accepted
-    assert!(
-        gate.verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
 
     // Replay: rejected
     let result = gate
@@ -291,22 +303,23 @@ async fn replay_same_nonce_different_content_rejected() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
     let nonce = Nonce::generate();
 
-    let env1 = make_signed_envelope_with_nonce(&identity, 100, nonce);
+    let env1 = make_signed_envelope_with_nonce(&identity, 1_000, nonce);
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
     let pricing = MockPricing { price_msat: 10 };
 
     // First envelope with this nonce: accepted
-    assert!(
-        gate.verify(&env1, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(&env1, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
 
     // Second envelope with same nonce: rejected (even if content differs)
-    let env2 = make_signed_envelope_with_nonce(&identity, 200, nonce);
-    let result = gate.verify(&env2, &nonces, &pricing, None, None, 0.0, None).await;
+    let env2 = make_signed_envelope_with_nonce(&identity, 2_000, nonce);
+    let result = gate
+        .verify(&env2, &nonces, &pricing, None, None, 0.0, None)
+        .await;
     assert!(matches!(result, Err(GateRejection::ReplayDetected)));
 }
 
@@ -314,8 +327,8 @@ async fn replay_same_nonce_different_content_rejected() {
 async fn different_nonces_both_accepted() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
     // Distinct messages → distinct nonces AND distinct payment proofs.
-    let env1 = make_signed_envelope_unique_proof(&identity, 100, 1);
-    let env2 = make_signed_envelope_unique_proof(&identity, 100, 2);
+    let env1 = make_signed_envelope_unique_proof(&identity, 1_000, 1);
+    let env2 = make_signed_envelope_unique_proof(&identity, 1_000, 2);
 
     // Different nonces (generated randomly)
     assert_ne!(env1.nonce.as_bytes(), env2.nonce.as_bytes());
@@ -329,16 +342,14 @@ async fn different_nonces_both_accepted() {
     let nonces = MockNonceStore::new();
     let pricing = MockPricing { price_msat: 10 };
 
-    assert!(
-        gate.verify(&env1, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
-    assert!(
-        gate.verify(&env2, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(&env1, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
+    assert!(gate
+        .verify(&env2, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -366,11 +377,11 @@ async fn zero_payment_rejected() {
 #[tokio::test]
 async fn one_sat_less_than_required_rejected() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 9); // 9 when 10 required
+    let envelope = make_signed_envelope(&identity, 1_000); // 1 sat when 2 sats required
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 2_000 };
 
     let result = gate
         .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
@@ -380,8 +391,8 @@ async fn one_sat_less_than_required_rejected() {
             required_msat,
             paid_msat,
         }) => {
-            assert_eq!(required_msat, 10);
-            assert_eq!(paid_msat, 9);
+            assert_eq!(required_msat, 2_000);
+            assert_eq!(paid_msat, 1_000);
         }
         other => panic!("expected InsufficientPayment, got: {other:?}"),
     }
@@ -424,7 +435,7 @@ async fn forged_preimage_rejected() {
 #[tokio::test]
 async fn nonce_store_failure_rejects_message() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 100);
+    let envelope = make_signed_envelope(&identity, 1_000);
 
     let gate = PaymentGate::new();
     let failing_nonces = FailingNonceStore;
@@ -456,7 +467,7 @@ async fn pricing_engine_failure_rejects_message() {
 #[tokio::test]
 async fn settlement_required_but_lightning_unavailable() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 100);
+    let envelope = make_signed_envelope(&identity, 1_000);
 
     let config = GateConfig {
         verify_lightning_settlement: true,
@@ -491,7 +502,15 @@ async fn settlement_unsettled_payment_rejected() {
     let lightning = MockLightning { settled: false };
 
     let result = gate
-        .verify(&envelope, &nonces, &pricing, None, Some(&lightning), 0.0, None)
+        .verify(
+            &envelope,
+            &nonces,
+            &pricing,
+            None,
+            Some(&lightning),
+            0.0,
+            None,
+        )
         .await;
     assert!(matches!(result, Err(GateRejection::PaymentNotSettled(_))));
 }
@@ -616,7 +635,15 @@ async fn whitelist_with_wrong_node_rejects() {
     whitelist.insert(*bob.node_id());
 
     let result = gate
-        .verify(&envelope, &nonces, &pricing, Some(&whitelist), None, 0.0, None)
+        .verify(
+            &envelope,
+            &nonces,
+            &pricing,
+            Some(&whitelist),
+            None,
+            0.0,
+            None,
+        )
         .await;
     assert!(matches!(result, Err(GateRejection::NotWhitelisted(_))));
 }
@@ -624,7 +651,7 @@ async fn whitelist_with_wrong_node_rejects() {
 #[tokio::test]
 async fn no_whitelist_accepts_all_senders() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 100);
+    let envelope = make_signed_envelope(&identity, 1_000);
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
@@ -726,7 +753,7 @@ fn signature_debug_redacts_content() {
 #[tokio::test]
 async fn invalid_envelope_rejected_before_nonce_consumed() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let mut envelope = make_signed_envelope(&identity, 100);
+    let mut envelope = make_signed_envelope(&identity, 1_000);
 
     // Tamper with ciphertext (breaks ID validation)
     envelope.ciphertext[0] ^= 0xFF;
@@ -742,7 +769,7 @@ async fn invalid_envelope_rejected_before_nonce_consumed() {
     assert!(matches!(result, Err(GateRejection::InvalidEnvelope(_))));
 
     // Fix the envelope (re-sign with correct content)
-    let fixed = make_signed_envelope_with_nonce(&identity, 100, envelope.nonce);
+    let fixed = make_signed_envelope_with_nonce(&identity, 1_000, envelope.nonce);
 
     // Nonce should NOT have been consumed by the failed attempt
     let result = gate
@@ -769,7 +796,15 @@ async fn whitelist_check_before_signature_verification() {
     whitelist.insert(NodeId::from_bytes([99u8; 32]));
 
     let result = gate
-        .verify(&envelope, &nonces, &pricing, Some(&whitelist), None, 0.0, None)
+        .verify(
+            &envelope,
+            &nonces,
+            &pricing,
+            Some(&whitelist),
+            None,
+            0.0,
+            None,
+        )
         .await;
 
     // Should be NotWhitelisted (not InvalidSignature)

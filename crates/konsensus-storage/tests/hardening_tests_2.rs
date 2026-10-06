@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::gate::NonceStore;
 use konsensus_core::types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, RoomId, Signature};
+use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_storage::models::{FileRecord, Peer, Room};
 use konsensus_storage::{EncryptedStorage, SqliteStorage, Storage, StorageNonceAdapter};
 use sha2::{Digest, Sha256};
@@ -286,12 +286,10 @@ async fn nonce_adapter_payment_hash_reuse_returns_false() {
     let message_b = MessageId::from_bytes([2u8; 32]);
     let payment_hash = [9u8; 32];
 
-    assert!(
-        adapter
-            .check_and_store_payment_hash(&payment_hash, &sender, &message_a)
-            .await
-            .unwrap()
-    );
+    assert!(adapter
+        .check_and_store_payment_hash(&payment_hash, &sender, &message_a)
+        .await
+        .unwrap());
     assert!(
         !adapter
             .check_and_store_payment_hash(&payment_hash, &sender, &message_b)
@@ -794,7 +792,7 @@ mod replay_e2e {
     use super::*;
     use konsensus_core::gate::{GateRejection, PaymentGate};
     use konsensus_core::identity::NodeIdentity;
-    use konsensus_core::kind::{KIND_CHAT, KindCategory};
+    use konsensus_core::kind::{KindCategory, KIND_CHAT};
     use konsensus_core::traits::pricing::{PricingEngine, PricingError};
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
@@ -833,17 +831,25 @@ mod replay_e2e {
     /// Build a fully-signed chat envelope. The payment proof is deterministic
     /// (fixed preimage), so two envelopes built by this helper share the same
     /// `payment_hash` while getting distinct fresh nonces from the builder.
-    fn signed_chat_envelope(identity: &NodeIdentity, amount_msat: u64) -> konsensus_core::UkmEnvelope {
+    fn signed_chat_envelope(
+        identity: &NodeIdentity,
+        amount_msat: u64,
+    ) -> konsensus_core::UkmEnvelope {
         let sender = *identity.node_id();
         let recipient = Recipient::Node(make_node_id(2));
         let preimage = [42u8; 32];
         let hash: [u8; 32] = Sha256::digest(preimage).into();
         let proof = PaymentProof::new(hash, preimage, amount_msat);
 
-        let mut envelope =
-            UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"encrypted content".to_vec(), proof)
-                .timestamp(now_ms())
-                .build();
+        let mut envelope = UkmEnvelopeBuilder::new(
+            KIND_CHAT,
+            sender,
+            recipient,
+            b"encrypted content".to_vec(),
+            proof,
+        )
+        .timestamp(now_ms())
+        .build();
 
         let signable = envelope.signable_bytes();
         let sig = identity.sign(&signable);
@@ -858,11 +864,14 @@ mod replay_e2e {
     async fn replayed_payment_hash_rejected_through_gate_and_sqlite() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
 
-        let first = signed_chat_envelope(&identity, 100);
-        let second = signed_chat_envelope(&identity, 100);
+        let first = signed_chat_envelope(&identity, 1_000);
+        let second = signed_chat_envelope(&identity, 1_000);
 
         // Sanity: fresh nonce, but identical economic proof (payment hash).
-        assert_ne!(first.nonce, second.nonce, "envelopes must have distinct nonces");
+        assert_ne!(
+            first.nonce, second.nonce,
+            "envelopes must have distinct nonces"
+        );
         assert_eq!(
             first.payment_proof.payment_hash, second.payment_proof.payment_hash,
             "envelopes must reuse the same payment hash for this test to mean anything"
@@ -914,20 +923,67 @@ async fn paid_replay_is_atomic_and_durable() {
     let message = MessageId::from_bytes([1; 32]);
     let first = Nonce::from_bytes([1; 24]);
     let second = Nonce::from_bytes([2; 24]);
-    assert_eq!(store.check_and_store_paid(&first, &[1; 32], &sender, &message).await.unwrap(), PaidReplay::Accepted);
-    assert_eq!(store.check_and_store_paid(&second, &[1; 32], &sender, &message).await.unwrap(), PaidReplay::PaymentReused);
-    assert!(!store.has_nonce(&second).await.unwrap(), "rejected proof persisted a fresh nonce");
-    assert_eq!(store.check_and_store_paid(&first, &[2; 32], &sender, &message).await.unwrap(), PaidReplay::NonceReused);
+    assert_eq!(
+        store
+            .check_and_store_paid(&first, &[1; 32], &sender, &message)
+            .await
+            .unwrap(),
+        PaidReplay::Accepted
+    );
+    assert_eq!(
+        store
+            .check_and_store_paid(&second, &[1; 32], &sender, &message)
+            .await
+            .unwrap(),
+        PaidReplay::PaymentReused
+    );
+    assert!(
+        !store.has_nonce(&second).await.unwrap(),
+        "rejected proof persisted a fresh nonce"
+    );
+    assert_eq!(
+        store
+            .check_and_store_paid(&first, &[2; 32], &sender, &message)
+            .await
+            .unwrap(),
+        PaidReplay::NonceReused
+    );
     drop(store);
     let store = Arc::new(SqliteStorage::open(&url).await.unwrap());
-    assert_eq!(store.check_and_store_paid(&second, &[2; 32], &sender, &message).await.unwrap(), PaidReplay::Accepted, "nonce rejection must not consume the new payment");
+    assert_eq!(
+        store
+            .check_and_store_paid(&second, &[2; 32], &sender, &message)
+            .await
+            .unwrap(),
+        PaidReplay::Accepted,
+        "nonce rejection must not consume the new payment"
+    );
     let mut attempts = tokio::task::JoinSet::new();
     for n in 3u8..23 {
         let store = store.clone();
-        attempts.spawn(async move { store.check_and_store_paid(&Nonce::from_bytes([n; 24]), &[3; 32], &sender, &message).await.unwrap() });
+        attempts.spawn(async move {
+            store
+                .check_and_store_paid(&Nonce::from_bytes([n; 24]), &[3; 32], &sender, &message)
+                .await
+                .unwrap()
+        });
     }
     let mut results = Vec::new();
-    while let Some(result) = attempts.join_next().await { results.push(result.unwrap()); }
-    assert_eq!(results.iter().filter(|r| **r == PaidReplay::Accepted).count(), 1);
-    assert_eq!(results.iter().filter(|r| **r == PaidReplay::PaymentReused).count(), 19);
+    while let Some(result) = attempts.join_next().await {
+        results.push(result.unwrap());
+    }
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| **r == PaidReplay::Accepted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| **r == PaidReplay::PaymentReused)
+            .count(),
+        19
+    );
 }

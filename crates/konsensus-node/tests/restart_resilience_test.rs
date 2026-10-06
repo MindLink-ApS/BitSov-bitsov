@@ -50,7 +50,7 @@ fn make_transport(identity: &Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Arc<N
 fn make_envelope(identity: &NodeIdentity, recipient: NodeId, ciphertext: Vec<u8>) -> UkmEnvelope {
     let preimage = rand::random::<[u8; 32]>();
     let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
-    let proof = PaymentProof::new(payment_hash, preimage, 100);
+    let proof = PaymentProof::new(payment_hash, preimage, 1_000);
 
     let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
         0, // KIND_CHAT
@@ -92,7 +92,9 @@ async fn run_resilient_session_handler(
                     };
                     let _ = transport.send_frame(&peer_id, &frame).await;
                 }
-                ControlEvent::PrekeyOffer { peer_id, bundle, .. } => {
+                ControlEvent::PrekeyOffer {
+                    peer_id, bundle, ..
+                } => {
                     if our_node_id.as_bytes() >= peer_id.as_bytes() {
                         continue; // Not the initiator
                     }
@@ -102,7 +104,10 @@ async fn run_resilient_session_handler(
                     }
                     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
                         serde_json::from_value(bundle).unwrap();
-                    match session_manager.initiate_session(&peer_id, &peer_bundle).await {
+                    match session_manager
+                        .initiate_session(&peer_id, &peer_bundle)
+                        .await
+                    {
                         Ok(init_data) => {
                             let init_json = serde_json::to_value(&init_data).unwrap();
                             let frame = Frame::SessionInit {
@@ -113,7 +118,9 @@ async fn run_resilient_session_handler(
                         Err(e) => eprintln!("X3DH initiation failed: {e}"),
                     }
                 }
-                ControlEvent::SessionInit { peer_id, init_data, .. } => {
+                ControlEvent::SessionInit {
+                    peer_id, init_data, ..
+                } => {
                     // Replace stale session if one exists (restart recovery)
                     if session_manager.has_session(&peer_id).await {
                         session_manager.remove_session(&peer_id).await;
@@ -137,7 +144,9 @@ async fn run_resilient_session_handler(
                         let _ = transport.send_frame(&peer_id, &frame).await;
                     }
                 }
-                ControlEvent::RatchetInit { peer_id, payload, .. } => {
+                ControlEvent::RatchetInit {
+                    peer_id, payload, ..
+                } => {
                     if let Ok(ratchet_msg) = ratchet_message_from_bytes(&payload) {
                         let _ = session_manager.decrypt(&peer_id, &ratchet_msg).await;
                     }
@@ -184,12 +193,8 @@ async fn session_recovers_after_node_restart() {
         alice_id,
     )
     .await;
-    run_resilient_session_handler(
-        Arc::clone(&transport_bob),
-        Arc::clone(&session_bob),
-        bob_id,
-    )
-    .await;
+    run_resilient_session_handler(Arc::clone(&transport_bob), Arc::clone(&session_bob), bob_id)
+        .await;
 
     sleep(Duration::from_millis(100)).await;
 
@@ -288,7 +293,8 @@ async fn session_recovers_after_node_restart() {
         &nonce_store,
         &pricing,
         Some(&whitelist),
-        None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+        None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+        0.0,
         None,
     )
     .await
@@ -343,16 +349,24 @@ impl InMemoryNonceStore {
 #[async_trait::async_trait]
 impl konsensus_core::gate::NonceStore for InMemoryNonceStore {
     async fn check_and_store_paid(
-        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
-        _sender: &konsensus_core::NodeId, _message_id: &konsensus_core::MessageId,
+        &self,
+        nonce: &konsensus_core::Nonce,
+        payment_hash: &[u8; 32],
+        _sender: &konsensus_core::NodeId,
+        _message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
         use konsensus_core::gate::PaidReplay;
         let mut nonces = self.seen.lock().await;
         let mut payments = self.seen_payment_hashes.lock().await;
         let key = nonce.as_bytes().to_vec();
-        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
-        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
-        nonces.insert(key); payments.insert(*payment_hash);
+        if nonces.contains(&key) {
+            return Ok(PaidReplay::NonceReused);
+        }
+        if payments.contains(payment_hash) {
+            return Ok(PaidReplay::PaymentReused);
+        }
+        nonces.insert(key);
+        payments.insert(*payment_hash);
         Ok(PaidReplay::Accepted)
     }
 

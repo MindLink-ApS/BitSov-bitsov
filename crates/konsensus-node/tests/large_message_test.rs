@@ -50,7 +50,7 @@ fn make_transport(identity: &Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Arc<N
 fn make_envelope(identity: &NodeIdentity, recipient: NodeId, ciphertext: Vec<u8>) -> UkmEnvelope {
     let preimage = rand::random::<[u8; 32]>();
     let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
-    let proof = PaymentProof::new(payment_hash, preimage, 100);
+    let proof = PaymentProof::new(payment_hash, preimage, 1_000);
 
     let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
         0, // KIND_CHAT
@@ -92,10 +92,14 @@ async fn run_session_handler(
                 konsensus_message::ControlEvent::PeerConnected { peer_id, .. } => {
                     let bundle = session_manager.prekey_bundle().await;
                     let bundle_json = serde_json::to_value(&bundle).unwrap();
-                    let frame = konsensus_message::Frame::PrekeyOffer { bundle: bundle_json };
+                    let frame = konsensus_message::Frame::PrekeyOffer {
+                        bundle: bundle_json,
+                    };
                     let _ = transport.send_frame(&peer_id, &frame).await;
                 }
-                konsensus_message::ControlEvent::PrekeyOffer { peer_id, bundle, .. } => {
+                konsensus_message::ControlEvent::PrekeyOffer {
+                    peer_id, bundle, ..
+                } => {
                     if our_node_id.as_bytes() >= peer_id.as_bytes() {
                         continue;
                     }
@@ -104,17 +108,23 @@ async fn run_session_handler(
                     }
                     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
                         serde_json::from_value(bundle).unwrap();
-                    match session_manager.initiate_session(&peer_id, &peer_bundle).await {
+                    match session_manager
+                        .initiate_session(&peer_id, &peer_bundle)
+                        .await
+                    {
                         Ok(init_data) => {
                             let init_json = serde_json::to_value(&init_data).unwrap();
-                            let frame =
-                                konsensus_message::Frame::SessionInit { init_data: init_json };
+                            let frame = konsensus_message::Frame::SessionInit {
+                                init_data: init_json,
+                            };
                             let _ = transport.send_frame(&peer_id, &frame).await;
                         }
                         Err(e) => eprintln!("X3DH initiation failed: {e}"),
                     }
                 }
-                konsensus_message::ControlEvent::SessionInit { peer_id, init_data, .. } => {
+                konsensus_message::ControlEvent::SessionInit {
+                    peer_id, init_data, ..
+                } => {
                     if session_manager.has_session(&peer_id).await {
                         continue;
                     }
@@ -137,7 +147,9 @@ async fn run_session_handler(
                         let _ = transport.send_frame(&peer_id, &frame).await;
                     }
                 }
-                konsensus_message::ControlEvent::RatchetInit { peer_id, payload, .. } => {
+                konsensus_message::ControlEvent::RatchetInit {
+                    peer_id, payload, ..
+                } => {
                     if let Ok(ratchet_msg) = ratchet_message_from_bytes(&payload) {
                         let _ = session_manager.decrypt(&peer_id, &ratchet_msg).await;
                     }
@@ -165,16 +177,24 @@ impl InMemoryNonceStore {
 #[async_trait::async_trait]
 impl konsensus_core::gate::NonceStore for InMemoryNonceStore {
     async fn check_and_store_paid(
-        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
-        _sender: &konsensus_core::NodeId, _message_id: &konsensus_core::MessageId,
+        &self,
+        nonce: &konsensus_core::Nonce,
+        payment_hash: &[u8; 32],
+        _sender: &konsensus_core::NodeId,
+        _message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
         use konsensus_core::gate::PaidReplay;
         let mut nonces = self.seen.lock().await;
         let mut payments = self.seen_payment_hashes.lock().await;
         let key = nonce.as_bytes().to_vec();
-        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
-        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
-        nonces.insert(key); payments.insert(*payment_hash);
+        if nonces.contains(&key) {
+            return Ok(PaidReplay::NonceReused);
+        }
+        if payments.contains(payment_hash) {
+            return Ok(PaidReplay::PaymentReused);
+        }
+        nonces.insert(key);
+        payments.insert(*payment_hash);
         Ok(PaidReplay::Accepted)
     }
 
@@ -216,12 +236,11 @@ async fn send_and_verify(p: &SendVerifyParams<'_>) {
     let label = p.label;
 
     // Generate deterministic test payload
-    let plaintext: Vec<u8> = (0..p.payload_size)
-        .map(|i| (i % 256) as u8)
-        .collect();
+    let plaintext: Vec<u8> = (0..p.payload_size).map(|i| (i % 256) as u8).collect();
 
     // Encrypt with Double Ratchet
-    let ratchet_msg = p.session_sender
+    let ratchet_msg = p
+        .session_sender
         .encrypt(p.receiver_id, &plaintext)
         .await
         .unwrap_or_else(|e| panic!("{label}: encrypt failed: {e}"));
@@ -262,7 +281,8 @@ async fn send_and_verify(p: &SendVerifyParams<'_>) {
         &nonce_store,
         &pricing,
         Some(&whitelist),
-        None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+        None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+        0.0,
         None,
     )
     .await
@@ -271,7 +291,8 @@ async fn send_and_verify(p: &SendVerifyParams<'_>) {
     // Decrypt
     let ratchet_msg_received = ratchet_message_from_bytes(&received.ciphertext)
         .unwrap_or_else(|e| panic!("{label}: ratchet parse failed: {e}"));
-    let decrypted = p.session_receiver
+    let decrypted = p
+        .session_receiver
         .decrypt(p.sender_id, &ratchet_msg_received)
         .await
         .unwrap_or_else(|e| panic!("{label}: decrypt failed: {e}"));
@@ -279,7 +300,8 @@ async fn send_and_verify(p: &SendVerifyParams<'_>) {
     assert_eq!(
         decrypted.len(),
         plaintext.len(),
-        "{label}: decrypted length mismatch (expected {})", p.payload_size
+        "{label}: decrypted length mismatch (expected {})",
+        p.payload_size
     );
     assert_eq!(
         decrypted, plaintext,
@@ -314,12 +336,7 @@ async fn large_messages_survive_full_e2ee_pipeline() {
         alice_id,
     )
     .await;
-    run_session_handler(
-        Arc::clone(&transport_bob),
-        Arc::clone(&session_bob),
-        bob_id,
-    )
-    .await;
+    run_session_handler(Arc::clone(&transport_bob), Arc::clone(&session_bob), bob_id).await;
 
     sleep(Duration::from_millis(100)).await;
     transport_alice
@@ -333,59 +350,101 @@ async fn large_messages_survive_full_e2ee_pipeline() {
 
     // ── Test 1: Small message (1 byte — boundary) ────────────────────────
     send_and_verify(&SendVerifyParams {
-        session_sender: &session_alice, session_receiver: &session_bob,
-        transport_sender: &transport_alice, transport_receiver: &transport_bob,
-        id_sender: &id_alice, sender_id: &alice_id, receiver_id: &bob_id,
-        payload_size: 1, label: "1-byte",
-    }).await;
+        session_sender: &session_alice,
+        session_receiver: &session_bob,
+        transport_sender: &transport_alice,
+        transport_receiver: &transport_bob,
+        id_sender: &id_alice,
+        sender_id: &alice_id,
+        receiver_id: &bob_id,
+        payload_size: 1,
+        label: "1-byte",
+    })
+    .await;
 
     // ── Test 2: Exactly 65000 bytes (Noise chunk boundary) ───────────────
     send_and_verify(&SendVerifyParams {
-        session_sender: &session_alice, session_receiver: &session_bob,
-        transport_sender: &transport_alice, transport_receiver: &transport_bob,
-        id_sender: &id_alice, sender_id: &alice_id, receiver_id: &bob_id,
-        payload_size: 65_000, label: "65000-byte (chunk boundary)",
-    }).await;
+        session_sender: &session_alice,
+        session_receiver: &session_bob,
+        transport_sender: &transport_alice,
+        transport_receiver: &transport_bob,
+        id_sender: &id_alice,
+        sender_id: &alice_id,
+        receiver_id: &bob_id,
+        payload_size: 65_000,
+        label: "65000-byte (chunk boundary)",
+    })
+    .await;
 
     // ── Test 3: Just over chunk boundary (65520 bytes) ───────────────────
     send_and_verify(&SendVerifyParams {
-        session_sender: &session_alice, session_receiver: &session_bob,
-        transport_sender: &transport_alice, transport_receiver: &transport_bob,
-        id_sender: &id_alice, sender_id: &alice_id, receiver_id: &bob_id,
-        payload_size: 65_520, label: "65520-byte (over boundary)",
-    }).await;
+        session_sender: &session_alice,
+        session_receiver: &session_bob,
+        transport_sender: &transport_alice,
+        transport_receiver: &transport_bob,
+        id_sender: &id_alice,
+        sender_id: &alice_id,
+        receiver_id: &bob_id,
+        payload_size: 65_520,
+        label: "65520-byte (over boundary)",
+    })
+    .await;
 
     // ── Test 4: 100 KB — requires multiple chunks ────────────────────────
     send_and_verify(&SendVerifyParams {
-        session_sender: &session_alice, session_receiver: &session_bob,
-        transport_sender: &transport_alice, transport_receiver: &transport_bob,
-        id_sender: &id_alice, sender_id: &alice_id, receiver_id: &bob_id,
-        payload_size: 100_000, label: "100KB",
-    }).await;
+        session_sender: &session_alice,
+        session_receiver: &session_bob,
+        transport_sender: &transport_alice,
+        transport_receiver: &transport_bob,
+        id_sender: &id_alice,
+        sender_id: &alice_id,
+        receiver_id: &bob_id,
+        payload_size: 100_000,
+        label: "100KB",
+    })
+    .await;
 
     // ── Test 5: 256 KB ───────────────────────────────────────────────────
     send_and_verify(&SendVerifyParams {
-        session_sender: &session_alice, session_receiver: &session_bob,
-        transport_sender: &transport_alice, transport_receiver: &transport_bob,
-        id_sender: &id_alice, sender_id: &alice_id, receiver_id: &bob_id,
-        payload_size: 256_000, label: "256KB",
-    }).await;
+        session_sender: &session_alice,
+        session_receiver: &session_bob,
+        transport_sender: &transport_alice,
+        transport_receiver: &transport_bob,
+        id_sender: &id_alice,
+        sender_id: &alice_id,
+        receiver_id: &bob_id,
+        payload_size: 256_000,
+        label: "256KB",
+    })
+    .await;
 
     // ── Test 6: 1 MB — the big one ──────────────────────────────────────
     send_and_verify(&SendVerifyParams {
-        session_sender: &session_alice, session_receiver: &session_bob,
-        transport_sender: &transport_alice, transport_receiver: &transport_bob,
-        id_sender: &id_alice, sender_id: &alice_id, receiver_id: &bob_id,
-        payload_size: 1_000_000, label: "1MB",
-    }).await;
+        session_sender: &session_alice,
+        session_receiver: &session_bob,
+        transport_sender: &transport_alice,
+        transport_receiver: &transport_bob,
+        id_sender: &id_alice,
+        sender_id: &alice_id,
+        receiver_id: &bob_id,
+        payload_size: 1_000_000,
+        label: "1MB",
+    })
+    .await;
 
     // ── Test 7: Bidirectional — Bob sends large message back to Alice ────
     send_and_verify(&SendVerifyParams {
-        session_sender: &session_bob, session_receiver: &session_alice,
-        transport_sender: &transport_bob, transport_receiver: &transport_alice,
-        id_sender: &id_bob, sender_id: &bob_id, receiver_id: &alice_id,
-        payload_size: 200_000, label: "200KB (Bob→Alice)",
-    }).await;
+        session_sender: &session_bob,
+        session_receiver: &session_alice,
+        transport_sender: &transport_bob,
+        transport_receiver: &transport_alice,
+        id_sender: &id_bob,
+        sender_id: &bob_id,
+        receiver_id: &alice_id,
+        payload_size: 200_000,
+        label: "200KB (Bob→Alice)",
+    })
+    .await;
 
     transport_alice.shutdown();
     transport_bob.shutdown();

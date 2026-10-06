@@ -24,9 +24,11 @@ use konsensus_message::wire::{Capability, SovereigntyTier};
 use konsensus_message::{NoiseTransport, TransportConfig};
 use konsensus_pricing::StaticPricingConfig;
 
-const MNEMONIC_ALICE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+const MNEMONIC_ALICE: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const MNEMONIC_BOB: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
-const MNEMONIC_CAROL: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+const MNEMONIC_CAROL: &str =
+    "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
 fn make_identity(mnemonic: &str) -> Arc<NodeIdentity> {
     Arc::new(NodeIdentity::from_mnemonic(mnemonic, "").expect("valid mnemonic"))
@@ -47,14 +49,10 @@ fn make_transport(identity: &Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Arc<N
 }
 
 /// Build and sign a UKM envelope with valid payment proof.
-fn make_envelope(
-    identity: &NodeIdentity,
-    recipient: NodeId,
-    ciphertext: Vec<u8>,
-) -> UkmEnvelope {
+fn make_envelope(identity: &NodeIdentity, recipient: NodeId, ciphertext: Vec<u8>) -> UkmEnvelope {
     let preimage = rand::random::<[u8; 32]>();
     let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
-    let proof = PaymentProof::new(payment_hash, preimage, 100);
+    let proof = PaymentProof::new(payment_hash, preimage, 1_000);
 
     let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
         0, // KIND_CHAT
@@ -104,10 +102,14 @@ async fn run_session_handler(
                 konsensus_message::ControlEvent::PeerConnected { peer_id, .. } => {
                     let bundle = session_manager.prekey_bundle().await;
                     let bundle_json = serde_json::to_value(&bundle).unwrap();
-                    let frame = konsensus_message::Frame::PrekeyOffer { bundle: bundle_json };
+                    let frame = konsensus_message::Frame::PrekeyOffer {
+                        bundle: bundle_json,
+                    };
                     let _ = transport.send_frame(&peer_id, &frame).await;
                 }
-                konsensus_message::ControlEvent::PrekeyOffer { peer_id, bundle, .. } => {
+                konsensus_message::ControlEvent::PrekeyOffer {
+                    peer_id, bundle, ..
+                } => {
                     if our_node_id.as_bytes() >= peer_id.as_bytes() {
                         continue; // Not the initiator
                     }
@@ -116,16 +118,23 @@ async fn run_session_handler(
                     }
                     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
                         serde_json::from_value(bundle).unwrap();
-                    match session_manager.initiate_session(&peer_id, &peer_bundle).await {
+                    match session_manager
+                        .initiate_session(&peer_id, &peer_bundle)
+                        .await
+                    {
                         Ok(init_data) => {
                             let init_json = serde_json::to_value(&init_data).unwrap();
-                            let frame = konsensus_message::Frame::SessionInit { init_data: init_json };
+                            let frame = konsensus_message::Frame::SessionInit {
+                                init_data: init_json,
+                            };
                             let _ = transport.send_frame(&peer_id, &frame).await;
                         }
                         Err(e) => eprintln!("X3DH initiation failed: {e}"),
                     }
                 }
-                konsensus_message::ControlEvent::SessionInit { peer_id, init_data, .. } => {
+                konsensus_message::ControlEvent::SessionInit {
+                    peer_id, init_data, ..
+                } => {
                     if session_manager.has_session(&peer_id).await {
                         continue;
                     }
@@ -142,15 +151,20 @@ async fn run_session_handler(
                 konsensus_message::ControlEvent::SessionAck { peer_id, .. } => {
                     // Session established (initiator side) — send ratchet init
                     // so the acceptor can initialize their sending chain.
-                    if let Ok(ratchet_msg) = session_manager.encrypt(&peer_id, b"ratchet-init").await {
+                    if let Ok(ratchet_msg) =
+                        session_manager.encrypt(&peer_id, b"ratchet-init").await
+                    {
                         let payload = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
                         let frame = konsensus_message::Frame::RatchetInit { payload };
                         let _ = transport.send_frame(&peer_id, &frame).await;
                     }
                 }
-                konsensus_message::ControlEvent::RatchetInit { peer_id, payload, .. } => {
+                konsensus_message::ControlEvent::RatchetInit {
+                    peer_id, payload, ..
+                } => {
                     // Acceptor decrypts ratchet init → initializes sending chain
-                    if let Ok(ratchet_msg) = konsensus_crypto::ratchet_message_from_bytes(&payload) {
+                    if let Ok(ratchet_msg) = konsensus_crypto::ratchet_message_from_bytes(&payload)
+                    {
                         let _ = session_manager.decrypt(&peer_id, &ratchet_msg).await;
                     }
                 }
@@ -198,26 +212,63 @@ async fn three_nodes_federate_and_exchange_encrypted_messages() {
     let session_carol = Arc::new(SessionManager::new(Arc::clone(&id_carol)));
 
     // Start session handlers (replicate main.rs control event handling)
-    run_session_handler(Arc::clone(&transport_alice), Arc::clone(&session_alice), alice_id).await;
+    run_session_handler(
+        Arc::clone(&transport_alice),
+        Arc::clone(&session_alice),
+        alice_id,
+    )
+    .await;
     run_session_handler(Arc::clone(&transport_bob), Arc::clone(&session_bob), bob_id).await;
-    run_session_handler(Arc::clone(&transport_carol), Arc::clone(&session_carol), carol_id).await;
+    run_session_handler(
+        Arc::clone(&transport_carol),
+        Arc::clone(&session_carol),
+        carol_id,
+    )
+    .await;
 
     sleep(Duration::from_millis(100)).await;
 
     // ── Connect: Alice→Bob, Alice→Carol, Bob→Carol ────────────────────
-    transport_alice.connect(&bob_id, &addr_bob.to_string()).await.unwrap();
-    transport_alice.connect(&carol_id, &addr_carol.to_string()).await.unwrap();
-    transport_bob.connect(&carol_id, &addr_carol.to_string()).await.unwrap();
+    transport_alice
+        .connect(&bob_id, &addr_bob.to_string())
+        .await
+        .unwrap();
+    transport_alice
+        .connect(&carol_id, &addr_carol.to_string())
+        .await
+        .unwrap();
+    transport_bob
+        .connect(&carol_id, &addr_carol.to_string())
+        .await
+        .unwrap();
 
     // Wait for connections to establish
     sleep(Duration::from_millis(500)).await;
 
-    assert!(transport_alice.is_connected(&bob_id).await, "Alice should be connected to Bob");
-    assert!(transport_alice.is_connected(&carol_id).await, "Alice should be connected to Carol");
-    assert!(transport_bob.is_connected(&alice_id).await, "Bob should be connected to Alice");
-    assert!(transport_bob.is_connected(&carol_id).await, "Bob should be connected to Carol");
-    assert!(transport_carol.is_connected(&alice_id).await, "Carol should be connected to Alice");
-    assert!(transport_carol.is_connected(&bob_id).await, "Carol should be connected to Bob");
+    assert!(
+        transport_alice.is_connected(&bob_id).await,
+        "Alice should be connected to Bob"
+    );
+    assert!(
+        transport_alice.is_connected(&carol_id).await,
+        "Alice should be connected to Carol"
+    );
+    assert!(
+        transport_bob.is_connected(&alice_id).await,
+        "Bob should be connected to Alice"
+    );
+    assert!(
+        transport_bob.is_connected(&carol_id).await,
+        "Bob should be connected to Carol"
+    );
+    assert!(
+        transport_carol.is_connected(&alice_id).await,
+        "Carol should be connected to Alice"
+    );
+    assert!(
+        transport_carol.is_connected(&bob_id).await,
+        "Carol should be connected to Bob"
+    );
 
     // ── Wait for E2EE sessions to auto-establish ─────────────────────
     wait_for_session(&session_alice, &bob_id, "Alice→Bob").await;
@@ -259,14 +310,25 @@ async fn three_nodes_federate_and_exchange_encrypted_messages() {
     let nonce_store = InMemoryNonceStore::new();
     let pricing = konsensus_pricing::StaticPricingEngine::new(StaticPricingConfig::default());
 
-    gate.verify(&received, &nonce_store, &pricing, Some(&whitelist), None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0, None)
-        .await
-        .expect("payment gate should pass");
+    gate.verify(
+        &received,
+        &nonce_store,
+        &pricing,
+        Some(&whitelist),
+        None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+        0.0,
+        None,
+    )
+    .await
+    .expect("payment gate should pass");
 
     // Bob decrypts
-    let ratchet_msg_received = ratchet_message_from_bytes(&received.ciphertext)
-        .expect("should parse ratchet message");
-    let decrypted = session_bob.decrypt(&alice_id, &ratchet_msg_received).await.unwrap();
+    let ratchet_msg_received =
+        ratchet_message_from_bytes(&received.ciphertext).expect("should parse ratchet message");
+    let decrypted = session_bob
+        .decrypt(&alice_id, &ratchet_msg_received)
+        .await
+        .unwrap();
     assert_eq!(&decrypted, plaintext, "Bob should decrypt Alice's message");
 
     // ── Test 2: Bob sends encrypted message to Carol ──────────────────
@@ -287,13 +349,27 @@ async fn three_nodes_federate_and_exchange_encrypted_messages() {
 
     let whitelist_carol: HashSet<NodeId> = [alice_id, bob_id].into_iter().collect();
     let nonce_store2 = InMemoryNonceStore::new();
-    gate.verify(&received2, &nonce_store2, &pricing, Some(&whitelist_carol), None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0, None)
-        .await
-        .expect("Carol's payment gate should pass");
+    gate.verify(
+        &received2,
+        &nonce_store2,
+        &pricing,
+        Some(&whitelist_carol),
+        None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+        0.0,
+        None,
+    )
+    .await
+    .expect("Carol's payment gate should pass");
 
     let ratchet_msg_received2 = ratchet_message_from_bytes(&received2.ciphertext).unwrap();
-    let decrypted2 = session_carol.decrypt(&bob_id, &ratchet_msg_received2).await.unwrap();
-    assert_eq!(&decrypted2, plaintext2, "Carol should decrypt Bob's message");
+    let decrypted2 = session_carol
+        .decrypt(&bob_id, &ratchet_msg_received2)
+        .await
+        .unwrap();
+    assert_eq!(
+        &decrypted2, plaintext2,
+        "Carol should decrypt Bob's message"
+    );
 
     // ── Test 3: Carol sends encrypted message to Alice ────────────────
     let plaintext3 = b"Alice, Carol here. Full triangle confirmed!";
@@ -313,21 +389,47 @@ async fn three_nodes_federate_and_exchange_encrypted_messages() {
 
     let nonce_store3 = InMemoryNonceStore::new();
     let whitelist_alice: HashSet<NodeId> = [bob_id, carol_id].into_iter().collect();
-    gate.verify(&received3, &nonce_store3, &pricing, Some(&whitelist_alice), None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0, None)
-        .await
-        .expect("Alice's payment gate should pass");
+    gate.verify(
+        &received3,
+        &nonce_store3,
+        &pricing,
+        Some(&whitelist_alice),
+        None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+        0.0,
+        None,
+    )
+    .await
+    .expect("Alice's payment gate should pass");
 
     let ratchet_msg_received3 = ratchet_message_from_bytes(&received3.ciphertext).unwrap();
-    let decrypted3 = session_alice.decrypt(&carol_id, &ratchet_msg_received3).await.unwrap();
-    assert_eq!(&decrypted3, plaintext3, "Alice should decrypt Carol's message");
+    let decrypted3 = session_alice
+        .decrypt(&carol_id, &ratchet_msg_received3)
+        .await
+        .unwrap();
+    assert_eq!(
+        &decrypted3, plaintext3,
+        "Alice should decrypt Carol's message"
+    );
 
     // ── Test 4: Verify payment gate rejects non-whitelisted sender ────
     // Carol's envelope but verified against a whitelist that excludes Carol
     let nonce_store4 = InMemoryNonceStore::new();
     let restricted_whitelist: HashSet<NodeId> = [bob_id].into_iter().collect(); // No Carol
-    let result = gate.verify(&received3, &nonce_store4, &pricing, Some(&restricted_whitelist), None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0, None)
+    let result = gate
+        .verify(
+            &received3,
+            &nonce_store4,
+            &pricing,
+            Some(&restricted_whitelist),
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
+            None,
+        )
         .await;
-    assert!(result.is_err(), "should reject message from non-whitelisted sender");
+    assert!(
+        result.is_err(),
+        "should reject message from non-whitelisted sender"
+    );
 
     // ── Cleanup ────────────────────────────────────────────────────────
     transport_alice.shutdown();
@@ -353,16 +455,24 @@ impl InMemoryNonceStore {
 #[async_trait::async_trait]
 impl konsensus_core::gate::NonceStore for InMemoryNonceStore {
     async fn check_and_store_paid(
-        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
-        _sender: &konsensus_core::NodeId, _message_id: &konsensus_core::MessageId,
+        &self,
+        nonce: &konsensus_core::Nonce,
+        payment_hash: &[u8; 32],
+        _sender: &konsensus_core::NodeId,
+        _message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
         use konsensus_core::gate::PaidReplay;
         let mut nonces = self.seen.lock().await;
         let mut payments = self.seen_payment_hashes.lock().await;
         let key = nonce.as_bytes().to_vec();
-        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
-        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
-        nonces.insert(key); payments.insert(*payment_hash);
+        if nonces.contains(&key) {
+            return Ok(PaidReplay::NonceReused);
+        }
+        if payments.contains(payment_hash) {
+            return Ok(PaidReplay::PaymentReused);
+        }
+        nonces.insert(key);
+        payments.insert(*payment_hash);
         Ok(PaidReplay::Accepted)
     }
 

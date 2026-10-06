@@ -25,8 +25,7 @@ use konsensus_pricing::StaticPricingConfig;
 
 const MNEMONIC_ALPHA: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-const MNEMONIC_BETA: &str =
-    "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+const MNEMONIC_BETA: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
 
 const MSG_COUNT: usize = 20;
 
@@ -49,14 +48,10 @@ fn make_transport(identity: &Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Arc<N
     Arc::new(NoiseTransport::new(Arc::clone(identity), config))
 }
 
-fn make_envelope(
-    identity: &NodeIdentity,
-    recipient: NodeId,
-    ciphertext: Vec<u8>,
-) -> UkmEnvelope {
+fn make_envelope(identity: &NodeIdentity, recipient: NodeId, ciphertext: Vec<u8>) -> UkmEnvelope {
     let preimage = rand::random::<[u8; 32]>();
     let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
-    let proof = PaymentProof::new(payment_hash, preimage, 100);
+    let proof = PaymentProof::new(payment_hash, preimage, 1_000);
 
     let mut envelope = konsensus_core::UkmEnvelopeBuilder::new(
         0, // KIND_CHAT
@@ -98,10 +93,14 @@ async fn run_session_handler(
                 konsensus_message::ControlEvent::PeerConnected { peer_id, .. } => {
                     let bundle = session_manager.prekey_bundle().await;
                     let bundle_json = serde_json::to_value(&bundle).unwrap();
-                    let frame = konsensus_message::Frame::PrekeyOffer { bundle: bundle_json };
+                    let frame = konsensus_message::Frame::PrekeyOffer {
+                        bundle: bundle_json,
+                    };
                     let _ = transport.send_frame(&peer_id, &frame).await;
                 }
-                konsensus_message::ControlEvent::PrekeyOffer { peer_id, bundle, .. } => {
+                konsensus_message::ControlEvent::PrekeyOffer {
+                    peer_id, bundle, ..
+                } => {
                     if our_node_id.as_bytes() >= peer_id.as_bytes() {
                         continue;
                     }
@@ -110,17 +109,23 @@ async fn run_session_handler(
                     }
                     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
                         serde_json::from_value(bundle).unwrap();
-                    match session_manager.initiate_session(&peer_id, &peer_bundle).await {
+                    match session_manager
+                        .initiate_session(&peer_id, &peer_bundle)
+                        .await
+                    {
                         Ok(init_data) => {
                             let init_json = serde_json::to_value(&init_data).unwrap();
-                            let frame =
-                                konsensus_message::Frame::SessionInit { init_data: init_json };
+                            let frame = konsensus_message::Frame::SessionInit {
+                                init_data: init_json,
+                            };
                             let _ = transport.send_frame(&peer_id, &frame).await;
                         }
                         Err(e) => eprintln!("X3DH initiation failed: {e}"),
                     }
                 }
-                konsensus_message::ControlEvent::SessionInit { peer_id, init_data, .. } => {
+                konsensus_message::ControlEvent::SessionInit {
+                    peer_id, init_data, ..
+                } => {
                     if session_manager.has_session(&peer_id).await {
                         continue;
                     }
@@ -143,7 +148,9 @@ async fn run_session_handler(
                         let _ = transport.send_frame(&peer_id, &frame).await;
                     }
                 }
-                konsensus_message::ControlEvent::RatchetInit { peer_id, payload, .. } => {
+                konsensus_message::ControlEvent::RatchetInit {
+                    peer_id, payload, ..
+                } => {
                     if let Ok(ratchet_msg) = konsensus_crypto::ratchet_message_from_bytes(&payload)
                     {
                         let _ = session_manager.decrypt(&peer_id, &ratchet_msg).await;
@@ -174,16 +181,24 @@ impl InMemoryNonceStore {
 #[async_trait::async_trait]
 impl konsensus_core::gate::NonceStore for InMemoryNonceStore {
     async fn check_and_store_paid(
-        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
-        _sender: &konsensus_core::NodeId, _message_id: &konsensus_core::MessageId,
+        &self,
+        nonce: &konsensus_core::Nonce,
+        payment_hash: &[u8; 32],
+        _sender: &konsensus_core::NodeId,
+        _message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
         use konsensus_core::gate::PaidReplay;
         let mut nonces = self.seen.lock().await;
         let mut payments = self.seen_payment_hashes.lock().await;
         let key = nonce.as_bytes().to_vec();
-        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
-        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
-        nonces.insert(key); payments.insert(*payment_hash);
+        if nonces.contains(&key) {
+            return Ok(PaidReplay::NonceReused);
+        }
+        if payments.contains(payment_hash) {
+            return Ok(PaidReplay::PaymentReused);
+        }
+        nonces.insert(key);
+        payments.insert(*payment_hash);
         Ok(PaidReplay::Accepted)
     }
 
@@ -250,17 +265,36 @@ async fn f7_stress_20_messages_alternating() {
     let session_alpha = Arc::new(SessionManager::new(Arc::clone(&id_alpha)));
     let session_beta = Arc::new(SessionManager::new(Arc::clone(&id_beta)));
 
-    run_session_handler(Arc::clone(&transport_alpha), Arc::clone(&session_alpha), alpha_id).await;
-    run_session_handler(Arc::clone(&transport_beta), Arc::clone(&session_beta), beta_id).await;
+    run_session_handler(
+        Arc::clone(&transport_alpha),
+        Arc::clone(&session_alpha),
+        alpha_id,
+    )
+    .await;
+    run_session_handler(
+        Arc::clone(&transport_beta),
+        Arc::clone(&session_beta),
+        beta_id,
+    )
+    .await;
 
     sleep(Duration::from_millis(100)).await;
 
     // ── Connect alpha → beta ──────────────────────────────────────────────
-    transport_alpha.connect(&beta_id, &addr_beta.to_string()).await.unwrap();
+    transport_alpha
+        .connect(&beta_id, &addr_beta.to_string())
+        .await
+        .unwrap();
     sleep(Duration::from_millis(500)).await;
 
-    assert!(transport_alpha.is_connected(&beta_id).await, "alpha→beta connected");
-    assert!(transport_beta.is_connected(&alpha_id).await, "beta→alpha connected");
+    assert!(
+        transport_alpha.is_connected(&beta_id).await,
+        "alpha→beta connected"
+    );
+    assert!(
+        transport_beta.is_connected(&alpha_id).await,
+        "beta→alpha connected"
+    );
 
     // ── Wait for E2EE sessions ────────────────────────────────────────────
     wait_for_session(&session_alpha, &beta_id, "alpha→beta session").await;
@@ -270,7 +304,7 @@ async fn f7_stress_20_messages_alternating() {
     let gate = PaymentGate::new();
     let pricing = konsensus_pricing::StaticPricingEngine::new(StaticPricingConfig::default());
     let nonce_alpha = InMemoryNonceStore::new(); // alpha receives from beta
-    let nonce_beta = InMemoryNonceStore::new();  // beta receives from alpha
+    let nonce_beta = InMemoryNonceStore::new(); // beta receives from alpha
     let whitelist_alpha: HashSet<NodeId> = [beta_id].into_iter().collect();
     let whitelist_beta: HashSet<NodeId> = [alpha_id].into_iter().collect();
 
@@ -282,43 +316,60 @@ async fn f7_stress_20_messages_alternating() {
 
     for i in 0..MSG_COUNT {
         let alpha_to_beta = i % 2 == 0; // even → alpha→beta, odd → beta→alpha
-        let direction = if alpha_to_beta { "alpha→beta" } else { "beta→alpha" };
+        let direction = if alpha_to_beta {
+            "alpha→beta"
+        } else {
+            "beta→alpha"
+        };
         let plaintext = format!("F7 stress msg #{i:02} direction={direction}");
         let plaintext_bytes = plaintext.as_bytes();
 
         let send_start = Instant::now();
 
         // Encrypt and send
-        let (envelope, receiver_transport, receiver_session, sender_id, _receiver_id, nonce_store, whitelist) =
-            if alpha_to_beta {
-                let rm = session_alpha.encrypt(&beta_id, plaintext_bytes).await.unwrap();
-                let ct = ratchet_message_to_bytes(&rm);
-                let env = make_envelope(&id_alpha, beta_id, ct);
-                transport_alpha.send(&beta_id, &env).await.unwrap();
-                (
-                    env,
-                    &transport_beta,
-                    &session_beta,
-                    alpha_id,
-                    beta_id,
-                    &nonce_beta,
-                    &whitelist_beta,
-                )
-            } else {
-                let rm = session_beta.encrypt(&alpha_id, plaintext_bytes).await.unwrap();
-                let ct = ratchet_message_to_bytes(&rm);
-                let env = make_envelope(&id_beta, alpha_id, ct);
-                transport_beta.send(&alpha_id, &env).await.unwrap();
-                (
-                    env,
-                    &transport_alpha,
-                    &session_alpha,
-                    beta_id,
-                    alpha_id,
-                    &nonce_alpha,
-                    &whitelist_alpha,
-                )
-            };
+        let (
+            envelope,
+            receiver_transport,
+            receiver_session,
+            sender_id,
+            _receiver_id,
+            nonce_store,
+            whitelist,
+        ) = if alpha_to_beta {
+            let rm = session_alpha
+                .encrypt(&beta_id, plaintext_bytes)
+                .await
+                .unwrap();
+            let ct = ratchet_message_to_bytes(&rm);
+            let env = make_envelope(&id_alpha, beta_id, ct);
+            transport_alpha.send(&beta_id, &env).await.unwrap();
+            (
+                env,
+                &transport_beta,
+                &session_beta,
+                alpha_id,
+                beta_id,
+                &nonce_beta,
+                &whitelist_beta,
+            )
+        } else {
+            let rm = session_beta
+                .encrypt(&alpha_id, plaintext_bytes)
+                .await
+                .unwrap();
+            let ct = ratchet_message_to_bytes(&rm);
+            let env = make_envelope(&id_beta, alpha_id, ct);
+            transport_beta.send(&alpha_id, &env).await.unwrap();
+            (
+                env,
+                &transport_alpha,
+                &session_alpha,
+                beta_id,
+                alpha_id,
+                &nonce_alpha,
+                &whitelist_alpha,
+            )
+        };
 
         // Receive
         let recv_result = timeout(Duration::from_secs(5), receiver_transport.recv()).await;
@@ -473,14 +524,22 @@ async fn f7_stress_20_messages_alternating() {
     let failed = timings.iter().filter(|t| !t.ok).count();
 
     let avg_msg_latency = if delivered > 0 {
-        timings.iter().filter(|t| t.ok).map(|t| t.message_latency_ms).sum::<u128>()
+        timings
+            .iter()
+            .filter(|t| t.ok)
+            .map(|t| t.message_latency_ms)
+            .sum::<u128>()
             / delivered as u128
     } else {
         0
     };
 
     let avg_payment_latency = if delivered > 0 {
-        timings.iter().filter(|t| t.ok).map(|t| t.payment_verify_ms).sum::<u128>()
+        timings
+            .iter()
+            .filter(|t| t.ok)
+            .map(|t| t.payment_verify_ms)
+            .sum::<u128>()
             / delivered as u128
     } else {
         0

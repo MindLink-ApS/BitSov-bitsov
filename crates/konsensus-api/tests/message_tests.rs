@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-
 #[tokio::test]
 async fn messages_list_empty() {
     let state = test_state();
@@ -249,7 +248,9 @@ async fn content_list_pages_disabled() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["enabled"], false);
     assert_eq!(json["pages"].as_array().unwrap().len(), 0);
@@ -288,7 +289,9 @@ async fn content_write_and_read_page() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["path"], "/hello.md");
     assert_eq!(json["title"], "Hello");
@@ -304,7 +307,9 @@ async fn content_write_and_read_page() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["path"], "/hello.md");
     assert_eq!(json["content"], "# Hello\n\nWorld");
@@ -320,7 +325,9 @@ async fn content_write_and_read_page() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["enabled"], true);
     assert_eq!(json["pages"].as_array().unwrap().len(), 1);
@@ -630,11 +637,15 @@ async fn search_finds_message_by_decrypted_plaintext() {
     let storage = Arc::new(MemStorage::new());
     let state = test_state_with_storage_and_cipher(storage);
     let auth = auth_header(&state);
-    let match_id =
-        store_test_message_with_plaintext(&state, b"aaa", "Let's meet about the QUARTERLY budget review")
-            .await;
+    let match_id = store_test_message_with_plaintext(
+        &state,
+        b"aaa",
+        "Let's meet about the QUARTERLY budget review",
+    )
+    .await;
     let _other =
-        store_test_message_with_plaintext(&state, b"bbb", "reminder: dentist appointment tomorrow").await;
+        store_test_message_with_plaintext(&state, b"bbb", "reminder: dentist appointment tomorrow")
+            .await;
 
     let app = build_router(state);
     let req = Request::builder()
@@ -651,7 +662,11 @@ async fn search_finds_message_by_decrypted_plaintext() {
     assert_eq!(arr.len(), 1, "exactly one match expected: {json}");
     assert_eq!(arr[0]["id"].as_str().unwrap(), match_id);
     assert!(
-        arr[0]["snippet"].as_str().unwrap().to_lowercase().contains("quarterly"),
+        arr[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("quarterly"),
         "snippet must contain the match: {json}"
     );
 }
@@ -711,7 +726,7 @@ async fn send_message_stores_and_returns_id() {
                 "ciphertext": hex::encode(b"encrypted-data"),
                 "payment_hash": hex::encode(hash),
                 "preimage": hex::encode(preimage),
-                "amount_msat": 10
+                "amount_msat": 1_000
             })
             .to_string(),
         ))
@@ -904,7 +919,7 @@ async fn send_message_room_recipient() {
                 "ciphertext": hex::encode(b"room-msg"),
                 "payment_hash": hex::encode(hash),
                 "preimage": hex::encode(preimage),
-                "amount_msat": 10
+                "amount_msat": 1_000
             })
             .to_string(),
         ))
@@ -989,8 +1004,7 @@ async fn content_rejects_oversized_page() {
     let resp = app.oneshot(req).await.unwrap();
     // Axum returns 413 Payload Too Large before the handler runs
     assert!(
-        resp.status() == StatusCode::BAD_REQUEST
-            || resp.status() == StatusCode::PAYLOAD_TOO_LARGE
+        resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::PAYLOAD_TOO_LARGE
     );
 }
 
@@ -1217,10 +1231,7 @@ async fn content_empty_path_rejected() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     // Either BAD_REQUEST or NOT_FOUND depending on routing
-    assert!(
-        resp.status() == StatusCode::BAD_REQUEST
-            || resp.status() == StatusCode::NOT_FOUND
-    );
+    assert!(resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1340,7 +1351,11 @@ async fn content_manifest_includes_written_pages() {
     // Write two pages
     for name in &["alpha.md", "beta.txt"] {
         let app = build_router(Arc::clone(&state));
-        let content = if name.ends_with(".md") { "# Alpha\n\nPage A." } else { "Plain text file." };
+        let content = if name.ends_with(".md") {
+            "# Alpha\n\nPage A."
+        } else {
+            "Plain text file."
+        };
         let req = Request::builder()
             .method("PUT")
             .uri(format!("/api/v1/content/pages/{name}"))
@@ -1482,7 +1497,7 @@ async fn send_message_to_room_stores_envelope() {
                 "ciphertext": hex::encode([0xbb; 64]),
                 "payment_hash": hex::encode(hash),
                 "preimage": hex::encode(preimage),
-                "amount_msat": 25
+                "amount_msat": 1_000
             })
             .to_string(),
         ))
@@ -1530,7 +1545,7 @@ async fn list_messages_with_before_param() {
                 "ciphertext": hex::encode([0xdd; 32]),
                 "payment_hash": hex::encode(hash),
                 "preimage": hex::encode(preimage),
-                "amount_msat": 10
+                "amount_msat": 1_000
             })
             .to_string(),
         ))
@@ -1672,7 +1687,9 @@ async fn reveal_mnemonic_returns_plaintext_with_reauth() {
         .unwrap();
     let chal_resp = app.clone().oneshot(chal_req).await.unwrap();
     assert_eq!(chal_resp.status(), StatusCode::OK);
-    let chal_body = axum::body::to_bytes(chal_resp.into_body(), 4096).await.unwrap();
+    let chal_body = axum::body::to_bytes(chal_resp.into_body(), 4096)
+        .await
+        .unwrap();
     let chal_json: serde_json::Value = serde_json::from_slice(&chal_body).unwrap();
     let challenge = chal_json["challenge"].as_str().unwrap().to_owned();
     let sig = state.identity.sign(challenge.as_bytes());
@@ -1728,7 +1745,7 @@ async fn list_messages_with_peer_filter() {
                 "ciphertext": hex::encode(b"convo-data"),
                 "payment_hash": hex::encode(hash),
                 "preimage": hex::encode(preimage),
-                "amount_msat": 10
+                "amount_msat": 1_000
             })
             .to_string(),
         ))
@@ -1749,7 +1766,10 @@ async fn list_messages_with_peer_filter() {
     let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let arr = json.as_array().unwrap();
-    assert!(!arr.is_empty(), "conversation should contain the sent message");
+    assert!(
+        !arr.is_empty(),
+        "conversation should contain the sent message"
+    );
 }
 
 #[tokio::test]
@@ -1855,9 +1875,9 @@ async fn compose_happy_path_keysend() {
     let invoice_requests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // Step 1: Set up E2EE session.
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
-        Arc::new(test_identity()),
-    ));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
     let peer_id = setup_e2ee_session(&session_manager).await;
     let peer_id_for_transport = peer_id;
 
@@ -1947,8 +1967,14 @@ async fn compose_happy_path_keysend() {
 
     // Verify response fields.
     assert!(json["message_id"].is_string(), "should return message_id");
-    assert_eq!(json["delivered"], true, "should be delivered (peer connected)");
-    assert!(json["amount_msat"].as_u64().unwrap() > 0, "should have paid");
+    assert_eq!(
+        json["delivered"], true,
+        "should be delivered (peer connected)"
+    );
+    assert!(
+        json["amount_msat"].as_u64().unwrap() > 0,
+        "should have paid"
+    );
 
     // Verify envelope was delivered through transport.
     let message_id = {
@@ -1960,8 +1986,14 @@ async fn compose_happy_path_keysend() {
         let envelope = &sent[0].1;
         assert_eq!(envelope.kind, 100, "correct message kind");
         assert_eq!(envelope.sender, *identity.node_id(), "sender is us");
-        assert!(!envelope.ciphertext.is_empty(), "ciphertext should not be empty");
-        assert!(envelope.payment_proof.amount_msat > 0, "payment proof should have amount");
+        assert!(
+            !envelope.ciphertext.is_empty(),
+            "ciphertext should not be empty"
+        );
+        assert!(
+            envelope.payment_proof.amount_msat > 0,
+            "payment proof should have amount"
+        );
         envelope.id
     };
 
@@ -1976,12 +2008,18 @@ async fn compose_happy_path_keysend() {
 async fn compose_happy_path_invoice_flow() {
     // Full pipeline with invoice-request/response round-trip.
     // This tests the path when no Lightning pubkey is known for the peer.
-    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let invoice_requests: Arc<
+        tokio::sync::Mutex<
+            HashMap<
+                String,
+                tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+            >,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
-        Arc::new(test_identity()),
-    ));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
     let peer_id = setup_e2ee_session(&session_manager).await;
 
     // Create transport that auto-responds to invoice requests with valid BOLT11.
@@ -1992,9 +2030,10 @@ async fn compose_happy_path_invoice_flow() {
                 // LNbits/LND round up sub-sat amounts, so use max(amount, 1000).
                 let invoice_amount = amount_msat.max(1000);
                 Some(konsensus_api::state::InvoiceResponseData {
-                recipient: peer_id,
+                    recipient: peer_id,
                     bolt11: create_test_bolt11(invoice_amount),
-                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
+                    payment_hash:
+                        "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );
@@ -2066,7 +2105,11 @@ async fn compose_happy_path_invoice_flow() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "compose via invoice should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "compose via invoice should succeed"
+    );
 
     let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -2091,12 +2134,18 @@ async fn compose_happy_path_invoice_flow() {
 async fn compose_rejects_invoice_amount_mismatch() {
     // Security: If a peer responds with an invoice for a different amount
     // than requested, the compose must reject it to prevent overcharging.
-    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let invoice_requests: Arc<
+        tokio::sync::Mutex<
+            HashMap<
+                String,
+                tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+            >,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
-        Arc::new(test_identity()),
-    ));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
     let peer_id = setup_e2ee_session(&session_manager).await;
 
     // Respond with an invoice for 10x the requested amount (overcharging).
@@ -2104,9 +2153,10 @@ async fn compose_rejects_invoice_amount_mismatch() {
         ConnectedStubTransport::new(vec![peer_id], Arc::clone(&invoice_requests))
             .with_invoice_responder(move |_request_id, amount_msat| {
                 Some(konsensus_api::state::InvoiceResponseData {
-                recipient: peer_id,
+                    recipient: peer_id,
                     bolt11: create_test_bolt11(amount_msat * 10), // 10x overcharge!
-                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
+                    payment_hash:
+                        "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );
@@ -2198,12 +2248,18 @@ async fn compose_rejects_invoice_amount_mismatch() {
 async fn compose_keysend_fallback_to_invoice() {
     // When keysend fails (peer doesn't support it), the handler should
     // fall back to the invoice-request flow.
-    let invoice_requests: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let invoice_requests: Arc<
+        tokio::sync::Mutex<
+            HashMap<
+                String,
+                tokio::sync::oneshot::Sender<konsensus_api::state::InvoiceRequestOutcome>,
+            >,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
-        Arc::new(test_identity()),
-    ));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
     let peer_id = setup_e2ee_session(&session_manager).await;
 
     // Transport with invoice responder (for fallback).
@@ -2212,9 +2268,10 @@ async fn compose_keysend_fallback_to_invoice() {
             .with_invoice_responder(move |_request_id, amount_msat| {
                 let invoice_amount = amount_msat.max(1000);
                 Some(konsensus_api::state::InvoiceResponseData {
-                recipient: peer_id,
+                    recipient: peer_id,
                     bolt11: create_test_bolt11(invoice_amount),
-                    payment_hash: "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
+                    payment_hash:
+                        "c2f480d4dda9f4522b9f6d590011636d904accfe59f12f9d66a0221c2558e3a2".into(),
                 })
             }),
     );
@@ -2224,15 +2281,36 @@ async fn compose_keysend_fallback_to_invoice() {
 
     #[async_trait]
     impl LightningProvider for KeysendFailingLightning {
-    async fn pay_invoice_with_fee_limit(&self, invoice: &str, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
-        self.pay_invoice(invoice).await
-    }
+        async fn pay_invoice_with_fee_limit(
+            &self,
+            invoice: &str,
+            _cap: u64,
+        ) -> Result<
+            konsensus_core::traits::lightning::PaymentDetails,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.pay_invoice(invoice).await
+        }
 
-    async fn keysend_with_fee_limit(&self, dest: &str, amount: u64, memo: Option<&str>, _cap: u64) -> Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError> {
-        self.keysend(dest, amount, memo).await
-    }
+        async fn keysend_with_fee_limit(
+            &self,
+            dest: &str,
+            amount: u64,
+            memo: Option<&str>,
+            _cap: u64,
+        ) -> Result<
+            konsensus_core::traits::lightning::PaymentDetails,
+            konsensus_core::traits::lightning::LightningError,
+        > {
+            self.keysend(dest, amount, memo).await
+        }
 
-        async fn create_invoice(&self, amount_msat: u64, desc: &str, expiry: u32) -> Result<Invoice, LightningError> {
+        async fn create_invoice(
+            &self,
+            amount_msat: u64,
+            desc: &str,
+            expiry: u32,
+        ) -> Result<Invoice, LightningError> {
             Ok(Invoice {
                 bolt11: "lnbc1stub...".into(),
                 payment_hash: "aa".repeat(32),
@@ -2254,8 +2332,15 @@ async fn compose_keysend_fallback_to_invoice() {
         async fn list_payments(&self, _: u32) -> Result<Vec<PaymentDetails>, LightningError> {
             Ok(vec![])
         }
-        async fn keysend(&self, _dest: &str, _amt: u64, _memo: Option<&str>) -> Result<PaymentDetails, LightningError> {
-            Err(LightningError::PaymentNotDispatched("keysend not supported".into()))
+        async fn keysend(
+            &self,
+            _dest: &str,
+            _amt: u64,
+            _memo: Option<&str>,
+        ) -> Result<PaymentDetails, LightningError> {
+            Err(LightningError::PaymentNotDispatched(
+                "keysend not supported".into(),
+            ))
         }
         async fn is_available(&self) -> bool {
             true
@@ -2310,9 +2395,16 @@ async fn compose_keysend_fallback_to_invoice() {
     });
 
     // Register peer LN pubkey so keysend is attempted first.
-    let invoice_payee = create_test_bolt11(1000).parse::<lightning_invoice::Bolt11Invoice>()
-        .unwrap().recover_payee_pub_key().to_string();
-    state.peer_ln_pubkeys.lock().await.insert(peer_id, invoice_payee);
+    let invoice_payee = create_test_bolt11(1000)
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .unwrap()
+        .recover_payee_pub_key()
+        .to_string();
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(peer_id, invoice_payee);
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2352,9 +2444,9 @@ async fn compose_queues_when_transport_send_fails() {
     // message should be queued for later delivery.
     let invoice_requests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
-        Arc::new(test_identity()),
-    ));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
     let peer_id = setup_e2ee_session(&session_manager).await;
 
     // Transport where peer is "connected" for is_connected check but send fails.
@@ -2436,7 +2528,11 @@ async fn compose_queues_when_transport_send_fails() {
     });
 
     // Register LN pubkey for keysend path (simpler than invoice flow).
-    state.peer_ln_pubkeys.lock().await.insert(peer_id, "02cccc".repeat(5));
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(peer_id, "02cccc".repeat(5));
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2457,7 +2553,11 @@ async fn compose_queues_when_transport_send_fails() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "compose should succeed even when delivery fails");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "compose should succeed even when delivery fails"
+    );
 
     let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -2465,7 +2565,10 @@ async fn compose_queues_when_transport_send_fails() {
     // Message should NOT be marked as delivered.
     assert_eq!(json["delivered"], false, "should report not delivered");
     // But it should still have a message_id (was stored).
-    assert!(json["message_id"].is_string(), "should still have message_id");
+    assert!(
+        json["message_id"].is_string(),
+        "should still have message_id"
+    );
 }
 
 // ─── Room Compose: Fan-out to Multiple Members ─────────────────────
@@ -2475,9 +2578,9 @@ async fn compose_room_delivers_to_all_connected_members() {
     // Room compose should encrypt + pay + deliver per member, skip self.
     let invoice_requests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
-        Arc::new(test_identity()),
-    ));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
     // Set up E2EE session with peer (Bob).
     let peer_id = setup_e2ee_session(&session_manager).await;
@@ -2536,7 +2639,11 @@ async fn compose_room_delivers_to_all_connected_members() {
     });
 
     // Register LN pubkey for keysend (avoids invoice flow complexity).
-    state.peer_ln_pubkeys.lock().await.insert(peer_id, "02dddd".repeat(5));
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(peer_id, "02dddd".repeat(5));
 
     // Create a room with our node + the peer as members.
     let auth = auth_header(&state);
@@ -2596,7 +2703,10 @@ async fn compose_room_delivers_to_all_connected_members() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["delivered"], true, "at least one member received it");
-    assert!(json["amount_msat"].as_u64().unwrap() > 0, "payment was made");
+    assert!(
+        json["amount_msat"].as_u64().unwrap() > 0,
+        "payment was made"
+    );
 
     // Verify the envelope was sent to the peer (not to self).
     let sent = transport.sent_envelopes.lock().unwrap();
@@ -2611,9 +2721,9 @@ async fn compose_broadcasts_to_websocket() {
     // The compose handler should broadcast the message to WebSocket
     // subscribers so the frontend can show the sent message immediately.
     let invoice_requests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
-        Arc::new(test_identity()),
-    ));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
     let peer_id = setup_e2ee_session(&session_manager).await;
 
     let transport = Arc::new(ConnectedStubTransport::new(
@@ -2622,7 +2732,8 @@ async fn compose_broadcasts_to_websocket() {
     ));
     let identity = Arc::new(test_identity());
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel::<Arc<konsensus_api::state::WsMessage>>(16);
+    let (ws_tx, _ws_rx) =
+        tokio::sync::broadcast::channel::<Arc<konsensus_api::state::WsMessage>>(16);
     let mut ws_subscriber = ws_tx.subscribe();
 
     let state = Arc::new(AppState {
@@ -2669,7 +2780,11 @@ async fn compose_broadcasts_to_websocket() {
         gossip_validator: None,
     });
 
-    state.peer_ln_pubkeys.lock().await.insert(peer_id, "02eeee".repeat(5));
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(peer_id, "02eeee".repeat(5));
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2693,7 +2808,9 @@ async fn compose_broadcasts_to_websocket() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Check that we received the broadcast.
-    let ws_msg = ws_subscriber.try_recv().expect("should receive WS broadcast");
+    let ws_msg = ws_subscriber
+        .try_recv()
+        .expect("should receive WS broadcast");
     assert_eq!(
         ws_msg.plaintext.as_deref(),
         Some("WS broadcast test"),
@@ -2709,9 +2826,9 @@ async fn compose_records_send_timestamp_for_stdp() {
     // The compose handler should record send timestamps for STDP
     // (Spike-Timing-Dependent Plasticity) latency measurement.
     let invoice_requests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
-        Arc::new(test_identity()),
-    ));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
     let peer_id = setup_e2ee_session(&session_manager).await;
 
     let transport = Arc::new(ConnectedStubTransport::new(
@@ -2766,7 +2883,11 @@ async fn compose_records_send_timestamp_for_stdp() {
         gossip_validator: None,
     });
 
-    state.peer_ln_pubkeys.lock().await.insert(peer_id, "02ffff".repeat(5));
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(peer_id, "02ffff".repeat(5));
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2802,15 +2923,13 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
     let invoice_requests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // Do NOT set up an E2EE session — encryption will fail for all members.
-    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(
-        Arc::new(test_identity()),
-    ));
+    let session_manager = Arc::new(konsensus_crypto::SessionManager::new(Arc::new(
+        test_identity(),
+    )));
 
-    let peer_identity = NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
+    let peer_identity =
+        NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
     let peer_id = *peer_identity.node_id();
 
     let transport = Arc::new(ConnectedStubTransport::new(
@@ -2927,11 +3046,16 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let outcomes = body["member_outcomes"].as_array().unwrap();
     assert!(!outcomes.is_empty());
-    assert!(outcomes.iter().all(|row| row["status"] == "refused" && row["amount_msat"] == 0));
+    assert!(outcomes
+        .iter()
+        .all(|row| row["status"] == "refused" && row["amount_msat"] == 0));
 
     // Verify no envelopes were sent.
     let sent = transport.sent_envelopes.lock().unwrap();
-    assert!(sent.is_empty(), "no envelopes should be sent when all members fail");
+    assert!(
+        sent.is_empty(),
+        "no envelopes should be sent when all members fail"
+    );
 }
 
 #[tokio::test]
@@ -3097,11 +3221,9 @@ async fn messages_compose_empty_plaintext_rejected() {
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
 
-    let other = NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
+    let other =
+        NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
 
     let req = Request::builder()
         .method("POST")
@@ -3128,11 +3250,9 @@ async fn messages_compose_oversized_plaintext_rejected() {
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
 
-    let other = NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
+    let other =
+        NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
 
     let big_text = "x".repeat(1_048_577);
     let req = Request::builder()
@@ -3209,11 +3329,9 @@ async fn messages_peer_query_returns_empty_list() {
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
 
-    let other = NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
+    let other =
+        NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
     let peer_id = other.node_id().to_hex();
 
     let req = Request::builder()
@@ -3236,11 +3354,9 @@ async fn messages_compose_rejects_unknown_fields() {
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
 
-    let other = NodeIdentity::from_mnemonic(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        "",
-    )
-    .unwrap();
+    let other =
+        NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "")
+            .unwrap();
 
     let req = Request::builder()
         .method("POST")
