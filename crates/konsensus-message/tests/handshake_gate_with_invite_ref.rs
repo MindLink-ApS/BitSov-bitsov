@@ -27,6 +27,7 @@ fn make_config(whitelist: Vec<NodeId>) -> TransportConfig {
         version: 2,
         admission_mode: ReachabilityMode::Whitelist,
         cookie_mode: Default::default(),
+        dos_edge: Default::default(),
     }
 }
 

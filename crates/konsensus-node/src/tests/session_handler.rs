@@ -1399,6 +1399,7 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
         &mut crate::admission_quotes::AdmissionQuotes::default(),
         &konsensus_api::membrane::Membrane::with_capacity(8),
         &mut crate::invoice_refusals::RefusalLimits::default(),
+        0,
     )
     .await;
 
@@ -1441,6 +1442,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
         &mut crate::admission_quotes::AdmissionQuotes::default(),
         &membrane,
         &mut last_refusal,
+        0,
     )
     .await;
 
@@ -1479,6 +1481,7 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
             &mut crate::admission_quotes::AdmissionQuotes::default(),
             &membrane,
             &mut last_refusal,
+            0,
         )
         .await;
     }
@@ -1685,6 +1688,7 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
             &mut quotes,
             &konsensus_api::membrane::Membrane::with_capacity(8),
             &mut crate::invoice_refusals::RefusalLimits::default(),
+            0,
         )
         .await;
     }
@@ -1947,6 +1951,7 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
         &mut quotes,
         &konsensus_api::membrane::Membrane::with_capacity(8),
         &mut crate::invoice_refusals::RefusalLimits::default(),
+        0,
     )
     .await;
     let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control())
@@ -2031,6 +2036,7 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
                         &mut quotes,
                         &membrane,
                         &mut limits,
+                        0,
                     )
                     .await;
                     handled.fetch_add(1, Ordering::Release);
@@ -3126,6 +3132,7 @@ async fn unavailable_admission_quote_is_prompt_and_creates_no_payment() {
             &lightning,
             "test-request",
             u64::MAX,
+            0,
         )
         .await;
         assert_eq!(result.unwrap_err(), reason);
@@ -3208,6 +3215,7 @@ async fn admission_backend_readiness_race_and_timeout_return_fixed_refusals() {
             &Wallet(hang),
             "test-request",
             u64::MAX,
+            0,
         )
         .await;
         assert_eq!(result.unwrap_err(), reason);
@@ -3234,6 +3242,7 @@ async fn ready_admission_preparation_preserves_signed_stateless_quote() {
         &wallet,
         "test-request",
         now + u64::from(konsensus_core::admission_quote::FIRST_CONTACT_QUOTE_VALIDITY_SECS),
+        0,
     )
     .await
     .unwrap();
@@ -3252,6 +3261,29 @@ async fn ready_admission_preparation_preserves_signed_stateless_quote() {
     );
     assert!(wallet.list_payments(10).await.unwrap().is_empty());
     assert_eq!(wallet.get_balance_msat().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn stateless_quote_carries_admission_cost_floor_above_chat_price() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(
+        &dir.path().join("wallet.sqlite"),
+        "recipient",
+        0,
+    )
+    .unwrap();
+    let (_, amount, description) = prepare_admission_invoice(
+        admission_pricing().as_ref(),
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &wallet,
+        "request",
+        u64::MAX,
+        25_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(amount, 25_000);
+    assert_eq!(description, "konsensus:request:message=25000");
 }
 
 #[test]
@@ -3424,7 +3456,7 @@ async fn assert_admission_height_cache(dynamic: bool) {
     )
     .unwrap();
     let results = futures::future::join_all((0..16).map(|_| {
-        prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+        prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX, 0)
     }))
     .await;
     assert!(
@@ -3432,18 +3464,18 @@ async fn assert_admission_height_cache(dynamic: bool) {
         "admission remains available in both pricing modes"
     );
     for _ in 0..16 {
-        prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+        prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX, 0)
             .await
             .unwrap();
     }
     assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
     tokio::time::advance(std::time::Duration::from_secs(59)).await;
-    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX, 0)
         .await
         .unwrap();
     assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX, 0)
         .await
         .unwrap();
     assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
@@ -3463,6 +3495,7 @@ async fn admission_height_cache_failure_is_shared_and_later_success_recovers() {
             &NoInvoiceWallet,
             "request",
             u64::MAX,
+            0,
         )
     }))
     .await;
@@ -3480,7 +3513,7 @@ async fn admission_height_cache_failure_is_shared_and_later_success_recovers() {
     )
     .unwrap();
     for _ in 0..16 {
-        prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+        prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX, 0)
             .await
             .unwrap();
     }
@@ -3495,14 +3528,15 @@ async fn admission_height_cache_failure_is_shared_and_later_success_recovers() {
             &cache,
             &NoInvoiceWallet,
             "request",
-            u64::MAX
+            u64::MAX,
+            0
         )
         .await
         .unwrap_err(),
         "konsensus:not_ready:chain_unavailable"
     );
     chain.fail.store(false, Ordering::SeqCst);
-    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX, 0)
         .await
         .unwrap();
     assert_eq!(chain.calls.load(Ordering::SeqCst), 4);
@@ -3522,7 +3556,8 @@ async fn admission_height_cache_timeout_recovers_and_does_not_cache_sync_state()
             &cache,
             &NoInvoiceWallet,
             "request",
-            u64::MAX
+            u64::MAX,
+            0
         )
         .await
         .unwrap_err(),
@@ -3537,7 +3572,7 @@ async fn admission_height_cache_timeout_recovers_and_does_not_cache_sync_state()
         0,
     )
     .unwrap();
-    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX, 0)
         .await
         .unwrap();
     chain.unsynced.store(true, Ordering::SeqCst);
@@ -3547,14 +3582,15 @@ async fn admission_height_cache_timeout_recovers_and_does_not_cache_sync_state()
             &cache,
             &NoInvoiceWallet,
             "request",
-            u64::MAX
+            u64::MAX,
+            0
         )
         .await
         .unwrap_err(),
         "konsensus:not_ready:not_synced"
     );
     chain.unsynced.store(false, Ordering::SeqCst);
-    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX)
+    prepare_admission_invoice(pricing.as_ref(), &cache, &wallet, "request", u64::MAX, 0)
         .await
         .unwrap();
     assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
@@ -3644,7 +3680,8 @@ async fn issue204_zero_height_refuses_admission_with_typed_not_ready() {
             &cache,
             &wallet,
             "request",
-            u64::MAX
+            u64::MAX,
+            0
         )
         .await
         .unwrap_err(),

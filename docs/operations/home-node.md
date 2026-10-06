@@ -9,7 +9,8 @@ Never learn a new pin from a locked node. Keep `pairing/box-transport.key` (0600
 and the public identity metadata intact across restarts.
 
 Configure `[api].listen_addr` on loopback and `[remote_access].listen_addr` plus
-`advertised_endpoint` for the Noise endpoint reachable by your device. Then run:
+`advertised_endpoint` for the Noise endpoint reachable by your device. To reach
+it off the LAN, see [reachability](reachability.md). Then run:
 
 ```sh
 konsensus start --config /path/to/konsensus.toml --remote-unlock --local-owner-device

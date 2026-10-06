@@ -326,7 +326,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                                     let kind = konsensus_core::kind::KIND_PAGE_REQUEST;
                                     match pricing.get_price_msat(kind).await {
                                         Ok(base) => {
-                                            let price = konsensus_core::gate::price_with_floor_msat(kind, base, min_admission_cost_msat);
+                                            let price = konsensus_core::gate::price_with_floor_msat(base, min_admission_cost_msat);
                                             // Persist the offered price before replying so a price change
                                             // during payment cannot invalidate the paid request.
                                             // V1 cannot supersede this on a tariff raise without
@@ -369,7 +369,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         handle_invoice_requested_gated(
                             &peer_id, &request_id, amount_msat, &purpose, privileged,
                             &pricing, &readiness_height, &lightning, &transport, &our_node_id, source_ip, &mut admission_quotes,
-                            audit_log.membrane(), &mut last_admission_refusal,
+                            audit_log.membrane(), &mut last_admission_refusal, min_admission_cost_msat,
                         ).await;
                     }
 
@@ -1257,6 +1257,7 @@ async fn handle_invoice_requested_gated(
     quotes: &mut crate::admission_quotes::AdmissionQuotes,
     membrane: &konsensus_api::membrane::Membrane,
     last_admission_refusal: &mut crate::invoice_refusals::RefusalLimits,
+    min_admission_cost_msat: u64,
 ) {
     use konsensus_core::admission_quote;
     if lightning.disk_status().is_some_and(|s| s.disk_low) {
@@ -1286,7 +1287,7 @@ async fn handle_invoice_requested_gated(
         let Some(attempt_end) = admission_quote::expires_at(request_id, recipient, peer_id, unix)
         else { return; };
         let (invoice, admission, description) = match prepare_admission_invoice(
-            pricing.as_ref(), readiness_height, lightning.as_ref(), request_id, attempt_end,
+            pricing.as_ref(), readiness_height, lightning.as_ref(), request_id, attempt_end, min_admission_cost_msat,
         ).await {
             Ok(invoice) => invoice,
             Err(reason) => {
@@ -1499,6 +1500,7 @@ async fn prepare_admission_invoice(
     lightning: &dyn LightningProvider,
     request_id: &str,
     attempt_end: u64,
+    min_admission_cost_msat: u64,
 ) -> Result<(konsensus_core::traits::lightning::Invoice, u64, String), &'static str> {
     use konsensus_api::invoice_refusal::{CHAIN_UNAVAILABLE, NOT_SYNCED};
     let price = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1518,7 +1520,7 @@ async fn prepare_admission_invoice(
     })
     .await
     .map_err(|_| CHAIN_UNAVAILABLE)??;
-    let (admission, message) = konsensus_core::introduction::first_contact_prices(price);
+    let (admission, message) = konsensus_core::introduction::first_contact_prices(price, min_admission_cost_msat);
     let description = format!("konsensus:{request_id}:message={message}");
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
