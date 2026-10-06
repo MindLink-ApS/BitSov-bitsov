@@ -17,6 +17,7 @@ use crate::auth::Scope;
 pub const VERSION: u8 = 1;
 pub const PAIR_LINK_PREFIX: &str = "bitsov://pair/";
 pub const TRANSPORT_PROOF_DOMAIN: &str = "bitsov-remote-transport-v1";
+pub const BOX_TRANSPORT_PROOF_DOMAIN: &str = "bitsov-box-transport-v1";
 pub const PAIRING_PROOF_DOMAIN: &str = "bitsov-remote-pair-v1";
 
 /// Keep tunnel records well below Noise's maximum to bound allocation and
@@ -69,6 +70,13 @@ pub fn transport_proof_message(node_id_hex: &str, transport_pubkey_hex: &str) ->
     format!("{TRANSPORT_PROOF_DOMAIN}:{node_id_hex}:{transport_pubkey_hex}")
 }
 
+/// Bind the seed-independent box Noise static to a trusted node identity.
+/// Clients verify this proof during an unlocked session before saving a box pin.
+/// Encoding matches transport proofs: lowercase hex keys, base64url-no-pad signature.
+pub fn box_transport_proof_message(node_id_hex: &str, box_transport_pubkey_hex: &str) -> String {
+    format!("{BOX_TRANSPORT_PROOF_DOMAIN}:{node_id_hex}:{box_transport_pubkey_hex}")
+}
+
 /// First encrypted message after Noise_XX. With `code`, every optional field
 /// below is required. Without `code`, all of them must be absent and the Noise
 /// remote static is looked up in the durable pairing store.
@@ -108,6 +116,10 @@ pub enum AuthResponse {
         v: u8,
         client_id: String,
         scopes: Vec<Scope>,
+        /// Lowercase hex X25519 public key; not the live responder static in U1.
+        box_transport_pubkey: String,
+        /// Base64url-no-pad Ed25519 proof over [`box_transport_proof_message`].
+        box_transport_signature: String,
     },
     Error {
         v: u8,

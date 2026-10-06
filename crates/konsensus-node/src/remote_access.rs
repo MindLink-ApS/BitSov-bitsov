@@ -105,6 +105,72 @@ async fn write_handshake_refusal<S: tokio::io::AsyncRead + tokio::io::AsyncWrite
     Ok(())
 }
 
+fn box_transport_proof(identity: &NodeIdentity, pairing: &PairingService) -> (String, String) {
+    let public_key = hex::encode(pairing.box_transport_pubkey());
+    let message = wire::box_transport_proof_message(&identity.node_id().to_hex(), &public_key);
+    let signature = URL_SAFE_NO_PAD.encode(identity.sign(message.as_bytes()).to_bytes());
+    (public_key, signature)
+}
+
+/// Publish only public identity data on every unlocked start, even when remote
+/// access is disabled. Preserve bootstrap's committed_at and future metadata.
+pub fn write_identity_metadata(
+    data_dir: &std::path::Path,
+    identity: &NodeIdentity,
+    pairing: &PairingService,
+) -> Result<()> {
+    write_identity_metadata_with_sync(
+        data_dir,
+        identity,
+        pairing,
+        konsensus_api::pairing::fsync_dir_strict,
+    )
+}
+
+fn write_identity_metadata_with_sync(
+    data_dir: &std::path::Path,
+    identity: &NodeIdentity,
+    pairing: &PairingService,
+    sync_dir: impl Fn(&std::path::Path) -> std::io::Result<()>,
+) -> Result<()> {
+    use konsensus_api::pairing::{identity_fingerprint, restrict_dir, write_protected};
+    let dir = data_dir.join("identity");
+    std::fs::create_dir_all(&dir)?;
+    restrict_dir(&dir)?;
+    let path = dir.join("identity.json");
+    let mut document: serde_json::Map<String, serde_json::Value> = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("invalid public identity metadata")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(error) => return Err(error.into()),
+    };
+    let previous = document.clone();
+    let node_id = identity.node_id().to_hex();
+    let (public_key, signature) = box_transport_proof(identity, pairing);
+    document.insert(
+        "identity_fingerprint".into(),
+        identity_fingerprint(&node_id).into(),
+    );
+    document.insert("node_id".into(), node_id.into());
+    document.insert("box_transport_pubkey".into(), public_key.into());
+    document.insert("box_transport_signature".into(), signature.into());
+    if document != previous {
+        // Publish all fields together; a crash must not leave half a proof.
+        let temporary = dir.join(format!(".identity-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            write_protected(&temporary, &serde_json::to_vec_pretty(&document)?)?;
+            std::fs::rename(&temporary, &path)?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&temporary);
+        result?;
+    }
+    // Retry synchronization even when the contents match: a prior start may
+    // have failed after rename, and identity/ may itself be newly created.
+    sync_dir(&dir)?;
+    sync_dir(data_dir)?;
+    Ok(())
+}
+
 pub struct RemoteAccessServer {
     listener: TcpListener,
     identity: Arc<NodeIdentity>,
@@ -296,6 +362,9 @@ async fn handle_connection(
     let mut authority_changes = pairing.subscribe_authority_changes();
     let (mut remote_reader, mut remote_writer) = stream.into_split();
     let handshake = async {
+        // Migration: paired clients already pin this seed-derived static.
+        // Advertise the identity-signed box key after auth; never rotate this
+        // live responder before those clients have had a chance to learn it.
         let mut noise = NoiseSession::responder(identity.x25519_secret_bytes())?;
         let msg1 = wire::read_frame(&mut remote_reader, MAX_NOISE_MSG_LEN).await?;
         noise.read_handshake(&msg1)?;
@@ -336,11 +405,14 @@ async fn handle_connection(
         &pairing,
         &pairing_code,
     );
+    let (box_transport_pubkey, box_transport_signature) = box_transport_proof(&identity, &pairing);
     let response = match &authenticated {
         Ok(client) => AuthResponse::Ok {
             v: VERSION,
             client_id: client.client_id.clone(),
             scopes: client.scopes.clone(),
+            box_transport_pubkey,
+            box_transport_signature,
         },
         Err(error) => AuthResponse::Error {
             v: VERSION,
@@ -526,6 +598,105 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
+    // Client fixture: use the already trusted node_id, not an identity supplied
+    // by the response. Only a verified proof can become a durable box pin.
+    fn verified_box_pin(node_id: &str, public_key: &str, signature: &str) -> Result<[u8; 32]> {
+        let identity_bytes: [u8; 32] = hex::decode(node_id)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("identity length"))?;
+        let key: [u8; 32] = hex::decode(public_key)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("box key length"))?;
+        let signature = ed25519_dalek::Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature)?)?;
+        let message = format!("bitsov-box-transport-v1:{node_id}:{public_key}");
+        ed25519_dalek::VerifyingKey::from_bytes(&identity_bytes)?
+            .verify_strict(message.as_bytes(), &signature)?;
+        Ok(key)
+    }
+
+    #[test]
+    fn box_identity_metadata_is_created_refreshed_and_preserves_bootstrap_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = identity();
+        let fingerprint = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
+        let pairing = PairingService::open(dir.path(), fingerprint.clone(), false).unwrap();
+        write_identity_metadata(dir.path(), &node, &pairing).unwrap();
+        let path = dir.path().join("identity/identity.json");
+        let read =
+            || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+        let document = read();
+        assert_eq!(document["node_id"], node.node_id().to_hex());
+        assert_eq!(document["identity_fingerprint"], fingerprint);
+        let public_key = document["box_transport_pubkey"].as_str().unwrap();
+        let signature = document["box_transport_signature"].as_str().unwrap();
+        assert_eq!(
+            verified_box_pin(&node.node_id().to_hex(), public_key, signature).unwrap(),
+            pairing.box_transport_pubkey()
+        );
+        assert_ne!(public_key, hex::encode(node.x25519_public().as_bytes()));
+        assert!(verified_box_pin(&identity().node_id().to_hex(), public_key, signature).is_err());
+        assert!(verified_box_pin(&node.node_id().to_hex(), &"00".repeat(32), signature).is_err());
+        assert!(verified_box_pin(
+            &node.node_id().to_hex(),
+            public_key,
+            &URL_SAFE_NO_PAD.encode([0u8; 64])
+        )
+        .is_err());
+        // Old bootstrap documents had no node_id or box proof. Keep their
+        // audit timestamp when adding the new public fields on live startup.
+        std::fs::write(
+            &path,
+            r#"{"identity_fingerprint":"stale","committed_at":123}"#,
+        )
+        .unwrap();
+        drop(pairing);
+        let restarted = PairingService::open(dir.path(), fingerprint, false).unwrap();
+        write_identity_metadata(dir.path(), &node, &restarted).unwrap();
+        let refreshed = read();
+        assert_eq!(refreshed["committed_at"], 123);
+        for field in [
+            "node_id",
+            "identity_fingerprint",
+            "box_transport_pubkey",
+            "box_transport_signature",
+        ] {
+            assert_eq!(refreshed[field], document[field]);
+        }
+        // Unreadable metadata is an error, not permission to erase evidence.
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(write_identity_metadata(dir.path(), &node, &restarted).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"broken");
+    }
+
+    #[test]
+    fn box_metadata_directory_sync_failure_refuses_start_even_when_unchanged() {
+        for existing in [false, true] {
+            for fail_parent in [false, true] {
+                let data = tempfile::tempdir().unwrap();
+                let node = identity();
+                let pairing = PairingService::open(data.path(), String::new(), false).unwrap();
+                if existing {
+                    write_identity_metadata(data.path(), &node, &pairing).unwrap();
+                }
+                let dir = data.path().join("identity");
+                let failed_path = if fail_parent { data.path() } else { &dir };
+                let result =
+                    write_identity_metadata_with_sync(data.path(), &node, &pairing, |path| {
+                        if path == failed_path {
+                            Err(std::io::Error::other("injected directory sync failure"))
+                        } else {
+                            konsensus_api::pairing::fsync_dir(path)
+                        }
+                    });
+                assert!(result.is_err(), "existing={existing}, parent={fail_parent}");
+                let path = dir.join("identity.json");
+                let before = std::fs::read(&path).unwrap();
+                write_identity_metadata(data.path(), &node, &pairing).unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), before);
+            }
+        }
+    }
 
     #[test]
     fn handshake_burst_is_limited_then_recovers_without_restarting() {
@@ -949,6 +1120,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_paired_client_reconnects_and_learns_box_pin_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = identity();
+        let node_id = node.node_id().to_hex();
+        let fingerprint = konsensus_api::pairing::identity_fingerprint(&node_id);
+        let client_secret = [0x63; 32];
+        let client_static = X25519PublicKey::from(&StaticSecret::from(client_secret)).to_bytes();
+        let legacy = PairingService::open(dir.path(), fingerprint.clone(), false).unwrap();
+        let client = legacy
+            .create_verified_remote_pairing(
+                "legacy app",
+                &hex::encode(
+                    SigningKey::from_bytes(&[0x64; 32])
+                        .verifying_key()
+                        .to_bytes(),
+                ),
+                &client_static,
+            )
+            .unwrap();
+        drop(legacy);
+        // A pre-U1 data directory has pairings but no box key. The client has
+        // only the old seed-derived responder pin, with no new pairing ticket.
+        std::fs::remove_file(dir.path().join("pairing/box-transport.key")).unwrap();
+        let legacy_pin = *node.x25519_public().as_bytes();
+        let mut saved_box_pin = None;
+        for _ in 0..2 {
+            let pairing =
+                Arc::new(PairingService::open(dir.path(), fingerprint.clone(), false).unwrap());
+            assert!(!pairing.pairing_open());
+            write_identity_metadata(dir.path(), &node, &pairing).unwrap();
+            let internal = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server = RemoteAccessServer::bind(
+                &RemoteAccessConfig {
+                    listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    advertised_endpoint: Some("node.example:18443".into()),
+                },
+                Arc::clone(&node),
+                Arc::clone(&pairing),
+                internal.local_addr().unwrap(),
+                Arc::new(RemoteTunnelClients::default()),
+            )
+            .await
+            .unwrap();
+            assert!(server.pair_link_path().is_none());
+            let address = server.local_addr().unwrap();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(server.serve(shutdown_rx));
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let mut noise = NoiseSession::initiator(&client_secret).unwrap();
+            wire::write_frame(&mut stream, &noise.write_handshake(&[]).unwrap())
+                .await
+                .unwrap();
+            noise
+                .read_handshake(
+                    &wire::read_frame(&mut stream, MAX_NOISE_MSG_LEN)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(noise.remote_static_key().unwrap(), &legacy_pin);
+            wire::write_frame(&mut stream, &noise.write_handshake(&[]).unwrap())
+                .await
+                .unwrap();
+            noise.try_finish_handshake().unwrap();
+            let auth = br#"{"v":1}"#;
+            wire::write_frame(
+                &mut stream,
+                &wire::encode_transport(&mut noise, auth).unwrap(),
+            )
+            .await
+            .unwrap();
+            let ciphertext = wire::read_frame(&mut stream, wire::MAX_TRANSPORT_FRAME)
+                .await
+                .unwrap();
+            let plaintext =
+                wire::decode_transport(&mut noise, &ciphertext, wire::MAX_AUTH_PLAINTEXT).unwrap();
+            // Today's response decoder ignores additive fields. Preserve that
+            // wire compatibility as well as the old responder static.
+            #[derive(serde::Deserialize)]
+            struct LegacyResponse {
+                status: String,
+                v: u8,
+                client_id: String,
+                scopes: Vec<konsensus_api::auth::Scope>,
+            }
+            let old_response: LegacyResponse = serde_json::from_slice(&plaintext).unwrap();
+            assert_eq!(old_response.status, "ok");
+            assert_eq!(old_response.v, VERSION);
+            assert_eq!(old_response.client_id, client.client_id);
+            assert_eq!(old_response.scopes, client.scopes);
+            let response: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+            let public_key = response["box_transport_pubkey"].as_str().unwrap();
+            let signature = response["box_transport_signature"].as_str().unwrap();
+            let pin = verified_box_pin(&node_id, public_key, signature).unwrap();
+            assert_ne!(pin, legacy_pin);
+            assert_eq!(pin, pairing.box_transport_pubkey());
+            let document: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(dir.path().join("identity/identity.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(document["box_transport_pubkey"], public_key);
+            assert_eq!(document["box_transport_signature"], signature);
+            if let Some(saved) = saved_box_pin {
+                assert_eq!(pin, saved);
+            }
+            saved_box_pin = Some(pin);
+            assert_eq!(
+                pairing
+                    .validate_remote_transport(&client_static)
+                    .unwrap()
+                    .epoch,
+                client.epoch
+            );
+            shutdown_tx.send(true).unwrap();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn pairing_link_signature_and_noise_tunnel_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let node = identity();
@@ -1049,6 +1339,21 @@ mod tests {
             .unwrap();
         let plaintext =
             wire::decode_transport(&mut noise, &ciphertext, wire::MAX_AUTH_PLAINTEXT).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        let public_key = response["box_transport_pubkey"]
+            .as_str()
+            .expect("signed box key in auth response");
+        let signature = response["box_transport_signature"].as_str().unwrap();
+        assert_eq!(
+            verified_box_pin(&link.node_id, public_key, signature).unwrap(),
+            pairing.box_transport_pubkey()
+        );
+        assert!(verified_box_pin(
+            &link.node_id,
+            public_key,
+            &URL_SAFE_NO_PAD.encode([0u8; 64])
+        )
+        .is_err());
         let client_id = match serde_json::from_slice::<AuthResponse>(&plaintext).unwrap() {
             AuthResponse::Ok { client_id, .. } => client_id,
             response => panic!("unexpected auth response: {response:?}"),

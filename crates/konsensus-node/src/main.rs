@@ -1209,6 +1209,8 @@ async fn start_node_services<'a>(
             }
         }
     });
+    remote_access::write_identity_metadata(&data_dir, node.identity(), &pairing_service)
+        .context("failed to publish signed box transport identity")?;
     // Approvals are durable; only their codes lived in memory. Print fresh
     // codes for any that survived the restart instead of losing them.
     if owner_control {
