@@ -1,5 +1,128 @@
 # Upgrading a retained node
 
+This note covers common failure modes when replacing the `konsensus` binary on a
+retained data directory without re-running `konsensus init`.
+
+**rc10 preparation:** covers `main` from `v0.3.0-rc9` (`cd75c69`) through #254
+(`efedd89`), 2026-10-06. Items marked _(expected)_ come from #250, #251 and
+#252, which were open at preparation time; confirm or remove them before
+tagging. The rc9 and older procedures remain below for nodes skipping releases:
+apply them first, then this one.
+
+## rc9 → rc10 procedure
+
+1. **Before stopping rc9**, reconcile pending payments, channel opens and LSPS2
+   top-ups as for rc9. Upgrade one host at a time. Verify the replacement
+   artifact against the signed `SHA256SUMS` (`SHA256SUMS.asc`, release key
+   `B299274C200301714DC6F51A7C2D6F8AC842EF6E`) under
+   [release policy](ops/RELEASE_POLICY.md). Then stop the node cleanly and keep
+   the same config and data directory. Do not re-run `init`.
+2. **State generation 2 makes the upgrade one-way.** The first rc10 start
+   raises `STATE_GENERATION` to `bitsov-state-v1:2` before SQLite or LDK opens.
+   With `--remote-unlock`, that happens at unlock, not while locked. After that,
+   an rc9 binary refuses the directory with `state_generation_newer`. A stopped
+   copy of the rc9 directory is a rollback option only **before** the first
+   rc10 start. Never lower or delete the marker, and never restore a
+   pre-upgrade LDK directory; see
+   [state generation](#state-generation-and-rollback-safety). No numbered SQL
+   migration was added: the embedded set remains **001–028**.
+3. **No config change is required.** Every new key below is optional and
+   defaults safely. Add any of them only after the binary is replaced: rc9
+   rejects unknown fields, so a config containing `[dos_edge]` or `[node]` will
+   not load on rc9.
+4. _(expected, #250)_ **Peer doorway defaults change.** `cookie_mode` now
+   defaults to `adaptive` (was `disabled`), and the new `[dos_edge]` limits
+   always apply. Under load, sources must return a stateless cookie before the
+   node does Noise work. Peers that cannot answer a cookie challenge cannot
+   connect while cookies are demanded. To keep the old cookie-free protocol, set
+   top-level `cookie_mode = "disabled"` (above any table header); the rate and
+   concurrency limits still apply. Many honest nodes behind one NAT or IPv6 /64
+   share one budget, so on a shared network raise `connection_burst`,
+   `handshake_burst`, `max_per_ip` or `max_per_subnet` carefully. The IPv4 /24
+   aggregation is gone, so each IPv4 address now gets its own budget. Keep
+   upstream firewall/SYN-flood protection. See
+   [protecting the peer doorway](operations/dos-edge.md).
+5. **Pricing floor (#245, #248, #253).** Every paid admission must now carry at
+   least 1,000 msat, including discounted prices and older delivery quotes.
+   Update custom or older senders that pay 1–999 msat. Advertised and
+   first-contact prices may rise. They now include `min_admission_cost_msat`
+   when it exceeds `chat_msat`, and a zero `chat_msat` quotes 1 sat. No config
+   change is required; see [paid admission minimum](#paid-admission-minimum-t18).
+6. **SCB restore and move-home (#246).** `konsensus scb restore` now always
+   refuses, including preview. Update runbooks that relied on it. Use
+   `konsensus move-home` on the healthy source, and restore the whitelist
+   explicitly with `konsensus whitelist restore`. While `ldk/move-home.json`
+   exists, normal startup refuses: resume the maintenance command, and keep the
+   journal with the live store. During move-home, LSPS2 service/client and
+   `forward_to_private_channels` are forced off for the maintenance run only;
+   the config is not changed. See
+   [SCB restore lock and move-home](#scb-restore-lock-and-move-home-157).
+7. **Box transport key (#244).** The first unlocked rc10 start creates
+   `pairing/box-transport.key` (0600) and signs it into `identity/identity.json`.
+   The data directory must be on a filesystem with hard links; key publication
+   fails on exFAT/FAT. Preserve both files from then on and back them up with
+   the identity. Paired clients learn the signed key on their next connection
+   to the unlocked node.
+8. **Remote unlock (#247) is opt-in** with `--remote-unlock`, which is an argv
+   switch, not a config key. Follow [Remote unlock (U2)](#remote-unlock-u2)
+   below before adopting it. The example
+   [systemd unit](operations/konsensus.service) changed from `--owner-control`
+   to `--remote-unlock --local-owner-device`. If you installed the old
+   example, do not replace your unit unless you are adopting remote unlock.
+   While locked, the node does not monitor channels or accept messages.
+9. _(expected, #251)_ **Owner-device delegation.** With `--local-owner-device`,
+   the node now keeps the owner signing key in zeroizing memory for the life of
+   the process, so an enrolled owner device can approve another device. Without
+   that flag, delegation is refused. Pending device-key requests created before
+   rc10 have no nonce: request them again to delegate. Check
+   `owner_device_count` in `GET /api/v1/pair/device-keys`. Keep at least one
+   non-phone owner device; console revoke and recovery are unchanged.
+10. _(expected, #252)_ **Pairing tickets and box label.**
+    `konsensus pair-ticket --config <cfg> [--qr] [--ttl 24h]` needs remote
+    access with `advertised_endpoint`, Unix file locking, and one unlocked rc10
+    start first so `identity/identity.json` holds both signed transport proofs.
+    It is refused while locked. Keep its output out of service journals and
+    package logs: anyone holding the ticket can pair once as `read+receive`.
+    The automatic five-minute first-pairing link is unchanged; the daemon only
+    prints the protected file's path. Optionally set `[node] hosted_by`. See
+    [enrollment tickets](operations/home-node.md#enrollment-tickets-and-box-labels).
+11. **After restart:** inspect authenticated `/api/v1/status` as in the rc9
+    procedure. For remote unlock, also check `GET /api/v1/node/lock`.
+    App-side remote unlock, delegation and tickets need an app build re-pinned to
+    rc10; the node cannot establish app support.
+
+### New config keys and switches (rc9 → rc10)
+
+| Key / switch | Where | Default | Source |
+|---|---|---|---|
+| `cookie_mode` | top level | **`adaptive`** (was `disabled`); also `required`, `disabled` | #250 _(expected)_ |
+| `connections_per_second`, `connection_burst` | `[dos_edge]` | `10.0`, `40` | #250 _(expected)_ |
+| `handshakes_per_second`, `handshake_burst` | `[dos_edge]` | `2.0`, `8` | #250 _(expected)_ |
+| `max_pending`, `max_handshakes` | `[dos_edge]` | `128`, `64` | #250 _(expected)_ |
+| `max_per_ip`, `max_per_subnet` | `[dos_edge]` | `4`, `8` | #250 _(expected)_ |
+| `cookie_threshold`, `max_tracked_sources` | `[dos_edge]` | `32`, `4096` | #250 _(expected)_ |
+| `cookie_timeout_secs`, `handshake_timeout_secs` | `[dos_edge]` | `3`, `10` | #250 _(expected)_ |
+| `hosted_by` | `[node]` | unset (`null` in API) | #252 _(expected)_ |
+| `forward_to_private_channels` | `[lightning]` | `false` (unchanged since rc9, #226) | forced off only during `move-home` (#246) |
+| `--remote-unlock` | `start` argv | off | #247 |
+| `konsensus pair-ticket --config <cfg> [--qr] [--ttl 24h]` | CLI | TTL `24h`, max 365 days | #252 _(expected)_ |
+| `konsensus move-home --config <cfg> --destination <addr> [--fee-rate 2] [--confirm]` | CLI, owner's `/dev/tty` | preview unless `--confirm`; `--force-close` needs separate consent | #246 |
+| `konsensus whitelist restore` | CLI | explicit only | #246 |
+
+`[dos_edge]` rejects unknown keys and zero, non-finite or inconsistent limits.
+`[node]` rejects unknown fields; `hosted_by` must be 1–64 printable characters
+without surrounding whitespace, control, bidi-override or zero-width characters.
+
+**Hubs and `forward_to_private_channels`:** rc10 does not change this key. An
+ordinary LDK hub that forwards into its clients' unannounced channels still
+needs `forward_to_private_channels = true` in `[lightning]`. The default is
+false. An LSPS2 service hub (`[lightning.lsps2_service] enabled = true`)
+enables private forwarding by itself. `konsensus move-home` disables
+forwarding, LSPS2 service and LSPS2 client for the maintenance run only. Moving
+a hub closes its client channels, and it forwards nothing during the run.
+Clients need new channels to the destination hub, so tell them before moving a
+hub.
+
 ## Remote unlock (U2)
 
 Before enabling `--remote-unlock`, start unlocked once on U1 or newer, enroll an
@@ -11,9 +134,6 @@ manual/descriptor startup remains available. Remote first-run bootstrap and new
 pairing while locked are not supported. A locked node does not monitor channels:
 read [the home-node runbook](operations/home-node.md) before changing unattended
 startup. `--remote-unlock` is an argv switch, never a configuration setting.
-
-This note covers common failure modes when replacing the `konsensus` binary on a
-retained data directory without re-running `konsensus init`.
 
 **rc9 preparation:** covers `main` through #240 (`7fde729`), 2026-10-06.
 Read this before replacing a retained node's binary. The older rc7 → rc8

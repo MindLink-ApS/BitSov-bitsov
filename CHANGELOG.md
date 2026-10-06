@@ -3,12 +3,110 @@
 All notable BitSov node (`konsensus`) releases are documented here. Pre-rc8 notes
 also live on the corresponding GitHub pre-release pages.
 
-## Unreleased
+## [0.3.0-rc10] — 2026-10-06 (prep; not tagged yet)
 
-- Add `start --remote-unlock`: an encrypted home node can wait after reboot for
-  an existing owner-approved device over the pinned box-static Noise tunnel.
-  Locked nodes serve four routes only, do not receive messages or watch Lightning
-  channels, and never persist the unlock password. See [the home-node runbook](docs/operations/home-node.md).
+**Pre-release.** Not for production use. Covers the 9 merged commits from
+`v0.3.0-rc9` (`cd75c69`) through **#254** (`efedd89`), plus three PRs
+**expected** to merge before tagging: #250, #251 and #252. Entries marked
+_(expected)_ describe the open PR head at preparation time; confirm or remove
+them before tagging. Signing checklist: [`docs/releases/v0.3.0-rc10.md`](docs/releases/v0.3.0-rc10.md).
+Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
+
+### Security
+
+- _(expected, #250)_ DoS edge on the unpaid peer doorway. Per-IP and per-IPv6-/64
+  connection and handshake token buckets, per-source and global concurrency
+  caps, and bounded source tables apply before any Noise work, in both
+  `whitelist` and `price_open` modes. New `[dos_edge]` table; partial tables
+  inherit defaults. **`cookie_mode` now defaults to `adaptive`** (was
+  `disabled`): under load, unverified sources must echo a stateless `BSc1`
+  cookie before the node does DH work. Peers that cannot answer a cookie cannot
+  connect while cookies are demanded. The old IPv4 /24 aggregation is removed.
+  This does not make a distributed flood starvation-proof; keep upstream
+  firewall/SYN protection. See [docs/operations/dos-edge.md](docs/operations/dos-edge.md).
+- `scripts/release-sign.sh <tag> <commit-on-main>` does the operator's signing in
+  one run: signed tag (or verify an existing one), wait for the exact-commit tag
+  CI, check every draft binary against its `.sha256`, then write, sign, verify
+  and attach `SHA256SUMS`/`SHA256SUMS.asc`. It never publishes. It refuses
+  expired, revoked or bad signatures (#242). A non-UTF-8 locale `unbound TAG`
+  abort is fixed, and the script is exercised offline in PR CI across three
+  locales (#243).
+
+### Money
+
+- Every paid admission must carry at least **1,000 msat (1 sat)**, enforced
+  after discounts and on previously issued delivery quotes. Bound web replies
+  and accepted-envelope retries keep their existing handling. Older or custom
+  senders paying 1–999 msat are now refused (#245, T18).
+- Every advertised price (peer price tables, delivery prices and front-door
+  quotes) passes the same admission floor the gate enforces, so advertised and
+  enforced prices cannot drift (#248, T18b).
+- First-contact prices (introduction card, front-door defaults, stateless quote)
+  include `min_admission_cost_msat` when it exceeds `chat_msat`. A stranger is
+  no longer refused after paying an understated quote. A zero chat price now
+  quotes 1 sat instead of a free message (#253, T18c).
+- **SCB restore is locked**, including preview and `--confirm`, with no bypass.
+  Starting historical channel state could broadcast a revoked commitment. New
+  owner-console `konsensus move-home` moves funds from a healthy node's current
+  live state: cooperative close, separately consented force-close of named
+  channels, and exact amount/fee sweep confirmation. Its journal
+  `ldk/move-home.json` blocks normal startup until the move completes.
+  **State generation rises to 2.** Whitelist sidecars are restored with
+  `konsensus whitelist restore`, and export restore steps now point to
+  move-home. Lightning 0.2.2 is vendored with narrow, documented patches (#246;
+  #157).
+
+### Pairing and home node
+
+- Seed-independent X25519 box transport key (`pairing/box-transport.key`,
+  0600), signed by the node identity on every unlocked start and recorded in
+  `identity/identity.json`. Successful remote auth carries the proof, so
+  existing clients can pin it under their trusted `node_id`. The live responder
+  stays on the seed-derived static. Publishing the key needs hard links, so it
+  fails on a data directory on exFAT/FAT (#244, U1).
+- `start --remote-unlock`: after a reboot an encrypted home node waits for an
+  existing owner-approved device over the pinned box-static Noise tunnel.
+  Locked nodes serve four routes only, do not receive messages or watch
+  Lightning channels, and never persist the unlock password. Wrong unlocks are
+  limited per key and per process. The systemd example now runs
+  `--remote-unlock --local-owner-device` instead of `--owner-control` (#247, U2).
+  See [the home-node runbook](docs/operations/home-node.md).
+- _(expected, #251)_ Owner-device delegation (PR C). In `--local-owner-device`
+  mode the owner signing key stays in zeroizing memory, so an enrolled owner
+  device can approve another device. It signs the exact
+  `bitsov-owner-delegation-v1` tuple via
+  `POST /api/v1/pair/device-key/{op_id}/delegate`, and the new record shows
+  `enrolled_by: "device:<approver>"`. Console `device revoke` and epoch bumps
+  retire delegated keys. `GET /api/v1/pair/device-keys` adds
+  `owner_device_count`; the app must keep a non-phone owner device.
+- _(expected, #252)_ One-shot pairing tickets (P1):
+  `konsensus pair-ticket --config <cfg> [--qr] [--ttl 24h]` writes a file-backed
+  `read+receive` ticket (TTL up to 365 days, survives restart, refused while
+  locked) and prints the URI or a terminal QR only to the CLI's own stdout.
+  Optional `[node] hosted_by` display label (1–64 printable characters) appears
+  in tickets, `/api/v1/node/lock` and `/api/v1/health`. It is display only and
+  does not imply `identity.hosted` custody.
+
+### Docs
+
+- Reaching a home node off the LAN over Tailscale: listeners and
+  advertised addresses on the tailnet address, `[api]` on loopback, what the
+  tailnet can see, and that the hub never relays for its LSP role. Port mapping
+  and Tor are documented as not shipped (#254;
+  [docs/operations/reachability.md](docs/operations/reachability.md)).
+- rc10 release notes and signing checklist, plus an rc9 → rc10 upgrade
+  procedure with every new config key and the state-generation-2 rollback rule.
+
+### Upgrade and version
+
+- **State generation 2:** the first rc10 node start raises `STATE_GENERATION`.
+  rc9 then refuses the data directory with `state_generation_newer`. Roll
+  forward only.
+- No numbered SQL migration since rc9 (still **001–028**).
+- `[dos_edge]` and `[node]` are new tables, and NodeConfig rejects unknown
+  fields, so rc9 will not parse a config that uses them.
+- Workspace version bump to `0.3.0-rc10` is still pending at preparation time;
+  see the signing checklist.
 
 ## [0.3.0-rc9] — 2026-10-06 (prep; not tagged yet)
 
