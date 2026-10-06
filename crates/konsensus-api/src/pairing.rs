@@ -637,6 +637,7 @@ struct Inner {
     pending: HashMap<String, PendingPairing>,
     token_challenges: HashMap<String, (String, Instant)>,
     window_until: Option<Instant>,
+    pairing_closed: bool,
     identity_fingerprint: String,
     // Never serialized or returned by HTTP/control status. Restart invalidates
     // pending console challenges; the owner must request a new operation.
@@ -867,6 +868,7 @@ impl PairingService {
                 pending: HashMap::new(),
                 token_challenges: HashMap::new(),
                 window_until: None,
+                pairing_closed: false,
                 identity_fingerprint,
                 owner_confirmations: HashMap::new(),
                 owner_code_failures: 0,
@@ -1332,6 +1334,12 @@ impl PairingService {
 
     // ── Pairing windows ────────────────────────────────────────────
 
+    /// Permanently disable all first-pairing ceremonies for this locked run.
+    pub fn with_pairing_closed(self) -> Self {
+        self.lock().pairing_closed = true;
+        self
+    }
+
     /// Is pairing currently accepted?
     ///
     /// Only while **no client is paired**, or while a window is explicitly
@@ -1343,6 +1351,9 @@ impl PairingService {
     }
 
     fn open_inner(inner: &Inner) -> bool {
+        if inner.pairing_closed {
+            return false;
+        }
         if inner.file.clients.is_empty() {
             return true;
         }

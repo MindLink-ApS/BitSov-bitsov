@@ -188,11 +188,13 @@ pub fn decode_transport(
     noise: &mut NoiseSession,
     ciphertext: &[u8],
     max_plaintext: usize,
-) -> Result<Vec<u8>, String> {
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
     if ciphertext.is_empty() || ciphertext.len() > MAX_TRANSPORT_FRAME {
         return Err("remote-access ciphertext length out of bounds".into());
     }
-    let plaintext = noise.decrypt(ciphertext).map_err(|e| e.to_string())?;
+    let plaintext = noise
+        .decrypt_sensitive(ciphertext)
+        .map_err(|e| e.to_string())?;
     if plaintext.is_empty() || plaintext.len() > max_plaintext {
         return Err("remote-access decrypted length out of bounds".into());
     }

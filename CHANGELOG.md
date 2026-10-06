@@ -3,6 +3,13 @@
 All notable BitSov node (`konsensus`) releases are documented here. Pre-rc8 notes
 also live on the corresponding GitHub pre-release pages.
 
+## Unreleased
+
+- Add `start --remote-unlock`: an encrypted home node can wait after reboot for
+  an existing owner-approved device over the pinned box-static Noise tunnel.
+  Locked nodes serve four routes only, do not receive messages or watch Lightning
+  channels, and never persist the unlock password. See [the home-node runbook](docs/operations/home-node.md).
+
 ## [0.3.0-rc9] — 2026-10-06 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Covers all 32 merged commits from

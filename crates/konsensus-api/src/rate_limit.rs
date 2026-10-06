@@ -24,6 +24,15 @@ pub struct RemoteTunnelClients {
 }
 
 impl RemoteTunnelClients {
+    /// Resolve only a server-registered TCP bridge, never a caller's headers.
+    pub fn client_id(&self, peer: SocketAddr) -> Option<Arc<str>> {
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&peer)
+            .cloned()
+    }
+
     /// Register before forwarding any HTTP bytes. Keep the guard alive for the
     /// tunnel's lifetime; dropping it removes the association even on cancellation.
     pub fn register(
