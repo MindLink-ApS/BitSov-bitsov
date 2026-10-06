@@ -50,7 +50,7 @@ fn signed_envelope(sender: &NodeIdentity, recipient: NodeId, tag: &[u8]) -> UkmE
         use sha2::{Digest, Sha256};
         Sha256::digest(preimage).into()
     };
-    let proof = PaymentProof::new(hash, preimage, 100);
+    let proof = PaymentProof::new(hash, preimage, 1_000);
     let mut env = UkmEnvelopeBuilder::new(
         KIND_CHAT,
         *sender.node_id(),

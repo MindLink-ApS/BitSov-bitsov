@@ -25,8 +25,7 @@ use konsensus_pricing::StaticPricingConfig;
 
 const MNEMONIC_ALICE: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-const MNEMONIC_BOB: &str =
-    "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+const MNEMONIC_BOB: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
 const MNEMONIC_CAROL: &str =
     "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
@@ -86,16 +85,24 @@ impl InMemoryNonceStore {
 #[async_trait::async_trait]
 impl konsensus_core::gate::NonceStore for InMemoryNonceStore {
     async fn check_and_store_paid(
-        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
-        _sender: &konsensus_core::NodeId, _message_id: &konsensus_core::MessageId,
+        &self,
+        nonce: &konsensus_core::Nonce,
+        payment_hash: &[u8; 32],
+        _sender: &konsensus_core::NodeId,
+        _message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
         use konsensus_core::gate::PaidReplay;
         let mut nonces = self.seen.lock().await;
         let mut payments = self.seen_payment_hashes.lock().await;
         let key = nonce.as_bytes().to_vec();
-        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
-        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
-        nonces.insert(key); payments.insert(*payment_hash);
+        if nonces.contains(&key) {
+            return Ok(PaidReplay::NonceReused);
+        }
+        if payments.contains(payment_hash) {
+            return Ok(PaidReplay::PaymentReused);
+        }
+        nonces.insert(key);
+        payments.insert(*payment_hash);
         Ok(PaidReplay::Accepted)
     }
 
@@ -126,7 +133,7 @@ async fn replay_attack_rejected_on_second_submission() {
     let bob_id = *id_bob.node_id();
     let alice_id = *id_alice.node_id();
 
-    let envelope = make_valid_envelope(&id_alice, bob_id, b"hello".to_vec(), 100);
+    let envelope = make_valid_envelope(&id_alice, bob_id, b"hello".to_vec(), 1_000);
     let gate = PaymentGate::new();
     let nonce_store = InMemoryNonceStore::new();
     let pricing = default_pricing();
@@ -138,7 +145,8 @@ async fn replay_attack_rejected_on_second_submission() {
         &nonce_store,
         &pricing,
         Some(&whitelist),
-        None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+        None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+        0.0,
         None,
     )
     .await
@@ -151,7 +159,8 @@ async fn replay_attack_rejected_on_second_submission() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -190,7 +199,8 @@ async fn tampered_signature_rejected() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -211,9 +221,7 @@ async fn zeroed_signature_rejected() {
     let mut envelope = make_valid_envelope(&id_alice, bob_id, b"hello".to_vec(), 100);
 
     // Tamper: zero out the signature
-    envelope.signature = Signature::from_ed25519(&ed25519_dalek::Signature::from_bytes(
-        &[0u8; 64],
-    ));
+    envelope.signature = Signature::from_ed25519(&ed25519_dalek::Signature::from_bytes(&[0u8; 64]));
 
     let gate = PaymentGate::new();
     let nonce_store = InMemoryNonceStore::new();
@@ -226,7 +234,8 @@ async fn zeroed_signature_rejected() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -264,7 +273,8 @@ async fn tampered_ciphertext_rejected() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -317,7 +327,8 @@ async fn wrong_preimage_rejected() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -349,7 +360,8 @@ async fn zero_payment_rejected() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -402,7 +414,8 @@ async fn far_future_timestamp_rejected() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -451,7 +464,8 @@ async fn expired_message_rejected() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -488,7 +502,8 @@ async fn non_whitelisted_sender_rejected() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -518,7 +533,8 @@ async fn empty_whitelist_rejects_all() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -546,8 +562,14 @@ async fn realtime_signaling_kind_uses_payment_gate() {
 
     // Realtime kinds are priceable, not a free lane. The call offer (400) is
     // the per-call admission at `call_msat`; answer/ICE/hangup keep the
-    // realtime category price.
-    for (kind, paid, admitted) in [(401, 100, true), (402, 100, true), (400, 100, false), (400, 10_000, true)] {
+    // realtime category price, subject to the one-sat admission floor.
+    for (kind, paid, admitted) in [
+        (401, 999, false),
+        (401, 1_000, true),
+        (402, 1_000, true),
+        (400, 1_000, false),
+        (400, 10_000, true),
+    ] {
         let preimage = rand::random::<[u8; 32]>();
         let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
         let proof = PaymentProof::new(payment_hash, preimage, paid);
@@ -568,11 +590,16 @@ async fn realtime_signaling_kind_uses_payment_gate() {
                 &nonce_store,
                 &pricing,
                 Some(&whitelist),
-                None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+                None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+                0.0,
                 None,
             )
             .await;
-        assert_eq!(result.is_ok(), admitted, "kind {kind} paying {paid} msat: {result:?}");
+        assert_eq!(
+            result.is_ok(),
+            admitted,
+            "kind {kind} paying {paid} msat: {result:?}"
+        );
     }
 }
 
@@ -625,7 +652,8 @@ async fn tight_max_age_rejects_slightly_old_message() {
             &nonce_store,
             &pricing,
             Some(&whitelist),
-            None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+            None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+            0.0,
             None,
         )
         .await;
@@ -647,7 +675,7 @@ async fn valid_envelope_passes_all_checks() {
     let bob_id = *id_bob.node_id();
     let alice_id = *id_alice.node_id();
 
-    let envelope = make_valid_envelope(&id_alice, bob_id, b"hello".to_vec(), 100);
+    let envelope = make_valid_envelope(&id_alice, bob_id, b"hello".to_vec(), 1_000);
 
     let gate = PaymentGate::new();
     let nonce_store = InMemoryNonceStore::new();
@@ -659,7 +687,8 @@ async fn valid_envelope_passes_all_checks() {
         &nonce_store,
         &pricing,
         Some(&whitelist),
-        None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+        None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+        0.0,
         None,
     )
     .await
@@ -672,7 +701,7 @@ async fn valid_envelope_with_no_whitelist_passes() {
     let id_bob = make_identity(MNEMONIC_BOB);
     let bob_id = *id_bob.node_id();
 
-    let envelope = make_valid_envelope(&id_alice, bob_id, b"hello".to_vec(), 100);
+    let envelope = make_valid_envelope(&id_alice, bob_id, b"hello".to_vec(), 1_000);
 
     let gate = PaymentGate::new();
     let nonce_store = InMemoryNonceStore::new();
@@ -684,7 +713,8 @@ async fn valid_envelope_with_no_whitelist_passes() {
         &nonce_store,
         &pricing,
         None,
-        None::<&dyn konsensus_core::traits::lightning::LightningProvider>, 0.0,
+        None::<&dyn konsensus_core::traits::lightning::LightningProvider>,
+        0.0,
         None,
     )
     .await
