@@ -496,3 +496,78 @@ unfunded in-memory nodes and feeds the resulting request to the production
 handler: a listed hub is accepted, an unlisted peer is rejected (and cannot be
 accepted later), and no allowlist accepts as before. Outbound opens to an
 unlisted peer fail before the running check; listed peers reach it unchanged.
+
+## W1: durable watchtower justice hook (2026-10-07)
+
+Baseline remains ldk-node **0.7.0**, archive and license provenance above.
+No lightning source, dependency, lockfile, wire protocol or monitor encoding changes.
+
+- `tower_hook.rs` (new), exported from `lib.rs`: `TowerPersister<P>` decorates the
+  existing monitor persister. `JusticeCandidate { channel_id, commitment_number,
+  ladder, value }` holds signed justice transactions, lowest fee first. Only the
+  revoked counterparty `to_local` output is covered; HTLC outputs are not.
+- `builder.rs`: Rust `Builder::set_tower_client(Arc<TowerClient>)` explicitly opts
+  in. `TowerClient::new(Arc<dyn KVStoreSync + Send + Sync>)` is the durable local
+  staging endpoint for the later W2 client. Use one client per node, backed by
+  durable local storage (normally the same store supplied to the node builder),
+  and retain that store on restart. Nothing opens a socket or sends a candidate.
+  A lazy wallet callback allocates and persists a fresh destination per channel.
+- `types.rs`: ChainMonitor uses the decorator. Default is `None`: no tower reads,
+  writes, fee queries or address allocation, and all original persistence inputs,
+  bytes, return statuses, completion notifications and archive calls pass through.
+- Pending unsigned ladders, values, commitment numbers, their observation monitor
+  update IDs and the destination are
+  TLV-encoded at `tower/pending/<channel_id>`. This implements F9 using persisted
+  unsigned transactions instead of persisting the entire CommitmentTransaction.
+  New commitment data is durable **before** the wrapped monitor can advance.
+  Signing retries on every update (including `None`) and on startup monitor
+  registration. A missing secret retains the queue head for the next update.
+  On restart, unsigned entries newer than the restored monitor are discarded:
+  they preceded a monitor write that never completed, and their commitment may
+  never be sent. Keeping them could permanently block later signing. Signed
+  candidates are retained. Record shape, fee bounds, channel/txid identity and
+  signed/unsigned witness state are validated on reads.
+- Signed candidates are durably emitted at
+  `tower_candidates/<channel_id>/<revoked_txid>`, before removing unsigned data.
+  Replays replace the same key. `TowerClient::pending_candidates(channel_id)`
+  reads without acknowledgement or removal; archive also retains these records.
+  A crash before/after either write cannot silently lose an acknowledged state.
+  A failed/corrupt tower record or the 10,000-candidate/channel limit returns
+  `UnrecoverableError` **before advancing the wrapped monitor**: LDK stops rather
+  than acknowledge unguardable progress. This is a synchronous local-disk failure
+  policy, not a wait for a remote tower.
+- `fee_estimator.rs`: a separate `tower_justice_rate` accessor recovers the
+  unadjusted one-block estimate from the cached `MaximumFeeEstimate`. All three
+  chain sources store `floor(raw * 11 / 10) + 2500`; the accessor exactly inverts
+  that integer margin, uses 8000 sat/kWU when no estimate is cached, and clamps
+  to the floor/u32 domain. This leaves LDK's protective maximum, chain-source
+  queries and the disabled path unchanged. Fees use
+  `max(253, estimate)`, 4x and 16x sat/kWU. Drop tiers exceeding half the protected
+  value, producing a dust destination, or overflowing LDK's internal u32 rate.
+  No revocable output (below dust), or no viable tier, yields no candidate.
+- `tower_hook/tests.rs` (new): offline port of LDK's
+  `do_test_forming_justice_tx_from_monitor_updates`, checking every signed tier
+  with `check_spends!`. Covers initial/later commitments, below dust, anchor
+  channels, fresh decorator/client restart before revocation, durable signed
+  reload, replay, injected failures at each queue write, fee limits/overflow,
+  the production fee adapter and byte/status/completion/archive equivalence
+  when disabled. A further crash regression restores serialized monitor AND
+  channel-manager snapshots with a newer tower journal, then makes/revokes a
+  different commitment. The reference test's simulated confirmation and recovered
+  balance checks are also ported. Malformed records return errors.
+
+Validation commands (no node is started and no RPC, regtest daemon or e2e runs):
+
+    cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib tower_hook
+    cargo check --offline --locked --workspace --all-targets
+    cargo clippy --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --all-targets
+
+Strict clippy (`-- -D warnings`) currently fails on existing vendor lint debt;
+W1 lint issues are fixed or narrowly allowed for LDK-generated TLV reader code.
+
+This does **not** claim tower protection: W2 encryption/outbox, transport, tower
+configuration, payment, acknowledgement/pruning and app status are not built.
+Enabling after earlier channel use cannot recover historical commitments missed
+while disabled. A signing error also retains a superseded splice at the head,
+matching the contract's stop-and-retry policy; splice-specific pruning is not
+implemented. Fable + Grok PASS on the same SHA remains the money-path merge gate.
