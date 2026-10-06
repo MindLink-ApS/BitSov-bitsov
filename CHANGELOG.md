@@ -5,8 +5,8 @@ also live on the corresponding GitHub pre-release pages.
 
 ## [0.3.0-rc9] — 2026-10-06 (prep; not tagged yet)
 
-**Pre-release.** Not for production use. Covers all 31 merged commits from
-`v0.3.0-rc8` (`f125aab`) through **#238** (`788eea3`). Full notes and the executed
+**Pre-release.** Not for production use. Covers all 32 merged commits from
+`v0.3.0-rc8` (`f125aab`) through **#240** (`7fde729`). Full notes and the executed
 upgrade check: [`docs/releases/v0.3.0-rc9.md`](docs/releases/v0.3.0-rc9.md).
 
 ### Local owner and encrypted bootstrap
@@ -98,6 +98,9 @@ upgrade check: [`docs/releases/v0.3.0-rc9.md`](docs/releases/v0.3.0-rc9.md).
   (#213; #207).
 - Three-node paid regtest harness and idle-link/ghost-retry fixes (#201, #203).
   Real regtest scenarios remain separate from ordinary workspace tests.
+- Regtest `hub_jit_then_stateless_admission` waits for the settled JIT channel
+  capacity instead of racing the client's `revoke_and_ack`; test-only, root cause in
+  [docs/qa/regtest-hub-jit-capacity-race.md](docs/qa/regtest-hub-jit-capacity-race.md) (#240).
 
 ### Upgrade and version
 
@@ -107,7 +110,7 @@ upgrade check: [`docs/releases/v0.3.0-rc9.md`](docs/releases/v0.3.0-rc9.md).
   state and rolling forward after LDK starts. See [UPGRADING](docs/UPGRADING.md)
   for rc7 → rc9, rc8 → rc9 and explicit `NODE_INITIALIZED` consent repair.
 
-## [0.3.0-rc8] — 2026-10-02 (prep; not tagged yet)
+## [0.3.0-rc8] — 2026-10-02
 
 **Pre-release.** Not for production use. Source range: `v0.3.0-rc7` (`958e399`) →
 `main` through **#184** (`62238c2`). Full narrative: [`docs/releases/v0.3.0-rc8.md`](docs/releases/v0.3.0-rc8.md).
