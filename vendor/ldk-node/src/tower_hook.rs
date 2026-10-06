@@ -12,6 +12,8 @@ use lightning::util::ser::{Readable, Writeable};
 use std::io;
 use std::sync::{Arc, Mutex};
 
+const SIGNED_CANDIDATE_TARGET: usize = 10_000;
+
 /// A revoked commitment's signed, lowest-fee-first justice transaction ladder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JusticeCandidate {
@@ -47,17 +49,152 @@ impl TowerClient {
     /// Returns signed candidates without removing them. Reading is not acknowledgement.
     pub fn pending_candidates(&self, channel_id: ChannelId) -> io::Result<Vec<JusticeCandidate>> {
         let _guard = self.gate.lock().unwrap();
-        let channel = channel_id.to_string();
-        self.store
-            .list("tower_candidates", &channel)?
+        Ok(self
+            .read_candidates(channel_id)?
             .into_iter()
-            .map(|key| {
-                let bytes = self.store.read("tower_candidates", &channel, &key)?;
-                let candidate = decode(&bytes)?;
-                validate_candidate(&candidate, channel_id, Some(&key), true)?;
-                Ok(candidate)
-            })
-            .collect()
+            .map(|(_, c)| c.into_candidate())
+            .collect())
+    }
+
+    // All private storage helpers run under gate. Copy before remove: a failed write
+    // must leave the source intact and propagate to the persister, never Completed.
+    fn quarantine(
+        &self,
+        primary: &str,
+        secondary: &str,
+        key: &str,
+        channel: &str,
+        bytes: Vec<u8>,
+        reason: &io::Error,
+    ) -> io::Result<()> {
+        use bitcoin::hashes::{sha256, Hash, HashEngine};
+        let namespace = if primary == "tower" {
+            "tower_quarantine_pending"
+        } else {
+            "tower_quarantine_candidates"
+        };
+        let mut hash = sha256::Hash::engine();
+        hash.input(key.as_bytes());
+        hash.input(&bytes);
+        let saved_key = sha256::Hash::from_engine(hash).to_string();
+        // Content-addressing makes retries after a crash between copy/remove idempotent,
+        // while preserving different corrupt versions of the same source key.
+        self.store.write(namespace, channel, &saved_key, bytes)?;
+        self.store.remove(primary, secondary, key, false)?;
+        log::error!(
+            "Quarantined corrupt watchtower record {}/{}/{} at {}/{}/{}: {}",
+            primary,
+            secondary,
+            key,
+            namespace,
+            channel,
+            saved_key,
+            reason
+        );
+        Ok(())
+    }
+
+    fn read_candidate(&self, id: ChannelId, key: &str) -> io::Result<Option<StoredCandidate>> {
+        let channel = id.to_string();
+        let bytes = match self.store.read("tower_candidates", &channel, key) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let decoded = decode::<StoredCandidate>(&bytes).and_then(|record| {
+            validate_candidate(&record.clone().into_candidate(), id, Some(key), true)?;
+            Ok(record)
+        });
+        match decoded {
+            Ok(record) => Ok(Some(record)),
+            Err(error) => {
+                self.quarantine("tower_candidates", &channel, key, &channel, bytes, &error)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn read_candidates(&self, id: ChannelId) -> io::Result<Vec<(String, StoredCandidate)>> {
+        let mut candidates = Vec::new();
+        for key in self.store.list("tower_candidates", &id.to_string())? {
+            if let Some(candidate) = self.read_candidate(id, &key)? {
+                candidates.push((key, candidate));
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn prune_candidates(&self, id: ChannelId) -> io::Result<()> {
+        let channel = id.to_string();
+        if self.store.list("tower_candidates", &channel)?.len() <= SIGNED_CANDIDATE_TARGET {
+            return Ok(());
+        }
+        let mut candidates = self.read_candidates(id)?;
+        let mut newest = std::collections::HashMap::new();
+        for (_, candidate) in &candidates {
+            if let Some(age) = candidate.observed_update_id {
+                let latest = newest.entry(candidate.commitment_number).or_insert(age);
+                *latest = (*latest).max(age);
+            }
+        }
+        let mut excess = candidates.len().saturating_sub(SIGNED_CANDIDATE_TARGET);
+        candidates.sort_by_key(|(key, c)| (c.observed_update_id, key.clone()));
+        for (key, candidate) in candidates {
+            if excess == 0 {
+                break;
+            }
+            // Only strictly older alternatives are superseded. Keep all distinct
+            // commitments, tied observations, and legacy records with unknown age.
+            if candidate
+                .observed_update_id
+                .is_some_and(|age| newest[&candidate.commitment_number] > age)
+            {
+                self.store
+                    .remove("tower_candidates", &channel, &key, false)?;
+                log::warn!("Pruned superseded watchtower candidate {} for channel {}, commitment {}, observation {:?}", key, channel, candidate.commitment_number, candidate.observed_update_id);
+                excess -= 1;
+            }
+        }
+        if excess != 0 {
+            log::warn!("Watchtower channel {} exceeds candidate target by {}: retaining distinct commitments and alternatives without a strictly newer observation", channel, excess);
+        }
+        Ok(())
+    }
+}
+
+// Same TLVs as JusticeCandidate, plus optional age metadata. W1 records remain readable,
+// and W1 readers ignore the new odd field. The public candidate API stays unchanged.
+#[derive(Clone)]
+struct StoredCandidate {
+    channel_id: ChannelId,
+    commitment_number: u64,
+    ladder: Vec<Transaction>,
+    value: u64,
+    observed_update_id: Option<u64>,
+}
+impl StoredCandidate {
+    fn new(candidate: JusticeCandidate, observed_update_id: u64) -> Self {
+        let JusticeCandidate {
+            channel_id,
+            commitment_number,
+            ladder,
+            value,
+        } = candidate;
+        Self {
+            channel_id,
+            commitment_number,
+            ladder,
+            value,
+            observed_update_id: Some(observed_update_id),
+        }
+    }
+    fn into_candidate(self) -> JusticeCandidate {
+        JusticeCandidate {
+            channel_id: self.channel_id,
+            commitment_number: self.commitment_number,
+            ladder: self.ladder,
+            value: self.value,
+        }
     }
 }
 
@@ -83,6 +220,13 @@ mod encoding {
         (2, commitment_number, required),
         (4, ladder, required_vec),
         (6, value, required),
+    });
+    impl_writeable_tlv_based!(StoredCandidate, {
+        (0, channel_id, required),
+        (2, commitment_number, required),
+        (4, ladder, required_vec),
+        (6, value, required),
+        (9, observed_update_id, option),
     });
     impl_writeable_tlv_based!(PendingCandidate, {
         (0, candidate, required),
@@ -229,16 +373,45 @@ impl<P> TowerPersister<P> {
         let _guard = client.gate.lock().unwrap();
         let id = monitor.channel_id();
         let channel = id.to_string();
-        let (mut state, fresh) = match client.store.read("tower", "pending", &channel) {
-            Ok(bytes) => (decode::<PendingChannel>(&bytes)?, false),
-            Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => (
+        // Startup also checks signed records which no pending entry currently references.
+        if update.is_none() {
+            client.read_candidates(id)?;
+        }
+        let loaded = match client.store.read("tower", "pending", &channel) {
+            Ok(bytes) => {
+                let decoded = decode::<PendingChannel>(&bytes).and_then(|state| {
+                    for pending in &state.pending {
+                        validate_candidate(&pending.candidate, id, None, false)?;
+                        if pending.candidate.ladder[0].output[0].script_pubkey != state.destination
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Tower destination mismatch",
+                            ));
+                        }
+                    }
+                    Ok(state)
+                });
+                match decoded {
+                    Ok(state) => Some(state),
+                    Err(error) => {
+                        client.quarantine("tower", "pending", &channel, &channel, bytes, &error)?;
+                        None
+                    }
+                }
+            }
+            Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let (mut state, fresh) = match loaded {
+            Some(state) => (state, false),
+            None => (
                 PendingChannel {
                     destination: (self.destination)()?,
                     pending: Vec::new(),
                 },
                 true,
             ),
-            Err(e) => return Err(e.into()),
         };
         // A crash can leave the tower write-ahead record newer than the durable monitor.
         // Those unsigned commitments were never acknowledged, so the manager can choose
@@ -247,15 +420,6 @@ impl<P> TowerPersister<P> {
         state
             .pending
             .retain(|p| p.observed_update_id <= monitor.get_latest_update_id());
-        for pending in &state.pending {
-            validate_candidate(&pending.candidate, id, None, false)?;
-            if pending.candidate.ladder[0].output[0].script_pubkey != state.destination {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Tower destination mismatch",
-                ));
-            }
-        }
         let mut commitments = Vec::new();
         if fresh {
             commitments.extend(monitor.initial_counterparty_commitment_tx());
@@ -274,22 +438,15 @@ impl<P> TowerPersister<P> {
                 {
                     continue;
                 }
-                match client.store.read("tower_candidates", &channel, &key) {
-                    Ok(bytes) => {
-                        let existing: JusticeCandidate = decode(&bytes)?;
-                        validate_candidate(&existing, id, Some(&key), true)?;
-                    }
-                    Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => {
-                        state.pending.push(PendingCandidate {
-                            candidate,
-                            observed_update_id: monitor.get_latest_update_id(),
-                            funding_outpoint: Some(
-                                commitment.trust().built_transaction().transaction.input[0]
-                                    .previous_output,
-                            ),
-                        })
-                    }
-                    Err(e) => return Err(e.into()),
+                if client.read_candidate(id, &key)?.is_none() {
+                    state.pending.push(PendingCandidate {
+                        candidate,
+                        observed_update_id: monitor.get_latest_update_id(),
+                        funding_outpoint: Some(
+                            commitment.trust().built_transaction().transaction.input[0]
+                                .previous_output,
+                        ),
+                    });
                 }
             }
         }
@@ -329,14 +486,16 @@ impl<P> TowerPersister<P> {
             };
             signed.ladder = ladder;
             let key = candidate_key(&signed);
-            let keys = client.store.list("tower_candidates", &channel)?;
-            if keys.len() >= 10_000 && !keys.contains(&key) {
-                return Err(io::Error::other("Tower candidate queue is full"));
-            }
             // Idempotent write BEFORE dequeue. A crash at either write cannot lose the state.
-            client
-                .store
-                .write("tower_candidates", &channel, &key, signed.encode())?;
+            client.store.write(
+                "tower_candidates",
+                &channel,
+                &key,
+                StoredCandidate::new(signed, pending.observed_update_id).encode(),
+            )?;
+            // Persist the replacement before pruning any older alternative. The target is
+            // soft when every retained commitment is distinct; age alone never loses one.
+            client.prune_candidates(id)?;
             state.pending.remove(index);
             client
                 .store
