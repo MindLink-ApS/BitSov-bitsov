@@ -497,7 +497,7 @@ handler: a listed hub is accepted, an unlisted peer is rejected (and cannot be
 accepted later), and no allowlist accepts as before. Outbound opens to an
 unlisted peer fail before the running check; listed peers reach it unchanged.
 
-## W1: durable watchtower justice hook (2026-10-07)
+## W1/W1b: durable watchtower justice hook and queue hardening (2026-10-07)
 
 Baseline remains ldk-node **0.7.0**, archive and license provenance above.
 No lightning source, dependency, lockfile, wire protocol or monitor encoding changes.
@@ -516,26 +516,54 @@ No lightning source, dependency, lockfile, wire protocol or monitor encoding cha
   writes, fee queries or address allocation, and all original persistence inputs,
   bytes, return statuses, completion notifications and archive calls pass through.
 - Pending unsigned ladders, values, commitment numbers, their observation monitor
-  update IDs and the destination are
+  update IDs, funding outpoints, the destination and observed funding retirement are
   TLV-encoded at `tower/pending/<channel_id>`. This implements F9 using persisted
   unsigned transactions instead of persisting the entire CommitmentTransaction.
   New commitment data is durable **before** the wrapped monitor can advance.
   Signing retries on every update (including `None`) and on startup monitor
-  registration. A missing secret retains the queue head for the next update.
+  registration. Whenever the pending record is missing (also after quarantine),
+  the initial counterparty commitment is staged if LDK supplies it, including on
+  `Some(update)` calls. Commitments carried by that update are also staged.
+  A missing secret or signer error retains that entry for retry and continues
+  through the queue. Funding outpoint mismatches are logged with the candidate,
+  channel, old input and active input; obsolete inbound-splice heads no longer
+  block later states. Failed entries remain available because a funding mismatch
+  may also be an unconfirmed splice. Legacy entries without funding metadata also
+  cannot block the queue.
   On restart, unsigned entries newer than the restored monitor are discarded:
   they preceded a monitor write that never completed, and their commitment may
-  never be sent. Keeping them could permanently block later signing. Signed
-  candidates are retained. Record shape, fee bounds, channel/txid identity and
+  never be sent. Funding-retirement proof is discarded on monitor rollback or an
+  ambiguous same-update-ID funding change. Signed candidates are retained. Record shape, fee bounds, channel/txid identity and
   signed/unsigned witness state are validated on reads.
 - Signed candidates are durably emitted at
   `tower_candidates/<channel_id>/<revoked_txid>`, before removing unsigned data.
   Replays replace the same key. `TowerClient::pending_candidates(channel_id)`
-  reads without acknowledgement or removal; archive also retains these records.
-  A crash before/after either write cannot silently lose an acknowledged state.
-  A failed/corrupt tower record or the 10,000-candidate/channel limit returns
-  `UnrecoverableError` **before advancing the wrapped monitor**: LDK stops rather
-  than acknowledge unguardable progress. This is a synchronous local-disk failure
-  policy, not a wait for a remote tower.
+  returns valid records without acknowledgement or removal; archive retains them.
+  New funding and observation metadata use optional odd TLVs, preserving W1 read
+  compatibility and the public `JusticeCandidate` encoding. Redelivering
+  an older `Some(update)` retains its original update ID for pruning order.
+- Corrupt pending or signed records are copied to
+  `tower_quarantine_pending/<channel_id>/<digest>` or
+  `tower_quarantine_candidates/<channel_id>/<digest>`, then removed from the active
+  queue and logged. Content-addressed copies preserve the corrupt bytes and make
+  interrupted moves retryable. Startup checks signed records even when no pending
+  entry references them; candidate reads quarantine corrupt entries too. Recovery
+  continues, but cannot reconstruct arbitrary historical commitments from a corrupt
+  journal. Real storage errors (including quarantine writes/removals) still return
+  `UnrecoverableError` **before advancing the wrapped monitor**, never `Completed`.
+- The signed-candidate target is 10,000 per channel. Above it, drop the oldest
+  superseded alternatives first: a record is eligible only when another signed
+  candidate for the same commitment number has a strictly newer observation update
+  ID **and** the older candidate's funding scope was observed being retired by LDK.
+  Active and still-pending splice alternatives remain protected even at the same
+  commitment number. Retirement follows LDK's configured splice confirmation policy
+  (which can allow zero confirmations), not an independent guarantee against reorgs.
+  Persist the incoming candidate before pruning or dequeueing. Keep the newest per
+  commitment, tied observations and legacy records without age/funding proof. If
+  these exceed 10,000, retain them and log the excess: the target is soft, so distinct
+  revoked commitments are never discarded merely to meet a size limit. Pruning is
+  local to the channel and is not tower acknowledgement. Ordinary ordered writes
+  remain retryable across crashes; disk write failures never report completion.
 - `fee_estimator.rs`: a separate `tower_justice_rate` accessor recovers the
   unadjusted one-block estimate from the cached `MaximumFeeEstimate`. All three
   chain sources store `floor(raw * 11 / 10) + 2500`; the accessor exactly inverts
@@ -549,25 +577,28 @@ No lightning source, dependency, lockfile, wire protocol or monitor encoding cha
   `do_test_forming_justice_tx_from_monitor_updates`, checking every signed tier
   with `check_spends!`. Covers initial/later commitments, below dust, anchor
   channels, fresh decorator/client restart before revocation, durable signed
-  reload, replay, injected failures at each queue write, fee limits/overflow,
+  reload, repeated redelivery of the same `Some(update)` both before and after
+  revocation (unchanged pending bytes and signed records), missing-record initial
+  staging on `Some(update)`, injected failures at each queue write, fee limits/overflow,
   the production fee adapter and byte/status/completion/archive equivalence
   when disabled. A further crash regression restores serialized monitor AND
   channel-manager snapshots with a newer tower journal, then makes/revokes a
   different commitment. The reference test's simulated confirmation and recovered
-  balance checks are also ported. Malformed records return errors.
+  balance checks are also ported. W1b adds a real in-memory inbound splice and
+  client restart followed by further signing, corrupt-record quarantine and restart,
+  failed quarantine writes, oldest-superseded cap pruning, replay at the cap,
+  failed signed writes at the cap, retention of more than 10,000 distinct states,
+  protection of both funding scopes during an unconfirmed splice under cap pressure,
+  pruning after LDK scope retirement, and rollback of uncertain retirement evidence.
 
 Validation commands (no node is started and no RPC, regtest daemon or e2e runs):
 
     cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib tower_hook
     cargo check --offline --locked --workspace --all-targets
-    cargo clippy --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --all-targets
-
-Strict clippy (`-- -D warnings`) currently fails on existing vendor lint debt;
-W1 lint issues are fixed or narrowly allowed for LDK-generated TLV reader code.
 
 This does **not** claim tower protection: W2 encryption/outbox, transport, tower
 configuration, payment, acknowledgement/pruning and app status are not built.
 Enabling after earlier channel use cannot recover historical commitments missed
-while disabled. A signing error also retains a superseded splice at the head,
-matching the contract's stop-and-retry policy; splice-specific pruning is not
-implemented. Fable + Grok PASS on the same SHA remains the money-path merge gate.
+while disabled. Quarantining corruption can leave historical states unguarded;
+this recovery policy avoids a permanent startup loop and does not claim repair of
+lost tower data. Fable + Grok PASS on the same SHA remains the money-path merge gate.
