@@ -5,20 +5,13 @@ use lightning::sign::SignerProvider;
 use lightning::util::test_utils::TestPersister;
 use lightning_persister::fs_store::FilesystemStore;
 
-struct Fees(u32);
-impl FeeEstimator for Fees {
-    fn get_est_sat_per_1000_weight(&self, _: ConfirmationTarget) -> u32 {
-        self.0
-    }
-}
-
 fn hook(path: &std::path::Path, script: ScriptBuf) -> TowerPersister<TestPersister> {
     TowerPersister::new(
         TestPersister::new(),
         Some(Arc::new(TowerClient::new(Arc::new(FilesystemStore::new(
             path.into(),
         ))))),
-        Arc::new(Fees(1000)),
+        Arc::new(|| 1000),
         Arc::new(move || Ok(script.clone())),
     )
 }
@@ -101,10 +94,13 @@ fn forming_justice(initial: bool, restart: bool, anchors: bool) {
             .read("tower", "pending", &channel_id.to_string())
             .unwrap();
         let state: PendingChannel = decode(&bytes).unwrap();
-        assert!(state
-            .pending
-            .iter()
-            .any(|c| c.ladder[0].input[0].previous_output.txid == revoked.compute_txid()));
+        assert!(
+            state
+                .pending
+                .iter()
+                .any(|c| c.candidate.ladder[0].input[0].previous_output.txid
+                    == revoked.compute_txid())
+        );
         *persisters[1].0.lock().unwrap() = restored;
         // Match builder startup: persist the reloaded monitor before later revocations arrive.
         let monitor = nodes[1]
@@ -149,6 +145,46 @@ fn forming_justice(initial: bool, restart: bool, anchors: bool) {
             .unwrap(),
         candidates
     );
+    // Complete the upstream functional-test port using only simulated blocks.
+    if !anchors {
+        let justice = &candidate.ladder[0];
+        mine_transactions(&nodes[1], &[&revoked, justice]);
+        mine_transactions(&nodes[0], &[&revoked, justice]);
+        get_announce_close_broadcast_events(&nodes, 1, 0);
+        for (index, peer) in [(1, 0), (0, 1)] {
+            check_added_monitors(&nodes[index], 1);
+            check_closed_event(
+                &nodes[index],
+                1,
+                lightning::events::ClosureReason::CommitmentTxConfirmed,
+                false,
+                &[nodes[peer].node.get_our_node_id()],
+                100_000,
+            );
+        }
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(channel_id)
+            .unwrap();
+        let total: u64 = monitor
+            .get_claimable_balances()
+            .iter()
+            .map(|balance| match balance {
+                lightning::chain::channelmonitor::Balance::ClaimableAwaitingConfirmations {
+                    amount_satoshis,
+                    ..
+                } => *amount_satoshis,
+                _ => panic!("unexpected claim balance"),
+            })
+            .sum();
+        let original_balance = if initial {
+            0
+        } else {
+            revoked.output[0].value.to_sat()
+        };
+        assert_eq!(total, original_balance + justice.output[0].value.to_sat());
+    }
 }
 
 #[test]
@@ -169,9 +205,11 @@ fn restart_mid_queue_keeps_later_pending_with_anchors() {
     forming_justice(false, true, true);
 }
 
+type PersistedCall = (String, Vec<u8>, Option<Vec<u8>>);
+
 #[derive(Default)]
 struct Recorder {
-    calls: Mutex<Vec<(String, Vec<u8>, Option<Vec<u8>>)>>,
+    calls: Mutex<Vec<PersistedCall>>,
     status: Mutex<Option<ChannelMonitorUpdateStatus>>,
 }
 impl<S: EcdsaChannelSigner> Persist<S> for Recorder {
@@ -259,7 +297,7 @@ fn storage_failure_does_not_advance_monitor_and_restart_retries() {
         let hook = TowerPersister::new(
             Recorder::default(),
             Some(Arc::new(TowerClient::new(store.clone()))),
-            Arc::new(Fees(1000)),
+            Arc::new(|| 1000),
             Arc::new(move || Ok(destination.clone())),
         );
         let monitor = nodes[1]
@@ -333,6 +371,9 @@ fn disabled_delegates_bytes_status_completion_and_archive() {
     let managers = create_node_chanmgrs(2, &configs, &[None, None]);
     let nodes = create_network(2, &configs, &managers);
     let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let updates = nodes[1].chain_monitor.monitor_updates.lock().unwrap();
+    let update = updates.get(&id).unwrap().last().unwrap();
     let monitor = nodes[1]
         .chain_monitor
         .chain_monitor
@@ -341,7 +382,7 @@ fn disabled_delegates_bytes_status_completion_and_archive() {
     let hook = TowerPersister::new(
         Recorder::default(),
         None,
-        Arc::new(Fees(1000)),
+        Arc::new(|| 1000),
         Arc::new(|| panic!("disabled allocated a wallet address")),
     );
     let direct = Recorder::default();
@@ -363,6 +404,10 @@ fn disabled_delegates_bytes_status_completion_and_archive() {
             direct.update_persisted_channel(monitor.persistence_key(), None, &monitor)
         );
     }
+    assert_eq!(
+        hook.update_persisted_channel(monitor.persistence_key(), Some(update), &monitor),
+        direct.update_persisted_channel(monitor.persistence_key(), Some(update), &monitor)
+    );
     type Signer = lightning::util::test_channel_signer::TestChannelSigner;
     assert_eq!(
         <TowerPersister<Recorder> as Persist<Signer>>::get_and_clear_completed_updates(&hook),
@@ -421,4 +466,250 @@ fn fee_ladder_caps_floor_dust_and_overflow() {
         253
     )
     .is_none());
+}
+
+#[test]
+fn crash_with_tower_ahead_of_durable_monitor_does_not_block_new_states() {
+    use lightning::ln::channelmanager::{PaymentId, RecipientOnionFields};
+    use lightning::ln::msgs::BaseMessageHandler;
+    use lightning::util::test_utils::TestChainMonitor;
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let cfg = create_chanmon_cfgs(2);
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let persisters = [
+        hook(dirs[0].path(), script.clone()),
+        hook(dirs[1].path(), script.clone()),
+    ];
+    let (restored, chain_monitor);
+    let configs = create_node_cfgs_with_persisters(2, &cfg, persisters.iter().collect());
+    let manager;
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let mut nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let manager_bytes = nodes[1].node.encode();
+    let monitor_bytes = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap()
+        .encode();
+    let before: PendingChannel = decode(
+        &persisters[1]
+            .client
+            .as_ref()
+            .unwrap()
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    // TestPersister does not write monitors. Keep only the old durable snapshot and discard
+    // outbound messages, simulating the crash after staging and before monitor fsync. No message
+    // reaches the peer. Restore the LAST durable manager/monitor, not these advanced objects.
+    let (route, hash, _, secret) =
+        lightning::get_route_and_payment_hash!(nodes[1], nodes[0], 2_000_000);
+    nodes[1]
+        .node
+        .send_payment_with_route(
+            route,
+            hash,
+            RecipientOnionFields::secret_only(secret),
+            PaymentId(hash.0),
+        )
+        .unwrap();
+    check_added_monitors(&nodes[1], 1);
+    assert!(!nodes[1].node.get_and_clear_pending_msg_events().is_empty()); // discard, never delivered
+    let ahead: PendingChannel = decode(
+        &persisters[1]
+            .client
+            .as_ref()
+            .unwrap()
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(ahead.pending.len() > before.pending.len());
+
+    restored = hook(dirs[1].path(), ScriptBuf::new());
+    chain_monitor = TestChainMonitor::new(
+        Some(nodes[1].chain_source),
+        nodes[1].tx_broadcaster,
+        nodes[1].logger,
+        nodes[1].fee_estimator,
+        &restored,
+        nodes[1].keys_manager,
+    );
+    nodes[1].chain_monitor = &chain_monitor;
+    manager = _reload_node(
+        &nodes[1],
+        test_default_channel_config(),
+        &manager_bytes,
+        &[&monitor_bytes],
+    );
+    nodes[1].node = &manager;
+    nodes[1].onion_messenger.set_offers_handler(&manager);
+    nodes[1]
+        .onion_messenger
+        .set_async_payments_handler(&manager);
+    {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        assert_eq!(
+            restored.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+    }
+    let recovered: PendingChannel = decode(
+        &restored
+            .client
+            .as_ref()
+            .unwrap()
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        recovered.pending.len(),
+        before.pending.len(),
+        "unacknowledged future queue entries must roll back with the monitor"
+    );
+    nodes[1].node.get_and_clear_pending_events(); // finish startup completion actions
+    nodes[0]
+        .node
+        .peer_disconnected(nodes[1].node.get_our_node_id());
+    reconnect_nodes(ReconnectArgs::new(&nodes[0], &nodes[1]));
+    send_payment(&nodes[1], &[&nodes[0]], 1_000_000);
+    let revoked = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    send_payment(&nodes[1], &[&nodes[0]], 1_000_000);
+    let candidates = restored
+        .client
+        .as_ref()
+        .unwrap()
+        .pending_candidates(id)
+        .unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|c| c.ladder[0].input[0].previous_output.txid == revoked.compute_txid())
+        .unwrap();
+    for tx in &candidate.ladder {
+        lightning::check_spends!(tx, revoked);
+    }
+}
+
+#[test]
+fn production_tower_fee_uses_unadjusted_one_block_estimate() {
+    use crate::fee_estimator::{apply_post_estimation_adjustments, OnchainFeeEstimator};
+    let estimator = OnchainFeeEstimator::new(60);
+    let target = lightning::chain::chaininterface::ConfirmationTarget::MaximumFeeEstimate.into();
+    for raw in [253, 254, 1000, 8000, 1 << 30, u32::MAX] {
+        let padded = apply_post_estimation_adjustments(
+            target,
+            bitcoin::FeeRate::from_sat_per_kwu(raw as u64),
+        );
+        estimator.set_test_fee_rate_cache([(target, padded)].into_iter().collect());
+        assert_eq!(estimator.tower_justice_rate(), raw);
+    }
+}
+
+#[test]
+fn malformed_candidate_records_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = create_chanmon_cfgs(2);
+    let configs = create_node_cfgs(2, &cfg);
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let hook = hook(dir.path(), script);
+    {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        assert_eq!(
+            hook.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+    }
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let monitor = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap();
+    assert_eq!(
+        hook.update_persisted_channel(monitor.persistence_key(), None, &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    let client = hook.client.as_ref().unwrap();
+    let original = client.pending_candidates(id).unwrap().remove(0);
+    let key = candidate_key(&original);
+    for mutation in 0..4 {
+        let mut bad = original.clone();
+        match mutation {
+            0 => bad.ladder.clear(),
+            1 => bad.channel_id = ChannelId([42; 32]),
+            2 => bad.ladder[0].input.clear(),
+            3 => bad.ladder[0].input[0].witness.clear(),
+            _ => unreachable!(),
+        }
+        client
+            .store
+            .write("tower_candidates", &id.to_string(), &key, bad.encode())
+            .unwrap();
+        assert!(
+            client.pending_candidates(id).is_err(),
+            "malformed signed record {mutation} accepted"
+        );
+    }
+    client
+        .store
+        .write("tower_candidates", &id.to_string(), &key, original.encode())
+        .unwrap();
+    let wrong_key = "00".repeat(32);
+    client
+        .store
+        .write(
+            "tower_candidates",
+            &id.to_string(),
+            &wrong_key,
+            original.encode(),
+        )
+        .unwrap();
+    assert!(
+        client.pending_candidates(id).is_err(),
+        "record txid must match key"
+    );
+    client
+        .store
+        .remove("tower_candidates", &id.to_string(), &wrong_key, false)
+        .unwrap();
+    let mut state: PendingChannel = decode(
+        &client
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    let mut bad = original;
+    bad.ladder.clear();
+    state.pending.push(PendingCandidate {
+        candidate: bad,
+        observed_update_id: monitor.get_latest_update_id(),
+    });
+    client
+        .store
+        .write("tower", "pending", &id.to_string(), state.encode())
+        .unwrap();
+    assert_eq!(
+        hook.persist_new_channel(monitor.persistence_key(), &monitor),
+        ChannelMonitorUpdateStatus::UnrecoverableError
+    );
 }

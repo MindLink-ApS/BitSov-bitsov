@@ -93,7 +93,7 @@ pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 	Arc<Broadcaster>,
 	Arc<OnchainFeeEstimator>,
 	Arc<Logger>,
-	Arc<Persister>,
+	Arc<crate::tower_hook::TowerPersister<Persister>>,
 	Arc<KeysManager>,
 >;
 

@@ -42,6 +42,20 @@ pub(crate) struct OnchainFeeEstimator {
 }
 
 impl OnchainFeeEstimator {
+	// W1 needs the one-block estimate without LDK's fee-inflation protection margin.
+	pub(crate) fn tower_justice_rate(&self) -> u32 {
+		let cache = self.fee_rate_cache.read().unwrap();
+		let target = LdkConfirmationTarget::MaximumFeeEstimate;
+		let Some(adjusted) = cache.get(&target.into()) else {
+			return get_fallback_rate_for_ldk_target(target);
+		};
+		// All chain sources cache apply_post_estimation_adjustments below. Invert its
+		// floor(raw * 11 / 10) + 2500 exactly for integer sat/kWU, without fetching
+		// another estimate or changing the fee cache / disabled-node behavior.
+		let raw = (u128::from(adjusted.to_sat_per_kwu().saturating_sub(2500)) * 10).div_ceil(11);
+		raw.clamp(FEERATE_FLOOR_SATS_PER_KW as u128, u32::MAX as u128) as u32
+	}
+
 	pub(crate) fn new(fee_refresh_interval_secs: u64) -> Self {
 		let fee_rate_cache = RwLock::new(HashMap::new());
 		Self {

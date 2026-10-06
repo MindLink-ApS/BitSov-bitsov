@@ -1,6 +1,5 @@
 //! Local, durable watchtower staging. W1 only: no encryption, transport or tower acknowledgement.
 use bitcoin::{ScriptBuf, Transaction};
-use lightning::chain::chaininterface::{ConfirmationTarget, FeeEstimator};
 use lightning::chain::chainmonitor::Persist;
 use lightning::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate};
 use lightning::chain::ChannelMonitorUpdateStatus;
@@ -54,27 +53,43 @@ impl TowerClient {
             .into_iter()
             .map(|key| {
                 let bytes = self.store.read("tower_candidates", &channel, &key)?;
-                decode(&bytes)
+                let candidate = decode(&bytes)?;
+                validate_candidate(&candidate, channel_id, Some(&key), true)?;
+                Ok(candidate)
             })
             .collect()
     }
 }
 
-impl_writeable_tlv_based!(JusticeCandidate, {
-    (0, channel_id, required),
-    (2, commitment_number, required),
-    (4, ladder, required_vec),
-    (6, value, required),
-});
+struct PendingCandidate {
+    candidate: JusticeCandidate,
+    observed_update_id: u64,
+}
 
 struct PendingChannel {
     destination: ScriptBuf,
-    pending: Vec<JusticeCandidate>,
+    pending: Vec<PendingCandidate>,
 }
-impl_writeable_tlv_based!(PendingChannel, {
-    (0, destination, required),
-    (2, pending, required_vec),
-});
+
+// LDK TLV readers deliberately drop a borrow-tracking reader before checking length.
+#[allow(clippy::drop_non_drop)]
+mod encoding {
+    use super::*;
+    impl_writeable_tlv_based!(JusticeCandidate, {
+        (0, channel_id, required),
+        (2, commitment_number, required),
+        (4, ladder, required_vec),
+        (6, value, required),
+    });
+    impl_writeable_tlv_based!(PendingCandidate, {
+        (0, candidate, required),
+        (2, observed_update_id, required),
+    });
+    impl_writeable_tlv_based!(PendingChannel, {
+        (0, destination, required),
+        (2, pending, required_vec),
+    });
+}
 
 fn decode<T: Readable>(bytes: &[u8]) -> io::Result<T> {
     let mut reader = io::Cursor::new(bytes);
@@ -87,6 +102,50 @@ fn decode<T: Readable>(bytes: &[u8]) -> io::Result<T> {
         ));
     }
     Ok(value)
+}
+
+fn validate_candidate(
+    candidate: &JusticeCandidate,
+    channel_id: ChannelId,
+    key: Option<&str>,
+    signed: bool,
+) -> io::Result<()> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "Invalid tower candidate");
+    if candidate.channel_id != channel_id
+        || candidate.commitment_number >= (1 << 48)
+        || !(1..=3).contains(&candidate.ladder.len())
+    {
+        return Err(invalid());
+    }
+    for tx in &candidate.ladder {
+        if tx.input.len() != 1
+            || tx.output.len() != 1
+            || tx.input[0].sequence != bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME
+            || (signed && tx.input[0].witness.is_empty())
+            || (!signed && !tx.input[0].witness.is_empty())
+            || tx.output[0].value < tx.output[0].script_pubkey.minimal_non_dust()
+            || candidate
+                .value
+                .checked_sub(tx.output[0].value.to_sat())
+                .is_none_or(|fee| fee > candidate.value / 2)
+        {
+            return Err(invalid());
+        }
+    }
+    let first = &candidate.ladder[0];
+    if key.is_some_and(|key| key != first.input[0].previous_output.txid.to_string())
+        || candidate.ladder.iter().any(|tx| {
+            tx.input[0].previous_output != first.input[0].previous_output
+                || tx.output[0].script_pubkey != first.output[0].script_pubkey
+        })
+        || candidate
+            .ladder
+            .windows(2)
+            .any(|tiers| tiers[0].output[0].value <= tiers[1].output[0].value)
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn candidate_key(candidate: &JusticeCandidate) -> String {
@@ -104,7 +163,7 @@ fn form_candidate(
 ) -> Option<JusticeCandidate> {
     let trusted = commitment.trust();
     let index = trusted.revokeable_output_index()?;
-    let value = trusted.built_transaction().transaction.output[index as usize]
+    let value = trusted.built_transaction().transaction.output[index]
         .value
         .to_sat();
     let base = feerate.max(253);
@@ -137,14 +196,14 @@ type Destination = Arc<dyn Fn() -> io::Result<ScriptBuf> + Send + Sync>;
 pub(crate) struct TowerPersister<P> {
     inner: P,
     client: Option<Arc<TowerClient>>,
-    fees: Arc<dyn FeeEstimator + Send + Sync>,
+    fees: Arc<dyn Fn() -> u32 + Send + Sync>,
     destination: Destination,
 }
 impl<P> TowerPersister<P> {
     pub(crate) fn new(
         inner: P,
         client: Option<Arc<TowerClient>>,
-        fees: Arc<dyn FeeEstimator + Send + Sync>,
+        fees: Arc<dyn Fn() -> u32 + Send + Sync>,
         destination: Destination,
     ) -> Self {
         Self {
@@ -177,6 +236,22 @@ impl<P> TowerPersister<P> {
             ),
             Err(e) => return Err(e.into()),
         };
+        // A crash can leave the tower write-ahead record newer than the durable monitor.
+        // Those unsigned commitments were never acknowledged, so the manager can choose
+        // different transactions at the same commitment number on restart. Drop only entries
+        // beyond the restored monitor; otherwise an unknown txid could block the queue forever.
+        state
+            .pending
+            .retain(|p| p.observed_update_id <= monitor.get_latest_update_id());
+        for pending in &state.pending {
+            validate_candidate(&pending.candidate, id, None, false)?;
+            if pending.candidate.ladder[0].output[0].script_pubkey != state.destination {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Tower destination mismatch",
+                ));
+            }
+        }
         let mut commitments = Vec::new();
         if fresh {
             commitments.extend(monitor.initial_counterparty_commitment_tx());
@@ -184,21 +259,27 @@ impl<P> TowerPersister<P> {
         if let Some(update) = update {
             commitments.extend(monitor.counterparty_commitment_txs_from_update(update));
         }
-        let rate = self
-            .fees
-            .get_est_sat_per_1000_weight(ConfirmationTarget::MaximumFeeEstimate);
+        let rate = (self.fees)();
         for commitment in commitments {
             if let Some(candidate) = form_candidate(id, &commitment, &state.destination, rate) {
                 let key = candidate_key(&candidate);
-                if state.pending.iter().any(|c| candidate_key(c) == key) {
+                if state
+                    .pending
+                    .iter()
+                    .any(|c| candidate_key(&c.candidate) == key)
+                {
                     continue;
                 }
                 match client.store.read("tower_candidates", &channel, &key) {
                     Ok(bytes) => {
-                        let _: JusticeCandidate = decode(&bytes)?;
+                        let existing: JusticeCandidate = decode(&bytes)?;
+                        validate_candidate(&existing, id, Some(&key), true)?;
                     }
                     Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => {
-                        state.pending.push(candidate)
+                        state.pending.push(PendingCandidate {
+                            candidate,
+                            observed_update_id: monitor.get_latest_update_id(),
+                        })
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -208,7 +289,8 @@ impl<P> TowerPersister<P> {
         client
             .store
             .write("tower", "pending", &channel, state.encode())?;
-        while let Some(candidate) = state.pending.first() {
+        while let Some(pending) = state.pending.first() {
+            let candidate = &pending.candidate;
             let mut signed = candidate.clone();
             let ladder = candidate
                 .ladder
