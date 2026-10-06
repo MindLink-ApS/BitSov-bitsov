@@ -259,6 +259,7 @@ pub fn lightning_config(dir: &std::path::Path, url: &str) -> konsensus_lightning
     let (mnemonic, _) = NodeIdentity::generate().unwrap();
     konsensus_lightning::LdkConfig {
         forward_to_private_channels: false,
+        our_to_self_delay_blocks: None,
         lsps2_service: Default::default(),
         channel_peers: None,
         esplora_sync_intervals: Default::default(),

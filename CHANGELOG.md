@@ -3,6 +3,13 @@
 All notable BitSov node (`konsensus`) releases are documented here. Pre-rc8 notes
 also live on the corresponding GitHub pre-release pages.
 
+## Unreleased
+
+- Optional `[lightning] our_to_self_delay_blocks` (144 to 2016) sets the breach
+  window peers must accept on new channels, inbound and outbound. Home nodes
+  that may stay locked can set 288 (about two days). Omitting it keeps LDK's 144;
+  existing channels keep their negotiated value. See [the home-node runbook](docs/operations/home-node.md#longer-breach-window-optional).
+
 ## [0.3.0-rc10] — 2026-10-06 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Covers the 14 merged commits from
