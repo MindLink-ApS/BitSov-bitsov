@@ -183,9 +183,9 @@ mod tests {
                         received_at: Instant::now(),
                         trust_discount: discount,
                     };
-                    // Exercise every u16 kind through both advert paths. Gate-check
-                    // every built-in kind plus the extension range's endpoints;
-                    // interior extension kinds share the same category price.
+                    // Every u16 kind goes through both advert paths. The gate check
+                    // covers every built-in kind, both extension-range endpoints and
+                    // every 64th interior extension kind (all 65,536 take ~5 min).
                     for kind in 0..=u16::MAX {
                         let Some(cached) = entry.get_discounted_price_for_kind(kind) else {
                             assert!((700..900).contains(&kind), "missing advert for kind={kind}");
@@ -194,8 +194,7 @@ mod tests {
                         let offered = advertised_price(base, discount, admission);
                         assert_eq!(cached, offered, "kind={kind}, base={base}, discount={discount}, admission={admission}");
                         assert!(offered >= 1000 && offered >= admission);
-                        if kind > 1000 && kind < u16::MAX {
-                            assert_eq!(entry.get_discounted_price_for_kind(1000), Some(offered));
+                        if kind > 1000 && kind < u16::MAX && kind % 64 != 0 {
                             continue;
                         }
                         let mut envelope = UkmEnvelopeBuilder::new(
