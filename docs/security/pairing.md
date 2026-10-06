@@ -48,9 +48,14 @@ silently rotated; a malformed file or a symlink fails startup. Restore a damaged
 key from backup. Deleting it generates a different key on the next open and invalidates
 any previously saved box pin. Include it in protected data-directory backups;
 it is not recoverable from the mnemonic. Secret bytes are zeroized on drop.
-Key and identity metadata publication require successful directory synchronization,
-including their parent data directory. Sync failures refuse startup; retrying
-keeps the published key and retries synchronization, even for unchanged files.
+Key creation requires a filesystem that supports hard links (for example NTFS,
+ext4 or APFS; exFAT/FAT SD cards are not supported). On Unix, key and identity
+metadata publication require successful directory synchronization, including their
+parent data directory. Sync failures refuse startup; retrying keeps the published
+key and retries synchronization, even for unchanged files. On non-Unix platforms,
+directory synchronization is best-effort for unsupported or permission-denied
+operations, including Windows read-only directory handles; other errors still
+refuse startup.
 
 On every **unlocked** start, including when remote access is disabled, the node
 signs the box public key with its Ed25519 identity and atomically creates or

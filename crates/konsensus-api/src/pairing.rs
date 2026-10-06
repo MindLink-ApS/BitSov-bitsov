@@ -3701,6 +3701,14 @@ fn load_box_transport_key_with_sync(
     dir: &Path,
     sync_dir: impl Fn(&Path) -> io::Result<()>,
 ) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
+    load_box_transport_key_with_io(dir, sync_dir, |from, to| std::fs::hard_link(from, to))
+}
+
+fn load_box_transport_key_with_io(
+    dir: &Path,
+    sync_dir: impl Fn(&Path) -> io::Result<()>,
+    hard_link: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
     use std::io::{Read, Write};
     let path = dir.join("box-transport.key");
     match std::fs::symlink_metadata(&path) {
@@ -3722,10 +3730,18 @@ fn load_box_transport_key_with_sync(
                 // Publish a complete, synced key without clobbering a winner
                 // from a concurrent open. A crash leaves at worst an ignored
                 // protected temporary file, never a partial authoritative key.
-                match std::fs::hard_link(&temporary, &path) {
+                match hard_link(&temporary, &path) {
                     Ok(()) => Ok(()),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-                    Err(error) => Err(error),
+                    Err(error) => Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot publish box transport key at {} via hard link: {error}. \
+                             The data directory must be on a filesystem that supports hard links; \
+                             exFAT/FAT SD cards do not. Use a filesystem such as NTFS, ext4 or APFS",
+                            path.display()
+                        ),
+                    )),
                 }
             })();
             drop(file);
@@ -3768,6 +3784,38 @@ fn load_box_transport_key_with_sync(
 #[cfg(test)]
 mod box_transport_durability_tests {
     use super::*;
+
+    #[cfg(not(unix))]
+    #[test]
+    fn strict_directory_sync_is_best_effort_on_non_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        // Windows may reject opening or flushing a read-only directory handle.
+        fsync_dir_strict(dir.path()).unwrap();
+        assert_eq!(
+            fsync_dir_strict(&dir.path().join("missing"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn unsupported_hard_links_explain_filesystem_requirement_and_leave_no_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = load_box_transport_key_with_io(dir.path(), fsync_dir_strict, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "injected unsupported link",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        let message = error.to_string();
+        assert!(message.contains("hard links"), "{message}");
+        assert!(message.contains("exFAT"), "{message}");
+        assert!(message.contains("injected unsupported link"), "{message}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3844,10 +3892,32 @@ pub fn restrict_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// fsync a directory so a rename into it is durable.
-/// Unlike the best-effort helper below, transport pins require durable names.
+/// fsync a directory so a rename into it is durable on Unix.
+/// Non-Unix platforms tolerate unsupported/permission-denied directory syncs.
 pub fn fsync_dir_strict(path: &Path) -> io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
+    let result = std::fs::File::open(path).and_then(|dir| dir.sync_all());
+    #[cfg(unix)]
+    {
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows can reject opening a directory or flushing a read-only
+        // directory handle. Keep directory sync best-effort on these platforms
+        // without discarding unrelated I/O failures. Unix transport pins still
+        // require successful directory synchronization.
+        match result {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
+    }
 }
 
 /// Best-effort directory fsync for existing callers.
