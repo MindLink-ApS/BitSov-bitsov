@@ -1,10 +1,11 @@
 //! Pre-Noise anti-DoS cookie (doorway hardening #2, "A-first").
 //!
 //! A **stateless return-routability cookie** that sits *before* the Noise_XX DH,
-//! so a node can refuse to spend an X25519 Diffie–Hellman on a spoofed or
-//! unproven source — the free-DH leak the per-subnet rate-limit (#300) could only
+//! so a node can refuse to spend an X25519 Diffie–Hellman on a source that has
+//! not proven it receives at its address (TCP already rules out blind spoofing) — the free-DH leak the per-subnet rate-limit (#300) could only
 //! *rate*-bound. No per-client cookie record or Noise state is created:
-//! a cookie is `HMAC(secret, src-ip ‖ epoch)`, recomputed on demand,
+//! a cookie is `HMAC(secret, src-ip ‖ epoch)` under a secret that rotates every
+//! two minutes (two generations kept), recomputed on demand,
 //! so the defense itself cannot be turned into a memory-DoS.
 //!
 //! Properties (per the #301 decision — "C implemented A-first"):
@@ -31,11 +32,13 @@
 //!   never admission; it changes no payment-gate and no message-wire semantics.
 
 use std::net::IpAddr;
+use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use konsensus_core::traits::transport::TransportError;
 
@@ -68,6 +71,11 @@ pub(super) const MAX_PRE_NOISE_FRAME: usize = 64;
 /// admit to a handshake.
 pub(super) const COOKIE_EPOCH_SECS: u64 = 30;
 
+/// The MAC secret rotates every `COOKIE_ROTATE_EPOCHS` epochs (2 minutes). Two
+/// generations are kept, which covers the current + previous epoch a verifier
+/// accepts across any rotation boundary.
+pub(super) const COOKIE_ROTATE_EPOCHS: u64 = 4;
+
 const KIND_CHALLENGE: u8 = 1;
 const KIND_RESPONSE: u8 = 2;
 
@@ -93,28 +101,76 @@ pub enum CookieMode {
     Required,
 }
 
-/// A node's in-memory cookie secret. Random at process start; **never persisted,
-/// never on the wire, never logged**.
+/// A node's in-memory cookie secrets. Random, **never persisted, never on the
+/// wire, never logged**, wiped on rotation and drop.
 ///
-/// v1 uses a single generation: a fixed secret plus epoch-based expiry is already
-/// stateless and time-bounded. A rotating two-generation keyring (to bound the
-/// lifetime of a compromised secret) is a documented follow-up and does not
-/// change the wire format.
+/// Two generations: the secret for the current rotation window and the one
+/// before it. A window is `COOKIE_ROTATE_EPOCHS` epochs; secrets older than the
+/// previous window are gone, which bounds the lifetime of a leaked secret to
+/// ~4 minutes. Rotation is lazy (on the next issue/verify), so it needs no task.
 pub(super) struct CookieKeyring {
-    secret: [u8; 32],
+    keys: StdMutex<KeyGenerations>,
+}
+
+struct KeyGenerations {
+    window: Option<u64>,
+    current: Zeroizing<[u8; 32]>,
+    previous: Option<Zeroizing<[u8; 32]>>,
+}
+
+fn fresh_secret() -> Zeroizing<[u8; 32]> {
+    let mut secret = Zeroizing::new([0u8; 32]);
+    rand::thread_rng().fill_bytes(secret.as_mut());
+    secret
 }
 
 impl CookieKeyring {
     /// Generate a fresh random keyring (called once at transport start).
     pub(super) fn random() -> Self {
-        let mut secret = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret);
-        Self { secret }
+        Self {
+            keys: StdMutex::new(KeyGenerations {
+                window: None,
+                current: fresh_secret(),
+                previous: None,
+            }),
+        }
+    }
+
+    /// Advance to the rotation window covering `epoch_now`, then return the
+    /// secret for `epoch` (current or previous window only).
+    fn secret_for(&self, epoch: u64, epoch_now: u64) -> Option<Zeroizing<[u8; 32]>> {
+        let now_window = epoch_now / COOKIE_ROTATE_EPOCHS;
+        let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+        match keys.window {
+            None => keys.window = Some(now_window),
+            Some(w) if now_window == w + 1 => {
+                let next = fresh_secret();
+                let old = std::mem::replace(&mut keys.current, next);
+                keys.previous = Some(old);
+                keys.window = Some(now_window);
+            }
+            Some(w) if now_window > w + 1 => {
+                keys.current = fresh_secret();
+                keys.previous = None;
+                keys.window = Some(now_window);
+            }
+            // Same window, or the wall clock stepped back: keep the keys.
+            Some(_) => {}
+        }
+        let current = keys.window?;
+        let want = epoch / COOKIE_ROTATE_EPOCHS;
+        if want == current {
+            Some(keys.current.clone())
+        } else if want.wrapping_add(1) == current {
+            keys.previous.clone()
+        } else {
+            None
+        }
     }
 
     /// `HMAC-SHA256(secret, ip-octets ‖ epoch_le)`, truncated to 16 bytes.
-    fn mac(&self, ip: IpAddr, epoch: u64) -> [u8; 16] {
-        let mut mac = HmacSha256::new_from_slice(&self.secret)
+    fn mac(secret: &[u8; 32], ip: IpAddr, epoch: u64) -> [u8; 16] {
+        let mut mac = HmacSha256::new_from_slice(secret)
             .expect("HMAC-SHA256 accepts a key of any length");
         match ip {
             IpAddr::V4(v4) => mac.update(&v4.octets()),
@@ -130,9 +186,12 @@ impl CookieKeyring {
     /// Issue a fresh cookie for `ip` at the epoch covering `now_unix`.
     pub(super) fn issue(&self, ip: IpAddr, now_unix: u64) -> Cookie {
         let epoch = now_unix / COOKIE_EPOCH_SECS;
+        let secret = self
+            .secret_for(epoch, epoch)
+            .expect("the current window always has a secret");
         Cookie {
             epoch,
-            mac: self.mac(ip, epoch),
+            mac: Self::mac(&secret, ip, epoch),
         }
     }
 
@@ -145,7 +204,10 @@ impl CookieKeyring {
         if presented.epoch != epoch_now && presented.epoch.wrapping_add(1) != epoch_now {
             return false;
         }
-        let expected = self.mac(ip, presented.epoch);
+        let Some(secret) = self.secret_for(presented.epoch, epoch_now) else {
+            return false;
+        };
+        let expected = Self::mac(&secret, ip, presented.epoch);
         ct_eq_16(&expected, &presented.mac)
     }
 }
@@ -264,8 +326,8 @@ pub(super) fn parse_challenge(bytes: &[u8]) -> Option<CookieFrame> {
 
 // ─── Responder gate ─────────────────────────────────────────────────────────
 
-/// Responder side of the pre-Noise cookie gate (runs only in
-/// [`CookieMode::Required`], before any Noise DH).
+/// Responder side of the pre-Noise cookie gate (runs in
+/// [`CookieMode::Required`], or in `Adaptive` while under load; before any Noise DH).
 ///
 /// Reads the initiator's first framed blob:
 /// - If it is already a valid cookie **response** (a future initiator that cached
@@ -482,4 +544,23 @@ mod tests {
         c.mac[0] ^= 0x01; // flip one bit
         assert!(!k.verify(ip, &c, now));
     }
+
+    #[test]
+    fn secret_rotates_and_previous_window_still_verifies() {
+        let k = CookieKeyring::random();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        // Last epoch of window 1, then the first epoch of window 2.
+        let t_last = (2 * COOKIE_ROTATE_EPOCHS - 1) * COOKIE_EPOCH_SECS;
+        let t_next = 2 * COOKIE_ROTATE_EPOCHS * COOKIE_EPOCH_SECS;
+        let c = k.issue(ip, t_last);
+        let before = k.secret_for(2 * COOKIE_ROTATE_EPOCHS - 1, 2 * COOKIE_ROTATE_EPOCHS - 1).unwrap();
+        assert!(k.verify(ip, &c, t_next), "previous-window cookie valid across rotation");
+        let after = k.secret_for(2 * COOKIE_ROTATE_EPOCHS, 2 * COOKIE_ROTATE_EPOCHS).unwrap();
+        assert_ne!(*before, *after, "the secret rotated");
+        // Two windows later the old secret is gone entirely.
+        let far = 4 * COOKIE_ROTATE_EPOCHS;
+        assert!(k.secret_for(2 * COOKIE_ROTATE_EPOCHS - 1, far).is_none());
+        assert!(!k.verify(ip, &c, far * COOKIE_EPOCH_SECS));
+    }
+
 }

@@ -125,9 +125,15 @@ impl SubnetRateLimiter {
         self.try_admit_key(subnet_key(ip), now)
     }
 
-    fn try_admit_key(&self, key: IpAddr, now: Instant) -> bool {
+    /// Whether `key` already has a bucket or one could be created now (running
+    /// the same bounded cleanup `try_admit_key` would). Takes no token.
+    fn has_room(&self, key: IpAddr, now: Instant) -> bool {
         let key = key.to_canonical();
         let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        self.make_room(&mut map, key, now)
+    }
+
+    fn make_room(&self, map: &mut HashMap<IpAddr, TokenBucket>, key: IpAddr, now: Instant) -> bool {
         if self.max_tracked == 0 {
             return false;
         }
@@ -146,6 +152,15 @@ impl SubnetRateLimiter {
             if map.len() >= self.max_tracked {
                 return false;
             }
+        }
+        true
+    }
+
+    fn try_admit_key(&self, key: IpAddr, now: Instant) -> bool {
+        let key = key.to_canonical();
+        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.make_room(&mut map, key, now) {
+            return false;
         }
 
         let cap = self.capacity;
@@ -188,7 +203,11 @@ impl SourceRateLimiter {
     fn try_admit(&self, ip: IpAddr, now: Instant) -> bool {
         // A rejected /64 must not allocate an exact-IP entry for every rotated
         // host address and thereby deny unrelated sources the bounded table.
-        self.subnets.try_admit(ip, now) && self.ips.try_admit_key(ip, now)
+        // And a host the exact-IP table can't track must not spend its /64's
+        // budget first: check room, then the /64 token, then the IP token.
+        self.ips.has_room(ip, now)
+            && self.subnets.try_admit(ip, now)
+            && self.ips.try_admit_key(ip, now)
     }
 }
 
@@ -776,6 +795,24 @@ mod edge_regressions {
             "a flood from one /64 must not fill the exact-IP table"
         );
         assert_eq!(limiter.ips.buckets.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn untrackable_host_does_not_spend_its_subnet_budget() {
+        // /64 budget 3, both tables track at most 2 keys.
+        let limiter = SourceRateLimiter::new(3.0, 0.001, 2);
+        let now = Instant::now();
+        let a: IpAddr = "2001:db8:1::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1::2".parse().unwrap();
+        assert!(limiter.try_admit(a, now));
+        assert!(limiter.try_admit(b, now));
+        // The exact-IP table is full; new hosts in the same /64 are refused...
+        for host in 3..50 {
+            let ip: IpAddr = format!("2001:db8:1::{host}").parse().unwrap();
+            assert!(!limiter.try_admit(ip, now));
+        }
+        // ...without burning the /64's last token, so a tracked host still gets in.
+        assert!(limiter.try_admit(a, now), "refused hosts must not drain the /64 budget");
     }
 
     #[test]

@@ -86,6 +86,16 @@ or an attacker sharing its NAT or /64. Keep established sessions alive, let
 reconnect backoff run, and retain upstream firewall/SYN-flood protection. This edge
 does not replace kernel TCP backlog or bandwidth defenses.
 
+It is not only an *unlimited* flood. With the defaults (`max_handshakes = 64`,
+`max_per_ip = 4`, `handshake_timeout_secs = 10`) about **16 IPv4 addresses, or 8
+IPv6 /64s**, each holding 4 stalled half-open handshakes, keep every handshake slot
+busy at roughly 7 new connections per second. Cookies don't help here, because the
+addresses are real. New peers then wait until those slots time out; established
+sessions are unaffected. The levers are a shorter `handshake_timeout_secs`, a lower
+`max_per_ip` and a higher `max_handshakes`, each traded against slow or NATed
+honest peers. IPv6 is aggregated at /64, so an attacker with a whole /48 has
+many budgets; IPv4 is limited per address only.
+
 For a shared network with many legitimate nodes, raise per-source bursts/caps
 carefully while retaining cookie-reserved capacity. Validation rejects zero,
 non-finite or excessive limits, an empty reservation, and inconsistent deadlines.
