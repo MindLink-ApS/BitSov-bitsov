@@ -81,6 +81,47 @@ fn remote_access_requires_loopback_plaintext_api_and_advertised_endpoint() {
 }
 
 #[test]
+fn hosted_by_is_bounded_trimmed_and_printable() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    for label in [
+        None,
+        Some("Rasmus's Pi".to_string()),
+        Some("Øresund-boks 🟠".to_string()),
+        Some("𝔅".repeat(64)),
+    ] {
+        config.node.hosted_by = label.clone();
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("{label:?} should be accepted: {error}"));
+    }
+    for (label, reason) in [
+        ("", "empty"),
+        ("   ", "empty"),
+        (" Pi", "whitespace"),
+        ("Pi\n", "whitespace"),
+        ("Rasmus\u{7}Pi", "printable"),
+        ("Rasmus\u{1b}[31mPi", "printable"),
+        ("Pi\u{202E}kcab", "printable"),
+        ("Pi\u{200B}", "printable"),
+        ("Pi\u{2066}x\u{2069}", "printable"),
+    ] {
+        config.node.hosted_by = Some(label.into());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("hosted_by") && error.contains(reason),
+            "{label:?}: {error}"
+        );
+    }
+    config.node.hosted_by = Some("x".repeat(65));
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("at most 64"), "{error}");
+}
+
+#[test]
 fn remote_access_rejects_tcp_port_collisions() {
     let mut config = NodeConfig::default_for_tier(
         NodeTier::Light,

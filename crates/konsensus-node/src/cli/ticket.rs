@@ -83,6 +83,7 @@ pub fn set_locked(dir: &Path, locked: bool) -> Result<()> {
 
 pub fn cmd_pair_ticket(config_path: &Path, qr: bool, ttl: Duration) -> Result<()> {
     let config = NodeConfig::load_before_identity_validation(config_path)?;
+    config.node.validate()?;
     anyhow::ensure!(
         config.remote_access.listen_addr.is_some(),
         "remote access is disabled"

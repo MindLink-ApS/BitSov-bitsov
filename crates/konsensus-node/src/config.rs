@@ -96,6 +96,50 @@ pub struct NodeDisplayConfig {
     pub hosted_by: Option<String>,
 }
 
+const HOSTED_BY_MAX_CHARS: usize = 64;
+
+impl NodeDisplayConfig {
+    /// The label is served unauthenticated and embedded in QR tickets, so it is
+    /// rejected rather than rewritten: bounded, trimmed, and free of control,
+    /// bidi-override and zero-width characters that could disguise the box.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let Some(label) = self.hosted_by.as_deref() else {
+            return Ok(());
+        };
+        if label.trim().is_empty() {
+            anyhow::bail!("[node].hosted_by must not be empty; omit it to show no label");
+        }
+        if label.trim() != label {
+            anyhow::bail!("[node].hosted_by must not start or end with whitespace");
+        }
+        if label.chars().count() > HOSTED_BY_MAX_CHARS {
+            anyhow::bail!("[node].hosted_by must be at most {HOSTED_BY_MAX_CHARS} characters");
+        }
+        if label.chars().any(|c| c.is_control() || is_invisible_format(c)) {
+            anyhow::bail!(
+                "[node].hosted_by must contain only printable characters (no control, \
+                 bidi-override or zero-width characters)"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
 /// Top-level node configuration, matching `konsensus.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1198,6 +1242,7 @@ impl NodeConfig {
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         self.validate_routing_fee_backend()?;
+        self.node.validate()?;
         if let LightningConfig::Ldk {
             lsps2_service,
             liquidity,

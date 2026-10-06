@@ -451,7 +451,6 @@ fn reload_pairing_code(
         remaining <= Duration::from_secs(365 * 86400),
         "invalid ticket expiry"
     );
-    pairing.open_pairing_window(remaining);
     *active = Some(ActivePairingCode {
         value: link.code,
         expires_at: tokio::time::Instant::now() + remaining,
@@ -763,7 +762,7 @@ fn authenticate(
         .remove_remote_access_link()
         .context("could not remove consumed remote pairing link")?;
     let client = pairing
-        .create_verified_remote_pairing(name, pubkey_hex, remote_static)
+        .create_ticket_remote_pairing(name, pubkey_hex, remote_static)
         .map_err(anyhow::Error::from)?;
     Ok(client)
 }
@@ -937,7 +936,7 @@ mod tests {
             &server.pairing_code
         )
         .is_ok());
-        // A CLI ticket opens pairing for a second device without owner control.
+        // A CLI ticket pairs a second device without owner control.
         ticket.code = crate::ticket_cmd::new_code();
         pairing
             .write_remote_access_link(&ticket.to_uri().unwrap())
@@ -1026,6 +1025,117 @@ mod tests {
             assert_eq!(fresh.node_id, node.node_id().to_hex());
             assert_ne!(fresh.code, old_code);
         }
+    }
+
+    #[tokio::test]
+    async fn tickets_never_open_the_local_pair_request_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = identity();
+        let node_id = node.node_id().to_hex();
+        let pairing = Arc::new(
+            PairingService::open(
+                dir.path(),
+                konsensus_api::pairing::identity_fingerprint(&node_id),
+                false,
+            )
+            .unwrap(),
+        );
+        let config = RemoteAccessConfig {
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            advertised_endpoint: Some("node.example:8443".into()),
+        };
+        let server = RemoteAccessServer::bind(
+            &config,
+            node.clone(),
+            pairing.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            Arc::new(RemoteTunnelClients::default()),
+        )
+        .await
+        .unwrap();
+        let local_request = || {
+            let key = SigningKey::from_bytes(&[0x50; 32]);
+            pairing.request_pairing("local", &hex::encode(key.verifying_key().to_bytes()))
+        };
+        let path = pairing.remote_access_link_path();
+        let mut ticket = PairLink::from_uri(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // Consuming the first-run ticket leaves /pair/request closed, as on a
+        // node whose first client paired locally.
+        authenticate_from_file(
+            &request(
+                &node,
+                &[0x41; 32],
+                &ticket.code,
+                &SigningKey::from_bytes(&[0x41; 32]),
+            ),
+            &[0x41; 32],
+            &node_id,
+            &pairing,
+            &server.pairing_code,
+        )
+        .unwrap();
+        assert!(!pairing.pairing_open());
+        assert!(matches!(
+            local_request(),
+            Err(konsensus_api::pairing::PairingError::Closed)
+        ));
+
+        // A long-lived operator ticket stays pending without opening the window.
+        ticket.code = crate::ticket_cmd::new_code();
+        ticket.expires_at = chrono::Utc::now().timestamp() + 365 * 86400;
+        pairing
+            .write_remote_access_link(&ticket.to_uri().unwrap())
+            .unwrap();
+        refresh_pairing_code(&pairing, &server.pairing_code, &node_id).unwrap();
+        assert!(server.pairing_code.lock().unwrap().is_some());
+        assert!(!pairing.pairing_open());
+        assert!(matches!(
+            local_request(),
+            Err(konsensus_api::pairing::PairingError::Closed)
+        ));
+
+        // The ticket itself is the grant: it pairs a second device anyway.
+        let second = authenticate_from_file(
+            &request(
+                &node,
+                &[0x42; 32],
+                &ticket.code,
+                &SigningKey::from_bytes(&[0x42; 32]),
+            ),
+            &[0x42; 32],
+            &node_id,
+            &pairing,
+            &server.pairing_code,
+        )
+        .unwrap();
+        assert_eq!(
+            second.scopes,
+            vec![
+                konsensus_api::auth::Scope::Read,
+                konsensus_api::auth::Scope::Receive
+            ]
+        );
+        assert!(!path.exists());
+        assert!(!pairing.pairing_open());
+        assert!(matches!(
+            local_request(),
+            Err(konsensus_api::pairing::PairingError::Closed)
+        ));
+
+        // The legacy verified-remote entry point still honours the window.
+        assert!(matches!(
+            pairing.create_verified_remote_pairing(
+                "windowless",
+                &hex::encode(
+                    SigningKey::from_bytes(&[0x43; 32])
+                        .verifying_key()
+                        .to_bytes()
+                ),
+                &[0x43; 32],
+            ),
+            Err(konsensus_api::pairing::PairingError::Closed)
+        ));
     }
 
     #[tokio::test]

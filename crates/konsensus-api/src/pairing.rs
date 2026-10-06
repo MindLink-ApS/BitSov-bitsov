@@ -1563,6 +1563,28 @@ impl PairingService {
         client_pubkey_hex: &str,
         remote_transport_pubkey: &[u8; 32],
     ) -> Result<PairedClient, PairingError> {
+        self.create_remote_pairing(name, client_pubkey_hex, remote_transport_pubkey, true)
+    }
+
+    /// Same pairing, authorized by a consumed one-shot enrollment ticket from
+    /// the protected `remote-access-link` file. The ticket is its own grant:
+    /// it neither needs nor opens the local `/pair/request` window.
+    pub fn create_ticket_remote_pairing(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        remote_transport_pubkey: &[u8; 32],
+    ) -> Result<PairedClient, PairingError> {
+        self.create_remote_pairing(name, client_pubkey_hex, remote_transport_pubkey, false)
+    }
+
+    fn create_remote_pairing(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        remote_transport_pubkey: &[u8; 32],
+        require_window: bool,
+    ) -> Result<PairedClient, PairingError> {
         let normalized_pubkey = client_pubkey_hex.to_ascii_lowercase();
         parse_pubkey(&normalized_pubkey)?;
         let remote_hex = hex::encode(remote_transport_pubkey);
@@ -1570,7 +1592,12 @@ impl PairingService {
         let now = chrono::Utc::now().timestamp();
 
         let mut inner = self.lock();
-        if !Self::open_inner(&inner) {
+        let open = if require_window {
+            Self::open_inner(&inner)
+        } else {
+            !inner.pairing_closed
+        };
+        if !open {
             return Err(PairingError::Closed);
         }
         if inner.file.clients.iter().any(|client| {

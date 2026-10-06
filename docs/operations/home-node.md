@@ -112,7 +112,9 @@ remote bootstrap itself is a separate P2 feature.
 
 The daemon continues to create a five-minute first-pairing ticket when no ticket
 or paired clients exist. It only prints the protected file's path, never its URI
-or code. CLI tickets can open pairing for a second device on a running node.
+or code. CLI tickets can pair a second device on a running node. A ticket is
+its own one-shot grant: it never opens the local `/api/v1/pair/request` window,
+which still needs `pair-window` or an `admin` client.
 
 Set a human-readable box label independently of custody:
 
@@ -122,7 +124,9 @@ hosted_by = "Rasmus's Pi"
 ```
 
 The label appears in tickets, `/api/v1/node/lock` and `/api/v1/health` (`null` when
-unset). Unknown `[node]` fields are rejected. It is display text only: it neither
+unset). Unknown `[node]` fields are rejected. The label must be 1–64 printable
+characters without leading or trailing whitespace; control, bidi-override and
+zero-width characters are refused. It is display text only: it neither
 sets `identity.hosted` nor changes the sovereignty tier. A box hosting another
 person's self-custody node is not the Cloud hosted-custody tier. Use one process,
 data directory, seed, password, ticket and set of ports per person (for example,

@@ -115,6 +115,78 @@ advertised_endpoint = "node.example:18443"
     assert_eq!(std::fs::read_to_string(&path).unwrap(), uri);
 }
 
+#[test]
+fn pair_ticket_qr_fits_the_longest_label_and_refuses_unprintable_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("konsensus.toml");
+    let write_config = |hosted_by: &str| {
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[node]
+hosted_by = "{hosted_by}"
+[identity]
+mnemonic_file = "absent.enc"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+[remote_access]
+listen_addr = "127.0.0.1:18443"
+advertised_endpoint = "{}.example:18443"
+"#,
+                "n".repeat(63)
+            ),
+        )
+        .unwrap();
+    };
+    let pair_ticket = || {
+        Command::new(env!("CARGO_BIN_EXE_konsensus"))
+            .args(["pair-ticket", "--config"])
+            .arg(&config)
+            .args(["--qr", "--ttl", "365d"])
+            .output()
+            .unwrap()
+    };
+    // 64 four-byte characters is the largest label validation admits.
+    let longest = "𝔅".repeat(64);
+    write_config(&longest);
+    let output = pair_ticket();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout).unwrap();
+    let (uri, rendered) = output.split_once('\n').unwrap();
+    assert_eq!(decode_terminal_qr(rendered), uri.as_bytes());
+    let ticket: serde_json::Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(uri.strip_prefix("bitsov://pair/").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ticket["hosted_by"], longest.as_str());
+    let path = dir.path().join("pairing/remote-access-link");
+    for bad in [
+        "Rasmus\\u0007Pi".to_string(),
+        "Pi\\u202Ekcab".to_string(),
+        " Pi".to_string(),
+        "x".repeat(65),
+    ] {
+        write_config(&bad);
+        let rejected = pair_ticket();
+        assert!(!rejected.status.success(), "{bad:?} must be refused");
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("hosted_by"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), uri);
+    }
+}
+
 // Convert the actual printed half-block glyphs to a grayscale raster. Decode
 // with an independent library, so polarity, quiet zone and URI wiring matter.
 fn decode_terminal_qr(rendered: &str) -> Vec<u8> {
