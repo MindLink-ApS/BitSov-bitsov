@@ -447,27 +447,27 @@ async fn bundled_getter_applies_discount_exactly_once() {
     let peer = test_node_id(1);
 
     let mut prices = HashMap::new();
-    prices.insert("communication".to_string(), 1000);
+    prices.insert("communication".to_string(), 4000);
     // Maximum trust discount.
     cache.update(peer, prices, 886_000, 144, MAX_TRUST_DISCOUNT).await;
 
     let max_age = std::time::Duration::from_secs(86400);
 
-    // Bundled choke-point getter: base 1000 at 0.5 discount → 500, applied once.
+    // Bundled choke-point getter: base 4000 at 0.5 discount → 2000, applied once.
     let discounted = cache
         .get_fresh_discounted_peer_price(&peer, 0, 886_100, max_age)
         .await;
-    assert_eq!(discounted, Some(500));
+    assert_eq!(discounted, Some(2000));
 
     // The undiscounted base getter still returns the full price, proving the
     // discount lives only in the bundled path (no compounding).
     assert_eq!(
         cache.get_fresh_peer_price(&peer, 0, 886_100, max_age).await,
-        Some(1000)
+        Some(4000)
     );
 
     // The bundled result must never fall below the floor.
-    let floor = trust_discount_floor_msat(1000);
+    let floor = trust_discount_floor_msat(4000);
     assert!(discounted.unwrap() >= floor);
 }
 
@@ -512,7 +512,7 @@ fn compute_discount_normal_weights() {
 }
 
 #[tokio::test]
-async fn porch_adverts_apply_floor_after_discount_only_to_reads() {
+async fn adverts_apply_floor_after_discount_to_all_web_kinds() {
     let cache = PeerPriceCache::new();
     let peer = test_node_id(1);
     for (base, discount, expected) in [
@@ -530,7 +530,7 @@ async fn porch_adverts_apply_floor_after_discount_only_to_reads() {
                 discount,
             )
             .await;
-        for kind in [500, 501] {
+        for kind in [500, 501, 502, 510, 599] {
             assert_eq!(
                 cache.get_discounted_peer_price(&peer, kind).await,
                 Some(expected)
@@ -548,25 +548,10 @@ async fn porch_adverts_apply_floor_after_discount_only_to_reads() {
             );
         }
     }
-    cache
-        .update(
-            peer,
-            HashMap::from([("web_content".into(), 1000)]),
-            1,
-            10,
-            0.5,
-        )
-        .await;
-    for kind in [502, 510, 599] {
-        assert_eq!(
-            cache.get_discounted_peer_price(&peer, kind).await,
-            Some(500)
-        );
-    }
 }
 
 #[tokio::test]
-async fn porch_adverts_include_admission_floor() {
+async fn adverts_include_admission_floor() {
     let cache = PeerPriceCache::new();
     let peer = test_node_id(1);
     cache
@@ -581,22 +566,16 @@ async fn porch_adverts_include_admission_floor() {
             0.5,
         )
         .await;
-    for kind in [500, 501] {
+    for kind in [500, 501, 502, 510, 599] {
         assert_eq!(
             cache.get_discounted_peer_price(&peer, kind).await,
             Some(2000)
         );
     }
-    for kind in [502, 510, 599] {
-        assert_eq!(
-            cache.get_discounted_peer_price(&peer, kind).await,
-            Some(500)
-        );
-    }
 }
 
 #[tokio::test]
-async fn peer_exchange_cache_does_not_apply_porch_or_advertised_admission_floor() {
+async fn peer_exchange_cache_applies_advertised_admission_floor() {
     let cache = PeerPriceCache::new();
     let peer = test_node_id(1);
     cache
@@ -612,12 +591,12 @@ async fn peer_exchange_cache_does_not_apply_porch_or_advertised_admission_floor(
         )
         .await;
     let kind = konsensus_core::kind::KIND_PEER_EXCHANGE;
-    assert_eq!(cache.get_discounted_peer_price(&peer, kind).await, Some(500));
+    assert_eq!(cache.get_discounted_peer_price(&peer, kind).await, Some(2000));
     assert_eq!(
         cache
             .get_fresh_discounted_peer_price(&peer, kind, 1, std::time::Duration::from_secs(60))
             .await,
-        Some(500)
+        Some(2000)
     );
 }
 
