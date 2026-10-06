@@ -169,7 +169,7 @@ pub fn locked_router(state: Arc<LockedState>) -> Router {
 }
 async fn lock_status(State(state): State<Arc<LockedState>>) -> Json<serde_json::Value> {
     Json(
-        json!({"state": "locked", "node_id": state.node_id, "fingerprint": state.pairing.bound_fingerprint(), "locked_since": state.locked_since, "attempts_left": 20u32.saturating_sub(state.attempts.lock().unwrap_or_else(|e| e.into_inner()).total), "hosted_by": null}),
+        json!({"state": "locked", "node_id": state.node_id, "fingerprint": state.pairing.bound_fingerprint(), "locked_since": state.locked_since, "attempts_left": 20u32.saturating_sub(state.attempts.lock().unwrap_or_else(|e| e.into_inner()).total), "hosted_by": state.pairing.hosted_by()}),
     )
 }
 async fn challenge(

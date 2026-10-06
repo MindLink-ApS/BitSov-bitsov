@@ -11,9 +11,9 @@ mod delivery_prices;
 mod guarded_lightning;
 mod housekeeping;
 mod invoice_refusals;
-mod logging;
 #[path = "cli/locked.rs"]
 mod locked_cmd;
+mod logging;
 mod mnemonic_crypto;
 #[path = "cli/move_home.rs"]
 mod move_home_cmd;
@@ -35,6 +35,8 @@ mod scb_restore;
 mod seed_cmd;
 mod session_handler;
 mod stun;
+#[path = "cli/ticket.rs"]
+mod ticket_cmd;
 #[path = "cli/whitelist.rs"]
 mod whitelist_cmd;
 
@@ -221,6 +223,9 @@ async fn main() -> Result<()> {
             config,
         } => {
             owner_cmd::cmd_pair_revoke(&config, &client_id, keep_pairing).await?;
+        }
+        Command::PairTicket { config, qr, ttl } => {
+            ticket_cmd::cmd_pair_ticket(&config, qr, ttl)?;
         }
         Command::PairWindow { seconds, config } => {
             owner_cmd::cmd_pair_window(&config, seconds).await?;
@@ -1234,7 +1239,8 @@ async fn start_node_services<'a>(
         )
         .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?
         // The owner command the app and console show names this exact config.
-        .with_owner_config(config_path.to_path_buf());
+        .with_owner_config(config_path.to_path_buf())
+        .with_hosted_by(config.node.hosted_by.clone());
         let service = if local_owner_device {
             service.with_local_owner_device()
         } else {

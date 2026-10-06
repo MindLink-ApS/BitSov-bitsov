@@ -402,6 +402,7 @@ async fn health_with_block_height_is_as_of_the_chain_read() {
             "chain_backend",
             "connected_peers",
             "e2ee_sessions",
+            "hosted_by",
             "lightning_available",
             "lightning_backend",
             "lightning_payment_capable",
@@ -412,6 +413,7 @@ async fn health_with_block_height_is_as_of_the_chain_read() {
         ]
     );
     assert_eq!(r.json["block_height"], 850_000);
+    assert!(r.json["hosted_by"].is_null());
     assert!(parse_as_of(r.as_of.as_deref().unwrap()) >= before);
     assert_eq!(r.stale, None);
 }

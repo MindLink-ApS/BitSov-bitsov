@@ -30,8 +30,12 @@ its challenge to a protected `0600` file and prints only that path and expiry.
 Remote access writes the complete one-shot `bitsov://pair/...` link to
 `<data_dir>/pairing/remote-access-link` at mode `0600`; stdout prints only the
 protected path and expiry. The app reads that file and pastes the link. The
-remote link expires after five minutes and is removed on successful pairing,
-expiry, or clean shutdown.
+automatically issued remote link expires after five minutes. Operator-issued
+`konsensus pair-ticket --config <cfg> [--qr] [--ttl 24h]` tickets default to
+24 hours and print their URI (and optional QR) only to that CLI's stdout.
+Both are file-backed, survive shutdown/restart until expiry, and are removed
+on consumption or expiry. Tickets are refused while locked. See
+[home-node enrollment](../operations/home-node.md#enrollment-tickets-and-box-labels).
 
 The code is a cross-check, not the control. A sidecar app owns the data
 directory and can read it by construction; describing code comparison as

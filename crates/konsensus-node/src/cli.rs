@@ -15,6 +15,16 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Print a one-use enrollment ticket (and optionally a terminal QR).
+    PairTicket {
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        qr: bool,
+        /// Ticket lifetime: positive seconds, minutes, hours or days (s/m/h/d).
+        #[arg(long, default_value = "24h", value_parser = crate::ticket_cmd::parse_ttl)]
+        ttl: std::time::Duration,
+    },
     /// Close channels and send funds to an owner-specified home address (local console only).
     MoveHome(crate::move_home_cmd::MoveHomeArgs),
     /// Initialize a new node: generate identity and create config file.

@@ -92,6 +92,11 @@ impl Fixture {
         );
         let config = dir.path().join("konsensus.toml");
         let mut cfg: toml::Value = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+        cfg["node"] = toml::Value::try_from(std::collections::BTreeMap::from([(
+            "hosted_by",
+            "Rasmus's Pi",
+        )]))
+        .unwrap();
         let api = address();
         let remote = address();
         let peer = address();
@@ -329,6 +334,15 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         let mut node = f.start(&log, local);
         let lock = f.ready(&mut node, "/api/v1/node/lock", &log).await;
         assert_eq!(lock["node_id"], f.identity.node_id().to_hex());
+        assert_eq!(lock["hosted_by"], "Rasmus's Pi");
+        let refused = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+            .args(["pair-ticket", "--config"])
+            .arg(&f.config)
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(refused.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("while locked"));
         assert!(!lock.to_string().contains(PASSWORD));
         assert!(
             TcpStream::connect(f.peer).await.is_err(),
@@ -379,7 +393,26 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
             closed.is_ok_and(|r| r.is_err()),
             "locked tunnel must close within 250ms"
         );
-        f.ready(&mut node, "/api/v1/health", &log).await;
+        let health = f.ready(&mut node, "/api/v1/health", &log).await;
+        assert_eq!(health["hosted_by"], "Rasmus's Pi");
+        let issued = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+            .args(["pair-ticket", "--config"])
+            .arg(&f.config)
+            .output()
+            .unwrap();
+        assert!(
+            issued.status.success(),
+            "{}",
+            String::from_utf8_lossy(&issued.stderr)
+        );
+        let uri = String::from_utf8(issued.stdout).unwrap();
+        let ticket = wire::PairLink::from_uri(uri.trim()).unwrap();
+        assert_eq!(ticket.node_id, f.identity.node_id().to_hex());
+        assert_eq!(ticket.hosted_by.as_deref(), Some("Rasmus's Pi"));
+        assert_eq!(ticket.box_transport_pubkey, hex::encode(f.box_pin));
+        assert!(ticket.box_transport_signature.is_some());
+        assert!(!logs(&log).contains("bitsov://pair/"));
+        assert!(!logs(&log).contains(&ticket.code));
         assert!(
             TcpStream::connect(f.peer).await.is_ok(),
             "normal startup binds peers"
@@ -438,6 +471,11 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
             .unwrap();
         assert_eq!(response.status().is_success(), local);
         drop(node);
+        let file_log = std::fs::read_to_string(f.dir.path().join("node.log")).unwrap();
+        for captured in [logs(&log), file_log] {
+            assert!(!captured.contains("bitsov://pair/"));
+            assert!(!captured.contains(&ticket.code));
+        }
     }
     assert!(!logs(&log).contains(PASSWORD));
     assert!(!std::fs::read_to_string(f.dir.path().join("node.log"))
