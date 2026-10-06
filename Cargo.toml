@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["vendor/ldk-node", "vendor/x25519-dalek", "vendor/esplora-client"]
+exclude = ["vendor/lightning", "vendor/ldk-node", "vendor/x25519-dalek", "vendor/esplora-client"]
 members = [
     "crates/konsensus-core",
     "crates/konsensus-chain",
@@ -126,6 +126,7 @@ base64 = "0.23"
 unicode-normalization = "0.1"
 
 [patch.crates-io]
+lightning = { path = "vendor/lightning" }
 ldk-node = { path = "vendor/ldk-node" }
 x25519-dalek = { path = "vendor/x25519-dalek" }
 esplora-client = { path = "vendor/esplora-client" }

@@ -280,6 +280,7 @@ version = "1.37"
 features = ["test-util"]
 
 [patch.crates-io]
+lightning = { path = "../lightning" }
 esplora-client = { path = "../esplora-client" }
 
 [dev-dependencies.http]
