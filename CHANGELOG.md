@@ -128,8 +128,7 @@ Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
 - No numbered SQL migration since rc9 (still **001–028**).
 - `[dos_edge]` and `[node]` are new tables, and NodeConfig rejects unknown
   fields, so rc9 will not parse a config that uses them.
-- Workspace version bump to `0.3.0-rc10` is still pending at preparation time;
-  see the signing checklist.
+- Workspace version is `0.3.0-rc10` (all 13 packages).
 
 ## [0.3.0-rc9] — 2026-10-06
 
