@@ -3893,7 +3893,7 @@ pub fn restrict_dir(path: &Path) -> io::Result<()> {
 }
 
 /// fsync a directory so a rename into it is durable on Unix.
-/// Non-Unix platforms tolerate unsupported/permission-denied directory syncs.
+/// On other platforms the directory sync is best-effort; a missing directory still fails.
 pub fn fsync_dir_strict(path: &Path) -> io::Result<()> {
     let result = std::fs::File::open(path).and_then(|dir| dir.sync_all());
     #[cfg(unix)]
@@ -3902,20 +3902,15 @@ pub fn fsync_dir_strict(path: &Path) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        // Windows can reject opening a directory or flushing a read-only
-        // directory handle. Keep directory sync best-effort on these platforms
-        // without discarding unrelated I/O failures. Unix transport pins still
-        // require successful directory synchronization.
+        // std has no directory fsync on Windows: opening a directory without
+        // backup semantics, or flushing its handle, fails with platform-specific
+        // errors (access denied, invalid handle, ...). The file was already
+        // synced before the rename, so only this directory step is best-effort
+        // here. A missing directory is still an error. Unix transport pins
+        // still require successful directory synchronization.
         match result {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                Ok(())
-            }
-            other => other,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
         }
     }
 }
