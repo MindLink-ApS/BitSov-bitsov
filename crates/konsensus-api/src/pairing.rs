@@ -609,6 +609,7 @@ fn scope_list(scopes: &[Scope]) -> String {
 pub struct PairingService {
     dir: PathBuf,
     file_path: PathBuf,
+    box_transport_secret: zeroize::Zeroizing<[u8; 32]>,
     inner: Mutex<Inner>,
     grant_changes: tokio::sync::Notify,
     authority_changes: tokio::sync::watch::Sender<u64>,
@@ -746,17 +747,12 @@ fn shell_word(s: &str) -> Option<String> {
     // A backslash or quote is refused, not escaped: `'\''` is POSIX-only, and
     // fish would read `\'` inside single quotes as the end of the string.
     if s.is_empty()
-        || s.chars().any(|c| {
-            c.is_control()
-                || c == '\\'
-                || c == '\''
-                || invisible_format(c)
-        })
+        || s.chars()
+            .any(|c| c.is_control() || c == '\\' || c == '\'' || invisible_format(c))
     {
         return None;
     }
-    if s
-        .chars()
+    if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c))
     {
         return Some(s.to_string());
@@ -809,7 +805,10 @@ impl PairingService {
         // reissuing fresh codes, including after an unclean shutdown.
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with("owner-approval-")
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("owner-approval-")
                 && entry.file_type()?.is_file()
             {
                 std::fs::remove_file(entry.path())?;
@@ -857,10 +856,12 @@ impl PairingService {
             Err(e) => return Err(e.into()),
         }
 
+        let box_transport_secret = load_box_transport_key(&dir)?;
         let (authority_changes, _) = tokio::sync::watch::channel(0);
         let service = Self {
             dir,
             file_path,
+            box_transport_secret,
             inner: Mutex::new(Inner {
                 file,
                 pending: HashMap::new(),
@@ -886,6 +887,17 @@ impl PairingService {
         // pre-G1 grant, must not survive the restart on disk either.
         service.prune_expired_grants()?;
         Ok(service)
+    }
+
+    /// Seed-independent Noise responder secret. Never send or log these bytes.
+    pub fn box_transport_secret_bytes(&self) -> &[u8; 32] {
+        &self.box_transport_secret
+    }
+
+    /// Public half of the persistent box transport key, independent of identity.
+    pub fn box_transport_pubkey(&self) -> [u8; 32] {
+        let secret = x25519_dalek::StaticSecret::from(*self.box_transport_secret);
+        x25519_dalek::PublicKey::from(&secret).to_bytes()
     }
 
     /// Enable device-signed recipient envelopes without enabling the owner console.
@@ -1028,8 +1040,16 @@ impl PairingService {
         inner.owner_confirmations.retain(|op_id, c| {
             c.expires_at > now
                 && (c.approval_file.is_none()
-                    || inner.file.pending_elevations.iter().any(|op| &op.op_id == op_id)
-                    || inner.file.pending_device_keys.iter().any(|op| &op.op_id == op_id))
+                    || inner
+                        .file
+                        .pending_elevations
+                        .iter()
+                        .any(|op| &op.op_id == op_id)
+                    || inner
+                        .file
+                        .pending_device_keys
+                        .iter()
+                        .any(|op| &op.op_id == op_id))
         });
     }
 
@@ -1093,10 +1113,20 @@ impl PairingService {
             inner.owner_confirmations.remove(op_id);
             // Cancel durably: a restart must not re-issue a code for a request
             // someone was guessing at.
-            let client_id = inner.file.pending_elevations.iter()
-                .find(|e| e.op_id == op_id).map(|e| e.client_id.clone())
-                .or_else(|| inner.file.pending_device_keys.iter()
-                    .find(|p| p.op_id == op_id).map(|p| p.client_id.clone()));
+            let client_id = inner
+                .file
+                .pending_elevations
+                .iter()
+                .find(|e| e.op_id == op_id)
+                .map(|e| e.client_id.clone())
+                .or_else(|| {
+                    inner
+                        .file
+                        .pending_device_keys
+                        .iter()
+                        .find(|p| p.op_id == op_id)
+                        .map(|p| p.client_id.clone())
+                });
             inner.file.pending_elevations.retain(|e| e.op_id != op_id);
             inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
             if let Some(client_id) = client_id {
@@ -1955,7 +1985,12 @@ impl PairingService {
             .file
             .pending_device_keys
             .retain(|p| p.client_id != client_id);
-        let keys: Vec<String> = inner.file.device_keys.iter().map(|k| k.key_id.clone()).collect();
+        let keys: Vec<String> = inner
+            .file
+            .device_keys
+            .iter()
+            .map(|k| k.key_id.clone())
+            .collect();
         inner.file.registered_ops.retain(|_, k| keys.contains(k));
         self.persist(&mut inner.file)?;
         self.notify_authority_change();
@@ -2036,7 +2071,10 @@ impl PairingService {
         // Device keys were registered to the old pairing id; retire them so the
         // same device can register again under the rotated one.
         inner.file.device_keys.retain(|k| k.client_id != client_id);
-        inner.file.pending_device_keys.retain(|p| p.client_id != client_id);
+        inner
+            .file
+            .pending_device_keys
+            .retain(|p| p.client_id != client_id);
         // Grants do not survive a key rotation: they were written against a
         // specific client id and epoch by a deliberate owner action.
         inner.file.revoke_grants(Some(client_id));
@@ -2136,8 +2174,12 @@ impl PairingService {
         }
         // Hold the same lock through check and insertion so concurrent requests
         // cannot exceed the cap. Expired proposals do not consume a slot.
-        if inner.file.pending_elevations.iter()
-            .filter(|e| e.client_id == client_id && e.expires_at > now).count()
+        if inner
+            .file
+            .pending_elevations
+            .iter()
+            .filter(|e| e.client_id == client_id && e.expires_at > now)
+            .count()
             >= MAX_PENDING_ELEVATIONS_PER_CLIENT
         {
             return Err(PairingError::TooManyPending);
@@ -2161,7 +2203,10 @@ impl PairingService {
         inner.file.pending_elevations.retain(|e| e.expires_at > now);
         inner.file.pending_elevations.push(op.clone());
         if let Err(error) = self.persist(&mut inner.file) {
-            inner.file.pending_elevations.retain(|e| e.op_id != op.op_id);
+            inner
+                .file
+                .pending_elevations
+                .retain(|e| e.op_id != op.op_id);
             inner.owner_confirmations.remove(&op.op_id);
             return Err(error);
         }
@@ -2174,26 +2219,48 @@ impl PairingService {
     /// On a sidecar a grant is never in effect (see `effective_scopes`), so it
     /// is never reported as granted either: the status must not claim an
     /// authority the token will not carry.
-    pub fn elevation_status(&self, client_id: &str, op_id: &str) -> Result<ElevationStatus, PairingError> {
+    pub fn elevation_status(
+        &self,
+        client_id: &str,
+        op_id: &str,
+    ) -> Result<ElevationStatus, PairingError> {
         let inner = self.lock();
-        let owned = inner.file.pending_elevations.iter()
+        let owned = inner
+            .file
+            .pending_elevations
+            .iter()
             .any(|e| e.op_id == op_id && e.client_id == client_id)
-            || inner.file.grants.iter().any(|g| g.op_id == op_id && g.client_id == client_id)
-            || inner.file.front_door_grants.iter().any(|g| g.op_id == op_id && g.client_id == client_id)
-            || inner.cancelled_ops.get(op_id).is_some_and(|owner| owner == client_id);
-        if !owned { return Err(PairingError::UnknownOperation); }
+            || inner
+                .file
+                .grants
+                .iter()
+                .any(|g| g.op_id == op_id && g.client_id == client_id)
+            || inner
+                .file
+                .front_door_grants
+                .iter()
+                .any(|g| g.op_id == op_id && g.client_id == client_id)
+            || inner
+                .cancelled_ops
+                .get(op_id)
+                .is_some_and(|owner| owner == client_id);
+        if !owned {
+            return Err(PairingError::UnknownOperation);
+        }
         let now = chrono::Utc::now().timestamp();
         if !self.owner_control_enabled {
-            return Ok(match inner
-                .file
-                .pending_elevations
-                .iter()
-                .find(|e| e.op_id == op_id)
-            {
-                Some(op) if op.expires_at <= now => ElevationStatus::Expired,
-                Some(_) => ElevationStatus::Pending,
-                None => ElevationStatus::Absent,
-            });
+            return Ok(
+                match inner
+                    .file
+                    .pending_elevations
+                    .iter()
+                    .find(|e| e.op_id == op_id)
+                {
+                    Some(op) if op.expires_at <= now => ElevationStatus::Expired,
+                    Some(_) => ElevationStatus::Pending,
+                    None => ElevationStatus::Absent,
+                },
+            );
         }
         if let Some(op) = inner
             .file
@@ -2600,39 +2667,87 @@ impl PairingService {
         clock: impl FnMut() -> i64,
     ) -> Result<Reservation, BudgetRefusal> {
         let mut inner = self.lock();
-        self.reserve_spend_locked(&mut inner, client_id, epoch, charges, ReservationAuthority::default(), clock)
+        self.reserve_spend_locked(
+            &mut inner,
+            client_id,
+            epoch,
+            charges,
+            ReservationAuthority::default(),
+            clock,
+        )
     }
 
     /// Liquidity authority is checked inside the SAME transaction as its debit.
-    pub fn reserve_liquidity_fee(&self, client_id: &str, epoch: u64, charges: Vec<Charge>) -> Result<Reservation, BudgetRefusal> {
+    pub fn reserve_liquidity_fee(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        charges: Vec<Charge>,
+    ) -> Result<Reservation, BudgetRefusal> {
         let mut inner = self.lock();
-        self.reserve_spend_locked(&mut inner, client_id, epoch, charges,
-            ReservationAuthority { liquidity: true, ..Default::default() },
-            || chrono::Utc::now().timestamp())
+        self.reserve_spend_locked(
+            &mut inner,
+            client_id,
+            epoch,
+            charges,
+            ReservationAuthority {
+                liquidity: true,
+                ..Default::default()
+            },
+            || chrono::Utc::now().timestamp(),
+        )
     }
 
     pub(crate) fn reserve_operation_spend(
-        &self, client_id: &str, epoch: u64, charges: Vec<Charge>,
+        &self,
+        client_id: &str,
+        epoch: u64,
+        charges: Vec<Charge>,
         operation: crate::spend_budget::OperationReservationLink,
     ) -> Result<Reservation, BudgetRefusal> {
         let mut inner = self.lock();
-        self.reserve_spend_locked(&mut inner, client_id, epoch, charges,
-            ReservationAuthority { operation: Some(operation), ..Default::default() },
-            || chrono::Utc::now().timestamp())
+        self.reserve_spend_locked(
+            &mut inner,
+            client_id,
+            epoch,
+            charges,
+            ReservationAuthority {
+                operation: Some(operation),
+                ..Default::default()
+            },
+            || chrono::Utc::now().timestamp(),
+        )
     }
 
     /// Discover even reservations whose async SQL attachment never ran.
-    pub(crate) fn pending_operation_reservations(&self) -> Vec<(crate::spend_budget::OperationReservationLink, Reservation)> {
+    pub(crate) fn pending_operation_reservations(
+        &self,
+    ) -> Vec<(crate::spend_budget::OperationReservationLink, Reservation)> {
         let inner = self.lock();
         let mut result = Vec::new();
         for grant in &inner.file.grants {
-            let Some(budget) = &grant.budget else { continue; };
+            let Some(budget) = &grant.budget else {
+                continue;
+            };
             for (id, link) in &budget.operation_links {
-                let Some(pending) = budget.pending.get(id) else { continue; };
-                result.push((link.clone(), Reservation {
-                    id: id.clone(), client_id: grant.client_id.clone(), op_id: grant.op_id.clone(),
-                    charges: pending.iter().map(|(recipient, amount_msat)| Charge { recipient: recipient.clone(), amount_msat: *amount_msat }).collect(),
-                }));
+                let Some(pending) = budget.pending.get(id) else {
+                    continue;
+                };
+                result.push((
+                    link.clone(),
+                    Reservation {
+                        id: id.clone(),
+                        client_id: grant.client_id.clone(),
+                        op_id: grant.op_id.clone(),
+                        charges: pending
+                            .iter()
+                            .map(|(recipient, amount_msat)| Charge {
+                                recipient: recipient.clone(),
+                                amount_msat: *amount_msat,
+                            })
+                            .collect(),
+                    },
+                ));
             }
         }
         result
@@ -2642,13 +2757,24 @@ impl PairingService {
     /// The callback must not re-enter this service. A crash can leave the
     /// operation reserved without a debit, but never an orphaned grant debit.
     pub(crate) fn reserve_spend_linked(
-        &self, client_id: &str, epoch: u64, charges: Vec<Charge>,
+        &self,
+        client_id: &str,
+        epoch: u64,
+        charges: Vec<Charge>,
         before_persist: impl FnOnce(&Reservation) -> Result<(), BudgetRefusal>,
     ) -> Result<Reservation, BudgetRefusal> {
         let mut inner = self.lock();
-        self.reserve_spend_locked(&mut inner, client_id, epoch, charges,
-            ReservationAuthority { before_persist: Some(Box::new(before_persist)), ..Default::default() },
-            || chrono::Utc::now().timestamp())
+        self.reserve_spend_locked(
+            &mut inner,
+            client_id,
+            epoch,
+            charges,
+            ReservationAuthority {
+                before_persist: Some(Box::new(before_persist)),
+                ..Default::default()
+            },
+            || chrono::Utc::now().timestamp(),
+        )
     }
 
     fn reserve_spend_locked(
@@ -2686,15 +2812,27 @@ impl PairingService {
         }) else {
             return Err(BudgetRefusal::NoGrant);
         };
-        if authority.liquidity && !inner.file.grants[idx].budget.as_ref().is_some_and(|b| b.allow_liquidity_fees) {
-            return Err(BudgetRefusal::Unpriced("grant does not authorize liquidity fees".into()));
+        if authority.liquidity
+            && !inner.file.grants[idx]
+                .budget
+                .as_ref()
+                .is_some_and(|b| b.allow_liquidity_fees)
+        {
+            return Err(BudgetRefusal::Unpriced(
+                "grant does not authorize liquidity fees".into(),
+            ));
         }
         let before = inner.file.grants[idx].budget.clone();
         let op_id = inner.file.grants[idx].op_id.clone();
         let id = uuid::Uuid::new_v4().to_string();
-        let budget = inner.file.grants[idx].budget.as_mut().ok_or(BudgetRefusal::NoGrant)?;
+        let budget = inner.file.grants[idx]
+            .budget
+            .as_mut()
+            .ok_or(BudgetRefusal::NoGrant)?;
         if budget.pending.len() >= 1024 {
-            return Err(BudgetRefusal::Ledger("too many unresolved reservations".into()));
+            return Err(BudgetRefusal::Ledger(
+                "too many unresolved reservations".into(),
+            ));
         }
         budget.reserve_at(&charges, now)?;
         let mut recipients = std::collections::BTreeMap::new();
@@ -2708,8 +2846,16 @@ impl PairingService {
                 budget.operation_links.insert(id.clone(), link);
             }
         }
-        let reservation = Reservation { id, client_id: client_id.to_string(), op_id: op_id.clone(), charges };
-        if let Err(e) = authority.before_persist.map_or(Ok(()), |save| save(&reservation)) {
+        let reservation = Reservation {
+            id,
+            client_id: client_id.to_string(),
+            op_id: op_id.clone(),
+            charges,
+        };
+        if let Err(e) = authority
+            .before_persist
+            .map_or(Ok(()), |save| save(&reservation))
+        {
             inner.file.grants[idx].budget = before;
             return Err(e);
         }
@@ -2777,10 +2923,18 @@ impl PairingService {
         let now = chrono::Utc::now().timestamp();
         let fingerprint = inner.identity_fingerprint.clone();
         let Some(grant) = inner.file.grants.iter().find(|g| {
-            g.client_id == client_id && g.op_id == grant_op_id
-                && g.identity_fingerprint == fingerprint && g.is_live(now)
-                && inner.file.clients.iter().any(|c| c.client_id == client_id && c.epoch == g.epoch)
-        }) else { return Err(BudgetRefusal::NoGrant); };
+            g.client_id == client_id
+                && g.op_id == grant_op_id
+                && g.identity_fingerprint == fingerprint
+                && g.is_live(now)
+                && inner
+                    .file
+                    .clients
+                    .iter()
+                    .any(|c| c.client_id == client_id && c.epoch == g.epoch)
+        }) else {
+            return Err(BudgetRefusal::NoGrant);
+        };
         let epoch = grant.epoch;
         let budget = grant.budget.as_ref().ok_or(BudgetRefusal::NoGrant)?;
         if max_total_msat > budget.per_call_max_msat {
@@ -2794,7 +2948,11 @@ impl PairingService {
             });
         }
         if let Some(cap) = budget.per_recipient_msat.get(&recipient) {
-            let used = budget.used_by_recipient.get(&recipient).copied().unwrap_or(0);
+            let used = budget
+                .used_by_recipient
+                .get(&recipient)
+                .copied()
+                .unwrap_or(0);
             let left = cap.saturating_sub(used);
             if max_total_msat > left {
                 return Err(BudgetRefusal::Recipient {
@@ -2804,8 +2962,12 @@ impl PairingService {
             }
         }
         if let Some(contact_budget) = contact_budget_msat {
-            if contact_budget < max_total_msat || contact_budget > budget.budget_msat
-                || budget.per_recipient_msat.get(&recipient).is_some_and(|cap| *cap != contact_budget)
+            if contact_budget < max_total_msat
+                || contact_budget > budget.budget_msat
+                || budget
+                    .per_recipient_msat
+                    .get(&recipient)
+                    .is_some_and(|cap| *cap != contact_budget)
             {
                 return Err(BudgetRefusal::FirstContact(
                     "contact budget must cover this approval, fit the grant total and match any existing recipient cap".into(),
@@ -2828,7 +2990,9 @@ impl PairingService {
             let before = inner.file.grants[idx].budget.clone();
             if let Some(budget) = inner.file.grants[idx].budget.as_mut() {
                 if !budget.per_recipient_msat.contains_key(&issued.recipient) {
-                    budget.per_recipient_msat.insert(issued.recipient.clone(), contact_budget);
+                    budget
+                        .per_recipient_msat
+                        .insert(issued.recipient.clone(), contact_budget);
                 }
             }
             if inner.file.grants[idx].budget != before {
@@ -2861,22 +3025,33 @@ impl PairingService {
         grant_op_id: &str,
         recipient: &str,
     ) -> Option<crate::spend_budget::FirstContactApprovalStatus> {
-        use crate::spend_budget::{FirstContactApprovalState as State,
-            FirstContactApprovalStatus, FIRST_CONTACT_APPROVAL_WINDOW_SECS};
+        use crate::spend_budget::{
+            FirstContactApprovalState as State, FirstContactApprovalStatus,
+            FIRST_CONTACT_APPROVAL_WINDOW_SECS,
+        };
         let recipient = crate::spend_budget::canonical_recipient(recipient)?;
         let inner = self.lock();
         let now = chrono::Utc::now().timestamp();
         if !self.owner_control_enabled
-            || !inner.file.clients.iter().any(|c| c.client_id == client_id && c.epoch == epoch)
-            || !inner.file.grants.iter().any(|g| g.op_id == grant_op_id
-                && g.client_id == client_id && g.epoch == epoch
-                && g.identity_fingerprint == inner.identity_fingerprint
-                && g.budget.is_some() && g.is_live(now))
+            || !inner
+                .file
+                .clients
+                .iter()
+                .any(|c| c.client_id == client_id && c.epoch == epoch)
+            || !inner.file.grants.iter().any(|g| {
+                g.op_id == grant_op_id
+                    && g.client_id == client_id
+                    && g.epoch == epoch
+                    && g.identity_fingerprint == inner.identity_fingerprint
+                    && g.budget.is_some()
+                    && g.is_live(now)
+            })
         {
             return None;
         }
-        let pending = inner.first_contact.get(client_id).filter(|p|
-            p.budget_op_id == grant_op_id && p.epoch == epoch && p.grant.recipient == recipient);
+        let pending = inner.first_contact.get(client_id).filter(|p| {
+            p.budget_op_id == grant_op_id && p.epoch == epoch && p.grant.recipient == recipient
+        });
         let state = match pending {
             Some(p) if p.consumed => State::Consumed,
             Some(p) if p.grant.expires_at <= now => State::Expired,
@@ -2884,7 +3059,9 @@ impl PairingService {
             None => State::Pending,
         };
         Some(FirstContactApprovalStatus {
-            grant_op_id: grant_op_id.to_owned(), recipient, state,
+            grant_op_id: grant_op_id.to_owned(),
+            recipient,
+            state,
             approval_window_secs: FIRST_CONTACT_APPROVAL_WINDOW_SECS,
             approval: pending.map(|p| p.grant.clone()),
         })
@@ -2913,7 +3090,8 @@ impl PairingService {
             })
             .ok_or(BudgetRefusal::NoGrant)?;
         let confirmed = inner.first_contact.get(&parent.client_id).filter(|p| {
-            !p.consumed && p.grant.recipient == recipient
+            !p.consumed
+                && p.grant.recipient == recipient
                 && p.epoch == grant.epoch
                 && p.budget_op_id == grant.op_id
                 && p.grant.expires_at > now
@@ -2939,11 +3117,16 @@ impl PairingService {
     /// Check, without reserving, that the grant behind `parent` may pay a
     /// re-admission to `recipient` (see [`Self::reserve_readmission`]). Lets a
     /// send refuse before it asks the recipient for a quote.
-    pub fn readmission_allowed(&self, parent: &Reservation, recipient: &str) -> Result<(), BudgetRefusal> {
-        let recipient = crate::spend_budget::canonical_recipient(recipient)
-            .ok_or(BudgetRefusal::NoGrant)?;
+    pub fn readmission_allowed(
+        &self,
+        parent: &Reservation,
+        recipient: &str,
+    ) -> Result<(), BudgetRefusal> {
+        let recipient =
+            crate::spend_budget::canonical_recipient(recipient).ok_or(BudgetRefusal::NoGrant)?;
         let inner = self.lock();
-        Self::readmission_basis(&inner, parent, &recipient, chrono::Utc::now().timestamp()).map(|_| ())
+        Self::readmission_basis(&inner, parent, &recipient, chrono::Utc::now().timestamp())
+            .map(|_| ())
     }
 
     /// Reserve a re-admission to `recipient` of exactly `amount_msat` (the
@@ -2957,7 +3140,11 @@ impl PairingService {
     /// and which bounds the amount. There is no durable admission object: the
     /// admission is re-proven by a new settled payment, debited like any other.
     pub fn reserve_readmission(
-        &self, parent: &Reservation, recipient: &str, amount_msat: u64, call_reserved_msat: u64,
+        &self,
+        parent: &Reservation,
+        recipient: &str,
+        amount_msat: u64,
+        call_reserved_msat: u64,
     ) -> Result<Reservation, BudgetRefusal> {
         self.reserve_readmission_operation(parent, recipient, amount_msat, call_reserved_msat, None)
     }
@@ -2970,8 +3157,15 @@ impl PairingService {
         call_reserved_msat: u64,
         operation: Option<crate::spend_budget::OperationReservationLink>,
     ) -> Result<Reservation, BudgetRefusal> {
-        self.reserve_quoted_readmission(parent, recipient, 0, amount_msat, call_reserved_msat, operation)
-            .map(|(_, admission)| admission)
+        self.reserve_quoted_readmission(
+            parent,
+            recipient,
+            0,
+            amount_msat,
+            call_reserved_msat,
+            operation,
+        )
+        .map(|(_, admission)| admission)
     }
 
     /// Before paying a signed re-admission quote: raise the parent's message
@@ -2990,26 +3184,42 @@ impl PairingService {
         call_reserved_msat: u64,
         operation: Option<crate::spend_budget::OperationReservationLink>,
     ) -> Result<(u64, Reservation), BudgetRefusal> {
-        let recipient = crate::spend_budget::canonical_recipient(recipient)
-            .ok_or(BudgetRefusal::NoGrant)?;
+        let recipient =
+            crate::spend_budget::canonical_recipient(recipient).ok_or(BudgetRefusal::NoGrant)?;
         let mut inner = self.lock();
         let (epoch, confirmed) =
             Self::readmission_basis(&inner, parent, &recipient, chrono::Utc::now().timestamp())?;
-        let grant_idx = inner.file.grants.iter().position(|g| g.op_id == parent.op_id)
+        let grant_idx = inner
+            .file
+            .grants
+            .iter()
+            .position(|g| g.op_id == parent.op_id)
             .ok_or(BudgetRefusal::NoGrant)?;
-        let budget = inner.file.grants[grant_idx].budget.as_ref().ok_or(BudgetRefusal::NoGrant)?;
+        let budget = inner.file.grants[grant_idx]
+            .budget
+            .as_ref()
+            .ok_or(BudgetRefusal::NoGrant)?;
         // A resolved parent cannot start more payments. This also binds the
         // admission to a recipient in the original API call.
-        let Some(old_message) = budget.pending.get(&parent.id).and_then(|p| p.get(&recipient)).copied() else {
+        let Some(old_message) = budget
+            .pending
+            .get(&parent.id)
+            .and_then(|p| p.get(&recipient))
+            .copied()
+        else {
             return Err(BudgetRefusal::NoGrant);
         };
         let message_top_up = quoted_message_all_in.saturating_sub(old_message);
         let max_msat = budget.per_call_max_msat;
-        let need = message_top_up.checked_add(admission_all_in)
+        let need = message_top_up
+            .checked_add(admission_all_in)
             .ok_or(BudgetRefusal::PerCall { max_msat })?;
-        let total = call_reserved_msat.checked_add(need)
+        let total = call_reserved_msat
+            .checked_add(need)
             .ok_or(BudgetRefusal::PerCall { max_msat })?;
-        if total > max_msat { return Err(BudgetRefusal::PerCall { max_msat }); }
+        if total > max_msat {
+            return Err(BudgetRefusal::PerCall { max_msat });
+        }
         if let Some(max_msat) = confirmed {
             if let Some(pending) = inner.first_contact.get_mut(&parent.client_id) {
                 pending.consumed = true;
@@ -3025,24 +3235,53 @@ impl PairingService {
         // admission below; on any refusal the whole budget is restored.
         let before = inner.file.grants[grant_idx].budget.clone();
         if message_top_up > 0 {
-            let budget = inner.file.grants[grant_idx].budget.as_mut().ok_or(BudgetRefusal::NoGrant)?;
-            if let Err(e) = budget.reserve_at(&[Charge { recipient: recipient.clone(), amount_msat: message_top_up }], chrono::Utc::now().timestamp()) {
+            let budget = inner.file.grants[grant_idx]
+                .budget
+                .as_mut()
+                .ok_or(BudgetRefusal::NoGrant)?;
+            if let Err(e) = budget.reserve_at(
+                &[Charge {
+                    recipient: recipient.clone(),
+                    amount_msat: message_top_up,
+                }],
+                chrono::Utc::now().timestamp(),
+            ) {
                 inner.file.grants[grant_idx].budget = before;
                 return Err(e);
             }
-            if let Some(amount) = budget.pending.get_mut(&parent.id).and_then(|p| p.get_mut(&recipient)) {
+            if let Some(amount) = budget
+                .pending
+                .get_mut(&parent.id)
+                .and_then(|p| p.get_mut(&recipient))
+            {
                 *amount += message_top_up;
             }
         }
         // Eligibility and reservation share the replacement/revocation mutex.
-        let admission = self.reserve_spend_locked(&mut inner, &parent.client_id, epoch,
-            vec![Charge { recipient, amount_msat: admission_all_in }],
-            ReservationAuthority { expected_op_id: Some(&parent.op_id), operation, ..Default::default() },
-            || chrono::Utc::now().timestamp());
+        let admission = self.reserve_spend_locked(
+            &mut inner,
+            &parent.client_id,
+            epoch,
+            vec![Charge {
+                recipient,
+                amount_msat: admission_all_in,
+            }],
+            ReservationAuthority {
+                expected_op_id: Some(&parent.op_id),
+                operation,
+                ..Default::default()
+            },
+            || chrono::Utc::now().timestamp(),
+        );
         match admission {
             Ok(admission) => Ok((total, admission)),
             Err(e) => {
-                if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == parent.op_id) {
+                if let Some(g) = inner
+                    .file
+                    .grants
+                    .iter_mut()
+                    .find(|g| g.op_id == parent.op_id)
+                {
                     g.budget = before;
                 }
                 Err(e)
@@ -3052,7 +3291,11 @@ impl PairingService {
 
     /// Reserve a consumed approval against its exact original grant. The
     /// opaque value is not cloneable and cannot be deserialized from a request.
-    pub fn reserve_first_contact(&self, approval: FirstContactAuthorization, cap: Option<u64>) -> Result<Reservation, BudgetRefusal> {
+    pub fn reserve_first_contact(
+        &self,
+        approval: FirstContactAuthorization,
+        cap: Option<u64>,
+    ) -> Result<Reservation, BudgetRefusal> {
         self.reserve_first_contact_operation(approval, cap, None)
     }
 
@@ -3062,13 +3305,28 @@ impl PairingService {
         cap: Option<u64>,
         operation: Option<crate::spend_budget::OperationReservationLink>,
     ) -> Result<Reservation, BudgetRefusal> {
-        let amount_msat = cap.unwrap_or(approval.max_total_msat).min(approval.max_total_msat);
+        let amount_msat = cap
+            .unwrap_or(approval.max_total_msat)
+            .min(approval.max_total_msat);
         let mut inner = self.lock();
-        if approval.expires_at <= chrono::Utc::now().timestamp() { return Err(BudgetRefusal::NoGrant); }
-        self.reserve_spend_locked(&mut inner, &approval.client_id, approval.epoch,
-            vec![Charge { recipient: approval.recipient, amount_msat }],
-            ReservationAuthority { expected_op_id: Some(&approval.budget_op_id), operation, ..Default::default() },
-            || chrono::Utc::now().timestamp())
+        if approval.expires_at <= chrono::Utc::now().timestamp() {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        self.reserve_spend_locked(
+            &mut inner,
+            &approval.client_id,
+            approval.epoch,
+            vec![Charge {
+                recipient: approval.recipient,
+                amount_msat,
+            }],
+            ReservationAuthority {
+                expected_op_id: Some(&approval.budget_op_id),
+                operation,
+                ..Default::default()
+            },
+            || chrono::Utc::now().timestamp(),
+        )
     }
 
     /// Consume this client's first-contact grant for `recipient`, returning
@@ -3076,7 +3334,12 @@ impl PairingService {
     /// for someone else, or when it has
     /// expired, or the budget grant it was issued under is no longer live
     /// (revoked, replaced, rotated). Single use: a match is marked consumed.
-    pub fn take_first_contact(&self, client_id: &str, epoch: u64, recipient: &str) -> Option<FirstContactAuthorization> {
+    pub fn take_first_contact(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        recipient: &str,
+    ) -> Option<FirstContactAuthorization> {
         let recipient = crate::spend_budget::canonical_recipient(recipient)?;
         let mut inner = self.lock();
         let now = chrono::Utc::now().timestamp();
@@ -3099,8 +3362,11 @@ impl PairingService {
         let taken = inner.first_contact.get_mut(client_id)?;
         taken.consumed = true;
         live.then_some(FirstContactAuthorization {
-            max_total_msat: taken.grant.max_total_msat, recipient,
-            client_id: client_id.to_owned(), epoch, budget_op_id: taken.budget_op_id.clone(),
+            max_total_msat: taken.grant.max_total_msat,
+            recipient,
+            client_id: client_id.to_owned(),
+            epoch,
+            budget_op_id: taken.budget_op_id.clone(),
             expires_at: taken.grant.expires_at,
         })
     }
@@ -3155,10 +3421,21 @@ impl PairingService {
         Ok(action())
     }
 
-    pub(crate) fn reservation_contact_budget(&self, reservation: &Reservation, recipient: &str) -> Option<u64> {
+    pub(crate) fn reservation_contact_budget(
+        &self,
+        reservation: &Reservation,
+        recipient: &str,
+    ) -> Option<u64> {
         let inner = self.lock();
-        inner.file.grants.iter().find(|g| g.op_id == reservation.op_id && g.client_id == reservation.client_id)
-            .and_then(|g| g.budget.as_ref())?.per_recipient_msat.get(recipient).copied()
+        inner
+            .file
+            .grants
+            .iter()
+            .find(|g| g.op_id == reservation.op_id && g.client_id == reservation.client_id)
+            .and_then(|g| g.budget.as_ref())?
+            .per_recipient_msat
+            .get(recipient)
+            .copied()
     }
 
     /// Resolve one recipient's part of a reservation to what was actually
@@ -3173,22 +3450,43 @@ impl PairingService {
         }
     }
 
-    pub(crate) fn try_resolve_spend(&self, reservation: &Reservation, recipient: &str, actual_msat: u64) -> Result<(), PairingError> {
+    pub(crate) fn try_resolve_spend(
+        &self,
+        reservation: &Reservation,
+        recipient: &str,
+        actual_msat: u64,
+    ) -> Result<(), PairingError> {
         let mut inner = self.lock();
-        let Some(grant) = inner.file.grants.iter_mut().find(|g|
-            g.op_id == reservation.op_id && g.client_id == reservation.client_id
-        ) else { return Ok(()); };
-        let Some(budget) = grant.budget.as_mut() else { return Ok(()); };
+        let Some(grant) = inner
+            .file
+            .grants
+            .iter_mut()
+            .find(|g| g.op_id == reservation.op_id && g.client_id == reservation.client_id)
+        else {
+            return Ok(());
+        };
+        let Some(budget) = grant.budget.as_mut() else {
+            return Ok(());
+        };
         let before = budget.clone();
-        let Some(recipients) = budget.pending.get_mut(&reservation.id) else { return Ok(()); };
-        let Some(reserved) = recipients.remove(recipient) else { return Ok(()); };
+        let Some(recipients) = budget.pending.get_mut(&reservation.id) else {
+            return Ok(());
+        };
+        let Some(reserved) = recipients.remove(recipient) else {
+            return Ok(());
+        };
         if recipients.is_empty() {
             budget.pending.remove(&reservation.id);
             budget.operation_links.remove(&reservation.id);
         }
         budget.resolve(recipient, reserved, actual_msat);
         if let Err(e) = self.persist(&mut inner.file) {
-            if let Some(grant) = inner.file.grants.iter_mut().find(|g| g.op_id == reservation.op_id) {
+            if let Some(grant) = inner
+                .file
+                .grants
+                .iter_mut()
+                .find(|g| g.op_id == reservation.op_id)
+            {
                 grant.budget = Some(before);
             }
             return Err(e);
@@ -3393,6 +3691,167 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
+/// Never truncate or silently replace a persistent transport key. Unlike a
+/// disposable challenge, rotating this secret invalidates clients' box pins.
+fn load_box_transport_key(dir: &Path) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
+    load_box_transport_key_with_sync(dir, fsync_dir_strict)
+}
+
+fn load_box_transport_key_with_sync(
+    dir: &Path,
+    sync_dir: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
+    load_box_transport_key_with_io(dir, sync_dir, |from, to| std::fs::hard_link(from, to))
+}
+
+fn load_box_transport_key_with_io(
+    dir: &Path,
+    sync_dir: impl Fn(&Path) -> io::Result<()>,
+    hard_link: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<zeroize::Zeroizing<[u8; 32]>> {
+    use std::io::{Read, Write};
+    let path = dir.join("box-transport.key");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let temporary = dir.join(format!(".box-transport-{}.tmp", uuid::Uuid::new_v4()));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            let published = (|| -> io::Result<()> {
+                let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+                rand::thread_rng().fill_bytes(secret.as_mut());
+                file.write_all(secret.as_ref())?;
+                file.sync_all()?;
+                // Publish a complete, synced key without clobbering a winner
+                // from a concurrent open. A crash leaves at worst an ignored
+                // protected temporary file, never a partial authoritative key.
+                match hard_link(&temporary, &path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                    Err(error) => Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot publish box transport key at {} via hard link: {error}. \
+                             The data directory must be on a filesystem that supports hard links; \
+                             exFAT/FAT SD cards do not. Use a filesystem such as NTFS, ext4 or APFS",
+                            path.display()
+                        ),
+                    )),
+                }
+            })();
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            published?;
+        }
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "box transport key must be a regular file",
+        ));
+    }
+    let mut file = std::fs::File::open(&path)?;
+    if file.metadata()?.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "box transport key must be exactly 32 bytes; restore it from backup",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+    file.read_exact(secret.as_mut())?;
+    // Also sync on reload: another opener (or a previous failed start) may
+    // have published the file without completing its directory synchronization.
+    sync_dir(dir)?;
+    sync_dir(
+        dir.parent()
+            .ok_or_else(|| io::Error::other("pairing directory has no parent"))?,
+    )?;
+    Ok(secret)
+}
+
+#[cfg(test)]
+mod box_transport_durability_tests {
+    use super::*;
+
+    #[cfg(not(unix))]
+    #[test]
+    fn strict_directory_sync_is_best_effort_on_non_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        // Windows may reject opening or flushing a read-only directory handle.
+        fsync_dir_strict(dir.path()).unwrap();
+        assert_eq!(
+            fsync_dir_strict(&dir.path().join("missing"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn unsupported_hard_links_explain_filesystem_requirement_and_leave_no_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = load_box_transport_key_with_io(dir.path(), fsync_dir_strict, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "injected unsupported link",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        let message = error.to_string();
+        assert!(message.contains("hard links"), "{message}");
+        assert!(message.contains("exFAT"), "{message}");
+        assert!(message.contains("injected unsupported link"), "{message}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_directory_sync_does_not_discard_os_errors() {
+        // This descriptor opens successfully, but cannot be fsynced.
+        assert!(fsync_dir_strict(Path::new("/dev/null")).is_err());
+    }
+
+    #[test]
+    fn directory_sync_failure_never_returns_a_box_key_or_rotates_it() {
+        for existing in [false, true] {
+            for fail_parent in [false, true] {
+                let data = tempfile::tempdir().unwrap();
+                let dir = data.path().join("pairing");
+                std::fs::create_dir(&dir).unwrap();
+                let path = dir.join("box-transport.key");
+                if existing {
+                    std::fs::write(&path, [0x42; 32]).unwrap();
+                }
+                let failed_path = if fail_parent { data.path() } else { &dir };
+                let result = load_box_transport_key_with_sync(&dir, |path| {
+                    if path == failed_path {
+                        Err(io::Error::other("injected directory sync failure"))
+                    } else {
+                        fsync_dir(path)
+                    }
+                });
+                assert!(result.is_err(), "existing={existing}, parent={fail_parent}");
+                let before = std::fs::read(&path).unwrap();
+                let recovered = load_box_transport_key(&dir).unwrap();
+                assert_eq!(&recovered[..], &before);
+            }
+        }
+    }
+}
+
 /// Write `bytes` to `path` at mode `0600`, fsyncing before returning.
 ///
 /// The `0600` is the actual security control for the challenge file: the
@@ -3433,7 +3892,30 @@ pub fn restrict_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// fsync a directory so a rename into it is durable.
+/// fsync a directory so a rename into it is durable on Unix.
+/// On other platforms the directory sync is best-effort; a missing directory still fails.
+pub fn fsync_dir_strict(path: &Path) -> io::Result<()> {
+    let result = std::fs::File::open(path).and_then(|dir| dir.sync_all());
+    #[cfg(unix)]
+    {
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        // std has no directory fsync on Windows: opening a directory without
+        // backup semantics, or flushing its handle, fails with platform-specific
+        // errors (access denied, invalid handle, ...). The file was already
+        // synced before the rename, so only this directory step is best-effort
+        // here. A missing directory is still an error. Unix transport pins
+        // still require successful directory synchronization.
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Best-effort directory fsync for existing callers.
 pub fn fsync_dir(path: &Path) -> io::Result<()> {
     let dir = std::fs::File::open(path)?;
     // Directory fsync is not supported on every platform/filesystem; the
