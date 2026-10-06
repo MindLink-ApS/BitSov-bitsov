@@ -133,7 +133,7 @@ fn write_identity_metadata_with_sync(
     pairing: &PairingService,
     sync_dir: impl Fn(&std::path::Path) -> std::io::Result<()>,
 ) -> Result<()> {
-    use konsensus_api::pairing::{identity_fingerprint, restrict_dir, write_protected};
+    use konsensus_api::pairing::{restrict_dir, write_protected};
     let dir = data_dir.join("identity");
     std::fs::create_dir_all(&dir)?;
     restrict_dir(&dir)?;
@@ -144,23 +144,10 @@ fn write_identity_metadata_with_sync(
         Err(error) => return Err(error.into()),
     };
     let previous = document.clone();
-    let node_id = identity.node_id().to_hex();
-    let (public_key, signature) = box_transport_proof(identity, pairing);
-    document.insert(
-        "identity_fingerprint".into(),
-        identity_fingerprint(&node_id).into(),
-    );
-    let transport_pubkey = hex::encode(identity.x25519_public().as_bytes());
-    let transport_signature = URL_SAFE_NO_PAD.encode(
-        identity
-            .sign(wire::transport_proof_message(&node_id, &transport_pubkey).as_bytes())
-            .to_bytes(),
-    );
-    document.insert("transport_pubkey".into(), transport_pubkey.into());
-    document.insert("transport_signature".into(), transport_signature.into());
-    document.insert("node_id".into(), node_id.into());
-    document.insert("box_transport_pubkey".into(), public_key.into());
-    document.insert("box_transport_signature".into(), signature.into());
+    document.extend(wire::public_identity_proofs(
+        identity,
+        &pairing.box_transport_pubkey(),
+    ));
     if document != previous {
         // Publish all fields together; a crash must not leave half a proof.
         let temporary = dir.join(format!(".identity-{}.tmp", uuid::Uuid::new_v4()));
@@ -193,6 +180,19 @@ pub struct LockedIdentity {
 enum ResponderIdentity {
     Live(Arc<NodeIdentity>),
     Locked(Arc<LockedIdentity>),
+    /// No identity exists yet: box static, pre-bootstrap tickets only.
+    Bootstrap,
+}
+
+impl ResponderIdentity {
+    /// The identity a ticket and pairing proof bind to; empty before bootstrap.
+    fn ticket_node_id(&self) -> Option<String> {
+        match self {
+            Self::Live(identity) => Some(identity.node_id().to_hex()),
+            Self::Bootstrap => Some(String::new()),
+            Self::Locked(_) => None,
+        }
+    }
 }
 
 pub struct RemoteAccessServer {
@@ -305,6 +305,46 @@ impl RemoteAccessServer {
         })
     }
 
+    /// Pre-identity tunnel for remote first run: the box static, existing
+    /// pairings, and first pairing only through a pre-bootstrap CLI ticket.
+    /// Never mints a ticket itself; `konsensus pair-ticket` is the grant.
+    pub async fn bind_bootstrap(
+        config: &RemoteAccessConfig,
+        pairing: Arc<PairingService>,
+        internal_api: SocketAddr,
+        tunnel_clients: Arc<RemoteTunnelClients>,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            pairing.bound_fingerprint().is_empty(),
+            "remote bootstrap requires an identity-free pairing state"
+        );
+        let listen_addr = config
+            .listen_addr
+            .context("remote bootstrap requires remote_access.listen_addr")?;
+        let listener = TcpListener::bind(listen_addr)
+            .await
+            .with_context(|| format!("could not bind remote access listener at {listen_addr}"))?;
+        let path = pairing.remote_access_link_path();
+        let _guard = crate::ticket_cmd::lock_ticket(path.parent().unwrap())?;
+        let mut pairing_code = None;
+        if reload_pairing_code(&pairing, &mut pairing_code, "").is_err() {
+            pairing.remove_remote_access_link()?;
+            warn!("discarded unusable remote pairing ticket at bootstrap startup");
+        }
+        let pairing_deadline = pairing_code.as_ref().map(|code| code.expires_at);
+        let pair_link_path = pairing_code.as_ref().map(|_| path);
+        Ok(Self {
+            listener,
+            identity: ResponderIdentity::Bootstrap,
+            pairing,
+            internal_api,
+            tunnel_clients,
+            pairing_code: Arc::new(Mutex::new(pairing_code)),
+            pair_link_path,
+            pairing_deadline,
+        })
+    }
+
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
@@ -325,12 +365,13 @@ impl RemoteAccessServer {
         let mut tasks = tokio::task::JoinSet::new();
 
         let mut refresh = tokio::time::interval(Duration::from_secs(1));
+        let ticket_node_id = self.identity.ticket_node_id();
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
-                _ = refresh.tick(), if matches!(self.identity, ResponderIdentity::Live(_)) => {
-                    if let ResponderIdentity::Live(identity) = &self.identity {
-                        if refresh_pairing_code(&self.pairing, &self.pairing_code, &identity.node_id().to_hex()).is_err() {
+                _ = refresh.tick(), if ticket_node_id.is_some() => {
+                    if let Some(node_id) = &ticket_node_id {
+                        if refresh_pairing_code(&self.pairing, &self.pairing_code, node_id).is_err() {
                             warn!("could not reload remote pairing ticket");
                         }
                     }
@@ -510,7 +551,9 @@ async fn handle_connection(
         // live responder before those clients have had a chance to learn it.
         let secret = match &identity {
             ResponderIdentity::Live(identity) => identity.x25519_secret_bytes(),
-            ResponderIdentity::Locked(_) => pairing.box_transport_secret_bytes(),
+            ResponderIdentity::Locked(_) | ResponderIdentity::Bootstrap => {
+                pairing.box_transport_secret_bytes()
+            }
         };
         let mut noise = NoiseSession::responder(secret)?;
         let msg1 = wire::read_frame(&mut remote_reader, MAX_NOISE_MSG_LEN).await?;
@@ -579,7 +622,15 @@ async fn handle_connection(
                 identity.box_transport_signature.clone(),
             )
         }
+        // No identity can sign the box key yet: the ticket is the pin, and
+        // finalize returns the committed identity's proof for re-pinning.
+        ResponderIdentity::Bootstrap => (
+            authenticate_from_file(&request, &remote_static, "", &pairing, &pairing_code),
+            hex::encode(pairing.box_transport_pubkey()),
+            String::new(),
+        ),
     };
+    let follow_rebind = matches!(identity, ResponderIdentity::Bootstrap);
     let response = match &authenticated {
         Ok(client) => AuthResponse::Ok {
             v: VERSION,
@@ -599,7 +650,7 @@ async fn handle_connection(
         wire::encode_transport(&mut noise, &response_json).map_err(anyhow::Error::msg)?;
     wire::write_frame(&mut remote_writer, &response_ciphertext).await?;
     let client = authenticated?;
-    validate_tunnel_authority(&pairing, &client, &remote_static)?;
+    validate_tunnel_authority(&pairing, &client, &remote_static, follow_rebind)?;
 
     let internal = TcpStream::connect(internal_api)
         .await
@@ -630,7 +681,7 @@ async fn handle_connection(
             _ = shutdown.changed() => return Ok(()),
             changed = authority_changes.changed() => {
                 changed.context("pairing authority notification channel closed")?;
-                validate_tunnel_authority(&pairing, &client, &remote_static)?;
+                validate_tunnel_authority(&pairing, &client, &remote_static, follow_rebind)?;
             }
             incoming = frame_rx.recv() => {
                 let ciphertext = match incoming {
@@ -643,7 +694,7 @@ async fn handle_connection(
                     &ciphertext,
                     wire::MAX_TUNNEL_PLAINTEXT,
                 ).map_err(anyhow::Error::msg)?;
-                validate_tunnel_authority(&pairing, &client, &remote_static)?;
+                validate_tunnel_authority(&pairing, &client, &remote_static, follow_rebind)?;
                 internal_writer.write_all(&plaintext).await?;
                 internal_writer.flush().await?;
             }
@@ -652,7 +703,7 @@ async fn handle_connection(
                 if read == 0 {
                     return Ok(());
                 }
-                validate_tunnel_authority(&pairing, &client, &remote_static)?;
+                validate_tunnel_authority(&pairing, &client, &remote_static, follow_rebind)?;
                 let ciphertext = wire::encode_transport(&mut noise, &internal_buf[..read])
                     .map_err(anyhow::Error::msg)?;
                 wire::write_frame(&mut remote_writer, &ciphertext).await?;
@@ -661,18 +712,22 @@ async fn handle_connection(
     }
 }
 
+/// A bootstrap tunnel outlives the commit's rebind from the empty fingerprint
+/// so finalize can answer; revocation or an epoch change still closes it, and
+/// the committed bootstrap router refuses every ceremony call.
 fn validate_tunnel_authority(
     pairing: &PairingService,
     client: &PairedClient,
     remote_static: &[u8; 32],
+    follow_rebind: bool,
 ) -> Result<()> {
+    let fingerprint = if follow_rebind {
+        pairing.bound_fingerprint()
+    } else {
+        client.identity_fingerprint.clone()
+    };
     pairing
-        .validate_remote_authority(
-            &client.client_id,
-            client.epoch,
-            remote_static,
-            &client.identity_fingerprint,
-        )
+        .validate_remote_authority(&client.client_id, client.epoch, remote_static, &fingerprint)
         .map_err(anyhow::Error::from)
 }
 
@@ -761,9 +816,14 @@ fn authenticate(
     pairing
         .remove_remote_access_link()
         .context("could not remove consumed remote pairing link")?;
-    let client = pairing
-        .create_ticket_remote_pairing(name, pubkey_hex, remote_static)
-        .map_err(anyhow::Error::from)?;
+    // `node_id` is server state: empty only on the identity-free bootstrap
+    // responder, where the pairing service also refuses once one is bound.
+    let client = if node_id.is_empty() {
+        pairing.create_bootstrap_ticket_pairing(name, pubkey_hex, remote_static)
+    } else {
+        pairing.create_ticket_remote_pairing(name, pubkey_hex, remote_static)
+    }
+    .map_err(anyhow::Error::from)?;
     Ok(client)
 }
 
@@ -1136,6 +1196,120 @@ mod tests {
             ),
             Err(konsensus_api::pairing::PairingError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_ticket_pairs_one_identity_client_without_local_window() {
+        let config = RemoteAccessConfig {
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            advertised_endpoint: Some("node.example:8443".into()),
+        };
+        let bind = |pairing| {
+            RemoteAccessServer::bind_bootstrap(
+                &config,
+                pairing,
+                "127.0.0.1:1".parse().unwrap(),
+                Arc::new(RemoteTunnelClients::default()),
+            )
+        };
+        let live = tempfile::tempdir().unwrap();
+        let bound = Arc::new(PairingService::open(live.path(), "ab".repeat(32), false).unwrap());
+        assert!(bind(bound).await.is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let pairing = Arc::new(PairingService::open(dir.path(), String::new(), false).unwrap());
+        let mut ticket = PairLink {
+            v: VERSION,
+            endpoint: "node.example:8443".into(),
+            node_id: String::new(),
+            transport_pubkey: String::new(),
+            transport_signature: String::new(),
+            box_transport_pubkey: hex::encode(pairing.box_transport_pubkey()),
+            box_transport_signature: None,
+            code: crate::ticket_cmd::new_code(),
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            hosted_by: None,
+        };
+        pairing
+            .write_remote_access_link(&ticket.to_uri().unwrap())
+            .unwrap();
+        let server = bind(pairing.clone()).await.unwrap();
+        assert_eq!(server.identity.ticket_node_id().as_deref(), Some(""));
+        let bootstrap_request = |transport: &[u8; 32], code: &str, key: &SigningKey| {
+            let pubkey = hex::encode(key.verifying_key().to_bytes());
+            let proof = wire::pairing_proof_message("", &hex::encode(transport), code, &pubkey);
+            AuthRequest {
+                v: VERSION,
+                code: Some(code.into()),
+                client_name: Some("phone".into()),
+                client_pubkey: Some(pubkey),
+                signature: Some(URL_SAFE_NO_PAD.encode(key.sign(proof.as_bytes()).to_bytes())),
+            }
+        };
+
+        // A proof bound to some identity is not a pre-bootstrap proof.
+        assert!(authenticate_from_file(
+            &request(
+                &identity(),
+                &[0x61; 32],
+                &ticket.code,
+                &SigningKey::from_bytes(&[0x61; 32])
+            ),
+            &[0x61; 32],
+            "",
+            &pairing,
+            &server.pairing_code,
+        )
+        .is_err());
+        let first = authenticate_from_file(
+            &bootstrap_request(
+                &[0x62; 32],
+                &ticket.code,
+                &SigningKey::from_bytes(&[0x62; 32]),
+            ),
+            &[0x62; 32],
+            "",
+            &pairing,
+            &server.pairing_code,
+        )
+        .unwrap();
+        assert_eq!(
+            first.scopes,
+            konsensus_api::pairing::bootstrap_pairing_scopes()
+        );
+        assert!(first.identity_fingerprint.is_empty());
+        assert!(!pairing.remote_access_link_path().exists());
+        assert!(!pairing.pairing_open());
+        assert!(matches!(
+            pairing.request_pairing(
+                "local",
+                &hex::encode(
+                    SigningKey::from_bytes(&[0x63; 32])
+                        .verifying_key()
+                        .to_bytes()
+                )
+            ),
+            Err(konsensus_api::pairing::PairingError::Closed)
+        ));
+
+        // Only one first-run client: a second ticket cannot add another.
+        ticket.code = crate::ticket_cmd::new_code();
+        pairing
+            .write_remote_access_link(&ticket.to_uri().unwrap())
+            .unwrap();
+        assert!(authenticate_from_file(
+            &bootstrap_request(
+                &[0x64; 32],
+                &ticket.code,
+                &SigningKey::from_bytes(&[0x64; 32])
+            ),
+            &[0x64; 32],
+            "",
+            &pairing,
+            &server.pairing_code,
+        )
+        .is_err());
+        assert_eq!(pairing.list_clients().len(), 1);
     }
 
     #[tokio::test]

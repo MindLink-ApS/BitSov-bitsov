@@ -9,6 +9,15 @@ also live on the corresponding GitHub pre-release pages.
   an existing owner-approved device over the pinned box-static Noise tunnel.
   Locked nodes serve four routes only, do not receive messages or watch Lightning
   channels, and never persist the unlock password. See [the home-node runbook](docs/operations/home-node.md).
+- Remote first run: `start --remote-unlock --local-owner-device` on a positively
+  empty data dir serves two-phase bootstrap over the box-static Noise tunnel to
+  the one client that consumed a pre-bootstrap `pair-ticket`. `create-pending`
+  takes a `password_commitment`, and `finalize` takes the password over the
+  tunnel only (`400 tunnel_required` on loopback). The commit writes only
+  `mnemonic.enc`, records `enrolled_by: "remote_first_run"`, writes signed public
+  identity metadata, returns the box proof, and exits 75 so `Restart=on-failure`
+  restarts into locked mode for the first remote unlock. Legacy create/restore
+  are not routed in this mode. See [remote first run](docs/security/pairing.md#remote-first-run-over-the-tunnel).
 
 ## [0.3.0-rc9] — 2026-10-06 (prep; not tagged yet)
 

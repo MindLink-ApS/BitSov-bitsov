@@ -90,6 +90,37 @@ pub fn box_transport_proof_message(node_id_hex: &str, box_transport_pubkey_hex: 
     format!("{BOX_TRANSPORT_PROOF_DOMAIN}:{node_id_hex}:{box_transport_pubkey_hex}")
 }
 
+/// Public, identity-signed fields of `identity/identity.json`: node id,
+/// fingerprint, and both transport proofs. Locked startup and enrollment
+/// tickets read only these; no seed or password material is involved.
+pub fn public_identity_proofs(
+    identity: &konsensus_core::NodeIdentity,
+    box_transport_pubkey: &[u8; 32],
+) -> serde_json::Map<String, serde_json::Value> {
+    let node_id = identity.node_id().to_hex();
+    let sign =
+        |message: String| URL_SAFE_NO_PAD.encode(identity.sign(message.as_bytes()).to_bytes());
+    let transport_pubkey = hex::encode(identity.x25519_public().as_bytes());
+    let box_pubkey = hex::encode(box_transport_pubkey);
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "identity_fingerprint".into(),
+        crate::pairing::identity_fingerprint(&node_id).into(),
+    );
+    fields.insert(
+        "transport_signature".into(),
+        sign(transport_proof_message(&node_id, &transport_pubkey)).into(),
+    );
+    fields.insert("transport_pubkey".into(), transport_pubkey.into());
+    fields.insert(
+        "box_transport_signature".into(),
+        sign(box_transport_proof_message(&node_id, &box_pubkey)).into(),
+    );
+    fields.insert("box_transport_pubkey".into(), box_pubkey.into());
+    fields.insert("node_id".into(), node_id.into());
+    fields
+}
+
 /// First encrypted message after Noise_XX. With `code`, every optional field
 /// below is required. Without `code`, all of them must be absent and the Noise
 /// remote static is looked up in the durable pairing store.

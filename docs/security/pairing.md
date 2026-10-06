@@ -332,8 +332,9 @@ After the normal bootstrap pairing, use its `bst` token with `identity` scope:
    `{public_key, name, proof}`. The key is 65-byte uncompressed SEC1 P-256, hex;
    the proof is a hex DER P-256/SHA-256 signature over `registration_message`
    from the device protocol, bound to the pending identity's fingerprint and
-   the paired `client_id`. No password field is accepted. Missing device is
-   `400`; invalid possession or the wrong fingerprint is `403`.
+   the paired `client_id`. No password field is accepted (`422`) on this local
+   path; only [remote first run](#remote-first-run-over-the-tunnel) takes one.
+   Missing device is `400`; invalid possession or the wrong fingerprint is `403`.
 3. Finalize returns `node_id`, `restart_required: true`, `device_key_id`,
    `device_fingerprint`, and `mnemonic_path`, never the phrase. Bootstrap exits;
    explicitly restart with the same descriptor password and local-owner flag.
@@ -385,6 +386,77 @@ that pairing explicitly through the owner console (revoke and re-pair); repair
 never silently rebinds it. After rebind, a missing device record leaves only
 read/receive authority. Enroll through the owner console; the HTTP bootstrap
 routes never reopen and the phrase is never shown again.
+
+### Remote first run over the tunnel
+
+A headless box has no launcher to pipe a password. Start it on a positively
+empty data dir with `start --remote-unlock --local-owner-device` and
+`[remote_access]` configured; `--password-fd` is not used. Bootstrap then also
+binds the Noise listener with the persistent box static
+(`pairing/box-transport.key`) and bridges it to an internal loopback listener,
+as in locked mode. The loopback API stays bound. No peer port is bound.
+
+First pairing needs a pre-bootstrap ticket from `konsensus pair-ticket` on the
+box; bootstrap never mints one. The ticket carries only the box public key, and
+the client pins it. The client's pairing proof binds the empty node id (`""`).
+Consuming the ticket creates the one bootstrap pairing (`read`, `receive`,
+`identity`) bound to the client's Noise static. A second ticket, or a ticket
+after any other pairing exists, is refused. A ticket never opens the local
+`/pair/request` window. The client then fetches its `bst` token through the
+tunnel as usual.
+
+`GET /api/v1/bootstrap/state` reports `can_restore: false` and
+`local_owner: {available: true, enroll_device: true, pending,
+tunnel_password: true}`. `tunnel_password` is absent in local mode. The
+ceremony routes change in this mode only:
+
+1. `POST /api/v1/identity/create-pending` takes
+   `{"password_commitment": "<blake3(password), 64 lowercase hex>"}`; anything
+   else is `400 invalid_password_commitment`. The client generates the
+   password and stores it (for example in Keychain) **before** this call. The
+   response is the local one.
+2. `POST /api/v1/identity/finalize` takes the local body plus `password`.
+   `device` is mandatory, because the box cannot be unlocked without a device
+   key. The password is decoded into zeroizing memory without a serde scratch
+   copy. A malformed body is `400 invalid_finalize_body`, a missing commitment
+   is `400 password_commitment_missing`, an empty password is
+   `400 password_required`, and a password that does not match the commitment
+   is `400 password_commitment_mismatch`. Mismatches count as failed backup
+   checks; the third is `410 ceremony_lost`. Nothing is written before the
+   check passes.
+3. Commit is the local commit with that password: `mnemonic.enc` only, the
+   owner approval from `owner_secret(password, node_id)`, and the device record
+   says `enrolled_by: remote_first_run`. `identity/identity.json` now carries the
+   signed public transport proofs that locked mode and `pair-ticket` require.
+   The finalize response adds `box_transport_pubkey` and
+   `box_transport_signature`, the committed identity's proof for re-pinning.
+   The tunnel survives the rebind long enough to deliver it, but a revocation
+   or epoch change still closes it.
+4. The process exits **75** (`EX_TEMPFAIL`). Under `Restart=on-failure` the same
+   command restarts into locked mode. The client completes the
+   [first remote unlock](../operations/home-node.md) with the stored password,
+   which also proves the stored copy is right.
+
+`create-pending` and `finalize` require the caller to arrive through a
+registered tunnel whose server-side pairing is the token's client. The
+registration is server state keyed by the internal peer address; no header can
+claim it. The same calls on the loopback listener, or from another tunnel
+client, are `400 tunnel_required`; finalize checks this before it reads the
+body. Legacy
+`/api/v1/identity/create` and `/api/v1/identity/restore` are not routed in this
+mode: a plaintext seed would leave a box that `--remote-unlock` refuses.
+Remote restore is not supported. The password never touches disk, logs or
+responses, and it is dropped with the ceremony state.
+
+Contract errata (C:§3.3, home-node contract §2.3): "no HTTP password field" is
+amended to "never on the loopback path". The tunnel is bound only with
+`--remote-unlock`, not whenever `listen_addr` is set: other bootstrap starts
+keep the loopback-only surface. Device enrollment is mandatory, and the restart
+exit code is 75.
+
+A box that is not the owner's own can serve a fake bootstrap to a client that
+scanned its ticket, and the client would then create a seed on that box. Take
+the ticket only from your own box.
 
 ## Unchanged
 
