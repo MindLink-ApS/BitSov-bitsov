@@ -553,16 +553,62 @@ async fn remote_bootstrap_over_tunnel_restarts_locked_and_first_unlock_succeeds(
         .json()
         .await
         .unwrap();
-    let keys: Value = http
-        .get(format!("http://{}/api/v1/pair/device-keys", f.api))
-        .bearer_auth(token["token"].as_str().unwrap())
+    let token = token["token"].as_str().unwrap();
+    let device_keys = || async {
+        http.get(format!("http://{}/api/v1/pair/device-keys", f.api))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    };
+    let keys = device_keys().await;
+    assert_eq!(keys["local_owner_device"], true, "{keys}");
+    assert_eq!(keys["owner_device_count"], 1, "{keys}");
+
+    // 9. The remote_first_run device is a delegation approver.
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let second =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let second_public = hex::encode(second.public_key().as_ref());
+    let proof = second
+        .sign(
+            &rng,
+            device::registration_message(&fingerprint, &client_id, &second_public).as_bytes(),
+        )
+        .unwrap();
+    let reg: Value = http
+        .post(format!("http://{}/api/v1/pair/device-key", f.api))
+        .bearer_auth(token)
+        .json(&json!({"public_key": second_public, "name": "iPad",
+                      "proof": hex::encode(proof.as_ref())}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(keys["local_owner_device"], true, "{keys}");
+    let delegation = reg["delegation_message"].as_str().unwrap();
+    let signature = device_key.sign(&rng, delegation.as_bytes()).unwrap();
+    let approved = http
+        .post(format!(
+            "http://{}/api/v1/pair/device-key/{}/delegate",
+            f.api,
+            reg["op_id"].as_str().unwrap()
+        ))
+        .bearer_auth(token)
+        .json(&json!({"approver_key_id": record.key_id,
+                      "signature": hex::encode(signature.as_ref())}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), 200);
+    let approved: Value = approved.json().await.unwrap();
+    assert_eq!(approved["status"], "registered", "{approved}");
+    assert_eq!(approved["key_id"], reg["key_id"]);
+    assert_eq!(device_keys().await["owner_device_count"], 2);
     drop(node);
 
     let file_log = std::fs::read_to_string(f.dir.path().join("node.log")).unwrap_or_default();

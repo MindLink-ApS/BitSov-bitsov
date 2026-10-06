@@ -108,6 +108,10 @@ fn hosted_by_is_bounded_trimmed_and_printable() {
         ("Pi\u{202E}kcab", "printable"),
         ("Pi\u{200B}", "printable"),
         ("Pi\u{2066}x\u{2069}", "printable"),
+        ("Pi\u{206A}", "printable"),
+        ("Pi\u{206F}", "printable"),
+        ("Pi\u{E0020}", "printable"),
+        ("Pi\u{E0041}\u{E007F}", "printable"),
     ] {
         config.node.hosted_by = Some(label.into());
         let error = config.validate().unwrap_err().to_string();
@@ -2854,6 +2858,75 @@ fn private_forwarding_rejects_non_boolean_values() {
         assert!(toml::from_str::<LightningConfig>(&format!(
             "backend = 'ldk'\nforward_to_private_channels = {value}"
         )).is_err());
+    }
+}
+
+#[test]
+fn our_to_self_delay_is_omitted_by_default_and_round_trips() {
+    let omitted: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
+    assert!(matches!(
+        omitted,
+        LightningConfig::Ldk { our_to_self_delay_blocks: None, .. }
+    ));
+    assert!(!toml::to_string(&omitted).unwrap().contains("our_to_self_delay"));
+    let full = NodeConfig::default_for_tier(NodeTier::Full, PathBuf::from("/dev/null"), Path::new("/tmp"));
+    assert!(!toml::to_string(&full).unwrap().contains("our_to_self_delay"));
+
+    let config: LightningConfig =
+        toml::from_str("backend = 'ldk'\nour_to_self_delay_blocks = 288").unwrap();
+    assert!(matches!(
+        config,
+        LightningConfig::Ldk { our_to_self_delay_blocks: Some(288), .. }
+    ));
+    let serialized = toml::to_string(&config).unwrap();
+    let round_trip: LightningConfig = toml::from_str(&serialized).unwrap();
+    assert_eq!(toml::to_string(&round_trip).unwrap(), serialized);
+}
+
+#[test]
+fn our_to_self_delay_rejects_non_u16_values_at_parse() {
+    for value in ["-1", "65536", "288.0", "'288'", "true"] {
+        assert!(
+            toml::from_str::<LightningConfig>(&format!(
+                "backend = 'ldk'\nour_to_self_delay_blocks = {value}"
+            ))
+            .is_err(),
+            "{value}"
+        );
+    }
+    assert!(toml::from_str::<LightningConfig>("backend = 'ldk'\nour_to_self_delay = 288").is_err());
+}
+
+#[test]
+fn our_to_self_delay_validation_bounds_precede_node_startup() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.peers.clear();
+    config.payment_gate.verify_lightning_settlement = Some(true);
+    for (setting, accepted) in [
+        ("", true),
+        ("our_to_self_delay_blocks = 0", false),
+        ("our_to_self_delay_blocks = 143", false),
+        ("our_to_self_delay_blocks = 144", true),
+        ("our_to_self_delay_blocks = 288", true),
+        ("our_to_self_delay_blocks = 2016", true),
+        ("our_to_self_delay_blocks = 2017", false),
+        ("our_to_self_delay_blocks = 65535", false),
+    ] {
+        config.lightning = toml::from_str(&format!("backend = 'ldk'\n{setting}")).unwrap();
+        match config.validate() {
+            Ok(()) => assert!(accepted, "{setting} must be refused"),
+            Err(error) => {
+                assert!(!accepted, "{setting}: {error}");
+                assert!(
+                    error.to_string().contains("our_to_self_delay_blocks must be between 144 and 2016"),
+                    "{setting}: {error}"
+                );
+            }
+        }
     }
 }
 

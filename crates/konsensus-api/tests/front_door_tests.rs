@@ -725,6 +725,34 @@ async fn porch_card_uses_gate_web_content_price() {
 }
 
 #[tokio::test]
+async fn owner_price_overrides_are_clamped_to_gate_floor() {
+    for (admission, requested, expected) in [
+        (5000, (0, 1), (5000, 5000)),
+        (5000, (4999, 7000), (5000, 7000)),
+        (0, (1, 999), (1000, 1000)),
+        (0, (1234, 5678), (1234, 5678)),
+    ] {
+        let state = porch_pricing_state(1000, admission);
+        let (status, body, _) = call(
+            &state,
+            "PUT",
+            "/api/v1/front-door",
+            bearer(&state, vec![auth::Scope::Admin]),
+            Some(json!({"display_name": "Porch", "admission_msat": requested.0, "message_msat": requested.1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let card = FrontDoorCard::parse(body["link"].as_str().unwrap()).unwrap();
+        card.verify_signature().unwrap();
+        assert_eq!(
+            (card.prices.admission_msat, card.prices.message_msat),
+            expected,
+            "{requested:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn porch_stored_card_get_reprices_and_signs() {
     let state = porch_pricing_state(1000, 2000);
     let mut fields: FrontDoorFields = serde_json::from_value(json!({
