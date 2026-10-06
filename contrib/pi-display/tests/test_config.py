@@ -71,7 +71,7 @@ def test_node_settings_from_file(tmp_path):
     assert s.min_admission_cost_msat == 1500
     assert s.prices_msat["chat_msat"] == 2500
     assert s.prices_msat["call_msat"] == 20000
-    assert s.prices_msat["longform_msat"] == 50  # node default
+    assert s.prices_msat["web_content_msat"] == 1000  # node default
 
 
 def test_missing_or_unreadable_node_config_is_not_fatal(tmp_path):
@@ -118,8 +118,37 @@ def test_invalid_price_falls_back_to_node_default(bad):
     assert s.prices_msat["chat_msat"] == 10
 
 
-def test_display_config_defaults():
-    assert bd.parse_display_config("") == bd.DisplayConfig()
+BITCOIN_MACHINES = {
+    "profile": "bitcoin-machines",
+    "driver": "st7735",
+    "width": 160,
+    "height": 128,
+    "spi_port": 0,
+    "spi_device": 0,
+    "spi_speed_hz": 8_000_000,
+    "gpio_dc": 24,
+    "gpio_rst": 25,
+    "gpio_backlight": 18,
+    "backlight_active_low": False,
+}
+
+
+def test_display_config_defaults_to_bitcoin_machines_profile():
+    cfg = bd.parse_display_config("")
+    assert {k: getattr(cfg, k) for k in BITCOIN_MACHINES} == BITCOIN_MACHINES
+    assert cfg.faces == bd.FACES and cfg.interval_secs == 8.0 and not cfg.remote_unlock
+    assert bd.parse_display_config('profile = "bitcoin-machines"') == cfg
+
+
+def test_profile_values_can_be_overridden_one_by_one():
+    cfg = bd.parse_display_config("rotate = 2\nspi_speed_hz = 4000000\nremote_unlock = true")
+    assert (cfg.driver, cfg.rotate, cfg.spi_speed_hz, cfg.remote_unlock) == ("st7735", 2, 4_000_000, True)
+
+
+def test_setting_driver_leaves_the_profile():
+    cfg = bd.parse_display_config('driver = "auto"')
+    assert cfg == bd.DisplayConfig(driver="auto")
+    assert cfg.profile is None and cfg.width is None
 
 
 def test_display_config_full():
@@ -136,13 +165,13 @@ def test_display_config_full():
         node_config = "/home/node/.local/share/konsensus/konsensus.toml"
         api_port = 4000
         interval_secs = 10
-        screens = ["status", "prices"]
+        faces = ["bitsov", "price"]
         """
     )
     assert cfg.driver == "sh1106" and (cfg.width, cfg.height, cfg.rotate) == (128, 64, 2)
     assert cfg.i2c_address == 0x3D and cfg.gpio_rst is None and cfg.gpio_backlight == 12
     assert cfg.backlight_active_low and cfg.api_port == 4000 and cfg.interval_secs == 10.0
-    assert cfg.screens == ("status", "prices")
+    assert cfg.faces == ("bitsov", "price")
 
 
 @pytest.mark.parametrize(
@@ -154,11 +183,17 @@ def test_display_config_full():
         ("i2c_address = 0x80", "i2c_address"),
         ("gpio_dc = -1", "gpio_dc"),
         ("spi_speed_hz = 100", "spi_speed_hz"),
+        ("spi_speed_hz = 10000000", "spi_speed_hz"),
+        ('profile = "pimoroni"', "profile must be one of"),
+        ('profile = "bitcoin-machines"\ndriver = "st7735"', "either profile or driver"),
+        ("remote_unlock = 1", "remote_unlock"),
         ('node_config = "relative.toml"', "absolute path"),
         ("interval_secs = 1", "interval_secs"),
-        ('screens = ["status", "status"]', "screens"),
-        ('screens = ["balance"]', "screens"),
-        ("screens = []", "screens"),
+        ('faces = ["price", "price"]', "faces"),
+        ('faces = ["balance"]', "faces"),
+        ('faces = ["fiat"]', "faces"),
+        ("faces = []", "faces"),
+        ('screens = ["logo"]', "unknown display config keys: screens"),
         ("api_port = true", "api_port"),
         ("jwt_secret = 'x'", "unknown display config keys: jwt_secret"),
         ("driver = ", "not valid TOML"),
@@ -169,5 +204,5 @@ def test_display_config_rejects(text, message):
         bd.parse_display_config(text)
 
 
-def test_missing_display_config_means_auto(tmp_path):
-    assert bd.load_display_config(tmp_path / "display.toml") == bd.DisplayConfig()
+def test_missing_display_config_means_default_profile(tmp_path):
+    assert bd.load_display_config(tmp_path / "display.toml") == bd.parse_display_config("")

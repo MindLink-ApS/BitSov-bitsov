@@ -9,15 +9,19 @@ SVC_USER=bitsov-display
 GROUPS_NEEDED=(gpio spi i2c video)
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+REPLACED="$CONF_DIR/replaced-services"
+
 usage() {
 	cat <<EOF
-Usage: sudo ./install.sh [--node-config PATH] [--enable-buses] [--no-apt] [--no-start]
+Usage: sudo ./install.sh [--node-config PATH] [--vendor-service UNIT]... [--enable-buses] [--no-apt] [--no-start]
        sudo ./install.sh --uninstall
 
-  --node-config PATH  the node's konsensus.toml (default: auto-detect a single node)
-  --enable-buses      turn on I2C and SPI with raspi-config (needs a reboot)
-  --no-apt            skip apt-get (build tools, acl, i2c-tools)
-  --no-start          install and enable, but do not (re)start now
+  --node-config PATH     the node's konsensus.toml (default: auto-detect a single node)
+  --vendor-service UNIT  also stop and disable this display service (repeatable); services
+                         holding the panel's SPI device or framebuffer open are found anyway
+  --enable-buses         turn on I2C and SPI with raspi-config (needs a reboot)
+  --no-apt               skip apt-get (build tools, acl, i2c-tools, DejaVu fonts)
+  --no-start             install and enable, but do not (re)start now
 EOF
 }
 
@@ -27,6 +31,7 @@ die() {
 }
 
 NODE_CONFIG=""
+VENDOR_SERVICES=()
 APT=1
 START=1
 ENABLE_BUSES=0
@@ -36,6 +41,11 @@ while [ $# -gt 0 ]; do
 	--node-config)
 		NODE_CONFIG=${2:-}
 		shift 2 || die "--node-config needs a path"
+		;;
+	--vendor-service)
+		[[ "${2:-}" =~ ^[A-Za-z0-9@._-]+$ ]] || die "--vendor-service needs a unit name"
+		VENDOR_SERVICES+=("${2%.service}.service")
+		shift 2
 		;;
 	--enable-buses) ENABLE_BUSES=1 && shift ;;
 	--no-apt) APT=0 && shift ;;
@@ -54,6 +64,22 @@ configured_node_config() {
 	sed -n 's/^node_config *= *"\(.*\)".*/\1/p' "$CONF_DIR/display.toml" | tail -n 1
 }
 
+# System services that hold the panel's SPI device or a panel framebuffer open.
+panel_holders() {
+	local fd target pid unit
+	for fd in /proc/[0-9]*/fd/*; do
+		target=$(readlink "$fd" 2>/dev/null) || continue
+		case "$target" in
+		/dev/spidev* | /dev/fb[1-9]*) ;;
+		*) continue ;;
+		esac
+		pid=${fd#/proc/}
+		pid=${pid%%/*}
+		unit=$(sed -n 's|^0::/system\.slice/\(.*/\)\{0,1\}\([^/]*\.service\)$|\2|p' "/proc/$pid/cgroup" 2>/dev/null)
+		[ -n "$unit" ] && [ "$unit" != bitsov-display.service ] && echo "$unit"
+	done | sort -u
+}
+
 if [ "$UNINSTALL" -eq 1 ]; then
 	systemctl disable --now bitsov-display.service 2>/dev/null || true
 	rm -f "$UNIT"
@@ -64,6 +90,12 @@ if [ "$UNINSTALL" -eq 1 ]; then
 	fi
 	rm -rf "$PREFIX"
 	userdel "$SVC_USER" 2>/dev/null || true
+	if [ -f "$REPLACED" ]; then
+		while read -r unit; do
+			[ -n "$unit" ] && systemctl enable --now "$unit" && echo "Re-enabled $unit."
+		done <"$REPLACED"
+		rm -f "$REPLACED"
+	fi
 	echo "Removed the service, $PREFIX and the $SVC_USER user. $CONF_DIR was kept."
 	exit 0
 fi
@@ -74,7 +106,7 @@ python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' ||
 if [ "$APT" -eq 1 ] && command -v apt-get >/dev/null; then
 	apt-get update -qq
 	DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-		python3-venv python3-dev build-essential swig acl i2c-tools
+		python3-venv python3-dev build-essential swig acl i2c-tools fonts-dejavu-core
 	# Only needed when lgpio has no wheel for this Python; absent on some images.
 	DEBIAN_FRONTEND=noninteractive apt-get install -y -qq liblgpio-dev 2>/dev/null || true
 fi
@@ -130,6 +162,8 @@ setfacl -m "u:$SVC_USER:r" "$NODE_CONFIG"
 install -d -m 0755 "$PREFIX"
 install -m 0644 "$HERE/bitsov_display.py" "$HERE/requirements.txt" "$HERE/README.md" \
 	"$HERE/display.toml.example" "$PREFIX/"
+install -d -m 0755 "$PREFIX/assets"
+install -m 0644 "$HERE/assets/bitsov-logo-96.png" "$PREFIX/assets/"
 rm -rf "$PREFIX/venv"
 python3 -m venv "$PREFIX/venv"
 "$PREFIX/venv/bin/pip" install --quiet --no-cache-dir --upgrade pip
@@ -137,6 +171,12 @@ python3 -m venv "$PREFIX/venv"
 
 # --- display config ----------------------------------------------------------
 install -d -m 0755 "$CONF_DIR"
+if [ -f "$CONF_DIR/display.toml" ] &&
+	! "$PREFIX/venv/bin/python" "$PREFIX/bitsov_display.py" --config "$CONF_DIR/display.toml" --check-config; then
+	old="$CONF_DIR/display.toml.old-$(date +%Y%m%d%H%M%S)"
+	mv "$CONF_DIR/display.toml" "$old"
+	echo "The existing display.toml is not valid for this version; moved it to $old."
+fi
 if [ ! -f "$CONF_DIR/display.toml" ]; then
 	install -m 0644 "$HERE/display.toml.example" "$CONF_DIR/display.toml"
 fi
@@ -145,6 +185,13 @@ if grep -q '^node_config *=' "$CONF_DIR/display.toml"; then
 else
 	printf '\nnode_config = "%s"\n' "$NODE_CONFIG" >>"$CONF_DIR/display.toml"
 fi
+# --remote-unlock is an argv switch the display cannot see; take it from the node's unit.
+if ! grep -q '^remote_unlock *=' "$CONF_DIR/display.toml" &&
+	grep -qsE '^ExecStart=.*konsensus.*--remote-unlock' /etc/systemd/system/*.service \
+		/etc/systemd/user/*.service /home/*/.config/systemd/user/*.service; then
+	printf 'remote_unlock = true\n' >>"$CONF_DIR/display.toml"
+	echo "The node starts with --remote-unlock: the Lightning face shows the hub-only badge."
+fi
 
 # --- systemd -------------------------------------------------------------------
 sed "s|@NODE_CONFIG@|$NODE_CONFIG|g" "$HERE/bitsov-display.service" >"$UNIT"
@@ -152,6 +199,17 @@ chmod 0644 "$UNIT"
 command -v systemd-analyze >/dev/null && systemd-analyze verify "$UNIT" || true
 systemctl daemon-reload
 systemctl enable bitsov-display.service >/dev/null
+
+# --- replace the vendor display service --------------------------------------
+# Two programs driving one panel garble it. Units are recorded so --uninstall
+# can hand the panel back.
+mapfile -t holders < <(panel_holders)
+for unit in "${VENDOR_SERVICES[@]}" "${holders[@]}"; do
+	[ -n "$unit" ] || continue
+	systemctl disable --now "$unit" >/dev/null 2>&1 || systemctl stop "$unit" || true
+	grep -qxF "$unit" "$REPLACED" 2>/dev/null || echo "$unit" >>"$REPLACED"
+	echo "Replaced the vendor display service $unit (re-enabled by --uninstall)."
+done
 
 echo "--- panel probe ---"
 runuser -u "$SVC_USER" -- "$PREFIX/venv/bin/python" "$PREFIX/bitsov_display.py" \

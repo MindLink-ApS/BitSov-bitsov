@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """BitSov front display for a Raspberry Pi home node.
 
-Rotates a few screens on the case's small panel: the BitSov mark, node state,
-the node's own price per act, and the box label with its LAN IP.
+Rotates six faces on the case's small panel: the BitSov node state, the node's
+own price per act, paid acts today, Bitcoin, Lightning and the machine. A face
+whose data is unavailable is skipped for that round.
 
 It is deliberately blind to everything that matters for custody. It talks only
 to 127.0.0.1, keeps only an allow-list of fields from those answers, and reads
 konsensus.toml through a line filter that discards every line outside that
 allow-list before anything is parsed. It never touches the seed, mnemonic,
-password, pairing links, tickets, tokens or balances. See README.md.
+password, pairing links, tickets, tokens or balances, and shows no fiat price.
+See README.md.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import glob
 import http.client
-import ipaddress
 import json
 import logging
-import math
 import os
 import re
 import signal
@@ -29,6 +30,7 @@ import struct
 import sys
 import time
 import tomllib
+import types
 import unicodedata
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -58,15 +60,8 @@ MIN_PAYABLE_MSAT = 1_000
 # crates/konsensus-node/src/config.rs (default_*_msat). Keep in sync.
 PRICE_TABLE: tuple[tuple[str, str, int], ...] = (
     ("chat_msat", "Message", 10),
-    ("longform_msat", "Mail", 50),
     ("call_msat", "Call", 10_000),
-    ("calendar_msat", "Calendar", 25),
-    ("file_ref_msat", "File", 100),
-    ("web_content_msat", "Web page", 1_000),
-    ("collaboration_msat", "Collab", 25),
-    ("realtime_signal_msat", "Call signal", 50),
-    ("app_ext_msat", "App", 10),
-    ("control_msat", "Control", 1),
+    ("web_content_msat", "Page", 1_000),
 )
 DEFAULT_PRICES_MSAT = {key: default for key, _, default in PRICE_TABLE}
 
@@ -81,20 +76,49 @@ NODE_KEYS = frozenset(
     | {f"pricing.{key}" for key, _, _ in PRICE_TABLE}
 )
 
-# The only fields kept from loopback API answers.
-PROBE_FIELDS = ("state", "uptime_secs", "hosted_by")
+# The only fields kept from loopback API answers. /api/v1/health is the
+# node's public, redacted health: no balances, keys or peer IDs.
+PROBE_FIELDS = (
+    "state",
+    "uptime_secs",
+    "hosted_by",
+    "block_height",
+    "connected_peers",
+    "lightning_available",
+    "lightning_payment_capable",
+)
 
-SCREENS = ("logo", "status", "prices", "host")
+FACES = ("bitsov", "price", "paid", "bitcoin", "lightning", "machine")
 I2C_DRIVERS = ("ssd1306", "sh1106")
-SPI_DRIVERS = ("st7789", "ili9341")
+SPI_DRIVERS = ("st7735", "st7789", "ili9341")
 DRIVERS = ("auto", *I2C_DRIVERS, *SPI_DRIVERS, "fbdev")
 DEFAULT_SIZES = {
     "ssd1306": (128, 64),
     "sh1106": (128, 64),
+    "st7735": (160, 128),
     "st7789": (240, 240),
     "ili9341": (320, 240),
 }
 OLED_ADDRESSES = (0x3C, 0x3D)
+# luma.core.interface.serial.spi refuses any other bus speed.
+SPI_SPEEDS_HZ = tuple(
+    int(mhz * 1_000_000) for mhz in (0.5, 1, 2, 4, 8, 16, 20, 24, 28, 32, 36, 40, 44, 48, 50, 52)
+)
+
+PROFILES: dict[str, dict[str, object]] = {
+    # Bitcoin Machines case: ST7735 1.8" on SPI0 CE0, backlight active high.
+    "bitcoin-machines": {
+        "driver": "st7735",
+        "width": 160,
+        "height": 128,
+        "spi_speed_hz": 8_000_000,
+        "gpio_dc": 24,
+        "gpio_rst": 25,
+        "gpio_backlight": 18,
+        "backlight_active_low": False,
+    },
+}
+DEFAULT_PROFILE = "bitcoin-machines"
 
 
 class ConfigError(ValueError):
@@ -108,6 +132,9 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class DisplayConfig:
+    """Generic defaults. parse_display_config applies a profile unless `driver` is set."""
+
+    profile: str | None = None
     driver: str = "auto"
     width: int | None = None
     height: int | None = None
@@ -124,8 +151,9 @@ class DisplayConfig:
     fb_device: str | None = None
     node_config: str | None = None
     api_port: int | None = None
+    remote_unlock: bool = False
     interval_secs: float = 8.0
-    screens: tuple[str, ...] = SCREENS
+    faces: tuple[str, ...] = FACES
 
 
 def _int(name: str, value: object, lo: int, hi: int) -> int:
@@ -139,6 +167,12 @@ def _pin(name: str, value: object) -> int | None:
     return None if pin == -1 else pin
 
 
+def _bool(name: str, value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{name} must be true or false")
+    return value
+
+
 def parse_display_config(text: str) -> DisplayConfig:
     try:
         raw = tomllib.loads(text)
@@ -148,6 +182,11 @@ def parse_display_config(text: str) -> DisplayConfig:
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ConfigError(f"unknown display config keys: {', '.join(unknown)}")
+    if "profile" in raw and "driver" in raw:
+        raise ConfigError("set either profile or driver, not both")
+    profile = raw.get("profile", DEFAULT_PROFILE)
+    if profile not in PROFILES:
+        raise ConfigError(f"profile must be one of: {', '.join(PROFILES)}")
 
     out: dict[str, object] = {}
     if "driver" in raw:
@@ -169,16 +208,17 @@ def parse_display_config(text: str) -> DisplayConfig:
         if name in raw:
             out[name] = _int(name, raw[name], 0, 15)
     if "spi_speed_hz" in raw:
-        out["spi_speed_hz"] = _int("spi_speed_hz", raw["spi_speed_hz"], 500_000, 52_000_000)
+        if raw["spi_speed_hz"] not in SPI_SPEEDS_HZ or isinstance(raw["spi_speed_hz"], bool):
+            raise ConfigError(f"spi_speed_hz must be one of: {', '.join(map(str, SPI_SPEEDS_HZ))}")
+        out["spi_speed_hz"] = int(raw["spi_speed_hz"])
     if "gpio_dc" in raw:
         out["gpio_dc"] = _int("gpio_dc", raw["gpio_dc"], 0, 27)
     for name in ("gpio_rst", "gpio_backlight"):
         if name in raw:
             out[name] = _pin(name, raw[name])
-    if "backlight_active_low" in raw:
-        if not isinstance(raw["backlight_active_low"], bool):
-            raise ConfigError("backlight_active_low must be true or false")
-        out["backlight_active_low"] = raw["backlight_active_low"]
+    for name in ("backlight_active_low", "remote_unlock"):
+        if name in raw:
+            out[name] = _bool(name, raw[name])
     for name in ("fb_device", "node_config"):
         if name in raw:
             value = raw[name]
@@ -192,25 +232,26 @@ def parse_display_config(text: str) -> DisplayConfig:
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 2 <= value <= 300:
             raise ConfigError("interval_secs must be a number in 2..300")
         out["interval_secs"] = float(value)
-    if "screens" in raw:
-        screens = raw["screens"]
+    if "faces" in raw:
+        faces = raw["faces"]
         if (
-            not isinstance(screens, list)
-            or not screens
-            or any(s not in SCREENS for s in screens)
-            or len(set(screens)) != len(screens)
+            not isinstance(faces, list)
+            or not faces
+            or any(f not in FACES for f in faces)
+            or len(set(faces)) != len(faces)
         ):
-            raise ConfigError(f"screens must be a non-empty list drawn from: {', '.join(SCREENS)}")
-        out["screens"] = tuple(screens)
-    return DisplayConfig(**out)
+            raise ConfigError(f"faces must be a non-empty list drawn from: {', '.join(FACES)}")
+        out["faces"] = tuple(faces)
+    base = {} if "driver" in raw else {"profile": profile, **PROFILES[profile]}
+    return DisplayConfig(**{**base, **out})
 
 
 def load_display_config(path: Path) -> DisplayConfig:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        log.info("no %s; using auto-detection and defaults", path)
-        return DisplayConfig()
+        log.info("no %s; using the %s profile", path, DEFAULT_PROFILE)
+        return parse_display_config("")
     except OSError as e:
         raise ConfigError(f"cannot read {path}: {e.strerror}") from None
     return parse_display_config(text)
@@ -358,15 +399,20 @@ def floored_price_msat(base_msat: int, min_admission_cost_msat: int = 0) -> int:
     return max(base_msat, min_admission_cost_msat, MIN_PAYABLE_MSAT)
 
 
-def format_sats(msat: int) -> str:
+def sats_parts(msat: int) -> tuple[str, str]:
     sats = Decimal(msat) / 1000
     number = f"{sats:,.3f}".rstrip("0").rstrip(".")
-    return f"{number} sat" if sats == 1 else f"{number} sats"
+    return number, "sat" if sats == 1 else "sats"
 
 
-def price_rows(settings: NodeSettings) -> list[tuple[str, str]]:
+def format_sats(msat: int) -> str:
+    return " ".join(sats_parts(msat))
+
+
+def price_rows(settings: NodeSettings) -> list[tuple[str, int]]:
+    """(label, floored msat) per shown kind."""
     return [
-        (label, format_sats(floored_price_msat(settings.prices_msat[key], settings.min_admission_cost_msat)))
+        (label, floored_price_msat(settings.prices_msat[key], settings.min_admission_cost_msat))
         for key, label, _ in PRICE_TABLE
     ]
 
@@ -383,6 +429,12 @@ class NodeState(Enum):
     OFFLINE = "offline"
 
 
+class Lightning(Enum):
+    READY = "ready to pay"
+    RECEIVE_ONLY = "receive only"
+    DOWN = "backend unreachable"
+
+
 @dataclass(frozen=True)
 class Probe:
     """One loopback answer. status None means nothing answered."""
@@ -397,6 +449,9 @@ class NodeStatus:
     state: NodeState
     uptime_secs: int | None = None
     hosted_by: str | None = None
+    block_height: int | None = None
+    peers: int | None = None
+    lightning: Lightning | None = None
 
 
 def probe_from_body(status: int, body: bytes) -> Probe:
@@ -424,10 +479,17 @@ def loopback_get(port: int, path: str, timeout: float = HTTP_TIMEOUT_SECS) -> Pr
         conn.close()
 
 
-def _uptime(probe: Probe | None) -> int | None:
-    if probe is None or probe.status != 200:
+def _ok_fields(probe: Probe | None) -> dict[str, object]:
+    return probe.fields if probe is not None and probe.status == 200 else {}
+
+
+def _lightning(fields: dict[str, object]) -> Lightning | None:
+    available, capable = fields.get("lightning_available"), fields.get("lightning_payment_capable")
+    if not isinstance(available, bool) or not isinstance(capable, bool):
         return None
-    return _u64(probe.fields.get("uptime_secs"))
+    if not available:
+        return Lightning.DOWN
+    return Lightning.READY if capable else Lightning.RECEIVE_ONLY
 
 
 def map_state(lock: Probe, livez: Probe | None = None, health: Probe | None = None) -> NodeStatus:
@@ -435,21 +497,29 @@ def map_state(lock: Probe, livez: Probe | None = None, health: Probe | None = No
 
     Locked router: /api/v1/node/lock answers {"state": "locked"}.
     Bootstrap (first run): /livez answers plain "ok", no lock route.
-    Live node: no lock route; /livez carries uptime only when operator probes
-    are on, otherwise the redacted public /api/v1/health carries it.
+    Live node: no lock route; the public /api/v1/health carries chain height,
+    peer count and Lightning readiness, and uptime when /livez is off.
     """
     hosted_by = None
     for probe in (lock, livez, health):
-        if probe is not None and probe.status == 200 and hosted_by is None:
-            hosted_by = valid_hosted_by(probe.fields.get("hosted_by"))
+        if hosted_by is None:
+            hosted_by = valid_hosted_by(_ok_fields(probe).get("hosted_by"))
     if lock.status is None and (livez is None or livez.status is None):
         return NodeStatus(NodeState.OFFLINE)
     if lock.status == 200 and lock.fields.get("state") == "locked":
         return NodeStatus(NodeState.LOCKED, hosted_by=hosted_by)
     if livez is not None and livez.status == 200 and livez.plain_ok and lock.status == 404:
         return NodeStatus(NodeState.SETUP)
-    uptime = _uptime(livez)
-    return NodeStatus(NodeState.RUNNING, _uptime(health) if uptime is None else uptime, hosted_by)
+    live, public = _ok_fields(livez), _ok_fields(health)
+    uptime = _u64(live.get("uptime_secs"))
+    return NodeStatus(
+        NodeState.RUNNING,
+        _u64(public.get("uptime_secs")) if uptime is None else uptime,
+        hosted_by,
+        block_height=_u64(public.get("block_height")),
+        peers=_u64(public.get("connected_peers")),
+        lightning=_lightning(public),
+    )
 
 
 def probe_node(get: Callable[[str], Probe]) -> NodeStatus:
@@ -457,7 +527,7 @@ def probe_node(get: Callable[[str], Probe]) -> NodeStatus:
     if lock.status is None or (lock.status == 200 and lock.fields.get("state") == "locked"):
         return map_state(lock)
     livez = get("/livez")
-    if _uptime(livez) is not None or livez.plain_ok:
+    if livez.plain_ok and lock.status == 404:
         return map_state(lock, livez)
     return map_state(lock, livez, get("/api/v1/health"))
 
@@ -476,48 +546,48 @@ def format_uptime(secs: int) -> str:
 
 
 # --------------------------------------------------------------------------
-# LAN address (local interface table; no packets sent)
+# The machine itself (local files only)
 # --------------------------------------------------------------------------
 
-_VIRTUAL_IFACES = ("lo", "docker", "br-", "veth", "virbr", "tailscale", "wg", "tun", "tap", "zt")
-_TAILSCALE_NET = ipaddress.ip_network("100.64.0.0/10")
+
+@dataclass(frozen=True)
+class MachineStats:
+    cpu_temp_c: float | None = None
+    disk_free_bytes: int | None = None
+    uptime_secs: int | None = None
+
+    @property
+    def any(self) -> bool:
+        return any(v is not None for v in (self.cpu_temp_c, self.disk_free_bytes, self.uptime_secs))
 
 
-def pick_lan_ip(addrs: Iterable[tuple[str, str]]) -> str | None:
-    def rank(item: tuple[str, str]) -> tuple[int, int]:
-        name, ip = item
-        wired = 0 if name.startswith(("eth", "en")) else 1 if name.startswith(("wlan", "wl")) else 2
-        return (0 if ipaddress.ip_address(ip).is_private else 1, wired)
+def read_machine_stats(disk_path: Path | None = None) -> MachineStats:
+    """CPU temperature, free space where the node keeps its data, OS uptime."""
+    temp = None
+    try:
+        value = int(Path("/sys/class/thermal/thermal_zone0/temp").read_text().strip()) / 1000
+        temp = value if -40 <= value <= 150 else None
+    except (OSError, ValueError):
+        pass
+    try:
+        st = os.statvfs(disk_path if disk_path is not None and disk_path.exists() else "/")
+        disk = st.f_bavail * st.f_frsize
+    except OSError:
+        disk = None
+    try:
+        uptime = int(float(Path("/proc/uptime").read_text().split()[0]))
+    except (OSError, ValueError, IndexError):
+        uptime = None
+    return MachineStats(temp, disk, uptime)
 
-    candidates = []
-    for name, ip in addrs:
-        try:
-            addr = ipaddress.IPv4Address(ip)
-        except ValueError:
-            continue
-        if name.startswith(_VIRTUAL_IFACES) or addr.is_loopback or addr.is_link_local:
-            continue
-        if addr in _TAILSCALE_NET or addr.is_unspecified:
-            continue
-        candidates.append((name, ip))
-    return min(candidates, key=rank)[1] if candidates else None
 
-
-def interface_ipv4s() -> list[tuple[str, str]]:
-    if not sys.platform.startswith("linux"):
-        return []
-    import fcntl
-
-    siocgifaddr = 0x8915
-    found = []
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        for _, name in socket.if_nameindex():
-            try:
-                packed = fcntl.ioctl(s.fileno(), siocgifaddr, struct.pack("256s", name.encode()[:15]))
-            except OSError:
-                continue
-            found.append((name, socket.inet_ntoa(packed[20:24])))
-    return found
+def format_bytes(n: int) -> tuple[str, str]:
+    gb = n / 1e9
+    if gb >= 100:
+        return f"{gb:,.0f}", "GB"
+    if gb >= 1:
+        return f"{gb:.1f}", "GB"
+    return f"{n / 1e6:.0f}", "MB"
 
 
 # --------------------------------------------------------------------------
@@ -525,88 +595,170 @@ def interface_ipv4s() -> list[tuple[str, str]]:
 # --------------------------------------------------------------------------
 
 
+@dataclass
+class Observed:
+    """What the display has seen across rounds, kept in memory only."""
+
+    seen_locked: bool = False
+    height: int | None = None
+    height_changed_at: float | None = None
+
+    def note(self, status: NodeStatus, now: float) -> None:
+        if status.state is NodeState.LOCKED:
+            self.seen_locked = True
+        height = status.block_height
+        if height is None:
+            return
+        if self.height is not None and height != self.height:
+            # The health answer has no block time: the age is measured from
+            # the round in which the display saw the tip move.
+            self.height_changed_at = now if height > self.height else None
+        self.height = height
+
+    def block_age_secs(self, now: float) -> int | None:
+        return None if self.height_changed_at is None else int(now - self.height_changed_at)
+
+
 @dataclass(frozen=True)
 class Snapshot:
     settings: NodeSettings
     status: NodeStatus
-    lan_ip: str | None
+    machine: MachineStats
     hostname: str
     api_port: int
+    block_age_secs: int | None = None
+    lockable: bool = False
+    # The node exposes no token-free count of settled paid admissions, so the
+    # live service never fills this in and the face stays skipped.
+    paid_today: int | None = None
 
     @property
     def hosted_by(self) -> str | None:
         return self.settings.hosted_by or self.status.hosted_by
 
 
-def collect_snapshot(cfg: DisplayConfig) -> Snapshot:
-    settings = read_node_settings(resolve_node_config(cfg.node_config))
+def collect_snapshot(cfg: DisplayConfig, observed: Observed) -> Snapshot:
+    node_config = resolve_node_config(cfg.node_config)
+    settings = read_node_settings(node_config)
     port = cfg.api_port or settings.api_port
     status = probe_node(lambda path: loopback_get(port, path))
-    try:
-        lan_ip = pick_lan_ip(interface_ipv4s())
-    except OSError:
-        lan_ip = None
-    return Snapshot(settings, status, lan_ip, socket.gethostname().split(".")[0], port)
+    now = time.monotonic()
+    observed.note(status, now)
+    return Snapshot(
+        settings,
+        status,
+        read_machine_stats(node_config),
+        socket.gethostname().split(".")[0],
+        port,
+        block_age_secs=observed.block_age_secs(now),
+        lockable=cfg.remote_unlock or observed.seen_locked,
+    )
 
 
 # --------------------------------------------------------------------------
 # Drawing
 # --------------------------------------------------------------------------
 
-ORANGE = (247, 147, 26)
+# Palette from the BitSov logo.
+BG_TOP = (30, 19, 16)
+BG_BOTTOM = (52, 31, 24)
+COPPER = (214, 140, 72)
+GOLD = (240, 190, 120)
+CREAM = (245, 225, 200)
+
+DESIGN_SIZE = (160, 128)
+LOGO_PATH = Path(__file__).resolve().parent / "assets" / "bitsov-logo-96.png"
+FONT_DIRS = ["/usr/share/fonts/truetype/dejavu"]
 
 
 @dataclass(frozen=True)
 class Theme:
-    bg: object
-    fg: object
-    dim: object
+    text: object
+    muted: object
     accent: object
+    gold: object
+    rule: object
     ok: object
     warn: object
     bad: object
+    ink: object
 
 
-MONO = Theme(bg=0, fg=255, dim=255, accent=255, ok=255, warn=255, bad=255)
 COLOR = Theme(
-    bg=(0, 0, 0),
-    fg=(240, 240, 240),
-    dim=(140, 148, 158),
-    accent=ORANGE,
-    ok=(63, 185, 80),
-    warn=(255, 176, 0),
-    bad=(248, 81, 73),
+    text=CREAM,
+    muted=(186, 154, 126),
+    accent=COPPER,
+    gold=GOLD,
+    rule=(84, 52, 36),
+    ok=(150, 205, 120),
+    warn=GOLD,
+    bad=(232, 102, 78),
+    ink=BG_TOP,
 )
+MONO = Theme(text=255, muted=255, accent=255, gold=255, rule=255, ok=255, warn=255, bad=255, ink=0)
 
 
-@functools.lru_cache(maxsize=64)
-def font(size: int) -> ImageFont.FreeTypeFont:
+def use_font_dir(path: str) -> None:
+    FONT_DIRS.insert(0, path)
+    font.cache_clear()
+
+
+def dejavu_path(bold: bool = False) -> Path | None:
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    for folder in FONT_DIRS:
+        path = Path(folder) / name
+        if path.is_file():
+            return path
+    return None
+
+
+@functools.lru_cache(maxsize=128)
+def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    path = dejavu_path(bold)
+    if path is not None:
+        return ImageFont.truetype(str(path), size)
     f = ImageFont.load_default(size)
     if not isinstance(f, ImageFont.FreeTypeFont):
         raise RuntimeError("Pillow was built without FreeType; reinstall Pillow from wheels")
     return f
 
 
+def cap(f: ImageFont.FreeTypeFont) -> int:
+    """Approximate cap height: what a line of digits or capitals occupies."""
+    return round(f.size * 0.73)
+
+
 class Canvas:
     def __init__(self, size: tuple[int, int], mode: str):
         self.mode = "1" if mode == "1" else "RGB"
+        self.mono = self.mode == "1"
+        self.w, self.h = size
         self.image = Image.new(self.mode, size, 0)
         self.draw = ImageDraw.Draw(self.image)
-        self.w, self.h = size
-        self.theme = MONO if self.mode == "1" else COLOR
-        self.small = self.h <= 80 or self.w <= 128
-        self.pad = 2 if self.small else max(6, round(min(size) * 0.05))
+        self.theme = MONO if self.mono else COLOR
+        self.u = min(self.w / DESIGN_SIZE[0], self.h / DESIGN_SIZE[1])
+        self.compact = self.h < 100
+        self.pad = self.s(6, 2)
+        if not self.mono:
+            for y in range(self.h):
+                t = y / max(1, self.h - 1)
+                color = tuple(round(a + (b - a) * t) for a, b in zip(BG_TOP, BG_BOTTOM))
+                self.draw.line([(0, y), (self.w, y)], fill=color)
 
-    def px(self, fraction: float, minimum: int = 8) -> int:
-        return max(minimum, round(min(self.w, self.h) * fraction))
+    def s(self, px: float, minimum: int = 1) -> int:
+        """A length from the 160x128 design, scaled to this panel."""
+        return max(minimum, round(px * self.u))
 
-    def text_w(self, text: str, f: ImageFont.FreeTypeFont, bold: int = 0) -> float:
-        return self.draw.textlength(text, font=f) + 2 * bold
+    def font(self, px: float, bold: bool = False, minimum: int = 8) -> ImageFont.FreeTypeFont:
+        return font(self.s(px, minimum), bold)
 
-    def fit(self, text: str, max_w: float, size: int, minimum: int = 8, bold: int = 0) -> ImageFont.FreeTypeFont:
-        while size > minimum and self.text_w(text, font(size), bold) > max_w:
+    def text_w(self, text: str, f: ImageFont.FreeTypeFont) -> float:
+        return self.draw.textlength(text, font=f)
+
+    def fit(self, text: str, max_w: float, size: int, minimum: int = 8, bold: bool = False) -> ImageFont.FreeTypeFont:
+        while size > minimum and self.text_w(text, font(size, bold)) > max_w:
             size -= 1
-        return font(size)
+        return font(size, bold)
 
     def ellipsize(self, text: str, f: ImageFont.FreeTypeFont, max_w: float) -> str:
         if self.text_w(text, f) <= max_w:
@@ -615,283 +767,297 @@ class Canvas:
             text = text[:-1]
         return text.rstrip() + "…"
 
-    def text(self, xy, text, f, fill, anchor="la", bold=0) -> None:
-        self.draw.text(xy, text, font=f, fill=fill, anchor=anchor, stroke_width=bold, stroke_fill=fill)
+    def text(self, xy, text, f, fill, anchor="la") -> None:
+        self.draw.text(xy, text, font=f, fill=fill, anchor=anchor)
 
-    def wrap(self, text: str, f: ImageFont.FreeTypeFont, max_w: float, max_lines: int) -> list[str]:
-        lines, current = [], ""
-        for word in text.split():
-            trial = f"{current} {word}".strip()
-            if self.text_w(trial, f) <= max_w or not current:
-                current = trial
-            else:
-                lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-        if len(lines) > max_lines:
-            lines = lines[: max_lines - 1] + [" ".join(lines[max_lines - 1 :])]
-        return [self.ellipsize(line, f, max_w) for line in lines]
+    def bar(self, y: float) -> float:
+        """The copper accent bar across the face; returns the y below it."""
+        height = self.s(2)
+        self.draw.rectangle((self.pad, round(y), self.w - self.pad - 1, round(y) + height - 1), fill=self.theme.accent)
+        return round(y) + height
 
 
-def _bezier(p0, p1, p2, steps=12):
-    return [
-        (
-            (1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t**2 * p2[0],
-            (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t**2 * p2[1],
+@functools.lru_cache(maxsize=1)
+def logo_rgba() -> Image.Image | None:
+    try:
+        with Image.open(LOGO_PATH) as src:
+            img = src.convert("RGB")
+    except OSError:
+        return None
+    # The asset is the app icon on its own dark tile; fade the tile out so the
+    # seed sits directly on the face's gradient.
+    tile = Image.new("RGB", img.size, img.getpixel((0, 0)))
+    img.putalpha(ImageChops.difference(img, tile).convert("L").point(lambda v: min(255, v * 5)))
+    return img
+
+
+@functools.lru_cache(maxsize=16)
+def logo_image(size: int, mono: bool) -> Image.Image | None:
+    src = logo_rgba()
+    if src is None:
+        return None
+    img = src.resize((size, size), Image.LANCZOS)
+    if mono:
+        return img.convert("L").point(lambda v: 255 if v >= 110 else 0).convert("1")
+    return img
+
+
+def draw_logo(c: Canvas, x: float, y: float, size: float) -> None:
+    size, x, y = max(4, round(size)), round(x), round(y)
+    img = logo_image(size, c.mono)
+    if img is None:
+        c.draw.ellipse(
+            (x, y + size * 0.15, x + size, y + size * 0.85), outline=c.theme.accent, width=max(1, size // 12)
         )
-        for t in (i / steps for i in range(steps + 1))
-    ]
-
-
-def draw_mark(c: Canvas, x: float, y: float, size: float) -> None:
-    """The BitSov mark: a shield with a knocked-out bitcoin-style B."""
-    t = c.theme
-
-    def p(u, v):
-        return (x + u * size, y + v * size)
-
-    shield = (
-        [p(0.10, 0.06), p(0.90, 0.06), p(0.90, 0.46)]
-        + _bezier(p(0.90, 0.46), p(0.90, 0.80), p(0.50, 0.97))[1:]
-        + _bezier(p(0.50, 0.97), p(0.10, 0.80), p(0.10, 0.46))[1:]
-    )
-    c.draw.polygon(shield, fill=t.accent)
-
-    stroke = max(2, round(size * 0.075))
-    left, right_top, right_bottom = 0.33, 0.62, 0.67
-    top, mid, bottom = 0.25, 0.50, 0.75
-    radius = max(1, round(size * 0.12))
-    c.draw.rounded_rectangle((*p(left, top), *p(right_top, mid + 0.02)), radius=radius, outline=t.bg, width=stroke)
-    c.draw.rounded_rectangle(
-        (*p(left, mid - 0.02), *p(right_bottom, bottom)), radius=radius, outline=t.bg, width=stroke
-    )
-    # Square off the left side so the bowls read as a B rather than two pills.
-    c.draw.rectangle((*p(left, top), p(left, bottom)[0] + stroke - 1, p(left, bottom)[1]), fill=t.bg)
-    tick = max(1, round(size * 0.05))
-    for u in (0.40, 0.51):
-        for v0, v1 in ((0.15, top), (bottom, 0.85)):
-            x0 = p(u, 0)[0]
-            c.draw.rectangle((x0, p(0, v0)[1], x0 + tick - 1, p(0, v1)[1]), fill=t.bg)
-
-
-def draw_wordmark(c: Canvas, x: float, y: float, size: int, anchor: str = "ls") -> None:
-    f = font(size)
-    bold = 0 if c.small else max(1, size // 22)
-    bit_w = c.text_w("Bit", f, bold)
-    total = c.text_w("BitSov", f, bold)
-    left = x - total / 2 if anchor[0] == "m" else x
-    c.text((left, y), "Bit", f, c.theme.fg, "l" + anchor[1], bold)
-    c.text((left + bit_w, y), "Sov", f, c.theme.accent, "l" + anchor[1], bold)
-
-
-def render_logo(c: Canvas, snap: Snapshot) -> None:
-    t = c.theme
-    if c.w >= 1.6 * c.h:
-        mark = c.h - 2 * c.pad
-        draw_mark(c, c.pad, c.pad, mark)
-        x = c.pad * 3 + mark
-        avail = c.w - x - c.pad
-        size = c.h // 3
-        while size > 8 and c.text_w("BitSov", font(size)) > avail:
-            size -= 1
-        draw_wordmark(c, x, c.h / 2 + size * 0.25, size)
-        tag = font(max(8, size // 2))
-        c.text((x, c.h / 2 + size * 0.25 + tag.size + 2), "home node", tag, t.dim, "ls")
-        return
-    mark = min(c.w, c.h) * 0.48
-    top = c.h * 0.12
-    draw_mark(c, (c.w - mark) / 2, top, mark)
-    size = c.px(0.16)
-    while size > 8 and c.text_w("BitSov", font(size)) > c.w - 2 * c.pad:
-        size -= 1
-    base = top + mark + c.h * 0.06 + size * 0.75
-    draw_wordmark(c, c.w / 2, base, size, "ms")
-    c.text((c.w / 2, base + c.px(0.08)), "home node", font(c.px(0.065)), t.dim, "ms")
-
-
-def _icon(c: Canvas, state: NodeState, cx: float, cy: float, s: float) -> None:
-    t = c.theme
-    w = max(1, round(s / 9))
-    if state is NodeState.LOCKED:
-        body = (cx - s * 0.42, cy - s * 0.05, cx + s * 0.42, cy + s * 0.48)
-        c.draw.arc((cx - s * 0.28, cy - s * 0.5, cx + s * 0.28, cy + s * 0.06), 180, 360, fill=t.warn, width=w)
-        for dx in (-s * 0.28, s * 0.28 - w + 1):
-            c.draw.rectangle((cx + dx, cy - s * 0.22, cx + dx + w - 1, cy - s * 0.05), fill=t.warn)
-        c.draw.rounded_rectangle(body, radius=max(1, round(s * 0.08)), fill=t.warn)
-        k = max(1, s * 0.08)
-        c.draw.ellipse((cx - k, cy + s * 0.13 - k, cx + k, cy + s * 0.13 + k), fill=t.bg)
-        c.draw.rectangle((cx - k / 2, cy + s * 0.13, cx + k / 2, cy + s * 0.32), fill=t.bg)
-        return
-    box = (cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2)
-    if state is NodeState.RUNNING:
-        c.draw.ellipse(box, fill=t.ok)
-        c.draw.line(
-            [(cx - s * 0.24, cy + s * 0.02), (cx - s * 0.06, cy + s * 0.2), (cx + s * 0.26, cy - s * 0.18)],
-            fill=t.bg,
-            width=max(2, w + 1),
-            joint="curve",
-        )
-    elif state is NodeState.OFFLINE:
-        c.draw.ellipse(box, outline=t.bad, width=w)
-        d = s * 0.5 / math.sqrt(2)
-        c.draw.line([(cx - d, cy + d), (cx + d, cy - d)], fill=t.bad, width=w)
+    elif c.mono:
+        c.image.paste(255, (x, y), img)
     else:
-        c.draw.ellipse(box, outline=t.accent, width=w)
-        r = max(1, s * 0.06)
-        for dx in (-s * 0.22, 0, s * 0.22):
-            c.draw.ellipse((cx + dx - r, cy - r, cx + dx + r, cy + r), fill=t.accent)
+        c.image.paste(img, (x, y), img)
 
 
-def status_lines(snap: Snapshot) -> tuple[str, str]:
+def draw_wordmark(c: Canvas, x: float, baseline: float, f: ImageFont.FreeTypeFont, centered: bool = False) -> None:
+    left = x - c.text_w("BitSov", f) / 2 if centered else x
+    c.text((left, baseline), "Bit", f, c.theme.text, "ls")
+    c.text((left + c.text_w("Bit", f), baseline), "Sov", f, c.theme.accent, "ls")
+
+
+def draw_header(c: Canvas, title: str) -> float:
+    """Small logo mark, title in copper, accent bar; returns the content top."""
+    mark = c.s(15, 8)
+    draw_logo(c, c.pad - c.s(1, 0), c.pad, mark)
+    f = c.font(11, bold=True)
+    x = c.pad + mark + c.s(4, 2)
+    c.text((x, c.pad + mark / 2), c.ellipsize(title, f, c.w - x - c.pad), f, c.theme.accent, "lm")
+    return c.bar(c.pad + mark + c.s(3, 1))
+
+
+def draw_footer(c: Canvas, text: str, color) -> float:
+    """A centred tagline on the bottom edge; returns the y above it. Compact panels skip it."""
+    if c.compact:
+        return c.h - c.pad
+    f = c.font(10)
+    c.text((c.w / 2, c.h - c.pad), c.ellipsize(text, f, c.w - 2 * c.pad), f, color, "ms")
+    return c.h - c.pad - cap(f) - c.s(5)
+
+
+Item = tuple[float, Callable[[float], None]]
+
+
+def stack(c: Canvas, top: float, bottom: float, items: list[Item], gap: float) -> None:
+    """Draw items (height, draw(y_top)) centred vertically between top and bottom."""
+    total = sum(h for h, _ in items) + gap * (len(items) - 1)
+    y = top + max(0.0, (bottom - top - total) / 2)
+    for height, draw in items:
+        draw(y)
+        y += height + gap
+
+
+def text_item(c: Canvas, text: str, size: float, color, bold: bool = False, minimum: int = 8) -> Item:
+    f = c.fit(text, c.w - 2 * c.pad, c.s(size, minimum), minimum, bold)
+    text = c.ellipsize(text, f, c.w - 2 * c.pad)
+    height = cap(f)
+    return height, lambda y: c.text((c.w / 2, y + height), text, f, color, "ms")
+
+
+def badge_item(c: Canvas, text: str, fill, size: float) -> Item:
+    padx, pady = c.s(7, 3), c.s(3, 1)
+    f = c.fit(text, c.w - 2 * c.pad - 2 * padx, c.s(size, 8), 7, bold=True)
+    width, height = c.text_w(text, f) + 2 * padx, cap(f) + 2 * pady
+
+    def draw(y: float) -> None:
+        box = (c.w / 2 - width / 2, y, c.w / 2 + width / 2, y + height)
+        c.draw.rounded_rectangle(box, radius=height / 2, fill=fill)
+        c.text((c.w / 2, y + pady + cap(f)), text, f, c.theme.ink, "ms")
+
+    return height, draw
+
+
+def draw_rows(c: Canvas, rows: list[tuple[str, str, str]], top: float, bottom: float) -> None:
+    """(label, value, unit) rows: label left, big bold value and unit right."""
+    t = c.theme
+    row_h = (bottom - top) / max(1, len(rows))
+    small = c.font(10)
+    for i, (label, value, unit) in enumerate(rows):
+        y0 = top + i * row_h
+        unit_w = c.text_w(" " + unit, small) if unit else 0
+        room = c.w - 2 * c.pad - c.text_w(label, small) - unit_w - c.s(6)
+        vf = c.fit(value, room, min(c.s(18), int(row_h * 0.78)), 8, bold=True)
+        base = y0 + (row_h + cap(vf)) / 2
+        c.text((c.pad, base), label, small, t.muted, "ls")
+        right = c.w - c.pad
+        if unit:
+            c.text((right, base), unit, small, t.gold, "rs")
+            right -= unit_w
+        c.text((right, base), value, vf, t.text, "rs")
+        if i < len(rows) - 1 and not c.mono:
+            y = round(y0 + row_h)
+            c.draw.line([(c.pad, y), (c.w - c.pad - 1, y)], fill=t.rule)
+
+
+# --------------------------------------------------------------------------
+# The six faces
+# --------------------------------------------------------------------------
+
+
+def state_badge(snap: Snapshot) -> tuple[str, str]:
     st = snap.status
     if st.state is NodeState.LOCKED:
         return "LOCKED", "unlock from your Mac"
     if st.state is NodeState.RUNNING:
-        return "Running", f"up {format_uptime(st.uptime_secs)}" if st.uptime_secs is not None else ""
+        return "RUNNING", f"up {format_uptime(st.uptime_secs)}" if st.uptime_secs is not None else ""
     if st.state is NodeState.SETUP:
-        return "Not set up", "finish setup from your Mac"
-    return "Node offline", f"no answer on 127.0.0.1:{snap.api_port}"
+        return "NOT SET UP", "finish setup from your Mac"
+    return "OFFLINE", f"no answer on 127.0.0.1:{snap.api_port}"
 
 
-def render_status(c: Canvas, snap: Snapshot) -> None:
+def face_bitsov(c: Canvas, snap: Snapshot) -> None:
     t = c.theme
-    state = snap.status.state
-    color = {NodeState.RUNNING: t.ok, NodeState.LOCKED: t.warn, NodeState.OFFLINE: t.bad}.get(state, t.accent)
-    title, sub = status_lines(snap)
-    header = font(10 if c.small else c.px(0.06))
-    c.text((c.pad, c.pad), "BITSOV NODE", header, t.dim)
+    label, sub = state_badge(snap)
+    color = {
+        NodeState.RUNNING: t.ok,
+        NodeState.LOCKED: t.warn,
+        NodeState.OFFLINE: t.bad,
+    }.get(snap.status.state, t.text)
 
-    if c.small:
-        icon = 20
-        top = c.pad + header.size + 4
-        _icon(c, state, c.pad + icon / 2, top + icon / 2, icon)
-        x = c.pad + icon + 6
-        big = c.fit(title, c.w - x - c.pad, 16, 10)
-        c.text((x, top + icon / 2), title, big, color if c.mode != "1" else t.fg, "lm")
+    if c.compact:
+        size = c.h - 2 * c.pad
+        draw_logo(c, c.pad, c.pad, size)
+        x = c.pad + size + c.s(4, 2)
+        avail = c.w - x - c.pad
+        wf = c.fit("BitSov", avail, c.s(22), 9, bold=True)
+        draw_wordmark(c, x, c.pad + cap(wf), wf)
+        bf = c.fit(label, avail - 6, 11, 7, bold=True)
+        top = c.pad + cap(wf) + 4
+        c.draw.rounded_rectangle((x, top, x + avail, top + cap(bf) + 5), radius=3, fill=color)
+        c.text((x + avail / 2, top + cap(bf) + 2), label, bf, t.ink, "ms")
         if sub:
-            f = c.fit(sub, c.w - 2 * c.pad, 11, 8)
-            c.text((c.pad, c.h - 1), c.ellipsize(sub, f, c.w - 2 * c.pad), f, t.fg, "ls")
+            sf = font(8)
+            c.text((x, c.h - c.pad), c.ellipsize(sub, sf, avail), sf, t.text, "ls")
         return
 
-    icon = c.px(0.24)
-    cy = c.h * 0.36
-    _icon(c, state, c.w / 2, cy, icon)
-    bold = max(1, c.px(0.004, 1))
-    big = c.fit(title, c.w - 2 * c.pad, c.px(0.13), 12, bold)
-    base = cy + icon * 0.6 + big.size * 1.05
-    c.text((c.w / 2, base), title, big, color, "ms", bold)
+    if c.w >= c.h * 1.15:
+        size = c.s(58)
+        draw_logo(c, c.pad - c.s(2, 0), c.pad, size)
+        x = c.pad + size + c.s(4)
+        wf = c.fit("BitSov", c.w - x - c.pad, c.s(24), 10, bold=True)
+        mid = c.pad + size / 2
+        draw_wordmark(c, x, mid, wf)
+        c.text((x, mid + c.s(5)), "home node", c.font(11), t.gold, "la")
+        top = c.bar(c.pad + size + c.s(5))
+    else:
+        size = round(min(c.w * 0.5, c.h * 0.36))
+        draw_logo(c, (c.w - size) / 2, c.pad, size)
+        wf = c.fit("BitSov", c.w - 2 * c.pad, c.s(24), 10, bold=True)
+        base = c.pad + size + c.s(4) + cap(wf)
+        draw_wordmark(c, c.w / 2, base, wf, centered=True)
+        hf = c.font(11)
+        c.text((c.w / 2, base + c.s(5) + cap(hf)), "home node", hf, t.gold, "ms")
+        top = c.bar(base + c.s(12) + cap(hf))
+
+    items = [badge_item(c, label, color, 13)]
     if sub:
-        f = c.fit(sub, c.w - 2 * c.pad, c.px(0.07), 9)
-        c.text((c.w / 2, base + f.size * 1.6), c.ellipsize(sub, f, c.w - 2 * c.pad), f, t.fg, "ms")
+        items.append(text_item(c, sub, 10, t.text))
+    stack(c, top, c.h - c.pad, items, c.s(6))
 
 
-def _price_metrics(size: tuple[int, int]) -> tuple[int, int, int, int]:
-    """(title size, row font size, row height, first row top) for a panel size."""
-    w, h = size
-    if h <= 80 or w <= 128:
-        return 11, 10, 10, 14
-    m = min(w, h)
-    title = max(14, round(m * 0.085))
-    row = max(11, round(m * 0.068))
-    pad = max(6, round(m * 0.05))
-    return title, row, round(row * 1.45), pad + title + round(row * 0.6)
+def face_price(c: Canvas, snap: Snapshot) -> None:
+    top = draw_header(c, "PRICE PER ACT")
+    tagline = "never 0 · rises with fees" if snap.settings.chain_aware else "never 0"
+    bottom = draw_footer(c, tagline, c.theme.gold)
+    rows = [(label, *sats_parts(msat)) for label, msat in price_rows(snap.settings)]
+    draw_rows(c, rows, top + c.s(2), bottom)
 
 
-def price_pages(size: tuple[int, int], settings: NodeSettings) -> tuple[int, int]:
-    """(page count, rows per page), split evenly so no page holds a lone row."""
-    _, row, row_h, top = _price_metrics(size)
-    small = size[1] <= 80 or size[0] <= 128
-    footer = row + 2 if settings.chain_aware and not small else 0
-    fits = max(1, (size[1] - top - footer - (0 if small else 4)) // row_h)
-    count = math.ceil(len(PRICE_TABLE) / fits)
-    return count, math.ceil(len(PRICE_TABLE) / count)
+def face_paid(c: Canvas, snap: Snapshot) -> None:
+    top = draw_header(c, "PAID ACTS TODAY")
+    bottom = draw_footer(c, "settled and received", c.theme.muted)
+    stack(c, top, bottom, [text_item(c, f"{snap.paid_today:,}", 46, c.theme.text, bold=True)], 0)
 
 
-def render_prices(c: Canvas, snap: Snapshot, index: int, count: int) -> None:
+def block_age_text(secs: int | None) -> str:
+    if secs is None:
+        return "watching for the next block"
+    if secs < 60:
+        return "new block just now"
+    hours, minutes = divmod(secs // 60, 60)
+    return f"last block {hours} h {minutes} min ago" if hours else f"last block {minutes} min ago"
+
+
+def face_bitcoin(c: Canvas, snap: Snapshot) -> None:
     t = c.theme
-    title_size, row_size, row_h, top = _price_metrics((c.w, c.h))
-    title = font(title_size)
-    c.text((c.pad, c.pad), "Price per act", title, t.accent, "la", 0 if c.small else 1)
-    if count > 1:
-        c.text((c.w - c.pad, c.pad), f"{index + 1}/{count}", font(max(8, title_size - 2)), t.dim, "ra")
-    if not snap.settings.readable:
-        f = font(row_size)
-        for i, line in enumerate(c.wrap("konsensus.toml not readable", f, c.w - 2 * c.pad, 3)):
-            c.text((c.pad, top + i * row_h), line, f, t.fg)
-        return
-    _, per_page = price_pages((c.w, c.h), snap.settings)
-    rows = price_rows(snap.settings)[index * per_page : (index + 1) * per_page]
-    f = font(row_size)
-    for i, (label, value) in enumerate(rows):
-        y = top + i * row_h + row_size
-        c.text((c.pad, y), label, f, t.fg, "ls")
-        c.text((c.w - c.pad, y), value, f, t.accent if c.mode != "1" else t.fg, "rs")
-        if not c.small and i < len(rows) - 1:
-            line_y = y + (row_h - row_size) / 2 + 1
-            c.draw.line([(c.pad, line_y), (c.w - c.pad, line_y)], fill=(38, 42, 48))
-    if snap.settings.chain_aware and not c.small:
-        c.text((c.pad, c.h - c.pad), "base price, rises with fees", font(row_size - 2), t.dim, "ls")
+    top = draw_header(c, "BITCOIN")
+    items = [
+        text_item(c, f"{snap.status.block_height:,}", 34, t.text, bold=True),
+        text_item(c, "block height", 11, t.gold),
+        text_item(c, block_age_text(snap.block_age_secs), 10, t.text),
+    ]
+    stack(c, top, c.h - c.pad, items, c.s(6, 3))
 
 
-def render_host(c: Canvas, snap: Snapshot) -> None:
+def face_lightning(c: Canvas, snap: Snapshot) -> None:
     t = c.theme
-    label = snap.hosted_by
-    heading = "Hosted by" if label else "This node"
-    name = label or snap.hostname
-    ip = snap.lan_ip or "no LAN address"
-    avail = c.w - 2 * c.pad
-    if c.small:
-        c.text((c.pad, c.pad), heading, font(10), t.dim)
-        f = c.fit(name, avail, 13, 10)
-        lines = c.wrap(name, f, avail, 2 if len(name) > 16 else 1)
-        for i, line in enumerate(lines):
-            c.text((c.pad, 14 + i * (f.size + 1)), line, f, t.fg)
-        c.text((c.pad, c.h - 1), "LAN", font(9), t.dim, "ls")
-        ipf = c.fit(ip, avail - 20, 13, 9)
-        c.text((c.w - c.pad, c.h - 1), ip, ipf, t.fg, "rs")
-        return
-    hf = font(c.px(0.065))
-    c.text((c.pad, c.pad), heading, hf, t.dim)
-    nf = c.fit(name, avail, c.px(0.11), 12)
-    lines = c.wrap(name, nf, avail, 2)
-    y = c.pad + hf.size * 1.5
-    for line in lines:
-        c.text((c.pad, y), line, nf, t.accent, "la", max(1, c.px(0.004, 1)))
-        y += nf.size * 1.2
-    c.text((c.pad, c.h * 0.62), "LAN IP", hf, t.dim)
-    ipf = c.fit(ip, avail, c.px(0.12), 12)
-    c.text((c.pad, c.h * 0.62 + hf.size * 1.4), ip, ipf, t.fg, "la", max(1, c.px(0.004, 1)))
-
-
-@dataclass(frozen=True)
-class Page:
-    screen: str
-    index: int = 0
-    count: int = 1
-
-
-def build_pages(screens: Iterable[str], size: tuple[int, int], settings: NodeSettings) -> list[Page]:
-    pages = []
-    for screen in screens:
-        if screen == "prices" and settings.readable:
-            count, _ = price_pages(size, settings)
-            pages.extend(Page(screen, i, count) for i in range(count))
+    st = snap.status
+    top = draw_header(c, "LIGHTNING")
+    items = []
+    if st.peers is not None:
+        caption = "peer online" if st.peers == 1 else "peers online"
+        if c.compact:
+            items.append(text_item(c, f"{st.peers:,} {caption}", 32, t.text, bold=True))
         else:
-            pages.append(Page(screen))
-    return pages
+            items.append(text_item(c, f"{st.peers:,}", 32, t.text, bold=True))
+            items.append(text_item(c, caption, 11, t.gold))
+    color = {Lightning.READY: t.ok, Lightning.RECEIVE_ONLY: t.gold}.get(st.lightning, t.bad)
+    items.append(text_item(c, st.lightning.value, 11, color, bold=True))
+    if snap.lockable:
+        items.append(badge_item(c, "HUB-ONLY WHILE LOCKABLE", t.gold, 9))
+    stack(c, top, c.h - c.pad, items, c.s(5, 3))
 
 
-def render_page(page: Page, size: tuple[int, int], mode: str, snap: Snapshot) -> Image.Image:
+def face_machine(c: Canvas, snap: Snapshot) -> None:
+    m = snap.machine
+    top = draw_header(c, "MACHINE")
+    rows = []
+    if m.cpu_temp_c is not None:
+        rows.append(("CPU", f"{m.cpu_temp_c:.0f}", "°C"))
+    if m.disk_free_bytes is not None:
+        rows.append(("Disk free", *format_bytes(m.disk_free_bytes)))
+    if m.uptime_secs is not None:
+        rows.append(("Uptime", format_uptime(m.uptime_secs), ""))
+    bottom = draw_footer(c, snap.hosted_by or snap.hostname, c.theme.gold)
+    draw_rows(c, rows, top + c.s(2), bottom)
+
+
+FACE_RENDERERS: dict[str, Callable[[Canvas, Snapshot], None]] = {
+    "bitsov": face_bitsov,
+    "price": face_price,
+    "paid": face_paid,
+    "bitcoin": face_bitcoin,
+    "lightning": face_lightning,
+    "machine": face_machine,
+}
+
+
+def face_available(name: str, snap: Snapshot) -> bool:
+    if name == "price":
+        return snap.settings.readable
+    if name == "paid":
+        return snap.paid_today is not None
+    if name == "bitcoin":
+        return snap.status.block_height is not None
+    if name == "lightning":
+        return snap.status.lightning is not None
+    if name == "machine":
+        return snap.machine.any
+    return True
+
+
+def round_faces(faces: Iterable[str], snap: Snapshot) -> list[str]:
+    return [name for name in faces if face_available(name, snap)]
+
+
+def render_face(name: str, size: tuple[int, int], mode: str, snap: Snapshot) -> Image.Image:
     c = Canvas(size, mode)
-    if page.screen == "logo":
-        render_logo(c, snap)
-    elif page.screen == "status":
-        render_status(c, snap)
-    elif page.screen == "prices":
-        render_prices(c, snap, page.index, page.count)
-    elif page.screen == "host":
-        render_host(c, snap)
+    FACE_RENDERERS[name](c, snap)
     return c.image
 
 
@@ -1039,6 +1205,20 @@ def framebuffer_bytes(img: Image.Image, bpp: int, red_high: bool = True) -> byte
     return Image.merge("LA", (lo, hi)).tobytes()
 
 
+@contextlib.contextmanager
+def without_luma_atexit():
+    """luma pins every device it builds in an atexit hook. run() reopens the
+    panel every round and closes it itself, so those hooks would only leak."""
+    import luma.core.device as luma_device
+
+    real = luma_device.atexit
+    luma_device.atexit = types.SimpleNamespace(register=lambda fn, *args, **kwargs: fn)
+    try:
+        yield
+    finally:
+        luma_device.atexit = real
+
+
 def open_device(spec: PanelSpec, cfg: DisplayConfig):
     if spec.driver == "fbdev":
         return FramebufferDevice(spec.fb_device, spec.rotate)
@@ -1047,7 +1227,8 @@ def open_device(spec: PanelSpec, cfg: DisplayConfig):
         from luma.oled import device as oled
 
         serial = i2c(port=cfg.i2c_port, address=spec.i2c_address)
-        return getattr(oled, spec.driver)(serial, width=spec.width, height=spec.height, rotate=spec.rotate)
+        with without_luma_atexit():
+            return getattr(oled, spec.driver)(serial, width=spec.width, height=spec.height, rotate=spec.rotate)
 
     from luma.core.interface.serial import spi
     from luma.lcd import device as lcd
@@ -1060,25 +1241,26 @@ def open_device(spec: PanelSpec, cfg: DisplayConfig):
         gpio_RST=cfg.gpio_rst,
     )
     width, height, rotate = spec.width, spec.height, spec.rotate
-    if spec.driver == "st7789" and height > width:
-        # luma's ST7789 init scans landscape; drive a portrait panel as a rotated landscape one.
+    if spec.driver in ("st7735", "st7789") and height > width:
+        # luma's ST77xx init scans landscape; drive a portrait panel as a rotated landscape one.
         width, height, rotate = height, width, (rotate + 1) % 4
     backlight = {}
     if cfg.gpio_backlight is None:
         backlight["backlight"] = lambda _on: None
     else:
         backlight.update(gpio_LIGHT=cfg.gpio_backlight, active_low=cfg.backlight_active_low)
-    return getattr(lcd, spec.driver)(serial, width=width, height=height, rotate=rotate, **backlight)
+    with without_luma_atexit():
+        return getattr(lcd, spec.driver)(serial, width=width, height=height, rotate=rotate, **backlight)
 
 
-def close_device(device) -> None:
+def close_device(device, keep_picture: bool = False) -> None:
+    """Release the panel. keep_picture leaves the image and backlight on for a reopen."""
+    if keep_picture and hasattr(device, "persist"):
+        device.persist = True
     try:
         device.cleanup()
     except Exception:  # noqa: BLE001 - best effort on a failing bus
         pass
-    if hasattr(device, "persist"):
-        # luma's atexit hook calls cleanup() again; skip its clear on a closed bus.
-        device.persist = True
 
 
 # --------------------------------------------------------------------------
@@ -1086,109 +1268,111 @@ def close_device(device) -> None:
 # --------------------------------------------------------------------------
 
 
-def run(cfg: DisplayConfig, hw: Hardware | None = None) -> None:
+def run(cfg: DisplayConfig, hw: Hardware | None = None, *, sleep=time.sleep, rounds: int | None = None) -> None:
+    """Show every available face once per round. Before each later round the
+    panel is closed and reopened: the reset pulse and init sequence recover a
+    controller frozen by a ribbon-cable glitch."""
     hw = hw or Hardware()
-    device = None
-    shown = 0
+    observed = Observed()
+    device = spec = None
     last_state: NodeState | None = None
+    done = 0
     try:
-        while True:
+        while rounds is None or done < rounds:
             if device is None:
                 spec = detect_panel(cfg, hw)
                 if spec is None:
                     log.warning("no panel found; retrying in 30 s (run with --probe to inspect)")
-                    time.sleep(30)
+                    sleep(30)
                     continue
                 try:
                     device = open_device(spec, cfg)
                     log.info("driving %s at %dx%d", spec.driver, *device.size)
                 except Exception as e:  # noqa: BLE001 - missing bus/driver must not kill the service
                     log.warning("cannot open %s: %s; retrying in 30 s", spec.driver, e)
-                    time.sleep(30)
+                    sleep(30)
+                    continue
+            elif spec.driver != "fbdev":
+                close_device(device, keep_picture=True)
+                device = None
+                try:
+                    device = open_device(spec, cfg)
+                except Exception as e:  # noqa: BLE001 - a bus glitch must not kill the service
+                    log.warning("cannot re-init %s: %s; retrying in 5 s", spec.driver, e)
+                    sleep(5)
                     continue
 
-            snap = collect_snapshot(cfg)
+            snap = collect_snapshot(cfg, observed)
             if snap.status.state is not last_state:
                 log.info("node state: %s", snap.status.state.value)
                 last_state = snap.status.state
-            pages = build_pages(cfg.screens, device.size, snap.settings)
-            page = pages[shown % len(pages)]
-            shown += 1
-            try:
-                device.display(render_page(page, device.size, device.mode, snap))
-            except Exception as e:  # noqa: BLE001 - a bus glitch reopens the panel
-                log.warning("display update failed: %s; reopening", e)
-                close_device(device)
-                device = None
-                time.sleep(5)
-                continue
-            time.sleep(cfg.interval_secs)
+            for name in round_faces(cfg.faces, snap):
+                try:
+                    device.display(render_face(name, device.size, device.mode, snap))
+                except Exception as e:  # noqa: BLE001 - a bus glitch reopens the panel
+                    log.warning("display update failed: %s; reopening", e)
+                    close_device(device)
+                    device = None
+                    sleep(5)
+                    break
+                sleep(cfg.interval_secs)
+            done += 1
     finally:
         if device is not None:
             close_device(device)
 
 
-PREVIEW_PROFILES = (
-    ("oled-128x64", (128, 64), "1"),
-    ("st7789-240x240", (240, 240), "RGB"),
-    ("st7789-240x320", (240, 320), "RGB"),
-    ("ili9341-320x240", (320, 240), "RGB"),
-    ("fbdev-480x320", (480, 320), "RGB"),
-)
+PREVIEW_SIZE = DESIGN_SIZE
 
 
-def preview_snapshots(settings: NodeSettings) -> dict[str, Snapshot]:
-    def snap(status: NodeStatus) -> Snapshot:
-        return Snapshot(settings, status, "192.168.1.42", "bitsov", settings.api_port)
+def preview_frames(settings: NodeSettings) -> list[tuple[str, str, Snapshot]]:
+    """(file label, face, sample snapshot) for every face and node state."""
+    machine = MachineStats(cpu_temp_c=48.3, disk_free_bytes=41_200_000_000, uptime_secs=9 * 86_400 + 5 * 3_600)
+    running = NodeStatus(
+        NodeState.RUNNING,
+        uptime_secs=3 * 86_400 + 4 * 3_600 + 720,
+        block_height=966_421,
+        peers=5,
+        lightning=Lightning.READY,
+    )
 
-    return {
-        "running": snap(NodeStatus(NodeState.RUNNING, uptime_secs=3 * 86_400 + 4 * 3_600 + 720)),
-        "locked": snap(NodeStatus(NodeState.LOCKED)),
-        "offline": snap(NodeStatus(NodeState.OFFLINE)),
-        "setup": snap(NodeStatus(NodeState.SETUP)),
-    }
+    def snap(status: NodeStatus, **extra) -> Snapshot:
+        return Snapshot(settings, status, machine, "bitsov", settings.api_port, **extra)
+
+    live = snap(running, block_age_secs=4 * 60 + 10, lockable=True, paid_today=7)
+    return [
+        ("bitsov-running", "bitsov", live),
+        ("bitsov-locked", "bitsov", snap(NodeStatus(NodeState.LOCKED))),
+        ("bitsov-setup", "bitsov", snap(NodeStatus(NodeState.SETUP))),
+        ("bitsov-offline", "bitsov", snap(NodeStatus(NodeState.OFFLINE))),
+        ("price", "price", live),
+        ("paid", "paid", live),
+        ("bitcoin", "bitcoin", live),
+        ("lightning", "lightning", live),
+        ("machine", "machine", live),
+    ]
 
 
 def write_previews(out_dir: Path, settings: NodeSettings) -> list[Path]:
-    """Render every screen for every common panel to PNG. No hardware, no network."""
-    snaps = preview_snapshots(settings)
-    written = []
-    tiles = []
-    for name, size, mode in PREVIEW_PROFILES:
-        scale = max(1, 480 // size[0])
-        frames = []
-        for page in build_pages(SCREENS, size, settings):
-            states = ("running", "locked", "offline", "setup") if page.screen == "status" else ("running",)
-            for state in states:
-                img = render_page(page, size, mode, snaps[state]).convert("RGB")
-                label = page.screen
-                if page.screen == "status":
-                    label += f"-{state}"
-                if page.count > 1:
-                    label += f"-{page.index + 1}of{page.count}"
-                frames.append((label, img))
-        folder = out_dir / name
-        folder.mkdir(parents=True, exist_ok=True)
-        for old in folder.glob("*.png"):
-            old.unlink()
-        for i, (label, img) in enumerate(frames, 1):
-            path = folder / f"{i:02d}-{label}.png"
-            img.resize((size[0] * scale, size[1] * scale), Image.NEAREST).save(path, optimize=True)
-            written.append(path)
-        tiles.append((name, [img for _, img in frames], scale))
+    """Render every face at 160x128 to PNG, plus a 2x overview. No hardware, no network."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("*.png"):
+        old.unlink()
+    written, frames = [], []
+    for i, (label, face, snap) in enumerate(preview_frames(settings), 1):
+        img = render_face(face, PREVIEW_SIZE, "RGB", snap)
+        path = out_dir / f"{i:02d}-{label}.png"
+        img.save(path, optimize=True)
+        written.append(path)
+        frames.append(img)
 
-    gap = 12
-    rows = [[img.resize((img.width * s, img.height * s), Image.NEAREST) for img in imgs] for _, imgs, s in tiles]
-    sheet_w = max(sum(i.width for i in row) + gap * (len(row) + 1) for row in rows)
-    sheet_h = sum(max(i.height for i in row) + gap for row in rows) + gap
-    sheet = Image.new("RGB", (sheet_w, sheet_h), (60, 60, 64))
-    y = gap
-    for row in rows:
-        x = gap
-        for img in row:
-            sheet.paste(img, (x, y))
-            x += img.width + gap
-        y += max(i.height for i in row) + gap
+    scale, gap, columns = 2, 10, 3
+    w, h = PREVIEW_SIZE[0] * scale, PREVIEW_SIZE[1] * scale
+    rows = -(-len(frames) // columns)
+    sheet = Image.new("RGB", (columns * (w + gap) + gap, rows * (h + gap) + gap), (18, 12, 10))
+    for i, img in enumerate(frames):
+        x, y = gap + (i % columns) * (w + gap), gap + (i // columns) * (h + gap)
+        sheet.paste(img.resize((w, h), Image.NEAREST), (x, y))
     overview = out_dir / "overview.png"
     sheet.save(overview, optimize=True)
     written.append(overview)
@@ -1203,6 +1387,13 @@ def probe_report(cfg: DisplayConfig, hw: Hardware) -> str:
         lines.append(f"model: {model}")
     except OSError:
         lines.append("model: unknown (not a Raspberry Pi?)")
+    backlight = "none" if cfg.gpio_backlight is None else (
+        f"GPIO{cfg.gpio_backlight} active {'low' if cfg.backlight_active_low else 'high'}"
+    )
+    lines.append(
+        f"config: profile {cfg.profile or '-'}, driver {cfg.driver}, SPI {cfg.spi_speed_hz / 1e6:g} MHz, "
+        f"DC GPIO{cfg.gpio_dc}, RST {'-' if cfg.gpio_rst is None else f'GPIO{cfg.gpio_rst}'}, backlight {backlight}"
+    )
     fbs = hw.framebuffers()
     lines.append("framebuffers: " + (", ".join(f"{p} ({n})" for p, n in fbs) or "none"))
     for port in sorted({cfg.i2c_port, 1}):
@@ -1233,19 +1424,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="BitSov front display for a Raspberry Pi home node.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="display.toml path")
     parser.add_argument("--node-config", help="konsensus.toml path (read-only, allow-listed keys only)")
-    parser.add_argument("--preview", type=Path, metavar="DIR", help="render all screens to PNG and exit")
+    parser.add_argument("--preview", type=Path, metavar="DIR", help="render every face at 160x128 to PNG and exit")
     parser.add_argument("--probe", action="store_true", help="report panel hardware and exit")
+    parser.add_argument("--check-config", action="store_true", help="validate display.toml and exit (2 if invalid)")
+    parser.add_argument("--font-dir", help="directory holding DejaVuSans.ttf and DejaVuSans-Bold.ttf")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(message)s",
     )
+    if args.font_dir:
+        use_font_dir(args.font_dir)
+    if dejavu_path() is None and not args.check_config:
+        log.warning("DejaVu fonts not found (apt install fonts-dejavu-core, or --font-dir); using Pillow's font")
 
     if args.preview:
         settings = read_node_settings(Path(args.node_config)) if args.node_config else None
         if settings is None or not settings.readable:
-            settings = NodeSettings(readable=True, hosted_by="Rasmus's Pi")
+            settings = NodeSettings(readable=True, hosted_by="Family Pi")
         for path in write_previews(args.preview, settings):
             print(path)
         return 0
@@ -1255,6 +1452,8 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as e:
         log.error("%s", e)
         return 2
+    if args.check_config:
+        return 0
     if args.node_config:
         cfg = DisplayConfig(**{**cfg.__dict__, "node_config": args.node_config})
     if args.probe:

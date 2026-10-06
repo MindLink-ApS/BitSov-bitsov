@@ -42,24 +42,33 @@ def test_format_sats(msat, text):
     assert bd.format_sats(msat) == text
 
 
+def _shown(settings):
+    return {label: bd.format_sats(msat) for label, msat in bd.price_rows(settings)}
+
+
+def test_price_face_shows_message_call_and_page():
+    assert [label for label, _ in bd.price_rows(bd.NodeSettings(readable=True))] == ["Message", "Call", "Page"]
+
+
 def test_default_price_rows_never_show_zero():
-    rows = dict(bd.price_rows(bd.NodeSettings(readable=True)))
+    rows = _shown(bd.NodeSettings(readable=True))
     assert rows["Message"] == "1 sat"  # chat_msat = 10 is floored
-    assert rows["Control"] == "1 sat"  # control_msat = 1 is floored
     assert rows["Call"] == "10 sats"
+    assert rows["Page"] == "1 sat"
     assert all(not v.startswith("0") for v in rows.values())
 
 
 def test_zero_prices_from_config_still_floor():
     lines = ["[pricing]"] + [f"{key} = 0" for key, _, _ in bd.PRICE_TABLE]
     settings = bd.node_settings_from_values(bd.allowed_node_values(lines))
-    assert all(v == "1 sat" for _, v in bd.price_rows(settings))
+    assert all(v == "1 sat" for v in _shown(settings).values())
 
 
 def test_admission_floor_applies_to_every_row():
     settings = bd.node_settings_from_values(
         bd.allowed_node_values(["[payment_gate]", "min_admission_cost_msat = 2000"])
     )
-    rows = dict(bd.price_rows(settings))
+    rows = _shown(settings)
     assert rows["Message"] == "2 sats"
     assert rows["Call"] == "10 sats"
+    assert rows["Page"] == "2 sats"
