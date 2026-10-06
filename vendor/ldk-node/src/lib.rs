@@ -1204,6 +1204,10 @@ impl Node {
 		announce_for_forwarding: bool,
 		funding_policy: Option<funding::FundingPolicy>,
 	) -> Result<UserChannelId, Error> {
+		if self.config.channel_peer_allowlist.as_ref().is_some_and(|peers| !peers.contains(&node_id)) {
+			log_error!(self.logger, "HUB_ONLY_WHILE_LOCKABLE: refusing to open a channel to peer {}", node_id);
+			return Err(Error::ChannelCreationFailed);
+		}
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
 		}

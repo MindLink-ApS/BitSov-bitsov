@@ -240,6 +240,11 @@ pub struct DiskStatus {
     pub disk_free_floor_bytes: u64,
 }
 
+/// [`LightningError::PaymentNotDispatched`] reason: a node started with
+/// `--remote-unlock` shares new channels only with its configured hub/LSP,
+/// because nothing watches its channels while it sits locked.
+pub const HUB_ONLY_WHILE_LOCKABLE: &str = "HUB_ONLY_WHILE_LOCKABLE";
+
 /// Errors from Lightning operations.
 #[derive(Debug, Error)]
 pub enum LightningError {
