@@ -18,8 +18,7 @@ use konsensus_core::traits::lightning::LightningProvider;
 use konsensus_core::traits::pricing::PricingEngine;
 use konsensus_core::types::NodeId;
 use konsensus_lightning::{
-    LdkConfig, LdkProvider, LndConfig, LndProvider, MockLightningConfig,
-    MockLightningProvider,
+    LdkConfig, LdkProvider, LndConfig, LndProvider, MockLightningConfig, MockLightningProvider,
 };
 use konsensus_message::wire::Capability;
 use konsensus_message::{NoiseTransport, PeerRegistry, TransportConfig};
@@ -83,15 +82,28 @@ impl KonsensusNode {
         config.validate_routing_fee_backend()?;
         // Fail closed before starting LDK or opening node state on insecure credentials.
         let chain_auth = match &config.chain {
-            ChainConfig::Esplora { credentials_file: Some(path), .. } =>
-                Some(konsensus_chain::bearer::BearerAuth::from_file(path)?),
+            ChainConfig::Esplora {
+                credentials_file: Some(path),
+                ..
+            } => Some(konsensus_chain::bearer::BearerAuth::from_file(path)?),
             _ => None,
         };
         // Same directory as the embedded LDK state. Check before opening either store.
-        let data_dir = config.identity.mnemonic_file.parent()
-            .filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
-        let state_guard = Arc::new(crate::safety::ensure_generation(data_dir, crate::safety::STATE_GENERATION)?);
-        let disk = Arc::new(crate::safety::DiskGuard::new(data_dir.to_path_buf(), config.disk_free_floor_bytes));
+        let data_dir = config
+            .identity
+            .mnemonic_file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let state_guard = Arc::new(crate::safety::ensure_generation(
+            data_dir,
+            crate::safety::STATE_GENERATION,
+        )?);
+        konsensus_lightning::ldk::ensure_no_move_home(&data_dir.join("ldk"))?;
+        let disk = Arc::new(crate::safety::DiskGuard::new(
+            data_dir.to_path_buf(),
+            config.disk_free_floor_bytes,
+        ));
         // ── 1. Load identity ────────────────────────────────────────────
         let mnemonic = crate::mnemonic_crypto::read_mnemonic(
             &config.identity.mnemonic_file,
@@ -148,7 +160,9 @@ impl KonsensusNode {
 
         // ── 3. Initialize Lightning provider ────────────────────────────
         let lightning: Arc<dyn LightningProvider> = match &config.lightning {
-            LightningConfig::Lnbits { .. } => anyhow::bail!("not_supported: LNbits routing fee ceilings"),
+            LightningConfig::Lnbits { .. } => {
+                anyhow::bail!("not_supported: LNbits routing fee ceilings")
+            }
             LightningConfig::Lnd {
                 api_url,
                 macaroon_hex,
@@ -166,11 +180,17 @@ impl KonsensusNode {
                 provider.probe_payment_capability().await;
                 Arc::new(provider)
             }
-            LightningConfig::SharedMock { ledger_path, initial_balance_msat } => {
-                Arc::new(konsensus_lightning::shared_mock::SharedMockProvider::new(
-                    ledger_path, &identity.node_id().to_hex(), *initial_balance_msat,
-                ).map_err(|e| anyhow::anyhow!("shared mock: {e}"))?)
-            }
+            LightningConfig::SharedMock {
+                ledger_path,
+                initial_balance_msat,
+            } => Arc::new(
+                konsensus_lightning::shared_mock::SharedMockProvider::new(
+                    ledger_path,
+                    &identity.node_id().to_hex(),
+                    *initial_balance_msat,
+                )
+                .map_err(|e| anyhow::anyhow!("shared mock: {e}"))?,
+            ),
             LightningConfig::Mock {
                 initial_balance_msat,
             } => {
@@ -247,7 +267,8 @@ impl KonsensusNode {
                 // entropy, directory and configuration, never onboarding/init.
                 let mut ldk_config = ldk_config;
                 let mnemonic = zeroize::Zeroizing::new(std::mem::take(&mut ldk_config.mnemonic));
-                let passphrase = zeroize::Zeroizing::new(ldk_config.passphrase.take().unwrap_or_default());
+                let passphrase =
+                    zeroize::Zeroizing::new(ldk_config.passphrase.take().unwrap_or_default());
                 let policy = config.routing_fees;
                 let admission_disk = disk.clone();
                 let admission_lease = state_guard.clone();
@@ -257,24 +278,36 @@ impl KonsensusNode {
                     let _lease = &admission_lease;
                     !admission_disk.refresh().disk_low
                 });
-                Arc::new(konsensus_lightning::RecoveringLightning::new(move || {
-                    let mut attempt = ldk_config.clone();
-                    attempt.mnemonic = mnemonic.to_string();
-                    attempt.passphrase = Some(passphrase.to_string());
-                    let admission = admission.clone();
-                    async move {
-                        LdkProvider::new_with_work_admission(attempt, Some(admission)).await.map(|provider|
-                            Arc::new(provider.with_routing_fee_policy(policy)) as Arc<dyn LightningProvider>)
-                    }
-                }, policy).await.map_err(|e| anyhow::anyhow!("ldk provider: {e}"))?)
+                Arc::new(
+                    konsensus_lightning::RecoveringLightning::new(
+                        move || {
+                            let mut attempt = ldk_config.clone();
+                            attempt.mnemonic = mnemonic.to_string();
+                            attempt.passphrase = Some(passphrase.to_string());
+                            let admission = admission.clone();
+                            async move {
+                                LdkProvider::new_with_work_admission(attempt, Some(admission))
+                                    .await
+                                    .map(|provider| {
+                                        Arc::new(provider.with_routing_fee_policy(policy))
+                                            as Arc<dyn LightningProvider>
+                                    })
+                            }
+                        },
+                        policy,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ldk provider: {e}"))?,
+                )
             }
         };
 
-        let lightning: Arc<dyn LightningProvider> = Arc::new(crate::guarded_lightning::GuardedLightning {
-            inner: lightning,
-            disk: disk.clone(),
-            _state_guard: state_guard.clone(),
-        });
+        let lightning: Arc<dyn LightningProvider> =
+            Arc::new(crate::guarded_lightning::GuardedLightning {
+                inner: lightning,
+                disk: disk.clone(),
+                _state_guard: state_guard.clone(),
+            });
         info!("lightning provider initialized");
 
         // ── 4. Initialize Chain provider ────────────────────────────────
@@ -285,8 +318,14 @@ impl KonsensusNode {
                     konsensus_core::traits::chain::TrustLevel::ServerTrust,
                 );
                 info!(backend = "esplora", "chain provider");
-                let provider = EsploraProvider::with_fallbacks(esplora_config, config.chain.esplora_fallbacks(&config.lightning))?;
-                Arc::new(match chain_auth { Some(auth) => provider.with_bearer(auth)?, None => provider })
+                let provider = EsploraProvider::with_fallbacks(
+                    esplora_config,
+                    config.chain.esplora_fallbacks(&config.lightning),
+                )?;
+                Arc::new(match chain_auth {
+                    Some(auth) => provider.with_bearer(auth)?,
+                    None => provider,
+                })
             }
             ChainConfig::Bitcoind(rpc) => {
                 info!(backend = "bitcoind", "chain provider (own node)");
@@ -691,7 +730,10 @@ mod relay_capability_tests {
         assert_eq!(format!("{meeting:?}"), r#"Custom("call_meeting_v1")"#);
         // An older node decodes it: `Custom` is an existing, name-tagged variant.
         let wire = serde_json::to_string(&caps).unwrap();
-        assert_eq!(serde_json::from_str::<Vec<Capability>>(&wire).unwrap(), caps);
+        assert_eq!(
+            serde_json::from_str::<Vec<Capability>>(&wire).unwrap(),
+            caps
+        );
     }
 
     #[test]

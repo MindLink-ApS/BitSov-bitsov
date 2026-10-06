@@ -36,11 +36,12 @@ rotation_count = 24
 
 ## Security Model
 
-SCB files contain channel metadata: counterparty pubkeys, funding outpoints,
-channel identifiers, and balances/capacity hints. Plain SCB files must not be
+SCB files contain persisted LDK manager, monitor and update state, including
+channel metadata and commitment history. Plain SCB files must not be
 synced to third-party storage.
 
-L5b uses AES-256-GCM with the node's master AES key derived from the mnemonic.
+L5b uses AES-256-GCM with an SCB-specific key derived from the LDK entropy seed
+(the mnemonic and optional BIP-39 passphrase).
 That means:
 
 - the backup directory can be copied like ordinary files;
@@ -48,85 +49,40 @@ That means:
 - a restored node with the same mnemonic can derive the same AES key and decrypt;
 - there is no operator GCS dependency in the sovereign default.
 
-## Restore From Local Rotated SCB
+## SCB restore is locked (issue #157)
 
-Use this path when the node disk is lost or corrupted but the operator still has
-an encrypted SCB copy.
+`konsensus scb restore` always fails closed, including preview and `--confirm`,
+before reading the seed/backup, writing state, starting LDK or applying a
+whitelist sidecar. Library import and restored force-close entry points are
+also disabled. There is no override flag or normal-build feature.
 
-1. Stop the node.
+These backups contain historical LDK channel-manager/monitor state. Starting a
+stale copy can broadcast a revoked commitment and lose the entire channel. The
+pinned LDK has no safe staged restore/broadcast-suppression path and can panic
+when peer reconnection proves data loss. Merely reconnecting before requesting
+a force-close is not a safe fix. Neither the newest snapshot nor any older copy
+is proof of current channel state. Never roll back a live LDK store.
 
-2. Restore the node identity from the mnemonic:
+For a healthy node moving to new hardware, use the original current live store
+and the owner-console [close and send home procedure](../operations/move-home.md).
+It cooperatively closes channels, waits for claims, then sweeps to the address
+you provide after fee/amount preview and consent. It is not disaster recovery.
 
-   ```sh
-   konsensus restore --dir /var/lib/bitsov/node --tier full
-   ```
+For a lost/corrupt disk, retain the seed, passphrase, all backups and available
+current state. Do not boot historical channel state or assume the mnemonic alone
+recovers channel outputs. Coordinate with counterparties and obtain a recovery
+procedure compatible with the pinned LDK; this release does not provide an
+automated channel recovery guarantee. Counterparty closure alone does not prove
+that this wallet can locate and spend every channel output.
 
-   Use the same BIP-39 passphrase if the original node used one.
+Restore peer/invite relationships independently using
+`konsensus whitelist restore --config … --from whitelist-latest.aes` after
+verifying the sidecar's provenance. The SCB command no longer auto-applies it.
 
-3. Choose the newest usable encrypted SCB:
+## Operator checklist
 
-   ```sh
-   ls -1 /var/lib/bitsov/node/backups/scb-*.aes | tail -1
-   ```
-
-   `scb-latest.aes` should match the newest timestamped copy, but the timestamped
-   copies are kept so an operator can step back if the latest file is damaged.
-
-4. Run SCB restore in preview mode first:
-
-   ```sh
-   konsensus scb restore \
-     --config /var/lib/bitsov/node/konsensus.toml \
-     --from /var/lib/bitsov/node/backups/scb-latest.aes \
-     --restore-dir /var/lib/bitsov/recovery/ldk-restore
-   ```
-
-   This decrypts the backup with the mnemonic-derived SCB AES key, imports
-   persisted recovery state into a separate restore directory, and prints
-   per-channel estimates:
-   `channel_id`, `counterparty`, `estimated_recoverable_sats`.
-
-5. Re-run with `--confirm` to execute destructive unilateral closes:
-
-   ```sh
-   konsensus scb restore \
-     --config /var/lib/bitsov/node/konsensus.toml \
-     --from /var/lib/bitsov/node/backups/scb-latest.aes \
-     --restore-dir /var/lib/bitsov/recovery/ldk-restore \
-     --confirm
-   ```
-
-   This initiates force-close for each recovered open channel.
-
-6. Do not delete encrypted backup files until force-close transactions are
-   broadcast and on-chain recovery balances are visible.
-
-## Mnemonic-Only Recovery
-
-Use this path when there is no SCB copy.
-
-1. Restore the node identity from the mnemonic:
-
-   ```sh
-   konsensus restore --dir /var/lib/bitsov/node --tier full
-   ```
-
-2. Start with no channel state and do not attempt to reuse stale LDK data from a
-   partial disk copy.
-
-3. Coordinate with each channel counterparty to force-close or cooperatively
-   close channels from their side. The restored node can derive its on-chain keys
-   from the mnemonic, but it cannot reconstruct full channel state without SCB.
-
-4. Wait for on-chain resolutions and CSV delays, then re-open channels.
-
-Mnemonic-only recovery is slower and may require counterparty action. SCB
-rotation exists to avoid this path.
-
-## Operator Checklist
-
-- Keep the mnemonic offline.
-- Keep `scb.bin` local only; sync only encrypted `.aes` files.
-- Prefer `scb-latest.aes` for restore; keep timestamped copies for rollback.
-- Test restore on a non-production data directory before touching live funds.
-- If cloud sync is needed for Cloud-tier tenants, sync only L5b encrypted blobs.
+- Keep the mnemonic and passphrase offline and retain the current live state.
+- Keep plaintext SCBs local; sync only encrypted `.aes` files.
+- Preserve backup history for a future compatible recovery procedure, not rollback.
+- Do not test channel restore by starting historical state against live peers.
+- For moving a healthy node, preview and use `konsensus move-home` on the source.

@@ -454,3 +454,16 @@ See `docs/LSPS2-LIQUIDITY.md` for settings, units and conservative limitations.
 Tests: vendor `bitsov_jit`, `funding`, `bitsov_money_tests`; application LSPS2
 configuration/tariff tests; real `hub_jit_then_stateless_admission` regtest with
 insufficient hub funds, retry recovery, fee-cap and restart telemetry checks.
+
+## Issue #157: owner-console move-home
+
+The root and this standalone crate patch `lightning` to the exact 0.2.2 source
+in `../lightning`; see its BITSOV-PATCH.md for provenance and the narrow changes.
+`Config::cooperative_close_only` defaults false and applies that runtime policy
+before startup. Migration closes retain peer addresses across restarts.
+`move_home_balances` reads monitor claims/events, then sweeper outputs, then
+wallet balances; wallet errors fail closed. `prepare_move_home` signs without
+reserving/broadcasting; `replay_move_home` validates the single destination,
+owned inputs and fee, then durably reserves the exact approved transaction
+before enqueueing. Queueing is not confirmation. Real BDK tests cover this
+boundary in wallet/money_tests.rs.

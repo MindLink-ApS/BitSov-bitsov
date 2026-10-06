@@ -13,6 +13,8 @@ mod housekeeping;
 mod invoice_refusals;
 mod logging;
 mod mnemonic_crypto;
+#[path = "cli/move_home.rs"]
+mod move_home_cmd;
 mod msg_handler;
 mod node;
 mod onboarding;
@@ -248,6 +250,7 @@ async fn main() -> Result<()> {
             let mnemonic_path = resolve_mnemonic_path(mnemonic, config)?;
             cmd_sign_challenge(&mnemonic_path, &passphrase, &challenge)?;
         }
+        Command::MoveHome(args) => move_home_cmd::run(args).await?,
         Command::Scb { command } => match command {
             ScbCommand::Restore {
                 from,

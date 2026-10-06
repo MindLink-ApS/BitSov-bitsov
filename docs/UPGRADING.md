@@ -9,6 +9,27 @@ procedure and compatibility inventory remain below for reference. Fresh rc9
 `konsensus init` installs do not need retained-node marker repair. For VMs,
 also read **VM / multi-host upgrade rules** and **Encrypted seed / custody**.
 
+## SCB restore lock and move-home (#157)
+
+SCB restore now always refuses, including preview and `--confirm`; there is no
+bypass. Previous preview started a node from historical channel state and could
+broadcast a revoked commitment. Do not downgrade to recover that behavior or
+roll back a live LDK directory. Preserve backups for a compatible recovery
+procedure. Whitelist sidecars must now be restored explicitly with
+`konsensus whitelist restore`; they are no longer applied by SCB restore.
+
+To move funds from a healthy node, stop the normal service and follow
+[close and send home](operations/move-home.md). This owner-console command uses
+current live state, cooperative closure, separate force-close consent for named
+disconnected peers, and exact sweep amount/fee confirmation. It records
+`ldk/move-home.json` beside the live LDK database. Keep this journal together
+with the live store: it binds the destination and records signed transactions
+for idempotent replay. Normal startup refuses while the journal exists,
+including after completion; resume the maintenance command instead. Do not
+remove the journal or run an older binary against a migrating store. The new
+node should have its own fresh identity. State generation increases to **2** so older generation-1 binaries refuse the
+store instead of ignoring migration consent. No numbered SQL migration is added.
+
 ## rc7 → rc9 procedure
 
 1. Record the installed version, config path and selected chain source. Stop
@@ -374,7 +395,7 @@ that server's responsibility.
 Before opening SQLite or constructing LDK, startup durably writes
 `STATE_GENERATION` beside the configured mnemonic (the same parent as `ldk/`).
 The marker uses format `bitsov-state-v1:<generation>`; this release introduces
-binary/state compatibility generation **1**. Future incompatible migrations or
+binary/state compatibility generation **2** (move-home journal safety). Future incompatible migrations or
 LDK persistence changes must increment `STATE_GENERATION` in the binary before
 state is opened. Publication uses a temporary file, file fsync, atomic rename,
 and directory fsync. A process lease (`STATE_GENERATION.lock`) prevents concurrent

@@ -127,12 +127,14 @@ pub(crate) const EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS: u64 = 5;
 ///
 /// [`Node`]: crate::Node
 pub struct Config {
+	/// Owner maintenance: stalled cooperative negotiation must await explicit force consent.
+	pub cooperative_close_only: bool,
 	/// Opt in to forwarding payments into private channels, even without a node alias.
 	/// Defaults to false. This does not enable node or channel announcements.
 	pub accept_forwards_to_priv_channels: bool,
-    /// Optional local disk admission check. False rejects unpaid incoming HTLCs
-    /// and new inbound channels, without affecting settlement recovery or closes.
-    pub work_admission: Option<WorkAdmissionCheck>,
+	/// Optional local disk admission check. False rejects unpaid incoming HTLCs
+	/// and new inbound channels, without affecting settlement recovery or closes.
+	pub work_admission: Option<WorkAdmissionCheck>,
 	/// The path where the underlying LDK and BDK persist their data.
 	pub storage_dir_path: String,
 	/// The used Bitcoin network.
@@ -197,18 +199,25 @@ pub struct Config {
 #[derive(Clone)]
 pub struct WorkAdmissionCheck(std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
 impl WorkAdmissionCheck {
-    /// Construct a check run before an incoming payment or channel is accepted.
-    pub fn new(check: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) -> Self { Self(check) }
-    pub(crate) fn allowed(&self) -> bool { (self.0)() }
+	/// Construct a check run before an incoming payment or channel is accepted.
+	pub fn new(check: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+		Self(check)
+	}
+	pub(crate) fn allowed(&self) -> bool {
+		(self.0)()
+	}
 }
 impl fmt::Debug for WorkAdmissionCheck {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("WorkAdmissionCheck") }
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("WorkAdmissionCheck")
+	}
 }
 
 impl Default for Config {
 	fn default() -> Self {
 		Self {
 			work_admission: None,
+			cooperative_close_only: false,
 			accept_forwards_to_priv_channels: false,
 			storage_dir_path: DEFAULT_STORAGE_DIR_PATH.to_string(),
 			network: DEFAULT_NETWORK,
@@ -315,10 +324,10 @@ impl fmt::Display for AnnounceError {
 			AnnounceError::MissingNodeAlias => write!(f, "Node alias is not configured"),
 			AnnounceError::MissingListeningAddresses => {
 				write!(f, "Listening addresses are not configured")
-			},
+			}
 			AnnounceError::MissingAliasAndAddresses => {
 				write!(f, "Node alias and listening addresses are not configured")
-			},
+			}
 		}
 	}
 }
@@ -551,7 +560,7 @@ impl From<LdkMaxDustHTLCExposure> for MaxDustHTLCExposure {
 			LdkMaxDustHTLCExposure::FixedLimitMsat(limit_msat) => Self::FixedLimit { limit_msat },
 			LdkMaxDustHTLCExposure::FeeRateMultiplier(multiplier) => {
 				Self::FeeRateMultiplier { multiplier }
-			},
+			}
 		}
 	}
 }
@@ -562,7 +571,7 @@ impl From<MaxDustHTLCExposure> for LdkMaxDustHTLCExposure {
 			MaxDustHTLCExposure::FixedLimit { limit_msat } => Self::FixedLimitMsat(limit_msat),
 			MaxDustHTLCExposure::FeeRateMultiplier { multiplier } => {
 				Self::FeeRateMultiplier(multiplier)
-			},
+			}
 		}
 	}
 }
@@ -590,10 +599,9 @@ mod tests {
 	fn private_forwarding_preserves_announcement_restrictions() {
 		assert!(!Config::default().accept_forwards_to_priv_channels);
 		for enabled in [false, true] {
-			for listening_addresses in [
-				None,
-				Some(vec![SocketAddress::from_str("127.0.0.1:9735").unwrap()]),
-			] {
+			for listening_addresses in
+				[None, Some(vec![SocketAddress::from_str("127.0.0.1:9735").unwrap()])]
+			{
 				let config = Config {
 					accept_forwards_to_priv_channels: enabled,
 					listening_addresses,

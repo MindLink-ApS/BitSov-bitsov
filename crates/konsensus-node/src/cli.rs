@@ -15,6 +15,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Close channels and send funds to an owner-specified home address (local console only).
+    MoveHome(crate::move_home_cmd::MoveHomeArgs),
     /// Initialize a new node: generate identity and create config file.
     Init {
         /// Directory to create the node data in.
@@ -350,7 +352,7 @@ pub enum RepairCommand {
 
 #[derive(Subcommand)]
 pub enum ScbCommand {
-    /// Restore an encrypted SCB backup and force-close restored channels.
+    /// Disabled: stale SCB state can lose funds. Use move-home on the current live node.
     Restore {
         /// Path to the encrypted backup file (`*.aes`).
         #[arg(long)]
@@ -360,11 +362,7 @@ pub enum ScbCommand {
         #[arg(short, long, default_value = "konsensus.toml")]
         config: PathBuf,
 
-        /// Directory where restored LDK state is imported.
-        ///
-        /// Defaults to `<node-data>/ldk-restore`. Refusing the live `ldk`
-        /// directory by default keeps preview mode from mutating a running
-        /// node's production store.
+        /// Legacy argument; restore is disabled before any import.
         #[arg(long)]
         restore_dir: Option<PathBuf>,
 
@@ -372,7 +370,7 @@ pub enum ScbCommand {
         #[arg(long)]
         password: Option<String>,
 
-        /// Required to execute destructive force-close operations.
+        /// Legacy argument; cannot bypass the restore safety lock.
         #[arg(long)]
         confirm: bool,
     },
@@ -401,7 +399,7 @@ pub enum WhitelistCommand {
     },
 
     /// Restore the gate-whitelist state from an encrypted sidecar into the
-    /// configured storage DB (RV-RESTORE). Run after `scb restore` on fresh
+    /// configured storage DB (RV-RESTORE), independently of disabled SCB restore on fresh
     /// hardware so the node re-admits invite-onboarded peers. Idempotent.
     Restore {
         /// Path to the encrypted whitelist backup (`whitelist-latest.aes`).
