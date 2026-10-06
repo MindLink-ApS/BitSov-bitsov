@@ -108,6 +108,10 @@ fn hosted_by_is_bounded_trimmed_and_printable() {
         ("Pi\u{202E}kcab", "printable"),
         ("Pi\u{200B}", "printable"),
         ("Pi\u{2066}x\u{2069}", "printable"),
+        ("Pi\u{206A}", "printable"),
+        ("Pi\u{206F}", "printable"),
+        ("Pi\u{E0020}", "printable"),
+        ("Pi\u{E0041}\u{E007F}", "printable"),
     ] {
         config.node.hosted_by = Some(label.into());
         let error = config.validate().unwrap_err().to_string();
