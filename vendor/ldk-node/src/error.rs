@@ -57,6 +57,8 @@ pub enum Error {
 	ChainRateLimited,
 	/// A wallet operation failed.
 	WalletOperationFailed,
+	/// An approved migration sweep has an input missing or spent by another transaction.
+	MoveHomeSweepUnavailable,
 	/// A reserved input still has a confirmed spend below the finality threshold.
 	LocalSpendStillConfirmed,
 	/// A wallet operation timed out.
@@ -163,6 +165,7 @@ impl fmt::Display for Error {
 			Self::FeerateEstimationUpdateTimeout => {
 				write!(f, "Updating fee rate estimates timed out.")
 			},
+			Self::MoveHomeSweepUnavailable => write!(f, "Approved move-home sweep inputs are unavailable (conflict, replacement or reorg). Keep the journal and live store; sync and investigate the sweep and its input transactions before resuming. Do not delete the journal or authorize a replacement sweep."),
 			Self::WalletOperationFailed => write!(f, "Failed to conduct wallet operation."),
 			Self::LocalSpendStillConfirmed => write!(f, "Transaction or conflicting spend is still confirmed below finality; reservation retained."),
 			Self::WalletOperationTimeout => write!(f, "A wallet operation timed out."),

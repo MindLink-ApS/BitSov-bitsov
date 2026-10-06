@@ -110,6 +110,7 @@ use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::wallet::bump::BumpWallet as LdkWallet;
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Amount};
@@ -118,8 +119,8 @@ pub use builder::ArcedNodeBuilder as Builder;
 pub use builder::BuildError;
 #[cfg(not(feature = "uniffi"))]
 pub use builder::NodeBuilder as Builder;
-use chain::ChainSource;
 pub use chain::sync_health::ChainSyncFailure;
+use chain::ChainSource;
 use config::{
 	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
 	NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
@@ -138,7 +139,6 @@ pub use io::utils::generate_entropy_mnemonic;
 use io::utils::write_node_metrics;
 use lightning::chain::BestBlock;
 use lightning::events::bump_transaction::Input;
-use crate::wallet::bump::BumpWallet as LdkWallet;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::chan_utils::{make_funding_redeemscript, FUNDING_TRANSACTION_WITNESS_WEIGHT};
 use lightning::ln::channel_state::{ChannelDetails as LdkChannelDetails, ChannelShutdownState};
@@ -216,6 +216,60 @@ pub struct Node {
 pub use wallet::LocalSpendReservation;
 
 impl Node {
+	/// Current LDK cooperative-close fee estimates (minimum, normal), in sat/vB.
+	/// Negotiation and the per-channel force-close avoidance allowance still apply.
+	pub fn move_home_close_fee_rates(&self) -> (u64, u64) {
+		use lightning::chain::chaininterface::ConfirmationTarget as Target;
+		(
+			self.fee_estimator
+				.estimate_fee_rate(Target::ChannelCloseMinimum.into())
+				.to_sat_per_vb_ceil(),
+			self.fee_estimator
+				.estimate_fee_rate(Target::NonAnchorChannelFee.into())
+				.to_sat_per_vb_ceil(),
+		)
+	}
+	/// Prepare a signed migration drain without reserving or broadcasting it.
+	/// Owner-console caller must hold the node lease and onchain_operation_lock.
+	/// Never use this with historical/restored channel state.
+	pub fn prepare_move_home(
+		&self,
+		address: &bitcoin::Address,
+		fee_rate: bitcoin::FeeRate,
+	) -> Result<(bitcoin::Transaction, u64), NodeError> {
+		if !self.status().is_running {
+			return Err(NodeError::NotRunning);
+		}
+		let (balances, pending_events) = self.move_home_balances()?;
+		if pending_events != 0
+			|| !self.list_channels().is_empty()
+			|| !balances.lightning_balances.is_empty()
+			|| !balances.pending_balances_from_channel_closures.is_empty()
+			|| balances.total_anchor_channels_reserve_sats != 0
+		{
+			return Err(NodeError::WalletOperationFailed);
+		}
+		self.wallet.prepare_move_home(address, fee_rate)
+	}
+
+	/// Replay only a durably saved, owner-approved sweep. Queueing is NOT acceptance.
+	pub fn replay_move_home(
+		&self,
+		tx: &bitcoin::Transaction,
+		address: &bitcoin::Address,
+		fee_sats: u64,
+	) -> Result<(), NodeError> {
+		if !self.status().is_running {
+			return Err(NodeError::NotRunning);
+		}
+		self.wallet.replay_move_home(tx, address, fee_sats)
+	}
+
+	/// Wallet's current chain view; zero includes unknown and locally queued transactions.
+	pub fn move_home_confirmations(&self, txid: bitcoin::Txid) -> u32 {
+		self.wallet.move_home_confirmations(txid)
+	}
+
 	/// Shared gate for owner on-chain operations and asynchronous close fee bumps.
 	/// Callers retain it through funding/chain verification. LDK funding events must
 	/// not acquire it again: they complete the operation already holding the gate.
@@ -241,9 +295,16 @@ impl Node {
 	/// Reconcile a successful lookup against the configured chain source.
 	/// Hold onchain_operation_lock across lookup and reconciliation. A lookup
 	/// error must never be represented as `visible = false`.
-	pub fn reconcile_local_spend(&self, txid: bitcoin::Txid, visible: bool) -> Result<(), NodeError> {
-		if visible { self.wallet.transaction_verified(txid) }
-		else { self.wallet.reconcile_absent_spend(txid, wallet::reservation_time()).map(|_| ()) }
+	pub fn reconcile_local_spend(
+		&self,
+		txid: bitcoin::Txid,
+		visible: bool,
+	) -> Result<(), NodeError> {
+		if visible {
+			self.wallet.transaction_verified(txid)
+		} else {
+			self.wallet.reconcile_absent_spend(txid, wallet::reservation_time()).map(|_| ())
+		}
 	}
 
 	/// Explicit owner-only abandonment. Hold onchain_operation_lock, verify
@@ -263,6 +324,9 @@ impl Node {
 	/// After this returns, the [`Node`] instance can be controlled via the provided API methods in
 	/// a thread-safe manner.
 	pub fn start(&self) -> Result<(), Error> {
+		if self.config.cooperative_close_only {
+			self.channel_manager.require_cooperative_close_consent();
+		}
 		// Acquire a run lock and hold it until we're setup.
 		let mut is_running_lock = self.is_running.write().unwrap();
 		if *is_running_lock {
@@ -397,7 +461,7 @@ impl Node {
 						Ok(listener) => {
 							log_trace!(logger, "Listener bound to {}", addr);
 							listeners.push(listener);
-						},
+						}
 						Err(e) => {
 							log_error!(
 								logger,
@@ -406,7 +470,7 @@ impl Node {
 								e
 							);
 							return Err(Error::InvalidSocketAddress);
-						},
+						}
 					}
 				}
 
@@ -565,12 +629,18 @@ impl Node {
 			});
 		}
 
-        let stop_tx_bcast = self.stop_sender.subscribe();
-        let chain_source = Arc::clone(&self.chain_source);
-        let broadcast_manager = Arc::clone(&self.channel_manager);
-        let broadcast_monitor = Arc::clone(&self.chain_monitor);
+		let stop_tx_bcast = self.stop_sender.subscribe();
+		let chain_source = Arc::clone(&self.chain_source);
+		let broadcast_manager = Arc::clone(&self.channel_manager);
+		let broadcast_monitor = Arc::clone(&self.chain_monitor);
 		self.runtime.spawn_cancellable_background_task(async move {
-			chain_source.continuously_process_broadcast_queue(stop_tx_bcast, broadcast_manager, broadcast_monitor).await
+			chain_source
+				.continuously_process_broadcast_queue(
+					stop_tx_bcast,
+					broadcast_manager,
+					broadcast_monitor,
+				)
+				.await
 		});
 
 		let bump_tx_event_handler = Arc::new(BumpTransactionEventHandler::new(
@@ -1071,7 +1141,10 @@ impl Node {
 	///
 	/// If `persist` is set to `true`, we'll remember the peer and reconnect to it on restart.
 	pub fn connect(
-		&self, node_id: PublicKey, address: SocketAddress, persist: bool,
+		&self,
+		node_id: PublicKey,
+		address: SocketAddress,
+		persist: bool,
 	) -> Result<(), Error> {
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
@@ -1110,10 +1183,10 @@ impl Node {
 		log_info!(self.logger, "Disconnecting peer {}..", counterparty_node_id);
 
 		match self.peer_store.remove_peer(&counterparty_node_id) {
-			Ok(()) => {},
+			Ok(()) => {}
 			Err(e) => {
 				log_error!(self.logger, "Failed to remove peer {}: {}", counterparty_node_id, e)
-			},
+			}
 		}
 
 		self.peer_manager.disconnect_by_node_id(counterparty_node_id);
@@ -1122,8 +1195,12 @@ impl Node {
 
 	#[allow(clippy::too_many_arguments)]
 	fn open_channel_inner(
-		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
-		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+		&self,
+		node_id: PublicKey,
+		address: SocketAddress,
+		channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>,
+		channel_config: Option<ChannelConfig>,
 		announce_for_forwarding: bool,
 		funding_policy: Option<funding::FundingPolicy>,
 	) -> Result<UserChannelId, Error> {
@@ -1183,11 +1260,11 @@ impl Node {
 				);
 				self.peer_store.add_peer(peer_info)?;
 				Ok(UserChannelId(user_channel_id))
-			},
+			}
 			Err(e) => {
 				log_error!(self.logger, "Failed to initiate channel creation: {:?}", e);
 				Err(Error::ChannelCreationFailed)
-			},
+			}
 		}
 	}
 
@@ -1199,26 +1276,39 @@ impl Node {
 	}
 
 	/// Read the current funding estimate. Missing/stale estimates are refused.
-	pub fn funding_fee_quote(&self, priority: funding::FundingPriority, max_fee_sats: Option<u64>) -> Result<funding::FundingPolicy, Error> {
+	pub fn funding_fee_quote(
+		&self,
+		priority: funding::FundingPriority,
+		max_fee_sats: Option<u64>,
+	) -> Result<funding::FundingPolicy, Error> {
 		let rate = self.fee_estimator.funding_rate(priority.target())?;
 		funding::FundingPolicy::new(priority, rate, max_fee_sats)
 	}
 
-    /// Construction failure for a policy-bearing channel; no funding tx was dispatched.
-    pub fn channel_funding_failure(&self, id: UserChannelId) -> Result<Option<String>, Error> {
-        funding::failure(self.kv_store.as_ref(), id.0)
-    }
+	/// Construction failure for a policy-bearing channel; no funding tx was dispatched.
+	pub fn channel_funding_failure(&self, id: UserChannelId) -> Result<Option<String>, Error> {
+		funding::failure(self.kv_store.as_ref(), id.0)
+	}
 
 	/// Open using an estimator-selected policy, durably pinned before negotiation.
-	pub fn open_channel_with_funding_policy(&self, node_id: PublicKey, address: SocketAddress,
-		amount_sats: u64, announce: bool, policy: funding::FundingPolicy,
+	pub fn open_channel_with_funding_policy(
+		&self,
+		node_id: PublicKey,
+		address: SocketAddress,
+		amount_sats: u64,
+		announce: bool,
+		policy: funding::FundingPolicy,
 	) -> Result<UserChannelId, Error> {
-		if announce { may_announce_channel(&self.config).map_err(|_| Error::ChannelCreationFailed)?; }
+		if announce {
+			may_announce_channel(&self.config).map_err(|_| Error::ChannelCreationFailed)?;
+		}
 		self.open_channel_inner(node_id, address, amount_sats, None, None, announce, Some(policy))
 	}
 
 	fn check_sufficient_funds_for_channel(
-		&self, amount_sats: u64, peer_node_id: &PublicKey,
+		&self,
+		amount_sats: u64,
+		peer_node_id: &PublicKey,
 	) -> Result<(), Error> {
 		let cur_anchor_reserve_sats =
 			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
@@ -1280,8 +1370,12 @@ impl Node {
 	///
 	/// [`AnchorChannelsConfig::per_channel_reserve_sats`]: crate::config::AnchorChannelsConfig::per_channel_reserve_sats
 	pub fn open_channel(
-		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
-		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+		&self,
+		node_id: PublicKey,
+		address: SocketAddress,
+		channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>,
+		channel_config: Option<ChannelConfig>,
 	) -> Result<UserChannelId, Error> {
 		self.open_channel_inner(
 			node_id,
@@ -1316,8 +1410,12 @@ impl Node {
 	///
 	/// [`AnchorChannelsConfig::per_channel_reserve_sats`]: crate::config::AnchorChannelsConfig::per_channel_reserve_sats
 	pub fn open_announced_channel(
-		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
-		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+		&self,
+		node_id: PublicKey,
+		address: SocketAddress,
+		channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>,
+		channel_config: Option<ChannelConfig>,
 	) -> Result<UserChannelId, Error> {
 		if let Err(err) = may_announce_channel(&self.config) {
 			log_error!(self.logger, "Failed to open announced channel as the node hasn't been sufficiently configured to act as a forwarding node: {}", err);
@@ -1346,7 +1444,9 @@ impl Node {
 	/// This API is experimental. Currently, a splice-in will be marked as an outbound payment, but
 	/// this classification may change in the future.
 	pub fn splice_in(
-		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		&self,
+		user_channel_id: &UserChannelId,
+		counterparty_node_id: PublicKey,
 		splice_amount_sats: u64,
 	) -> Result<(), Error> {
 		let open_channels =
@@ -1410,7 +1510,7 @@ impl Node {
 				Err(_) => {
 					debug_assert!(false);
 					fee_estimator::get_fallback_rate_for_target(ConfirmationTarget::ChannelFunding)
-				},
+				}
 			};
 
 			self.channel_manager
@@ -1461,7 +1561,10 @@ impl Node {
 	/// paid to an address associated with the on-chain wallet, but this classification may change
 	/// in the future.
 	pub fn splice_out(
-		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, address: &Address,
+		&self,
+		user_channel_id: &UserChannelId,
+		counterparty_node_id: PublicKey,
+		address: &Address,
 		splice_amount_sats: u64,
 	) -> Result<(), Error> {
 		let open_channels =
@@ -1489,7 +1592,7 @@ impl Node {
 					debug_assert!(false, "FeeRate should always fit within u32");
 					log_error!(self.logger, "FeeRate should always fit within u32");
 					fee_estimator::get_fallback_rate_for_target(ConfirmationTarget::ChannelFunding)
-				},
+				}
 			};
 
 			self.channel_manager
@@ -1563,9 +1666,11 @@ impl Node {
 	/// Will attempt to close a channel coopertively. If this fails, users might need to resort to
 	/// [`Node::force_close_channel`].
 	pub fn close_channel(
-		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		&self,
+		user_channel_id: &UserChannelId,
+		counterparty_node_id: PublicKey,
 	) -> Result<(), Error> {
-		self.close_channel_internal(user_channel_id, counterparty_node_id, false, None)
+		self.close_channel_internal(user_channel_id, counterparty_node_id, false, None, false)
 	}
 
 	/// Force-close a previously opened channel.
@@ -1582,15 +1687,43 @@ impl Node {
 	///
 	/// [`AnchorChannelsConfig::trusted_peers_no_reserve`]: crate::config::AnchorChannelsConfig::trusted_peers_no_reserve
 	pub fn force_close_channel(
-		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		&self,
+		user_channel_id: &UserChannelId,
+		counterparty_node_id: PublicKey,
 		reason: Option<String>,
 	) -> Result<(), Error> {
-		self.close_channel_internal(user_channel_id, counterparty_node_id, true, reason)
+		self.close_channel_internal(user_channel_id, counterparty_node_id, true, reason, false)
+	}
+
+	/// Channels already shutting down in the current live channel manager.
+	pub fn move_home_closing_channels(&self) -> Vec<UserChannelId> {
+		self.channel_manager.list_channels().iter().filter_map(|channel| {
+			channel.channel_shutdown_state
+				.filter(|state| *state != ChannelShutdownState::NotShuttingDown)
+				.map(|_| UserChannelId(channel.user_channel_id))
+		}).collect()
+	}
+
+	/// Retain addresses so interrupted migration negotiation can reconnect.
+	pub fn close_channel_for_move_home(
+		&self,
+		id: &UserChannelId,
+		peer: PublicKey,
+		force: bool,
+	) -> Result<(), Error> {
+		if !self.config.cooperative_close_only {
+			return Err(Error::ChannelClosingFailed);
+		}
+		self.close_channel_internal(id, peer, force, None, true)
 	}
 
 	fn close_channel_internal(
-		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, force: bool,
+		&self,
+		user_channel_id: &UserChannelId,
+		counterparty_node_id: PublicKey,
+		force: bool,
 		force_close_reason: Option<String>,
+		retain_peer: bool,
 	) -> Result<(), Error> {
 		debug_assert!(
 			force_close_reason.is_none() || force,
@@ -1622,7 +1755,7 @@ impl Node {
 			}
 
 			// Check if this was the last open channel, if so, forget the peer.
-			if open_channels.len() == 1 {
+			if open_channels.len() == 1 && !retain_peer {
 				self.peer_store.remove_peer(&counterparty_node_id)?;
 			}
 		}
@@ -1632,7 +1765,9 @@ impl Node {
 
 	/// Update the config for a previously opened channel.
 	pub fn update_channel_config(
-		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		&self,
+		user_channel_id: &UserChannelId,
+		counterparty_node_id: PublicKey,
 		channel_config: ChannelConfig,
 	) -> Result<(), Error> {
 		let open_channels: Vec<LdkChannelDetails> =
@@ -1664,28 +1799,39 @@ impl Node {
 		self.payment_store.remove(&payment_id)
 	}
 
-    /// Configure indexed funding verification for a non-Esplora source.
-    /// Return `Ok(false)` ONLY for proven absence under the configured source's
-    /// indexing/sync rules. Errors are inconclusive and never suppress a spend.
-    pub fn set_funding_verifier<F, Fut>(&self, verify: F)
-    where F: Fn(bitcoin::Txid) -> Fut + Send + Sync + 'static,
-          Fut: std::future::Future<Output = Result<bool, Error>> + Send + 'static {
-        self.chain_source.set_funding_verifier(verify);
-    }
+	/// Configure indexed funding verification for a non-Esplora source.
+	/// Return `Ok(false)` ONLY for proven absence under the configured source's
+	/// indexing/sync rules. Errors are inconclusive and never suppress a spend.
+	pub fn set_funding_verifier<F, Fut>(&self, verify: F)
+	where
+		F: Fn(bitcoin::Txid) -> Fut + Send + Sync + 'static,
+		Fut: std::future::Future<Output = Result<bool, Error>> + Send + 'static,
+	{
+		self.chain_source.set_funding_verifier(verify);
+	}
 
-    /// Verify funding with the configured source and its shared HTTP cooldown.
-    /// No source evidence is inferred from a local monitor or a failed lookup.
-    pub async fn funding_present(&self, txid: bitcoin::Txid) -> Result<bool, Error> {
-        tokio::time::timeout(std::time::Duration::from_secs(10), self.chain_source.funding_present(txid))
-            .await.map_err(|_| Error::TxSyncTimeout)?
-    }
+	/// Verify funding with the configured source and its shared HTTP cooldown.
+	/// No source evidence is inferred from a local monitor or a failed lookup.
+	pub async fn funding_present(&self, txid: bitcoin::Txid) -> Result<bool, Error> {
+		tokio::time::timeout(
+			std::time::Duration::from_secs(10),
+			self.chain_source.funding_present(txid),
+		)
+		.await
+		.map_err(|_| Error::TxSyncTimeout)?
+	}
 
 	/// Returns a monitored channel's funding outpoint, including after force-close.
 	///
 	/// A monitor is not evidence that funding was broadcast or confirmed. Callers
 	/// must verify funding against their chain source before valuing a removed channel.
-	pub fn channel_funding_outpoint(&self, channel_id: lightning::ln::types::ChannelId) -> Option<bitcoin::OutPoint> {
-		self.chain_monitor.get_monitor(channel_id).ok()
+	pub fn channel_funding_outpoint(
+		&self,
+		channel_id: lightning::ln::types::ChannelId,
+	) -> Option<bitcoin::OutPoint> {
+		self.chain_monitor
+			.get_monitor(channel_id)
+			.ok()
 			.map(|monitor| monitor.get_funding_txo().into_bitcoin_outpoint())
 	}
 
@@ -1713,10 +1859,10 @@ impl Node {
 							ldk_balance,
 						));
 					}
-				},
+				}
 				Err(()) => {
 					continue;
-				},
+				}
 			}
 		}
 
@@ -1737,6 +1883,33 @@ impl Node {
 		}
 	}
 
+	/// Readiness ordered across monitor -> event -> sweeper -> wallet handoffs.
+	/// Regular list_balances is a display API and can hide wallet errors as zero.
+	pub fn move_home_balances(&self) -> Result<(BalanceDetails, usize), Error> {
+		let mut balances = self.list_balances();
+		let mut pending_monitor_events = 0;
+		for id in self.chain_monitor.list_monitors() {
+			let monitor =
+				self.chain_monitor.get_monitor(id).map_err(|_| Error::WalletOperationFailed)?;
+			// Re-observe claims before events, then inspect their consumer below.
+			if !monitor.get_claimable_balances().is_empty() || monitor.has_pending_events() {
+				pending_monitor_events += 1;
+			}
+		}
+		balances.pending_balances_from_channel_closures = self
+			.output_sweeper
+			.tracked_spendable_outputs()
+			.into_iter()
+			.map(PendingSweepBalance::from_tracked_spendable_output)
+			.collect();
+		let reserve = total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let (total, spendable) = self.wallet.get_balances(reserve)?;
+		balances.total_onchain_balance_sats = total;
+		balances.spendable_onchain_balance_sats = spendable;
+		balances.total_anchor_channels_reserve_sats = reserve;
+		Ok((balances, pending_monitor_events))
+	}
+
 	/// Retrieves all payments that match the given predicate.
 	///
 	/// For example, you could retrieve all stored outbound payments as follows:
@@ -1753,7 +1926,8 @@ impl Node {
 	/// node.list_payments_with_filter(|p| p.direction == PaymentDirection::Outbound);
 	/// ```
 	pub fn list_payments_with_filter<F: FnMut(&&PaymentDetails) -> bool>(
-		&self, f: F,
+		&self,
+		f: F,
 	) -> Vec<PaymentDetails> {
 		self.payment_store.list_filter(f)
 	}
@@ -1938,7 +2112,8 @@ impl_writeable_tlv_based!(NodeMetrics, {
 });
 
 pub(crate) fn total_anchor_channels_reserve_sats(
-	channel_manager: &ChannelManager, config: &Config,
+	channel_manager: &ChannelManager,
+	config: &Config,
 ) -> u64 {
 	config.anchor_channels_config.as_ref().map_or(0, |anchor_channels_config| {
 		channel_manager

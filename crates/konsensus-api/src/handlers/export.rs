@@ -2,11 +2,13 @@
 //!
 //! Assembles the node owner's complete *encrypted* recovery set into a single
 //! authenticated response so they can migrate to self-hosting (or another
-//! operator) with identity, funds, and relationships intact:
+//! operator) with identity and relationships intact. Funds move separately,
+//! with `konsensus move-home` on the healthy source node:
 //!
 //! - **SCB** (`scb-latest.aes`) — LDK channel-monitor state, encrypted with a
 //!   seed-derived key by the rotation producer
-//!   ([`konsensus_lightning::scb_rotate`]). Recovers **funds**. Served as-is.
+//!   ([`konsensus_lightning::scb_rotate`]). Kept for a future compatible
+//!   recovery procedure; restoring it is disabled (issue #157). Served as-is.
 //! - **Whitelist sidecar** — `peers` + `accepted_invites`, freshly sealed at
 //!   request time with the identity AES key
 //!   ([`konsensus_storage::WhitelistBackup`]). Recovers **relationships**.
@@ -172,7 +174,9 @@ async fn build_exit_bundle(
         scb_age_seconds,
         manifest: ExitManifest {
             contains: vec![
-                "LDK channel-monitor state (encrypted) — recovers your funds".into(),
+                "LDK channel backup (encrypted) — kept for a future recovery procedure; \
+                 restoring it is disabled (issue #157)"
+                    .into(),
                 "peer whitelist + accepted invites (encrypted) — who you federate with".into(),
             ],
             does_not_contain: vec![
@@ -181,17 +185,20 @@ async fn build_exit_bundle(
                 "pending/outgoing invites you have not had accepted yet".into(),
             ],
             restore_steps: vec![
+                "Move funds BEFORE leaving the old machine: while it is still healthy, run \
+                 `konsensus move-home --destination <address on the new node>` on its local \
+                 console. It closes channels cooperatively and sends the funds home. See \
+                 docs/operations/move-home.md."
+                    .into(),
                 "On the new machine, install BitSov and run `konsensus init` with YOUR existing \
                  mnemonic (the same seed — that is what re-binds this identity)."
                     .into(),
-                "Base64-decode `scb_latest_b64` into `scb-latest.aes` and `whitelist_backup_b64` \
-                 into `whitelist-latest.aes`."
+                "Base64-decode `whitelist_backup_b64` into `whitelist-latest.aes` and re-admit \
+                 your peers: `konsensus whitelist restore --from whitelist-latest.aes`."
                     .into(),
-                "Preview recoverable channels: `konsensus scb restore --from scb-latest.aes` \
-                 (run from your node directory or pass `--config <konsensus.toml>`). Then, to \
-                 actually reclaim funds on-chain via force-close, re-run with `--confirm`."
-                    .into(),
-                "Re-admit your peers: `konsensus whitelist restore --from whitelist-latest.aes`."
+                "Do NOT restore channels from `scb_latest_b64`: SCB restore is disabled because \
+                 starting stale channel state can lose the whole channel. Keep the file with your \
+                 seed for a future compatible recovery procedure (docs/v2/RECOVERY.md)."
                     .into(),
                 "Both files decrypt only with keys derived from your mnemonic — without it the \
                  bundle is inert ciphertext."
