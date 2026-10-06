@@ -34,12 +34,13 @@
 //! One commit, marker last, single-flight — see [`commit_first_run`].
 
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -51,6 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, Scope};
 use crate::pairing::{self, PairingError, PairingService};
+use crate::rate_limit::RemoteTunnelClients;
 
 /// The marker file whose presence is the **sole** authority signal for "this
 /// data directory has been initialized".
@@ -368,6 +370,8 @@ pub struct CommitOutcome {
     pub identity_fingerprint: String,
     /// Path the mnemonic was written to.
     pub mnemonic_path: PathBuf,
+    /// Box transport key and its identity proof, written to `identity.json`.
+    pub box_transport: Option<(String, String)>,
 }
 
 /// Hook after rebind and before `NODE_INITIALIZED` (clippy::type_complexity).
@@ -391,6 +395,23 @@ pub struct LocalOwnerHooks {
     pub enroll_device: bool,
 }
 
+/// Builds one ceremony's hooks from the password received in `finalize`.
+/// The hooks own the only copy, which zeroizes when finalize returns.
+pub type RemoteOwnerHooksFactory =
+    dyn Fn(Zeroizing<String>) -> Result<LocalOwnerHooks, CommitError> + Send + Sync;
+
+/// Remote first run (P2): no startup password exists. `create-pending`
+/// accepts a `password_commitment` and `finalize` the password itself, both
+/// **only** from a peer registered by the box-static Noise tunnel. The same
+/// requests on the loopback listener are refused. Device enrollment is
+/// mandatory: a box restarted into locked mode is unlocked by that device.
+pub struct RemoteOwner {
+    /// Hook factory supplied by the node crate.
+    pub hooks: Box<RemoteOwnerHooksFactory>,
+    /// Server-owned tunnel registrations, never HTTP headers.
+    pub tunnel: Arc<RemoteTunnelClients>,
+}
+
 // No Debug/Clone: the only retained phrase buffer zeroizes on drop, including
 // cancellation, expiry, failed backup, shutdown and commit errors.
 #[derive(zeroize::ZeroizeOnDrop)]
@@ -404,6 +425,8 @@ struct PendingIdentity {
     created_at: tokio::time::Instant,
     backup_check: [usize; 3],
     failed_backup_attempts: u8,
+    /// `blake3(password)` from a remote create-pending; `None` locally.
+    password_commitment: Option<[u8; 32]>,
 }
 
 impl PendingIdentity {
@@ -439,7 +462,15 @@ pub struct DeviceEnrollment {
     pub proof: String,
 }
 
-/// No password is accepted over HTTP.
+/// Remote create-pending: commits to the password finalize must carry.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteCreatePendingBody {
+    /// Lowercase hex `blake3(password)`.
+    pub password_commitment: String,
+}
+
+/// No password is accepted on the loopback path; see [`RemoteOwner`].
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalizeBody {
@@ -464,6 +495,13 @@ pub struct FinalizeResponse {
     pub device_fingerprint: Option<String>,
     /// Committed encrypted seed path.
     pub mnemonic_path: String,
+    /// Box transport public key (hex) and the committed identity's proof
+    /// over it, so a client can pin the box under `node_id` before restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub box_transport_pubkey: Option<String>,
+    /// Base64url-no-pad Ed25519 signature over `box_transport_proof_message`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub box_transport_signature: Option<String>,
 }
 
 /// Errors from the transition.
@@ -573,14 +611,27 @@ fn commit_first_run_local(
         pairing::write_protected(&staging.join("mnemonic.txt"), mnemonic.as_bytes())?;
         "mnemonic.txt"
     };
+    // The same signed public document a live start writes, so a box restarted
+    // straight into locked mode can verify its box key against this identity.
+    let mut metadata = pairing
+        .map(|service| {
+            crate::remote_access::public_identity_proofs(&identity, &service.box_transport_pubkey())
+        })
+        .unwrap_or_default();
+    let box_transport = metadata
+        .get("box_transport_pubkey")
+        .and_then(|v| v.as_str())
+        .zip(
+            metadata
+                .get("box_transport_signature")
+                .and_then(|v| v.as_str()),
+        )
+        .map(|(key, signature)| (key.to_owned(), signature.to_owned()));
+    metadata.insert("identity_fingerprint".into(), fingerprint.clone().into());
+    metadata.insert("committed_at".into(), chrono::Utc::now().timestamp().into());
     pairing::write_protected(
         &staging.join("identity.json"),
-        serde_json::json!({
-            "identity_fingerprint": fingerprint,
-            "committed_at": chrono::Utc::now().timestamp(),
-        })
-        .to_string()
-        .as_bytes(),
+        serde_json::Value::Object(metadata).to_string().as_bytes(),
     )?;
     pairing::fsync_dir(&staging)?;
 
@@ -622,6 +673,7 @@ fn commit_first_run_local(
         node_id,
         identity_fingerprint: fingerprint.clone(),
         mnemonic_path: target.join(mnemonic_name),
+        box_transport,
     };
 
     // Align any operator config with the committed mnemonic *before* the
@@ -674,6 +726,7 @@ pub struct BootstrapState {
     /// (e.g. aligning the operator's config file with the committed mnemonic).
     before_marker: Option<BeforeMarkerHookOwned>,
     local: Option<LocalOwnerHooks>,
+    remote: Option<RemoteOwner>,
     pending: Mutex<Option<PendingIdentity>>,
 }
 
@@ -693,6 +746,7 @@ impl BootstrapState {
             started_at: Instant::now(),
             before_marker: None,
             local: None,
+            remote: None,
             pending: Mutex::new(None),
         }
     }
@@ -709,7 +763,34 @@ impl BootstrapState {
     /// Enable encrypted two-phase bootstrap with node-supplied hooks.
     pub fn with_local_owner(mut self, hooks: LocalOwnerHooks) -> Self {
         self.local = Some(hooks);
+        self.remote = None;
         self
+    }
+
+    /// Enable the tunnel-only remote first run. Replaces any startup hooks:
+    /// a remote ceremony never uses a password the process started with.
+    pub fn with_remote_owner(mut self, remote: RemoteOwner) -> Self {
+        self.remote = Some(remote);
+        self.local = None;
+        self
+    }
+
+    /// Is `peer` the server-registered tunnel of `client_id`? Loopback and
+    /// unregistered connections to the internal listener never are.
+    fn tunnel_peer_is(
+        &self,
+        peer: Option<ConnectInfo<SocketAddr>>,
+        client_id: &str,
+    ) -> Result<(), BootstrapError> {
+        let tunnel = self
+            .remote
+            .as_ref()
+            .zip(peer)
+            .and_then(|(remote, peer)| remote.tunnel.client_id(peer.0));
+        if tunnel.as_deref() != Some(client_id) {
+            return Err(ceremony_error(StatusCode::BAD_REQUEST, "tunnel_required"));
+        }
+        Ok(())
     }
 
     fn ensure_open(&self) -> Result<(), CommitError> {
@@ -726,6 +807,7 @@ impl BootstrapState {
         mnemonic: &str,
         fault: CommitFault,
         device: Option<pairing::device::DeviceKey>,
+        hooks: Option<&LocalOwnerHooks>,
     ) -> Result<CommitOutcome, CommitError> {
         let outcome = commit_first_run_local(
             &self.layout,
@@ -735,7 +817,7 @@ impl BootstrapState {
             self.before_marker
                 .as_ref()
                 .map(|h| h.as_ref() as &BeforeMarkerHook<'_>),
-            self.local.as_ref(),
+            hooks,
             device,
         )?;
         *self.outcome.lock().unwrap() = Some(outcome.clone());
@@ -751,15 +833,39 @@ impl BootstrapState {
         body: FinalizeBody,
         fault: CommitFault,
     ) -> Result<FinalizeResponse, (StatusCode, String)> {
+        self.finalize_with(client_id, body, None, fault)
+    }
+
+    /// Remote first-run finalize. The caller has already verified that the
+    /// request arrived through `client_id`'s tunnel; the password must match
+    /// the create-pending commitment and is dropped when this returns.
+    pub fn finalize_remote(
+        &self,
+        client_id: &str,
+        body: FinalizeBody,
+        password: Zeroizing<String>,
+        fault: CommitFault,
+    ) -> Result<FinalizeResponse, (StatusCode, String)> {
+        self.finalize_with(client_id, body, Some(password), fault)
+    }
+
+    fn finalize_with(
+        &self,
+        client_id: &str,
+        body: FinalizeBody,
+        password: Option<Zeroizing<String>>,
+        fault: CommitFault,
+    ) -> Result<FinalizeResponse, (StatusCode, String)> {
         let _guard = self
             .transition
             .try_lock()
             .map_err(|_| ceremony_error(StatusCode::CONFLICT, "ceremony_in_progress"))?;
         self.ensure_open().map_err(commit_error_response)?;
-        let hooks = self
-            .local
-            .as_ref()
-            .ok_or_else(|| ceremony_error(StatusCode::CONFLICT, "password_unavailable"))?;
+        let remote = match (&self.remote, &password, &self.local) {
+            (Some(_), Some(_), _) => true,
+            (None, None, Some(_)) => false,
+            _ => return Err(ceremony_error(StatusCode::CONFLICT, "password_unavailable")),
+        };
         let mut slot = self.pending.lock().unwrap();
         let pending = slot
             .as_mut()
@@ -777,7 +883,35 @@ impl BootstrapState {
         if pending.ceremony_id != body.ceremony_id {
             return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
         }
-        if hooks.enroll_device != body.device.is_some() {
+        let remote_hooks = match (password, &self.remote) {
+            (Some(password), Some(owner)) => {
+                let commitment = pending.password_commitment.ok_or_else(|| {
+                    ceremony_error(StatusCode::BAD_REQUEST, "password_commitment_missing")
+                })?;
+                if password.is_empty() {
+                    return Err(ceremony_error(StatusCode::BAD_REQUEST, "password_required"));
+                }
+                // blake3::Hash equality is constant-time.
+                if blake3::hash(password.as_bytes()) != blake3::Hash::from(commitment) {
+                    pending.failed_backup_attempts += 1;
+                    if pending.failed_backup_attempts >= 3 {
+                        *slot = None;
+                        return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
+                    }
+                    return Err(ceremony_error(
+                        StatusCode::BAD_REQUEST,
+                        "password_commitment_mismatch",
+                    ));
+                }
+                Some((owner.hooks)(password).map_err(commit_error_response)?)
+            }
+            _ => None,
+        };
+        let hooks = match remote_hooks.as_ref().or(self.local.as_ref()) {
+            Some(hooks) => hooks,
+            None => return Err(ceremony_error(StatusCode::CONFLICT, "password_unavailable")),
+        };
+        if (hooks.enroll_device || remote) != body.device.is_some() {
             return Err(ceremony_error(
                 StatusCode::BAD_REQUEST,
                 "device_requirement_mismatch",
@@ -817,6 +951,9 @@ impl BootstrapState {
                         pairing_error_response(e)
                     }
                 })?;
+            if remote {
+                record.enrolled_by = "remote_first_run".into();
+            }
             let message = pairing::device::owner_approval_message(
                 &pending.fingerprint,
                 &record.client_pubkey,
@@ -836,8 +973,9 @@ impl BootstrapState {
         let pending = slot.take().unwrap();
         drop(slot);
         let outcome = self
-            .commit_locked(&pending.mnemonic, fault, device)
+            .commit_locked(&pending.mnemonic, fault, device, Some(hooks))
             .map_err(commit_error_response)?;
+        let (box_transport_pubkey, box_transport_signature) = outcome.box_transport.unzip();
         Ok(FinalizeResponse {
             node_id: outcome.node_id,
             restart_required: true,
@@ -846,6 +984,8 @@ impl BootstrapState {
                 .map(pairing::device::key_fingerprint),
             device_key_id,
             mnemonic_path: outcome.mnemonic_path.display().to_string(),
+            box_transport_pubkey,
+            box_transport_signature,
         })
     }
 
@@ -872,6 +1012,11 @@ impl BootstrapState {
             .transition
             .try_lock()
             .map_err(|_| CommitError::Conflict)?;
+        // Without a startup password a legacy commit would write a plaintext
+        // seed that `--remote-unlock` then refuses to start.
+        if self.remote.is_some() {
+            return Err(CommitError::Conflict);
+        }
         self.ensure_open()?;
         let mut pending = self.pending.lock().unwrap();
         if pending.as_ref().is_some_and(PendingIdentity::expired) {
@@ -880,7 +1025,7 @@ impl BootstrapState {
         if pending.is_some() {
             return Err(CommitError::Conflict);
         }
-        self.commit_locked(mnemonic, fault, None)
+        self.commit_locked(mnemonic, fault, None, self.local.as_ref())
     }
 }
 
@@ -962,6 +1107,9 @@ pub struct LocalOwnerState {
     pub enroll_device: bool,
     /// A phrase is held in memory awaiting backup proof.
     pub pending: bool,
+    /// Remote first run: the password arrives in finalize, tunnel only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tunnel_password: bool,
 }
 
 async fn bootstrap_state(
@@ -986,14 +1134,17 @@ async fn bootstrap_state(
     if pending.as_ref().is_some_and(PendingIdentity::expired) {
         *pending = None;
     }
+    let remote = state.remote.is_some();
     Ok(Json(BootstrapStateResponse {
         state: status,
-        can_restore: open,
+        // Remote first run has no restore route: only the ceremony creates.
+        can_restore: open && !remote,
         can_create: open,
         local_owner: LocalOwnerState {
-            available: state.local.is_some(),
-            enroll_device: state.local.as_ref().is_some_and(|l| l.enroll_device),
+            available: state.local.is_some() || remote,
+            enroll_device: remote || state.local.as_ref().is_some_and(|l| l.enroll_device),
             pending: pending.is_some(),
+            tunnel_password: remote,
         },
     }))
 }
@@ -1238,13 +1389,41 @@ async fn create_pending(
     auth: BootstrapAuth,
     State(state): State<Arc<BootstrapState>>,
 ) -> Result<Json<CreatePendingResponse>, BootstrapError> {
+    begin_pending(&state, auth.client_id, None).map(Json)
+}
+
+/// Remote first run: tunnel only, and the password is committed to up front.
+async fn create_pending_remote(
+    auth: BootstrapAuth,
+    State(state): State<Arc<BootstrapState>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    Json(body): Json<RemoteCreatePendingBody>,
+) -> Result<Json<CreatePendingResponse>, BootstrapError> {
+    state.tunnel_peer_is(peer, &auth.client_id)?;
+    let commitment = (body.password_commitment.len() == 64
+        && body.password_commitment == body.password_commitment.to_ascii_lowercase())
+    .then(|| blake3::Hash::from_hex(&body.password_commitment).ok())
+    .flatten()
+    .ok_or_else(|| ceremony_error(StatusCode::BAD_REQUEST, "invalid_password_commitment"))?;
+    begin_pending(&state, auth.client_id, Some(*commitment.as_bytes())).map(Json)
+}
+
+fn begin_pending(
+    state: &BootstrapState,
+    client_id: String,
+    password_commitment: Option<[u8; 32]>,
+) -> Result<CreatePendingResponse, BootstrapError> {
     use rand::seq::SliceRandom;
     let _guard = state
         .transition
         .try_lock()
         .map_err(|_| ceremony_error(StatusCode::CONFLICT, "ceremony_in_progress"))?;
     state.ensure_open().map_err(commit_error_response)?;
-    if state.local.is_none() {
+    let available = match password_commitment {
+        Some(_) => state.remote.is_some(),
+        None => state.local.is_some(),
+    };
+    if !available {
         return Err(ceremony_error(StatusCode::CONFLICT, "password_unavailable"));
     }
     let mut slot = state.pending.lock().unwrap();
@@ -1271,18 +1450,19 @@ async fn create_pending(
         mnemonic: mnemonic.clone(),
         node_id: node_id.clone(),
         fingerprint: pairing::identity_fingerprint(&node_id),
-        client_id: auth.client_id,
+        client_id,
         created_at: tokio::time::Instant::now(),
         backup_check,
         failed_backup_attempts: 0,
+        password_commitment,
     });
-    Ok(Json(CreatePendingResponse {
+    Ok(CreatePendingResponse {
         ceremony_id,
         node_id,
         mnemonic,
         expires_at: chrono::Utc::now().timestamp() + 1800,
         backup_check,
-    }))
+    })
 }
 
 async fn finalize(
@@ -1292,6 +1472,42 @@ async fn finalize(
 ) -> Result<Json<FinalizeResponse>, BootstrapError> {
     state
         .finalize(&auth.client_id, body, CommitFault::None)
+        .map(Json)
+}
+
+/// [`FinalizeBody`] plus the password, which is decoded straight into
+/// zeroizing memory rather than through serde_json's string scratch.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteFinalizeBody<'a> {
+    ceremony_id: String,
+    backup_words: [Zeroizing<String>; 3],
+    device: Option<DeviceEnrollment>,
+    #[serde(borrow)]
+    password: &'a serde_json::value::RawValue,
+}
+
+/// Remote first run: refused before the body is read unless the request
+/// arrived through the caller's own tunnel. Never `Json<_>`: the aggregate
+/// body buffer would not be wiped.
+async fn finalize_remote(
+    auth: BootstrapAuth,
+    State(state): State<Arc<BootstrapState>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    request: Request,
+) -> Result<Json<FinalizeResponse>, BootstrapError> {
+    state.tunnel_peer_is(peer, &auth.client_id)?;
+    let bad = || ceremony_error(StatusCode::BAD_REQUEST, "invalid_finalize_body");
+    let raw = crate::locked::body::read(request).await.ok_or_else(bad)?;
+    let wire: RemoteFinalizeBody<'_> = serde_json::from_slice(&raw).map_err(|_| bad())?;
+    let password = crate::locked::body::decode_password(wire.password.get()).map_err(|_| bad())?;
+    let body = FinalizeBody {
+        ceremony_id: wire.ceremony_id,
+        backup_words: wire.backup_words,
+        device: wire.device,
+    };
+    state
+        .finalize_remote(&auth.client_id, body, password, CommitFault::None)
         .map(Json)
 }
 
@@ -1338,16 +1554,35 @@ async fn cancel_pending(
 /// mounting those routes to return 403 would manufacture exactly the
 /// "looks like a funded node" surface this design avoids. An unrouted path
 /// answers 404 because the capability genuinely does not exist yet.
+///
+/// A remote first run mounts the tunnel-only ceremony and no legacy
+/// create/restore: with no startup password those would write a plaintext seed.
 pub fn build_bootstrap_router(state: Arc<BootstrapState>) -> Router {
     let mut router = Router::new();
-    if state.local.is_some() {
+    if state.remote.is_some() {
         router = router
-            .route("/api/v1/identity/create-pending", post(create_pending))
-            .route("/api/v1/identity/finalize", post(finalize))
+            .route(
+                "/api/v1/identity/create-pending",
+                post(create_pending_remote),
+            )
+            .route("/api/v1/identity/finalize", post(finalize_remote))
             .route(
                 "/api/v1/identity/pending/:ceremony_id",
                 delete(cancel_pending),
             );
+    } else {
+        if state.local.is_some() {
+            router = router
+                .route("/api/v1/identity/create-pending", post(create_pending))
+                .route("/api/v1/identity/finalize", post(finalize))
+                .route(
+                    "/api/v1/identity/pending/:ceremony_id",
+                    delete(cancel_pending),
+                );
+        }
+        router = router
+            .route("/api/v1/identity/restore", post(first_run_restore))
+            .route("/api/v1/identity/create", post(first_run_create));
     }
     router
         .route("/livez", get(livez))
@@ -1356,8 +1591,6 @@ pub fn build_bootstrap_router(state: Arc<BootstrapState>) -> Router {
         .route("/api/v1/pair/confirm", post(pair_confirm))
         .route("/api/v1/pair/challenge", get(pair_challenge))
         .route("/api/v1/pair/token", post(pair_token))
-        .route("/api/v1/identity/restore", post(first_run_restore))
-        .route("/api/v1/identity/create", post(first_run_create))
         .with_state(state)
 }
 
@@ -1369,29 +1602,53 @@ pub fn build_bootstrap_router(state: Arc<BootstrapState>) -> Router {
 pub async fn serve_bootstrap(
     addr: std::net::SocketAddr,
     state: Arc<BootstrapState>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Option<CommitOutcome>, Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "node is in identity-free BOOTSTRAP mode — only the pairing ceremony and first-run create/restore are reachable");
+    serve_bootstrap_listeners(vec![listener], state, shutdown_rx).await
+}
 
-    let app = build_bootstrap_router(Arc::clone(&state));
-    let poll_state = Arc::clone(&state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            loop {
-                if poll_state.is_committed() {
-                    // Give the terminal response time to flush before the
-                    // listener closes.
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    return;
-                }
-                tokio::select! {
-                    _ = shutdown_rx.changed() => return,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                }
-            }
-        })
-        .await?;
-
+/// [`serve_bootstrap`] on already-bound listeners, e.g. the loopback API and
+/// the internal listener a Noise tunnel bridges to. Each connection carries
+/// its peer address so tunnel registrations can be resolved.
+pub async fn serve_bootstrap_listeners(
+    listeners: Vec<tokio::net::TcpListener>,
+    state: Arc<BootstrapState>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<CommitOutcome>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut servers = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let addr = listener.local_addr()?;
+        tracing::info!(%addr, "node is in identity-free BOOTSTRAP mode — only the pairing ceremony and first-run create/restore are reachable");
+        let app = build_bootstrap_router(Arc::clone(&state))
+            .into_make_service_with_connect_info::<SocketAddr>();
+        let stop = until_terminal(Arc::clone(&state), shutdown_rx.clone());
+        servers.spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(stop)
+                .await
+        });
+    }
+    while let Some(joined) = servers.join_next().await {
+        joined??;
+    }
     Ok(state.outcome())
+}
+
+/// Resolves on shutdown, or 250 ms after the transition commits so the
+/// terminal response can flush before listeners close.
+pub async fn until_terminal(
+    state: Arc<BootstrapState>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if state.is_committed() {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            return;
+        }
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
 }

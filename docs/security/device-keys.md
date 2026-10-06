@@ -41,6 +41,8 @@ can enroll the first device with `--password-fd --local-owner-device`. After
 backup confirmation and P-256 possession proof, the node transiently derives
 the same owner signing key and signs the same approval tuple. The seed is
 persisted only as `mnemonic.enc`; the record says `enrolled_by: local_first_run`.
+[Remote first run](pairing.md#remote-first-run-over-the-tunnel) does the same
+over the box-static tunnel and records `enrolled_by: remote_first_run`.
 Later device enrollment still requires the owner console.
 
 ## API

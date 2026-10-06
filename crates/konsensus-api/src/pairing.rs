@@ -1578,6 +1578,52 @@ impl PairingService {
         self.create_remote_pairing(name, client_pubkey_hex, remote_transport_pubkey, false)
     }
 
+    /// First-run pairing authorized by a consumed pre-bootstrap ticket over the
+    /// box-static tunnel. It carries [`bootstrap_pairing_scopes`] only while no
+    /// identity is bound and no other client exists; the transition commit
+    /// strips `identity` exactly as it does for a loopback bootstrap pairing.
+    pub fn create_bootstrap_ticket_pairing(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        remote_transport_pubkey: &[u8; 32],
+    ) -> Result<PairedClient, PairingError> {
+        let normalized_pubkey = client_pubkey_hex.to_ascii_lowercase();
+        parse_pubkey(&normalized_pubkey)?;
+        let client_id = client_id_from_pubkey(&normalized_pubkey);
+        let mut inner = self.lock();
+        if inner.pairing_closed
+            || !inner.identity_fingerprint.is_empty()
+            || !inner.file.clients.is_empty()
+        {
+            return Err(PairingError::Closed);
+        }
+        let previous = inner.file.clone();
+        let epoch = {
+            let entry = inner.file.last_epoch.entry(client_id.clone()).or_insert(0);
+            *entry = entry.checked_add(1).ok_or(PairingError::Closed)?;
+            *entry
+        };
+        let record = PairedClient {
+            client_id,
+            name: sanitize_name(name),
+            client_pubkey: normalized_pubkey,
+            remote_transport_pubkey: Some(hex::encode(remote_transport_pubkey)),
+            scopes: bootstrap_pairing_scopes(),
+            epoch,
+            identity_fingerprint: String::new(),
+            created_at: chrono::Utc::now().timestamp(),
+            last_seen: None,
+        };
+        inner.file.clients.push(record.clone());
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = previous;
+            return Err(error);
+        }
+        self.notify_authority_change();
+        Ok(record)
+    }
+
     fn create_remote_pairing(
         &self,
         name: &str,

@@ -13,11 +13,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::StreamExt;
 use rand::RngCore;
 use serde_json::json;
 use tokio::{sync::oneshot, time::Instant};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::{
     pairing::{
@@ -28,11 +27,10 @@ use crate::{
 };
 
 #[path = "locked_body.rs"]
-mod body;
+pub(crate) mod body;
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(120);
 const FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
-const MAX_BODY: usize = 16 * 1024;
 
 /// Exact device-signed bytes; all authority fields come from server state.
 pub fn unlock_message(
@@ -233,31 +231,9 @@ async fn unlock(
     if transition.is_none() {
         return Err(UnlockError::AlreadyUnlocking);
     }
-    // Never use Json<UnlockBody>: its aggregate body is not zeroizing. Bound
-    // both allocation and upload time, and wipe each exclusively-owned frame.
-    // Hyper may share a frame with its HTTP read buffer: that library-owned
-    // allocation (like kernel socket buffers) cannot be wiped through Bytes.
-    let read = async {
-        let mut raw = Zeroizing::new(Vec::with_capacity(MAX_BODY));
-        let mut stream = request.into_body().into_data_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| UnlockError::Failed)?;
-            let oversized = raw.len() + chunk.len() > MAX_BODY;
-            if !oversized {
-                raw.extend_from_slice(&chunk);
-            }
-            if let Ok(mut chunk) = chunk.try_into_mut() {
-                chunk.as_mut().zeroize();
-            }
-            if oversized {
-                return Err(UnlockError::Failed);
-            }
-        }
-        body::parse(&raw)
-    };
-    let body = tokio::time::timeout(Duration::from_secs(10), read)
-        .await
-        .map_err(|_| UnlockError::Failed)??;
+    // Never use Json<UnlockBody>: its aggregate body is not zeroizing.
+    let raw = body::read(request).await.ok_or(UnlockError::Failed)?;
+    let body = body::parse(&raw)?;
     let issued = {
         let mut challenges = state.challenges.lock().unwrap_or_else(|e| e.into_inner());
         let issuer = challenges

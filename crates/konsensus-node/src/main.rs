@@ -866,6 +866,9 @@ fn custody_mode(config: &NodeConfig) -> konsensus_api::custody::CustodyMode {
     }
 }
 
+/// Exit status after a remote first run commits: restart into locked mode.
+const REMOTE_BOOTSTRAP_RESTART_EXIT: i32 = 75;
+
 /// `konsensus start` — boot the node.
 async fn cmd_start(
     config_path: &Path,
@@ -894,15 +897,16 @@ async fn cmd_start(
     let data_dir = owner_cmd::data_dir_of(config_path);
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
-            anyhow::ensure!(
-                password_source != PasswordSource::RemoteUnlock,
-                "remote unlock requires an initialized encrypted node; remote bootstrap is not supported"
-            );
+            // A positively empty directory with --remote-unlock serves the
+            // remote first run; the password then arrives only through
+            // the Noise tunnel and --local-owner-device applies after unlock.
+            let remote = password_source == PasswordSource::RemoteUnlock;
             let local = password.map(|password| owner_cmd::LocalOwnerBootstrap {
                 password,
                 enroll_device: local_owner_device,
             });
             if local_owner_device
+                && !remote
                 && (password_source != PasswordSource::Descriptor || local.is_none())
             {
                 anyhow::bail!("--local-owner-device requires --password-fd");
@@ -910,7 +914,12 @@ async fn cmd_start(
             file_logging
                 .enable(&config_path.with_file_name("node.log"), config.logging)
                 .context("failed to initialize bounded node logging")?;
-            return owner_cmd::serve_bootstrap_mode(config_path, &config, local).await;
+            if owner_cmd::serve_bootstrap_mode(config_path, &config, local, remote).await? {
+                // EX_TEMPFAIL: `Restart=on-failure` restarts the same
+                // `--remote-unlock` command, which now serves locked mode.
+                std::process::exit(REMOTE_BOOTSTRAP_RESTART_EXIT);
+            }
+            return Ok(());
         }
         konsensus_api::bootstrap::StartupMode::Initialized => {}
         // `prepare_start` has already turned this into an error.

@@ -23,6 +23,7 @@ use crate::config::{NodeConfig, NodeTier, StorageConfig};
 use konsensus_api::bootstrap::{self, DataDirLayout, StartupMode};
 use konsensus_api::control::{self, ControlRequest, ControlResponse};
 use konsensus_api::pairing::PairingService;
+use konsensus_api::rate_limit::RemoteTunnelClients;
 use konsensus_api::spend_budget::{self, GrantTerms};
 
 /// Prepare startup without constructing a wallet, node or listener.
@@ -892,11 +893,17 @@ impl LocalOwnerBootstrap {
 /// durably aligns that file with the committed mnemonic **before** publishing
 /// the success marker, so a completed bootstrap is always restartable with the
 /// same filename.
+///
+/// With `remote_unlock` (P2) there is no startup password: the box-static
+/// Noise tunnel is bound beside the loopback API, and the password reaches
+/// `finalize` through that tunnel only. Returns `true` when such a remote
+/// first run committed, so the caller exits for a restart into locked mode.
 pub async fn serve_bootstrap_mode(
     config_path: &Path,
     config: &NodeConfig,
     local: Option<LocalOwnerBootstrap>,
-) -> Result<()> {
+    remote_unlock: bool,
+) -> Result<bool> {
     if !config.identity.passphrase.is_empty() {
         anyhow::bail!(
             "bootstrap does not support identity.passphrase: first-run commit derives with an \
@@ -933,6 +940,24 @@ pub async fn serve_bootstrap_mode(
     if let Some(hooks) = hooks {
         state = state.with_local_owner(hooks);
     }
+    let tunnel_clients = std::sync::Arc::new(RemoteTunnelClients::default());
+    if remote_unlock {
+        anyhow::ensure!(
+            config.remote_access.listen_addr.is_some(),
+            "remote bootstrap requires remote_access.listen_addr"
+        );
+        state = state.with_remote_owner(bootstrap::RemoteOwner {
+            hooks: Box::new(|password| {
+                LocalOwnerBootstrap {
+                    password,
+                    enroll_device: true,
+                }
+                .into_hooks()
+                .map_err(|_| bootstrap::CommitError::Io("bootstrap password rejected".into()))
+            }),
+            tunnel: tunnel_clients.clone(),
+        });
+    }
     let state = std::sync::Arc::new(state);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -947,11 +972,53 @@ pub async fn serve_bootstrap_mode(
          create/restore are reachable on {api_addr}."
     );
 
-    let outcome = konsensus_api::bootstrap::serve_bootstrap(api_addr, state, shutdown_rx)
+    let api = tokio::net::TcpListener::bind(api_addr)
         .await
-        .map_err(|e| anyhow::anyhow!("bootstrap API failed: {e}"))?;
+        .with_context(|| format!("could not bind bootstrap API at {api_addr}"))?;
+    let mut listeners = vec![api];
+    let mut tunnel = None;
+    if remote_unlock {
+        let internal = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let server = crate::remote_access::RemoteAccessServer::bind_bootstrap(
+            &config.remote_access,
+            state.pairing.clone(),
+            internal.local_addr()?,
+            tunnel_clients,
+        )
+        .await?;
+        listeners.push(internal);
+        // Stop the tunnel with the bootstrap listeners so no bridge outlives
+        // the terminal response.
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let terminal = bootstrap::until_terminal(state.clone(), shutdown_rx.clone());
+        tokio::spawn(async move {
+            terminal.await;
+            let _ = stop_tx.send(true);
+        });
+        tunnel = Some(tokio::spawn(server.serve(stop_rx)));
+        println!("Remote first run is reachable through the box-static Noise tunnel.");
+    }
+
+    let outcome =
+        konsensus_api::bootstrap::serve_bootstrap_listeners(listeners, state, shutdown_rx)
+            .await
+            .map_err(|e| anyhow::anyhow!("bootstrap API failed: {e}"))?;
+    if let Some(tunnel) = tunnel {
+        tunnel.await.context("remote bootstrap tunnel failed")?;
+    }
 
     match outcome {
+        Some(o) if remote_unlock => {
+            println!(
+                "identity committed: node {} (fingerprint {}).\n\
+                 Encrypted seed written to {}.\n\
+                 Exiting for a supervised restart into locked mode; unlock from the enrolled device.",
+                o.node_id,
+                o.identity_fingerprint,
+                o.mnemonic_path.display()
+            );
+            Ok(true)
+        }
         Some(o) => {
             println!(
                 "identity committed: node {} (fingerprint {}).\n\
@@ -961,11 +1028,11 @@ pub async fn serve_bootstrap_mode(
                 o.identity_fingerprint,
                 o.mnemonic_path.display()
             );
-            Ok(())
+            Ok(false)
         }
         None => {
             println!("bootstrap ended without an identity being committed");
-            Ok(())
+            Ok(false)
         }
     }
 }
