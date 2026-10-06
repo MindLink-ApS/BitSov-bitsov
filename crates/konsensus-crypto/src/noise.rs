@@ -251,13 +251,23 @@ impl NoiseSession {
     /// Parses length-prefixed chunks produced by [`Self::encrypt`], decrypts each,
     /// and reassembles the original plaintext.
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, NoiseError> {
+        self.decrypt_sensitive(ciphertext)
+            .map(|mut plaintext| std::mem::take(&mut *plaintext))
+    }
+
+    /// Decrypt secret-bearing records, wiping partial plaintext on every error.
+    /// Preallocate once so growing the aggregate never frees unwiped plaintext.
+    pub fn decrypt_sensitive(
+        &mut self,
+        ciphertext: &[u8],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, NoiseError> {
         let transport = match self.state.as_mut() {
             Some(SessionState::Transport(t)) => t,
             Some(SessionState::Handshaking(_)) => return Err(NoiseError::HandshakeIncomplete),
             None => return Err(NoiseError::InvalidState),
         };
 
-        let mut output = Vec::new();
+        let mut output = zeroize::Zeroizing::new(Vec::with_capacity(ciphertext.len()));
         let mut cursor = 0;
         while cursor < ciphertext.len() {
             if cursor + 2 > ciphertext.len() {
@@ -269,7 +279,7 @@ impl NoiseSession {
             if cursor + chunk_len > ciphertext.len() {
                 return Err(NoiseError::Snow(snow::Error::Input));
             }
-            let mut buf = vec![0u8; chunk_len];
+            let mut buf = zeroize::Zeroizing::new(vec![0u8; chunk_len]);
             let len = transport.read_message(&ciphertext[cursor..cursor + chunk_len], &mut buf)?;
             output.extend_from_slice(&buf[..len]);
             cursor += chunk_len;

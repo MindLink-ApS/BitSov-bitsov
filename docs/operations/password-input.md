@@ -50,7 +50,7 @@ access.
 For an initialized local node with a first-run or console-enrolled owner device,
 start with `--password-fd 0 --local-owner-device` to enable device-signed,
 recipient-bound spend envelopes. This flag is required on every start; it is
-not a config setting. It requires `--password-fd` and conflicts with
+not a config setting. It requires `--password-fd` or `--remote-unlock` and conflicts with
 `--password`, `--password-file`, and `--owner-control`.
 
 The seed must be encrypted with no sibling `mnemonic.txt`. At startup the node
@@ -90,3 +90,27 @@ Persisted spend grants remain trusted state: the `device:` provenance prefix
 and budget fields are not signed grants. A writer of `pairing/clients.json` can
 forge those fields. Owner signatures protect device registration records, not
 the grant ledger; this mode retains that existing account-layer limitation.
+
+## Remote unlock after reboot
+
+For an initialized home node with an encrypted seed, start with
+`--remote-unlock --local-owner-device`. The node waits for an already paired,
+owner-approved device over the box-static Noise tunnel. It accepts no password
+flag, file, descriptor, or owner console in this mode. The password is held in
+zeroizing memory only, never logged, returned, or written to disk, and handed to
+the normal startup path after device possession, seed decryption, owner approval,
+and the saved node identity all verify. A failed unlock leaves the node locked.
+Do not provide a systemd credential containing the seed password.
+
+`--remote-unlock` alone unlocks receiving but keeps device spend approvals off
+(`seed_password_not_typed`). Add `--local-owner-device` on each start to enable
+existing owner-approved device intents. Neither switch is a configuration key.
+The mode rejects plaintext seeds and uninitialized data directories; remote
+first-run bootstrap is not part of this release. See [home-node.md](home-node.md)
+for migration, listener behavior, and the Lightning risk while locked.
+
+Remote unlock uses zeroizing buffers for tunnel decryption, the collected request,
+JSON password decoding and the password handoff, including errors and cancellation.
+This does not guarantee erasure of library-owned HTTP read buffers, kernel socket
+buffers, compiler temporaries, or memory after abrupt process termination. The
+in-process loopback bridge is part of the trusted local process/OS boundary.

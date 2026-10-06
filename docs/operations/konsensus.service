@@ -6,7 +6,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/konsensus start --config %h/.local/share/konsensus/konsensus.toml --owner-control
+ExecStart=%h/.local/bin/konsensus start --config %h/.local/share/konsensus/konsensus.toml --remote-unlock --local-owner-device
 Restart=on-failure
 RestartSec=10
 # The node allows 15s for Lightning, 10s for cleanup, and enforces a 30s deadline.
