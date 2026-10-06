@@ -125,7 +125,7 @@ async fn read_scope_gets_a_signed_card_of_this_node() {
     assert_eq!(card.endpoint, "node.example.org:9000");
     assert_eq!(card.reach, Reach::Public);
     // StubPricing charges 10 msat per chat: the card shows what the stateless quote would.
-    assert_eq!((card.admission_msat, card.message_msat), first_contact_prices(10));
+    assert_eq!((card.admission_msat, card.message_msat), first_contact_prices(10, 0));
     assert!(card.expires_at - card.issued_at <= 600);
     let link = body["link"].as_str().unwrap();
     assert!(link.starts_with("bitsov://introduce#"));
