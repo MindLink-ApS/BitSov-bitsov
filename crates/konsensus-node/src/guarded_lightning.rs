@@ -19,9 +19,60 @@ mod tests;
 #[path = "tests/funding_fees.rs"]
 mod funding_tests;
 
+#[cfg(test)]
+#[path = "tests/hub_only_channels.rs"]
+mod hub_only_tests;
+
+/// Who new channels may be opened with, in either direction. Selected for this
+/// invocation, never loaded from configuration.
+#[derive(Clone, Debug, Default)]
+pub enum ChannelPeers {
+    #[default]
+    Any,
+    /// `--remote-unlock`: nothing watches this node's channels while it sits
+    /// locked (no watchtower yet), so only the configured hub/LSP node ids qualify.
+    HubOnly(Arc<[String]>),
+}
+
+impl ChannelPeers {
+    /// Hub-only policy from `[lightning.liquidity] providers`, the configured
+    /// LSP/hub set. Other backends configure no hub, so every peer is refused.
+    pub fn hub_only(lightning: &crate::config::LightningConfig) -> anyhow::Result<Self> {
+        let crate::config::LightningConfig::Ldk { liquidity, lsps2_service, .. } = lightning else {
+            return Ok(Self::HubOnly(Arc::from([])));
+        };
+        anyhow::ensure!(
+            !lsps2_service.enabled,
+            "{HUB_ONLY_WHILE_LOCKABLE}: lsps2_service opens channels to any client; disable it to start with --remote-unlock"
+        );
+        Ok(Self::HubOnly(
+            liquidity.providers.iter().map(|p| p.node_id.to_ascii_lowercase()).collect(),
+        ))
+    }
+
+    /// The allowlist handed to the Lightning backend, if any.
+    pub fn allowlist(&self) -> Option<Vec<String>> {
+        match self {
+            Self::Any => None,
+            Self::HubOnly(hubs) => Some(hubs.to_vec()),
+        }
+    }
+
+    fn check(&self, peer_pubkey: &str) -> Result<(), LightningError> {
+        match self {
+            Self::HubOnly(hubs) if !hubs.iter().any(|hub| hub.eq_ignore_ascii_case(peer_pubkey)) => {
+                tracing::warn!(peer = %peer_pubkey, code = HUB_ONLY_WHILE_LOCKABLE, "refused channel open to a non-hub peer");
+                Err(LightningError::PaymentNotDispatched(HUB_ONLY_WHILE_LOCKABLE.into()))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 pub struct GuardedLightning {
     pub inner: Arc<dyn LightningProvider>,
     pub disk: Arc<DiskGuard>,
+    pub channel_peers: ChannelPeers,
     // Drop after the provider; cloned handles must retain the directory lease.
     pub _state_guard: Arc<std::fs::File>,
 }
@@ -233,6 +284,7 @@ impl LightningProvider for GuardedLightning {
         announce: bool,
         fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<String, LightningError> {
+        self.channel_peers.check(peer_pubkey)?;
         self.disk.check()?;
         self.inner
             .open_channel(
@@ -252,6 +304,7 @@ impl LightningProvider for GuardedLightning {
         announce: bool,
         fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<ChannelOpenResult, LightningError> {
+        self.channel_peers.check(peer_pubkey)?;
         self.disk.check()?;
         self.inner
             .open_channel_with_status(
@@ -278,6 +331,7 @@ impl LightningProvider for GuardedLightning {
         announce: bool,
         options: FundingOptions,
     ) -> Result<ChannelOpenResult, LightningError> {
+        self.channel_peers.check(peer_pubkey)?;
         self.disk.check()?;
         self.inner
             .open_channel_with_funding(peer_pubkey, peer_addr, amount_sats, announce, options)

@@ -22,6 +22,10 @@ also live on the corresponding GitHub pre-release pages.
   window peers must accept on new channels, inbound and outbound. Home nodes
   that may stay locked can set 288 (about two days). Omitting it keeps LDK's 144;
   existing channels keep their negotiated value. See [the home-node runbook](docs/operations/home-node.md#longer-breach-window-optional).
+- `start --remote-unlock` limits new channels, outbound and inbound, to the
+  configured `[lightning.liquidity] providers` hub/LSPs until a watchtower exists.
+  Other opens are refused with `HUB_ONLY_WHILE_LOCKABLE` (API 403), and the LSPS2
+  hub service cannot be combined with the flag. Starts without the flag are unchanged.
 
 ## [0.3.0-rc9] — 2026-10-06 (prep; not tagged yet)
 

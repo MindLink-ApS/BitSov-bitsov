@@ -129,6 +129,7 @@ pub async fn run(args: MoveHomeArgs) -> Result<()> {
         },
         liquidity: Default::default(),
         lsps2_service: Default::default(),
+        channel_peers: None,
         storage_dir: storage_dir.clone(),
         scb_backup_dir: Some(PathBuf::from(&config.backup.scb_dir)),
         scb_rotation_count: config.backup.rotation_count,

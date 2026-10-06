@@ -141,6 +141,9 @@ pub struct Config {
 	/// Optional local disk admission check. False rejects unpaid incoming HTLCs
 	/// and new inbound channels, without affecting settlement recovery or closes.
 	pub work_admission: Option<WorkAdmissionCheck>,
+	/// When set, new channels in either direction are refused unless the counterparty is listed.
+	/// `None` leaves channel opening and acceptance unchanged. Existing channels are unaffected.
+	pub channel_peer_allowlist: Option<Vec<PublicKey>>,
 	/// The path where the underlying LDK and BDK persist their data.
 	pub storage_dir_path: String,
 	/// The used Bitcoin network.
@@ -223,6 +226,7 @@ impl Default for Config {
 	fn default() -> Self {
 		Self {
 			work_admission: None,
+			channel_peer_allowlist: None,
 			cooperative_close_only: false,
 			accept_forwards_to_priv_channels: false,
 			our_to_self_delay: None,
