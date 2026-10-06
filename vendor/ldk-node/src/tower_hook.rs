@@ -64,6 +64,9 @@ impl TowerClient {
 struct PendingCandidate {
     candidate: JusticeCandidate,
     observed_update_id: u64,
+    // Optional for journals written by W1. This is the commitment's funding input,
+    // not the monitor's active input (a pending splice may use a different one).
+    funding_outpoint: Option<bitcoin::OutPoint>,
 }
 
 struct PendingChannel {
@@ -84,6 +87,7 @@ mod encoding {
     impl_writeable_tlv_based!(PendingCandidate, {
         (0, candidate, required),
         (2, observed_update_id, required),
+        (3, funding_outpoint, option),
     });
     impl_writeable_tlv_based!(PendingChannel, {
         (0, destination, required),
@@ -279,6 +283,10 @@ impl<P> TowerPersister<P> {
                         state.pending.push(PendingCandidate {
                             candidate,
                             observed_update_id: monitor.get_latest_update_id(),
+                            funding_outpoint: Some(
+                                commitment.trust().built_transaction().transaction.input[0]
+                                    .previous_output,
+                            ),
                         })
                     }
                     Err(e) => return Err(e.into()),
@@ -289,7 +297,8 @@ impl<P> TowerPersister<P> {
         client
             .store
             .write("tower", "pending", &channel, state.encode())?;
-        while let Some(pending) = state.pending.first() {
+        let mut index = 0;
+        while let Some(pending) = state.pending.get(index) {
             let candidate = &pending.candidate;
             let mut signed = candidate.clone();
             let ladder = candidate
@@ -304,9 +313,19 @@ impl<P> TowerPersister<P> {
                     )
                 })
                 .collect::<Result<Vec<_>, _>>();
-            // Secret not yet known (or a superseded splice): retain and retry later.
+            // A locked splice removes the old funding scope from LDK's signer. Never let
+            // that entry (including legacy entries with no funding metadata) block later
+            // states. Retain failures for retry: a differing input can also be a pending
+            // splice, and Err alone does not distinguish a missing secret/signer outage.
             let Ok(ladder) = ladder else {
-                break;
+                let active_funding = monitor.get_funding_txo().into_bitcoin_outpoint();
+                if let Some(funding) = pending.funding_outpoint.filter(|f| *f != active_funding) {
+                    log::warn!("Watchtower skipping unsigned candidate {} for channel {}: funding outpoint {} differs from active {}; retaining for retry", candidate_key(candidate), channel, funding, active_funding);
+                } else {
+                    log::debug!("Watchtower deferring unsigned candidate {} for channel {}: secret or signer unavailable (funding {:?}); continuing queue", candidate_key(candidate), channel, pending.funding_outpoint);
+                }
+                index += 1;
+                continue;
             };
             signed.ladder = ladder;
             let key = candidate_key(&signed);
@@ -318,7 +337,7 @@ impl<P> TowerPersister<P> {
             client
                 .store
                 .write("tower_candidates", &channel, &key, signed.encode())?;
-            state.pending.remove(0);
+            state.pending.remove(index);
             client
                 .store
                 .write("tower", "pending", &channel, state.encode())?;

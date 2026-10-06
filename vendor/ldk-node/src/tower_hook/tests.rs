@@ -205,6 +205,98 @@ fn restart_mid_queue_keeps_later_pending_with_anchors() {
     forming_justice(false, true, true);
 }
 
+#[test]
+fn inbound_splice_does_not_block_later_justice() {
+    use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
+    use lightning::ln::funding::SpliceContribution;
+    use lightning::ln::splicing_tests::{lock_splice_after_blocks, splice_channel};
+
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let cfg = create_chanmon_cfgs(2);
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let persisters = [
+        Restartable(Mutex::new(hook(dirs[0].path(), script.clone()))),
+        Restartable(Mutex::new(hook(dirs[1].path(), script))),
+    ];
+    let configs = create_node_cfgs_with_persisters(2, &cfg, persisters.iter().collect());
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    let before = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    let splice = splice_channel(
+        &nodes[0],
+        &nodes[1],
+        id,
+        SpliceContribution::SpliceOut {
+            outputs: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: cfg[0].keys_manager.get_destination_script([0; 32]).unwrap(),
+            }],
+        },
+    );
+    mine_transaction(&nodes[0], &splice);
+    mine_transaction(&nodes[1], &splice);
+    lock_splice_after_blocks(&nodes[0], &nodes[1], ANTI_REORG_DELAY - 1);
+    // The acceptor now cannot sign the old funding scope, even after its secret arrives.
+    let client = persisters[1]
+        .0
+        .lock()
+        .unwrap()
+        .client
+        .as_ref()
+        .unwrap()
+        .clone();
+    let state: PendingChannel = decode(
+        &client
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(state
+        .pending
+        .iter()
+        .any(|p| candidate_key(&p.candidate) == before.compute_txid().to_string()));
+    let after = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    assert_ne!(
+        before.input[0].previous_output,
+        after.input[0].previous_output
+    );
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let candidates = client.pending_candidates(id).unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|c| candidate_key(c) == after.compute_txid().to_string())
+        .expect("pre-splice head must not block post-splice justice");
+    for tx in &candidate.ladder {
+        lightning::check_spends!(tx, after);
+    }
+    // A fresh client must also skip the persisted head on startup and sign subsequent states.
+    let restored = hook(dirs[1].path(), ScriptBuf::new());
+    {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        assert_eq!(
+            restored.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+    }
+    *persisters[1].0.lock().unwrap() = restored;
+    let later = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let candidates = persisters[1].candidates(id);
+    let candidate = candidates
+        .iter()
+        .find(|c| candidate_key(c) == later.compute_txid().to_string())
+        .unwrap();
+    for tx in &candidate.ladder {
+        lightning::check_spends!(tx, later);
+    }
+}
+
 type PersistedCall = (String, Vec<u8>, Option<Vec<u8>>);
 
 #[derive(Default)]
@@ -702,6 +794,7 @@ fn malformed_candidate_records_are_rejected() {
     bad.ladder.clear();
     state.pending.push(PendingCandidate {
         candidate: bad,
+        funding_outpoint: None,
         observed_update_id: monitor.get_latest_update_id(),
     });
     client
