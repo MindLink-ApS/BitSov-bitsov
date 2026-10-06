@@ -54,13 +54,15 @@ not a config setting. It requires `--password-fd` and conflicts with
 `--password`, `--password-file`, and `--owner-control`.
 
 The seed must be encrypted with no sibling `mnemonic.txt`. At startup the node
-derives the owner verifying key from the seed and password, then drops the
-password and owner signing key. No owner public key is trusted from disk.
+derives owner authority from the seed and password, then drops the password.
+Only local-owner mode retains the owner signing key in zeroizing memory for
+[device delegation](../security/device-keys.md#delegating-another-owner-device). No owner public key is trusted from disk.
 Console-enrolled device records work unchanged; their owner signatures are
 verified on every intent. A restart without the flag disables descriptor-based
 device approval again (`seed_password_not_typed`) and honours no spend grants.
 
-This mode opens no control socket. Later enrollment, console grants, elevation,
+This mode opens no control socket. Later enrollment requires an existing owner
+device signature over the pending delegation tuple. Console grants, elevation,
 front-door, identity replacement, pairing-window control and first-contact
 approval retain their console-only rules. Only live `device:` grants with
 `recipients_only` budgets supply spend scope and spending authority; `cli`

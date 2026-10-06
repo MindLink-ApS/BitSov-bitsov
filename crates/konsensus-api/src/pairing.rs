@@ -616,7 +616,7 @@ pub struct PairingService {
     /// Whether the owner control socket exists in this deployment. Console
     /// grants and approvals require this independently of local device authority.
     owner_control_enabled: bool,
-    /// Explicit live-start authority for device-signed recipient envelopes only.
+    /// Explicit live-start authority for device envelopes and signed delegation.
     local_owner_device: bool,
     /// Whether a safe protected-file instruction is written to stdout. The
     /// code/challenge itself is never printed.
@@ -627,6 +627,8 @@ pub struct PairingService {
     /// Public half of the seed-derived owner-approval key. Device keys are
     /// honoured only under its signature. Never read from `data_dir`.
     owner_approval_key: Option<ed25519_dalek::VerifyingKey>,
+    /// Startup-only local delegation signer; its private material zeroizes on drop.
+    owner_signing_key: Option<konsensus_core::OwnerApprovalKey>,
     /// Why device authority is off, if it is. Fail closed: off until startup
     /// supplies an owner key derived from a protected seed.
     device_authority_off: Option<&'static str>,
@@ -881,6 +883,7 @@ impl PairingService {
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
             owner_config: None,
             owner_approval_key: None,
+            owner_signing_key: None,
             device_authority_off: Some(device::OWNER_KEY_UNAVAILABLE),
         };
         // A grant that expired while the node was down, or an unmetered
@@ -900,7 +903,7 @@ impl PairingService {
         x25519_dalek::PublicKey::from(&secret).to_bytes()
     }
 
-    /// Enable device-signed recipient envelopes without enabling the owner console.
+    /// Enable device envelopes and delegation without enabling the owner console.
     pub fn with_local_owner_device(mut self) -> Self {
         self.local_owner_device = true;
         self
@@ -1175,8 +1178,18 @@ impl PairingService {
     /// The owner-approval public key, derived from the running identity's
     /// seed (`NodeIdentity::owner_approval_public`).
     pub fn with_owner_approval_key(mut self, key: ed25519_dalek::VerifyingKey) -> Self {
+        self.owner_signing_key = None;
         self.owner_approval_key = Some(key);
         self.device_authority_off = None;
+        self
+    }
+
+    /// Retain the seed-derived signing key only for explicitly enabled local
+    /// delegation. No key material is serialized into pairing state.
+    pub fn with_owner_signing_key(mut self, key: konsensus_core::OwnerApprovalKey) -> Self {
+        self.owner_approval_key = Some(key.verifying_key());
+        self.device_authority_off = None;
+        self.owner_signing_key = self.local_owner_device.then_some(key);
         self
     }
 
@@ -1184,6 +1197,7 @@ impl PairingService {
     /// the reason the app shows (e.g. [`device::SEED_NOT_ENCRYPTED`]).
     pub fn with_device_authority_disabled(mut self, reason: &'static str) -> Self {
         self.owner_approval_key = None;
+        self.owner_signing_key = None;
         self.device_authority_off = Some(reason);
         self
     }

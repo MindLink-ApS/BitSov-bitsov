@@ -189,7 +189,12 @@ client only from a live `device:` grant with a recipient-only budget, bound to
 the same identity and epoch. Base pairing scopes cannot smuggle in grantable
 scopes. This mode never adds `front_door` or honours console (`cli`) grants.
 Device intents require an owner-approved device signature; startup derives the
-owner verifying key from the encrypted seed and descriptor password.
+owner authority from the encrypted seed and descriptor password. In local mode
+the zeroizing owner signing key is retained for device delegation. Pending
+enrollment is available, but approval requires an enrolled owner device signing
+the exact pending tuple. The approver uses its own paired token; token-only
+enrollment is refused. `owner_device_count` reports valid owners node-wide so
+the app can warn at one and prevent the phone from being the sole owner device.
 
 The flag is absent by default and has no config equivalent. Console-only
 operations and the remote router's allowlist and scope rules are unchanged.

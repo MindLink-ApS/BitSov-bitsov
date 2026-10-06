@@ -1,11 +1,9 @@
 //! Paired device keys and signed relation intents over HTTP.
 //!
-//! Registration here only **requests**: the key is registered by the owner
-//! at the control socket (`konsensus device approve`), once. After that,
-//! `POST /api/v1/pair/relation-intent` is the one HTTP path that writes spend
-//! authority, and only with a registered device key's signature over the
-//! exact terms (see [`crate::pairing::device`]). A paired token alone, or a
-//! token plus a "user confirmed" flag, writes nothing.
+//! Registration requests write no authority. The console can approve once,
+//! or an enrolled owner device can sign a delegation in local-owner mode.
+//! Relation intents require an enrolled device signature over exact terms.
+//! A paired token alone, or a "user confirmed" flag, grants nothing.
 
 use std::sync::Arc;
 
@@ -83,6 +81,8 @@ pub struct DeviceKeyResponse {
     pub expires_at: i64,
     /// What the owner runs, once.
     pub owner_action: String,
+    /// Exact bytes to show and sign on an existing owner device in local mode.
+    pub delegation_message: Option<String>,
 }
 
 async fn request_device_key(
@@ -97,6 +97,9 @@ async fn request_device_key(
         .map_err(map_err)?;
     Ok(Json(DeviceKeyResponse {
         owner_action: svc.owner_device_command(&op.op_id),
+        delegation_message: svc
+            .local_owner_device()
+            .then(|| crate::pairing::device::delegation_message(&svc.bound_fingerprint(), &op)),
         fingerprint: crate::pairing::device::key_fingerprint(&op.key_id),
         op_id: op.op_id,
         key_id: op.key_id,
@@ -110,8 +113,50 @@ async fn device_key_status(
     Path(op_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let binding = binding(&auth)?;
-    let status = service(&state)?.device_key_status(&binding.client_id, &op_id);
-    Ok(Json(serde_json::json!({ "op_id": op_id, "status": status })))
+    let svc = service(&state)?;
+    let status = svc.device_key_status(&binding.client_id, &op_id);
+    let message = svc
+        .pending_device_key(&op_id)
+        .filter(|op| {
+            svc.local_owner_device()
+                && op.client_id == binding.client_id
+                && status == crate::pairing::DeviceKeyStatus::Pending
+        })
+        .map(|op| crate::pairing::device::delegation_message(&svc.bound_fingerprint(), &op));
+    Ok(Json(
+        serde_json::json!({ "op_id": op_id, "status": status, "delegation_message": message }),
+    ))
+}
+
+/// An enrolled owner's P-256 signature over the pending delegation tuple.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationRequest {
+    /// Enrolled key belonging to the authenticated approver client.
+    pub approver_key_id: String,
+    /// P-256/SHA-256 DER signature, hex.
+    pub signature: String,
+}
+
+async fn delegate_device_key(
+    auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    Path(op_id): Path<String>,
+    Json(body): Json<DelegationRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let binding = binding(&auth)?;
+    let key = service(&state)?
+        .delegate_device_key(
+            &binding.client_id,
+            binding.epoch,
+            &op_id,
+            &body.approver_key_id,
+            &body.signature,
+        )
+        .map_err(map_err)?;
+    Ok(Json(
+        serde_json::json!({ "op_id": op_id, "key_id": key.key_id, "status": "registered" }),
+    ))
 }
 
 /// `DELETE /api/v1/pair/device-key/{op_id}` and
@@ -153,6 +198,7 @@ async fn list_device_keys(
         "client_id": binding.client_id,
         "owner_control": svc.owner_control_enabled(),
         "local_owner_device": svc.local_owner_device(),
+        "owner_device_count": svc.owner_device_count(),
         // "enabled", or the reason code device approvals are off node-wide.
         "device_approvals": svc.device_authority_off().unwrap_or("enabled"),
         "device_keys": keys,
@@ -209,6 +255,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/v1/pair/device-key/:op_id",
             get(device_key_status).delete(cancel_pending),
+        )
+        .route(
+            "/api/v1/pair/device-key/:op_id/delegate",
+            post(delegate_device_key),
         )
         .route("/api/v1/pair/device-keys", get(list_device_keys))
         .route("/api/v1/pair/device-keys/:key_id", delete(revoke_own_device_key))

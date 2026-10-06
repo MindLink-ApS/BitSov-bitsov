@@ -3,7 +3,8 @@
 //! A paired app generates a P-256 key in the device's secure hardware (on
 //! macOS the Secure Enclave, unlocked by Touch ID for each signature). The
 //! owner registers its public key with the node **once**, over the owner
-//! console (the short code of `konsensus device approve`). After that the app
+//! console (the short code of `konsensus device approve`), local first run, or
+//! delegation by an enrolled owner device in local mode. After that the app
 //! opens a per-peer spend envelope by signing a [`RelationIntent`]; the node
 //! verifies the signature against the registered key and enforces the exact
 //! terms per recipient. There is no "biometric passed" flag anywhere: the node
@@ -123,6 +124,10 @@ pub struct PendingDeviceKey {
     pub name: String,
     /// Unix seconds after which it can no longer be approved.
     pub expires_at: i64,
+    /// Server-issued, single-use delegation challenge (16 random bytes, hex).
+    /// Older pending console requests have no nonce and cannot be delegated.
+    #[serde(default)]
+    pub delegation_nonce: String,
 }
 
 /// Status of a device-key registration, as the requesting client reads it.
@@ -191,6 +196,15 @@ pub fn owner_approval_message(node: &str, client_pubkey: &str, epoch: u64, devic
     format!(
         "bitsov-owner-approval-v1\npurpose:device-key\nnode:{node}\nclient_pubkey:{client_pubkey}\n\
          epoch:{epoch}\ndevice_key:{device_public_key}"
+    )
+}
+
+/// Exact UTF-8 bytes an enrolled P-256 device signs to approve a pending key.
+/// All fields come from node state; there is no trailing newline.
+pub fn delegation_message(node: &str, op: &PendingDeviceKey) -> String {
+    format!(
+        "bitsov-owner-delegation-v1\nnode:{node}\nclient_pubkey:{}\nepoch:{}\ndevice_key:{}\nop_id:{}\nnonce:{}",
+        op.client_pubkey, op.epoch, op.public_key, op.op_id, op.delegation_nonce
     )
 }
 
@@ -334,7 +348,8 @@ impl PairingService {
     /// A paired client asks the owner to register a device key. Writes **no**
     /// authority. `proof_hex` must be the key's signature over
     /// [`registration_message`], so a client cannot register a key it does
-    /// not hold. The owner approves with `konsensus device approve`.
+    /// not hold. The console approves with `konsensus device approve`, or an
+    /// enrolled owner device delegates approval in local-owner mode.
     pub fn request_device_key(
         &self,
         client_id: &str,
@@ -342,7 +357,7 @@ impl PairingService {
         name: &str,
         proof_hex: &str,
     ) -> Result<PendingDeviceKey, PairingError> {
-        if !self.owner_control_enabled {
+        if !self.owner_control_enabled && !self.local_owner_device {
             return Err(PairingError::OwnerChannelUnavailable);
         }
         self.device_authority()?;
@@ -400,6 +415,8 @@ impl PairingService {
                 "this pairing already has {MAX_DEVICE_KEYS_PER_CLIENT} device keys; revoke one first"
             )));
         }
+        let mut nonce = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut nonce);
         let op = PendingDeviceKey {
             op_id: hex::encode(op_bytes),
             client_id: client_id.to_string(),
@@ -410,14 +427,17 @@ impl PairingService {
             public_key: public_key_hex,
             name,
             expires_at: now + ELEVATION_TTL_SECS,
+            delegation_nonce: hex::encode(nonce),
         };
-        self.console_challenge(
-            &mut inner,
-            &op.op_id,
-            &device_confirmation_phrase(&op),
-            op.expires_at,
-            Some(self.owner_device_command(&op.op_id)),
-        )?;
+        if self.owner_control_enabled {
+            self.console_challenge(
+                &mut inner,
+                &op.op_id,
+                &device_confirmation_phrase(&op),
+                op.expires_at,
+                Some(self.owner_device_command(&op.op_id)),
+            )?;
+        }
         // One registration in flight per client: a new request replaces it.
         let replaced: Vec<String> = inner
             .file
@@ -456,7 +476,9 @@ impl PairingService {
             if p.expires_at <= now {
                 return DeviceKeyStatus::Expired;
             }
-            if !Self::confirmable(&inner, op_id) {
+            if !(Self::confirmable(&inner, op_id)
+                || self.local_owner_device && is_hex(&p.delegation_nonce, 32))
+            {
                 return DeviceKeyStatus::Lost;
             }
             return DeviceKeyStatus::Pending;
@@ -571,6 +593,131 @@ impl PairingService {
         }
         inner.owner_confirmations.remove(op_id);
         Ok(key)
+    }
+
+    /// An authenticated, enrolled device approves a pending key, possibly for
+    /// another paired client. Verification, revocation checks, signing and
+    /// consumption share the pairing lock so no stale authority can race in.
+    pub fn delegate_device_key(
+        &self,
+        approver_client_id: &str,
+        approver_epoch: u64,
+        op_id: &str,
+        approver_key_id: &str,
+        signature: &str,
+    ) -> Result<DeviceKey, PairingError> {
+        if !self.local_owner_device {
+            return Err(PairingError::OwnerChannelUnavailable);
+        }
+        self.device_authority()?;
+        let signer = self
+            .owner_signing_key
+            .as_ref()
+            .ok_or(PairingError::DeviceApprovalsDisabled(OWNER_KEY_UNAVAILABLE))?;
+        let mut inner = self.lock();
+        let approver =
+            self.intent_key(&inner, approver_client_id, approver_epoch, approver_key_id)?;
+        let op = inner
+            .file
+            .pending_device_keys
+            .iter()
+            .find(|p| p.op_id == op_id)
+            .cloned()
+            .ok_or(PairingError::UnknownOperation)?;
+        let now = chrono::Utc::now().timestamp();
+        if op.expires_at <= now {
+            return Err(PairingError::Expired);
+        }
+        if !is_hex(&op.delegation_nonce, 32) {
+            return Err(PairingError::BadProof);
+        }
+        let client = inner
+            .file
+            .clients
+            .iter()
+            .find(|c| c.client_id == op.client_id)
+            .ok_or(PairingError::UnknownClient)?;
+        if client.epoch != op.epoch || client.client_pubkey != op.client_pubkey {
+            return Err(PairingError::PairingInvalid(
+                "the pairing changed; ask again".into(),
+            ));
+        }
+        let raw = parse_public_key(&op.public_key)?;
+        if key_id_for(&raw) != op.key_id
+            || inner.file.device_keys.iter().any(|k| k.key_id == op.key_id)
+            || inner
+                .file
+                .device_keys
+                .iter()
+                .filter(|k| k.client_id == op.client_id && k.epoch == op.epoch)
+                .count()
+                >= MAX_DEVICE_KEYS_PER_CLIENT
+        {
+            return Err(PairingError::NotGrantable(
+                "device key already enrolled or pairing full".into(),
+            ));
+        }
+        verify_p256(
+            &parse_public_key(&approver.public_key)?,
+            delegation_message(&inner.identity_fingerprint, &op).as_bytes(),
+            signature,
+        )?;
+        let owner_approval = hex::encode(
+            signer
+                .sign(
+                    owner_approval_message(
+                        &inner.identity_fingerprint,
+                        &op.client_pubkey,
+                        op.epoch,
+                        &op.public_key,
+                    )
+                    .as_bytes(),
+                )
+                .to_bytes(),
+        );
+        let key = DeviceKey {
+            key_id: op.key_id.clone(),
+            client_id: op.client_id,
+            public_key: op.public_key,
+            name: op.name,
+            registered_at: now,
+            epoch: op.epoch,
+            client_pubkey: op.client_pubkey,
+            owner_approval,
+            enrolled_by: format!("device:{approver_key_id}"),
+        };
+        let before = inner.file.clone();
+        inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
+        inner.file.device_keys.push(key.clone());
+        inner
+            .file
+            .registered_ops
+            .insert(op_id.into(), key.key_id.clone());
+        if let Err(e) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(e);
+        }
+        inner.owner_confirmations.remove(op_id);
+        Ok(key)
+    }
+
+    /// Node-wide count of owner-approved keys at their pairing's current
+    /// epoch. Unverified, tampered and retired records do not count.
+    pub fn owner_device_count(&self) -> usize {
+        let inner = self.lock();
+        inner
+            .file
+            .device_keys
+            .iter()
+            .filter(|k| {
+                parse_public_key(&k.public_key)
+                    .is_ok_and(|raw| key_id_for(&raw) == k.key_id)
+                    && self.intent_key(&inner, &k.client_id, k.epoch, &k.key_id)
+                        .is_ok()
+            })
+            .map(|k| &k.key_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
     }
 
     /// Registered device keys (all clients), for the owner.

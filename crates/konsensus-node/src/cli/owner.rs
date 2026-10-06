@@ -1416,7 +1416,7 @@ mod startup_tests {
             let live = PairingService::open(dir.path(), fp, false)
                 .unwrap()
                 .with_local_owner_device()
-                .with_owner_approval_key(verifier);
+                .with_owner_signing_key(verifier.signing_key.unwrap());
             assert!(live.device_keys().is_empty());
             let challenge = live.issue_token_challenge(&client.client_id).unwrap();
             let sig = hex::encode(key.sign(challenge.as_bytes()).to_bytes());
