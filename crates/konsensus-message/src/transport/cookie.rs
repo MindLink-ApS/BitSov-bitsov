@@ -136,9 +136,10 @@ impl CookieKeyring {
         }
     }
 
-    /// Advance to the rotation window covering `epoch_now`, then return the
-    /// secret for `epoch` (current or previous window only).
-    fn secret_for(&self, epoch: u64, epoch_now: u64) -> Option<Zeroizing<[u8; 32]>> {
+    /// Advance to the rotation window covering `epoch_now` and return the
+    /// current secret plus the previous generation, if any. Never fails: if the
+    /// wall clock steps backwards the keys are simply kept.
+    fn secrets(&self, epoch_now: u64) -> (Zeroizing<[u8; 32]>, Option<Zeroizing<[u8; 32]>>) {
         let now_window = epoch_now / COOKIE_ROTATE_EPOCHS;
         let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         match keys.window {
@@ -157,15 +158,7 @@ impl CookieKeyring {
             // Same window, or the wall clock stepped back: keep the keys.
             Some(_) => {}
         }
-        let current = keys.window?;
-        let want = epoch / COOKIE_ROTATE_EPOCHS;
-        if want == current {
-            Some(keys.current.clone())
-        } else if want.wrapping_add(1) == current {
-            keys.previous.clone()
-        } else {
-            None
-        }
+        (keys.current.clone(), keys.previous.clone())
     }
 
     /// `HMAC-SHA256(secret, ip-octets ‖ epoch_le)`, truncated to 16 bytes.
@@ -186,12 +179,10 @@ impl CookieKeyring {
     /// Issue a fresh cookie for `ip` at the epoch covering `now_unix`.
     pub(super) fn issue(&self, ip: IpAddr, now_unix: u64) -> Cookie {
         let epoch = now_unix / COOKIE_EPOCH_SECS;
-        let secret = self
-            .secret_for(epoch, epoch)
-            .expect("the current window always has a secret");
+        let (current, _) = self.secrets(epoch);
         Cookie {
             epoch,
-            mac: Self::mac(&secret, ip, epoch),
+            mac: Self::mac(&current, ip, epoch),
         }
     }
 
@@ -204,11 +195,13 @@ impl CookieKeyring {
         if presented.epoch != epoch_now && presented.epoch.wrapping_add(1) != epoch_now {
             return false;
         }
-        let Some(secret) = self.secret_for(presented.epoch, epoch_now) else {
-            return false;
-        };
-        let expected = Self::mac(&secret, ip, presented.epoch);
-        ct_eq_16(&expected, &presented.mac)
+        // The epoch check above bounds validity; the MAC decides which
+        // generation (if any) issued it. At most two HMACs, no lookup that can fail.
+        let (current, previous) = self.secrets(epoch_now);
+        if ct_eq_16(&Self::mac(&current, ip, presented.epoch), &presented.mac) {
+            return true;
+        }
+        previous.is_some_and(|p| ct_eq_16(&Self::mac(&p, ip, presented.epoch), &presented.mac))
     }
 }
 
@@ -549,18 +542,40 @@ mod tests {
     fn secret_rotates_and_previous_window_still_verifies() {
         let k = CookieKeyring::random();
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let w = COOKIE_ROTATE_EPOCHS;
         // Last epoch of window 1, then the first epoch of window 2.
-        let t_last = (2 * COOKIE_ROTATE_EPOCHS - 1) * COOKIE_EPOCH_SECS;
-        let t_next = 2 * COOKIE_ROTATE_EPOCHS * COOKIE_EPOCH_SECS;
-        let c = k.issue(ip, t_last);
-        let before = k.secret_for(2 * COOKIE_ROTATE_EPOCHS - 1, 2 * COOKIE_ROTATE_EPOCHS - 1).unwrap();
-        assert!(k.verify(ip, &c, t_next), "previous-window cookie valid across rotation");
-        let after = k.secret_for(2 * COOKIE_ROTATE_EPOCHS, 2 * COOKIE_ROTATE_EPOCHS).unwrap();
+        let c = k.issue(ip, (2 * w - 1) * COOKIE_EPOCH_SECS);
+        let (before, _) = k.secrets(2 * w - 1);
+        assert!(k.verify(ip, &c, 2 * w * COOKIE_EPOCH_SECS), "valid across rotation");
+        let (after, prev) = k.secrets(2 * w);
         assert_ne!(*before, *after, "the secret rotated");
-        // Two windows later the old secret is gone entirely.
-        let far = 4 * COOKIE_ROTATE_EPOCHS;
-        assert!(k.secret_for(2 * COOKIE_ROTATE_EPOCHS - 1, far).is_none());
-        assert!(!k.verify(ip, &c, far * COOKIE_EPOCH_SECS));
+        assert_eq!(*prev.unwrap(), *before, "previous generation kept");
+        // An idle jump of more than one window drops the previous generation.
+        let (_, prev) = k.secrets(5 * w);
+        assert!(prev.is_none(), "old generation wiped after a long idle");
+        assert!(k.keys.lock().unwrap().previous.is_none());
+    }
+
+    #[test]
+    fn clock_stepping_back_never_panics_and_still_issues_valid_cookies() {
+        let ip: IpAddr = "203.0.113.10".parse().unwrap();
+        let w = COOKIE_ROTATE_EPOCHS;
+        // Fresh keyring, then the clock steps back across a window boundary.
+        let k = CookieKeyring::random();
+        let _ = k.issue(ip, 100 * w * COOKIE_EPOCH_SECS);
+        let back = (100 * w - 1) * COOKIE_EPOCH_SECS;
+        let c = k.issue(ip, back);
+        assert!(k.verify(ip, &c, back));
+        // After rotations, back two windows; and after an idle jump, back one.
+        let k = CookieKeyring::random();
+        for e in [10 * w, 11 * w, 12 * w] {
+            let _ = k.issue(ip, e * COOKIE_EPOCH_SECS);
+        }
+        let c = k.issue(ip, 10 * w * COOKIE_EPOCH_SECS);
+        assert!(k.verify(ip, &c, 10 * w * COOKIE_EPOCH_SECS));
+        let _ = k.issue(ip, 20 * w * COOKIE_EPOCH_SECS);
+        let c = k.issue(ip, (20 * w - 1) * COOKIE_EPOCH_SECS);
+        assert!(k.verify(ip, &c, (20 * w - 1) * COOKIE_EPOCH_SECS));
     }
 
 }
