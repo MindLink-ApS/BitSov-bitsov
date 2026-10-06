@@ -113,7 +113,7 @@ pub(super) async fn noise_handshake_responder(
     TransportError,
 > {
     // Message 1: ← e
-    let msg1 = read_noise_message(&mut reader)
+    let msg1 = super::read_bounded_message(&mut reader, 32)
         .await
         .map_err(|e| TransportError::NoiseError(e.to_string()))?;
     noise
@@ -129,7 +129,7 @@ pub(super) async fn noise_handshake_responder(
         .map_err(|e| TransportError::NoiseError(e.to_string()))?;
 
     // Message 3: ← s, se
-    let msg3 = read_noise_message(&mut reader)
+    let msg3 = super::read_bounded_message(&mut reader, 64)
         .await
         .map_err(|e| TransportError::NoiseError(e.to_string()))?;
     noise
@@ -236,7 +236,7 @@ pub(super) async fn recv_encrypted_frame(
     reader: &mut tokio::net::tcp::OwnedReadHalf,
     noise: &mut NoiseSession,
 ) -> Result<Frame, TransportError> {
-    let encrypted = read_noise_message(reader)
+    let encrypted = super::read_bounded_message(reader, 4096)
         .await
         .map_err(|e| TransportError::Other(e.to_string()))?;
     let decrypted = noise
