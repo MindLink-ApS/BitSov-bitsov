@@ -46,7 +46,8 @@ impl TowerClient {
             gate: Mutex::new(()),
         }
     }
-    /// Returns signed candidates without removing them. Reading is not acknowledgement.
+    /// Returns valid signed candidates without acknowledging or removing them.
+    /// Corrupt records are quarantined and logged; storage failures are returned.
     pub fn pending_candidates(&self, channel_id: ChannelId) -> io::Result<Vec<JusticeCandidate>> {
         let _guard = self.gate.lock().unwrap();
         Ok(self
@@ -124,7 +125,12 @@ impl TowerClient {
         Ok(candidates)
     }
 
-    fn prune_candidates(&self, id: ChannelId) -> io::Result<()> {
+    fn prune_candidates(
+        &self,
+        id: ChannelId,
+        retired_funding: &[bitcoin::OutPoint],
+        active_funding: bitcoin::OutPoint,
+    ) -> io::Result<()> {
         let channel = id.to_string();
         if self.store.list("tower_candidates", &channel)?.len() <= SIGNED_CANDIDATE_TARGET {
             return Ok(());
@@ -143,11 +149,16 @@ impl TowerClient {
             if excess == 0 {
                 break;
             }
-            // Only strictly older alternatives are superseded. Keep all distinct
-            // commitments, tied observations, and legacy records with unknown age.
+            // Age alone is NOT proof of supersession: an unconfirmed splice has two
+            // broadcastable funding scopes at the same commitment number. Require an
+            // observed LDK retirement of the old scope as well as a newer alternative.
+            // Unknown legacy metadata and all still-live scopes remain protected.
             if candidate
                 .observed_update_id
                 .is_some_and(|age| newest[&candidate.commitment_number] > age)
+                && candidate.funding_outpoint.is_some_and(|funding| {
+                    funding != active_funding && retired_funding.contains(&funding)
+                })
             {
                 self.store
                     .remove("tower_candidates", &channel, &key, false)?;
@@ -156,7 +167,7 @@ impl TowerClient {
             }
         }
         if excess != 0 {
-            log::warn!("Watchtower channel {} exceeds candidate target by {}: retaining distinct commitments and alternatives without a strictly newer observation", channel, excess);
+            log::warn!("Watchtower channel {} exceeds candidate target by {}: retaining distinct commitments and alternatives without proven funding retirement and a strictly newer observation", channel, excess);
         }
         Ok(())
     }
@@ -171,9 +182,14 @@ struct StoredCandidate {
     ladder: Vec<Transaction>,
     value: u64,
     observed_update_id: Option<u64>,
+    funding_outpoint: Option<bitcoin::OutPoint>,
 }
 impl StoredCandidate {
-    fn new(candidate: JusticeCandidate, observed_update_id: u64) -> Self {
+    fn new(
+        candidate: JusticeCandidate,
+        observed_update_id: u64,
+        funding_outpoint: Option<bitcoin::OutPoint>,
+    ) -> Self {
         let JusticeCandidate {
             channel_id,
             commitment_number,
@@ -186,6 +202,7 @@ impl StoredCandidate {
             ladder,
             value,
             observed_update_id: Some(observed_update_id),
+            funding_outpoint,
         }
     }
     fn into_candidate(self) -> JusticeCandidate {
@@ -209,6 +226,28 @@ struct PendingCandidate {
 struct PendingChannel {
     destination: ScriptBuf,
     pending: Vec<PendingCandidate>,
+    // Active funding at the last journal write, paired with its monitor observation ID.
+    funding: Option<(bitcoin::OutPoint, u64)>,
+    retired_funding: Vec<bitcoin::OutPoint>,
+}
+impl PendingChannel {
+    fn reconcile_funding(&mut self, active: bitcoin::OutPoint, update_id: u64) {
+        if let Some((previous, observed)) = self.funding {
+            if observed > update_id || (previous != active && observed == update_id) {
+                // Write-ahead rollback or a same-ID chain transition: do not mistake a
+                // restored older monitor for proof that its newer funding was retired.
+                self.retired_funding.clear();
+            } else if previous != active && !self.retired_funding.contains(&previous) {
+                // Follow LDK's scope-retirement policy (including configured splice depth),
+                // not a stronger assertion that the funding spend can never be reorged.
+                self.retired_funding.push(previous);
+            }
+        } else {
+            self.retired_funding.clear();
+        }
+        self.retired_funding.retain(|funding| *funding != active);
+        self.funding = Some((active, update_id));
+    }
 }
 
 // LDK TLV readers deliberately drop a borrow-tracking reader before checking length.
@@ -227,6 +266,7 @@ mod encoding {
         (4, ladder, required_vec),
         (6, value, required),
         (9, observed_update_id, option),
+        (11, funding_outpoint, option),
     });
     impl_writeable_tlv_based!(PendingCandidate, {
         (0, candidate, required),
@@ -236,6 +276,8 @@ mod encoding {
     impl_writeable_tlv_based!(PendingChannel, {
         (0, destination, required),
         (2, pending, required_vec),
+        (3, funding, option),
+        (5, retired_funding, optional_vec),
     });
 }
 
@@ -409,26 +451,39 @@ impl<P> TowerPersister<P> {
                 PendingChannel {
                     destination: (self.destination)()?,
                     pending: Vec::new(),
+                    funding: None,
+                    retired_funding: Vec::new(),
                 },
                 true,
             ),
         };
+        let active_funding = monitor.get_funding_txo().into_bitcoin_outpoint();
+        state.reconcile_funding(active_funding, monitor.get_latest_update_id());
         // A crash can leave the tower write-ahead record newer than the durable monitor.
         // Those unsigned commitments were never acknowledged, so the manager can choose
         // different transactions at the same commitment number on restart. Drop only entries
-        // beyond the restored monitor; otherwise an unknown txid could block the queue forever.
+        // beyond the restored monitor; they are not acknowledged states of its channel history.
         state
             .pending
             .retain(|p| p.observed_update_id <= monitor.get_latest_update_id());
         let mut commitments = Vec::new();
         if fresh {
-            commitments.extend(monitor.initial_counterparty_commitment_tx());
+            commitments.extend(
+                monitor
+                    .initial_counterparty_commitment_tx()
+                    .map(|tx| (tx, 0)),
+            );
         }
         if let Some(update) = update {
-            commitments.extend(monitor.counterparty_commitment_txs_from_update(update));
+            commitments.extend(
+                monitor
+                    .counterparty_commitment_txs_from_update(update)
+                    .into_iter()
+                    .map(|tx| (tx, update.update_id)),
+            );
         }
         let rate = (self.fees)();
-        for commitment in commitments {
+        for (commitment, observed_update_id) in commitments {
             if let Some(candidate) = form_candidate(id, &commitment, &state.destination, rate) {
                 let key = candidate_key(&candidate);
                 if state
@@ -441,7 +496,8 @@ impl<P> TowerPersister<P> {
                 if client.read_candidate(id, &key)?.is_none() {
                     state.pending.push(PendingCandidate {
                         candidate,
-                        observed_update_id: monitor.get_latest_update_id(),
+                        // Redelivery to a newer monitor must not refresh an old alternative's age.
+                        observed_update_id,
                         funding_outpoint: Some(
                             commitment.trust().built_transaction().transaction.input[0]
                                 .previous_output,
@@ -491,11 +547,12 @@ impl<P> TowerPersister<P> {
                 "tower_candidates",
                 &channel,
                 &key,
-                StoredCandidate::new(signed, pending.observed_update_id).encode(),
+                StoredCandidate::new(signed, pending.observed_update_id, pending.funding_outpoint)
+                    .encode(),
             )?;
             // Persist the replacement before pruning any older alternative. The target is
             // soft when every retained commitment is distinct; age alone never loses one.
-            client.prune_candidates(id)?;
+            client.prune_candidates(id, &state.retired_funding, active_funding)?;
             state.pending.remove(index);
             client
                 .store
