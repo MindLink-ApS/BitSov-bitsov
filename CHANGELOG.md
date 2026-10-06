@@ -3,14 +3,20 @@
 All notable BitSov node (`konsensus`) releases are documented here. Pre-rc8 notes
 also live on the corresponding GitHub pre-release pages.
 
+## Next release (not in rc10)
+
+- Hub-only channels while a node can sit locked (#257, open, not merged). With
+  `--remote-unlock`, channel opens and inbound channel requests are refused
+  unless the counterparty is the configured hub/LSP, because nothing watches
+  the node's channels while it is locked. Not part of `v0.3.0-rc10`; rc10 nodes
+  using `--remote-unlock` should still keep channels to their hub only.
+
 ## [0.3.0-rc10] — 2026-10-06 (prep; not tagged yet)
 
-**Pre-release.** Not for production use. Covers the 12 merged commits from
-`v0.3.0-rc9` (`cd75c69`) through **#252** (`64b4542`), including #250
-(`a0062b2`), #251 (`29385e7`) and #252 (`64b4542`). One PR is still
-**expected** before tagging and is the last piece of rc10: #256 (P2 remote
-first run). Entries marked _(expected)_ describe its open head at preparation
-time; confirm or remove them before tagging. Signing checklist: [`docs/releases/v0.3.0-rc10.md`](docs/releases/v0.3.0-rc10.md).
+**Pre-release.** Not for production use. Covers the 13 merged commits from
+`v0.3.0-rc9` (`cd75c69`) through **#256** (`d59031f`), including #250
+(`a0062b2`), #251 (`29385e7`), #252 (`64b4542`) and #256 (`d59031f`).
+Signing checklist: [`docs/releases/v0.3.0-rc10.md`](docs/releases/v0.3.0-rc10.md).
 Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
 
 ### Security
@@ -88,15 +94,17 @@ Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
   printable characters) appears in tickets, `/api/v1/node/lock` and
   `/api/v1/health`. It is display only and does not imply `identity.hosted`
   custody.
-- _(expected, #256 — last rc10 piece)_ Remote first run (P2):
+- Remote first run (#256, P2; merge `d59031f`):
   `start --remote-unlock --local-owner-device` on a positively empty data
   directory serves two-phase bootstrap over the box-static Noise tunnel to the
   one client that consumed a pre-bootstrap `pair-ticket`. `create-pending`
   takes a `password_commitment` and `finalize` takes the password over the
   tunnel only (`400 tunnel_required` on loopback). The commit writes only
-  `mnemonic.enc`, records `enrolled_by: "remote_first_run"`, and exits 75 so
+  `mnemonic.enc`, records `enrolled_by: "remote_first_run"`, writes signed
+  public identity metadata, returns the box proof, and exits 75 so
   `Restart=on-failure` restarts into locked mode for the first remote unlock.
-  Legacy create/restore are not routed in this mode.
+  Legacy create/restore are not routed in this mode. See
+  [remote first run](docs/security/pairing.md#remote-first-run-over-the-tunnel).
 
 ### Docs
 

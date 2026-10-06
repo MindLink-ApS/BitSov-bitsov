@@ -1,8 +1,43 @@
 //! Parse password-bearing JSON without serde_json's unwiped escape scratch.
+use std::time::Duration;
+
+use axum::extract::Request;
+use futures::StreamExt;
 use serde::Deserialize;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::UnlockError;
+
+const MAX_BODY: usize = 16 * 1024;
+
+/// Read a password-bearing body into wiped memory, bounding both allocation
+/// and upload time, and wipe each exclusively-owned frame. Hyper may share a
+/// frame with its HTTP read buffer: that library-owned allocation (like
+/// kernel socket buffers) cannot be wiped through Bytes.
+pub(crate) async fn read(request: Request) -> Option<Zeroizing<Vec<u8>>> {
+    let read = async {
+        let mut raw = Zeroizing::new(Vec::with_capacity(MAX_BODY));
+        let mut stream = request.into_body().into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.ok()?;
+            let oversized = raw.len() + chunk.len() > MAX_BODY;
+            if !oversized {
+                raw.extend_from_slice(&chunk);
+            }
+            if let Ok(mut chunk) = chunk.try_into_mut() {
+                chunk.as_mut().zeroize();
+            }
+            if oversized {
+                return None;
+            }
+        }
+        Some(raw)
+    };
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .ok()
+        .flatten()
+}
 
 pub(super) struct UnlockBody {
     pub challenge: String,
@@ -42,7 +77,7 @@ fn quad(chars: &mut std::str::Chars<'_>) -> Result<u32, UnlockError> {
     })
 }
 
-fn decode_password(raw: &str) -> Result<Zeroizing<String>, UnlockError> {
+pub(crate) fn decode_password(raw: &str) -> Result<Zeroizing<String>, UnlockError> {
     let inner = raw
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))

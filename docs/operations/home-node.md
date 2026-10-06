@@ -20,9 +20,10 @@ The example [systemd unit](konsensus.service) uses these switches and
 `Restart=on-failure`. Install it only after the unlocked migration and owner
 key enrollment. There is no password file, `LoadCredentialEncrypted`, or
 password in argv/environment. On reboot the box waits for the device to unlock;
-it does not automatically retrieve a password from its disk. A plaintext seed,
-missing/stale public identity metadata or an empty data directory is refused.
-Repair metadata by starting normally with the correct encrypted seed first.
+it does not automatically retrieve a password from its disk. A plaintext seed or
+missing/stale public identity metadata is refused. Repair metadata by starting
+normally with the correct encrypted seed first. A positively empty data
+directory starts [remote first run](#remote-first-run-on-an-empty-box) instead.
 
 While locked, the only routes are `GET /livez`, `GET /api/v1/node/lock`,
 `POST /api/v1/node/unlock/challenge` and `POST /api/v1/node/unlock`. The first two
@@ -108,8 +109,9 @@ a stopped/crashed locked run, until a successful unlocked start refreshes public
 identity metadata. For an initialized node, start unlocked with this version once
 before issuing tickets: `identity/identity.json` contains both signed transport
 proofs, and the CLI never reads or decrypts the seed. Pre-bootstrap tickets omit
-`node_id` and identity signatures and carry only the persistent box public key;
-remote bootstrap itself is a separate P2 feature.
+`node_id` and identity signatures and carry only the persistent box public key.
+On an empty box such a ticket grants the one first-run pairing, which can create
+the identity (see below), so guard it like the seed itself.
 
 The daemon continues to create a five-minute first-pairing ticket when no ticket
 or paired clients exist. It only prints the protected file's path, never its URI
@@ -134,3 +136,33 @@ data directory, seed, password, ticket and set of ports per person (for example,
 `konsensus@<name>.service` instances). The OS operator can take a node offline and
 read its encrypted seed, box key and pairing records; the network-impersonation
 risk above still applies per person.
+
+## Remote first run on an empty box
+
+A headless box can be set up entirely from the owner's phone or Mac. Configure
+`[api]`, `[remote_access]` and an `identity.mnemonic_file` that does not exist
+yet, leave the data directory otherwise empty, and issue a ticket on the box:
+
+```sh
+konsensus pair-ticket --config /path/to/konsensus.toml --qr
+```
+
+Then start the same command as above (`--remote-unlock --local-owner-device`, no
+password source), for example through the systemd unit. The box serves bootstrap
+mode over the box-static Noise tunnel and binds no peer port. The client:
+
+1. Scans the ticket, pins its box key, and pairs with its code. This is the only
+   first-run pairing; a second ticket is refused.
+2. Generates the startup password, stores it, and sends only
+   `blake3(password)` to `create-pending`. It shows the phrase to the owner.
+3. Sends the backup words, its Secure Enclave device key and the password to
+   `finalize`, over the tunnel only. The loopback API refuses both calls.
+4. Re-pins the box key from the identity-signed proof in the finalize response.
+
+The box writes only `identity/mnemonic.enc`, records the device as
+`enrolled_by: remote_first_run`, and exits with status 75. `Restart=on-failure`
+restarts it into locked mode, and the client performs the first unlock with the
+stored password immediately. Under a supervisor that does not restart on 75,
+start the same command again yourself. If the password is lost before that
+unlock, only the recorded phrase can recover the node. Details and error codes:
+[remote first run](../security/pairing.md#remote-first-run-over-the-tunnel).

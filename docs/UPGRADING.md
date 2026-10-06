@@ -3,11 +3,10 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-**rc10 preparation:** covers `main` from `v0.3.0-rc9` (`cd75c69`) through #252
-(`64b4542`), 2026-10-06, including #250 (`a0062b2`), #251 (`29385e7`) and #252
-(`64b4542`). Items marked _(expected)_ come from #256 (P2 remote first run), the
-last rc10 piece, which was open at preparation time; confirm or remove them
-before tagging. The rc9 and older procedures remain below for nodes skipping
+**rc10 preparation:** covers `main` from `v0.3.0-rc9` (`cd75c69`) through #256
+(`d59031f`), 2026-10-06, including #250 (`a0062b2`), #251 (`29385e7`), #252
+(`64b4542`) and #256 (`d59031f`). Hub-only channels while lockable (#257) is
+not in rc10. The rc9 and older procedures remain below for nodes skipping
 releases: apply them first, then this one.
 
 ## rc9 → rc10 procedure
@@ -88,7 +87,7 @@ releases: apply them first, then this one.
     The automatic five-minute first-pairing link is unchanged; the daemon only
     prints the protected file's path. Optionally set `[node] hosted_by`. See
     [enrollment tickets](operations/home-node.md#enrollment-tickets-and-box-labels).
-11. _(expected, #256 — last rc10 piece)_ **Remote first run.** Only fresh
+11. **Remote first run (#256).** Only fresh
     installs are affected: `start --remote-unlock --local-owner-device` on a
     positively empty data directory serves two-phase bootstrap over the tunnel
     to the client that consumed a pre-bootstrap `pair-ticket`, then exits 75.
@@ -142,9 +141,12 @@ transport key. Preserve `identity/identity.json` and `pairing/box-transport.key`
 The home-node systemd example now uses `--remote-unlock --local-owner-device`;
 remove any password file or credential directive when adopting it. Existing
 manual/descriptor startup remains available. New pairing while locked is not
-supported. Remote first-run bootstrap on an empty data directory is
-_(expected, #256)_; without it, first run stays local. A locked node does not monitor channels:
-read [the home-node runbook](operations/home-node.md) before changing unattended
+supported. Remote first-run bootstrap on an empty data directory (#256) is
+supported; see
+[remote first run on an empty box](operations/home-node.md#remote-first-run-on-an-empty-box).
+A locked node does not monitor channels, so keep channels only with your hub;
+rc10 does not enforce this (#257 is not in rc10). Read
+[the home-node runbook](operations/home-node.md) before changing unattended
 startup. `--remote-unlock` is an argv switch, never a configuration setting.
 
 **rc9 preparation:** covers `main` through #240 (`7fde729`), 2026-10-06.
