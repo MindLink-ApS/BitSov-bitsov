@@ -9,20 +9,46 @@ on:
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
-  # 2026-04-30: paths-ignore REMOVED from pull_request. Branch protection on
-  # main requires Rust Check & Test + Semgrep to report
-  # status; if a PR matches paths-ignore the workflow is skipped, the
-  # required checks never report, and the PR is permanently blocked
-  # (deadlock). Cost of running CI on doc-only PRs is ~10 min compute,
-  # acceptable. The push trigger keeps paths-ignore so daily-merged docs
-  # don't waste CI minutes on main itself.
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Preserve release and main runs; only superseded PR runs are disposable.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    outputs:
+      # Pushes and tags always receive the full validation path. Only PRs may
+      # use the lightweight required-check path.
+      rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
+    steps:
+      - name: Detect Rust-impacting changes
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - '**'
+              - '!docs/**'
+              - '!**/*.md'
+              - '!LICENSE'
+              - '!.gitignore'
+              - '!CODEOWNERS'
+              - '!.github/dependabot.yml'
+
   release-sign-test:
     name: Offline Release Signing
     runs-on: ubuntu-latest
@@ -51,6 +77,10 @@ jobs:
 
   check:
     name: Rust Check & Test
+    needs: changes
+    # A skipped job reports success under GitHub branch protection, preserving
+    # this required check without allocating a runner for docs-only/draft PRs.
+    if: needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     env:
       # Keep the hosted runner below disk/linker pressure during the core test
@@ -84,16 +114,11 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev
 
-      - uses: actions/cache@v4
+      # rust-cache includes dependency build artifacts in target/ and keys the
+      # cache on Cargo.lock, the compiler, the host, and relevant job settings.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+          shared-key: workspace-${{ hashFiles('Cargo.lock') }}
 
       - name: Check disk space
         run: df -h /
@@ -119,6 +144,10 @@ jobs:
 
   audit:
     name: Cargo Audit
+    needs: changes
+    # Keep the required check present while avoiding tool setup on
+    # docs-only/project-management-only and draft PRs.
+    if: needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
