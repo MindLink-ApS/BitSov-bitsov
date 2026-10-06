@@ -55,7 +55,11 @@ also read **VM / multi-host upgrade rules** and **Encrypted seed / custody**.
    migrated SQL or restore stale Lightning state.
 
 The executed [rc7 → rc9 upgrade check](releases/v0.3.0-rc9.md#upgrade-check)
-records the marker refusal, explicit repair, pricing adjustment and mock start.
+uses the verified rc7 release sidecar (SHA-256 `e7429f6a…`) and records the
+marker refusal, explicit repair, pricing adjustment and mock start. That sidecar
+still generates `web_content_msat = 50`: after marker repair, rc9 refuses until
+it is raised to at least 1000 or removed, because the Porch floor is validated
+even when web serving is disabled. Marker repair does not change this config.
 It is not a funded-wallet or live-channel migration qualification.
 
 ## rc8 → rc9 procedure
