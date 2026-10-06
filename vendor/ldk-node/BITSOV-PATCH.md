@@ -472,3 +472,34 @@ before enqueueing. Replay permits inputs spent by that same canonical sweep,
 but returns `MoveHomeSweepUnavailable` with operator guidance for missing inputs
 or inputs spent by a conflict/replacement. Queueing is not confirmation. Real BDK
 tests cover this boundary in wallet/money_tests.rs.
+
+## Configurable `our_to_self_delay` (watchtower W0)
+
+Upstream `default_user_config` leaves `ChannelHandshakeConfig::our_to_self_delay`
+at LDK's `BREAKDOWN_TIMEOUT` (144 blocks) and offers no knob. `Config::our_to_self_delay:
+Option<u16>` defaults to `None`, which keeps that value. When set,
+`default_user_config` copies it into the handshake config after the existing
+announcement and forwarding adjustments. Every channel-creation path starts
+from that `UserConfig`: `Node::open_channel` (outbound), inbound acceptance in
+`event.rs` (its `ChannelConfigOverrides` only override the in-flight percentage),
+and the LSPS2 service open in `liquidity/jit.rs` (`get_current_config`).
+
+The value is the delay a counterparty must wait before claiming its `to_local`
+output after a unilateral close, so it is our window to punish a revoked state.
+It is fixed per channel at open; existing channels keep their negotiated value.
+The vendor does not range-check it: LDK refuses channels below 144, and a peer
+refuses values above its `their_to_self_delay` limit (LDK default 2016). BitSov
+exposes it as `[lightning] our_to_self_delay_blocks` and rejects values outside
+144..=2016 at config validation and again before `LdkProvider` builds the node.
+Our own force-close outputs wait on the peer's delay, which this setting does
+not change.
+
+No commitment, revocation, monitor or HTLC logic changes.
+
+    cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib bitsov_our_to_self_delay
+
+The unit test checks the unset default (144), applied values (144, 288, 2016),
+and that anchors and the inbound `their_to_self_delay` limit are unchanged. Not
+yet covered: a regtest scenario asserting the counterparty's
+`ChannelDetails::force_close_spend_delay` equals the configured value for
+inbound and outbound channels.

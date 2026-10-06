@@ -49,6 +49,8 @@ use konsensus_core::traits::lightning::{
 pub struct LdkConfig {
     /// Opt in to forwarding into private channels, without enabling announcements.
     pub forward_to_private_channels: bool,
+    /// Breach window (blocks) we ask peers to accept on new channels; `None` keeps LDK's 144.
+    pub our_to_self_delay_blocks: Option<u16>,
     /// Shared per-file diagnostic log limits.
     pub logging: konsensus_core::logging::LoggingConfig,
     /// Own Bitcoin Core overrides Esplora, including probes and fallback.
@@ -101,9 +103,29 @@ impl LdkConfig {
     ) -> ldk_node::config::Config {
         ldk_node::config::Config {
             accept_forwards_to_priv_channels: self.forward_to_private_channels,
+            our_to_self_delay: self.our_to_self_delay_blocks,
             work_admission: admission.map(ldk_node::config::WorkAdmissionCheck::new),
             ..Default::default()
         }
+    }
+}
+
+/// Accepted `lightning.our_to_self_delay_blocks`. LDK refuses channels below
+/// `BREAKDOWN_TIMEOUT` (144); peers on LDK defaults refuse above 2016.
+pub const OUR_TO_SELF_DELAY_BLOCKS: std::ops::RangeInclusive<u16> =
+    ldk_node::lightning::ln::channelmanager::BREAKDOWN_TIMEOUT..=2016;
+
+/// Validate before starting any network work; `None` keeps LDK's default.
+pub fn validate_our_to_self_delay(blocks: Option<u16>) -> Result<(), LightningError> {
+    match blocks {
+        Some(blocks) if !OUR_TO_SELF_DELAY_BLOCKS.contains(&blocks) => {
+            Err(LightningError::InvalidStartupConfig(format!(
+                "lightning.our_to_self_delay_blocks must be between {} and {} blocks (inclusive), got {blocks}",
+                OUR_TO_SELF_DELAY_BLOCKS.start(),
+                OUR_TO_SELF_DELAY_BLOCKS.end(),
+            )))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -569,6 +591,7 @@ impl LdkProvider {
         // itself `ZeroizeOnDrop`.
         let mnemonic_phrase = Zeroizing::new(std::mem::take(&mut config.mnemonic));
         let esplora_sync_config = config.esplora_sync_intervals.to_sync_config()?;
+        validate_our_to_self_delay(config.our_to_self_delay_blocks)?;
         let sync_intervals = if config.bitcoind.is_some() || config.electrum.is_some() {
             BackgroundSyncConfig::default()
         } else {

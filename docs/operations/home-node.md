@@ -61,8 +61,33 @@ Unlock promptly after every restart; do not treat these estimates as guarantees.
 
 LDK has no watchtower client here, and creating a justice transaction requires
 keys: there is no keyless watch-only protection. Keep channels only with the
-reputable hub while this gap exists. A later change may negotiate an inbound
-`our_to_self_delay` of at least 288 blocks; this release does not set that value.
+reputable hub while this gap exists.
+
+### Longer breach window (optional)
+
+You can ask channel peers for a longer window to respond to a revoked state:
+
+```toml
+[lightning]
+backend = "ldk"
+our_to_self_delay_blocks = 288  # about two days
+```
+
+The value is the number of blocks a peer must wait before it can claim its own
+balance after it force-closes. During that wait the unlocked node can punish an
+old state, so 288 gives roughly two days to unlock instead of one. It applies to
+channels opened after the change, in both directions (including channels the
+hub opens to you); existing channels keep the value they were opened with.
+Accepted values are 144 to 2016 blocks; others are refused at startup. Omitting
+the key keeps LDK's default of 144, the behaviour of earlier releases.
+
+The peer must agree. LDK peers accept up to 2016 by default; a peer with a
+lower limit refuses the channel, and the open fails rather than falling back to
+144. A larger value delays the peer's funds after its force-close, so some peers
+may prefer not to accept it. It does not delay your own funds when you
+force-close; that wait is set by the peer. It is not a watchtower: if the box
+stays locked or offline for longer than the window, the risk above still
+applies.
 
 Peers get connection refused while the node is locked. The tier-2 relay is not a
 session forwarder and does not queue messages for it. Paid messages are not

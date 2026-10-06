@@ -509,6 +509,12 @@ pub enum LightningConfig {
         /// forwarded HTLCs hold liquidity until resolved (see docs/regtest-e2e.md).
         #[serde(default)]
         forward_to_private_channels: bool,
+        /// Blocks a peer must wait to claim its balance after force-closing a new channel,
+        /// i.e. our window to punish a revoked state (144..=2016; omitted keeps LDK's 144).
+        /// Home nodes that may stay locked can set 288 (about two days); see
+        /// docs/operations/home-node.md. Existing channels keep their negotiated value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        our_to_self_delay_blocks: Option<u16>,
         /// Listening address for Lightning P2P (e.g., "0.0.0.0:9735").
         #[serde(default)]
         listening_address: Option<String>,
@@ -1244,10 +1250,12 @@ impl NodeConfig {
         if let LightningConfig::Ldk {
             lsps2_service,
             liquidity,
+            our_to_self_delay_blocks,
             ..
         } = &self.lightning
         {
             lsps2_service.to_ldk(liquidity.enabled)?;
+            konsensus_lightning::ldk::validate_our_to_self_delay(*our_to_self_delay_blocks)?;
         }
         self.lightning.esplora_sync_intervals().to_sync_config()?;
         self.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?;
@@ -1653,6 +1661,7 @@ impl NodeConfig {
                     liquidity: Default::default(),
                     lsps2_service: Default::default(),
                     forward_to_private_channels: false,
+                    our_to_self_delay_blocks: None,
                     listening_address: Some("0.0.0.0:9735".to_string()),
                     advertised_address: None,
                 },

@@ -111,6 +111,7 @@ pub(crate) const EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS: u64 = 5;
 /// | `network`                              | Bitcoin            |
 /// | `listening_addresses`                  | None               |
 /// | `accept_forwards_to_priv_channels`     | false              |
+/// | `our_to_self_delay`                    | None               |
 /// | `node_alias`                           | None               |
 /// | `default_cltv_expiry_delta`            | 144                |
 /// | `onchain_wallet_sync_interval_secs`    | 80                 |
@@ -132,6 +133,11 @@ pub struct Config {
 	/// Opt in to forwarding payments into private channels, even without a node alias.
 	/// Defaults to false. This does not enable node or channel announcements.
 	pub accept_forwards_to_priv_channels: bool,
+	/// Blocks the counterparty must wait before claiming its `to_local` output after a
+	/// unilateral close, i.e. our window to punish a revoked state. Applies to new inbound
+	/// and outbound channels. `None` keeps LDK's default of 144. LDK refuses channels with
+	/// values below 144, and peers on LDK defaults refuse values above 2016.
+	pub our_to_self_delay: Option<u16>,
 	/// Optional local disk admission check. False rejects unpaid incoming HTLCs
 	/// and new inbound channels, without affecting settlement recovery or closes.
 	pub work_admission: Option<WorkAdmissionCheck>,
@@ -219,6 +225,7 @@ impl Default for Config {
 			work_admission: None,
 			cooperative_close_only: false,
 			accept_forwards_to_priv_channels: false,
+			our_to_self_delay: None,
 			storage_dir_path: DEFAULT_STORAGE_DIR_PATH.to_string(),
 			network: DEFAULT_NETWORK,
 			listening_addresses: None,
@@ -367,6 +374,11 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	// Apply only the opt-in so an unset flag preserves upstream behavior.
 	if config.accept_forwards_to_priv_channels {
 		user_config.accept_forwards_to_priv_channels = true;
+	}
+
+	// BitSov: a box that may be locked or offline needs a longer breach window.
+	if let Some(delay) = config.our_to_self_delay {
+		user_config.channel_handshake_config.our_to_self_delay = delay;
 	}
 
 	user_config
@@ -614,6 +626,30 @@ mod tests {
 				assert!(config.node_alias.is_none());
 				assert!(may_announce_channel(&config).is_err());
 			}
+		}
+	}
+
+	#[test]
+	fn bitsov_our_to_self_delay_is_opt_in() {
+		use lightning::ln::channelmanager::BREAKDOWN_TIMEOUT;
+
+		assert_eq!(Config::default().our_to_self_delay, None);
+		let unset = super::default_user_config(&Config::default());
+		assert_eq!(unset.channel_handshake_config.our_to_self_delay, BREAKDOWN_TIMEOUT);
+		assert_eq!(BREAKDOWN_TIMEOUT, 144);
+
+		for delay in [144, 288, 2016] {
+			let config = Config { our_to_self_delay: Some(delay), ..Default::default() };
+			let user = super::default_user_config(&config);
+			assert_eq!(user.channel_handshake_config.our_to_self_delay, delay);
+			assert_eq!(
+				user.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx,
+				unset.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx
+			);
+			assert_eq!(
+				user.channel_handshake_limits.their_to_self_delay,
+				unset.channel_handshake_limits.their_to_self_delay
+			);
 		}
 	}
 

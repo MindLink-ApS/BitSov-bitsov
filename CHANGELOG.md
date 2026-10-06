@@ -18,6 +18,10 @@ also live on the corresponding GitHub pre-release pages.
   identity metadata, returns the box proof, and exits 75 so `Restart=on-failure`
   restarts into locked mode for the first remote unlock. Legacy create/restore
   are not routed in this mode. See [remote first run](docs/security/pairing.md#remote-first-run-over-the-tunnel).
+- Optional `[lightning] our_to_self_delay_blocks` (144 to 2016) sets the breach
+  window peers must accept on new channels, inbound and outbound. Home nodes
+  that may stay locked can set 288 (about two days). Omitting it keeps LDK's 144;
+  existing channels keep their negotiated value. See [the home-node runbook](docs/operations/home-node.md#longer-breach-window-optional).
 
 ## [0.3.0-rc9] — 2026-10-06 (prep; not tagged yet)
 
