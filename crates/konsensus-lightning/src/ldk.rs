@@ -59,6 +59,9 @@ pub struct LdkConfig {
     pub liquidity: LiquidityConfig,
     /// Opt-in hub service; mutually exclusive with the LSPS2 client.
     pub lsps2_service: crate::lsps2_service::Lsps2ServiceConfig,
+    /// When set, new channels in either direction are limited to these node ids
+    /// (`--remote-unlock`: the configured hub/LSPs). Excludes the hub service role.
+    pub channel_peers: Option<Vec<String>>,
     /// Path to store LDK state (channel monitors, network graph, scorer, etc.).
     pub storage_dir: PathBuf,
     /// Directory where encrypted SCB snapshots are rotated.
@@ -577,6 +580,10 @@ impl LdkProvider {
                 .expect("background sync is enabled")
         };
         let lsps2_service = config.lsps2_service.to_ldk(config.liquidity.enabled)?;
+        let channel_peer_allowlist = channel_peer_allowlist(
+            config.channel_peers.as_deref(),
+            lsps2_service.is_some(),
+        )?;
         let mnemonic = Mnemonic::from_str(&mnemonic_phrase)
             .map_err(|e| LightningError::InvalidStartupConfig(format!("invalid mnemonic: {e}")))?;
 
@@ -657,6 +664,7 @@ impl LdkProvider {
 
         let mut node_config = config.node_config(admission);
         node_config.cooperative_close_only = moving_home;
+        node_config.channel_peer_allowlist = channel_peer_allowlist;
         let mut builder = LdkBuilder::from_config(node_config);
         builder.set_network(network);
         builder.set_entropy_seed_bytes(*ldk_seed);
@@ -2885,6 +2893,30 @@ fn refuse_exact_funding_rate(rate: Option<f32>) -> Result<(), LightningError> {
         ));
     }
     Ok(())
+}
+
+/// The hub service opens JIT channels to arbitrary clients, so it cannot run hub-only.
+fn channel_peer_allowlist(
+    peers: Option<&[String]>,
+    hub_service: bool,
+) -> Result<Option<Vec<ldk_node::bitcoin::secp256k1::PublicKey>>, LightningError> {
+    use konsensus_core::traits::lightning::HUB_ONLY_WHILE_LOCKABLE;
+    let Some(peers) = peers else { return Ok(None) };
+    if hub_service {
+        return Err(LightningError::InvalidStartupConfig(format!(
+            "{HUB_ONLY_WHILE_LOCKABLE}: lsps2_service opens channels to any client; disable it to start with --remote-unlock"
+        )));
+    }
+    peers
+        .iter()
+        .map(|peer| peer.parse())
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+        .map_err(|_| {
+            LightningError::InvalidStartupConfig(format!(
+                "{HUB_ONLY_WHILE_LOCKABLE}: invalid hub/LSP node id"
+            ))
+        })
 }
 
 /// Migration consent remains attached to this store even after completion.

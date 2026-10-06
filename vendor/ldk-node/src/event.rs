@@ -1214,6 +1214,16 @@ where
                     }
                     return Ok(());
                 }
+                if self.config.channel_peer_allowlist.as_ref().is_some_and(|peers| !peers.contains(&counterparty_node_id)) {
+                    log_info!(self.logger, "HUB_ONLY_WHILE_LOCKABLE: refusing inbound channel from peer {}", counterparty_node_id);
+                    // Unaccepted request: no funding transaction exists yet.
+                    if let Err(error) = self.channel_manager.force_close_broadcasting_latest_txn(
+                        &temporary_channel_id, &counterparty_node_id, "HUB_ONLY_WHILE_LOCKABLE".into(),
+                    ) {
+                        log_error!(self.logger, "Failed to reject inbound channel: {:?}", error);
+                    }
+                    return Ok(());
+                }
 				if is_announced {
 					if let Err(err) = may_announce_channel(&*self.config) {
 						log_error!(self.logger, "Rejecting inbound announced channel from peer {} due to missing configuration: {}", counterparty_node_id, err);
@@ -2165,3 +2175,7 @@ mod bitsov_stateless_tests {
 #[cfg(test)]
 #[path = "tests/bitsov_jit.rs"]
 mod bitsov_jit_tests;
+
+#[cfg(test)]
+#[path = "tests/bitsov_channel_peers.rs"]
+mod bitsov_channel_peers_tests;

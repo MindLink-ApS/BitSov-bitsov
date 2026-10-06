@@ -59,9 +59,36 @@ state and deadlines. Outgoing HTLCs also resolve on-chain through the peer.
 Unlock promptly after every restart; do not treat these estimates as guarantees.
 
 LDK has no watchtower client here, and creating a justice transaction requires
-keys: there is no keyless watch-only protection. Keep channels only with the
-reputable hub while this gap exists. A later change may negotiate an inbound
-`our_to_self_delay` of at least 288 blocks; this release does not set that value.
+keys: there is no keyless watch-only protection. The node therefore enforces
+hub-only channels while it can sit locked (next section). A later change may
+negotiate an inbound `our_to_self_delay` of at least 288 blocks; this release
+does not set that value.
+
+## Hub-only channels: `HUB_ONLY_WHILE_LOCKABLE`
+
+Started with `--remote-unlock`, the node opens and accepts new channels only with
+the hub/LSP node ids listed under `[lightning.liquidity] providers` (every listed
+provider, not only `selected_provider`). The rule holds for the whole run, after
+unlock too, because the next reboot leaves every channel unwatched again:
+
+- Owner `POST /api/v1/payments/open-channel` to any other peer returns 403 with
+  `"code": "HUB_ONLY_WHILE_LOCKABLE"` and `"retry_allowed": false`. Nothing is
+  dialed, funded or signed.
+- The onboarding auto-channel worker gets the same refusal and leaves the invite
+  pending.
+- Inbound channel requests from any other peer are rejected before acceptance
+  (`HUB_ONLY_WHILE_LOCKABLE: refusing inbound channel` in `ldk_node.log`).
+  The hub's LSPS2 JIT channels are accepted as before.
+- `[lightning.lsps2_service] enabled = true` opens channels to arbitrary clients,
+  so `--remote-unlock` refuses to start with it.
+- With no provider listed, or with a non-LDK backend, every new channel is refused.
+
+Existing channels, payments, forwarding and closes are unaffected. The flag does
+not close channels a node opened during an earlier start without it; close any
+non-hub channels before relying on remote unlock. A start without
+`--remote-unlock` keeps the previous behaviour. The rule relaxes only once
+watchtowers exist that are not the channel's counterparty; a hub-run tower cannot
+guard against the hub itself.
 
 Peers get connection refused while the node is locked. The tier-2 relay is not a
 session forwarder and does not queue messages for it. Paid messages are not

@@ -9,6 +9,10 @@ also live on the corresponding GitHub pre-release pages.
   an existing owner-approved device over the pinned box-static Noise tunnel.
   Locked nodes serve four routes only, do not receive messages or watch Lightning
   channels, and never persist the unlock password. See [the home-node runbook](docs/operations/home-node.md).
+- `start --remote-unlock` limits new channels, outbound and inbound, to the
+  configured `[lightning.liquidity] providers` hub/LSPs until a watchtower exists.
+  Other opens are refused with `HUB_ONLY_WHILE_LOCKABLE` (API 403), and the LSPS2
+  hub service cannot be combined with the flag. Starts without the flag are unchanged.
 
 ## [0.3.0-rc9] — 2026-10-06 (prep; not tagged yet)
 

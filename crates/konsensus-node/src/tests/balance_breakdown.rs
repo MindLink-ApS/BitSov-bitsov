@@ -73,6 +73,7 @@ async fn assert_balance_breakdown(disk_floor: u64, with_circuit_breaker: bool) {
     let provider = Arc::new(GuardedLightning {
         inner,
         disk,
+        channel_peers: Default::default(),
         _state_guard: Arc::new(
             crate::safety::ensure_generation(dir.path(), crate::safety::STATE_GENERATION).unwrap(),
         ),

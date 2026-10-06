@@ -83,6 +83,7 @@ fn config(dir: &tempfile::TempDir, url: &str) -> LdkConfig {
     LdkConfig {
         forward_to_private_channels: false,
         lsps2_service: Default::default(),
+        channel_peers: None,
         esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,
