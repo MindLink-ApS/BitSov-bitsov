@@ -74,11 +74,22 @@ pub struct KonsensusNode {
 }
 
 impl KonsensusNode {
-    /// Build a node from configuration.
+    /// Build a node with no channel-peer limit.
+    #[cfg(test)]
+    pub async fn from_config(config: NodeConfig, mnemonic_password: Option<&str>) -> Result<Self> {
+        Self::from_config_with_channel_peers(config, mnemonic_password, Default::default()).await
+    }
+
+    /// Build a node from configuration, limiting new channels in both directions
+    /// to `channel_peers`.
     ///
     /// This wires all components together based on the config file's
     /// backend selections. The node is not started yet — call [`Self::start`] next.
-    pub async fn from_config(config: NodeConfig, mnemonic_password: Option<&str>) -> Result<Self> {
+    pub async fn from_config_with_channel_peers(
+        config: NodeConfig,
+        mnemonic_password: Option<&str>,
+        channel_peers: crate::guarded_lightning::ChannelPeers,
+    ) -> Result<Self> {
         config.validate_routing_fee_backend()?;
         // Fail closed before starting LDK or opening node state on insecure credentials.
         let chain_auth = match &config.chain {
@@ -240,6 +251,7 @@ impl KonsensusNode {
                     },
                     liquidity: liquidity.clone(),
                     lsps2_service: lsps2_service.clone(),
+                    channel_peers: channel_peers.allowlist(),
                     storage_dir: ldk_storage_dir,
                     scb_backup_dir: Some(std::path::PathBuf::from(&config.backup.scb_dir)),
                     scb_rotation_count: config.backup.rotation_count,
@@ -306,6 +318,7 @@ impl KonsensusNode {
             Arc::new(crate::guarded_lightning::GuardedLightning {
                 inner: lightning,
                 disk: disk.clone(),
+                channel_peers,
                 _state_guard: state_guard.clone(),
             });
         info!("lightning provider initialized");
