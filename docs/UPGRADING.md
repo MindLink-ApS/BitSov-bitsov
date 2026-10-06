@@ -3,12 +3,102 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-**rc8 preparation:** covers `main` through #184 (`62238c2`), 2026-10-02. Read
-this before swapping a long-lived data directory onto the new binary. Fresh
-`konsensus init` installs do not need the retained-node repair steps. For VMs, also read **VM / multi-host
-upgrade rules** and **Encrypted seed / custody** below.
+**rc9 preparation:** covers `main` through #240 (`7fde729`), 2026-10-06.
+Read this before replacing a retained node's binary. The older rc7 → rc8
+procedure and compatibility inventory remain below for reference. Fresh rc9
+`konsensus init` installs do not need retained-node marker repair. For VMs,
+also read **VM / multi-host upgrade rules** and **Encrypted seed / custody**.
 
-## Opt-in local owner devices (unreleased)
+## rc7 → rc9 procedure
+
+1. Record the installed version, config path and selected chain source. Stop
+   the node cleanly; preserve the latest data directory and verify your normal
+   backup/recovery procedure. Do not re-run `init`, copy/export the seed, or
+   delete state to resolve an upgrade refusal. Upgrade one host at a time.
+2. Verify the replacement artifact's signed checksums and provenance under
+   [release policy](ops/RELEASE_POLICY.md). Source builds require Rust 1.88+
+   and the release lockfile. These preparation notes do not publish a release.
+3. Remove stale `KONSENSUS_SQLITE_MIGRATIONS_DIR`, or ensure it contains every
+   embedded SQLite migration **001–028**. rc7 ends at **019**; rc9 applies
+   **020–028** at first database open. There are no new numbered migrations
+   since rc8. Preserve the existing wallet, pairing, config and seed files;
+   check free space against the 2 GiB default reserve.
+4. Review the rc8 config/API inventory below and the rc9 changes in the next
+   section. In particular, rc7 init writes `[pricing] web_content_msat = 50`:
+   **raise it to at least `1000`** (1 sat), or remove it to use rc9's default.
+   A retained value below 1000 causes startup validation to refuse, even with
+   `[web] enabled = false`. Valid higher operator prices are preserved. Arrange
+   encrypted-seed password input before restarting an unattended service.
+5. Start rc9 with the existing config. A legacy identity without
+   `NODE_INITIALIZED` refuses with **`identity_without_marker`** (identity only)
+   or **`identity_and_state_without_marker`** (identity and retained state).
+   If inspection confirms a healthy legacy installation, explicitly consent:
+
+   ```bash
+   konsensus repair mark-initialized --config /path/to/konsensus.toml --confirm
+   konsensus start --config /path/to/konsensus.toml
+   ```
+
+   Repair writes only `NODE_INITIALIZED`; it does not recreate keys, migrate
+   SQL, repair config, rebind pairing or enroll devices. Normal startup writes
+   `STATE_GENERATION` and applies the pending SQL migrations. Never fabricate
+   markers for missing identity material or wipe state to reopen bootstrap.
+6. Inspect authenticated `/api/v1/status`: `disk_low`, `money_ready`,
+   `chain_view`, `chain_sync`, `custody_mode`, storage diagnostics and
+   `local_spends` where present. API availability or a successful mock startup
+   does not prove Lightning readiness. Reconcile pending payments, top-ups and
+   channel opens before retrying; timeouts are not proof of non-dispatch.
+7. Verify the app compatibility requirements below (including scoped tokens,
+   owner grants, `porch_quote_v1` and remote retry hints). A stopped pre-upgrade
+   copy is a rollback option only **before the first LDK start on rc9**. After
+   that, keep current state together and roll forward; never run rc7 against
+   migrated SQL or restore stale Lightning state.
+
+The executed [rc7 → rc9 upgrade check](releases/v0.3.0-rc9.md#upgrade-check)
+uses the verified rc7 release sidecar (SHA-256 `e7429f6a…`) and records the
+marker refusal, explicit repair, pricing adjustment and mock start. That sidecar
+still generates `web_content_msat = 50`: after marker repair, rc9 refuses until
+it is raised to at least 1000 or removed, because the Porch floor is validated
+even when web serving is disabled. Marker repair does not change this config.
+It is not a funded-wallet or live-channel migration qualification.
+
+## rc8 → rc9 procedure
+
+1. Stop cleanly, preserve current state, verify release provenance, and keep
+   the same config/data directory. The one-host-at-a-time and pre-LDK-only
+   rollback rules above apply. **No new numbered SQL migration** was added:
+   the embedded set remains **001–028**. Do not interpret this as downgrade
+   compatibility: local-spend, LSPS2 and owner-device state changed outside SQL.
+2. A healthy rc8 installation already has `NODE_INITIALIZED`; no routine repair
+   or reinitialization is needed. If the marker is absent, inspect the refusal
+   and use the same consent repair only for a verified healthy identity. A
+   deleted key or interrupted encrypted bootstrap needs its specific recovery,
+   not a blind marker write. Check retained `web_content_msat >= 1000` as above.
+3. Remove external `node.log` append/`tee` redirection before restart; node and
+   LDK files now rotate (10 MiB × 5 files each by default). Journald retention
+   and the security audit log remain separate. Set a supervisor stop budget
+   above the initialized node's 30-second shutdown deadline (the supplied unit
+   uses 45 seconds; bootstrap/password input is outside that bound).
+   See [logging](operations/logging.md) and the [service example](operations/konsensus.service).
+4. New capabilities remain opt-in: `--local-owner-device` on each start,
+   `[lightning.lsps2_service] enabled = true`, ordinary
+   `forward_to_private_channels = true`, Esplora `credentials_file`, and custom
+   sync intervals. Hub LSPS2 and LSPS2 client mode cannot run together; service
+   mode itself enables private forwarding. Omission does not enable a paid
+   chain provider, hub, owner console, STUN or remote access.
+5. Upgrade reader and serving nodes for `porch_quote_v1`; old serving nodes
+   refuse before payment. Raised tariffs **do not revoke old offers**; see
+   **Porch availability quotes** below. Remote clients may implement bounded
+   `rate_limited` handshake hints; a hint is unauthenticated and grants nothing.
+   Headless owner approvals remain local to the node host. Their files are
+   owner-only, not an isolation boundary against apps under the same OS account.
+6. Restart, inspect owner status and reconcile uncertain operations as in the
+   rc7 procedure. Channel-open `pending_visibility` is a pending success, not
+   retry permission. LSPS2's upstream pre-delivery crash window remains; its
+   at-least-once metrics are not an accounting ledger. Preserve journals and
+   reservations rather than deleting them to unblock funding.
+
+## Opt-in local owner devices (rc9)
 
 Existing console-enrolled devices can use `start --password-fd <n>
 --local-owner-device` on an initialized node. Supply the flag on every launch;
@@ -21,9 +111,22 @@ Without this flag, descriptor passwords keep `seed_password_not_typed` and
 sidecar grants remain inactive. The live mode does not open `control.sock`, enroll
 new devices, enable console grants or alter remote rules. On a positively empty
 directory it now enables encrypted two-phase bootstrap and one first owner
-device enrollment. Legacy create/restore encrypt when a startup password is
-present; no-password bootstrap retains its existing behavior. Review [password input](operations/password-input.md),
-including the Mac launcher's signing/hardened-runtime release requirement.
+device enrollment. Legacy HTTP create/restore now write `mnemonic.enc` whenever
+a startup password is present, including `--password` and `--password-file`
+without local owner authority; no-password bootstrap retains plaintext behavior. This does not
+automatically encrypt an existing plaintext seed. Review
+[password input](operations/password-input.md), including the Mac launcher's
+signing/hardened-runtime release requirement.
+
+After a failed encrypted bootstrap commit, `/api/v1/bootstrap/state` reports
+`state: "refused"`, `can_create: false`, `can_restore: false`, with no public
+refusal reason or repair details. Restart for CLI diagnostics. If the crash
+preceded config alignment, explicitly align `identity.mnemonic_file` to
+`identity/mnemonic.enc` before live startup. Marker repair alone does not do
+that, rebind an old empty-fingerprint pairing, or install a missing device
+record. Recover pairing/device authority through the owner console; bootstrap
+must not reopen or show the phrase again. See the
+[two-phase crash rules](security/pairing.md#two-phase-local-bootstrap).
 
 ## rc7 → rc8 procedure
 
@@ -64,14 +167,15 @@ including the Mac launcher's signing/hardened-runtime release requirement.
 Workspace `rust-version` is **1.88** (raised from 1.75). The tree uses
 `Option::is_none_or` (stabilized in 1.82), and the locked dependency set
 requires Rust 1.88 (`home` 0.5.12 and related crates). Build with Rust 1.88 or
-newer; CI continues to use stable. Release preparation checks the current tree
-with `cargo check --workspace --offline --locked`; this is not a fresh MSRV test.
+newer; CI continues to use stable. rc9 preparation uses Rust 1.91.1 for the
+locked offline build, Clippy and workspace tests; this is not a fresh MSRV test.
 
 ## Missing `NODE_INITIALIZED` after upgrade (pre-#76/#77 nodes)
 
 Nodes deployed before bootstrap (#76/#77) never wrote a `NODE_INITIALIZED` marker. After
 upgrading the binary, `konsensus start` refuses with reason
-`identity_and_state_without_marker`: identity material and wallet/channel state are present,
+`identity_without_marker` when only identity material exists, or
+`identity_and_state_without_marker` when identity and wallet/channel state exist,
 but the marker is absent.
 
 This is expected for a healthy legacy installation — not a signal to wipe the data directory.
@@ -82,7 +186,8 @@ konsensus repair mark-initialized --config /path/to/konsensus.toml --confirm
 ```
 
 Use the same config path you pass to `konsensus start` (`-c` / `--config`). The repair
-writes `NODE_INITIALIZED` and nothing else, then normal startup proceeds.
+writes `NODE_INITIALIZED` and nothing else. Normal startup still validates config
+and identity and applies pending migrations; repair does not bypass those checks.
 
 See also [pairing security](security/pairing.md) for how the marker fits into bootstrap.
 
@@ -187,7 +292,7 @@ stun_listen = "0.0.0.0:3478"   # UDP; omit to keep it off (default)
 
 See [`docs/v2/CALLS-PROTOTYPE.md`](v2/CALLS-PROTOTYPE.md).
 
-## VM / multi-host upgrade rules (rc8)
+## VM / multi-host upgrade rules (rc8 / rc9)
 
 These rules apply when replacing the binary on a long-lived data directory (Mac pilot
 or hosted VMs). They are operational constraints, not a claim that a particular
@@ -308,7 +413,7 @@ selects embedded LDK's chain source; it does not reconfigure an external LND.
 | `[network]` | `advertised_addr`, `stun_server` | Optional; explicit advertised address wins. Discovery uses only owner-set STUN; no default third-party server. |
 | `[calls]` | `stun_listen` | Omitted/off; optional UDP binding responder, no TURN. |
 | `[pricing]` | `call_msat` | New, default `10000`, must be positive; offer kind 400 only. |
-| `[pricing]` / `[web]` | Existing `web_content_msat` / `page_price_msat` | Defaults changed from 50 to 1000 msat. Porch enforcement and advertised card/manifest/pricing surfaces have a 1000-msat floor even with lower settings or discounts (#167, #173). |
+| `[pricing]` / `[web]` | Existing `web_content_msat` / `page_price_msat` | Defaults changed from 50 to 1000 msat before rc8 (#167, #173). Retained `web_content_msat < 1000` is rejected at startup, even if web serving is disabled; raise or remove it. `page_price_msat` is legacy, not a separate charge override. Porch floors still apply to advertised and paid prices. |
 | `[identity]` | `hosted` | Default false; true or cloud tier reports hosted custody. Seed encryption does not turn a hosted node into a remote signer. |
 | `[routing_fees]` | `minimum_msat`, `proportional_millionths`, `maximum_msat` | Defaults `5000`, `10000` (1%), `10000`; callers can tighten the computed ceiling, not widen it. Principal-only app caps may now refuse. |
 | `[lightning.liquidity]` (LDK) | `enabled`, `selected_provider`, `providers` entries with `node_id`, `address`, optional `token` | Off, no providers; LSPS2 funding pilot needs explicit provider/fee consent. No automatic failover. See [liquidity](LSPS2-LIQUIDITY.md). |
@@ -474,5 +579,6 @@ preview availability, principal, and the routing ceiling. Handle HTTP 404
 `porch_not_found` and the `porch_quote_unavailable`, `porch_quote_invalid`, and
 `porch_unavailable` reasons as prepayment refusals. Do not auto-retry paid
 failures. The safe default remains **1,000 msat = 1 sat**; explicit operator
-prices are preserved. See [BROWSE.md](protocol/BROWSE.md) and
+prices at or above that floor are preserved. Lower retained values must be
+raised or removed before startup. See [BROWSE.md](protocol/BROWSE.md) and
 [NOTES-PORCH.md](../NOTES-PORCH.md) for compatibility and availability limits.
