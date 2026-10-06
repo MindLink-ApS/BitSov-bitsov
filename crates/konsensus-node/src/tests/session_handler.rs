@@ -48,7 +48,10 @@ async fn e2ee_self_heal_targets_missing_or_receiver_only_sessions() {
         .initiate_session(bob.node_id(), &bob_bundle)
         .await
         .unwrap();
-    bob_mgr.accept_session(alice.node_id(), &init).await.unwrap();
+    bob_mgr
+        .accept_session(alice.node_id(), &init)
+        .await
+        .unwrap();
 
     assert!(
         !e2ee_needs_self_heal(&alice_mgr, bob.node_id()).await,
@@ -108,9 +111,10 @@ async fn progress_event_persisted_and_replayable() {
 #[tokio::test]
 async fn lightning_info_stores_valid_pubkey() {
     let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::<NodeId, String>::new(),
-    ));
+    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        NodeId,
+        String,
+    >::new()));
 
     handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &pubkeys).await;
 
@@ -122,9 +126,10 @@ async fn lightning_info_stores_valid_pubkey() {
 #[tokio::test]
 async fn lightning_info_rejects_short_pubkey() {
     let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::<NodeId, String>::new(),
-    ));
+    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        NodeId,
+        String,
+    >::new()));
 
     handle_lightning_info_received(&peer_id, "02abcdef", &pubkeys).await;
 
@@ -134,9 +139,10 @@ async fn lightning_info_rejects_short_pubkey() {
 #[tokio::test]
 async fn lightning_info_rejects_wrong_prefix() {
     let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::<NodeId, String>::new(),
-    ));
+    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        NodeId,
+        String,
+    >::new()));
 
     // Starts with 04 (uncompressed) — invalid.
     let bad_pk = "04abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
@@ -148,9 +154,10 @@ async fn lightning_info_rejects_wrong_prefix() {
 #[tokio::test]
 async fn lightning_info_rejects_invalid_hex() {
     let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::<NodeId, String>::new(),
-    ));
+    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        NodeId,
+        String,
+    >::new()));
 
     // Correct length but contains non-hex character 'zz'.
     let bad_pk = "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456zzab";
@@ -162,9 +169,10 @@ async fn lightning_info_rejects_invalid_hex() {
 #[tokio::test]
 async fn lightning_info_updates_on_reconnect() {
     let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::<NodeId, String>::new(),
-    ));
+    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        NodeId,
+        String,
+    >::new()));
 
     let pk1 = "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
     let pk2 = "03abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
@@ -185,16 +193,21 @@ async fn invoice_response_delivers_to_waiting_sender() {
     let request_id = "req-001".to_string();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let map: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
     handle_invoice_response(
-        &peer_id, &request_id,
+        &peer_id,
+        &request_id,
         "lnbc100n1...".to_string(),
         "abc123hash".to_string(),
         &map,
-    ).await;
+    )
+    .await;
 
     let data = rx.await.unwrap().unwrap();
     assert_eq!(data.bolt11, "lnbc100n1...");
@@ -206,16 +219,21 @@ async fn invoice_response_delivers_to_waiting_sender() {
 #[tokio::test]
 async fn invoice_response_unknown_request_id_is_noop() {
     let peer_id = test_peer_id();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let map: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // No request registered — should log warning but not panic
     handle_invoice_response(
-        &peer_id, "nonexistent",
+        &peer_id,
+        "nonexistent",
         "lnbc100n1...".to_string(),
         "hash".to_string(),
         &map,
-    ).await;
+    )
+    .await;
 
     assert!(map.lock().await.is_empty());
 }
@@ -226,8 +244,11 @@ async fn invoice_response_dropped_receiver_is_handled() {
     let request_id = "req-dropped".to_string();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let map: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
     // Drop the receiver to simulate timeout on compose side
@@ -235,11 +256,13 @@ async fn invoice_response_dropped_receiver_is_handled() {
 
     // Should not panic — sender.send() returns Err but is handled
     handle_invoice_response(
-        &peer_id, &request_id,
+        &peer_id,
+        &request_id,
         "lnbc100n1...".to_string(),
         "hash".to_string(),
         &map,
-    ).await;
+    )
+    .await;
 
     // Request should still be removed from map
     assert!(map.lock().await.is_empty());
@@ -251,8 +274,11 @@ async fn invoice_error_drops_sender_channel() {
     let peer_id = test_peer_id();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let map: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
     handle_invoice_error_received(&peer_id, &request_id, "invoice failed", true, &map).await;
@@ -268,11 +294,17 @@ async fn unprivileged_invoice_error_does_not_drop_sender_channel() {
     let peer_id = test_peer_id();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let map: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
-    assert!(handle_invoice_error_received(&peer_id, &request_id, "attacker-forged error", false, &map).await);
+    assert!(
+        handle_invoice_error_received(&peer_id, &request_id, "attacker-forged error", false, &map)
+            .await
+    );
 
     let sender = map
         .lock()
@@ -301,15 +333,26 @@ async fn unprivileged_refusal_of_a_request_sent_to_that_peer_ends_it() {
     let binding = konsensus_api::invoice_refusal::bind(&request_id, peer_id);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let map: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     map.lock().await.insert(request_id.clone(), tx);
 
     handle_invoice_error_received(
-        &peer_id, &request_id, konsensus_api::invoice_refusal::ADMISSION_REQUIRED, false, &map,
-    ).await;
+        &peer_id,
+        &request_id,
+        konsensus_api::invoice_refusal::ADMISSION_REQUIRED,
+        false,
+        &map,
+    )
+    .await;
 
-    assert!(rx.await.unwrap().is_err(), "the pending request ends at once");
+    assert!(
+        rx.await.unwrap().is_err(),
+        "the pending request ends at once"
+    );
     assert!(map.lock().await.is_empty());
     assert_eq!(
         binding.finish().as_deref(),
@@ -321,8 +364,11 @@ async fn unprivileged_refusal_of_a_request_sent_to_that_peer_ends_it() {
 #[tokio::test]
 async fn invoice_response_concurrent_requests_isolated() {
     let peer_id = test_peer_id();
-    let map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let map: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
+        >,
+    > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     let (tx1, rx1) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
     let (tx2, rx2) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
@@ -331,15 +377,23 @@ async fn invoice_response_concurrent_requests_isolated() {
 
     // Deliver response to req-2 first
     handle_invoice_response(
-        &peer_id, "req-2",
-        "bolt11-for-2".to_string(), "hash-2".to_string(), &map,
-    ).await;
+        &peer_id,
+        "req-2",
+        "bolt11-for-2".to_string(),
+        "hash-2".to_string(),
+        &map,
+    )
+    .await;
 
     // Deliver response to req-1 second
     handle_invoice_response(
-        &peer_id, "req-1",
-        "bolt11-for-1".to_string(), "hash-1".to_string(), &map,
-    ).await;
+        &peer_id,
+        "req-1",
+        "bolt11-for-1".to_string(),
+        "hash-1".to_string(),
+        &map,
+    )
+    .await;
 
     let data1 = rx1.await.unwrap().unwrap();
     let data2 = rx2.await.unwrap().unwrap();
@@ -357,23 +411,35 @@ async fn message_acked_records_routing_success() {
     let routing = Arc::new(konsensus_routing::RoutingTable::new(
         konsensus_routing::RoutingConfig::default(),
     ));
-    let send_timestamps = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let send_timestamps = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let storage: Arc<dyn konsensus_storage::Storage> =
         Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let (ws_tx, _ws_rx) = broadcast::channel::<Arc<WsDeliveryStatus>>(16);
 
     // Record send timestamp
-    send_timestamps.lock().await.insert(msg_id, std::time::Instant::now());
+    send_timestamps
+        .lock()
+        .await
+        .insert(msg_id, std::time::Instant::now());
 
     handle_message_acked(
-        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx, true).await;
+        &peer_id,
+        &msg_id,
+        &send_timestamps,
+        &storage,
+        &routing,
+        &ws_tx,
+        true,
+    )
+    .await;
 
     // Routing weight should be updated (> 0)
     let weight = routing.get_peer_weight(&peer_id).await;
     assert!(weight.is_some());
-    assert!(weight.unwrap() > 0.0, "routing weight should increase after ack");
+    assert!(
+        weight.unwrap() > 0.0,
+        "routing weight should increase after ack"
+    );
 
     // Send timestamp should be removed
     assert!(!send_timestamps.lock().await.contains_key(&msg_id));
@@ -386,16 +452,25 @@ async fn message_acked_without_timestamp_uses_zero_latency() {
     let routing = Arc::new(konsensus_routing::RoutingTable::new(
         konsensus_routing::RoutingConfig::default(),
     ));
-    let send_timestamps = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::<konsensus_core::types::MessageId, std::time::Instant>::new(),
-    ));
+    let send_timestamps = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        konsensus_core::types::MessageId,
+        std::time::Instant,
+    >::new()));
     let storage: Arc<dyn konsensus_storage::Storage> =
         Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let (ws_tx, _ws_rx) = broadcast::channel::<Arc<WsDeliveryStatus>>(16);
 
     // No timestamp registered — should still succeed with 0 latency
     handle_message_acked(
-        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx, true).await;
+        &peer_id,
+        &msg_id,
+        &send_timestamps,
+        &storage,
+        &routing,
+        &ws_tx,
+        true,
+    )
+    .await;
 
     let weight = routing.get_peer_weight(&peer_id).await;
     assert!(weight.is_some());
@@ -408,15 +483,21 @@ async fn message_acked_broadcasts_delivery_status() {
     let routing = Arc::new(konsensus_routing::RoutingTable::new(
         konsensus_routing::RoutingConfig::default(),
     ));
-    let send_timestamps = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let send_timestamps = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let storage: Arc<dyn konsensus_storage::Storage> =
         Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let (ws_tx, mut ws_rx) = broadcast::channel::<Arc<WsDeliveryStatus>>(16);
 
     handle_message_acked(
-        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx, true).await;
+        &peer_id,
+        &msg_id,
+        &send_timestamps,
+        &storage,
+        &routing,
+        &ws_tx,
+        true,
+    )
+    .await;
 
     let status = ws_rx.recv().await.unwrap();
     assert_eq!(status.status, "delivered");
@@ -431,9 +512,7 @@ async fn message_acked_prunes_stale_timestamps() {
     let routing = Arc::new(konsensus_routing::RoutingTable::new(
         konsensus_routing::RoutingConfig::default(),
     ));
-    let send_timestamps = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let send_timestamps = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let storage: Arc<dyn konsensus_storage::Storage> =
         Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let (ws_tx, _ws_rx) = broadcast::channel::<Arc<WsDeliveryStatus>>(16);
@@ -445,18 +524,32 @@ async fn message_acked_prunes_stale_timestamps() {
         for i in 0..1010u32 {
             let mut bytes = [0u8; 32];
             bytes[..4].copy_from_slice(&i.to_be_bytes());
-            ts.insert(konsensus_core::types::MessageId::from_bytes(bytes), old_instant);
+            ts.insert(
+                konsensus_core::types::MessageId::from_bytes(bytes),
+                old_instant,
+            );
         }
         // Add the target message with current timestamp
         ts.insert(msg_id, std::time::Instant::now());
     }
 
     handle_message_acked(
-        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx, true).await;
+        &peer_id,
+        &msg_id,
+        &send_timestamps,
+        &storage,
+        &routing,
+        &ws_tx,
+        true,
+    )
+    .await;
 
     // Stale entries (>5 min old) should be pruned; only fresh ones remain
     let remaining = send_timestamps.lock().await.len();
-    assert!(remaining < 100, "stale timestamps should be pruned, got {remaining}");
+    assert!(
+        remaining < 100,
+        "stale timestamps should be pruned, got {remaining}"
+    );
 }
 
 #[tokio::test]
@@ -473,7 +566,14 @@ async fn message_rejected_records_routing_failure() {
     let weight_before = routing.get_peer_weight(&peer_id).await.unwrap();
 
     handle_message_rejected(
-        &peer_id, &msg_id, "InsufficientPayment", &routing, &ws_tx, true).await;
+        &peer_id,
+        &msg_id,
+        "InsufficientPayment",
+        &routing,
+        &ws_tx,
+        true,
+    )
+    .await;
 
     let weight_after = routing.get_peer_weight(&peer_id).await.unwrap();
     assert!(
@@ -492,7 +592,14 @@ async fn message_rejected_broadcasts_status_with_reason() {
     let (ws_tx, mut ws_rx) = broadcast::channel::<Arc<WsDeliveryStatus>>(16);
 
     handle_message_rejected(
-        &peer_id, &msg_id, "InsufficientPayment", &routing, &ws_tx, true).await;
+        &peer_id,
+        &msg_id,
+        "InsufficientPayment",
+        &routing,
+        &ws_tx,
+        true,
+    )
+    .await;
 
     let status = ws_rx.recv().await.unwrap();
     assert_eq!(status.status, "rejected");
@@ -507,9 +614,7 @@ async fn message_acked_no_ws_subscribers_is_handled() {
     let routing = Arc::new(konsensus_routing::RoutingTable::new(
         konsensus_routing::RoutingConfig::default(),
     ));
-    let send_timestamps = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let send_timestamps = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let storage: Arc<dyn konsensus_storage::Storage> =
         Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let (ws_tx, ws_rx) = broadcast::channel::<Arc<WsDeliveryStatus>>(16);
@@ -517,7 +622,15 @@ async fn message_acked_no_ws_subscribers_is_handled() {
     drop(ws_rx);
 
     handle_message_acked(
-        &peer_id, &msg_id, &send_timestamps, &storage, &routing, &ws_tx, true).await;
+        &peer_id,
+        &msg_id,
+        &send_timestamps,
+        &storage,
+        &routing,
+        &ws_tx,
+        true,
+    )
+    .await;
 
     // No panic = success
     let weight = routing.get_peer_weight(&peer_id).await;
@@ -536,9 +649,11 @@ fn make_gossip_identity_2() -> konsensus_core::NodeIdentity {
     konsensus_core::NodeIdentity::from_mnemonic(mnemonic, "").unwrap()
 }
 
-fn make_signed_gossip_envelope(identity: &konsensus_core::NodeIdentity) -> konsensus_core::UkmEnvelope {
-    use konsensus_core::{UkmEnvelopeBuilder, PaymentProof};
+fn make_signed_gossip_envelope(
+    identity: &konsensus_core::NodeIdentity,
+) -> konsensus_core::UkmEnvelope {
     use konsensus_core::types::{Recipient, Signature};
+    use konsensus_core::{PaymentProof, UkmEnvelopeBuilder};
 
     let preimage = [42u8; 32];
     let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
@@ -549,7 +664,8 @@ fn make_signed_gossip_envelope(identity: &konsensus_core::NodeIdentity) -> konse
         Recipient::Broadcast,
         b"test gossip payload".to_vec(),
         proof,
-    ).build();
+    )
+    .build();
     let sig = identity.sign(&env.signable_bytes());
     env.signature = Signature::from_ed25519(&sig);
     env
@@ -593,8 +709,13 @@ async fn gossip_legacy_free_kind_rejected() {
         &transport,
         &audit,
         &make_gossip_ws_tx(),
-    ).await;
-    assert_eq!(validator.store().len(), 0, "legacy free gossip must not be stored");
+    )
+    .await;
+    assert_eq!(
+        validator.store().len(),
+        0,
+        "legacy free gossip must not be stored"
+    );
 }
 
 #[tokio::test]
@@ -621,7 +742,8 @@ async fn gossip_forged_signature_rejected() {
         &transport,
         &audit,
         &make_gossip_ws_tx(),
-    ).await;
+    )
+    .await;
     // No audit entry for accepted gossip — the forged message was rejected
 }
 
@@ -647,15 +769,16 @@ async fn gossip_tampered_payload_rejected() {
         &transport,
         &audit,
         &make_gossip_ws_tx(),
-    ).await;
+    )
+    .await;
     // No panic = rejected by validation (either ID mismatch or signature failure)
 }
 
 #[tokio::test]
 async fn gossip_wrong_kind_rejected() {
     let identity = make_gossip_identity();
-    use konsensus_core::{UkmEnvelopeBuilder, PaymentProof};
     use konsensus_core::types::{Recipient, Signature};
+    use konsensus_core::{PaymentProof, UkmEnvelopeBuilder};
 
     let preimage = [42u8; 32];
     let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
@@ -667,7 +790,8 @@ async fn gossip_wrong_kind_rejected() {
         Recipient::Broadcast,
         b"not gossip".to_vec(),
         proof,
-    ).build();
+    )
+    .build();
     let sig = identity.sign(&env.signable_bytes());
     env.signature = Signature::from_ed25519(&sig);
 
@@ -682,15 +806,16 @@ async fn gossip_wrong_kind_rejected() {
         &transport,
         &audit,
         &make_gossip_ws_tx(),
-    ).await;
+    )
+    .await;
     // Rejected by kind check — no panic
 }
 
 #[tokio::test]
 async fn gossip_non_broadcast_recipient_rejected() {
     let identity = make_gossip_identity();
-    use konsensus_core::{UkmEnvelopeBuilder, PaymentProof};
     use konsensus_core::types::{Recipient, Signature};
+    use konsensus_core::{PaymentProof, UkmEnvelopeBuilder};
 
     let preimage = [42u8; 32];
     let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
@@ -702,7 +827,8 @@ async fn gossip_non_broadcast_recipient_rejected() {
         Recipient::Node(test_peer_id()),
         b"not broadcast".to_vec(),
         proof,
-    ).build();
+    )
+    .build();
     let sig = identity.sign(&env.signable_bytes());
     env.signature = Signature::from_ed25519(&sig);
 
@@ -717,7 +843,8 @@ async fn gossip_non_broadcast_recipient_rejected() {
         &transport,
         &audit,
         &make_gossip_ws_tx(),
-    ).await;
+    )
+    .await;
     // Rejected by recipient check — no panic
 }
 
@@ -737,10 +864,18 @@ async fn gossip_legacy_free_message_not_broadcast_to_ws() {
         &transport,
         &audit,
         &ws_tx,
-    ).await;
+    )
+    .await;
 
-    assert!(ws_rx.try_recv().is_err(), "legacy free gossip must not reach WebSocket clients");
-    assert_eq!(validator.store().len(), 0, "legacy free gossip must not be stored");
+    assert!(
+        ws_rx.try_recv().is_err(),
+        "legacy free gossip must not reach WebSocket clients"
+    );
+    assert_eq!(
+        validator.store().len(),
+        0,
+        "legacy free gossip must not be stored"
+    );
 }
 
 #[tokio::test]
@@ -765,7 +900,8 @@ async fn gossip_rejected_message_not_broadcast_to_ws() {
         &transport,
         &audit,
         &ws_tx,
-    ).await;
+    )
+    .await;
 
     // Should NOT receive anything on WS — message was rejected
     assert!(ws_rx.try_recv().is_err());
@@ -786,7 +922,8 @@ async fn gossip_oversized_payload_rejected() {
         konsensus_core::types::Recipient::Broadcast,
         oversized_payload,
         proof,
-    ).build();
+    )
+    .build();
     let sig = identity.sign(&env.signable_bytes());
     env.signature = konsensus_core::types::Signature::from_ed25519(&sig);
 
@@ -795,19 +932,19 @@ async fn gossip_oversized_payload_rejected() {
     let audit = make_gossip_audit_log();
     let (ws_tx, mut ws_rx) = broadcast::channel::<Arc<konsensus_api::state::WsMessage>>(16);
 
-    handle_gossip_received(
-        test_peer_id(),
-        env,
-        &validator,
-        &transport,
-        &audit,
-        &ws_tx,
-    ).await;
+    handle_gossip_received(test_peer_id(), env, &validator, &transport, &audit, &ws_tx).await;
 
     // Oversized payload should be rejected — not broadcast to WS
-    assert!(ws_rx.try_recv().is_err(), "oversized gossip should not reach WebSocket clients");
+    assert!(
+        ws_rx.try_recv().is_err(),
+        "oversized gossip should not reach WebSocket clients"
+    );
     // Message should NOT be in the dedup store (rejected before validation)
-    assert_eq!(validator.store().len(), 0, "oversized gossip should not be stored");
+    assert_eq!(
+        validator.store().len(),
+        0,
+        "oversized gossip should not be stored"
+    );
 }
 
 #[tokio::test]
@@ -825,7 +962,8 @@ async fn gossip_exactly_at_size_limit_rejected_while_legacy_free_gossip_disabled
         konsensus_core::types::Recipient::Broadcast,
         payload,
         proof,
-    ).build();
+    )
+    .build();
     let sig = identity.sign(&env.signable_bytes());
     env.signature = konsensus_core::types::Signature::from_ed25519(&sig);
 
@@ -834,17 +972,17 @@ async fn gossip_exactly_at_size_limit_rejected_while_legacy_free_gossip_disabled
     let audit = make_gossip_audit_log();
     let (ws_tx, mut ws_rx) = broadcast::channel::<Arc<konsensus_api::state::WsMessage>>(16);
 
-    handle_gossip_received(
-        test_peer_id(),
-        env,
-        &validator,
-        &transport,
-        &audit,
-        &ws_tx,
-    ).await;
+    handle_gossip_received(test_peer_id(), env, &validator, &transport, &audit, &ws_tx).await;
 
-    assert!(ws_rx.try_recv().is_err(), "legacy free gossip must not reach WebSocket clients");
-    assert_eq!(validator.store().len(), 0, "legacy free gossip must not be stored");
+    assert!(
+        ws_rx.try_recv().is_err(),
+        "legacy free gossip must not reach WebSocket clients"
+    );
+    assert_eq!(
+        validator.store().len(),
+        0,
+        "legacy free gossip must not be stored"
+    );
 }
 
 /// Verify that a forged-signature gossip message does NOT consume dedup
@@ -873,13 +1011,15 @@ async fn gossip_forged_signature_does_not_consume_dedup_store() {
         &transport,
         &audit,
         &make_gossip_ws_tx(),
-    ).await;
+    )
+    .await;
 
     // The dedup store must be empty — forged messages should not occupy
     // dedup slots, preventing an attacker from exhausting the legitimate
     // sender's rate-limit quota.
     assert_eq!(
-        validator.store().len(), 0,
+        validator.store().len(),
+        0,
         "forged-signature gossip must NOT consume dedup store space"
     );
 }
@@ -910,8 +1050,12 @@ async fn gossip_valid_message_still_rejected_after_forged_attempt() {
         &transport,
         &audit,
         &ws_tx,
-    ).await;
-    assert!(ws_rx.try_recv().is_err(), "forged message should not reach WS");
+    )
+    .await;
+    assert!(
+        ws_rx.try_recv().is_err(),
+        "forged message should not reach WS"
+    );
     assert_eq!(validator.store().len(), 0);
 
     // Send real — still rejected because free gossip is disabled.
@@ -922,9 +1066,17 @@ async fn gossip_valid_message_still_rejected_after_forged_attempt() {
         &transport,
         &audit,
         &ws_tx,
-    ).await;
-    assert!(ws_rx.try_recv().is_err(), "legacy free gossip must not reach WS");
-    assert_eq!(validator.store().len(), 0, "legacy free gossip must not be stored");
+    )
+    .await;
+    assert!(
+        ws_rx.try_recv().is_err(),
+        "legacy free gossip must not reach WS"
+    );
+    assert_eq!(
+        validator.store().len(),
+        0,
+        "legacy free gossip must not be stored"
+    );
 }
 
 // ── Peer exchange handler tests ───────────────────────────
@@ -968,9 +1120,7 @@ async fn peer_exchange_received_adds_new_peers() {
         },
     ];
 
-    handle_peer_exchange_received(
-        &sender, peers, our_node_id, &registry, &mut cooldown,
-    ).await;
+    handle_peer_exchange_received(&sender, peers, our_node_id, &registry, &mut cooldown).await;
 
     let reg = registry.read().await;
     // B2: PEX is discovery, not admission — suggested peers land in the
@@ -1015,9 +1165,7 @@ async fn peer_exchange_received_skips_self() {
         },
     ];
 
-    handle_peer_exchange_received(
-        &sender, peers, our_node_id, &registry, &mut cooldown,
-    ).await;
+    handle_peer_exchange_received(&sender, peers, our_node_id, &registry, &mut cooldown).await;
 
     let reg = registry.read().await;
     assert!(!reg.is_known(&our_node_id), "should not add ourselves");
@@ -1039,7 +1187,7 @@ async fn peer_exchange_received_skips_duplicates() {
 
     let peers = vec![
         konsensus_message::wire::PeerExchangeEntry {
-            node_id: make_peer_id(2), // already in registry
+            node_id: make_peer_id(2),              // already in registry
             addr: "5.6.7.8:9999".parse().unwrap(), // different addr
             label: Some("renamed".to_string()),
             tier: konsensus_message::wire::SovereigntyTier::T1,
@@ -1052,16 +1200,17 @@ async fn peer_exchange_received_skips_duplicates() {
         },
     ];
 
-    handle_peer_exchange_received(
-        &sender, peers, our_node_id, &registry, &mut cooldown,
-    ).await;
+    handle_peer_exchange_received(&sender, peers, our_node_id, &registry, &mut cooldown).await;
 
     let reg = registry.read().await;
     // Peer 2 was already ADMITTED — a PEX suggestion must neither overwrite its
     // address nor demote it to discovered.
     let all = reg.all();
     let peer2 = all.iter().find(|p| p.node_id == make_peer_id(2)).unwrap();
-    assert_eq!(peer2.addr, "5.6.7.8:9002".parse::<std::net::SocketAddr>().unwrap());
+    assert_eq!(
+        peer2.addr,
+        "5.6.7.8:9002".parse::<std::net::SocketAddr>().unwrap()
+    );
     assert!(reg.contains(&make_peer_id(2)), "still admitted");
     assert!(!reg.is_discovered(&make_peer_id(2)));
     // Peer 4 is newly DISCOVERED — known but not admitted.
@@ -1080,23 +1229,24 @@ async fn peer_exchange_received_truncates_oversized_list() {
     let mut cooldown = std::collections::HashMap::new();
 
     // Send 60 entries — should be truncated to MAX_PEER_EXCHANGE_ENTRIES (50)
-    let peers: Vec<_> = (10..70u8).map(|i| {
-        konsensus_message::wire::PeerExchangeEntry {
+    let peers: Vec<_> = (10..70u8)
+        .map(|i| konsensus_message::wire::PeerExchangeEntry {
             node_id: make_peer_id(i),
             addr: format!("5.6.7.8:{}", 9000 + i as u16).parse().unwrap(),
             label: None,
             tier: konsensus_message::wire::SovereigntyTier::T1,
-        }
-    }).collect();
+        })
+        .collect();
     assert_eq!(peers.len(), 60);
 
-    handle_peer_exchange_received(
-        &sender, peers, our_node_id, &registry, &mut cooldown,
-    ).await;
+    handle_peer_exchange_received(&sender, peers, our_node_id, &registry, &mut cooldown).await;
 
     let reg = registry.read().await;
     let count = reg.discovered_len();
-    assert_eq!(count, 50, "should truncate to MAX_PEER_EXCHANGE_ENTRIES, got {count}");
+    assert_eq!(
+        count, 50,
+        "should truncate to MAX_PEER_EXCHANGE_ENTRIES, got {count}"
+    );
     assert!(reg.is_empty(), "PEX peers are discovered, never admitted");
 }
 
@@ -1107,35 +1257,36 @@ async fn peer_exchange_received_throttled_by_cooldown() {
     let registry = tokio::sync::RwLock::new(PeerRegistry::new());
     let mut cooldown = std::collections::HashMap::new();
 
-    let peers = vec![
-        konsensus_message::wire::PeerExchangeEntry {
-            node_id: make_peer_id(2),
-            addr: "5.6.7.8:9002".parse().unwrap(),
-            label: None,
-            tier: konsensus_message::wire::SovereigntyTier::T1,
-        },
-    ];
+    let peers = vec![konsensus_message::wire::PeerExchangeEntry {
+        node_id: make_peer_id(2),
+        addr: "5.6.7.8:9002".parse().unwrap(),
+        label: None,
+        tier: konsensus_message::wire::SovereigntyTier::T1,
+    }];
 
     // First call — should succeed
     handle_peer_exchange_received(
-        &sender, peers.clone(), our_node_id, &registry, &mut cooldown,
-    ).await;
+        &sender,
+        peers.clone(),
+        our_node_id,
+        &registry,
+        &mut cooldown,
+    )
+    .await;
     assert!(registry.read().await.is_discovered(&make_peer_id(2)));
 
     // Second call within cooldown — should be throttled, peer 3 NOT added
-    let peers2 = vec![
-        konsensus_message::wire::PeerExchangeEntry {
-            node_id: make_peer_id(3),
-            addr: "5.6.7.8:9003".parse().unwrap(),
-            label: None,
-            tier: konsensus_message::wire::SovereigntyTier::T1,
-        },
-    ];
-    handle_peer_exchange_received(
-        &sender, peers2, our_node_id, &registry, &mut cooldown,
-    ).await;
-    assert!(!registry.read().await.is_known(&make_peer_id(3)),
-        "peer 3 should NOT be discovered — exchange was throttled");
+    let peers2 = vec![konsensus_message::wire::PeerExchangeEntry {
+        node_id: make_peer_id(3),
+        addr: "5.6.7.8:9003".parse().unwrap(),
+        label: None,
+        tier: konsensus_message::wire::SovereigntyTier::T1,
+    }];
+    handle_peer_exchange_received(&sender, peers2, our_node_id, &registry, &mut cooldown).await;
+    assert!(
+        !registry.read().await.is_known(&make_peer_id(3)),
+        "peer 3 should NOT be discovered — exchange was throttled"
+    );
 }
 
 // ── Invoice requested handler tests ────────────────────────
@@ -1149,19 +1300,29 @@ async fn invoice_requested_creates_invoice_on_local_wallet() {
 
     // Should create invoice without panicking
     handle_invoice_requested(
-        &peer_id, "req-inv-1", 25_000, "konsensus message",
-        &lightning, &transport, "127.0.0.1".parse().unwrap(), &mut crate::invoice_refusals::RefusalLimits::default(),
-    ).await;
+        &peer_id,
+        "req-inv-1",
+        25_000,
+        "konsensus message",
+        &lightning,
+        &transport,
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+    )
+    .await;
 
     // Verify the invoice was actually created on the mock
     let payments = lightning.list_payments(10).await.unwrap();
-    assert!(!payments.is_empty(), "invoice should be created on local wallet");
+    assert!(
+        !payments.is_empty(),
+        "invoice should be created on local wallet"
+    );
 }
 
 #[tokio::test]
 async fn invoice_requested_sends_error_on_lightning_failure() {
     use konsensus_core::traits::lightning::{
-        LightningProvider as LP, LightningError, Invoice, PaymentDetails,
+        Invoice, LightningError, LightningProvider as LP, PaymentDetails,
     };
 
     /// A lightning provider that always fails invoice creation.
@@ -1181,7 +1342,9 @@ async fn invoice_requested_sends_error_on_lightning_failure() {
         async fn get_balance_msat(&self) -> Result<u64, LightningError> {
             Err(LightningError::Backend("wallet locked".into()))
         }
-        async fn is_available(&self) -> bool { false }
+        async fn is_available(&self) -> bool {
+            false
+        }
     }
 
     let peer_id = test_peer_id();
@@ -1190,9 +1353,16 @@ async fn invoice_requested_sends_error_on_lightning_failure() {
 
     // Should not panic — sends InvoiceError frame (which fails silently since no peer connected)
     handle_invoice_requested(
-        &peer_id, "req-inv-fail", 25_000, "konsensus message",
-        &lightning, &transport, "127.0.0.1".parse().unwrap(), &mut crate::invoice_refusals::RefusalLimits::default(),
-    ).await;
+        &peer_id,
+        "req-inv-fail",
+        25_000,
+        "konsensus message",
+        &lightning,
+        &transport,
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+    )
+    .await;
     // No panic = success
 }
 
@@ -1215,14 +1385,33 @@ async fn privileged_invoice_request_honours_caller_amount_unchanged() {
     let pricing = admission_pricing();
 
     handle_invoice_requested_gated(
-        &peer_id, "req-priv", 25_000, "konsensus message", true,
-        &pricing, &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
-        &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default(),
-    ).await;
+        &peer_id,
+        "req-priv",
+        25_000,
+        "konsensus message",
+        true,
+        &pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &lightning,
+        &transport,
+        &test_peer_id(),
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+    )
+    .await;
 
     let payments = lightning.list_payments(10).await.unwrap();
-    assert_eq!(payments.len(), 1, "privileged request must create exactly one invoice");
-    assert_eq!(payments[0].amount_msat, 25_000, "caller amount honoured for privileged peer");
+    assert_eq!(
+        payments.len(),
+        1,
+        "privileged request must create exactly one invoice"
+    );
+    assert_eq!(
+        payments[0].amount_msat, 25_000,
+        "caller amount honoured for privileged peer"
+    );
 }
 
 #[tokio::test]
@@ -1238,27 +1427,72 @@ async fn unprivileged_non_admission_invoice_request_is_refused_not_issued() {
     let mut last_refusal = crate::invoice_refusals::RefusalLimits::default();
 
     handle_invoice_requested_gated(
-        &peer_id, "req-strange", 1_000_000, "konsensus message", false,
-        &pricing, &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
-        &membrane, &mut last_refusal,
-    ).await;
+        &peer_id,
+        "req-strange",
+        1_000_000,
+        "konsensus message",
+        false,
+        &pricing,
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &lightning,
+        &transport,
+        &test_peer_id(),
+        "127.0.0.1".parse().unwrap(),
+        &mut crate::admission_quotes::AdmissionQuotes::default(),
+        &membrane,
+        &mut last_refusal,
+    )
+    .await;
 
     let payments = lightning.list_payments(10).await.unwrap();
-    assert!(payments.is_empty(), "no invoice may be created for an unprivileged non-admission request");
+    assert!(
+        payments.is_empty(),
+        "no invoice may be created for an unprivileged non-admission request"
+    );
     let (events, totals) = membrane.read(None, 10);
-    assert!(events.is_empty(), "unpaid requests must not create per-event state");
-    assert_eq!(totals.refused, 0, "event totals exclude aggregate-only refusals");
-    assert_eq!(membrane.pre_payment_refusals().buckets[0].counts[&konsensus_api::membrane::PrePaymentReason::AdmissionRequired], 1);
+    assert!(
+        events.is_empty(),
+        "unpaid requests must not create per-event state"
+    );
+    assert_eq!(
+        totals.refused, 0,
+        "event totals exclude aggregate-only refusals"
+    );
+    assert_eq!(
+        membrane.pre_payment_refusals().buckets[0].counts
+            [&konsensus_api::membrane::PrePaymentReason::AdmissionRequired],
+        1
+    );
     for _ in 0..100 {
         handle_invoice_requested_gated(
-            &peer_id, "req-strange", 1_000_000, "konsensus message", false,
-            &pricing, &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut crate::admission_quotes::AdmissionQuotes::default(),
-            &membrane, &mut last_refusal,
-        ).await;
+            &peer_id,
+            "req-strange",
+            1_000_000,
+            "konsensus message",
+            false,
+            &pricing,
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &lightning,
+            &transport,
+            &test_peer_id(),
+            "127.0.0.1".parse().unwrap(),
+            &mut crate::admission_quotes::AdmissionQuotes::default(),
+            &membrane,
+            &mut last_refusal,
+        )
+        .await;
     }
-    assert_eq!(membrane.pre_payment_refusals().buckets.iter().map(|b| b.counts[&konsensus_api::membrane::PrePaymentReason::AdmissionRequired]).sum::<u64>(), 101, "count even when refusal replies are throttled");
+    assert_eq!(
+        membrane
+            .pre_payment_refusals()
+            .buckets
+            .iter()
+            .map(|b| b.counts[&konsensus_api::membrane::PrePaymentReason::AdmissionRequired])
+            .sum::<u64>(),
+        101,
+        "count even when refusal replies are throttled"
+    );
     assert!(membrane.read(None, 500).0.is_empty());
-
 }
 
 // ── Price query handler tests ──────────────────────────────
@@ -1300,12 +1534,19 @@ async fn price_query_responds_with_price() {
         Arc::new(konsensus_pricing::StaticPricingEngine::new(
             konsensus_pricing::StaticPricingConfig::default(),
         ));
-    let chain: Arc<dyn ChainProvider> = Arc::new(
-        konsensus_chain::MockChainProvider::new(),
-    );
+    let chain: Arc<dyn ChainProvider> = Arc::new(konsensus_chain::MockChainProvider::new());
 
     // Should not panic — sends PriceResponse (fails silently since no peer connected)
-    handle_price_query(&peer_id, 100, &pricing, &chain, &transport, &konsensus_storage::SqliteStorage::in_memory().await.unwrap(), 0).await;
+    handle_price_query(
+        &peer_id,
+        100,
+        &pricing,
+        &chain,
+        &transport,
+        &konsensus_storage::SqliteStorage::in_memory().await.unwrap(),
+        0,
+    )
+    .await;
     // No panic = success
 }
 
@@ -1317,7 +1558,9 @@ async fn price_query_skips_response_when_chain_unavailable() {
 
     #[async_trait::async_trait]
     impl ChainProvider for FailingChain {
-        fn trust_level(&self) -> TrustLevel { TrustLevel::ServerTrust }
+        fn trust_level(&self) -> TrustLevel {
+            TrustLevel::ServerTrust
+        }
         async fn get_block_height(&self) -> Result<u64, ChainError> {
             Err(ChainError::Backend("down".into()))
         }
@@ -1330,7 +1573,9 @@ async fn price_query_skips_response_when_chain_unavailable() {
         async fn is_tx_confirmed(&self, _tx: &str, _min: u32) -> Result<bool, ChainError> {
             Err(ChainError::Backend("down".into()))
         }
-        async fn is_synced(&self) -> bool { false }
+        async fn is_synced(&self) -> bool {
+            false
+        }
     }
 
     let peer_id = test_peer_id();
@@ -1342,7 +1587,16 @@ async fn price_query_skips_response_when_chain_unavailable() {
     let chain: Arc<dyn ChainProvider> = Arc::new(FailingChain);
 
     // Should not panic — skips response due to chain failure
-    handle_price_query(&peer_id, 100, &pricing, &chain, &transport, &konsensus_storage::SqliteStorage::in_memory().await.unwrap(), 0).await;
+    handle_price_query(
+        &peer_id,
+        100,
+        &pricing,
+        &chain,
+        &transport,
+        &konsensus_storage::SqliteStorage::in_memory().await.unwrap(),
+        0,
+    )
+    .await;
     // No panic = success (handler returns early with warning)
 }
 
@@ -1383,7 +1637,6 @@ fn routable_peer_addr_filter() {
     }
 }
 
-
 #[tokio::test]
 async fn stranger_cannot_quote_file_or_other_service_kinds() {
     // No connected/running node, wallet, or paid contact: the handler receives
@@ -1392,29 +1645,53 @@ async fn stranger_cannot_quote_file_or_other_service_kinds() {
     let transport = make_gossip_test_transport();
     let lightning: Arc<dyn LightningProvider> =
         Arc::new(konsensus_lightning::MockLightningProvider::new());
-    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> =
-        Arc::new(konsensus_pricing::StaticPricingEngine::new(
-            konsensus_pricing::StaticPricingConfig {
-                chat_msat: 2000,
-                file_ref_msat: 123_456,
-                ..Default::default()
-            },
-        ));
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
+            chat_msat: 2000,
+            file_ref_msat: 123_456,
+            ..Default::default()
+        }),
+    );
 
-    let mut quotes=crate::admission_quotes::AdmissionQuotes::default();
+    let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let id=konsensus_core::admission_quote::request_id(&test_peer_id(), &peer_id,
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    let id = konsensus_core::admission_quote::request_id(
+        &test_peer_id(),
+        &peer_id,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
     // Otherwise-valid, bound, live attempts still cannot request another kind.
-    for purpose in ["konsensus:admission:200", "konsensus:admission:100", "konsensus:admission", "arbitrary invoice"] {
+    for purpose in [
+        "konsensus:admission:200",
+        "konsensus:admission:100",
+        "konsensus:admission",
+        "arbitrary invoice",
+    ] {
         handle_invoice_requested_gated(
-            &peer_id, &id, 1, purpose, false,
-            &pricing, &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &transport, &test_peer_id(), "127.0.0.1".parse().unwrap(), &mut quotes,
-            &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default(),
-        ).await;
+            &peer_id,
+            &id,
+            1,
+            purpose,
+            false,
+            &pricing,
+            &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+            &lightning,
+            &transport,
+            &test_peer_id(),
+            "127.0.0.1".parse().unwrap(),
+            &mut quotes,
+            &konsensus_api::membrane::Membrane::with_capacity(8),
+            &mut crate::invoice_refusals::RefusalLimits::default(),
+        )
+        .await;
     }
-    assert!(lightning.list_payments(10).await.unwrap().is_empty(),
-        "unpaid stranger minted a non-chat invoice");
+    assert!(
+        lightning.list_payments(10).await.unwrap().is_empty(),
+        "unpaid stranger minted a non-chat invoice"
+    );
 }
 
 #[tokio::test]
@@ -1545,12 +1822,20 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
         provider.get_node_pubkey().await.unwrap()
     );
     source.send_frame(&recipient, &request).await.unwrap();
-    let refusal = tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await.unwrap().unwrap();
-    assert!(matches!(refusal, ControlEvent::InvoiceErrorReceived { request_id, reason, .. }
+    let refusal = tokio::time::timeout(Duration::from_secs(2), source.recv_control())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(refusal, ControlEvent::InvoiceErrorReceived { request_id, reason, .. }
         if request_id == id && reason == konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED),
-        "a repeated attempt receives a bounded refusal, never a second quote or service");
+        "a repeated attempt receives a bounded refusal, never a second quote or service"
+    );
     let invoices = provider.list_payments(10).await.unwrap();
-    assert!(invoices.is_empty(), "stranger quote wrote pending backend state");
+    assert!(
+        invoices.is_empty(),
+        "stranger quote wrote pending backend state"
+    );
     assert_eq!(provider.get_balance_msat().await.unwrap(), 0);
     assert!(registry.read().await.is_empty());
     assert!(storage.list_peers().await.unwrap().is_empty());
@@ -1584,10 +1869,12 @@ async fn bound_unsupported_quote_error_preserves_provenance() {
     let (tx, rx) = tokio::sync::oneshot::channel::<InvoiceRequestOutcome>();
     map.lock().await.insert(id.clone(), tx);
     for privileged in [false, true] {
-        handle_invoice_error_received(&wrong, &id, "stateless_quote_unsupported", privileged, &map).await;
+        handle_invoice_error_received(&wrong, &id, "stateless_quote_unsupported", privileged, &map)
+            .await;
         assert_eq!(map.lock().await.len(), 1, "wrong recipient cancelled quote");
     }
-    handle_invoice_error_received(&recipient, &id, "stateless_quote_unsupported", false, &map).await;
+    handle_invoice_error_received(&recipient, &id, "stateless_quote_unsupported", false, &map)
+        .await;
     let error = rx.await.unwrap().unwrap_err();
     assert_eq!(error.recipient, recipient);
     assert_eq!(error.reason, "stateless_quote_unsupported");
@@ -1596,37 +1883,80 @@ async fn bound_unsupported_quote_error_preserves_provenance() {
 
 #[tokio::test]
 async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
-    use konsensus_message::{ReachabilityMode, TransportConfig};
     use konsensus_lightning::lnd::{LndConfig, LndProvider};
+    use konsensus_message::{ReachabilityMode, TransportConfig};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     let (_, a) = NodeIdentity::generate().unwrap();
     let (_, b) = NodeIdentity::generate().unwrap();
     let peer = *a.node_id();
     let recipient = *b.node_id();
-    let make = |id| Arc::new(NoiseTransport::new(Arc::new(id), TransportConfig {
-        listen_addr: "127.0.0.1:0".parse().unwrap(),
-        admission_mode: ReachabilityMode::PriceOpen, whitelist: vec![], ..Default::default()
-    }));
+    let make = |id| {
+        Arc::new(NoiseTransport::new(
+            Arc::new(id),
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                whitelist: vec![],
+                ..Default::default()
+            },
+        ))
+    };
     let source = make(a);
     let target = make(b);
     target.start_listener().await.unwrap();
-    source.connect(&recipient, &target.listen_addr().unwrap().to_string()).await.unwrap();
-    assert!(matches!(source.recv_control().await, Some(ControlEvent::PeerConnected { .. })));
+    source
+        .connect(&recipient, &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    assert!(matches!(
+        source.recv_control().await,
+        Some(ControlEvent::PeerConnected { .. })
+    ));
     // An accidental create_invoice fallback would hit this unreachable endpoint,
     // return a different error and fail the expected stateless refusal assertion.
-    let provider: Arc<dyn LightningProvider> = Arc::new(LndProvider::new(LndConfig {
-        api_url: "http://127.0.0.1:1".into(), macaroon_hex: "00".into(), tls_cert_path: None,
-    }).unwrap());
+    let provider: Arc<dyn LightningProvider> = Arc::new(
+        LndProvider::new(LndConfig {
+            api_url: "http://127.0.0.1:1".into(),
+            macaroon_hex: "00".into(),
+            tls_cert_path: None,
+        })
+        .unwrap(),
+    );
     let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    let request_id = konsensus_core::admission_quote::request_id(&recipient, &peer,
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-    handle_invoice_requested_gated(&peer, &request_id, 1,
-        konsensus_core::admission_quote::PURPOSE, false, &admission_pricing(), &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &provider,
-        &target, &recipient, "127.0.0.1".parse().unwrap(), &mut quotes, &konsensus_api::membrane::Membrane::with_capacity(8), &mut crate::invoice_refusals::RefusalLimits::default()).await;
-    let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await.unwrap().unwrap();
-    assert!(matches!(event, ControlEvent::InvoiceErrorReceived { peer_id, request_id: id, reason, .. }
-        if peer_id == recipient && id == request_id && reason == "stateless_quote_unsupported"));
+    let request_id = konsensus_core::admission_quote::request_id(
+        &recipient,
+        &peer,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    handle_invoice_requested_gated(
+        &peer,
+        &request_id,
+        1,
+        konsensus_core::admission_quote::PURPOSE,
+        false,
+        &admission_pricing(),
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &provider,
+        &target,
+        &recipient,
+        "127.0.0.1".parse().unwrap(),
+        &mut quotes,
+        &konsensus_api::membrane::Membrane::with_capacity(8),
+        &mut crate::invoice_refusals::RefusalLimits::default(),
+    )
+    .await;
+    let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event, ControlEvent::InvoiceErrorReceived { peer_id, request_id: id, reason, .. }
+        if peer_id == recipient && id == request_id && reason == "stateless_quote_unsupported")
+    );
     assert!(target.connected_privileged_peers().await.is_empty());
     source.shutdown();
     target.shutdown();
@@ -1635,14 +1965,24 @@ async fn lnd_stranger_quote_returns_stable_refusal_over_noise() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unpaid_request_flood_does_not_stall_other_peers() {
     use konsensus_message::{ReachabilityMode, TransportConfig};
-    use std::{sync::atomic::{AtomicUsize, Ordering}, time::Duration};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
     let make = || {
         let (_, identity) = NodeIdentity::generate().unwrap();
         let id = *identity.node_id();
-        (id, Arc::new(NoiseTransport::new(Arc::new(identity), TransportConfig {
-            listen_addr: "127.0.0.1:0".parse().unwrap(), admission_mode: ReachabilityMode::PriceOpen,
-            ..Default::default()
-        })))
+        (
+            id,
+            Arc::new(NoiseTransport::new(
+                Arc::new(identity),
+                TransportConfig {
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    admission_mode: ReachabilityMode::PriceOpen,
+                    ..Default::default()
+                },
+            )),
+        )
     };
     let (recipient, target) = make();
     let (_, attacker) = make();
@@ -1652,19 +1992,47 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
     let addr = target.listen_addr().unwrap().to_string();
     attacker.connect(&recipient, &addr).await.unwrap();
     healthy.connect(&recipient, &addr).await.unwrap();
-    let lightning: Arc<dyn LightningProvider> = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let lightning: Arc<dyn LightningProvider> =
+        Arc::new(konsensus_lightning::MockLightningProvider::new());
     let handled = Arc::new(AtomicUsize::new(0));
     let membrane = Arc::new(konsensus_api::membrane::Membrane::with_capacity(64));
     let handler = {
-        let target = Arc::clone(&target); let lightning = Arc::clone(&lightning);
-        let handled = Arc::clone(&handled); let membrane = Arc::clone(&membrane);
+        let target = Arc::clone(&target);
+        let lightning = Arc::clone(&lightning);
+        let handled = Arc::clone(&handled);
+        let membrane = Arc::clone(&membrane);
         tokio::spawn(async move {
             let mut quotes = crate::admission_quotes::AdmissionQuotes::default();
             let mut limits = crate::invoice_refusals::RefusalLimits::default();
             while let Some(event) = target.recv_control().await {
-                if let ControlEvent::InvoiceRequested { peer_id, request_id, amount_msat, purpose, privileged, source_ip } = event {
-                    handle_invoice_requested_gated(&peer_id, &request_id, amount_msat, &purpose, privileged,
-                        &admission_pricing(), &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())), &lightning, &target, &recipient, source_ip, &mut quotes, &membrane, &mut limits).await;
+                if let ControlEvent::InvoiceRequested {
+                    peer_id,
+                    request_id,
+                    amount_msat,
+                    purpose,
+                    privileged,
+                    source_ip,
+                } = event
+                {
+                    handle_invoice_requested_gated(
+                        &peer_id,
+                        &request_id,
+                        amount_msat,
+                        &purpose,
+                        privileged,
+                        &admission_pricing(),
+                        &ReadinessHeightCache::new(Arc::new(
+                            konsensus_chain::MockChainProvider::new(),
+                        )),
+                        &lightning,
+                        &target,
+                        &recipient,
+                        source_ip,
+                        &mut quotes,
+                        &membrane,
+                        &mut limits,
+                    )
+                    .await;
                     handled.fetch_add(1, Ordering::Release);
                 }
             }
@@ -1674,24 +2042,54 @@ async fn unpaid_request_flood_does_not_stall_other_peers() {
     // eventually stop its reader and fill the recipient's TCP send buffer.
     tokio::time::timeout(Duration::from_secs(5), async {
         for i in 0..5000 {
-            attacker.send_frame(&recipient, &Frame::RequestInvoice {
-                request_id: format!("{i:04}{}", "x".repeat(1000)), amount_msat: 1000, purpose: "konsensus message".into()
-            }).await.unwrap();
+            attacker
+                .send_frame(
+                    &recipient,
+                    &Frame::RequestInvoice {
+                        request_id: format!("{i:04}{}", "x".repeat(1000)),
+                        amount_msat: 1000,
+                        purpose: "konsensus message".into(),
+                    },
+                )
+                .await
+                .unwrap();
         }
-        while handled.load(Ordering::Acquire) < 5000 { tokio::task::yield_now().await; }
-        assert!(lightning.list_payments(100).await.unwrap().is_empty(), "unpaid flood must issue no invoices");
-        healthy.send_frame(&recipient, &Frame::RequestInvoice {
-            request_id: "healthy".into(), amount_msat: 1000, purpose: "konsensus message".into()
-        }).await.unwrap();
+        while handled.load(Ordering::Acquire) < 5000 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            lightning.list_payments(100).await.unwrap().is_empty(),
+            "unpaid flood must issue no invoices"
+        );
+        healthy
+            .send_frame(
+                &recipient,
+                &Frame::RequestInvoice {
+                    request_id: "healthy".into(),
+                    amount_msat: 1000,
+                    purpose: "konsensus message".into(),
+                },
+            )
+            .await
+            .unwrap();
         loop {
-            if let Some(ControlEvent::InvoiceResponseReceived { request_id, .. }) = healthy.recv_control().await {
-                assert_eq!(request_id, "healthy"); break;
+            if let Some(ControlEvent::InvoiceResponseReceived { request_id, .. }) =
+                healthy.recv_control().await
+            {
+                assert_eq!(request_id, "healthy");
+                break;
             }
         }
-    }).await.expect("unpaid flood stalled the global control loop or another peer");
+    })
+    .await
+    .expect("unpaid flood stalled the global control loop or another peer");
     let (events, totals) = membrane.read(None, 100);
-    assert!(events.len() <= 1); assert!(totals.refused <= 1);
-    handler.abort(); attacker.shutdown(); healthy.shutdown(); target.shutdown();
+    assert!(events.len() <= 1);
+    assert!(totals.refused <= 1);
+    handler.abort();
+    attacker.shutdown();
+    healthy.shutdown();
+    target.shutdown();
 }
 
 #[test]
@@ -1727,7 +2125,8 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     privileged,
                 },
                 ControlEvent::MessageAcked {
-                    duplicate: false,                    peer_id,
+                    duplicate: false,
+                    peer_id,
                     message_id,
                     privileged,
                 },
@@ -1784,8 +2183,16 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                 },
             ];
             for event in events {
-                let delivery = matches!(event, ControlEvent::MessageAcked { .. } | ControlEvent::MessageRejected { .. } | ControlEvent::PeerExchangeRequested { .. });
-                assert_eq!(refuse_unpaid_control(&event, &membrane), !privileged && !delivery);
+                let delivery = matches!(
+                    event,
+                    ControlEvent::MessageAcked { .. }
+                        | ControlEvent::MessageRejected { .. }
+                        | ControlEvent::PeerExchangeRequested { .. }
+                );
+                assert_eq!(
+                    refuse_unpaid_control(&event, &membrane),
+                    !privileged && !delivery
+                );
             }
         }
     }
@@ -1838,7 +2245,9 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
 async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weights() {
     use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
     let mut limits = DeliveryConfirmationBudget::default();
-    let own = make_peer_id(61); let peer = make_peer_id(62); let impostor = make_peer_id(63);
+    let own = make_peer_id(61);
+    let peer = make_peer_id(62);
+    let impostor = make_peer_id(63);
     let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let storage: Arc<dyn Storage> = db.clone();
     let routing = konsensus_routing::RoutingTable::new(Default::default());
@@ -1846,43 +2255,159 @@ async fn delivery_receipts_only_advance_matching_sent_rows_and_never_unpaid_weig
     let (ws, mut updates) = broadcast::channel(16);
     let dir = tempfile::tempdir().unwrap();
     let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
-    let env = UkmEnvelopeBuilder::new(100, own, Recipient::Node(peer), vec![1],
-        PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000)).build();
+    let env = UkmEnvelopeBuilder::new(
+        100,
+        own,
+        Recipient::Node(peer),
+        vec![1],
+        PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000),
+    )
+    .build();
     db.store_message(&env).await.unwrap();
     db.queue_pending_delivery(&env.id, &peer).await.unwrap();
-    for rejection in [None, Some("storage error"), Some("replay detected: nonce already used")] {
-        handle_delivery_confirmation(&peer, &env.id, rejection, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+    for rejection in [
+        None,
+        Some("storage error"),
+        Some("replay detected: nonce already used"),
+    ] {
+        handle_delivery_confirmation(
+            &peer,
+            &env.id,
+            rejection,
+            false,
+            &own,
+            &storage,
+            &timestamps,
+            &routing,
+            &ws,
+            &audit,
+            &mut limits,
+        )
+        .await;
     }
-    assert!(updates.try_recv().is_err(), "unsent ids are not delivery receipts");
+    assert!(
+        updates.try_recv().is_err(),
+        "unsent ids are not delivery receipts"
+    );
     db.mark_pending_sent(&env.id, &peer).await.unwrap();
-    handle_delivery_confirmation(&impostor, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
-    handle_delivery_confirmation(&peer, &konsensus_core::MessageId::from_bytes([9; 32]), None, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+    handle_delivery_confirmation(
+        &impostor,
+        &env.id,
+        None,
+        false,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut limits,
+    )
+    .await;
+    handle_delivery_confirmation(
+        &peer,
+        &konsensus_core::MessageId::from_bytes([9; 32]),
+        None,
+        false,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut limits,
+    )
+    .await;
     assert!(updates.try_recv().is_err());
-    handle_delivery_confirmation(&peer, &env.id, Some("storage error"), false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+    handle_delivery_confirmation(
+        &peer,
+        &env.id,
+        Some("storage error"),
+        false,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut limits,
+    )
+    .await;
     assert_eq!(updates.try_recv().unwrap().status, "rejected");
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 1);
-    handle_delivery_confirmation(&peer, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+    handle_delivery_confirmation(
+        &peer,
+        &env.id,
+        None,
+        false,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut limits,
+    )
+    .await;
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
-    handle_delivery_confirmation(&peer, &env.id, None, true, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
-    assert!(updates.try_recv().is_err(), "duplicate ACK cannot update weights or emit twice");
+    handle_delivery_confirmation(
+        &peer,
+        &env.id,
+        None,
+        true,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut limits,
+    )
+    .await;
+    assert!(
+        updates.try_recv().is_err(),
+        "duplicate ACK cannot update weights or emit twice"
+    );
     assert!(routing.get_peer_weight(&peer).await.is_none());
     // Explicit compatibility mapping consumes only an own, dispatched row.
     db.prepare_delivery(&env.id, &peer).await.unwrap();
-    handle_delivery_confirmation(&peer, &env.id, Some("replay detected: nonce already used"), true, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+    handle_delivery_confirmation(
+        &peer,
+        &env.id,
+        Some("replay detected: nonce already used"),
+        true,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut limits,
+    )
+    .await;
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
     assert!(routing.get_peer_weight(&peer).await.is_none());
-    assert!(std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap().contains("acked_legacy"));
+    assert!(std::fs::read_to_string(dir.path().join("audit.jsonl"))
+        .unwrap()
+        .contains("acked_legacy"));
 }
 
 #[tokio::test]
 async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
     use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
-    for reason in ["payment proof already used: hash", "insufficient payment: required 2000 msat, got 1000 msat",
-        "recipient mismatch: envelope addressed to a, this node is b", "invalid signature: bad signature", "storage error", "lightning verification failed: offline"] {
+    for reason in [
+        "payment proof already used: hash",
+        "insufficient payment: required 2000 msat, got 1000 msat",
+        "recipient mismatch: envelope addressed to a, this node is b",
+        "invalid signature: bad signature",
+        "storage error",
+        "lightning verification failed: offline",
+    ] {
         let mut limits = DeliveryConfirmationBudget::default();
-    let own = make_peer_id(61); let peer = make_peer_id(62);
+        let own = make_peer_id(61);
+        let peer = make_peer_id(62);
         let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
         let storage: Arc<dyn Storage> = db.clone();
         let routing = konsensus_routing::RoutingTable::new(Default::default());
@@ -1890,34 +2415,113 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
         let (ws, mut updates) = broadcast::channel(16);
         let dir = tempfile::tempdir().unwrap();
         let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
-        let env = UkmEnvelopeBuilder::new(0, own, Recipient::Node(peer), vec![1],
-            PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000)).build();
+        let env = UkmEnvelopeBuilder::new(
+            0,
+            own,
+            Recipient::Node(peer),
+            vec![1],
+            PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000),
+        )
+        .build();
         db.store_message(&env).await.unwrap();
         db.prepare_delivery(&env.id, &peer).await.unwrap();
-        handle_delivery_confirmation(&peer, &env.id, Some(reason), false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
-        let terminal = !matches!(reason, "storage error" | "lightning verification failed: offline");
-        assert_eq!(updates.try_recv().unwrap().status, if terminal { "failed_paid" } else { "rejected" });
-        assert!(db.get_pending_for_peer(&peer).await.unwrap().is_empty(), "no immediate resend: {reason}");
-        let (state, attempts): (String, i64) = sqlx::query_as("SELECT state, attempts FROM pending_deliveries").fetch_one(db.pool()).await.unwrap();
+        handle_delivery_confirmation(
+            &peer,
+            &env.id,
+            Some(reason),
+            false,
+            &own,
+            &storage,
+            &timestamps,
+            &routing,
+            &ws,
+            &audit,
+            &mut limits,
+        )
+        .await;
+        let terminal = !matches!(
+            reason,
+            "storage error" | "lightning verification failed: offline"
+        );
+        assert_eq!(
+            updates.try_recv().unwrap().status,
+            if terminal { "failed_paid" } else { "rejected" }
+        );
+        assert!(
+            db.get_pending_for_peer(&peer).await.unwrap().is_empty(),
+            "no immediate resend: {reason}"
+        );
+        let (state, attempts): (String, i64) =
+            sqlx::query_as("SELECT state, attempts FROM pending_deliveries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert_eq!(state, if terminal { "failed_paid" } else { "pending" });
         assert_eq!(attempts, 1);
-        assert!(db.mark_pending_sent(&env.id, &peer).await.is_err(), "stale flusher snapshot cannot bypass rejection");
-        handle_delivery_confirmation(&peer, &env.id, Some(reason), false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+        assert!(
+            db.mark_pending_sent(&env.id, &peer).await.is_err(),
+            "stale flusher snapshot cannot bypass rejection"
+        );
+        handle_delivery_confirmation(
+            &peer,
+            &env.id,
+            Some(reason),
+            false,
+            &own,
+            &storage,
+            &timestamps,
+            &routing,
+            &ws,
+            &audit,
+            &mut limits,
+        )
+        .await;
         assert!(updates.try_recv().is_err(), "one rejection per dispatch");
         if terminal {
             db.cleanup_stale_pending(1).await.unwrap();
             assert!(db.get_pending_for_peer(&peer).await.unwrap().is_empty());
-            assert!(!db.acknowledge_pending(&env.id, &peer, &own).await.unwrap(), "terminal state cannot regress");
+            assert!(
+                !db.acknowledge_pending(&env.id, &peer, &own).await.unwrap(),
+                "terminal state cannot regress"
+            );
         } else {
-            let retry: i64 = sqlx::query_scalar("SELECT retry_after_ms FROM pending_deliveries").fetch_one(db.pool()).await.unwrap();
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+            let retry: i64 = sqlx::query_scalar("SELECT retry_after_ms FROM pending_deliveries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
             assert!(retry > now + 50_000);
-            sqlx::query("UPDATE pending_deliveries SET retry_after_ms = 1").execute(db.pool()).await.unwrap();
+            sqlx::query("UPDATE pending_deliveries SET retry_after_ms = 1")
+                .execute(db.pool())
+                .await
+                .unwrap();
             assert_eq!(db.get_pending_for_peer(&peer).await.unwrap().len(), 1);
             db.mark_pending_sent(&env.id, &peer).await.unwrap();
-            handle_delivery_confirmation(&peer, &env.id, Some(reason), false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
-            let retry: i64 = sqlx::query_scalar("SELECT retry_after_ms FROM pending_deliveries").fetch_one(db.pool()).await.unwrap();
-            assert!(retry > now + 110_000, "successive transient rejects increase the delay");
+            handle_delivery_confirmation(
+                &peer,
+                &env.id,
+                Some(reason),
+                false,
+                &own,
+                &storage,
+                &timestamps,
+                &routing,
+                &ws,
+                &audit,
+                &mut limits,
+            )
+            .await;
+            let retry: i64 = sqlx::query_scalar("SELECT retry_after_ms FROM pending_deliveries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert!(
+                retry > now + 110_000,
+                "successive transient rejects increase the delay"
+            );
         }
         assert!(db.get_message(&env.id).await.unwrap().is_some());
         assert!(routing.get_peer_weight(&peer).await.is_none());
@@ -1927,11 +2531,18 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
 #[tokio::test]
 async fn unpaid_confirmation_flood_is_bounded_before_storage_even_across_peer_churn() {
     let mut limits = DeliveryConfirmationBudget::default();
-    let own = make_peer_id(61); let peer = make_peer_id(62);
+    let own = make_peer_id(61);
+    let peer = make_peer_id(62);
     let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let storage: Arc<dyn Storage> = db.clone();
-    let env = konsensus_core::UkmEnvelopeBuilder::new(0, own, konsensus_core::Recipient::Node(peer), vec![1],
-        konsensus_core::PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000)).build();
+    let env = konsensus_core::UkmEnvelopeBuilder::new(
+        0,
+        own,
+        konsensus_core::Recipient::Node(peer),
+        vec![1],
+        konsensus_core::PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000),
+    )
+    .build();
     db.store_message(&env).await.unwrap();
     db.prepare_delivery(&env.id, &peer).await.unwrap();
     let routing = konsensus_routing::RoutingTable::new(Default::default());
@@ -1941,55 +2552,149 @@ async fn unpaid_confirmation_flood_is_bounded_before_storage_even_across_peer_ch
     let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
     // Both unknown ACKs and rejects consume the shared per-peer allowance.
     for n in 0..32 {
-        handle_delivery_confirmation(&peer, &konsensus_core::MessageId::from_bytes([9; 32]),
-            if n % 2 == 0 { None } else { Some("storage error") }, false,
-            &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+        handle_delivery_confirmation(
+            &peer,
+            &konsensus_core::MessageId::from_bytes([9; 32]),
+            if n % 2 == 0 {
+                None
+            } else {
+                Some("storage error")
+            },
+            false,
+            &own,
+            &storage,
+            &timestamps,
+            &routing,
+            &ws,
+            &audit,
+            &mut limits,
+        )
+        .await;
     }
-    handle_delivery_confirmation(&peer, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
-    assert_eq!(db.count_pending_deliveries().await.unwrap(), 1, "exhausted peer cannot reach the ACK DELETE");
+    handle_delivery_confirmation(
+        &peer,
+        &env.id,
+        None,
+        false,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut limits,
+    )
+    .await;
+    assert_eq!(
+        db.count_pending_deliveries().await.unwrap(),
+        1,
+        "exhausted peer cannot reach the ACK DELETE"
+    );
     assert!(updates.try_recv().is_err());
     let now = tokio::time::Instant::now();
-    let allowed = (0..1000).filter(|n| {
-        let mut bytes = [0; 32]; bytes[..4].copy_from_slice(&(*n as u32).to_le_bytes());
-        limits.allow(&NodeId::from_bytes(bytes), false, now)
-    }).count();
-    assert_eq!(allowed, 96, "peer churn cannot exceed the global 128/s budget");
-    assert!(limits.peers.len() <= 128, "attacker identities cannot grow memory without bound");
-    assert!(limits.allow(&peer, true, now), "privileged confirmations remain available");
+    let allowed = (0..1000)
+        .filter(|n| {
+            let mut bytes = [0; 32];
+            bytes[..4].copy_from_slice(&(*n as u32).to_le_bytes());
+            limits.allow(&NodeId::from_bytes(bytes), false, now)
+        })
+        .count();
+    assert_eq!(
+        allowed, 96,
+        "peer churn cannot exceed the global 128/s budget"
+    );
+    assert!(
+        limits.peers.len() <= 128,
+        "attacker identities cannot grow memory without bound"
+    );
+    assert!(
+        limits.allow(&peer, true, now),
+        "privileged confirmations remain available"
+    );
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    handle_delivery_confirmation(&peer, &env.id, None, false, &own, &storage, &timestamps, &routing, &ws, &audit, &mut limits).await;
+    handle_delivery_confirmation(
+        &peer,
+        &env.id,
+        None,
+        false,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut limits,
+    )
+    .await;
     assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
 }
 
 #[tokio::test]
 async fn legacy_lost_ack_recovers_after_nonce_expiry_and_sender_restart() {
-    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder, Signature};
-    use konsensus_core::gate::{PaymentGate, GateConfig};
+    use konsensus_core::gate::{GateConfig, PaymentGate};
+    use konsensus_core::{PaymentProof, Recipient, Signature, UkmEnvelopeBuilder};
     let dir = tempfile::tempdir().unwrap();
     let (_, alice) = konsensus_core::NodeIdentity::generate().unwrap();
-    let own = *alice.node_id(); let peer = make_peer_id(62);
-    let mut env = UkmEnvelopeBuilder::new(0, own, Recipient::Node(peer), vec![1], PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000)).build();
+    let own = *alice.node_id();
+    let peer = make_peer_id(62);
+    let mut env = UkmEnvelopeBuilder::new(
+        0,
+        own,
+        Recipient::Node(peer),
+        vec![1],
+        PaymentProof::new(sha2::Sha256::digest([4; 32]).into(), [4; 32], 1000),
+    )
+    .build();
     env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
     let recipient = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
-    let gate = PaymentGate::with_config(GateConfig { verify_lightning_settlement: false, ..Default::default() });
+    let gate = PaymentGate::with_config(GateConfig {
+        verify_lightning_settlement: false,
+        ..Default::default()
+    });
     let pricing = konsensus_pricing::StaticPricingEngine::new(Default::default());
-    gate.verify(&env, &recipient, &pricing, None, None, 0.0, Some(&peer)).await.unwrap();
+    gate.verify(&env, &recipient, &pricing, None, None, 0.0, Some(&peer))
+        .await
+        .unwrap();
     recipient.store_message(&env).await.unwrap();
-    let before = gate.verify(&env, &recipient, &pricing, None, None, 0.0, Some(&peer)).await.unwrap_err();
+    let before = gate
+        .verify(&env, &recipient, &pricing, None, None, 0.0, Some(&peer))
+        .await
+        .unwrap_err();
     assert_eq!(before.to_string(), "replay detected: nonce already used");
-    sqlx::query("UPDATE nonces SET received_at = '2000-01-01T00:00:00.000Z'").execute(recipient.pool()).await.unwrap();
+    sqlx::query("UPDATE nonces SET received_at = '2000-01-01T00:00:00.000Z'")
+        .execute(recipient.pool())
+        .await
+        .unwrap();
     assert_eq!(recipient.cleanup_expired_nonces(3600).await.unwrap(), 1);
-    let reason = gate.verify(&env, &recipient, &pricing, None, None, 0.0, Some(&peer)).await.unwrap_err().to_string();
-    assert_eq!(reason, format!("payment proof already used: {}", hex::encode(env.payment_proof.payment_hash)));
+    let reason = gate
+        .verify(&env, &recipient, &pricing, None, None, 0.0, Some(&peer))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        reason,
+        format!(
+            "payment proof already used: {}",
+            hex::encode(env.payment_proof.payment_hash)
+        )
+    );
     for case in ["exact", "peer", "id", "sender", "unsent", "hash", "suffix"] {
         let path = dir.path().join(format!("{case}.sqlite"));
-        let db = konsensus_storage::SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+        let db = konsensus_storage::SqliteStorage::open(path.to_str().unwrap())
+            .await
+            .unwrap();
         db.store_message(&env).await.unwrap();
         db.queue_pending_delivery(&env.id, &peer).await.unwrap();
-        if case != "unsent" { db.mark_pending_sent(&env.id, &peer).await.unwrap(); }
+        if case != "unsent" {
+            db.mark_pending_sent(&env.id, &peer).await.unwrap();
+        }
         db.pool().close().await;
-        let db = Arc::new(konsensus_storage::SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+        let db = Arc::new(
+            konsensus_storage::SqliteStorage::open(path.to_str().unwrap())
+                .await
+                .unwrap(),
+        );
         let storage: Arc<dyn Storage> = db.clone();
         let routing = konsensus_routing::RoutingTable::new(Default::default());
         let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
@@ -1998,20 +2703,42 @@ async fn legacy_lost_ack_recovers_after_nonce_expiry_and_sender_restart() {
         let mut budget = DeliveryConfirmationBudget::default();
         let other = make_peer_id(63);
         let other_id = konsensus_core::MessageId::from_bytes([9; 32]);
-        let response = match case { "hash" => format!("payment proof already used: {}", "ab".repeat(32)), "suffix" => format!("{reason} extra"), _ => reason.clone() };
-        handle_delivery_confirmation(if case == "peer" { &other } else { &peer }, if case == "id" { &other_id } else { &env.id }, Some(&response), case == "exact", if case == "sender" { &other } else { &own }, &storage, &timestamps, &routing, &ws, &audit, &mut budget).await;
+        let response = match case {
+            "hash" => format!("payment proof already used: {}", "ab".repeat(32)),
+            "suffix" => format!("{reason} extra"),
+            _ => reason.clone(),
+        };
+        handle_delivery_confirmation(
+            if case == "peer" { &other } else { &peer },
+            if case == "id" { &other_id } else { &env.id },
+            Some(&response),
+            case == "exact",
+            if case == "sender" { &other } else { &own },
+            &storage,
+            &timestamps,
+            &routing,
+            &ws,
+            &audit,
+            &mut budget,
+        )
+        .await;
         if case == "exact" {
             assert_eq!(db.count_pending_deliveries().await.unwrap(), 0);
             assert_eq!(updates.try_recv().unwrap().status, "delivered");
-            assert!(std::fs::read_to_string(dir.path().join(format!("{case}.jsonl"))).unwrap().contains("acked_legacy"));
+            assert!(
+                std::fs::read_to_string(dir.path().join(format!("{case}.jsonl")))
+                    .unwrap()
+                    .contains("acked_legacy")
+            );
         } else {
             assert_eq!(db.count_pending_deliveries().await.unwrap(), 1, "{case}");
-            if let Ok(update) = updates.try_recv() { assert_eq!(update.status, "failed_paid"); }
+            if let Ok(update) = updates.try_recv() {
+                assert_eq!(update.status, "failed_paid");
+            }
         }
         assert!(routing.get_peer_weight(&peer).await.is_none());
     }
 }
-
 
 #[tokio::test]
 async fn accepted_chain_price_rise_and_delayed_ack_never_fail_paid() {
@@ -2032,26 +2759,49 @@ async fn accepted_chain_price_rise_and_delayed_ack_never_fail_paid() {
     }
     #[async_trait::async_trait]
     impl ChainProvider for FeeSpikeChain {
-        fn trust_level(&self) -> TrustLevel { self.inner.trust_level() }
-        async fn get_block_height(&self) -> Result<u64, ChainError> { self.inner.get_block_height().await }
-        async fn get_block_header(&self, height: u64) -> Result<BlockHeader, ChainError> { self.inner.get_block_header(height).await }
-        async fn estimate_fee(&self, target_blocks: u32) -> Result<FeeEstimate, ChainError> {
-            Ok(FeeEstimate { target_blocks, sat_per_vbyte: self.sat_per_vb.load(Ordering::SeqCst) as f64 })
+        fn trust_level(&self) -> TrustLevel {
+            self.inner.trust_level()
         }
-        async fn is_tx_confirmed(&self, txid: &str, confirmations: u32) -> Result<bool, ChainError> {
+        async fn get_block_height(&self) -> Result<u64, ChainError> {
+            self.inner.get_block_height().await
+        }
+        async fn get_block_header(&self, height: u64) -> Result<BlockHeader, ChainError> {
+            self.inner.get_block_header(height).await
+        }
+        async fn estimate_fee(&self, target_blocks: u32) -> Result<FeeEstimate, ChainError> {
+            Ok(FeeEstimate {
+                target_blocks,
+                sat_per_vbyte: self.sat_per_vb.load(Ordering::SeqCst) as f64,
+            })
+        }
+        async fn is_tx_confirmed(
+            &self,
+            txid: &str,
+            confirmations: u32,
+        ) -> Result<bool, ChainError> {
             self.inner.is_tx_confirmed(txid, confirmations).await
         }
-        async fn is_synced(&self) -> bool { self.inner.is_synced().await }
+        async fn is_synced(&self) -> bool {
+            self.inner.is_synced().await
+        }
     }
     let chain = Arc::new(FeeSpikeChain {
-        inner: konsensus_chain::MockChainProvider::new(), sat_per_vb: AtomicU64::new(1),
+        inner: konsensus_chain::MockChainProvider::new(),
+        sat_per_vb: AtomicU64::new(1),
     });
     let pricing = konsensus_pricing::ChainAwarePricingEngine::new(
         konsensus_pricing::ChainAwarePricingConfig {
-            cache_ttl: std::time::Duration::ZERO, ..Default::default()
-        }, chain.clone());
+            base: konsensus_pricing::StaticPricingConfig {
+                chat_msat: 1_000,
+                ..Default::default()
+            },
+            cache_ttl: std::time::Duration::ZERO,
+            ..Default::default()
+        },
+        chain.clone(),
+    );
     let paid_msat = pricing.get_price_msat(KIND_CHAT).await.unwrap();
-    assert_eq!(paid_msat, 11);
+    assert_eq!(paid_msat, 1_018);
 
     let alice = identity_from_mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
     let bob = identity_from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
@@ -2061,30 +2811,79 @@ async fn accepted_chain_price_rise_and_delayed_ack_never_fail_paid() {
     let wallet = konsensus_lightning::MockLightningProvider::new();
     let hash = wallet.inject_inbound_keysend(paid_msat, None).await;
     let settled = wallet.get_payment_status(&hash).await.unwrap();
-    let proof = PaymentProof::new(hex::decode(&hash).unwrap().try_into().unwrap(),
-        hex::decode(settled.preimage.unwrap()).unwrap().try_into().unwrap(), paid_msat);
-    let mut envelope = UkmEnvelopeBuilder::new(KIND_CHAT, own, Recipient::Node(peer), vec![1, 2, 3], proof).build();
+    let proof = PaymentProof::new(
+        hex::decode(&hash).unwrap().try_into().unwrap(),
+        hex::decode(settled.preimage.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        paid_msat,
+    );
+    let mut envelope =
+        UkmEnvelopeBuilder::new(KIND_CHAT, own, Recipient::Node(peer), vec![1, 2, 3], proof)
+            .build();
     envelope.signature = Signature::from_ed25519(&alice.sign(&envelope.signable_bytes()));
     let gate = PaymentGate::with_config(GateConfig {
-        verify_lightning_settlement: true, ..Default::default()
+        verify_lightning_settlement: true,
+        ..Default::default()
     });
     let recipient = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
 
     // Production receive ordering: validate first, then atomic acceptance.
-    gate.validate_paid_envelope(&envelope, &pricing, Some(&whitelist), Some(&wallet), 0.0, Some(&peer)).await.unwrap();
-    assert_eq!(recipient.accept_paid_envelope(&envelope).await.unwrap(), PaidAcceptance::Accepted);
+    gate.validate_paid_envelope(
+        &envelope,
+        &pricing,
+        Some(&whitelist),
+        Some(&wallet),
+        0.0,
+        Some(&peer),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recipient.accept_paid_envelope(&envelope).await.unwrap(),
+        PaidAcceptance::Accepted
+    );
     // Lose the ACK. While the price remains unchanged, the same validated
     // signed envelope correctly reaches AlreadyAccepted (duplicate ACK).
-    gate.validate_paid_envelope(&envelope, &pricing, Some(&whitelist), Some(&wallet), 0.0, Some(&peer)).await.unwrap();
-    assert_eq!(recipient.accept_paid_envelope(&envelope).await.unwrap(), PaidAcceptance::AlreadyAccepted);
+    gate.validate_paid_envelope(
+        &envelope,
+        &pricing,
+        Some(&whitelist),
+        Some(&wallet),
+        0.0,
+        Some(&peer),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recipient.accept_paid_envelope(&envelope).await.unwrap(),
+        PaidAcceptance::AlreadyAccepted
+    );
 
     // Price refresh after congestion. Even granting the maximum 50% routing
     // discount cannot save this already-accepted proof from re-pricing.
     chain.sat_per_vb.store(1000, Ordering::SeqCst);
     let new_price = pricing.get_price_msat(KIND_CHAT).await.unwrap();
-    assert_eq!(new_price, 50, "production default 5x cap remains enforced");
+    assert_eq!(
+        new_price, 5_000,
+        "production default 5x cap remains enforced"
+    );
     let receipts = konsensus_storage::StorageNonceAdapter::new(recipient.clone());
-    assert!(gate.validate_received_paid_envelope(&envelope, &receipts, &pricing, Some(&whitelist), Some(&wallet), 0.5, Some(&peer)).await.unwrap(), "already-accepted evidence precedes current pricing");
+    assert!(
+        gate.validate_received_paid_envelope(
+            &envelope,
+            &receipts,
+            &pricing,
+            Some(&whitelist),
+            Some(&wallet),
+            0.5,
+            Some(&peer)
+        )
+        .await
+        .unwrap(),
+        "already-accepted evidence precedes current pricing"
+    );
     assert!(recipient.get_message(&envelope.id).await.unwrap().is_some());
 
     let sender = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
@@ -2099,13 +2898,37 @@ async fn accepted_chain_price_rise_and_delayed_ack_never_fail_paid() {
     let mut budget = DeliveryConfirmationBudget::default();
     // Model an authenticated, whitelisted/privileged counterparty: the
     // PriceOpen unpaid-stranger suppression does not apply to this case.
-    handle_delivery_confirmation(&peer, &envelope.id, None, true, &own,
-        &storage, &timestamps, &routing, &ws, &audit, &mut budget).await;
+    handle_delivery_confirmation(
+        &peer,
+        &envelope.id,
+        None,
+        true,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut budget,
+    )
+    .await;
     assert_eq!(updates.try_recv().unwrap().status, "delivered");
     assert_eq!(sender.count_pending_deliveries().await.unwrap(), 0);
     // A delayed original ACK is harmless after duplicate-ACK completion.
-    handle_delivery_confirmation(&peer, &envelope.id, None, true, &own,
-        &storage, &timestamps, &routing, &ws, &audit, &mut budget).await;
+    handle_delivery_confirmation(
+        &peer,
+        &envelope.id,
+        None,
+        true,
+        &own,
+        &storage,
+        &timestamps,
+        &routing,
+        &ws,
+        &audit,
+        &mut budget,
+    )
+    .await;
     assert!(updates.try_recv().is_err());
     assert_eq!(sender.count_pending_deliveries().await.unwrap(), 0);
 }
@@ -2121,10 +2944,17 @@ async fn recovery_announces_lightning_once_only_to_privileged_connected_peers() 
     let a = Arc::new(a);
     let b = Arc::new(b);
     let c = Arc::new(c);
-    let build = |id: Arc<NodeIdentity>, whitelist| Arc::new(NoiseTransport::new(id, TransportConfig {
-        listen_addr: "127.0.0.1:0".parse().unwrap(), admission_mode: ReachabilityMode::PriceOpen,
-        whitelist, ..Default::default()
-    }));
+    let build = |id: Arc<NodeIdentity>, whitelist| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                whitelist,
+                ..Default::default()
+            },
+        ))
+    };
     let source = build(a.clone(), vec![*b.node_id()]);
     let stranger = build(c, vec![*b.node_id()]);
     let target = build(b.clone(), vec![*a.node_id()]);
@@ -2133,20 +2963,66 @@ async fn recovery_announces_lightning_once_only_to_privileged_connected_peers() 
     source.connect(b.node_id(), &addr).await.unwrap();
     stranger.connect(b.node_id(), &addr).await.unwrap();
     // Drain connection events; no session handler has sent LightningInfo yet.
-    assert!(matches!(source.recv_control().await, Some(ControlEvent::PeerConnected { .. })));
-    assert!(matches!(stranger.recv_control().await, Some(ControlEvent::PeerConnected { .. })));
-    let lightning: Arc<dyn LightningProvider> = Arc::new(konsensus_lightning::shared_mock::SharedMockProvider::new(
-        &dir.path().join("ledger.sqlite"), "recovered", 0).unwrap());
+    assert!(matches!(
+        source.recv_control().await,
+        Some(ControlEvent::PeerConnected { .. })
+    ));
+    assert!(matches!(
+        stranger.recv_control().await,
+        Some(ControlEvent::PeerConnected { .. })
+    ));
+    let lightning: Arc<dyn LightningProvider> = Arc::new(
+        konsensus_lightning::shared_mock::SharedMockProvider::new(
+            &dir.path().join("ledger.sqlite"),
+            "recovered",
+            0,
+        )
+        .unwrap(),
+    );
     let expected = lightning.get_node_pubkey().await.unwrap();
-    let storage: Arc<dyn Storage> = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> =
+        Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
     let (ws, _) = broadcast::channel(8);
     let mut was_ready = false;
-    refresh_recovered_lightning(&mut was_ready, &target, &lightning, &None, &storage, &ws, *b.node_id()).await;
-    let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control()).await.unwrap().unwrap();
-    assert!(matches!(event, ControlEvent::LightningInfoReceived { ln_pubkey, .. } if ln_pubkey == expected));
-    refresh_recovered_lightning(&mut was_ready, &target, &lightning, &None, &storage, &ws, *b.node_id()).await;
-    assert!(tokio::time::timeout(Duration::from_millis(50), source.recv_control()).await.is_err(), "duplicate announcement");
-    assert!(tokio::time::timeout(Duration::from_millis(50), stranger.recv_control()).await.is_err(), "unpaid stranger received identity");
+    refresh_recovered_lightning(
+        &mut was_ready,
+        &target,
+        &lightning,
+        &None,
+        &storage,
+        &ws,
+        *b.node_id(),
+    )
+    .await;
+    let event = tokio::time::timeout(Duration::from_secs(2), source.recv_control())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event, ControlEvent::LightningInfoReceived { ln_pubkey, .. } if ln_pubkey == expected)
+    );
+    refresh_recovered_lightning(
+        &mut was_ready,
+        &target,
+        &lightning,
+        &None,
+        &storage,
+        &ws,
+        *b.node_id(),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), source.recv_control())
+            .await
+            .is_err(),
+        "duplicate announcement"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), stranger.recv_control())
+            .await
+            .is_err(),
+        "unpaid stranger received identity"
+    );
     source.shutdown();
     stranger.shutdown();
     target.shutdown();
@@ -2343,18 +3219,37 @@ async fn admission_backend_readiness_race_and_timeout_return_fixed_refusals() {
 async fn ready_admission_preparation_preserves_signed_stateless_quote() {
     let dir = tempfile::tempdir().unwrap();
     let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(
-        &dir.path().join("wallet.sqlite"), "recipient", 0).unwrap();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        &dir.path().join("wallet.sqlite"),
+        "recipient",
+        0,
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let (invoice, amount, description) = prepare_admission_invoice(
-        admission_pricing().as_ref(), &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
-        &wallet, "test-request", now + u64::from(konsensus_core::admission_quote::FIRST_CONTACT_QUOTE_VALIDITY_SECS)).await.unwrap();
-    let signed = invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>().unwrap();
+        admission_pricing().as_ref(),
+        &ReadinessHeightCache::new(Arc::new(konsensus_chain::MockChainProvider::new())),
+        &wallet,
+        "test-request",
+        now + u64::from(konsensus_core::admission_quote::FIRST_CONTACT_QUOTE_VALIDITY_SECS),
+    )
+    .await
+    .unwrap();
+    let signed = invoice
+        .bolt11
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .unwrap();
     assert_eq!(signed.amount_milli_satoshis(), Some(amount));
     assert_eq!(signed.description().to_string(), description);
     assert_eq!(signed.payment_hash().to_string(), invoice.payment_hash);
     assert!(signed.expires_at().unwrap().as_secs() > now + 290);
     assert!(signed.expires_at().unwrap().as_secs() <= now + 300);
-    assert_eq!(signed.recover_payee_pub_key().to_string(), wallet.get_node_pubkey().await.unwrap());
+    assert_eq!(
+        signed.recover_payee_pub_key().to_string(),
+        wallet.get_node_pubkey().await.unwrap()
+    );
     assert!(wallet.list_payments(10).await.unwrap().is_empty());
     assert_eq!(wallet.get_balance_msat().await.unwrap(), 0);
 }
@@ -2364,19 +3259,49 @@ fn privileged_invoice_error_frames_never_contain_backend_details() {
     use konsensus_core::traits::lightning::LightningError;
     const PRIVATE: &str = "https://user:secret@private-backend.invalid/private-wallet";
     let cases = [
-        (LightningError::Backend(PRIVATE.into()), "konsensus:invoice_unavailable"),
-        (LightningError::InvoiceCreation(PRIVATE.into()), "konsensus:invoice_unavailable"),
-        (LightningError::Connection(PRIVATE.into()), "konsensus:invoice_unavailable"),
-        (LightningError::Auth(PRIVATE.into()), "konsensus:invoice_unavailable"),
-        (LightningError::InvalidStartupConfig(PRIVATE.into()), "konsensus:invoice_unavailable"),
-        (LightningError::PaymentNotDispatched(PRIVATE.into()), "konsensus:invoice_unavailable"),
+        (
+            LightningError::Backend(PRIVATE.into()),
+            "konsensus:invoice_unavailable",
+        ),
+        (
+            LightningError::InvoiceCreation(PRIVATE.into()),
+            "konsensus:invoice_unavailable",
+        ),
+        (
+            LightningError::Connection(PRIVATE.into()),
+            "konsensus:invoice_unavailable",
+        ),
+        (
+            LightningError::Auth(PRIVATE.into()),
+            "konsensus:invoice_unavailable",
+        ),
+        (
+            LightningError::InvalidStartupConfig(PRIVATE.into()),
+            "konsensus:invoice_unavailable",
+        ),
+        (
+            LightningError::PaymentNotDispatched(PRIVATE.into()),
+            "konsensus:invoice_unavailable",
+        ),
         (LightningError::NotReady, "konsensus:not_ready:not_synced"),
-        (LightningError::StatelessQuoteUnsupported, "stateless_quote_unsupported"),
-        (LightningError::PaymentNotDispatched("disk_low".into()), "disk_low"),
-        (LightningError::ChainSourceUnavailable {
-            network: PRIVATE.into(), service: PRIVATE.into(), attempts: 1,
-            elapsed_ms: 1, cause: PRIVATE.into(),
-        }, "konsensus:not_ready:chain_unavailable"),
+        (
+            LightningError::StatelessQuoteUnsupported,
+            "stateless_quote_unsupported",
+        ),
+        (
+            LightningError::PaymentNotDispatched("disk_low".into()),
+            "disk_low",
+        ),
+        (
+            LightningError::ChainSourceUnavailable {
+                network: PRIVATE.into(),
+                service: PRIVATE.into(),
+                attempts: 1,
+                elapsed_ms: 1,
+                cause: PRIVATE.into(),
+            },
+            "konsensus:not_ready:chain_unavailable",
+        ),
     ];
     for (error, expected) in cases {
         let frame = invoice_error_frame("request-199", error);
@@ -2642,7 +3567,9 @@ async fn admission_height_cache_discards_overdue_cancelled_lookups() {
     let cache = ReadinessHeightCache::new(chain.clone());
     // Leave a read pending with no waiter. Its delayed response must not become
     // a new observation when the next admission arrives much later.
-    assert!(tokio::time::timeout(std::time::Duration::ZERO, cache.get()).await.is_err());
+    assert!(tokio::time::timeout(std::time::Duration::ZERO, cache.get())
+        .await
+        .is_err());
     assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
     tokio::time::advance(std::time::Duration::from_secs(61)).await;
     cache.get().await.unwrap();
@@ -2687,18 +3614,40 @@ async fn admission_height_cache_rejects_overdue_ready_response() {
     assert!(futures::poll!(&mut lookup).is_pending());
     // Both the response and timeout are ready when the lookup is polled again.
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
-    assert_eq!(lookup.await.unwrap_err(), "konsensus:not_ready:chain_unavailable");
+    assert_eq!(
+        lookup.await.unwrap_err(),
+        "konsensus:not_ready:chain_unavailable"
+    );
     cache.get().await.unwrap();
     assert_eq!(chain.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
 async fn issue204_zero_height_refuses_admission_with_typed_not_ready() {
-    let chain = Arc::new(konsensus_chain::MockChainProvider::with_config(konsensus_chain::MockChainConfig {
-        initial_height: 0, ..Default::default()
-    }));
+    let chain = Arc::new(konsensus_chain::MockChainProvider::with_config(
+        konsensus_chain::MockChainConfig {
+            initial_height: 0,
+            ..Default::default()
+        },
+    ));
     let cache = ReadinessHeightCache::new(chain);
     let dir = tempfile::tempdir().unwrap();
-    let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(&dir.path().join("wallet.sqlite"), "recipient", 0).unwrap();
-    assert_eq!(prepare_admission_invoice(admission_pricing().as_ref(), &cache, &wallet, "request", u64::MAX).await.unwrap_err(), konsensus_api::invoice_refusal::CHAIN_UNAVAILABLE);
+    let wallet = konsensus_lightning::shared_mock::SharedMockProvider::new(
+        &dir.path().join("wallet.sqlite"),
+        "recipient",
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        prepare_admission_invoice(
+            admission_pricing().as_ref(),
+            &cache,
+            &wallet,
+            "request",
+            u64::MAX
+        )
+        .await
+        .unwrap_err(),
+        konsensus_api::invoice_refusal::CHAIN_UNAVAILABLE
+    );
 }

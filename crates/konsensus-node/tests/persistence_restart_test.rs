@@ -58,7 +58,7 @@ fn make_transport(identity: &Arc<NodeIdentity>, whitelist: Vec<NodeId>) -> Arc<N
 fn make_envelope(identity: &NodeIdentity, recipient: NodeId, ciphertext: Vec<u8>) -> UkmEnvelope {
     let preimage = rand::random::<[u8; 32]>();
     let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
-    let proof = PaymentProof::new(payment_hash, preimage, 100);
+    let proof = PaymentProof::new(payment_hash, preimage, 1_000);
 
     let mut envelope = UkmEnvelopeBuilder::new(
         0, // KIND_CHAT
@@ -80,7 +80,7 @@ fn make_envelope(identity: &NodeIdentity, recipient: NodeId, ciphertext: Vec<u8>
 fn make_stored_envelope(sender: NodeId, recipient: NodeId, seq: usize) -> UkmEnvelope {
     let preimage = [seq as u8; 32];
     let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
-    let proof = PaymentProof::new(payment_hash, preimage, 100);
+    let proof = PaymentProof::new(payment_hash, preimage, 1_000);
     let ciphertext = format!("encrypted-payload-{seq}").into_bytes();
     let nonce = Nonce::from_bytes([(seq % 256) as u8; 24]);
 

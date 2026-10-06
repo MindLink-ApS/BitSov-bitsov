@@ -1972,6 +1972,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x25519-dalek",
  "zeroize",
 ]
 

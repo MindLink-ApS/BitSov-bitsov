@@ -5,15 +5,15 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::gate::{GateConfig, GateRejection, NonceStore, PaymentGate};
 use konsensus_core::identity::NodeIdentity;
-use konsensus_core::kind::{KIND_CHAT, KIND_FILE_REF, KIND_LONGFORM, KindCategory};
+use konsensus_core::kind::{KindCategory, KIND_CHAT, KIND_FILE_REF, KIND_LONGFORM};
 use konsensus_core::traits::lightning::{
     Invoice, LightningError, PaymentDetails, PaymentDirection, PaymentStatus,
 };
 use konsensus_core::traits::pricing::{PricingEngine, PricingError};
 use konsensus_core::types::{NodeId, Nonce, PaymentProof, Recipient, Signature};
+use konsensus_core::UkmEnvelopeBuilder;
 
 use sha2::{Digest, Sha256};
 
@@ -36,16 +36,24 @@ impl MockNonceStore {
 #[async_trait::async_trait]
 impl NonceStore for MockNonceStore {
     async fn check_and_store_paid(
-        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
-        _sender: &konsensus_core::NodeId, _message_id: &konsensus_core::MessageId,
+        &self,
+        nonce: &konsensus_core::Nonce,
+        payment_hash: &[u8; 32],
+        _sender: &konsensus_core::NodeId,
+        _message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
         use konsensus_core::gate::PaidReplay;
         let mut nonces = self.seen.lock().unwrap();
         let mut payments = self.seen_payment_hashes.lock().unwrap();
         let key = *nonce.as_bytes();
-        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
-        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
-        nonces.insert(key); payments.insert(*payment_hash);
+        if nonces.contains(&key) {
+            return Ok(PaidReplay::NonceReused);
+        }
+        if payments.contains(payment_hash) {
+            return Ok(PaidReplay::PaymentReused);
+        }
+        nonces.insert(key);
+        payments.insert(*payment_hash);
         Ok(PaidReplay::Accepted)
     }
 
@@ -99,10 +107,10 @@ impl PricingEngine for KindAwarePricing {
 
     async fn get_price_msat(&self, kind: u16) -> Result<u64, PricingError> {
         match kind {
-            0 => Ok(10),    // KIND_CHAT
-            1 => Ok(50),    // KIND_LONGFORM
-            200 => Ok(100), // KIND_FILE_REF
-            _ => Ok(25),
+            0 => Ok(1_000),    // KIND_CHAT
+            1 => Ok(5_000),    // KIND_LONGFORM
+            200 => Ok(10_000), // KIND_FILE_REF
+            _ => Ok(2_500),
         }
     }
 
@@ -142,7 +150,7 @@ impl konsensus_core::traits::lightning::LightningProvider for MockLightning {
         Ok(PaymentDetails {
             payment_hash: payment_hash.to_string(),
             preimage: Some(hex::encode([42u8; 32])),
-            amount_msat: 100,
+            amount_msat: 10_000,
             status,
             direction: PaymentDirection::Incoming,
             timestamp: 0,
@@ -221,10 +229,15 @@ fn make_signed_envelope_unique_proof(
     let hash: [u8; 32] = Sha256::digest(preimage).into();
     let proof = PaymentProof::new(hash, preimage, amount_msat);
 
-    let mut envelope =
-        UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"encrypted content".to_vec(), proof)
-            .timestamp(now_ms())
-            .build();
+    let mut envelope = UkmEnvelopeBuilder::new(
+        KIND_CHAT,
+        sender,
+        recipient,
+        b"encrypted content".to_vec(),
+        proof,
+    )
+    .timestamp(now_ms())
+    .build();
 
     let signable = envelope.signable_bytes();
     let sig = identity.sign(&signable);
@@ -243,17 +256,16 @@ async fn message_just_within_max_age_accepted() {
 
     // Timestamp is exactly (max_age - 1000ms) old — safely within window
     let ts = now_ms() - (max_age_ms - 1_000);
-    let envelope = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 100, ts);
+    let envelope = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 10_000, ts);
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
-    assert!(
-        gate.verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -262,11 +274,11 @@ async fn message_well_beyond_max_age_rejected() {
 
     // Timestamp is 10 minutes old (well beyond default 5-minute window)
     let ts = now_ms() - (10 * 60 * 1000);
-    let envelope = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 100, ts);
+    let envelope = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 10_000, ts);
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
     let result = gate
         .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
@@ -284,11 +296,11 @@ async fn custom_max_age_1_second_rejects_old_messages() {
     };
     let gate = PaymentGate::with_config(config);
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
     // Message 2 seconds old — rejected with 1s max age
     let ts = now_ms() - 2_000;
-    let envelope = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 100, ts);
+    let envelope = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 10_000, ts);
 
     let result = gate
         .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
@@ -306,17 +318,16 @@ async fn custom_max_age_1_hour_accepts_recent_messages() {
     };
     let gate = PaymentGate::with_config(config);
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
     // Message 10 minutes old — accepted with 1h max age
     let ts = now_ms() - (10 * 60 * 1000);
-    let envelope = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 100, ts);
+    let envelope = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 10_000, ts);
 
-    assert!(
-        gate.verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -324,11 +335,11 @@ async fn zero_timestamp_rejected_as_too_old() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
 
     // Timestamp = 0 (epoch) — extremely old
-    let envelope = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 100, 0);
+    let envelope = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 10_000, 0);
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
     let result = gate
         .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
@@ -343,49 +354,50 @@ async fn zero_timestamp_rejected_as_too_old() {
 #[tokio::test]
 async fn exact_payment_amount_accepted() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 10); // exactly 10 msat
+    let envelope = make_signed_envelope(&identity, 1_000); // exactly 1,000 msat
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
-    assert!(
-        gate.verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
 async fn overpayment_accepted() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 1_000_000); // 1M msat overpayment
+    let envelope = make_signed_envelope(&identity, 100_000_000); // 1M msat overpayment
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
-    assert!(
-        gate.verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
-async fn zero_price_accepts_zero_payment() {
+async fn zero_price_still_requires_one_sat() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
     let envelope = make_signed_envelope(&identity, 0);
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 0 }; // free messages
+    let pricing = MockPricing { price_msat: 0 };
 
-    assert!(
+    assert!(matches!(
         gate.verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+            .await,
+        Err(GateRejection::InsufficientPayment {
+            required_msat: 1_000,
+            paid_msat: 0
+        })
+    ));
 }
 
 #[tokio::test]
@@ -400,11 +412,10 @@ async fn large_payment_amount_no_overflow() {
     };
 
     // u64::MAX >= u64::MAX — should pass price check
-    assert!(
-        gate.verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -417,35 +428,35 @@ async fn different_kinds_require_different_payments() {
     let gate = PaymentGate::new();
     let pricing = KindAwarePricing;
 
-    // KIND_CHAT costs 10 — paying 10 should pass
-    let env = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 10, now_ms());
+    // KIND_CHAT costs 1,000 — paying 1,000 should pass
+    let env = make_signed_envelope_with_kind_and_ts(&identity, KIND_CHAT, 1_000, now_ms());
     let nonces = MockNonceStore::new();
-    assert!(
-        gate.verify(&env, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(&env, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
 
-    // KIND_LONGFORM costs 50 — paying 10 should fail
-    let env = make_signed_envelope_with_kind_and_ts(&identity, KIND_LONGFORM, 10, now_ms());
+    // KIND_LONGFORM costs 5,000 — paying 1,000 should fail
+    let env = make_signed_envelope_with_kind_and_ts(&identity, KIND_LONGFORM, 1_000, now_ms());
     let nonces = MockNonceStore::new();
-    let result = gate.verify(&env, &nonces, &pricing, None, None, 0.0, None).await;
+    let result = gate
+        .verify(&env, &nonces, &pricing, None, None, 0.0, None)
+        .await;
     assert!(matches!(
         result,
         Err(GateRejection::InsufficientPayment {
-            required_msat: 50,
-            paid_msat: 10
+            required_msat: 5_000,
+            paid_msat: 1_000
         })
     ));
 
-    // KIND_FILE_REF costs 100 — paying 100 should pass
-    let env = make_signed_envelope_with_kind_and_ts(&identity, KIND_FILE_REF, 100, now_ms());
+    // KIND_FILE_REF costs 10,000 — paying 10,000 should pass
+    let env = make_signed_envelope_with_kind_and_ts(&identity, KIND_FILE_REF, 10_000, now_ms());
     let nonces = MockNonceStore::new();
-    assert!(
-        gate.verify(&env, &nonces, &pricing, None, None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(&env, &nonces, &pricing, None, None, 0.0, None)
+        .await
+        .is_ok());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -455,7 +466,7 @@ async fn different_kinds_require_different_payments() {
 #[tokio::test]
 async fn settled_payment_passes_settlement_check() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 100);
+    let envelope = make_signed_envelope(&identity, 10_000);
 
     let config = GateConfig {
         verify_lightning_settlement: true,
@@ -463,33 +474,47 @@ async fn settled_payment_passes_settlement_check() {
     };
     let gate = PaymentGate::with_config(config);
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
     let lightning = MockLightning { settled: true };
 
-    assert!(
-        gate.verify(&envelope, &nonces, &pricing, None, Some(&lightning), 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(
+            &envelope,
+            &nonces,
+            &pricing,
+            None,
+            Some(&lightning),
+            0.0,
+            None
+        )
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
 async fn settlement_not_required_by_default() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 100);
+    let envelope = make_signed_envelope(&identity, 10_000);
 
     // Default config: settlement not required
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
     let lightning = MockLightning { settled: false };
 
     // Even with unsettled Lightning, should pass (settlement not checked)
-    assert!(
-        gate.verify(&envelope, &nonces, &pricing, None, Some(&lightning), 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(
+            &envelope,
+            &nonces,
+            &pricing,
+            None,
+            Some(&lightning),
+            0.0,
+            None
+        )
+        .await
+        .is_ok());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -499,30 +524,37 @@ async fn settlement_not_required_by_default() {
 #[tokio::test]
 async fn sender_in_whitelist_accepted() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 100);
+    let envelope = make_signed_envelope(&identity, 10_000);
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
     let mut whitelist = HashSet::new();
     whitelist.insert(*identity.node_id());
 
-    assert!(
-        gate.verify(&envelope, &nonces, &pricing, Some(&whitelist), None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(
+            &envelope,
+            &nonces,
+            &pricing,
+            Some(&whitelist),
+            None,
+            0.0,
+            None
+        )
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
 async fn large_whitelist_with_sender_accepted() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
-    let envelope = make_signed_envelope(&identity, 100);
+    let envelope = make_signed_envelope(&identity, 10_000);
 
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
     // Whitelist with 100 random nodes plus the sender
     let mut whitelist = HashSet::new();
@@ -532,11 +564,18 @@ async fn large_whitelist_with_sender_accepted() {
     }
     whitelist.insert(*identity.node_id());
 
-    assert!(
-        gate.verify(&envelope, &nonces, &pricing, Some(&whitelist), None, 0.0, None)
-            .await
-            .is_ok()
-    );
+    assert!(gate
+        .verify(
+            &envelope,
+            &nonces,
+            &pricing,
+            Some(&whitelist),
+            None,
+            0.0,
+            None
+        )
+        .await
+        .is_ok());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -548,16 +587,15 @@ async fn multiple_valid_messages_all_accepted() {
     let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
     for seed in 0..20u8 {
         // Each message is paid with its own Lightning proof → unique payment hash.
-        let envelope = make_signed_envelope_unique_proof(&identity, 100, seed);
-        assert!(
-            gate.verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
-                .await
-                .is_ok()
-        );
+        let envelope = make_signed_envelope_unique_proof(&identity, 10_000, seed);
+        assert!(gate
+            .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
+            .await
+            .is_ok());
     }
 }
 
@@ -565,19 +603,30 @@ async fn multiple_valid_messages_all_accepted() {
 async fn messages_from_multiple_senders_accepted() {
     let gate = PaymentGate::new();
     let nonces = MockNonceStore::new();
-    let pricing = MockPricing { price_msat: 10 };
+    let pricing = MockPricing { price_msat: 1_000 };
 
     let mut whitelist = HashSet::new();
 
-    for (seed, pass) in ["alice", "bob", "charlie", "dave", "eve"].iter().enumerate() {
+    for (seed, pass) in ["alice", "bob", "charlie", "dave", "eve"]
+        .iter()
+        .enumerate()
+    {
         let id = NodeIdentity::from_mnemonic(TEST_MNEMONIC, pass).unwrap();
         whitelist.insert(*id.node_id());
         // Distinct senders pay with distinct Lightning proofs → unique hashes.
-        let envelope = make_signed_envelope_unique_proof(&id, 100, seed as u8);
+        let envelope = make_signed_envelope_unique_proof(&id, 10_000, seed as u8);
         assert!(
-            gate.verify(&envelope, &nonces, &pricing, Some(&whitelist), None, 0.0, None)
-                .await
-                .is_ok(),
+            gate.verify(
+                &envelope,
+                &nonces,
+                &pricing,
+                Some(&whitelist),
+                None,
+                0.0,
+                None
+            )
+            .await
+            .is_ok(),
             "message from {pass} should be accepted"
         );
     }

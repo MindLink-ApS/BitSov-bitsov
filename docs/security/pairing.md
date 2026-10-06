@@ -37,6 +37,65 @@ The code is a cross-check, not the control. A sidecar app owns the data
 directory and can read it by construction; describing code comparison as
 *preventing* such an app from pairing would be an overclaim.
 
+## Box transport key and migration (U1)
+
+`PairingService::open` creates `<data_dir>/pairing/box-transport.key`: a
+CSPRNG-generated, raw 32-byte X25519 secret, stored at mode `0600` inside the
+`0700` pairing directory. It is independent of the mnemonic and remains stable
+across restarts and identity changes. Creation publishes a fully written, synced
+key atomically without replacing an existing key. Existing keys are loaded, never
+silently rotated; a malformed file or a symlink fails startup. Restore a damaged
+key from backup. Deleting it generates a different key on the next open and invalidates
+any previously saved box pin. Include it in protected data-directory backups;
+it is not recoverable from the mnemonic. Secret bytes are zeroized on drop.
+Key creation requires a filesystem that supports hard links (for example NTFS,
+ext4 or APFS; exFAT/FAT SD cards are not supported). On Unix, key and identity
+metadata publication require successful directory synchronization, including their
+parent data directory. Sync failures refuse startup; retrying keeps the published
+key and retries synchronization, even for unchanged files. On non-Unix platforms,
+directory synchronization is best-effort (std has no directory fsync on
+Windows); only a missing directory refuses startup. The files themselves are
+still synced before they are published.
+
+On every **unlocked** start, including when remote access is disabled, the node
+signs the box public key with its Ed25519 identity and atomically creates or
+refreshes `<data_dir>/identity/identity.json`. The public fields are `node_id`,
+`identity_fingerprint`, `box_transport_pubkey`, and `box_transport_signature`;
+bootstrap's `committed_at` and other existing metadata are preserved. Keys are
+lowercase hex. The signature is base64url without padding over these exact UTF-8
+bytes (no trailing newline):
+
+```text
+bitsov-box-transport-v1:<node_id>:<box_transport_pubkey>
+```
+
+Every successful remote `AuthResponse::Ok`, for first pairing and subsequent
+authentication, adds `box_transport_pubkey` and `box_transport_signature` with
+the same encoding and proof. A client verifies the signature against its
+**already trusted node_id**, then saves the box key under that identity in its
+protected credential store. Reject a missing, malformed, tampered, or
+wrong-identity proof for box pinning. The box key does not grant any scope or
+replace the client's durable pairing key. Client credential storage is in the
+app repository; this repository tests the verification rule with a client
+fixture and real Noise connections.
+
+**Migration:** U1 deliberately keeps the live tunnel's seed-derived Noise
+responder static and the existing pairing-link format. Today's paired clients
+can reconnect with their old pin and ignore the additive auth fields. Updated
+clients learn the signed box pin over that authenticated live connection before
+using it for a future locked connection. Retain the live pin alongside the box
+pin; do not overwrite it. There is no automatic switch of the live listener,
+no re-pairing requirement, and no change to client epochs, scopes, or revocation.
+U1 adds no locked startup, unlock endpoint, or remote bootstrap. A future locked
+listener must prove possession of the previously verified box static; a client
+must never trust a replacement advertised by a locked node on first use.
+
+This secret is a transport credential, not a seed-decryption key. A disk image
+alone does not decrypt an encrypted seed, but a thief with the key **and** the
+node's network position could impersonate a future locked box and capture a
+password sent during unlock. U1 does not provide hardware protection against
+that adversary.
+
 ## Scopes
 
 | grant | how |

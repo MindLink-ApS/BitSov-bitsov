@@ -23,6 +23,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  release-sign-test:
+    name: Offline Release Signing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate regression-test locales
+        run: |
+          sudo localedef -i da_DK -f ISO-8859-1 da_DK.ISO8859-1
+          sudo localedef -i en_US -f UTF-8 en_US.UTF-8
+      - name: Exercise the release-signing command offline
+        run: bash scripts/test-release-sign.sh
+
   frontend:
     name: Frontend Build
     runs-on: ubuntu-latest
