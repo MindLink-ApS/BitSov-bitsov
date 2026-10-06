@@ -48,7 +48,7 @@ else
 fi
 
 # 2. Wait for the tag's CI run
-echo "waiting for CI on $TAG…"
+echo "waiting for CI on ${TAG}..."
 RUN=""
 for _ in $(seq 1 60); do
   RUN=$(gh run list --repo "$REPO" --workflow ci.yml --branch "$TAG" --event push --limit 1 --json databaseId -q '.[0].databaseId' || true)
