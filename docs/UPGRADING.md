@@ -153,8 +153,11 @@ read as `console`; the owner signature remains mandatory. Never install an
 owner public key file as a replacement for startup derivation.
 
 Without this flag, descriptor passwords keep `seed_password_not_typed` and
-sidecar grants remain inactive. The live mode does not open `control.sock`, enroll
-new devices, enable console grants or alter remote rules. On a positively empty
+sidecar grants remain inactive. Local mode retains the zeroizing owner signing
+key for enrollment delegated by an existing owner device. The live mode does
+not open `control.sock`, enable console grants or alter remote rules. Apps can
+read `owner_device_count` to warn when only one owner device remains; the phone
+must never be the only owner device. On a positively empty
 directory it now enables encrypted two-phase bootstrap and one first owner
 device enrollment. Legacy HTTP create/restore now write `mnemonic.enc` whenever
 a startup password is present, including `--password` and `--password-file`

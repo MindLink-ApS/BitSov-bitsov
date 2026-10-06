@@ -892,18 +892,9 @@ fn local_owner_honours_only_recipient_bound_device_grants_from_disk() {
 #[test]
 fn local_owner_cannot_use_console_only_authority() {
     let tmp = tempfile::tempdir().unwrap();
-    let (service, _, client, device, _) = registered(tmp.path());
+    let (service, _, client, _, _) = registered(tmp.path());
     drop(service);
     let local = local_run(tmp.path());
-    assert!(matches!(
-        local.request_device_key(
-            &client.client_id,
-            &device.public_hex(),
-            "mac",
-            &device.proof(&client.client_id)
-        ),
-        Err(PairingError::OwnerChannelUnavailable)
-    ));
     assert!(matches!(
         local.approve_device_key("op", "code", "sig"),
         Err(PairingError::OwnerChannelUnavailable)
@@ -935,4 +926,342 @@ fn local_owner_cannot_use_console_only_authority() {
     assert_eq!(local.reissue_owner_challenges().unwrap(), 0);
     assert!(local.pending_device_keys().is_empty());
     assert!(local.grant_view_for(&client.client_id).is_none());
+}
+
+// PR C: the signed bytes are built independently here to pin the wire contract.
+fn delegation_bytes(op: &PendingDeviceKey) -> String {
+    format!(
+        "bitsov-owner-delegation-v1\nnode:{}\nclient_pubkey:{}\nepoch:{}\ndevice_key:{}\nop_id:{}\nnonce:{}",
+        fingerprint(), op.client_pubkey, op.epoch, op.public_key, op.op_id, op.delegation_nonce
+    )
+}
+
+fn delegation_run(dir: &std::path::Path) -> PairingService {
+    PairingService::open(dir, fingerprint(), false)
+        .unwrap()
+        .with_local_owner_device()
+        .with_owner_signing_key(owner_key())
+        .without_stdout_code()
+}
+
+#[test]
+fn delegation_binds_every_tuple_field_and_is_single_use_across_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (svc, _, approver, device, key_id) = registered(tmp.path());
+    let (target, _) = pair(&svc, 2);
+    drop(svc);
+    let svc = delegation_run(tmp.path());
+    let new = Device::new();
+    let op = svc
+        .request_device_key(
+            &target.client_id,
+            &new.public_hex(),
+            "phone",
+            &new.proof(&target.client_id),
+        )
+        .unwrap();
+    assert_eq!(
+        svc.device_key_status(&target.client_id, &op.op_id),
+        DeviceKeyStatus::Pending
+    );
+    assert_eq!(op.delegation_nonce.len(), 32);
+    assert_eq!(svc.owner_device_count(), 1);
+    let msg = delegation_bytes(&op);
+    for (from, to) in [
+        (fingerprint(), "0".repeat(32)),
+        (op.client_pubkey.clone(), "1".repeat(64)),
+        (
+            format!("epoch:{}", op.epoch),
+            format!("epoch:{}", op.epoch + 1),
+        ),
+        (op.public_key.clone(), device.public_hex()),
+        (op.op_id.clone(), "2".repeat(24)),
+        (op.delegation_nonce.clone(), "3".repeat(32)),
+        (
+            "bitsov-owner-delegation-v1".into(),
+            "bitsov-owner-delegation-v2".into(),
+        ),
+    ] {
+        assert!(
+            matches!(
+                svc.delegate_device_key(
+                    &approver.client_id,
+                    approver.epoch,
+                    &op.op_id,
+                    &key_id,
+                    &device.sign(&msg.replace(&from, &to))
+                ),
+                Err(PairingError::BadProof)
+            ),
+            "{from}"
+        );
+        assert!(svc.device_keys_for(&target.client_id).is_empty());
+    }
+    let sig = device.sign(&msg);
+    assert!(svc
+        .delegate_device_key(
+            &approver.client_id,
+            approver.epoch,
+            "wrong-op",
+            &key_id,
+            &sig
+        )
+        .is_err());
+    assert!(
+        svc.delegate_device_key(&target.client_id, target.epoch, &op.op_id, &key_id, &sig)
+            .is_err(),
+        "token must belong to approver"
+    );
+    drop(svc);
+    let svc = delegation_run(tmp.path());
+    assert_eq!(
+        svc.device_key_status(&target.client_id, &op.op_id),
+        DeviceKeyStatus::Pending
+    );
+    let record = svc
+        .delegate_device_key(
+            &approver.client_id,
+            approver.epoch,
+            &op.op_id,
+            &key_id,
+            &sig,
+        )
+        .unwrap();
+    assert_eq!(record.enrolled_by, format!("device:{key_id}"));
+    device::verify_owner_approval(
+        &owner_key().verifying_key(),
+        &owner_approval_message(
+            &fingerprint(),
+            &target.client_pubkey,
+            target.epoch,
+            &new.public_hex(),
+        ),
+        &record.owner_approval,
+    )
+    .unwrap();
+    assert_eq!(svc.owner_device_count(), 2);
+    let i = intent(&record.key_id, PEER, 200_000, 20_000);
+    svc.apply_relation_intent(
+        &target.client_id,
+        target.epoch,
+        &i,
+        &new.sign(&intent_message(&fingerprint(), &target.client_id, &i)),
+    )
+    .unwrap();
+    drop(svc);
+    let svc = delegation_run(tmp.path());
+    assert!(svc
+        .delegate_device_key(
+            &approver.client_id,
+            approver.epoch,
+            &op.op_id,
+            &key_id,
+            &sig
+        )
+        .is_err());
+    assert_eq!(svc.owner_device_count(), 2);
+    assert_eq!(
+        svc.device_key_status(&target.client_id, &op.op_id),
+        DeviceKeyStatus::Registered
+    );
+}
+
+#[test]
+fn delegation_refuses_non_local_mode_and_missing_signer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (svc, _, client, device, key_id) = registered(tmp.path());
+    let new = Device::new();
+    let op = svc
+        .request_device_key(
+            &client.client_id,
+            &new.public_hex(),
+            "phone",
+            &new.proof(&client.client_id),
+        )
+        .unwrap();
+    let sig = device.sign(&delegation_bytes(&op));
+    drop(svc);
+    for console in [false, true] {
+        let svc = PairingService::open(tmp.path(), fingerprint(), console)
+            .unwrap()
+            .with_owner_signing_key(owner_key())
+            .without_stdout_code();
+        assert!(matches!(
+            svc.delegate_device_key(&client.client_id, client.epoch, &op.op_id, &key_id, &sig),
+            Err(PairingError::OwnerChannelUnavailable)
+        ));
+        assert_eq!(svc.device_keys().len(), 1);
+    }
+    let svc = local_run(tmp.path());
+    assert!(svc
+        .delegate_device_key(&client.client_id, client.epoch, &op.op_id, &key_id, &sig)
+        .is_err());
+    assert_eq!(svc.device_keys().len(), 1);
+}
+
+#[test]
+fn delegation_rechecks_approver_approval_revocation_and_both_epochs() {
+    for mutation in [
+        "revoked",
+        "approver_epoch",
+        "target_epoch",
+        "owner_approval",
+        "client_pubkey",
+        "expired",
+        "cancelled",
+        "legacy_nonce",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (svc, _, approver, device, key_id) = registered(tmp.path());
+        let (target, _) = pair(&svc, 2);
+        drop(svc);
+        let svc = delegation_run(tmp.path());
+        let new = Device::new();
+        let op = svc
+            .request_device_key(
+                &target.client_id,
+                &new.public_hex(),
+                "phone",
+                &new.proof(&target.client_id),
+            )
+            .unwrap();
+        let sig = device.sign(&delegation_bytes(&op));
+        match mutation {
+            "revoked" => svc.revoke_device_key(&key_id, None).unwrap(),
+            "approver_epoch" => {
+                svc.bump_epoch(&approver.client_id).unwrap();
+            }
+            "target_epoch" => {
+                svc.bump_epoch(&target.client_id).unwrap();
+            }
+            "cancelled" => svc.cancel_pending(&target.client_id, &op.op_id).unwrap(),
+            _ => {}
+        }
+        drop(svc);
+        if ["owner_approval", "client_pubkey", "expired", "legacy_nonce"].contains(&mutation) {
+            let path = tmp.path().join("pairing/clients.json");
+            let mut file: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            match mutation {
+                "owner_approval" => file["device_keys"][0][mutation] = "00".repeat(64).into(),
+                "client_pubkey" => file["device_keys"][0][mutation] = "00".repeat(32).into(),
+                "expired" => file["pending_device_keys"][0]["expires_at"] = 0.into(),
+                "legacy_nonce" => {
+                    file["pending_device_keys"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("delegation_nonce");
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+        }
+        let svc = delegation_run(tmp.path());
+        assert!(
+            svc.delegate_device_key(
+                &approver.client_id,
+                approver.epoch,
+                &op.op_id,
+                &key_id,
+                &sig
+            )
+            .is_err(),
+            "{mutation}"
+        );
+        assert!(
+            svc.device_keys_for(&target.client_id).is_empty(),
+            "{mutation}"
+        );
+        if [
+            "revoked",
+            "approver_epoch",
+            "owner_approval",
+            "client_pubkey",
+        ]
+        .contains(&mutation)
+        {
+            assert_eq!(svc.owner_device_count(), 0, "{mutation}");
+        }
+    }
+}
+
+#[test]
+fn console_revoke_and_epoch_bump_retire_delegated_keys_and_envelopes() {
+    for epoch_bump in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (svc, _, approver, device, key_id) = registered(tmp.path());
+        let (target, _) = pair(&svc, 2);
+        drop(svc);
+        let svc = delegation_run(tmp.path());
+        let new = Device::new();
+        let op = svc
+            .request_device_key(
+                &target.client_id,
+                &new.public_hex(),
+                "phone",
+                &new.proof(&target.client_id),
+            )
+            .unwrap();
+        let record = svc
+            .delegate_device_key(
+                &approver.client_id,
+                approver.epoch,
+                &op.op_id,
+                &key_id,
+                &device.sign(&delegation_bytes(&op)),
+            )
+            .unwrap();
+        let i = intent(&record.key_id, PEER, 200_000, 20_000);
+        svc.apply_relation_intent(
+            &target.client_id,
+            target.epoch,
+            &i,
+            &new.sign(&intent_message(&fingerprint(), &target.client_id, &i)),
+        )
+        .unwrap();
+        drop(svc);
+        let (svc, _) = owner_run(tmp.path());
+        if epoch_bump {
+            svc.bump_epoch(&target.client_id).unwrap();
+        } else {
+            let result = control::handle(
+                &ctx(&svc, tmp.path()),
+                ControlRequest::RevokeDeviceKey {
+                    key_id: record.key_id.clone(),
+                },
+            );
+            assert!(matches!(result, ControlResponse::Ok { .. }), "{result:?}");
+        }
+        assert_eq!(svc.owner_device_count(), 1);
+        let fresh = intent(&record.key_id, PEER, 200_000, 20_000);
+        assert!(svc
+            .apply_relation_intent(
+                &target.client_id,
+                target.epoch,
+                &fresh,
+                &new.sign(&intent_message(&fingerprint(), &target.client_id, &fresh))
+            )
+            .is_err());
+        assert!(svc
+            .reserve_spend(&target.client_id, target.epoch, charge(PEER, 1))
+            .is_err());
+        drop(svc);
+        assert_eq!(delegation_run(tmp.path()).owner_device_count(), 1);
+    }
+}
+
+#[test]
+fn owner_device_count_does_not_count_forged_aliases_of_the_same_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (svc, _, _, _, _) = registered(tmp.path());
+    assert_eq!(svc.owner_device_count(), 1);
+    drop(svc);
+    let path = tmp.path().join("pairing/clients.json");
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut alias = file["device_keys"][0].clone();
+    alias["key_id"] = "00".repeat(16).into();
+    file["device_keys"].as_array_mut().unwrap().push(alias);
+    std::fs::write(path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+    assert_eq!(delegation_run(tmp.path()).owner_device_count(), 1);
 }
