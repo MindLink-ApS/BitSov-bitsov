@@ -137,15 +137,7 @@ async fn restored_invite_peer_is_accepted_by_gate() {
 
     let env = signed_envelope(&peer, *me.node_id(), b"hello-after-restore");
     let result = gate
-        .verify(
-            &env,
-            &nonce_store,
-            &pricing,
-            Some(&whitelist),
-            None,
-            0.0,
-            None,
-        )
+        .verify(&env, &nonce_store, &pricing, Some(&whitelist), None, 0.0, None)
         .await;
     assert!(
         result.is_ok(),

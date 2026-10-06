@@ -106,14 +106,10 @@ async fn run_resilient_session_handler(
                 ControlEvent::PeerConnected { peer_id, .. } => {
                     let bundle = session_manager.prekey_bundle().await;
                     let bundle_json = serde_json::to_value(&bundle).unwrap();
-                    let frame = Frame::PrekeyOffer {
-                        bundle: bundle_json,
-                    };
+                    let frame = Frame::PrekeyOffer { bundle: bundle_json };
                     let _ = transport.send_frame(&peer_id, &frame).await;
                 }
-                ControlEvent::PrekeyOffer {
-                    peer_id, bundle, ..
-                } => {
+                ControlEvent::PrekeyOffer { peer_id, bundle, .. } => {
                     if our_node_id.as_bytes() >= peer_id.as_bytes() {
                         continue; // Not the initiator
                     }
@@ -123,23 +119,16 @@ async fn run_resilient_session_handler(
                     }
                     let peer_bundle: konsensus_crypto::SerializablePrekeyBundle =
                         serde_json::from_value(bundle).unwrap();
-                    match session_manager
-                        .initiate_session(&peer_id, &peer_bundle)
-                        .await
-                    {
+                    match session_manager.initiate_session(&peer_id, &peer_bundle).await {
                         Ok(init_data) => {
                             let init_json = serde_json::to_value(&init_data).unwrap();
-                            let frame = Frame::SessionInit {
-                                init_data: init_json,
-                            };
+                            let frame = Frame::SessionInit { init_data: init_json };
                             let _ = transport.send_frame(&peer_id, &frame).await;
                         }
                         Err(e) => eprintln!("X3DH initiation failed: {e}"),
                     }
                 }
-                ControlEvent::SessionInit {
-                    peer_id, init_data, ..
-                } => {
+                ControlEvent::SessionInit { peer_id, init_data, .. } => {
                     // Replace stale session (restart recovery path)
                     if session_manager.has_session(&peer_id).await {
                         session_manager.remove_session(&peer_id).await;
@@ -163,9 +152,7 @@ async fn run_resilient_session_handler(
                         let _ = transport.send_frame(&peer_id, &frame).await;
                     }
                 }
-                ControlEvent::RatchetInit {
-                    peer_id, payload, ..
-                } => {
+                ControlEvent::RatchetInit { peer_id, payload, .. } => {
                     if let Ok(ratchet_msg) = ratchet_message_from_bytes(&payload) {
                         let _ = session_manager.decrypt(&peer_id, &ratchet_msg).await;
                     }
@@ -205,24 +192,16 @@ impl InMemoryNonceStore {
 #[async_trait::async_trait]
 impl konsensus_core::gate::NonceStore for InMemoryNonceStore {
     async fn check_and_store_paid(
-        &self,
-        nonce: &konsensus_core::Nonce,
-        payment_hash: &[u8; 32],
-        _sender: &konsensus_core::NodeId,
-        _message_id: &konsensus_core::MessageId,
+        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
+        _sender: &konsensus_core::NodeId, _message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
         use konsensus_core::gate::PaidReplay;
         let mut nonces = self.seen.lock().await;
         let mut payments = self.seen_payment_hashes.lock().await;
         let key = nonce.as_bytes().to_vec();
-        if nonces.contains(&key) {
-            return Ok(PaidReplay::NonceReused);
-        }
-        if payments.contains(payment_hash) {
-            return Ok(PaidReplay::PaymentReused);
-        }
-        nonces.insert(key);
-        payments.insert(*payment_hash);
+        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
+        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
+        nonces.insert(key); payments.insert(*payment_hash);
         Ok(PaidReplay::Accepted)
     }
 
@@ -286,7 +265,9 @@ impl konsensus_crypto::SessionStore for StorageSessionAdapter {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
-    async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn list_sessions(
+        &self,
+    ) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
         self.storage
             .list_sessions()
             .await
@@ -338,10 +319,7 @@ async fn f8_persistence_survives_beta_restart() {
     );
 
     // ── Phase 0: Store PRE_RESTART_MSG_COUNT messages in beta's DB ────────
-    eprintln!(
-        "[Phase 0] Seeding {} messages into beta DB…",
-        PRE_RESTART_MSG_COUNT
-    );
+    eprintln!("[Phase 0] Seeding {} messages into beta DB…", PRE_RESTART_MSG_COUNT);
     let seed_start = Instant::now();
 
     for seq in 0..PRE_RESTART_MSG_COUNT {
@@ -355,7 +333,9 @@ async fn f8_persistence_survives_beta_restart() {
         pre_restart_count, PRE_RESTART_MSG_COUNT,
         "all seeded messages should be in DB before restart"
     );
-    eprintln!("[Phase 0] OK — {pre_restart_count} messages stored in {seed_elapsed:?}");
+    eprintln!(
+        "[Phase 0] OK — {pre_restart_count} messages stored in {seed_elapsed:?}"
+    );
 
     // ── Phase 1: Connect alpha↔beta, establish E2EE, send a pre-restart msg ─
     eprintln!("[Phase 1] Establishing alpha↔beta E2EE session…");
@@ -371,13 +351,9 @@ async fn f8_persistence_survives_beta_restart() {
     // Alpha uses in-memory sessions; beta uses persistent sessions (SQLite)
     let session_alpha = Arc::new(SessionManager::new(Arc::clone(&id_alpha)));
     let beta_session_store: Arc<dyn konsensus_crypto::SessionStore> =
-        Arc::new(StorageSessionAdapter {
-            storage: Arc::clone(&beta_db),
-        });
-    let session_beta = Arc::new(SessionManager::with_store(
-        Arc::clone(&id_beta),
-        beta_session_store,
-    ));
+        Arc::new(StorageSessionAdapter { storage: Arc::clone(&beta_db) });
+    let session_beta =
+        Arc::new(SessionManager::with_store(Arc::clone(&id_beta), beta_session_store));
 
     run_resilient_session_handler(
         Arc::clone(&transport_alpha),
@@ -414,10 +390,7 @@ async fn f8_persistence_survives_beta_restart() {
         .unwrap();
 
     // Persist the received envelope into beta's DB (simulating node's receive handler)
-    beta_db
-        .store_message(&received)
-        .await
-        .expect("persist received msg");
+    beta_db.store_message(&received).await.expect("persist received msg");
 
     let count_after_live_msg = count_messages(&beta_db, beta_id).await;
     eprintln!(
@@ -446,19 +419,17 @@ async fn f8_persistence_survives_beta_restart() {
             .expect("beta db2 open (same file)"),
     );
     let beta_session_store2: Arc<dyn konsensus_crypto::SessionStore> =
-        Arc::new(StorageSessionAdapter {
-            storage: Arc::clone(&beta_db2),
-        });
-    let session_beta2 = Arc::new(SessionManager::with_store(
-        Arc::clone(&id_beta),
-        beta_session_store2,
-    ));
+        Arc::new(StorageSessionAdapter { storage: Arc::clone(&beta_db2) });
+    let session_beta2 =
+        Arc::new(SessionManager::with_store(Arc::clone(&id_beta), beta_session_store2));
 
     // Restore persisted sessions (mirrors startup logic in main.rs)
     let session_restore_start = Instant::now();
     let restored = session_beta2.restore_sessions().await;
     let session_restore_elapsed = session_restore_start.elapsed();
-    eprintln!("[Phase 2] Session restore: {restored} sessions in {session_restore_elapsed:?}");
+    eprintln!(
+        "[Phase 2] Session restore: {restored} sessions in {session_restore_elapsed:?}"
+    );
 
     // ── Verify 1: Messages survived the restart ───────────────────────────
     eprintln!("[Phase 2] Verifying message persistence…");
@@ -544,15 +515,14 @@ async fn f8_persistence_survives_beta_restart() {
     .await
     .expect("payment gate must pass after Lightning reconnect");
 
-    eprintln!("[Phase 3] Payment gate passed — message received in {recv_elapsed:?}");
+    eprintln!(
+        "[Phase 3] Payment gate passed — message received in {recv_elapsed:?}"
+    );
 
     // Decrypt the post-restart message to confirm E2EE integrity
     let rm2 = ratchet_message_from_bytes(&received2.ciphertext).unwrap();
     let decrypted2 = session_beta2.decrypt(&alpha_id, &rm2).await.unwrap();
-    assert_eq!(
-        &decrypted2, post_msg,
-        "post-restart message must decrypt correctly"
-    );
+    assert_eq!(&decrypted2, post_msg, "post-restart message must decrypt correctly");
 
     // Beta sends back to alpha (bidirectional verify)
     let reply_msg = b"Beta reply - bidirectional after restart confirmed";
@@ -568,10 +538,7 @@ async fn f8_persistence_survives_beta_restart() {
 
     let rm3 = ratchet_message_from_bytes(&received3.ciphertext).unwrap();
     let decrypted3 = session_alpha.decrypt(&beta_id, &rm3).await.unwrap();
-    assert_eq!(
-        &decrypted3, reply_msg,
-        "alpha must decrypt beta's post-restart reply"
-    );
+    assert_eq!(&decrypted3, reply_msg, "alpha must decrypt beta's post-restart reply");
 
     let total_recovery = restart_start.elapsed();
 

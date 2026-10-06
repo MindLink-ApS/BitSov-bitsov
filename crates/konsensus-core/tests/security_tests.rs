@@ -11,15 +11,15 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
+use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::gate::{GateConfig, GateRejection, NonceStore, PaymentGate};
 use konsensus_core::identity::NodeIdentity;
-use konsensus_core::kind::{KindCategory, KIND_CHAT};
+use konsensus_core::kind::{KIND_CHAT, KindCategory};
 use konsensus_core::traits::lightning::{
     Invoice, LightningError, PaymentDetails, PaymentDirection, PaymentStatus,
 };
 use konsensus_core::traits::pricing::{PricingEngine, PricingError};
 use konsensus_core::types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, Signature};
-use konsensus_core::UkmEnvelopeBuilder;
 
 use sha2::{Digest, Sha256};
 
@@ -42,24 +42,16 @@ impl MockNonceStore {
 #[async_trait::async_trait]
 impl NonceStore for MockNonceStore {
     async fn check_and_store_paid(
-        &self,
-        nonce: &konsensus_core::Nonce,
-        payment_hash: &[u8; 32],
-        _sender: &konsensus_core::NodeId,
-        _message_id: &konsensus_core::MessageId,
+        &self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32],
+        _sender: &konsensus_core::NodeId, _message_id: &konsensus_core::MessageId,
     ) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
         use konsensus_core::gate::PaidReplay;
         let mut nonces = self.seen.lock().unwrap();
         let mut payments = self.seen_payment_hashes.lock().unwrap();
         let key = *nonce.as_bytes();
-        if nonces.contains(&key) {
-            return Ok(PaidReplay::NonceReused);
-        }
-        if payments.contains(payment_hash) {
-            return Ok(PaidReplay::PaymentReused);
-        }
-        nonces.insert(key);
-        payments.insert(*payment_hash);
+        if nonces.contains(&key) { return Ok(PaidReplay::NonceReused); }
+        if payments.contains(payment_hash) { return Ok(PaidReplay::PaymentReused); }
+        nonces.insert(key); payments.insert(*payment_hash);
         Ok(PaidReplay::Accepted)
     }
 
@@ -235,15 +227,10 @@ fn make_signed_envelope_unique_proof(
     let hash: [u8; 32] = Sha256::digest(preimage).into();
     let proof = PaymentProof::new(hash, preimage, amount_msat);
 
-    let mut envelope = UkmEnvelopeBuilder::new(
-        KIND_CHAT,
-        sender,
-        recipient,
-        b"encrypted content".to_vec(),
-        proof,
-    )
-    .timestamp(now_ms())
-    .build();
+    let mut envelope =
+        UkmEnvelopeBuilder::new(KIND_CHAT, sender, recipient, b"encrypted content".to_vec(), proof)
+            .timestamp(now_ms())
+            .build();
 
     let signable = envelope.signable_bytes();
     let sig = identity.sign(&signable);
@@ -286,10 +273,11 @@ async fn replay_same_envelope_rejected() {
     let pricing = MockPricing { price_msat: 10 };
 
     // First: accepted
-    assert!(gate
-        .verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
-        .await
-        .is_ok());
+    assert!(
+        gate.verify(&envelope, &nonces, &pricing, None, None, 0.0, None)
+            .await
+            .is_ok()
+    );
 
     // Replay: rejected
     let result = gate
@@ -310,16 +298,15 @@ async fn replay_same_nonce_different_content_rejected() {
     let pricing = MockPricing { price_msat: 10 };
 
     // First envelope with this nonce: accepted
-    assert!(gate
-        .verify(&env1, &nonces, &pricing, None, None, 0.0, None)
-        .await
-        .is_ok());
+    assert!(
+        gate.verify(&env1, &nonces, &pricing, None, None, 0.0, None)
+            .await
+            .is_ok()
+    );
 
     // Second envelope with same nonce: rejected (even if content differs)
     let env2 = make_signed_envelope_with_nonce(&identity, 2_000, nonce);
-    let result = gate
-        .verify(&env2, &nonces, &pricing, None, None, 0.0, None)
-        .await;
+    let result = gate.verify(&env2, &nonces, &pricing, None, None, 0.0, None).await;
     assert!(matches!(result, Err(GateRejection::ReplayDetected)));
 }
 
@@ -342,14 +329,16 @@ async fn different_nonces_both_accepted() {
     let nonces = MockNonceStore::new();
     let pricing = MockPricing { price_msat: 10 };
 
-    assert!(gate
-        .verify(&env1, &nonces, &pricing, None, None, 0.0, None)
-        .await
-        .is_ok());
-    assert!(gate
-        .verify(&env2, &nonces, &pricing, None, None, 0.0, None)
-        .await
-        .is_ok());
+    assert!(
+        gate.verify(&env1, &nonces, &pricing, None, None, 0.0, None)
+            .await
+            .is_ok()
+    );
+    assert!(
+        gate.verify(&env2, &nonces, &pricing, None, None, 0.0, None)
+            .await
+            .is_ok()
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -502,15 +491,7 @@ async fn settlement_unsettled_payment_rejected() {
     let lightning = MockLightning { settled: false };
 
     let result = gate
-        .verify(
-            &envelope,
-            &nonces,
-            &pricing,
-            None,
-            Some(&lightning),
-            0.0,
-            None,
-        )
+        .verify(&envelope, &nonces, &pricing, None, Some(&lightning), 0.0, None)
         .await;
     assert!(matches!(result, Err(GateRejection::PaymentNotSettled(_))));
 }
@@ -635,15 +616,7 @@ async fn whitelist_with_wrong_node_rejects() {
     whitelist.insert(*bob.node_id());
 
     let result = gate
-        .verify(
-            &envelope,
-            &nonces,
-            &pricing,
-            Some(&whitelist),
-            None,
-            0.0,
-            None,
-        )
+        .verify(&envelope, &nonces, &pricing, Some(&whitelist), None, 0.0, None)
         .await;
     assert!(matches!(result, Err(GateRejection::NotWhitelisted(_))));
 }
@@ -796,15 +769,7 @@ async fn whitelist_check_before_signature_verification() {
     whitelist.insert(NodeId::from_bytes([99u8; 32]));
 
     let result = gate
-        .verify(
-            &envelope,
-            &nonces,
-            &pricing,
-            Some(&whitelist),
-            None,
-            0.0,
-            None,
-        )
+        .verify(&envelope, &nonces, &pricing, Some(&whitelist), None, 0.0, None)
         .await;
 
     // Should be NotWhitelisted (not InvalidSignature)
