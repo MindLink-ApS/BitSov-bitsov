@@ -240,7 +240,36 @@ async fn hub_jit_then_stateless_admission() {
     );
     assert_eq!(client.node().list_channels().len(), 1);
     assert_eq!(hub.node().list_channels().len(), 2);
-    let channel = client.node().list_channels().pop().unwrap();
+    let channel_id = client.node().list_channels().pop().unwrap().channel_id;
+    // PaymentClaimed can persist the receipt before the peer's revoke_and_ack
+    // credits the client's spendable balance. Sponsor settlement and hub skim
+    // metrics also follow the preimage, not this channel's commitment update.
+    let channel = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if let Some(channel) = client.node().list_channels().into_iter().find(|c| {
+                c.channel_id == channel_id
+                    && c.outbound_capacity_msat > 90_000_000
+                    && c.inbound_capacity_msat > 90_000_000
+            }) {
+                return channel;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        // ChannelDetails includes outbound/inbound capacity and the punishment
+        // reserve; BalanceDetails includes claimable balances and anchor reserve.
+        panic!(
+            "JIT channel {channel_id:?} capacities must both exceed 90_000_000 msat within 60s \
+             after payment {} settled; client channels={:#?}; client balances={:#?}; \
+             hub channels={:#?}",
+            funding.payment_hash,
+            client.node().list_channels(),
+            client.node().list_balances(),
+            hub.node().list_channels(),
+        );
+    });
     assert!(channel.is_usable && !channel.is_announced && !channel.is_outbound);
     assert!(channel.outbound_capacity_msat > 90_000_000);
     assert!(
