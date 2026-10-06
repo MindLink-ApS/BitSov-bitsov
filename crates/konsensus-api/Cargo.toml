@@ -21,7 +21,7 @@ axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true

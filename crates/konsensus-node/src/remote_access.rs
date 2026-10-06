@@ -171,9 +171,24 @@ fn write_identity_metadata_with_sync(
     Ok(())
 }
 
+/// Public metadata signed on the last unlocked start. No seed or password.
+#[derive(Clone, serde::Deserialize)]
+pub struct LockedIdentity {
+    pub node_id: String,
+    pub identity_fingerprint: String,
+    pub box_transport_pubkey: String,
+    pub box_transport_signature: String,
+}
+
+#[derive(Clone)]
+enum ResponderIdentity {
+    Live(Arc<NodeIdentity>),
+    Locked(Arc<LockedIdentity>),
+}
+
 pub struct RemoteAccessServer {
     listener: TcpListener,
-    identity: Arc<NodeIdentity>,
+    identity: ResponderIdentity,
     pairing: Arc<PairingService>,
     internal_api: SocketAddr,
     tunnel_clients: Arc<RemoteTunnelClients>,
@@ -242,13 +257,41 @@ impl RemoteAccessServer {
 
         Ok(Self {
             listener,
-            identity,
+            identity: ResponderIdentity::Live(identity),
             pairing,
             internal_api,
             tunnel_clients,
             pairing_code: Arc::new(Mutex::new(pairing_code)),
             pair_link_path,
             pairing_deadline,
+        })
+    }
+
+    /// Reuse the bounded tunnel, but with the box static and no first pairing.
+    pub async fn bind_locked(
+        config: &RemoteAccessConfig,
+        identity: LockedIdentity,
+        pairing: Arc<PairingService>,
+        internal_api: SocketAddr,
+        tunnel_clients: Arc<RemoteTunnelClients>,
+    ) -> Result<Self> {
+        anyhow::ensure!(!pairing.pairing_open(), "locked pairing must be closed");
+        let listener = TcpListener::bind(
+            config
+                .listen_addr
+                .context("remote unlock requires remote_access.listen_addr")?,
+        )
+        .await?;
+        pairing.remove_remote_access_link()?;
+        Ok(Self {
+            listener,
+            identity: ResponderIdentity::Locked(Arc::new(identity)),
+            pairing,
+            internal_api,
+            tunnel_clients,
+            pairing_code: Arc::new(Mutex::new(None)),
+            pair_link_path: None,
+            pairing_deadline: None,
         })
     }
 
@@ -306,7 +349,7 @@ impl RemoteAccessServer {
                         debug!(%peer_addr, "remote access connection limit");
                         continue;
                     };
-                    let identity = Arc::clone(&self.identity);
+                    let identity = self.identity.clone();
                     let pairing = Arc::clone(&self.pairing);
                     let pairing_code = Arc::clone(&self.pairing_code);
                     let internal_api = self.internal_api;
@@ -352,7 +395,7 @@ async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
 
 async fn handle_connection(
     stream: TcpStream,
-    identity: Arc<NodeIdentity>,
+    identity: ResponderIdentity,
     pairing: Arc<PairingService>,
     pairing_code: Arc<Mutex<Option<ActivePairingCode>>>,
     internal_api: SocketAddr,
@@ -365,7 +408,11 @@ async fn handle_connection(
         // Migration: paired clients already pin this seed-derived static.
         // Advertise the identity-signed box key after auth; never rotate this
         // live responder before those clients have had a chance to learn it.
-        let mut noise = NoiseSession::responder(identity.x25519_secret_bytes())?;
+        let secret = match &identity {
+            ResponderIdentity::Live(identity) => identity.x25519_secret_bytes(),
+            ResponderIdentity::Locked(_) => pairing.box_transport_secret_bytes(),
+        };
+        let mut noise = NoiseSession::responder(secret)?;
         let msg1 = wire::read_frame(&mut remote_reader, MAX_NOISE_MSG_LEN).await?;
         noise.read_handshake(&msg1)?;
         let msg2 = noise.write_handshake(&[])?;
@@ -398,14 +445,41 @@ async fn handle_connection(
         }
     };
 
-    let authenticated = authenticate(
-        &request,
-        &remote_static,
-        identity.node_id().to_hex().as_str(),
-        &pairing,
-        &pairing_code,
-    );
-    let (box_transport_pubkey, box_transport_signature) = box_transport_proof(&identity, &pairing);
+    let (authenticated, box_transport_pubkey, box_transport_signature) = match &identity {
+        ResponderIdentity::Live(identity) => {
+            let authenticated = authenticate(
+                &request,
+                &remote_static,
+                &identity.node_id().to_hex(),
+                &pairing,
+                &pairing_code,
+            );
+            let (public, signature) = box_transport_proof(identity, &pairing);
+            (authenticated, public, signature)
+        }
+        ResponderIdentity::Locked(identity) => {
+            let authenticated = if request.code.is_some()
+                || request.client_name.is_some()
+                || request.client_pubkey.is_some()
+                || request.signature.is_some()
+            {
+                Err(anyhow::anyhow!("first pairing is unavailable while locked"))
+            } else {
+                authenticate(
+                    &request,
+                    &remote_static,
+                    &identity.node_id,
+                    &pairing,
+                    &pairing_code,
+                )
+            };
+            (
+                authenticated,
+                identity.box_transport_pubkey.clone(),
+                identity.box_transport_signature.clone(),
+            )
+        }
+    };
     let response = match &authenticated {
         Ok(client) => AuthResponse::Ok {
             v: VERSION,
@@ -434,7 +508,7 @@ async fn handle_connection(
     // precede the first forwarded byte so Axum can resolve every request.
     let _registration = tunnel_clients.register(internal.local_addr()?, client.client_id.clone());
     let (mut internal_reader, mut internal_writer) = internal.into_split();
-    let mut internal_buf = vec![0u8; wire::MAX_TUNNEL_PLAINTEXT];
+    let mut internal_buf = zeroize::Zeroizing::new(vec![0u8; wire::MAX_TUNNEL_PLAINTEXT]);
     info!(client_id = %client.client_id, "remote access tunnel authenticated");
 
     // Keep framed reads in their own task. `read_exact` is not cancellation

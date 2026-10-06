@@ -1,5 +1,17 @@
 # Upgrading a retained node
 
+## Remote unlock (U2)
+
+Before enabling `--remote-unlock`, start unlocked once on U1 or newer, enroll an
+owner device, and connect a supporting client so it pins the identity-signed box
+transport key. Preserve `identity/identity.json` and `pairing/box-transport.key`.
+The home-node systemd example now uses `--remote-unlock --local-owner-device`;
+remove any password file or credential directive when adopting it. Existing
+manual/descriptor startup remains available. Remote first-run bootstrap and new
+pairing while locked are not supported. A locked node does not monitor channels:
+read [the home-node runbook](operations/home-node.md) before changing unattended
+startup. `--remote-unlock` is an argv switch, never a configuration setting.
+
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
