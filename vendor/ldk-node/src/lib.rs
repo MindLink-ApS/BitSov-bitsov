@@ -86,6 +86,7 @@ mod data_store;
 mod error;
 mod event;
 mod fee_estimator;
+pub mod tower_hook;
 pub mod funding;
 mod lsps2_open;
 pub use lsps2_open::LSPS2ServiceMetrics;
