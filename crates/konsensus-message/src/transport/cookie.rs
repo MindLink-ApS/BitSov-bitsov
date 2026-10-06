@@ -3,13 +3,14 @@
 //! A **stateless return-routability cookie** that sits *before* the Noise_XX DH,
 //! so a node can refuse to spend an X25519 Diffie–Hellman on a spoofed or
 //! unproven source — the free-DH leak the per-subnet rate-limit (#300) could only
-//! *rate*-bound. The node holds **no per-connection state** until the cookie
-//! validates: a cookie is `HMAC(secret, src-ip ‖ epoch)`, recomputed on demand,
+//! *rate*-bound. No per-client cookie record or Noise state is created:
+//! a cookie is `HMAC(secret, src-ip ‖ epoch)`, recomputed on demand,
 //! so the defense itself cannot be turned into a memory-DoS.
 //!
 //! Properties (per the #301 decision — "C implemented A-first"):
-//! - **Default off.** [`CookieMode::Disabled`] ⇒ the handshake is byte-identical
-//!   to pre-cookie. Enabling it is an operator opt-in via [`super::TransportConfig`].
+//! - **Adaptive by default.** Under load the listener requires a cookie before
+//!   allocating Noise state. TCP sockets and small framing buffers are bounded
+//!   separately; stateless describes the cookie, not the TCP transport.
 //! - **Self-describing on the wire.** A cookie frame carries the [`COOKIE_MAGIC`]
 //!   prefix and is a fixed 38 bytes; a Noise_XX message-1 is a bare 32-byte
 //!   ephemeral key with no magic, so the two are unambiguous. The challenge is
@@ -77,11 +78,14 @@ const KIND_RESPONSE: u8 = 2;
 )]
 #[serde(rename_all = "snake_case")]
 pub enum CookieMode {
-    /// Default: no pre-Noise cookie. The handshake is byte-identical to
+    /// No pre-Noise cookie. The handshake is byte-identical to
     /// pre-cookie; the node never issues or expects a cookie. (`konsensus.toml`:
     /// `cookie_mode = "disabled"`.)
-    #[default]
     Disabled,
+    /// Require cookies when optimistic handshake capacity is exhausted or a
+    /// recent connection was refused. Leaves capacity for verified sources.
+    #[default]
+    Adaptive,
     /// Require every inbound initiator to echo a valid stateless cookie before
     /// this node spends a Noise DH. Operator opt-in; legacy peers that cannot
     /// answer the self-describing challenge are rejected (the operator accepted
@@ -272,7 +276,8 @@ pub(super) fn parse_challenge(bytes: &[u8]) -> Option<CookieFrame> {
 ///   Noise handshake (the initiator re-sends a fresh Noise message-1); on failure
 ///   the connection is dropped before any DH.
 ///
-/// Holds **no per-connection state**: the cookie is recomputed from `ip` + epoch.
+/// No cookie record is stored: the MAC is recomputed from `ip` + epoch.
+/// The caller separately bounds TCP sockets, framing buffers and deadlines.
 pub(super) async fn cookie_gate_responder(
     reader: &mut tokio::net::tcp::OwnedReadHalf,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,

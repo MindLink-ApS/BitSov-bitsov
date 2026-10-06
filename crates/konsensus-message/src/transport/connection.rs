@@ -1,7 +1,9 @@
 //! TCP listener, incoming connection handler.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(test)]
+use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -12,28 +14,13 @@ use tracing::{debug, error, info, warn};
 
 use konsensus_core::traits::transport::TransportError;
 
-use super::{
-    ControlEvent, PeerConnection, TransportCtx,
-    BAN_EVICTION_INTERVAL, HANDSHAKE_TIMEOUT, INBOUND_HANDSHAKE_BURST_PER_SUBNET,
-    INBOUND_HANDSHAKE_RATE_PER_SUBNET, MAX_CONCURRENT_INBOUND, MAX_TRACKED_SUBNETS,
-};
 use super::handshake::{noise_handshake_responder, perform_federation_handshake_responder};
 use super::messaging::spawn_reader_task;
+use super::{ControlEvent, PeerConnection, TransportCtx, BAN_EVICTION_INTERVAL};
 
 // ─── impl NoiseTransport — listener / connection management ─────────────────
 
 use super::NoiseTransport;
-
-/// Maximum concurrent inbound handshakes accepted from a single source IP.
-///
-/// This is a pre-admission anti-DoS resource cap, **not** payment clearance.
-/// Under "payment is the connection" the TCP+Noise pipe is a quarantined knock
-/// that yields nothing privileged until a settled, recipient-bound payment binds
-/// the peer; this cap only stops one source from starving the global
-/// [`MAX_CONCURRENT_INBOUND`] budget while that quarantined handshake runs. It
-/// consults no identity and no operator list — availability defense, never
-/// admission. (See CODEX.md: endpoint knowledge is free; endpoint service is paid.)
-const MAX_INBOUND_PER_IP: u32 = 8;
 
 /// Concurrent-inbound-handshake counts keyed by source IP.
 type PerIpCounts = Arc<StdMutex<HashMap<IpAddr, u32>>>;
@@ -52,7 +39,10 @@ impl PerIpGuard {
     /// Returns `Some(guard)` if `ip` is below `cap` (count incremented), or
     /// `None` if the source already holds `cap` concurrent handshakes.
     fn try_acquire(counts: &PerIpCounts, ip: IpAddr, cap: u32) -> Option<Self> {
-        let mut map = counts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ip = ip.to_canonical();
+        let mut map = counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let count = map.entry(ip).or_insert(0);
         if *count >= cap {
             return None;
@@ -67,7 +57,10 @@ impl PerIpGuard {
 
 impl Drop for PerIpGuard {
     fn drop(&mut self) {
-        let mut map = self.counts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut map = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(count) = map.get_mut(&self.ip) {
             *count -= 1;
             if *count == 0 {
@@ -77,15 +70,12 @@ impl Drop for PerIpGuard {
     }
 }
 
-/// Collapse a source IP to its rate-limit aggregation key: the IPv4 `/24`
-/// network or the IPv6 `/64` network. Aggregating here is what makes the
+/// Collapse a source IP to its rate-limit aggregation key: the full IPv4
+/// address or the IPv6 `/64` network. Aggregating here is what makes the
 /// limiter resistant to an attacker who rotates addresses inside one block.
 fn subnet_key(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], 0))
-        }
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
         IpAddr::V6(v6) => {
             let s = v6.octets();
             let mut masked = [0u8; 16];
@@ -101,29 +91,18 @@ struct TokenBucket {
     last_refill: Instant,
 }
 
-/// Token-bucket inbound-handshake **rate** limiter, aggregated per subnet
-/// (IPv4 `/24`, IPv6 `/64`).
-///
-/// This extends — it does not replace — the exact-IP **concurrency** cap
-/// ([`PerIpGuard`]). The concurrency cap stops one IP holding many simultaneous
-/// handshake slots; this limiter stops a whole subnet (or a botnet within one
-/// block) from sustaining a high *rate* of fresh handshakes by rotating source
-/// addresses. It is pre-auth and identity-blind — it consults only the source
-/// subnet, never a node id or operator list: availability defense, never
-/// admission. It changes no wire bytes, no Noise handshake, and no payment-gate
-/// semantics. Parameters are constructor-injected (the listener seeds them from
-/// the centralized constants in `mod.rs`, matching how the sibling inbound caps
-/// `MAX_INBOUND_PER_IP` / `MAX_CONCURRENT_INBOUND` are defined); wiring them onto
-/// operator `TransportConfig` is a mechanical follow-up, not done here.
+/// Bounded token buckets using the API rate_limit.rs mutex pattern. Like the
+/// remote-access HandshakeLimiter, never forget active debt to admit a new IP.
+/// Both exact addresses and subnet keys use this implementation, independently.
 struct SubnetRateLimiter {
     buckets: StdMutex<HashMap<IpAddr, TokenBucket>>,
     /// Bucket size (max burst).
     capacity: f64,
     /// Sustained refill, tokens per second.
     refill_per_sec: f64,
-    /// Hard ceiling on tracked subnets; enforced by evicting idle-then-nearest-idle
-    /// buckets, so the map cannot grow unbounded even under an active wide flood.
+    /// Hard ceiling; only fully replenished budgets may be forgotten.
     max_tracked: usize,
+    last_cleanup: StdMutex<Option<Instant>>,
 }
 
 impl SubnetRateLimiter {
@@ -133,6 +112,7 @@ impl SubnetRateLimiter {
             capacity,
             refill_per_sec,
             max_tracked,
+            last_cleanup: StdMutex::new(None),
         }
     }
 
@@ -142,42 +122,29 @@ impl SubnetRateLimiter {
     ///
     /// `now` is injected so the refill math is deterministically testable.
     fn try_admit(&self, ip: IpAddr, now: Instant) -> bool {
-        let key = subnet_key(ip);
-        let mut map = self.buckets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.try_admit_key(subnet_key(ip), now)
+    }
 
-        // Keep `max_tracked` a HARD ceiling, even under an active wide-source
-        // flood (the case where pruning only idle buckets is not enough).
+    fn try_admit_key(&self, key: IpAddr, now: Instant) -> bool {
+        let key = key.to_canonical();
+        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        if self.max_tracked == 0 {
+            return false;
+        }
         if map.len() >= self.max_tracked && !map.contains_key(&key) {
-            let cap = self.capacity;
-            let refill = self.refill_per_sec;
-            // Effective tokens after lazy refill — used only for ranking here.
-            let eff = |b: &TokenBucket| -> f64 {
-                let elapsed = now.saturating_duration_since(b.last_refill).as_secs_f64();
-                (b.tokens + elapsed * refill).min(cap)
-            };
-            // 1) Drop fully-refilled (idle) buckets first — a subnet at rest, so
-            //    forgetting it only forgoes carried-over burst, never the cap.
-            map.retain(|_, b| eff(b) < cap);
-            // 2) If the map is STILL at the ceiling, every tracked subnet is being
-            //    actively throttled. Evict the buckets nearest full (highest tokens
-            //    = least-actively-throttled, safest to forget), leaving 1/8 headroom
-            //    so we do not evict on every subsequent insert. This bounds memory
-            //    strictly; the worst case for an attacker cycling > max_tracked
-            //    subnets is that the limiter degrades to the global concurrency cap.
+            // At most one bounded scan per second, including under IP churn.
+            let mut last = self.last_cleanup.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_none_or(|t| now.saturating_duration_since(t).as_secs() >= 1) {
+                map.retain(|_, b| {
+                    b.tokens
+                        + now.saturating_duration_since(b.last_refill).as_secs_f64()
+                            * self.refill_per_sec
+                        < self.capacity
+                });
+                *last = Some(now);
+            }
             if map.len() >= self.max_tracked {
-                let target = (self.max_tracked - self.max_tracked / 8).max(1);
-                let to_drop = map.len().saturating_sub(target);
-                if to_drop > 0 {
-                    let mut ranked: Vec<(IpAddr, f64)> =
-                        map.iter().map(|(k, b)| (*k, eff(b))).collect();
-                    // Highest effective tokens first.
-                    ranked.sort_unstable_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    for (k, _) in ranked.into_iter().take(to_drop) {
-                        map.remove(&k);
-                    }
-                }
+                return false;
             }
         }
 
@@ -187,7 +154,12 @@ impl SubnetRateLimiter {
             tokens: cap,
             last_refill: now,
         });
-        let elapsed = now.saturating_duration_since(bucket.last_refill).as_secs_f64();
+        // Shared handshake callers may capture time before acquiring this lock.
+        // Never rewind the refill clock if those calls are scheduled out of order.
+        let now = now.max(bucket.last_refill);
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * refill).min(cap);
         bucket.last_refill = now;
         if bucket.tokens >= 1.0 {
@@ -199,12 +171,37 @@ impl SubnetRateLimiter {
     }
 }
 
+/// Apply both source budgets together so their ordering is testable.
+struct SourceRateLimiter {
+    ips: SubnetRateLimiter,
+    subnets: SubnetRateLimiter,
+}
+
+impl SourceRateLimiter {
+    fn new(capacity: f64, rate: f64, max_tracked: usize) -> Self {
+        Self {
+            ips: SubnetRateLimiter::new(capacity, rate, max_tracked),
+            subnets: SubnetRateLimiter::new(capacity, rate, max_tracked),
+        }
+    }
+
+    fn try_admit(&self, ip: IpAddr, now: Instant) -> bool {
+        // A rejected /64 must not allocate an exact-IP entry for every rotated
+        // host address and thereby deny unrelated sources the bounded table.
+        self.subnets.try_admit(ip, now) && self.ips.try_admit_key(ip, now)
+    }
+}
+
 impl NoiseTransport {
     /// Start the TCP listener for incoming connections.
     ///
     /// Spawns a background task that accepts connections, performs the Noise + federation
     /// handshake, and registers authenticated peers.
     pub async fn start_listener(&self) -> Result<(), TransportError> {
+        self.config
+            .dos_edge
+            .validate()
+            .map_err(TransportError::Rejected)?;
         let listener = TcpListener::bind(self.config.listen_addr)
             .await
             .map_err(|e| TransportError::ConnectionFailed(format!("bind failed: {e}")))?;
@@ -263,71 +260,77 @@ impl NoiseTransport {
         }
 
         tokio::spawn(async move {
-            let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INBOUND));
+            let limits = &ctx.config.dos_edge;
+            let pending = Arc::new(tokio::sync::Semaphore::new(limits.max_pending));
+            let handshakes = Arc::new(tokio::sync::Semaphore::new(limits.max_handshakes));
+            let optimistic = Arc::new(tokio::sync::Semaphore::new(limits.cookie_threshold));
             let per_ip_counts: PerIpCounts = Arc::new(StdMutex::new(HashMap::new()));
-            // Per-subnet handshake RATE limiter (IPv4 /24, IPv6 /64). Extends the
-            // exact-IP concurrency cap below so a subnet/botnet cannot evade it by
-            // rotating addresses. Conservative, configurable defaults.
-            let subnet_limiter = SubnetRateLimiter::new(
-                INBOUND_HANDSHAKE_BURST_PER_SUBNET,
-                INBOUND_HANDSHAKE_RATE_PER_SUBNET,
-                MAX_TRACKED_SUBNETS,
+            let per_subnet_counts: PerIpCounts = Arc::new(StdMutex::new(HashMap::new()));
+            let connections = SourceRateLimiter::new(
+                limits.connection_burst as f64,
+                limits.connections_per_second,
+                limits.max_tracked_sources,
             );
+            let noise_rates = Arc::new(SourceRateLimiter::new(
+                limits.handshake_burst as f64,
+                limits.handshakes_per_second,
+                limits.max_tracked_sources,
+            ));
+            let mut under_load_until = Instant::now();
+            let mut tasks = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     result = listener.accept() => {
                         match result {
                             Ok((stream, addr)) => {
-                                debug!(%addr, "incoming connection");
-                                let ctx = ctx.clone();
-                                // Per-source-IP concurrency cap first, so one source
-                                // cannot drain the global inbound budget — a pre-auth
-                                // DoS the energy gate cannot close. Anonymous and
-                                // content-blind: it consults no node identity and no
-                                // operator list, only the source IP.
-                                let ip_guard = match PerIpGuard::try_acquire(
-                                    &per_ip_counts,
-                                    addr.ip(),
-                                    MAX_INBOUND_PER_IP,
-                                ) {
-                                    Some(guard) => guard,
-                                    None => {
-                                        warn!(%addr, "rejecting connection: too many concurrent inbound handshakes from this source IP");
-                                        drop(stream);
-                                        continue;
-                                    }
-                                };
-                                let permit = match conn_semaphore.clone().try_acquire_owned() {
-                                    Ok(permit) => permit,
-                                    Err(_) => {
-                                        warn!(%addr, "rejecting connection: too many concurrent inbound handshakes");
-                                        drop(stream);
-                                        continue;
-                                    }
-                                };
-                                // Per-subnet handshake-RATE limit LAST: a token is
-                                // consumed only by a connection that already passed the
-                                // per-IP and global concurrency caps, so a single noisy
-                                // host (bounded by the per-IP cap) cannot drain a whole
-                                // /24 (IPv4) or /64 (IPv6) bucket and starve legitimate
-                                // peers. Bounds the *rate* of fresh handshakes per subnet
-                                // so an attacker cannot evade the exact-IP cap by rotating
-                                // addresses. Identity-blind, pre-auth — availability
-                                // defense, never admission. On reject, `ip_guard` and
-                                // `permit` drop here, releasing the slots.
-                                if !subnet_limiter.try_admit(addr.ip(), Instant::now()) {
-                                    warn!(%addr, "rejecting connection: inbound handshake rate exceeded for source subnet");
-                                    drop(stream);
+                                // Reap completed tasks before admitting another socket;
+                                // JoinSet outputs are also part of the memory bound.
+                                while tasks.try_join_next().is_some() {}
+                                let now = Instant::now();
+                                let ip = addr.ip().to_canonical();
+                                // Charge all accepted sockets, even ones subsequently refused.
+                                // No task, Noise session or peer state exists at this point.
+                                if !connections.try_admit(ip, now) {
+                                    under_load_until = now + std::time::Duration::from_secs(1);
                                     continue;
                                 }
-
-                                tokio::spawn(async move {
-                                    let _permit = permit; // held until task completes
-                                    let _ip_guard = ip_guard; // per-IP slot held until task completes
-                                    if let Err(e) = handle_incoming(
-                                        stream, addr, ctx,
-                                    ).await {
-                                        warn!(%addr, error = %e, "incoming connection failed");
+                                let Ok(pending_slot) = pending.clone().try_acquire_owned() else {
+                                    under_load_until = now + std::time::Duration::from_secs(1);
+                                    continue;
+                                };
+                                let Some(ip_guard) = PerIpGuard::try_acquire(&per_ip_counts, ip, ctx.config.dos_edge.max_per_ip) else {
+                                    under_load_until = now + std::time::Duration::from_secs(1);
+                                    continue;
+                                };
+                                let Some(subnet_guard) = PerIpGuard::try_acquire(&per_subnet_counts, subnet_key(ip), ctx.config.dos_edge.max_per_subnet) else {
+                                    under_load_until = now + std::time::Duration::from_secs(1);
+                                    continue;
+                                };
+                                let optimistic_slot = if ctx.config.cookie_mode == super::CookieMode::Adaptive && now >= under_load_until {
+                                    optimistic.clone().try_acquire_owned().ok()
+                                } else {
+                                    None
+                                };
+                                let require_cookie = match ctx.config.cookie_mode {
+                                    super::CookieMode::Disabled => false,
+                                    super::CookieMode::Required => true,
+                                    super::CookieMode::Adaptive => optimistic_slot.is_none(),
+                                };
+                                let ctx = ctx.clone();
+                                let handshakes = handshakes.clone();
+                                let noise_rates = noise_rates.clone();
+                                tasks.spawn(async move {
+                                    let _pending_slot = pending_slot;
+                                    let _ip_guard = ip_guard;
+                                    let _subnet_guard = subnet_guard;
+                                    let _optimistic_slot = optimistic_slot;
+                                    let deadline = std::time::Duration::from_secs(ctx.config.dos_edge.handshake_timeout_secs);
+                                    let result = tokio::time::timeout(deadline, handle_incoming(
+                                        stream, addr, ctx, require_cookie, handshakes, noise_rates,
+                                    )).await;
+                                    // Floods must not amplify into warning-log/disk floods.
+                                    if !matches!(result, Ok(Ok(()))) {
+                                        debug!(%addr, "inbound handshake refused or timed out");
                                     }
                                 });
                             }
@@ -336,6 +339,7 @@ impl NoiseTransport {
                             }
                         }
                     }
+                    _ = tasks.join_next(), if !tasks.is_empty() => {}
                     _ = shutdown_rx.changed() => {
                         info!("transport listener shutting down");
                         break;
@@ -374,21 +378,21 @@ impl NoiseTransport {
 // ─── handle_incoming ────────────────────────────────────────────────────────
 
 /// Handle an incoming TCP connection (responder side).
-pub(super) async fn handle_incoming(
+async fn handle_incoming(
     stream: tokio::net::TcpStream,
     addr: SocketAddr,
     ctx: TransportCtx,
+    require_cookie: bool,
+    handshakes: Arc<tokio::sync::Semaphore>,
+    noise_rates: Arc<SourceRateLimiter>,
 ) -> Result<(), TransportError> {
     let (mut reader, mut writer) = stream.into_split();
 
-    // Pre-Noise anti-DoS cookie gate (doorway hardening #2), only when the
-    // operator opted in. Runs BEFORE the Noise DH and holds no per-connection
-    // state until the cookie validates, so a spoofed/unproven source is dropped
-    // without this node spending an X25519 DH. Skipped (byte-identical to
-    // pre-cookie) under the default `CookieMode::Disabled`.
-    if ctx.config.cookie_mode == super::CookieMode::Required {
+    // The cookie has no stored challenge record. Only bounded TCP/framing
+    // resources exist here; no Noise/DH or peer registration before verification.
+    if require_cookie {
         tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
+            std::time::Duration::from_secs(ctx.config.dos_edge.cookie_timeout_secs),
             super::cookie::cookie_gate_responder(
                 &mut reader,
                 &mut writer,
@@ -400,39 +404,41 @@ pub(super) async fn handle_incoming(
         .map_err(|_| {
             TransportError::Rejected(format!(
                 "pre-Noise cookie gate timed out after {}s from {addr}",
-                HANDSHAKE_TIMEOUT.as_secs()
+                ctx.config.dos_edge.cookie_timeout_secs
             ))
         })??;
+    }
+
+    // Never wait in an unbounded queue for expensive work. Optimistic callers
+    // can occupy at most cookie_threshold slots; verified callers use the rest.
+    let _handshake_slot = handshakes
+        .try_acquire_owned()
+        .map_err(|_| TransportError::Rejected("global handshake limit".into()))?;
+    let now = Instant::now();
+    if !noise_rates.try_admit(addr.ip(), now) {
+        return Err(TransportError::Rejected(
+            "source handshake rate limit".into(),
+        ));
     }
 
     // Noise handshake as responder — with timeout to prevent slot exhaustion
     let noise = NoiseSession::responder(ctx.identity.x25519_secret_bytes())
         .map_err(|e| TransportError::NoiseError(e.to_string()))?;
 
-    let (reader, writer, noise) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        noise_handshake_responder(reader, writer, noise),
-    )
-    .await
-    .map_err(|_| TransportError::NoiseError(format!(
-        "handshake timed out after {}s from {addr}",
-        HANDSHAKE_TIMEOUT.as_secs()
-    )))?
-    ?;
+    let (reader, writer, noise) = noise_handshake_responder(reader, writer, noise).await?;
 
-    // Federation handshake — also under timeout. `privileged` reflects whether the
-    // peer is in our whitelist; in PriceOpen mode a non-whitelisted peer completes
-    // the handshake unprivileged (per-message payment is the gate).
-    let (peer_node_id, tier, capabilities, reader, writer, noise, privileged) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        perform_federation_handshake_responder(reader, writer, noise, &ctx.identity, &ctx.config, &ctx.whitelist),
-    )
-    .await
-    .map_err(|_| TransportError::NoiseError(format!(
-        "federation handshake timed out after {}s from {addr}",
-        HANDSHAKE_TIMEOUT.as_secs()
-    )))?
-    ?;
+    // The outer deadline spans cookie, Noise and federation. A slow client
+    // cannot renew its budget at each phase. Payment admission is unchanged.
+    let (peer_node_id, tier, capabilities, reader, writer, noise, privileged) =
+        perform_federation_handshake_responder(
+            reader,
+            writer,
+            noise,
+            &ctx.identity,
+            &ctx.config,
+            &ctx.whitelist,
+        )
+        .await?;
 
     // Whitelist check is now done inside perform_federation_handshake_responder
     // BEFORE sending HelloAck, preventing identity leak to unauthorized peers (QA-M5).
@@ -453,47 +459,55 @@ pub(super) async fn handle_incoming(
         }
     }
 
+    // Reserve lifecycle delivery before registration. The total deadline may
+    // cancel this wait, but must never leave a registered peer without its event.
+    let connected_event = ctx
+        .control_tx
+        .reserve()
+        .await
+        .map_err(|_| TransportError::Rejected("connection event receiver closed".into()))?;
+
     // Register connection
     let now = Instant::now();
-    let conn = super::Connection::new(PeerConnection {
-        advertised_trust_discount: None,
-        source_ip: addr.ip(),
-        privileged,
-        noise,
-        writer,
-        tier,
-        capabilities,
-        connected_at: now,
-        last_recv: now,
-        pending_ping: None,
-        invalid_frame_level: 0.0,
-        invalid_frame_last_leak: now,
-        bytes_received: 0,
-        memory_budget_window_start: now,
-    }, peer_node_id, Arc::clone(&ctx.peers), false)?;
+    let conn = super::Connection::new(
+        PeerConnection {
+            advertised_trust_discount: None,
+            source_ip: addr.ip(),
+            privileged,
+            noise,
+            writer,
+            tier,
+            capabilities,
+            connected_at: now,
+            last_recv: now,
+            pending_ping: None,
+            invalid_frame_level: 0.0,
+            invalid_frame_last_leak: now,
+            bytes_received: 0,
+            memory_budget_window_start: now,
+        },
+        peer_node_id,
+        Arc::clone(&ctx.peers),
+        false,
+    )?;
 
-    if !conn.register(ctx.identity.node_id(), &peer_node_id, &ctx.peers).await {
+    if !conn
+        .register(ctx.identity.node_id(), &peer_node_id, &ctx.peers)
+        .await
+    {
         return Ok(());
     }
 
     // Spawn reader task
-    spawn_reader_task(
-        peer_node_id, reader, conn,
-        ctx.clone(),
-    );
+    spawn_reader_task(peer_node_id, reader, conn, ctx.clone());
 
     // Notify application layer of new peer connection. M1b: carry the privilege
     // tag so the session handler does NOT volunteer X3DH/onboarding to a stranger
     // (PriceOpen, privileged == false) until they pay (promote-on-paid).
-    if let Err(e) = ctx.control_tx
-        .send(ControlEvent::PeerConnected {
-            peer_id: peer_node_id,
-            privileged,
-        })
-        .await
-    {
-        warn!(peer = %peer_node_id, error = %e, "failed to send PeerConnected control event");
-    }
+    connected_event.send(ControlEvent::PeerConnected {
+        peer_id: peer_node_id,
+        privileged,
+    });
 
     info!(peer = %peer_node_id, %addr, "incoming peer authenticated");
     Ok(())
@@ -545,11 +559,8 @@ mod per_ip_cap_tests {
         let counts = counts();
         let ip: IpAddr = "127.0.0.1".parse().expect("valid ip");
         {
-            let _g = PerIpGuard::try_acquire(&counts, ip, MAX_INBOUND_PER_IP);
-            assert_eq!(
-                *counts.lock().expect("lock").get(&ip).expect("entry"),
-                1
-            );
+            let _g = PerIpGuard::try_acquire(&counts, ip, 4);
+            assert_eq!(*counts.lock().expect("lock").get(&ip).expect("entry"), 1);
         }
         // Once the last guard drops, the entry is removed so the map cannot
         // grow unbounded across many short-lived sources.
@@ -566,35 +577,47 @@ mod subnet_rate_limit_tests {
     use std::time::Duration;
 
     #[test]
-    fn subnet_key_masks_ipv4_to_24_and_ipv6_to_64() {
+    fn subnet_key_preserves_ipv4_and_masks_ipv6_to_64() {
         let a: IpAddr = "203.0.113.7".parse().expect("valid ip");
         let b: IpAddr = "203.0.113.250".parse().expect("valid ip");
-        assert_eq!(subnet_key(a), subnet_key(b), "same /24 must share a key");
-        assert_eq!(subnet_key(a), "203.0.113.0".parse::<IpAddr>().expect("valid ip"));
+        assert_ne!(
+            subnet_key(a),
+            subnet_key(b),
+            "IPv4 neighbors have independent budgets"
+        );
+        assert_eq!(subnet_key(a), a);
 
         let c: IpAddr = "203.0.114.7".parse().expect("valid ip");
         assert_ne!(subnet_key(a), subnet_key(c), "different /24 must differ");
 
         let v6a: IpAddr = "2001:db8:abcd:1234::1".parse().expect("valid ip");
         let v6b: IpAddr = "2001:db8:abcd:1234:ffff::9".parse().expect("valid ip");
-        assert_eq!(subnet_key(v6a), subnet_key(v6b), "same /64 must share a key");
+        assert_eq!(
+            subnet_key(v6a),
+            subnet_key(v6b),
+            "same /64 must share a key"
+        );
         let v6c: IpAddr = "2001:db8:abcd:9999::1".parse().expect("valid ip");
-        assert_ne!(subnet_key(v6a), subnet_key(v6c), "different /64 must differ");
+        assert_ne!(
+            subnet_key(v6a),
+            subnet_key(v6c),
+            "different /64 must differ"
+        );
     }
 
     #[test]
     fn burst_from_same_subnet_is_capped_even_across_rotating_ips() {
-        // capacity 3, refill 1/s. Rotating the host octet stays inside one /24.
+        // capacity 3, refill 1/s. Rotating the host bits stays inside one /64.
         let rl = SubnetRateLimiter::new(3.0, 1.0, 1024);
         let t0 = Instant::now();
-        assert!(rl.try_admit("198.51.100.1".parse().expect("valid ip"), t0));
-        assert!(rl.try_admit("198.51.100.2".parse().expect("valid ip"), t0));
-        assert!(rl.try_admit("198.51.100.3".parse().expect("valid ip"), t0));
-        // A fourth rotated IP in the SAME /24 is throttled — rotation does not win,
+        assert!(rl.try_admit("2001:db8::1".parse().expect("valid ip"), t0));
+        assert!(rl.try_admit("2001:db8::2".parse().expect("valid ip"), t0));
+        assert!(rl.try_admit("2001:db8::3".parse().expect("valid ip"), t0));
+        // A fourth rotated IP in the SAME /64 is throttled — rotation does not win,
         // because the bucket aggregates the whole subnet.
         assert!(
-            !rl.try_admit("198.51.100.4".parse().expect("valid ip"), t0),
-            "rotating IPs within one /24 must not exceed the subnet rate"
+            !rl.try_admit("2001:db8::4".parse().expect("valid ip"), t0),
+            "rotating IPs within one /64 must not exceed the subnet rate"
         );
     }
 
@@ -618,12 +641,12 @@ mod subnet_rate_limit_tests {
         let t0 = Instant::now();
         assert!(rl.try_admit("203.0.113.1".parse().expect("valid ip"), t0));
         assert!(
-            !rl.try_admit("203.0.113.2".parse().expect("valid ip"), t0),
-            "same /24 shares the bucket"
+            !rl.try_admit("203.0.113.1".parse().expect("valid ip"), t0),
+            "same IPv4 shares the bucket"
         );
         assert!(
             rl.try_admit("203.0.114.1".parse().expect("valid ip"), t0),
-            "a different /24 has its own bucket"
+            "a different IPv4 has its own bucket"
         );
     }
 
@@ -631,11 +654,7 @@ mod subnet_rate_limit_tests {
     fn legitimate_low_rate_peer_always_admitted() {
         // Production defaults: 10/s sustained, 40 burst. A legitimate peer
         // reconnecting ~once per second is never throttled over a long run.
-        let rl = SubnetRateLimiter::new(
-            INBOUND_HANDSHAKE_BURST_PER_SUBNET,
-            INBOUND_HANDSHAKE_RATE_PER_SUBNET,
-            MAX_TRACKED_SUBNETS,
-        );
+        let rl = SubnetRateLimiter::new(40.0, 10.0, 4096);
         let ip: IpAddr = "198.51.100.20".parse().expect("valid ip");
         let mut t = Instant::now();
         for _ in 0..1000 {
@@ -668,17 +687,14 @@ mod subnet_rate_limit_tests {
 
     #[test]
     fn hard_ceiling_bounds_map_under_active_flood() {
-        // The hard case Codex flagged: every tracked subnet stays *actively*
-        // throttled (burst spent, no refill), so idle-pruning alone cannot bound
-        // the map — the hard ceiling must evict nearest-idle buckets regardless.
+        // Every tracked source has active debt. New sources must be refused
+        // without growing the table or forgetting an existing budget.
         let max_tracked = 8;
         let rl = SubnetRateLimiter::new(1.0, 0.0, max_tracked); // burst 1, no refill
         let t0 = Instant::now();
         for i in 0..200u32 {
             // 200 distinct /24s, each consuming its single token (left throttled).
-            let ip: IpAddr = format!("10.0.{}.1", i & 0xff)
-                .parse()
-                .expect("valid ip");
+            let ip: IpAddr = format!("10.0.{}.1", i & 0xff).parse().expect("valid ip");
             rl.try_admit(ip, t0);
             let tracked = rl.buckets.lock().expect("lock").len();
             assert!(
@@ -686,5 +702,113 @@ mod subnet_rate_limit_tests {
                 "map must never exceed the hard ceiling, got {tracked}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod edge_regressions {
+    use super::*;
+
+    #[test]
+    fn scheduler_reordering_cannot_refill_twice() {
+        let limiter = SubnetRateLimiter::new(1.0, 1.0, 4);
+        let now = Instant::now();
+        let ip = "192.0.2.1".parse().unwrap();
+        assert!(limiter.try_admit(ip, now));
+        assert!(limiter.try_admit(ip, now + std::time::Duration::from_secs(1)));
+        assert!(!limiter.try_admit(ip, now));
+        assert!(!limiter.try_admit(ip, now + std::time::Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn full_event_queue_cannot_leave_a_registered_peer_without_event() {
+        use konsensus_core::identity::NodeIdentity;
+        use konsensus_core::traits::transport::MessageTransport;
+        let alice = Arc::new(NodeIdentity::generate().unwrap().1);
+        let bob = Arc::new(NodeIdentity::generate().unwrap().1);
+        let mut config = super::super::TransportConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            whitelist: vec![*alice.node_id()],
+            ..Default::default()
+        };
+        config.dos_edge.handshake_timeout_secs = 1;
+        config.dos_edge.cookie_timeout_secs = 1;
+        let responder = NoiseTransport::new(bob.clone(), config);
+        responder.start_listener().await.unwrap();
+        while responder
+            .control_tx
+            .try_send(ControlEvent::PeerConnected {
+                peer_id: *bob.node_id(),
+                privileged: false,
+            })
+            .is_ok()
+        {}
+        let initiator = NoiseTransport::new(
+            alice.clone(),
+            super::super::TransportConfig {
+                whitelist: vec![*bob.node_id()],
+                ..Default::default()
+            },
+        );
+        initiator
+            .connect(bob.node_id(), &responder.listen_addr().unwrap().to_string())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            !responder.is_connected(alice.node_id()).await,
+            "deadline must drop an unannounced connection before peer registration"
+        );
+        responder.shutdown();
+        initiator.shutdown();
+    }
+
+    #[test]
+    fn rejected_ipv6_rotation_cannot_fill_the_exact_ip_table() {
+        let limiter = SourceRateLimiter::new(1.0, 1.0, 4);
+        let now = Instant::now();
+        assert!(limiter.try_admit("2001:db8:1::1".parse().unwrap(), now));
+        for host in 2..100 {
+            assert!(!limiter.try_admit(format!("2001:db8:1::{host}").parse().unwrap(), now));
+        }
+        assert!(
+            limiter.try_admit("2001:db8:2::1".parse().unwrap(), now),
+            "a flood from one /64 must not fill the exact-IP table"
+        );
+        assert_eq!(limiter.ips.buckets.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ipv4_flood_does_not_spend_neighbors_budget() {
+        let limiter = SubnetRateLimiter::new(1.0, 1.0, 8);
+        let now = Instant::now();
+        assert!(limiter.try_admit("192.0.2.1".parse().unwrap(), now));
+        assert!(!limiter.try_admit("192.0.2.1".parse().unwrap(), now));
+        assert!(limiter.try_admit("192.0.2.2".parse().unwrap(), now));
+    }
+
+    #[test]
+    fn one_entry_table_never_grows_or_forgets_active_debt() {
+        let limiter = SubnetRateLimiter::new(1.0, 1.0, 1);
+        let now = Instant::now();
+        let first = "192.0.2.1".parse().unwrap();
+        assert!(limiter.try_admit(first, now));
+        for n in 0..100 {
+            let other = IpAddr::V4(Ipv4Addr::new(10, n, 0, 1));
+            assert!(!limiter.try_admit(other, now));
+            assert_eq!(limiter.buckets.lock().unwrap().len(), 1);
+            assert!(!limiter.try_admit(first, now));
+        }
+        assert!(limiter.try_admit(
+            "198.51.100.1".parse().unwrap(),
+            now + std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn mapped_ipv4_cannot_bypass_source_concurrency() {
+        let counts = Arc::new(StdMutex::new(HashMap::new()));
+        let _guard = PerIpGuard::try_acquire(&counts, "192.0.2.1".parse().unwrap(), 1).unwrap();
+        assert!(PerIpGuard::try_acquire(&counts, "::ffff:192.0.2.1".parse().unwrap(), 1).is_none());
     }
 }

@@ -15,11 +15,13 @@ mod connection;
 mod control_reply;
 use control_reply::Connection;
 mod cookie;
+mod edge;
 mod handshake;
 mod messaging;
 mod supervisor;
 
 pub use cookie::CookieMode;
+pub use edge::DosEdgeConfig;
 pub use messaging::Standing;
 
 // Re-export internal helpers that sibling submodules access via `super::`.
@@ -373,32 +375,6 @@ const RECONNECT_MIN_DELAY: Duration = Duration::from_secs(1);
 /// Maximum reconnection delay (exponential backoff cap).
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
-/// Maximum concurrent inbound connection handshakes.
-/// Limits resource consumption from connection storms or slow handshakes.
-const MAX_CONCURRENT_INBOUND: usize = 64;
-
-/// Sustained inbound-handshake rate, in new handshakes per second, allowed per
-/// source *subnet* (IPv4 /24, IPv6 /64). Aggregating at the subnet granularity
-/// stops a `/24` or a botnet within one block from evading the exact-IP
-/// concurrency cap ([`crate::transport::connection::MAX_INBOUND_PER_IP`]) by
-/// rotating addresses. Conservative: a legitimate cohort of peers behind one
-/// `/24` connects far below this; only floods exceed it. Pre-auth, identity-blind
-/// (consults only the source subnet) — availability defense, never admission.
-pub(crate) const INBOUND_HANDSHAKE_RATE_PER_SUBNET: f64 = 10.0;
-
-/// Burst capacity (token-bucket size) for the per-subnet inbound-handshake rate
-/// limiter. Allows a short burst of legitimate reconnects without throttling,
-/// while the sustained rate is bounded by [`INBOUND_HANDSHAKE_RATE_PER_SUBNET`].
-pub(crate) const INBOUND_HANDSHAKE_BURST_PER_SUBNET: f64 = 40.0;
-
-/// Hard ceiling on the number of distinct subnet token-buckets tracked at once.
-/// When reached, idle (full) buckets are dropped first, then — if every tracked
-/// subnet is still actively throttled — the buckets nearest full are evicted, so
-/// the limiter's memory is strictly bounded even under an active wide-source
-/// flood. ~64K buckets is a few MiB; an attacker cycling more distinct subnets
-/// than this only degrades the limiter toward the global concurrency cap.
-pub(crate) const MAX_TRACKED_SUBNETS: usize = 65_536;
-
 /// Timeout for a single TCP read operation (length prefix + payload).
 /// Prevents slowloris attacks where an attacker sends partial data to hold connections.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -556,12 +532,10 @@ pub struct TransportConfig {
     /// `PriceOpen` a non-whitelisted peer may handshake/be-dialed unprivileged and
     /// the per-message PaymentGate is the sole admission authority.
     pub admission_mode: ReachabilityMode,
-    /// Pre-Noise anti-DoS cookie (doorway hardening #2). `Disabled` by default —
-    /// the handshake is then byte-identical to pre-cookie. `Required` makes this
-    /// node demand a stateless return-routability cookie before it spends a Noise
-    /// DH (self-describing challenge, graceful, no flag-day; availability defense
-    /// only — never admission). Operator opt-in.
+    /// Adaptive by default: require a cookie when optimistic capacity is full.
     pub cookie_mode: CookieMode,
+    /// Resource limits before payment can be checked.
+    pub dos_edge: DosEdgeConfig,
 }
 
 impl Default for TransportConfig {
@@ -574,6 +548,7 @@ impl Default for TransportConfig {
             version: 2,
             admission_mode: ReachabilityMode::default(),
             cookie_mode: CookieMode::default(),
+            dos_edge: Default::default(),
         }
     }
 }
@@ -658,8 +633,7 @@ struct TransportCtx {
     banned_peers: BanMap,
     incoming_tx: mpsc::Sender<UkmEnvelope>,
     control_tx: mpsc::Sender<ControlEvent>,
-    /// Shared pre-Noise cookie secret (doorway hardening #2). Consulted by the
-    /// inbound handler only when `config.cookie_mode == CookieMode::Required`.
+    /// Shared pre-Noise cookie secret, consulted when admission requires a cookie.
     cookie_keyring: Arc<cookie::CookieKeyring>,
 }
 
@@ -699,8 +673,7 @@ pub struct NoiseTransport {
     /// Receiver for the actual listen address.
     actual_listen_addr_rx: tokio::sync::watch::Receiver<Option<SocketAddr>>,
     /// Per-node secret for the pre-Noise anti-DoS cookie (doorway hardening #2).
-    /// Random at start, never persisted; only consulted when
-    /// `config.cookie_mode == CookieMode::Required`.
+    /// Random at start, never persisted; used in adaptive and required modes.
     cookie_keyring: Arc<cookie::CookieKeyring>,
 }
 
@@ -1190,6 +1163,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let config_b_fixed = TransportConfig {
@@ -1200,6 +1174,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let transport_b = Arc::new(NoiseTransport::new(Arc::clone(&identity_b), config_b_fixed));
@@ -1277,6 +1252,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let transport_a = NoiseTransport::new(Arc::clone(&identity_a), config_a);
@@ -1383,6 +1359,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1392,6 +1369,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let transport_b = Arc::new(NoiseTransport::new(Arc::clone(&identity_b), config_b));
@@ -1589,6 +1567,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1598,6 +1577,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         // Start B's listener
@@ -1682,6 +1662,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1691,6 +1672,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let transport_b = Arc::new(NoiseTransport::new(Arc::clone(&identity_b), config_b));
@@ -2523,6 +2505,7 @@ mod tests {
             whitelist: vec![],
             admission_mode: ReachabilityMode::PriceOpen,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
 
@@ -2585,6 +2568,7 @@ mod tests {
             whitelist: vec![],
             admission_mode: ReachabilityMode::PriceOpen,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
 
@@ -2594,6 +2578,7 @@ mod tests {
             whitelist: vec![],
             admission_mode: ReachabilityMode::PriceOpen,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
 
@@ -2652,6 +2637,7 @@ mod tests {
             whitelist: vec![],
             admission_mode: ReachabilityMode::PriceOpen,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
         let config_a = TransportConfig {
@@ -2961,6 +2947,7 @@ mod tests {
             whitelist: vec![],
             admission_mode: ReachabilityMode::PriceOpen,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
         let config_a = TransportConfig {
@@ -3024,6 +3011,7 @@ mod tests {
             whitelist: vec![],
             admission_mode: ReachabilityMode::PriceOpen,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
         let open = |wl: Vec<NodeId>| TransportConfig {
@@ -3031,6 +3019,7 @@ mod tests {
             whitelist: wl,
             admission_mode: ReachabilityMode::PriceOpen,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
 
@@ -3085,6 +3074,7 @@ mod tests {
             whitelist: vec![],
             admission_mode: ReachabilityMode::PriceOpen,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
         let config_a = TransportConfig {
@@ -3092,6 +3082,7 @@ mod tests {
             whitelist: vec![node_b_id],
             admission_mode: ReachabilityMode::PriceOpen,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
 
@@ -3155,6 +3146,7 @@ mod tests {
             whitelist: vec![],
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
 
@@ -3164,6 +3156,7 @@ mod tests {
             whitelist: vec![node_b_id],
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
             ..Default::default()
         };
 
@@ -3799,6 +3792,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3808,6 +3802,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let transport_a = Arc::new(NoiseTransport::new(Arc::clone(&identity_a), config_a));
@@ -3851,6 +3846,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -3860,6 +3856,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let transport_a = Arc::new(NoiseTransport::new(Arc::clone(&identity_a), config_a));
@@ -3908,6 +3905,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let config_b = TransportConfig {
@@ -3918,6 +3916,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let transport_a = Arc::new(NoiseTransport::new(Arc::clone(&identity_a), config_a));
@@ -3960,6 +3959,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let config_b = TransportConfig {
@@ -3970,6 +3970,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let transport_a = Arc::new(NoiseTransport::new(Arc::clone(&identity_a), config_a));
@@ -4153,6 +4154,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -4162,6 +4164,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let transport_a = NoiseTransport::new(Arc::clone(&identity_a), config_a);
@@ -4215,6 +4218,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
         let config_b = TransportConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
@@ -4224,6 +4228,7 @@ mod tests {
             version: 2,
             admission_mode: ReachabilityMode::Whitelist,
             cookie_mode: Default::default(),
+            dos_edge: Default::default(),
         };
 
         let transport_a = NoiseTransport::new(Arc::clone(&identity_a), config_a);
