@@ -3,10 +3,10 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-**rc10 preparation:** covers `main` from `v0.3.0-rc9` (`cd75c69`) through #256
-(`d59031f`), 2026-10-06, including #250 (`a0062b2`), #251 (`29385e7`), #252
-(`64b4542`) and #256 (`d59031f`). Hub-only channels while lockable (#257) is
-not in rc10. The rc9 and older procedures remain below for nodes skipping
+**rc10 preparation:** covers `main` from `v0.3.0-rc9` (`cd75c69`) through #257
+(`1ae4e62`), 2026-10-06, including #250 (`a0062b2`), #251 (`29385e7`), #252
+(`64b4542`), #256 (`d59031f`) and #257 (`1ae4e62`, hub-only channels while
+lockable). The rc9 and older procedures remain below for nodes skipping
 releases: apply them first, then this one.
 
 ## rc9 → rc10 procedure
@@ -144,8 +144,10 @@ manual/descriptor startup remains available. New pairing while locked is not
 supported. Remote first-run bootstrap on an empty data directory (#256) is
 supported; see
 [remote first run on an empty box](operations/home-node.md#remote-first-run-on-an-empty-box).
-A locked node does not monitor channels, so keep channels only with your hub;
-rc10 does not enforce this (#257 is not in rc10). Read
+A locked node does not monitor channels. rc10 enforces this (#257): with
+`--remote-unlock`, new channels in or out are refused with `HUB_ONLY_WHILE_LOCKABLE`
+unless the peer is in `[lightning.liquidity] providers`; existing non-hub channels
+are not closed, so close them first. Read
 [the home-node runbook](operations/home-node.md) before changing unattended
 startup. `--remote-unlock` is an argv switch, never a configuration setting.
 

@@ -3,19 +3,12 @@
 All notable BitSov node (`konsensus`) releases are documented here. Pre-rc8 notes
 also live on the corresponding GitHub pre-release pages.
 
-## Next release (not in rc10)
-
-- Hub-only channels while a node can sit locked (#257, open, not merged). With
-  `--remote-unlock`, channel opens and inbound channel requests are refused
-  unless the counterparty is the configured hub/LSP, because nothing watches
-  the node's channels while it is locked. Not part of `v0.3.0-rc10`; rc10 nodes
-  using `--remote-unlock` should still keep channels to their hub only.
-
 ## [0.3.0-rc10] — 2026-10-06 (prep; not tagged yet)
 
-**Pre-release.** Not for production use. Covers the 13 merged commits from
-`v0.3.0-rc9` (`cd75c69`) through **#256** (`d59031f`), including #250
-(`a0062b2`), #251 (`29385e7`), #252 (`64b4542`) and #256 (`d59031f`).
+**Pre-release.** Not for production use. Covers the 14 merged commits from
+`v0.3.0-rc9` (`cd75c69`) through **#257** (`1ae4e62`), including #250
+(`a0062b2`), #251 (`29385e7`), #252 (`64b4542`), #256 (`d59031f`) and #257
+(`1ae4e62`).
 Signing checklist: [`docs/releases/v0.3.0-rc10.md`](docs/releases/v0.3.0-rc10.md).
 Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
 
@@ -105,6 +98,17 @@ Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
   `Restart=on-failure` restarts into locked mode for the first remote unlock.
   Legacy create/restore are not routed in this mode. See
   [remote first run](docs/security/pairing.md#remote-first-run-over-the-tunnel).
+- Hub-only channels while a node can sit locked (#257; merge `1ae4e62`). For
+  the whole `start --remote-unlock` run, after unlock too, new channels in
+  either direction are limited to the node ids under `[lightning.liquidity]
+  providers` until a watchtower exists. Other API and auto-channel opens are
+  refused with `HUB_ONLY_WHILE_LOCKABLE` (API 403, `retry_allowed: false`)
+  before anything is dialed or funded. Inbound requests from other peers are
+  rejected before acceptance; the hub's LSPS2 JIT channels still pass. With no
+  provider listed, or a non-LDK backend, every new channel is refused.
+  `[lightning.lsps2_service] enabled = true` cannot start with the flag.
+  Existing channels are not closed. Starts without the flag are unchanged. See
+  [hub-only channels](docs/operations/home-node.md#hub-only-channels-hub_only_while_lockable).
 
 ### Docs
 
@@ -127,7 +131,7 @@ Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
 - Workspace version bump to `0.3.0-rc10` is still pending at preparation time;
   see the signing checklist.
 
-## [0.3.0-rc9] — 2026-10-06 (prep; not tagged yet)
+## [0.3.0-rc9] — 2026-10-06
 
 **Pre-release.** Not for production use. Covers all 32 merged commits from
 `v0.3.0-rc8` (`f125aab`) through **#240** (`7fde729`). Full notes and the executed

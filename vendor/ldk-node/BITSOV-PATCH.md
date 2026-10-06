@@ -472,3 +472,27 @@ before enqueueing. Replay permits inputs spent by that same canonical sweep,
 but returns `MoveHomeSweepUnavailable` with operator guidance for missing inputs
 or inputs spent by a conflict/replacement. Queueing is not confirmation. Real BDK
 tests cover this boundary in wallet/money_tests.rs.
+
+## Hub-only channels while lockable (2026-10-06)
+
+`Config::channel_peer_allowlist` defaults to `None` (unchanged behavior). When
+set, `event.rs` rejects an `OpenChannelRequest` from any unlisted counterparty
+right after the disk admission check, using the same pre-acceptance rejection
+(no funding transaction exists), and logs `HUB_ONLY_WHILE_LOCKABLE`.
+`open_channel_inner` (plain, announced and funding-policy opens) returns
+`ChannelCreationFailed` for an unlisted peer before connecting or reserving
+funds. Existing channels, splices, forwards, closes and claims are unaffected.
+The LSPS2 service open path (`liquidity/jit.rs`) is not gated here; BitSov
+refuses to configure the service together with an allowlist.
+
+BitSov sets the allowlist for `start --remote-unlock` from the configured
+`[lightning.liquidity] providers`, because a locked node runs no ChainMonitor
+(see `docs/operations/home-node.md`).
+
+    cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib bitsov_channel_peers
+
+The regression exchanges real `open_channel` messages between unstarted,
+unfunded in-memory nodes and feeds the resulting request to the production
+handler: a listed hub is accepted, an unlisted peer is rejected (and cannot be
+accepted later), and no allowlist accepts as before. Outbound opens to an
+unlisted peer fail before the running check; listed peers reach it unchanged.

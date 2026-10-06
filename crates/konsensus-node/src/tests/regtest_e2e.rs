@@ -1969,6 +1969,7 @@ async fn bitcoind_chain_source_pruned_and_full() {
         let ldk = LdkProvider::new(konsensus_lightning::LdkConfig {
             forward_to_private_channels: false,
             lsps2_service: Default::default(),
+            channel_peers: None,
             esplora_sync_intervals: Default::default(),
             logging: Default::default(),
             electrum: None,
