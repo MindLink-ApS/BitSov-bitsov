@@ -53,9 +53,9 @@ ext4 or APFS; exFAT/FAT SD cards are not supported). On Unix, key and identity
 metadata publication require successful directory synchronization, including their
 parent data directory. Sync failures refuse startup; retrying keeps the published
 key and retries synchronization, even for unchanged files. On non-Unix platforms,
-directory synchronization is best-effort for unsupported or permission-denied
-operations, including Windows read-only directory handles; other errors still
-refuse startup.
+directory synchronization is best-effort (std has no directory fsync on
+Windows); only a missing directory refuses startup. The files themselves are
+still synced before they are published.
 
 On every **unlocked** start, including when remote access is disabled, the node
 signs the box public key with its Ed25519 identity and atomically creates or
