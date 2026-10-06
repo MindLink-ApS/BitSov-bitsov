@@ -3,11 +3,12 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-**rc10 preparation:** covers `main` from `v0.3.0-rc9` (`cd75c69`) through #254
-(`efedd89`), 2026-10-06. Items marked _(expected)_ come from #250, #251 and
-#252, which were open at preparation time; confirm or remove them before
-tagging. The rc9 and older procedures remain below for nodes skipping releases:
-apply them first, then this one.
+**rc10 preparation:** covers `main` from `v0.3.0-rc9` (`cd75c69`) through #252
+(`64b4542`), 2026-10-06, including #250 (`a0062b2`), #251 (`29385e7`) and #252
+(`64b4542`). Items marked _(expected)_ come from #256 (P2 remote first run), the
+last rc10 piece, which was open at preparation time; confirm or remove them
+before tagging. The rc9 and older procedures remain below for nodes skipping
+releases: apply them first, then this one.
 
 ## rc9 → rc10 procedure
 
@@ -30,7 +31,7 @@ apply them first, then this one.
    defaults safely. Add any of them only after the binary is replaced: rc9
    rejects unknown fields, so a config containing `[dos_edge]` or `[node]` will
    not load on rc9.
-4. _(expected, #250)_ **Peer doorway defaults change.** `cookie_mode` now
+4. **Peer doorway defaults change (#250).** `cookie_mode` now
    defaults to `adaptive` (was `disabled`), and the new `[dos_edge]` limits
    always apply. Under load, sources must return a stateless cookie before the
    node does Noise work. Peers that cannot answer a cookie challenge cannot
@@ -51,7 +52,7 @@ apply them first, then this one.
 6. **SCB restore and move-home (#246).** `konsensus scb restore` now always
    refuses, including preview. Update runbooks that relied on it. Use
    `konsensus move-home` on the healthy source, and restore the whitelist
-   explicitly with `konsensus whitelist restore`. While `ldk/move-home.json`
+   explicitly with `konsensus whitelist restore --from <file>`. While `ldk/move-home.json`
    exists, normal startup refuses: resume the maintenance command, and keep the
    journal with the live store. During move-home, LSPS2 service/client and
    `forward_to_private_channels` are forced off for the maintenance run only;
@@ -70,23 +71,30 @@ apply them first, then this one.
    to `--remote-unlock --local-owner-device`. If you installed the old
    example, do not replace your unit unless you are adopting remote unlock.
    While locked, the node does not monitor channels or accept messages.
-9. _(expected, #251)_ **Owner-device delegation.** With `--local-owner-device`,
-   the node now keeps the owner signing key in zeroizing memory for the life of
+9. **Owner-device delegation (#251).** With `--local-owner-device` (which
+   needs `--password-fd` or `--remote-unlock`), the node now keeps the owner signing key in zeroizing memory for the life of
    the process, so an enrolled owner device can approve another device. Without
    that flag, delegation is refused. Pending device-key requests created before
    rc10 have no nonce: request them again to delegate. Check
    `owner_device_count` in `GET /api/v1/pair/device-keys`. Keep at least one
    non-phone owner device; console revoke and recovery are unchanged.
-10. _(expected, #252)_ **Pairing tickets and box label.**
-    `konsensus pair-ticket --config <cfg> [--qr] [--ttl 24h]` needs remote
-    access with `advertised_endpoint`, Unix file locking, and one unlocked rc10
-    start first so `identity/identity.json` holds both signed transport proofs.
+10. **Pairing tickets and box label (#252).**
+    `konsensus pair-ticket --config <cfg> [--qr] [--ttl 24h]` needs
+    `[remote_access]` with `listen_addr` and `advertised_endpoint`, Unix file
+    locking, and, on an initialized node, one unlocked rc10 start first so
+    `identity/identity.json` holds both signed transport proofs.
     It is refused while locked. Keep its output out of service journals and
     package logs: anyone holding the ticket can pair once as `read+receive`.
     The automatic five-minute first-pairing link is unchanged; the daemon only
     prints the protected file's path. Optionally set `[node] hosted_by`. See
     [enrollment tickets](operations/home-node.md#enrollment-tickets-and-box-labels).
-11. **After restart:** inspect authenticated `/api/v1/status` as in the rc9
+11. _(expected, #256 — last rc10 piece)_ **Remote first run.** Only fresh
+    installs are affected: `start --remote-unlock --local-owner-device` on a
+    positively empty data directory serves two-phase bootstrap over the tunnel
+    to the client that consumed a pre-bootstrap `pair-ticket`, then exits 75.
+    The supervisor must restart on failure (`Restart=on-failure`) to come back
+    locked for the first remote unlock. Retained nodes need no action.
+12. **After restart:** inspect authenticated `/api/v1/status` as in the rc9
     procedure. For remote unlock, also check `GET /api/v1/node/lock`.
     App-side remote unlock, delegation and tickets need an app build re-pinned to
     rc10; the node cannot establish app support.
@@ -95,21 +103,24 @@ apply them first, then this one.
 
 | Key / switch | Where | Default | Source |
 |---|---|---|---|
-| `cookie_mode` | top level | **`adaptive`** (was `disabled`); also `required`, `disabled` | #250 _(expected)_ |
-| `connections_per_second`, `connection_burst` | `[dos_edge]` | `10.0`, `40` | #250 _(expected)_ |
-| `handshakes_per_second`, `handshake_burst` | `[dos_edge]` | `2.0`, `8` | #250 _(expected)_ |
-| `max_pending`, `max_handshakes` | `[dos_edge]` | `128`, `64` | #250 _(expected)_ |
-| `max_per_ip`, `max_per_subnet` | `[dos_edge]` | `4`, `8` | #250 _(expected)_ |
-| `cookie_threshold`, `max_tracked_sources` | `[dos_edge]` | `32`, `4096` | #250 _(expected)_ |
-| `cookie_timeout_secs`, `handshake_timeout_secs` | `[dos_edge]` | `3`, `10` | #250 _(expected)_ |
-| `hosted_by` | `[node]` | unset (`null` in API) | #252 _(expected)_ |
+| `cookie_mode` | top level | **`adaptive`** (was `disabled`); also `required`, `disabled` | #250 |
+| `connections_per_second`, `connection_burst` | `[dos_edge]` | `10.0`, `40` | #250 |
+| `handshakes_per_second`, `handshake_burst` | `[dos_edge]` | `2.0`, `8` | #250 |
+| `max_pending`, `max_handshakes` | `[dos_edge]` | `128`, `64` | #250 |
+| `max_per_ip`, `max_per_subnet` | `[dos_edge]` | `4`, `8` | #250 |
+| `cookie_threshold`, `max_tracked_sources` | `[dos_edge]` | `32`, `4096` | #250 |
+| `cookie_timeout_secs`, `handshake_timeout_secs` | `[dos_edge]` | `3`, `10` | #250 |
+| `hosted_by` | `[node]` | unset (`null` in API) | #252 |
 | `forward_to_private_channels` | `[lightning]` | `false` (unchanged since rc9, #226) | forced off only during `move-home` (#246) |
-| `--remote-unlock` | `start` argv | off | #247 |
-| `konsensus pair-ticket --config <cfg> [--qr] [--ttl 24h]` | CLI | TTL `24h`, max 365 days | #252 _(expected)_ |
-| `konsensus move-home --config <cfg> --destination <addr> [--fee-rate 2] [--confirm]` | CLI, owner's `/dev/tty` | preview unless `--confirm`; `--force-close` needs separate consent | #246 |
-| `konsensus whitelist restore` | CLI | explicit only | #246 |
+| `--remote-unlock` | `start` argv | off; excludes `--password`, `--password-file`, `--password-fd`, `--owner-control` | #247 |
+| `konsensus pair-ticket [-c <cfg>] [--qr] [--ttl 24h]` | CLI | config `konsensus.toml`; TTL `24h`, `s`/`m`/`h`/`d`, max 365 days | #252 |
+| `konsensus move-home [-c <cfg>] --destination <addr> [--fee-rate 2] [--confirm] [--password-fd <n>]` | CLI, owner's `/dev/tty` | preview unless `--confirm`; fee rate 1–10000; `--force-close <channel>` also needs `--confirm --confirm-force-close` | #246 |
+| `konsensus whitelist restore --from <file> [-c <cfg>]` | CLI | explicit only | #246 |
 
-`[dos_edge]` rejects unknown keys and zero, non-finite or inconsistent limits.
+`[dos_edge]` rejects unknown keys and zero, non-finite, out-of-range or
+inconsistent limits (for example `max_per_ip` > `max_per_subnet`, or
+`cookie_threshold` ≥ `max_handshakes`); see
+[protecting the peer doorway](operations/dos-edge.md).
 `[node]` rejects unknown fields; `hosted_by` must be 1–64 printable characters
 without surrounding whitespace, control, bidi-override or zero-width characters.
 
@@ -130,8 +141,9 @@ owner device, and connect a supporting client so it pins the identity-signed box
 transport key. Preserve `identity/identity.json` and `pairing/box-transport.key`.
 The home-node systemd example now uses `--remote-unlock --local-owner-device`;
 remove any password file or credential directive when adopting it. Existing
-manual/descriptor startup remains available. Remote first-run bootstrap and new
-pairing while locked are not supported. A locked node does not monitor channels:
+manual/descriptor startup remains available. New pairing while locked is not
+supported. Remote first-run bootstrap on an empty data directory is
+_(expected, #256)_; without it, first run stays local. A locked node does not monitor channels:
 read [the home-node runbook](operations/home-node.md) before changing unattended
 startup. `--remote-unlock` is an argv switch, never a configuration setting.
 
@@ -273,8 +285,9 @@ read as `console`; the owner signature remains mandatory. Never install an
 owner public key file as a replacement for startup derivation.
 
 Without this flag, descriptor passwords keep `seed_password_not_typed` and
-sidecar grants remain inactive. Local mode retains the zeroizing owner signing
-key for enrollment delegated by an existing owner device. The live mode does
+sidecar grants remain inactive. From rc10 (#251), local mode retains the
+zeroizing owner signing key for enrollment delegated by an existing owner
+device. The live mode does
 not open `control.sock`, enable console grants or alter remote rules. Apps can
 read `owner_device_count` to warn when only one owner device remains; the phone
 must never be the only owner device. On a positively empty

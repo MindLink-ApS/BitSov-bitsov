@@ -5,16 +5,17 @@ also live on the corresponding GitHub pre-release pages.
 
 ## [0.3.0-rc10] — 2026-10-06 (prep; not tagged yet)
 
-**Pre-release.** Not for production use. Covers the 9 merged commits from
-`v0.3.0-rc9` (`cd75c69`) through **#254** (`efedd89`), plus three PRs
-**expected** to merge before tagging: #250, #251 and #252. Entries marked
-_(expected)_ describe the open PR head at preparation time; confirm or remove
-them before tagging. Signing checklist: [`docs/releases/v0.3.0-rc10.md`](docs/releases/v0.3.0-rc10.md).
+**Pre-release.** Not for production use. Covers the 12 merged commits from
+`v0.3.0-rc9` (`cd75c69`) through **#252** (`64b4542`), including #250
+(`a0062b2`), #251 (`29385e7`) and #252 (`64b4542`). One PR is still
+**expected** before tagging and is the last piece of rc10: #256 (P2 remote
+first run). Entries marked _(expected)_ describe its open head at preparation
+time; confirm or remove them before tagging. Signing checklist: [`docs/releases/v0.3.0-rc10.md`](docs/releases/v0.3.0-rc10.md).
 Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
 
 ### Security
 
-- _(expected, #250)_ DoS edge on the unpaid peer doorway. Per-IP and per-IPv6-/64
+- DoS edge on the unpaid peer doorway (#250). Per-IP and per-IPv6-/64
   connection and handshake token buckets, per-source and global concurrency
   caps, and bounded source tables apply before any Noise work, in both
   `whitelist` and `price_open` modes. New `[dos_edge]` table; partial tables
@@ -71,7 +72,7 @@ Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
   limited per key and per process. The systemd example now runs
   `--remote-unlock --local-owner-device` instead of `--owner-control` (#247, U2).
   See [the home-node runbook](docs/operations/home-node.md).
-- _(expected, #251)_ Owner-device delegation (PR C). In `--local-owner-device`
+- Owner-device delegation (#251, PR C). In `--local-owner-device`
   mode the owner signing key stays in zeroizing memory, so an enrolled owner
   device can approve another device. It signs the exact
   `bitsov-owner-delegation-v1` tuple via
@@ -79,13 +80,23 @@ Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
   `enrolled_by: "device:<approver>"`. Console `device revoke` and epoch bumps
   retire delegated keys. `GET /api/v1/pair/device-keys` adds
   `owner_device_count`; the app must keep a non-phone owner device.
-- _(expected, #252)_ One-shot pairing tickets (P1):
+- One-shot pairing tickets (#252, P1):
   `konsensus pair-ticket --config <cfg> [--qr] [--ttl 24h]` writes a file-backed
-  `read+receive` ticket (TTL up to 365 days, survives restart, refused while
-  locked) and prints the URI or a terminal QR only to the CLI's own stdout.
-  Optional `[node] hosted_by` display label (1–64 printable characters) appears
-  in tickets, `/api/v1/node/lock` and `/api/v1/health`. It is display only and
-  does not imply `identity.hosted` custody.
+  `read+receive` ticket (TTL in `s`/`m`/`h`/`d` up to 365 days, survives
+  restart, refused while locked) and prints the URI or a terminal QR only to
+  the CLI's own stdout. Optional `[node] hosted_by` display label (1–64
+  printable characters) appears in tickets, `/api/v1/node/lock` and
+  `/api/v1/health`. It is display only and does not imply `identity.hosted`
+  custody.
+- _(expected, #256 — last rc10 piece)_ Remote first run (P2):
+  `start --remote-unlock --local-owner-device` on a positively empty data
+  directory serves two-phase bootstrap over the box-static Noise tunnel to the
+  one client that consumed a pre-bootstrap `pair-ticket`. `create-pending`
+  takes a `password_commitment` and `finalize` takes the password over the
+  tunnel only (`400 tunnel_required` on loopback). The commit writes only
+  `mnemonic.enc`, records `enrolled_by: "remote_first_run"`, and exits 75 so
+  `Restart=on-failure` restarts into locked mode for the first remote unlock.
+  Legacy create/restore are not routed in this mode.
 
 ### Docs
 
@@ -115,12 +126,6 @@ Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
 upgrade check: [`docs/releases/v0.3.0-rc9.md`](docs/releases/v0.3.0-rc9.md).
 
 ### Local owner and encrypted bootstrap
-
-- Local owner devices can approve another device through P-256 delegation bound
-  to the exact node, pairing, epoch, new key, operation and nonce. Local starts
-  retain the owner signing key in zeroizing memory; console revoke and epoch
-  bumps retire delegated keys. The device list reports `owner_device_count`
-  for the app warning and rule that a phone must never be the sole owner device.
 
 - `init/start --password-fd <n>` reads a bounded, one-shot UTF-8 password from an
   inherited descriptor (`0` = stdin), with mutually exclusive password sources
