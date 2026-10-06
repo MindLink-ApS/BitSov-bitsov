@@ -65,12 +65,16 @@ pub enum Command {
         /// Read the password once to EOF from an inherited descriptor (0 = stdin).
         /// UTF-8, at most 4096 bytes; trailing CR/LF is removed. Touch ID requires
         /// --local-owner-device too. Nonzero descriptors require Unix.
-        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with_all = ["password", "password_file"])]
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with_all = ["password", "password_file"], group = "owner_password")]
         password_fd: Option<i32>,
 
+        /// Wait for an existing owner device to unlock the encrypted seed over Noise.
+        #[arg(long, group = "owner_password", conflicts_with_all = ["password", "password_file", "password_fd", "owner_control"])]
+        remote_unlock: bool,
+
         /// Enable existing owner-approved devices to sign recipient-bound spend envelopes.
-        /// Requires a descriptor password and an encrypted seed; does not open a console.
-        #[arg(long, requires = "password_fd", conflicts_with_all = ["password", "password_file", "owner_control"])]
+        /// Requires a descriptor password or remote unlock and an encrypted seed; does not open a console.
+        #[arg(long, requires = "owner_password", conflicts_with_all = ["password", "password_file", "owner_control"])]
         local_owner_device: bool,
 
         /// Override admission mode for this run: `whitelist` (default) or `price-open`.
@@ -572,6 +576,27 @@ fn approval_code(value: &str) -> Result<String, String> {
 mod local_owner_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn remote_unlock_flags() {
+        for args in [
+            vec!["--remote-unlock"],
+            vec!["--remote-unlock", "--local-owner-device"],
+        ] {
+            assert!(Cli::try_parse_from([vec!["konsensus", "start"], args].concat()).is_ok());
+        }
+        for args in [
+            vec!["--password", "secret"],
+            vec!["--password-file", "secret"],
+            vec!["--password-fd", "0"],
+            vec!["--owner-control"],
+        ] {
+            assert!(Cli::try_parse_from(
+                [vec!["konsensus", "start", "--remote-unlock"], args].concat()
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn local_owner_requires_descriptor_and_excludes_console_and_other_password_sources() {

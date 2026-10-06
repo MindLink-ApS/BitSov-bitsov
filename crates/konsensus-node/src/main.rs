@@ -12,6 +12,8 @@ mod guarded_lightning;
 mod housekeeping;
 mod invoice_refusals;
 mod logging;
+#[path = "cli/locked.rs"]
+mod locked_cmd;
 mod mnemonic_crypto;
 #[path = "cli/move_home.rs"]
 mod move_home_cmd;
@@ -126,8 +128,11 @@ async fn main() -> Result<()> {
             admission_mode,
             owner_control,
             local_owner_device,
+            remote_unlock,
         } => {
-            let password_source = if password_fd.is_some() {
+            let password_source = if remote_unlock {
+                PasswordSource::RemoteUnlock
+            } else if password_fd.is_some() {
                 PasswordSource::Descriptor
             } else if password_file.is_some() {
                 PasswordSource::File
@@ -786,6 +791,7 @@ fn sign_auth_challenge(mnemonic_path: &Path, passphrase: &str, challenge: &str) 
 enum PasswordSource {
     Typed,
     Descriptor,
+    RemoteUnlock,
     Flag,
     File,
     None,
@@ -801,8 +807,8 @@ struct StartAuthority {
 /// The owner-approval public key, or why device approvals stay off.
 ///
 /// Only an encrypted recovery phrase, with no plaintext copy beside it, whose
-/// password was typed or supplied by descriptor with explicit local owner
-/// authority, yields a key. The local launcher must protect the password:
+/// password was typed, supplied by descriptor, or remotely unlocked with explicit
+/// local owner authority, yields a key. The local launcher must protect the password:
 /// seed plus password derives the key (see `mnemonic_crypto::owner_secret`).
 fn owner_approval_key(
     config: &NodeConfig,
@@ -818,7 +824,10 @@ fn owner_approval_key(
         return Err(SEED_NOT_ENCRYPTED);
     }
     if source != PasswordSource::Typed
-        && !(source == PasswordSource::Descriptor && local_owner_device)
+        && !(matches!(
+            source,
+            PasswordSource::Descriptor | PasswordSource::RemoteUnlock
+        ) && local_owner_device)
     {
         return Err(SEED_PASSWORD_NOT_TYPED);
     }
@@ -880,6 +889,10 @@ async fn cmd_start(
     let data_dir = owner_cmd::data_dir_of(config_path);
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
+            anyhow::ensure!(
+                password_source != PasswordSource::RemoteUnlock,
+                "remote unlock requires an initialized encrypted node; remote bootstrap is not supported"
+            );
             let local = password.map(|password| owner_cmd::LocalOwnerBootstrap {
                 password,
                 enroll_device: local_owner_device,
@@ -898,6 +911,19 @@ async fn cmd_start(
         // `prepare_start` has already turned this into an error.
         konsensus_api::bootstrap::StartupMode::Refuse(_) => unreachable!(),
     }
+
+    let password = if password_source == PasswordSource::RemoteUnlock {
+        // No node, wallet, peer transport or live API exists before this returns.
+        let signal = shutdown_signal()?;
+        tokio::pin!(signal);
+        tokio::select! {
+            biased;
+            result = &mut signal => { result?; return Ok(()); }
+            result = locked_cmd::serve_locked_mode(config_path, &config) => Some(result?),
+        }
+    } else {
+        password
+    };
 
     // M1a: apply the optional `--admission-mode` CLI override BEFORE building the
     // node, so the configured mode reaches every wall (gate carrier + handshake +
@@ -2377,17 +2403,19 @@ mod owner_key_startup_tests {
     #[test]
     fn local_owner_authority_cannot_be_enabled_by_config() {
         let (_dir, cfg) = config(None);
-        let mut value = toml::Value::try_from(&cfg).unwrap();
-        let _: NodeConfig = value.clone().try_into().unwrap();
-        value
-            .as_table_mut()
-            .unwrap()
-            .insert("local_owner_device".into(), true.into());
-        let error = value.try_into::<NodeConfig>().unwrap_err().to_string();
-        assert!(
-            error.contains("unknown field `local_owner_device`"),
-            "{error}"
-        );
+        for flag in ["local_owner_device", "remote_unlock"] {
+            let mut value = toml::Value::try_from(&cfg).unwrap();
+            let _: NodeConfig = value.clone().try_into().unwrap();
+            value
+                .as_table_mut()
+                .unwrap()
+                .insert(flag.into(), true.into());
+            let error = value.try_into::<NodeConfig>().unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("unknown field `{flag}`")),
+                "{error}"
+            );
+        }
     }
 
     #[test]
