@@ -3,7 +3,7 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-**rc9 preparation:** covers `main` through #238 (`788eea3`), 2026-10-06.
+**rc9 preparation:** covers `main` through #240 (`7fde729`), 2026-10-06.
 Read this before replacing a retained node's binary. The older rc7 → rc8
 procedure and compatibility inventory remain below for reference. Fresh rc9
 `konsensus init` installs do not need retained-node marker repair. For VMs,
