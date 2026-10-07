@@ -1,7 +1,7 @@
 # Home node: unlock after a restart
 
 Run one process, data directory, identity and password per person. Initialize
-and enroll an owner device first. On a U1-capable unlocked start, the node writes
+and [enroll an owner device](#enroll-your-first-owner-device) first. On a U1-capable unlocked start, the node writes
 `identity/identity.json` and advertises its identity-signed box transport public
 key to paired clients. Before enabling remote unlock, connect the owner device
 to that unlocked node and ensure its client supports and pins that signed key.
@@ -46,6 +46,93 @@ Wrong unlocks are limited to five per key in a sliding 15-minute window and 20
 per process run; exhaustion returns 429 (the process cap requires a restart).
 `--local-owner-device` additionally enables existing owner-approved spend intents;
 without it those intents remain off with `seed_password_not_typed`.
+
+## Enroll your first owner device
+
+For an already initialized box with an encrypted seed, use **option A: console
+approval during an unlocked start**. A ticket pairs a client; it does not approve
+its owner key. A locked node needs an already approved key, so first enrollment
+must happen before enabling remote unlock.
+
+**Current transport limitation:** the normal Noise tunnel does not expose
+`/api/v1/pair/device-key` or its delegation route. The steps below require a
+client that can send enrollment requests to the owner-local API, for example
+through a private SSH port forward terminating at that loopback API. Keep the
+API bound to loopback. A tunnel-only desktop client cannot complete enrollment
+or delegation on this node version; ticket pairing and subsequent remote unlock
+are available over Noise.
+
+1. Stop the node service. Use the same config, data directory and OS account for
+   every step. Configure the Noise endpoint your device can reach; see the
+   [`[remote_access]` Tailscale example](reachability.md#settings). Keep the HTTP
+   API on loopback.
+2. Start unlocked at the box's terminal (an SSH terminal on the box is fine):
+
+   ```sh
+   konsensus start --config /path/to/konsensus.toml --owner-control
+   ```
+
+   Type the seed password when prompted. For this console-approval mode,
+   `--password-fd` does **not** enable device authority: descriptor-based
+   authority requires `--local-owner-device`, which conflicts with
+   `--owner-control`. Do not put the password in argv, environment variables or
+   a persistent file. Do not combine this start with `--remote-unlock` or
+   `--local-owner-device`.
+3. In another terminal on the box, issue a private enrollment ticket:
+
+   ```sh
+   konsensus pair-ticket --config /path/to/konsensus.toml --qr --ttl 24h
+   ```
+
+   Open/scan it on the device and complete pairing. The device must verify and
+   save the identity-signed box transport key while the node is unlocked.
+4. On the paired device, request owner-key enrollment (for example, **Set up
+   Touch ID approvals** in a supporting app). The device creates its P-256 key,
+   proves possession, and sends `POST /api/v1/pair/device-key` with its paired
+   token to the owner-local API. It receives a pending `op_id` and fingerprint.
+   At the box, run:
+
+   ```sh
+   konsensus device approve --op <id> --config /path/to/konsensus.toml
+   ```
+
+   Compare the fingerprint printed by the command with the device's screen
+   before proceeding. Enter the short code from the node's terminal (or the
+   owner-only `pairing/owner-approval-<id>` file on a headless start), then type
+   the seed password at the approval prompt. Wait until the device reports the
+   key as registered. See [device keys](../security/device-keys.md) for details.
+5. Stop the foreground node, then restart with:
+
+   ```sh
+   konsensus start --config /path/to/konsensus.toml --remote-unlock --local-owner-device
+   ```
+
+   Or start the [systemd unit](konsensus.service) configured with those switches.
+   The node now waits locked. A supporting device connects using its saved box
+   pin, requests an unlock challenge, and submits its approved key's signature
+   plus the seed password over Noise. Success returns 204; reconnect after normal
+   startup. Password entry/storage and biometric prompts depend on the client;
+   enrollment alone does not store the seed password on the device.
+
+### Add further devices by delegation
+
+Use **option D** while the node is unlocked after a
+`--remote-unlock --local-owner-device` start. Issue another ticket, pair the new
+device, and have it request `POST /api/v1/pair/device-key`. An already approved
+owner device verifies the node and compares the new device's fingerprint, then
+signs the exact pending `delegation_message`. Using **the approving device's
+paired token**, it submits `{approver_key_id, signature}` to
+`POST /api/v1/pair/device-key/{op_id}/delegate` on the owner-local API (available
+in rc11, but not exposed on the Noise tunnel).
+
+This needs client support for delegation; see the
+[delegation contract](../security/device-keys.md#delegating-another-owner-device).
+The new device polls its pending operation until registered. After a restart,
+each paired device's unlock challenge lists its own approved `key_ids`; a pending,
+unapproved key is absent and cannot unlock. The node retains the owner signing
+key in memory after local-owner unlock so it can approve delegation. No console
+approval command is available in this mode. If there is no approved device,
+return to option A rather than trying to enroll while locked.
 
 ## Receiving and channel safety while locked
 
@@ -215,7 +302,7 @@ The CLI prints a `bitsov://pair/…` URI to its own terminal and, with `--qr`,
 a terminal QR of that same URI. It never needs `--owner-control` or a control
 socket. Package hooks can call this command; keep the output private and out of
 service journals. Anyone who can read the ticket can pair once as `read+receive`.
-Owner-device enrollment still requires delegation from an existing owner device;
+Owner-device enrollment still requires [console approval or delegation](#enroll-your-first-owner-device);
 a ticket never grants spend or identity authority on an initialized node.
 
 The protected file `pairing/remote-access-link` (0600) is the ticket authority.

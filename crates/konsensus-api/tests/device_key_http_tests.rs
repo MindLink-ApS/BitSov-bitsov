@@ -39,6 +39,64 @@ async fn call(state: &Arc<AppState>, method: &str, uri: &str, body: Option<Value
     (status, serde_json::from_slice(&bytes).unwrap_or(json!({"raw": String::from_utf8_lossy(&bytes)})))
 }
 
+// Reopen durable authority as locked startup does. Password verification is
+// injected here; the node locked_mode_tests cover real seed decryption/startup.
+async fn assert_locked_restart(
+    state: &Arc<AppState>,
+    owner: ed25519_dalek::VerifyingKey,
+    client: &pairing::PairedClient,
+    device: &EcdsaKeyPair,
+    key_id: &str,
+    expected_ids: &[&str],
+    expected_status: StatusCode,
+) {
+    use axum::extract::ConnectInfo;
+    use konsensus_api::locked::{locked_router, unlock_message, LockedState, UnlockError};
+    use konsensus_api::rate_limit::RemoteTunnelClients;
+    let node_id = state.identity.node_id().to_hex();
+    let service = Arc::new(PairingService::open(
+        state.data_dir.as_ref().unwrap(), pairing::identity_fingerprint(&node_id), false,
+    ).unwrap().with_pairing_closed());
+    let clients = Arc::new(RemoteTunnelClients::default());
+    let peer: std::net::SocketAddr = "127.0.0.1:40001".parse().unwrap();
+    let _guard = clients.register(peer, client.client_id.clone());
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let verified_node = node_id.clone();
+    let router = locked_router(Arc::new(LockedState::new(
+        node_id, service.clone(), clients,
+        move |password| {
+            if password == "contract-test-password" {
+                Ok((verified_node.clone(), owner))
+            } else {
+                Err(UnlockError::Failed)
+            }
+        }, tx,
+    )));
+    let request = |path: &str, body: Value| Request::builder()
+        .method("POST").uri(path).extension(ConnectInfo(peer))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string())).unwrap();
+    let response = router.clone().oneshot(request("/api/v1/node/unlock/challenge", json!({}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 16384).await.unwrap();
+    let challenge: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(challenge["key_ids"], json!(expected_ids));
+    let message = unlock_message(&service.bound_fingerprint(), &client.client_id,
+        client.epoch, key_id, challenge["challenge"].as_str().unwrap(),
+        &hex::encode(service.box_transport_pubkey()));
+    let signature = hex::encode(device.sign(&ring::rand::SystemRandom::new(), message.as_bytes()).unwrap().as_ref());
+    let response = router.oneshot(request("/api/v1/node/unlock", json!({
+        "challenge": challenge["challenge"], "key_id": key_id,
+        "signature": signature, "password": "contract-test-password",
+    }))).await.unwrap();
+    assert_eq!(response.status(), expected_status);
+    if expected_status == StatusCode::NO_CONTENT {
+        assert_eq!(rx.await.unwrap().as_str(), "contract-test-password");
+    } else {
+        assert!(rx.try_recv().is_err(), "unapproved key must never hand off the password");
+    }
+}
+
 #[tokio::test]
 async fn register_once_then_sign_per_peer_over_http() {
     register_device_over_http(false).await;
@@ -143,6 +201,9 @@ async fn register_device_over_http(headless: bool) {
     assert!(matches!(reply, ControlResponse::Ok { .. }), "{reply:?}");
     let (_, done) = call(&state, "GET", &status_path, None, Some(&read_token)).await;
     assert_eq!(done["status"], "registered");
+    let key_id = reg["key_id"].as_str().unwrap();
+    assert_locked_restart(&state, owner.verifying_key(), &client, &device, key_id,
+        &[key_id], StatusCode::NO_CONTENT).await;
     assert!(!approval_path.exists());
     let (_, keys) = call(&state, "GET", "/api/v1/pair/device-keys", None, Some(&read_token)).await;
     assert_eq!(keys["device_keys"].as_array().unwrap().len(), 1, "{keys}");
@@ -192,6 +253,7 @@ async fn register_device_over_http(headless: bool) {
     assert_eq!(gone["status"], "absent");
 
     // Local restart retains the signer and accepts only a device delegation.
+    let owner_verifier = owner.verifying_key();
     let local = Arc::new(
         PairingService::open(tmp.path(), fp.clone(), false)
             .unwrap()
@@ -212,15 +274,29 @@ async fn register_device_over_http(headless: bool) {
     )
     .await;
     assert_eq!(keys["owner_device_count"], 1);
+    // A second device has its own pairing, as it would after ticket enrollment.
+    let second_signer = SigningKey::from_bytes(&[10; 32]);
+    let second = local.create_ticket_remote_pairing("second desktop",
+        &hex::encode(second_signer.verifying_key().to_bytes()), &[20; 32]).unwrap();
+    let challenge = local.issue_token_challenge(&second.client_id).unwrap();
+    let signature = hex::encode(second_signer.sign(challenge.as_bytes()).to_bytes());
+    let (status, token) = call(&local_state, "POST", "/api/v1/pair/token",
+        Some(json!({"client_id": second.client_id, "challenge": challenge, "signature": signature})), None).await;
+    assert_eq!(status, StatusCode::OK, "{token}");
+    let second_token = token["token"].as_str().unwrap();
+    let proof = hex::encode(other.sign(&rng, registration_message(&fp, &second.client_id, &other_pub).as_bytes()).unwrap().as_ref());
     let (status, reg) = call(
         &local_state,
         "POST",
         "/api/v1/pair/device-key",
         Some(json!({"public_key": other_pub, "name": "phone", "proof": proof})),
-        Some(&read_token),
+        Some(second_token),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{reg}");
+    let second_key_id = reg["key_id"].as_str().unwrap();
+    assert_locked_restart(&local_state, owner_verifier, &second, &other, second_key_id,
+        &[], StatusCode::FORBIDDEN).await;
     let op = reg["op_id"].as_str().unwrap();
     let msg = reg["delegation_message"].as_str().unwrap();
     assert!(msg.starts_with("bitsov-owner-delegation-v1\nnode:"));
@@ -229,7 +305,7 @@ async fn register_device_over_http(headless: bool) {
         "GET",
         &format!("/api/v1/pair/device-key/{op}"),
         None,
-        Some(&read_token),
+        Some(second_token),
     )
     .await;
     assert_eq!(pending["delegation_message"], msg);
@@ -267,6 +343,11 @@ async fn register_device_over_http(headless: bool) {
     )
     .await;
     assert_eq!(keys["owner_device_count"], 2);
+    // key_ids is per pairing, not a node-wide list: both devices survive relock.
+    assert_locked_restart(&local_state, owner_verifier, &client, &device, &intent.device_key_id,
+        &[&intent.device_key_id], StatusCode::NO_CONTENT).await;
+    assert_locked_restart(&local_state, owner_verifier, &second, &other, second_key_id,
+        &[second_key_id], StatusCode::NO_CONTENT).await;
     let (status, _) = call(&local_state, "POST", &uri, Some(body), Some(&read_token)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }

@@ -5,6 +5,15 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Document first owner-device enrollment by console approval before remote
+  unlock, and later enrollment by delegation. Correct the tunnel route
+  description and document its enrollment and password-descriptor limitations.
+  Contract tests cover local API approval/delegation, persisted keys across
+  locked service restarts and unapproved-key rejection; process tests pin
+  device-key/delegation 404s over Noise. Locked route restrictions are checked
+  for paired and unpaired callers. No node mode,
+  route or cryptographic behavior changes.
+
 - Node-local offline safety alert (v1 safety PR 2): persist an atomic synced-height
   heartbeat while unlocked, warn at 50% and report critical at 80% of each open
   channel's negotiated breach window. Owner `GET /api/v1/status` exposes

@@ -237,6 +237,9 @@ struct Tunnel {
 }
 impl Tunnel {
     async fn connect(f: &Fixture, auth: Value) -> (Self, Value) {
+        Self::connect_pinned(f, &f.box_pin, auth).await
+    }
+    async fn connect_pinned(f: &Fixture, pin: &[u8; 32], auth: Value) -> (Self, Value) {
         let mut stream = TcpStream::connect(f.remote).await.unwrap();
         let mut noise = NoiseSession::initiator(&[18; 32]).unwrap();
         wire::write_frame(&mut stream, &noise.write_handshake(&[]).unwrap())
@@ -249,7 +252,7 @@ impl Tunnel {
                     .unwrap(),
             )
             .unwrap();
-        assert_eq!(noise.remote_static_key().unwrap(), &f.box_pin);
+        assert_eq!(noise.remote_static_key().unwrap(), pin);
         wire::write_frame(&mut stream, &noise.write_handshake(&[]).unwrap())
             .await
             .unwrap();
@@ -270,8 +273,19 @@ impl Tunnel {
         (Self { stream, noise }, response)
     }
     async fn post(&mut self, path: &str, body: Value) -> (u16, Value) {
+        self.post_with_token(path, body, None).await
+    }
+    async fn post_with_token(
+        &mut self,
+        path: &str,
+        body: Value,
+        token: Option<&str>,
+    ) -> (u16, Value) {
+        let authorization = token
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
         let body = Zeroizing::new(body.to_string());
-        let request = Zeroizing::new(format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",body.len(),body.as_str()));
+        let request = Zeroizing::new(format!("POST {path} HTTP/1.1\r\nHost: localhost\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",body.len(),body.as_str()));
         wire::write_frame(
             &mut self.stream,
             &wire::encode_transport(&mut self.noise, request.as_bytes()).unwrap(),
@@ -369,6 +383,12 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         }
         let (mut tunnel, auth) = Tunnel::connect(&f, json!({"v":1})).await;
         assert_eq!(auth["status"], "ok");
+        for path in [
+            "/api/v1/pair/device-key",
+            "/api/v1/pair/device-key/op/delegate",
+        ] {
+            assert_eq!(tunnel.post(path, json!({})).await.0, 404, "locked {path}");
+        }
         let c = tunnel.challenge().await;
         assert_eq!(
             tunnel
@@ -428,6 +448,26 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
             .unwrap();
         let token:Value=http.post(format!("http://{}/api/v1/pair/token",f.api)).json(&json!({"client_id":f.record.client_id,"challenge":challenge["challenge"],"signature":hex::encode(f.client.sign(challenge["challenge"].as_str().unwrap().as_bytes()).to_bytes())})).send().await.unwrap().json().await.unwrap();
         let token = token["token"].as_str().unwrap();
+        // The bridge forwards bytes, but the remote router excludes device
+        // enrollment/delegation even for an authenticated paired token.
+        let (mut unlocked_tunnel, auth) =
+            Tunnel::connect_pinned(&f, f.identity.x25519_public().as_bytes(), json!({"v": 1}))
+                .await;
+        assert_eq!(auth["status"], "ok");
+        for path in [
+            "/api/v1/pair/device-key",
+            "/api/v1/pair/device-key/op/delegate",
+        ] {
+            assert_eq!(
+                unlocked_tunnel
+                    .post_with_token(path, json!({}), Some(token))
+                    .await
+                    .0,
+                404,
+                "unlocked {path}"
+            );
+        }
+        drop(unlocked_tunnel);
         let keys: Value = http
             .get(format!("http://{}/api/v1/pair/device-keys", f.api))
             .bearer_auth(token)
