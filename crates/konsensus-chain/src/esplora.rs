@@ -221,6 +221,78 @@ impl EsploraProvider {
         Err(last_error)
     }
 
+    /// Binary/block and submission requests share the existing auth, fallback,
+    /// deadlines and limiter. Response allocation is bounded (a block <= 4 MB).
+    async fn tower_request<T>(
+        &self,
+        path: &str,
+        body: Option<String>,
+        parse: impl Fn(&[u8]) -> Result<T, ChainError>,
+    ) -> Result<T, ChainError> {
+        let mut last = ChainError::NotAvailable("no usable Esplora endpoint".into());
+        for (index, (base, limiter)) in self.endpoints.iter().enumerate() {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(self.config.timeout_secs),
+                async {
+                    let request = match &body {
+                        Some(body) => self.client.post(format!("{base}{path}")).body(body.clone()),
+                        None => self.client.get(format!("{base}{path}")),
+                    };
+                    let mut response = limiter
+                        .run(body.is_some(), || async {
+                            match if index == 0 {
+                                self.bearer.as_ref().or(self.transport.as_ref())
+                            } else {
+                                self.transport.as_ref()
+                            } {
+                                Some(transport) => transport.execute(request).await,
+                                None => Ok(request.send().await?),
+                            }
+                        })
+                        .await
+                        .map_err(|_| {
+                            ChainError::Connection("tower Esplora request unavailable".into())
+                        })?;
+                    if !response.status().is_success() {
+                        return Err(ChainError::Backend(format!(
+                            "tower Esplora HTTP {}",
+                            response.status()
+                        )));
+                    }
+                    let limit = if body.is_some() { 1024 } else { 4_000_000 };
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = response
+                        .chunk()
+                        .await
+                        .map_err(|_| ChainError::Backend("tower Esplora body unavailable".into()))?
+                    {
+                        if bytes.len() + chunk.len() > limit {
+                            return Err(ChainError::Backend(
+                                "tower Esplora response too large".into(),
+                            ));
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    parse(&bytes)
+                },
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(ChainError::NotAvailable(
+                    "tower Esplora request timed out".into(),
+                ))
+            });
+            match result {
+                Ok(bytes) => {
+                    self.active.store(index, Ordering::Relaxed);
+                    return Ok(bytes);
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
     async fn get_text(&self, path: &str) -> Result<String, ChainError> {
         self.get_parsed(path, |text| Ok(text.to_owned())).await
     }
@@ -236,6 +308,40 @@ impl EsploraProvider {
 
 #[async_trait]
 impl ChainProvider for EsploraProvider {
+    async fn get_block(&self, height: u64) -> Result<bitcoin::Block, ChainError> {
+        let hash: bitcoin::BlockHash = self
+            .get_parsed(&format!("/block-height/{height}"), |text| {
+                text.trim()
+                    .parse()
+                    .map_err(|_| ChainError::Backend("invalid tower block hash".into()))
+            })
+            .await?;
+        self.tower_request(&format!("/block/{hash}/raw"), None, |bytes| {
+            let block: bitcoin::Block = bitcoin::consensus::deserialize(bytes)
+                .map_err(|_| ChainError::Backend("invalid tower block".into()))?;
+            if block.block_hash() != hash || !block.check_merkle_root() {
+                return Err(ChainError::Backend(
+                    "tower block hash or merkle mismatch".into(),
+                ));
+            }
+            Ok(block)
+        })
+        .await
+    }
+    async fn broadcast_transaction(&self, tx: &bitcoin::Transaction) -> Result<(), ChainError> {
+        self.tower_request(
+            "/tx",
+            Some(hex::encode(bitcoin::consensus::serialize(tx))),
+            |bytes| {
+                if String::from_utf8_lossy(bytes).trim() != tx.compute_txid().to_string() {
+                    return Err(ChainError::Backend("tower broadcast txid mismatch".into()));
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+
     fn chain_view(&self) -> konsensus_core::traits::chain::ChainView {
         konsensus_core::traits::chain::ChainView {
             backend: "esplora",

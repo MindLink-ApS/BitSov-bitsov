@@ -271,9 +271,47 @@ fn number(value: &Value, field: &str) -> Result<u64, ChainError> {
 
 #[async_trait]
 impl ChainProvider for BitcoindProvider {
+    async fn get_block(&self, height: u64) -> Result<bitcoin::Block, ChainError> {
+        let hash = self.call("getblockhash", json!([height])).await?;
+        let hash: bitcoin::BlockHash = hash
+            .as_str()
+            .ok_or_else(|| ChainError::Backend("invalid tower block hash".into()))?
+            .parse()
+            .map_err(|_| ChainError::Backend("invalid tower block hash".into()))?;
+        let raw = self.call("getblock", json!([hash.to_string(), 0])).await?;
+        let raw = raw
+            .as_str()
+            .filter(|s| s.len() <= 8_000_000)
+            .ok_or_else(|| ChainError::Backend("invalid tower block hex".into()))?;
+        let bytes =
+            hex::decode(raw).map_err(|_| ChainError::Backend("invalid tower block hex".into()))?;
+        let block: bitcoin::Block = bitcoin::consensus::deserialize(&bytes)
+            .map_err(|_| ChainError::Backend("invalid tower block".into()))?;
+        if block.block_hash() != hash || !block.check_merkle_root() {
+            return Err(ChainError::Backend(
+                "tower block hash or merkle mismatch".into(),
+            ));
+        }
+        Ok(block)
+    }
+    async fn broadcast_transaction(&self, tx: &bitcoin::Transaction) -> Result<(), ChainError> {
+        let result = self
+            .rpc(
+                "sendrawtransaction",
+                json!([hex::encode(bitcoin::consensus::serialize(tx))]),
+            )
+            .await?;
+        match result {
+            Ok(value) if value.as_str() == Some(tx.compute_txid().to_string().as_str()) => Ok(()),
+            Err(-27) => Ok(()), // Already in the chain: idempotent success after crash.
+            _ => Err(ChainError::Backend("tower broadcast rejected".into())),
+        }
+    }
+
     fn trust_level(&self) -> TrustLevel {
         TrustLevel::FullValidation
     }
+
     fn chain_view(&self) -> ChainView {
         ChainView {
             backend: "bitcoind",
@@ -460,5 +498,67 @@ mod funding_tests {
         assert!(funding_present_with(&"ab".repeat(32), |_, _| {
             std::future::ready(Err(ChainError::Connection("offline".into())))
         }).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod tower_tests {
+    use super::*;
+    #[tokio::test]
+    async fn tower_full_block_and_exact_rpc_broadcast() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let expected = block.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
+                let block = block.clone();
+                async move {
+                    let result = match request["method"].as_str().unwrap() {
+                        "getblockhash" => {
+                            assert_eq!(request["params"], json!([0]));
+                            json!(block.block_hash().to_string())
+                        }
+                        "getblock" => {
+                            assert_eq!(
+                                request["params"],
+                                json!([block.block_hash().to_string(), 0])
+                            );
+                            json!(hex::encode(bitcoin::consensus::serialize(&block)))
+                        }
+                        "sendrawtransaction" => {
+                            assert_eq!(
+                                request["params"],
+                                json!([hex::encode(bitcoin::consensus::serialize(
+                                    &block.txdata[0]
+                                ))])
+                            );
+                            json!(block.txdata[0].compute_txid().to_string())
+                        }
+                        _ => panic!("unexpected RPC"),
+                    };
+                    axum::Json(json!({"result":result,"error":null,"id":1}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let cookie = dir.path().join("cookie");
+        std::fs::write(&cookie, "user:password").unwrap();
+        let provider = BitcoindProvider::new(BitcoindConfig {
+            rpc_host: "127.0.0.1".into(),
+            rpc_port: port,
+            cookie_file: Some(cookie),
+            rpc_user: None,
+            rpc_password_file: None,
+        })
+        .unwrap();
+        assert_eq!(provider.get_block(0).await.unwrap(), expected);
+        provider
+            .broadcast_transaction(&expected.txdata[0])
+            .await
+            .unwrap();
+        task.abort();
     }
 }
