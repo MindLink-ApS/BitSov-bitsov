@@ -51,6 +51,7 @@ use crate::connection::ConnectionManager;
 use crate::event::EventQueue;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::GossipSource;
+use crate::tower_hook::{TowerClient, TowerPersister};
 use crate::io::sqlite_store::SqliteStore;
 use crate::io::utils::{
 	read_external_pathfinding_scores_from_cache, read_node_metrics, write_node_metrics,
@@ -251,6 +252,7 @@ impl std::error::Error for BuildError {}
 /// - Gossip data is sourced via the peer-to-peer network
 #[derive(Debug)]
 pub struct NodeBuilder {
+	tower_client: Option<Arc<TowerClient>>,
 	config: Config,
 	entropy_source_config: Option<EntropySourceConfig>,
 	chain_data_source_config: Option<ChainDataSourceConfig>,
@@ -279,6 +281,7 @@ impl NodeBuilder {
 		let runtime_handle = None;
 		let pathfinding_scores_sync_config = None;
 		Self {
+			tower_client: None,
 			config,
 			entropy_source_config,
 			chain_data_source_config,
@@ -289,6 +292,16 @@ impl NodeBuilder {
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
 		}
+	}
+
+	/// Enables durable justice-candidate staging for a configured tower client.
+	///
+	/// Disabled by default. The client must use persistent, node-local storage retained
+	/// across restarts. This hook does not send anything; W2 consumes the client queue.
+	/// It only captures commitments observed while enabled, not historical revoked states.
+	pub fn set_tower_client(&mut self, client: Arc<TowerClient>) -> &mut Self {
+		self.tower_client = Some(client);
+		self
 	}
 
 	/// Configures the [`Node`] instance to (re-)use a specific `tokio` runtime.
@@ -768,6 +781,7 @@ impl NodeBuilder {
 			runtime,
 			logger,
 			Arc::new(vss_store),
+			self.tower_client.clone(),
 		)
 	}
 
@@ -802,6 +816,7 @@ impl NodeBuilder {
 			runtime,
 			logger,
 			kv_store,
+			self.tower_client.clone(),
 		)
 	}
 }
@@ -1166,6 +1181,7 @@ fn build_with_store_internal(
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	async_payments_role: Option<AsyncPaymentsRole>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
 	logger: Arc<Logger>, kv_store: Arc<DynStore>,
+	tower_client: Option<Arc<TowerClient>>,
 ) -> Result<Node, BuildError> {
 	optionally_install_rustls_cryptoprovider();
 
@@ -1414,7 +1430,7 @@ fn build_with_store_internal(
 	));
 
 	let peer_storage_key = keys_manager.get_peer_storage_key();
-	let persister = Arc::new(Persister::new(
+	let persister = Persister::new(
 		Arc::clone(&kv_store),
 		Arc::clone(&logger),
 		PERSISTER_MAX_PENDING_UPDATES,
@@ -1422,7 +1438,7 @@ fn build_with_store_internal(
 		Arc::clone(&keys_manager),
 		Arc::clone(&tx_broadcaster),
 		Arc::clone(&fee_estimator),
-	));
+	);
 
 	// Read ChannelMonitor state from store
 	let channel_monitors = match persister.read_all_channel_monitors_with_updates() {
@@ -1436,6 +1452,21 @@ fn build_with_store_internal(
 			}
 		},
 	};
+
+	// The disabled decorator performs only the original persistence calls. The wallet
+	// callback is lazy: no address is allocated unless a tower client sees a channel.
+	let tower_wallet = Arc::clone(&wallet);
+	let tower_fees = Arc::clone(&fee_estimator);
+	let persister = Arc::new(TowerPersister::new(
+		persister,
+		tower_client,
+		Arc::new(move || tower_fees.tower_justice_rate()),
+		Arc::new(move || {
+			tower_wallet.get_new_address()
+				.map(|address| address.script_pubkey())
+				.map_err(|_| std::io::Error::other("Failed to persist tower destination"))
+		}),
+	));
 
 	// Initialize the ChainMonitor
 	let chain_monitor: Arc<ChainMonitor> = Arc::new(chainmonitor::ChainMonitor::new(
