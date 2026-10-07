@@ -161,8 +161,11 @@ impl ChainProvider for Chain {
         self.sent.lock().unwrap().push(tx.clone());
         Ok(())
     }
-    async fn estimate_fee(&self, _: u32) -> Result<FeeEstimate, ChainError> {
-        unimplemented!()
+    async fn estimate_fee(&self, target_blocks: u32) -> Result<FeeEstimate, ChainError> {
+        Ok(FeeEstimate {
+            target_blocks,
+            sat_per_vbyte: 1.0,
+        })
     }
     async fn is_tx_confirmed(&self, id: &str, _: u32) -> Result<bool, ChainError> {
         Ok(self
