@@ -200,7 +200,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install semgrep
-        run: pip install semgrep
+        run: pip install "semgrep==1.179.0"  # 1.180.0 ships without semgrep-core (sdist build); bump deliberately
 
       # Two-pass scan:
       #   Pass 1 — full report (no --error), all findings visible in CI log.
