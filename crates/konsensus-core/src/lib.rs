@@ -22,6 +22,7 @@ pub mod invite;
 pub mod kind;
 pub mod payloads;
 pub mod profile;
+pub mod tower;
 pub mod traits;
 pub mod types;
 pub mod web_reply;
