@@ -51,7 +51,7 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use crate::cli::{Cli, Command, RepairCommand, ScbCommand, WhitelistCommand};
-use crate::config::{NodeConfig, NodeTier};
+use crate::config::{LightningConfig, NodeConfig, NodeTier};
 use crate::node::KonsensusNode;
 use konsensus_core::traits::transport::MessageTransport;
 use konsensus_core::types::NodeId;
@@ -803,7 +803,24 @@ enum PasswordSource {
     None,
 }
 
-/// Startup flags select the home safety profile, independently of password provenance.
+/// Lockable starts are always hub-only, regardless of the configured opt-out.
+fn channel_peers_for_start(
+    lightning: &LightningConfig,
+    source: PasswordSource,
+) -> anyhow::Result<guarded_lightning::ChannelPeers> {
+    if source == PasswordSource::RemoteUnlock
+        && matches!(lightning, LightningConfig::Ldk { lsps2_service, .. } if lsps2_service.enabled)
+    {
+        anyhow::bail!("HUB_ONLY_WHILE_LOCKABLE: --remote-unlock cannot run an LSPS2 service");
+    }
+    if source == PasswordSource::RemoteUnlock {
+        guarded_lightning::ChannelPeers::hub_only(lightning)
+    } else {
+        guarded_lightning::ChannelPeers::from_config(lightning)
+    }
+}
+
+/// Startup flags select the breach-window profile, independently of password provenance.
 fn is_home_profile(source: PasswordSource, local_owner_device: bool) -> bool {
     source == PasswordSource::RemoteUnlock || local_owner_device
 }
@@ -952,12 +969,7 @@ async fn cmd_start(
         konsensus_api::bootstrap::StartupMode::Refuse(_) => unreachable!(),
     }
 
-    // Refuse a conflicting hub-service role before locking, not after the owner unlocks.
-    let channel_peers = if password_source == PasswordSource::RemoteUnlock {
-        guarded_lightning::ChannelPeers::hub_only(&config.lightning)?
-    } else {
-        guarded_lightning::ChannelPeers::Any
-    };
+    let channel_peers = channel_peers_for_start(&config.lightning, password_source)?;
 
     let password = if password_source == PasswordSource::RemoteUnlock {
         // No node, wallet, peer transport or live API exists before this returns.
@@ -1043,7 +1055,7 @@ async fn cmd_start(
         info!(
             code = konsensus_core::traits::lightning::HUB_ONLY_WHILE_LOCKABLE,
             hubs = hubs.len(),
-            "remote unlock: new channels limited to the configured hub/LSP"
+            "new channels limited to the configured hub/LSP"
         );
     }
 
@@ -2409,6 +2421,40 @@ mod tests;
 mod owner_key_startup_tests {
     use super::*;
     use konsensus_api::pairing::device::{SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
+
+    #[test]
+    fn home_channels_are_hub_only_and_only_non_lockable_starts_can_opt_out() {
+        let default: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
+        let opt_out: LightningConfig =
+            toml::from_str("backend = 'ldk'\nhub_only_channels = false").unwrap();
+        for source in [
+            PasswordSource::Typed,
+            PasswordSource::Descriptor,
+            PasswordSource::RemoteUnlock,
+            PasswordSource::Flag,
+            PasswordSource::File,
+            PasswordSource::None,
+        ] {
+            assert_eq!(
+                channel_peers_for_start(&default, source)
+                    .unwrap()
+                    .allowlist(),
+                Some(vec![]),
+                "{source:?}"
+            );
+            assert_eq!(
+                channel_peers_for_start(&opt_out, source)
+                    .unwrap()
+                    .allowlist(),
+                if source == PasswordSource::RemoteUnlock {
+                    Some(vec![])
+                } else {
+                    None
+                },
+                "{source:?}"
+            );
+        }
+    }
 
     #[test]
     fn home_profile_all_password_sources() {

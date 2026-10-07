@@ -263,6 +263,7 @@ pub fn lightning_config(dir: &std::path::Path, url: &str) -> konsensus_lightning
         our_to_self_delay_blocks: None,
         lsps2_service: Default::default(),
         channel_peers: None,
+        channel_capacity_limits: Default::default(),
         esplora_sync_intervals: Default::default(),
         logging: Default::default(),
         electrum: None,

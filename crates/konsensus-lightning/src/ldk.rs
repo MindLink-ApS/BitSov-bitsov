@@ -47,6 +47,8 @@ use konsensus_core::traits::lightning::{
 /// Configuration for the embedded LDK Lightning provider.
 #[derive(Debug, Clone)]
 pub struct LdkConfig {
+    /// Full-capacity admission ceilings applied to every channel open path.
+    pub channel_capacity_limits: konsensus_core::traits::lightning::ChannelCapacityLimits,
     /// Optional local-only watchtower staging; empty leaves the hook disabled.
     pub tower: crate::tower::TowerConfig,
     /// Opt in to forwarding into private channels, without enabling announcements.
@@ -64,7 +66,7 @@ pub struct LdkConfig {
     /// Opt-in hub service; mutually exclusive with the LSPS2 client.
     pub lsps2_service: crate::lsps2_service::Lsps2ServiceConfig,
     /// When set, new channels in either direction are limited to these node ids
-    /// (`--remote-unlock`: the configured hub/LSPs). Excludes the hub service role.
+    /// (the configured hub/LSPs). Excludes the hub service role.
     pub channel_peers: Option<Vec<String>>,
     /// Path to store LDK state (channel monitors, network graph, scorer, etc.).
     pub storage_dir: PathBuf,
@@ -107,6 +109,10 @@ impl LdkConfig {
         admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> ldk_node::config::Config {
         ldk_node::config::Config {
+            channel_limits: Some(ldk_node::channel_limits::ChannelLimits::new(
+                self.channel_capacity_limits.max_channel_capacity_sats,
+                self.channel_capacity_limits.max_total_channel_capacity_sats,
+            )),
             accept_forwards_to_priv_channels: self.forward_to_private_channels,
             our_to_self_delay: self.our_to_self_delay_blocks,
             work_admission: admission.map(ldk_node::config::WorkAdmissionCheck::new),
@@ -1438,6 +1444,18 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
+    fn channel_safety(&self) -> Option<konsensus_core::traits::lightning::ChannelSafetyStatus> {
+        use konsensus_core::traits::lightning::{ChannelCapacityLimits, ChannelSafetyStatus};
+        let config = self.node.config();
+        config.channel_limits.map(|limits| ChannelSafetyStatus {
+            limits: ChannelCapacityLimits {
+                max_channel_capacity_sats: limits.max_channel_capacity_sats,
+                max_total_channel_capacity_sats: limits.max_total_channel_capacity_sats,
+            },
+            hub_only: config.channel_peer_allowlist.is_some(),
+        })
+    }
+
     fn offline_safety(&self) -> Option<konsensus_core::offline_safety::SharedOfflineSafety> {
         Some(self.offline_safety.clone())
     }
@@ -2900,6 +2918,10 @@ fn open_ldk_channel_with_policy(
         // lightning 0.2.2's create_channel returned Err, before queuing an open
         // message. Other errors (e.g. peer persistence AFTER creation) may be
         // post-dispatch and must retain the conservative Backend classification.
+        ldk_node::NodeError::ChannelCapacityExceeded
+        | ldk_node::NodeError::TotalChannelCapacityExceeded => {
+            LightningError::PaymentNotDispatched(e.to_string())
+        }
         ldk_node::NodeError::ChannelCreationFailed => {
             LightningError::PaymentNotDispatched(format!("open_channel failed: {e}"))
         }
@@ -2986,7 +3008,7 @@ fn channel_peer_allowlist(
     let Some(peers) = peers else { return Ok(None) };
     if hub_service {
         return Err(LightningError::InvalidStartupConfig(format!(
-            "{HUB_ONLY_WHILE_LOCKABLE}: lsps2_service opens channels to any client; disable it to start with --remote-unlock"
+            "{HUB_ONLY_WHILE_LOCKABLE}: lsps2_service opens channels to any client; disable it to use hub_only_channels"
         )));
     }
     peers

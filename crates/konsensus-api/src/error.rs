@@ -153,11 +153,25 @@ impl ApiError {
                     "code": "disk_low", "retry_allowed": true
                 }));
             }
+            if reason == konsensus_core::traits::lightning::CHANNEL_CAPACITY_EXCEEDED
+                || reason == konsensus_core::traits::lightning::TOTAL_CHANNEL_CAPACITY_EXCEEDED
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({
+                        "error": "Channel open refused by the active capacity ceiling. Check channel_safety in owner status.",
+                        "code": reason, "retry_allowed": false
+                    }),
+                );
+            }
             if reason == konsensus_core::traits::lightning::HUB_ONLY_WHILE_LOCKABLE {
-                return (StatusCode::FORBIDDEN, serde_json::json!({
-                    "error": "This node was started with --remote-unlock. Until a watchtower exists, nothing watches its channels while it is locked, so new channels are limited to the configured hub/LSP ([lightning.liquidity] providers).",
-                    "code": reason, "retry_allowed": false
-                }));
+                return (
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({
+                        "error": "The active hub-only policy limits new channels to configured hubs/LSPs. While this node is locked or offline its channels are unmonitored; this policy still requires trust in those counterparties.",
+                        "code": reason, "retry_allowed": false
+                    }),
+                );
             }
             return (StatusCode::BAD_REQUEST, serde_json::json!({
                 "error": reason, "code": "not_dispatched"
@@ -315,6 +329,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_capacity_refusals_have_distinct_owner_actionable_codes() {
+        for code in [
+            "CHANNEL_CAPACITY_EXCEEDED",
+            "TOTAL_CHANNEL_CAPACITY_EXCEEDED",
+        ] {
+            let (status, body) = error_body(ApiError::from(
+                konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(
+                    code.into(),
+                ),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["code"], code);
+            assert_eq!(body["retry_allowed"], false);
+        }
+    }
+
+    #[tokio::test]
     async fn hub_only_refusal_is_forbidden_and_not_retryable() {
         use konsensus_core::traits::lightning::{LightningError, HUB_ONLY_WHILE_LOCKABLE};
         let (status, body) = error_body(ApiError::from(
@@ -323,7 +355,7 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], HUB_ONLY_WHILE_LOCKABLE);
         assert_eq!(body["retry_allowed"], false);
-        assert!(body["error"].as_str().unwrap().contains("--remote-unlock"));
+        assert!(body["error"].as_str().unwrap().contains("hub-only"));
     }
 
     #[tokio::test]
