@@ -5,6 +5,21 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+### Security
+
+- Safe-restore PR1 (#271): bind `ldk/INSTANCE` to the host, filesystem/volume
+  and a random instance ID; refuse mismatches before constructing LDK.
+  Existing nodes bind on their first upgraded start. Missing platform IDs
+  fail closed. A legitimate latest-live-store hardware move requires the
+  documented `rebind-instance` owner-console typed confirmation. Open or
+  invalid `ldk/recover.json` journals block startup; generation 3 prevents
+  older guard-aware binaries from ignoring these guards. The example systemd
+  unit caps rapid restart loops at three starts per 300 seconds.
+  **Never restore a copied data directory. Same-host SD-image rollback is not
+  detected yet.** `konsensus recover` is coming; use the
+  [recovery guidance](docs/v2/RECOVERY.md) and
+  [hardware-move runbook](docs/operations/home-node.md#copied-directories-and-hardware-moves-271).
+
 ## [0.3.0-rc12] — 2026-10-07 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Includes all three PRs merged after

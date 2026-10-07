@@ -10,6 +10,36 @@ For nodes skipping releases, apply the older procedures below first, then
 [rc11 → rc12](#rc11--rc12-procedure). Earlier sections describe their release's
 behavior; the rc12 home-node delay policy supersedes rc11's optional W0 default.
 
+## Next upgrade: copied-directory fence (#271)
+
+Keep the current live directory on its existing host. **Never restore a copied
+data directory, rsync backup or SD image to start a Lightning node.** A stale
+copy can broadcast a revoked commitment and lose the channel balance.
+
+On init or first upgraded start, `ldk/INSTANCE` binds a random instance ID to a
+hash of the machine ID and filesystem/volume ID. Existing nodes without this
+file bind automatically; no reinitialization or owner confirmation is required.
+That first binding cannot recognize an already-stale legacy copy. Subsequent
+host/volume mismatches refuse before LDK construction. Missing platform IDs or
+corrupt binding files also refuse; fix the underlying cause, never delete the
+markers. **Same-host SD-image rollback is not detected yet**, nor are same-host,
+same-filesystem copies or clones retaining both identifiers. This is not a
+freshness proof.
+
+Generation **3** prevents generation-2 binaries from ignoring the new fence and
+`ldk/recover.json` journal. An open, malformed, unreadable or unsupported journal
+blocks normal startup. `konsensus recover` is **coming**, not built yet: use the
+[recovery guidance](v2/RECOVERY.md) and contact the operator for a lost disk.
+For a healthy source use [move-home](operations/move-home.md). A legitimate move
+of the latest cleanly stopped live store has a separate console-only
+`konsensus rebind-instance --config …` override requiring an exact typed
+challenge; it never bypasses recovery/migration journals or proves freshness.
+See the [hardware-move runbook](operations/home-node.md#owner-override-for-a-legitimate-hardware-move).
+
+Update any installed example systemd unit to include `StartLimitIntervalSec=300`
+and `StartLimitBurst=3` in `[Unit]`, then reload the user daemon. Inspect and fix
+startup failures before resetting the failed service; do not automate resets.
+
 ## rc11 → rc12 procedure
 
 1. **Replace the binary without reinitializing.** Verify the rc12 artifact and
@@ -639,7 +669,7 @@ that server's responsibility.
 Before opening SQLite or constructing LDK, startup durably writes
 `STATE_GENERATION` beside the configured mnemonic (the same parent as `ldk/`).
 The marker uses format `bitsov-state-v1:<generation>`; this release introduces
-binary/state compatibility generation **2** (move-home journal safety). Future incompatible migrations or
+binary/state compatibility generation **3** (host-binding and recovery journal safety). Future incompatible migrations or
 LDK persistence changes must increment `STATE_GENERATION` in the binary before
 state is opened. Publication uses a temporary file, file fsync, atomic rename,
 and directory fsync. A process lease (`STATE_GENERATION.lock`) prevents concurrent

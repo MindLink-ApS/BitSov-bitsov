@@ -483,7 +483,10 @@ async fn from_config_lnbits_lightning_provider() {
 async fn offline_fee_barrier_preserves_local_identity_and_storage() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
-    let expected = *KonsensusNode::from_config(config.clone(), None).await.unwrap().node_id();
+    let expected = *KonsensusNode::from_config(config.clone(), None)
+        .await
+        .unwrap()
+        .node_id();
     config.lightning = LightningConfig::Ldk {
         forward_to_private_channels: false,
         our_to_self_delay_blocks: None,
@@ -491,17 +494,29 @@ async fn offline_fee_barrier_preserves_local_identity_and_storage() {
         onchain_wallet_sync_interval_secs: None,
         lightning_wallet_sync_interval_secs: None,
         fee_rate_cache_update_interval_secs: None,
-        liquidity: Default::default(), network: "bitcoin".into(),
-        esplora_url: "http://127.0.0.1:1".into(), esplora_url_fallback: None, credentials_file: None,
-        rgs_url: None, lsp_node_id: None, lsp_address: None, lsp_token: None,
-        listening_address: None, advertised_address: None,
+        liquidity: Default::default(),
+        network: "bitcoin".into(),
+        esplora_url: "http://127.0.0.1:1".into(),
+        esplora_url_fallback: None,
+        credentials_file: None,
+        rgs_url: None,
+        lsp_node_id: None,
+        lsp_address: None,
+        lsp_token: None,
+        listening_address: None,
+        advertised_address: None,
     };
-    let node = KonsensusNode::from_config(config, None).await
+    let node = KonsensusNode::from_config(config, None)
+        .await
         .expect("fee outage must leave local services available");
     assert_eq!(*node.node_id(), expected);
     assert!(!node.lightning().is_available().await);
     assert_eq!(node.storage().count_pending_deliveries().await.unwrap(), 0);
-    let error = node.lightning().create_invoice(1000, "offline", 60).await.unwrap_err();
+    let error = node
+        .lightning()
+        .create_invoice(1000, "offline", 60)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("not_ready"), "{error}");
     node.lightning().shutdown().await.unwrap();
 }
@@ -590,11 +605,60 @@ async fn state_lease_outlives_cloned_lightning_handle() {
         .unwrap();
     let lightning = node.lightning().clone();
     drop(node);
+    assert!(
+        crate::safety::ensure_generation(dir.path(), crate::safety::STATE_GENERATION)
+            .unwrap_err()
+            .to_string()
+            .contains("state_generation_busy")
+    );
+    lightning.shutdown().await.unwrap();
+    drop(lightning);
+    crate::safety::ensure_generation(dir.path(), crate::safety::STATE_GENERATION).unwrap();
+}
+
+#[tokio::test]
+async fn restore_fences_refuse_before_identity_or_storage_is_opened() {
+    for marker in ["INSTANCE", "recover.json"] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        // A later startup stage would fail on this seed. The fence must win.
+        std::fs::write(&config.identity.mnemonic_file, "invalid seed").unwrap();
+        std::fs::create_dir(dir.path().join("ldk")).unwrap();
+        let content = if marker == "INSTANCE" {
+            r#"{"version":1,"instance_id":"01234567-89ab-cdef-0123-456789abcdef","binding":"0000000000000000000000000000000000000000000000000000000000000000"}"#
+        } else {
+            r#"{"version":1,"state":"open"}"#
+        };
+        std::fs::write(dir.path().join("ldk").join(marker), content).unwrap();
+        let err = KonsensusNode::from_config(config, None)
+            .await
+            .err()
+            .unwrap();
+        let message = format!("{err:#}");
+        assert!(message.contains("konsensus recover"), "{message}");
+        assert!(!message.contains("mnemonic"), "{message}");
+        assert!(!dir.path().join("konsensus.db").exists());
+    }
+}
+
+#[tokio::test]
+async fn upgrade_binds_retained_node_and_preserves_binding_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    crate::safety::ensure_generation(dir.path(), 2).unwrap();
+    let node = KonsensusNode::from_config(config.clone(), None)
+        .await
+        .unwrap();
+    let binding = std::fs::read(dir.path().join("ldk/INSTANCE")).unwrap();
+    drop(node);
+    let _node = KonsensusNode::from_config(config, None).await.unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("ldk/INSTANCE")).unwrap(),
+        binding
+    );
+    drop(_node);
     assert!(crate::safety::ensure_generation(dir.path(), 2)
         .unwrap_err()
         .to_string()
-        .contains("state_generation_busy"));
-    lightning.shutdown().await.unwrap();
-    drop(lightning);
-    crate::safety::ensure_generation(dir.path(), 2).unwrap();
+        .contains("state_generation_newer"));
 }

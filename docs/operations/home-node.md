@@ -447,3 +447,66 @@ unlocked and syncing whenever channels are open.
 This is a node-local reminder. The hub neither computes nor pushes it, and an
 offline/locked node cannot deliver a live notification: it reports on unlock.
 It does not extend negotiated windows or replace monitoring or a watchtower.
+
+## Copied directories and hardware moves (#271)
+
+**Never restore a copied data directory, rsync backup, VM snapshot or SD-card
+image as a running Lightning node.** It may contain revoked commitments:
+broadcasting one can lose the whole channel balance, even before reconnecting
+to the peer. `STATE_GENERATION` travels with a copy and proves no freshness.
+
+On init or first upgraded start, the node writes `ldk/INSTANCE` beside the LDK
+store (under the configured mnemonic's parent). It records a random instance ID
+and a hash binding it to the machine and the filesystem containing `ldk/`.
+Linux uses `/etc/machine-id` (with `/var/lib/dbus/machine-id` as a fallback) and
+the kernel filesystem ID; macOS uses `IOPlatformUUID` and the volume UUID.
+Raw machine IDs are not saved. A changed host or filesystem refuses startup
+before LDK is constructed; `move-home` also checks the fence. Missing, invalid
+or unavailable platform IDs fail closed with an explanation, including during
+an override. Provision a persistent, unique Linux machine-id using your OS
+installation tooling; do not substitute a shared or temporary ID.
+
+**Limits:** this is an accidental-copy fence, not a freshness proof or an
+anti-tamper boundary. Same-host SD-image rollback is **not detected yet**.
+Copies on the same host/filesystem, cloned machine/volume identifiers, deleted
+binding files, and old directories without a binding can escape detection.
+Existing installations without `INSTANCE` bind on their first upgraded start
+without refusing; that upgrade cannot determine whether their state is stale.
+Never delete or edit safety markers to get a node to start.
+
+`konsensus recover` is **coming**, not implemented. For a lost disk, stop and
+follow [the recovery guidance](../v2/RECOVERY.md); contact the operator rather
+than starting an old copy. For a healthy node, prefer
+[`konsensus move-home`](move-home.md) on its original live store.
+
+### Owner override for a legitimate hardware move
+
+Use this only when relocating the **latest, cleanly stopped live store**, never
+a backup or snapshot. It changes the binding; it does not verify freshness.
+
+1. Stop the service on both machines. Verify the source shut down cleanly,
+   preserve its latest state, and ensure the old node cannot restart. Never
+   run two nodes with this identity.
+2. Move the current store and update paths in `konsensus.toml` as needed.
+3. At the destination's owner console (a terminal or SSH with a controlling
+   terminal), run `konsensus rebind-instance --config /path/konsensus.toml`.
+   Read the warning and type the exact `REBIND … TO …` challenge displayed.
+   Confirmation is read from `/dev/tty`, never stdin, a flag, or an API.
+   Wrong text, EOF or no console leaves the binding unchanged. This command
+   constructs no LDK node and does not start the service.
+4. Start normally. Keep the old node disabled. Do not add the override to a
+   service or unattended script. An open recovery or move-home journal cannot
+   be bypassed by rebinding.
+
+The recovery-journal skeleton is `ldk/recover.json`, version 1, with `state`
+`open` or `done` (for example `{"version":1,"state":"open"}`). Any open,
+malformed, unreadable or unsupported journal refuses startup before LDK.
+Only a valid `done` journal permits normal startup. No recovery workflow writes
+or completes this journal yet; do not create, remove or mark it done manually
+to bypass recovery.
+
+The example systemd unit limits starts to three within 300 seconds. After a
+panic or safety refusal, inspect `journalctl --user -u konsensus.service` and
+resolve the cause before `systemctl --user reset-failed konsensus.service`
+and a deliberate restart. This caps rapid crash loops; it cannot suppress a
+revoked-commitment broadcast or stop failures spaced outside the limit window.
