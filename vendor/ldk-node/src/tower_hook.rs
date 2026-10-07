@@ -88,7 +88,6 @@ impl TowerClient {
         // Content-addressing makes retries after a crash between copy/remove idempotent,
         // while preserving different corrupt versions of the same source key.
         self.store.write(namespace, channel, &saved_key, bytes)?;
-        self.store.remove(primary, secondary, key, false)?;
         if primary == "tower" && self.limit.is_some() {
             // Quarantining the journal invalidates its deferred-state markers too.
             for overflow in self.store.list("tower_overflow", channel)? {
@@ -96,6 +95,9 @@ impl TowerClient {
                     .remove("tower_overflow", channel, &overflow, false)?;
             }
         }
+        // Keep the corrupt source until deferred-marker cleanup succeeds, so a
+        // crash/error retries cleanup rather than leaving orphan coverage counts.
+        self.store.remove(primary, secondary, key, false)?;
         log::error!(
             "Quarantined corrupt watchtower record {}/{}/{} at {}/{}/{}: {}",
             primary,

@@ -1970,6 +1970,7 @@ struct CountTowerIo {
     store: FilesystemStore,
     candidate_lists: std::sync::atomic::AtomicUsize,
     overflow_writes: std::sync::atomic::AtomicUsize,
+    fail_overflow_remove: std::sync::atomic::AtomicBool,
 }
 impl KVStoreSync for CountTowerIo {
     fn read(&self, p: &str, s: &str, k: &str) -> Result<Vec<u8>, lightning::io::Error> {
@@ -1983,6 +1984,13 @@ impl KVStoreSync for CountTowerIo {
         self.store.write(p, s, k, b)
     }
     fn remove(&self, p: &str, s: &str, k: &str, lazy: bool) -> Result<(), lightning::io::Error> {
+        if p == "tower_overflow"
+            && self
+                .fail_overflow_remove
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(io::Error::other("injected overflow cleanup failure").into());
+        }
         self.store.remove(p, s, k, lazy)
     }
     fn list(&self, p: &str, s: &str) -> Result<Vec<String>, lightning::io::Error> {
@@ -2003,6 +2011,7 @@ fn bounded_candidates_retain_overflow_and_ack_deduplicates_redelivery() {
         store: FilesystemStore::new(dir.path().into()),
         candidate_lists: 0.into(),
         overflow_writes: 0.into(),
+        fail_overflow_remove: false.into(),
     });
     let client = Arc::new(TowerClient::new_bounded(store.clone(), 1));
     let hook = TowerPersister::new(
@@ -2099,4 +2108,51 @@ fn bounded_candidates_retain_overflow_and_ack_deduplicates_redelivery() {
         ChannelMonitorUpdateStatus::Completed
     );
     assert!(store.list("tower_overflow", &channel).unwrap().is_empty());
+}
+
+#[test]
+fn bounded_quarantine_retries_deferred_marker_cleanup_before_source_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(CountTowerIo {
+        store: FilesystemStore::new(dir.path().into()),
+        candidate_lists: 0.into(),
+        overflow_writes: 0.into(),
+        fail_overflow_remove: true.into(),
+    });
+    let client = TowerClient::new_bounded(store.clone(), 10_000);
+    let channel = ChannelId([42; 32]).to_string();
+    let bytes = vec![0];
+    store
+        .write("tower", "pending", &channel, bytes.clone())
+        .unwrap();
+    store
+        .write("tower_overflow", &channel, "old", vec![1])
+        .unwrap();
+    let reason = io::Error::new(io::ErrorKind::InvalidData, "fixture");
+    assert!(client
+        .quarantine(
+            "tower",
+            "pending",
+            &channel,
+            &channel,
+            bytes.clone(),
+            &reason
+        )
+        .is_err());
+    assert_eq!(store.read("tower", "pending", &channel).unwrap(), bytes);
+    store
+        .fail_overflow_remove
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    client
+        .quarantine("tower", "pending", &channel, &channel, bytes, &reason)
+        .unwrap();
+    assert!(store.list("tower_overflow", &channel).unwrap().is_empty());
+    assert_eq!(
+        store
+            .list("tower_quarantine_pending", &channel)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store.read("tower", "pending", &channel).is_err());
 }
