@@ -514,8 +514,8 @@ pub enum LightningConfig {
         #[serde(default)]
         forward_to_private_channels: bool,
         /// Blocks a peer must wait to claim its balance after force-closing a new channel,
-        /// i.e. our window to punish a revoked state (144..=2016; omitted keeps LDK's 144).
-        /// Home nodes that may stay locked can set 288 (about two days); see
+        /// i.e. our window to punish a revoked state. Home starts default to 2016
+        /// with a 288 floor; other starts keep LDK's 144 (144..=2016 explicit). See
         /// docs/operations/home-node.md. Existing channels keep their negotiated value.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         our_to_self_delay_blocks: Option<u16>,
@@ -534,6 +534,24 @@ pub enum LightningConfig {
 }
 
 impl LightningConfig {
+    /// Apply the startup profile before any identity or network work.
+    pub(crate) fn apply_home_to_self_delay(&mut self, home_profile: bool) -> anyhow::Result<()> {
+        if let Self::Ldk { our_to_self_delay_blocks, lsps2_service, .. } = self {
+            // Owner-device authority can also be enabled on a hub service. It
+            // does not change that role; remote unlock rejects it separately.
+            if home_profile && !lsps2_service.enabled {
+                let blocks = our_to_self_delay_blocks.unwrap_or(2016);
+                anyhow::ensure!(
+                    (288..=2016).contains(&blocks),
+                    "lightning.our_to_self_delay_blocks must be between 288 and 2016 blocks (inclusive) for home nodes, got {blocks}"
+                );
+                *our_to_self_delay_blocks = Some(blocks);
+            }
+            konsensus_lightning::ldk::validate_our_to_self_delay(*our_to_self_delay_blocks)?;
+        }
+        Ok(())
+    }
+
     /// Keep the TOML fields explicit so `deny_unknown_fields` remains effective.
     pub(crate) fn esplora_sync_intervals(&self) -> konsensus_lightning::ldk::EsploraSyncIntervals {
         match self {

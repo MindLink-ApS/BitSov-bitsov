@@ -244,7 +244,7 @@ fn restore_into_empty_dir_prepares_initialized_start() -> Result<()> {
         dir.join("NODE_INITIALIZED").exists(),
         "restore must write NODE_INITIALIZED so start does not need a separate repair"
     );
-    let (mode, _config) = owner_cmd::prepare_start(&dir.join("konsensus.toml"))?;
+    let (mode, _config) = owner_cmd::prepare_start(&dir.join("konsensus.toml"), false)?;
     assert_eq!(
         mode,
         konsensus_api::bootstrap::StartupMode::Initialized,

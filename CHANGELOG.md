@@ -5,6 +5,17 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Home-node breach window (v1 safety PR 1, building on W0/#261): embedded LDK
+  starts with `--remote-unlock` or `--local-owner-device` default to 2016 blocks
+  (about two weeks). Explicit `lightning.our_to_self_delay_blocks` values must
+  be 288..=2016 for this profile; lower values fail startup. The enabled
+  hub/LSP service role and plain non-home starts retain W0's 144-block default
+  and 144..=2016 explicit range. Applies only to new channels; existing
+  channels retain their negotiated delay. Peers with a lower maximum refuse
+  the channel without fallback. The hub's funds can remain locked for about
+  two weeks after its own force-close, which a hub/LSP may price into fees.
+  See [the home-node runbook](docs/operations/home-node.md#longer-breach-window-optional).
+
 ## [0.3.0-rc11] — 2026-10-07 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Includes everything since rc9

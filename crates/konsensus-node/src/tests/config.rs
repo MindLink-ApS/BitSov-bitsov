@@ -2932,6 +2932,59 @@ fn our_to_self_delay_validation_bounds_precede_node_startup() {
 }
 
 #[test]
+fn home_to_self_delay_defaults_and_explicit_values() {
+    for (setting, expected) in [
+        ("", 2016),
+        ("our_to_self_delay_blocks = 288", 288),
+        ("our_to_self_delay_blocks = 500", 500),
+        ("our_to_self_delay_blocks = 2016", 2016),
+    ] {
+        let mut config: LightningConfig =
+            toml::from_str(&format!("backend = 'ldk'\n{setting}")).unwrap();
+        config.apply_home_to_self_delay(true).unwrap();
+        assert!(
+            matches!(config, LightningConfig::Ldk { our_to_self_delay_blocks: Some(value), .. } if value == expected)
+        );
+    }
+}
+
+#[test]
+fn home_to_self_delay_refuses_below_floor_and_above_peer_limit() {
+    for value in [0, 143, 144, 200, 287, 2017, u16::MAX] {
+        let mut config: LightningConfig = toml::from_str(&format!(
+            "backend = 'ldk'\nour_to_self_delay_blocks = {value}"
+        ))
+        .unwrap();
+        let error = config
+            .apply_home_to_self_delay(true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("lightning.our_to_self_delay_blocks"),
+            "{error}"
+        );
+        assert!(error.contains("288") && error.contains("2016"), "{error}");
+    }
+}
+
+#[test]
+fn non_home_and_hub_service_to_self_delay_keep_w0_policy() {
+    for (home, service) in [(false, false), (false, true), (true, true)] {
+        for (setting, expected) in [
+            ("", None),
+            ("our_to_self_delay_blocks = 200", Some(200)),
+            ("our_to_self_delay_blocks = 500", Some(500)),
+        ] {
+            let mut config: LightningConfig = toml::from_str(&format!("backend = 'ldk'\n{setting}\n[lsps2_service]\nenabled = {service}\nrequire_token = 'test'")).unwrap();
+            config.apply_home_to_self_delay(home).unwrap();
+            assert!(
+                matches!(config, LightningConfig::Ldk { our_to_self_delay_blocks, .. } if our_to_self_delay_blocks == expected)
+            );
+        }
+    }
+}
+
+#[test]
 fn lsps2_service_is_opt_in_and_round_trips() {
     let omitted: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
     let table: toml::Value = toml::from_str(&toml::to_string(&omitted).unwrap()).unwrap();

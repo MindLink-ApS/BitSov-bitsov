@@ -119,8 +119,10 @@ fn ldk_config_construction() {
         assert!(node_config.announcement_addresses.is_none());
     }
     assert_eq!(config.node_config(None).our_to_self_delay, None);
-    config.our_to_self_delay_blocks = Some(288);
-    assert_eq!(config.node_config(None).our_to_self_delay, Some(288));
+    for delay in [288, 500, 2016] {
+        config.our_to_self_delay_blocks = Some(delay);
+        assert_eq!(config.node_config(None).our_to_self_delay, Some(delay));
+    }
 }
 
 #[test]
