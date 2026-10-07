@@ -19,8 +19,8 @@ mod mnemonic_crypto;
 mod move_home_cmd;
 mod msg_handler;
 mod node;
-mod onboarding;
 mod offline_safety;
+mod onboarding;
 #[path = "cli/owner.rs"]
 mod owner_cmd;
 mod password;
@@ -132,8 +132,12 @@ async fn main() -> Result<()> {
             owner_control,
             local_owner_device,
             remote_unlock,
+            home,
         } => {
-            let password_source = if remote_unlock {
+            // Home mode is the existing remote state machine plus device authority.
+            // Console authority remains exclusively controlled by --owner-control.
+            let local_owner_device = local_owner_device || home;
+            let password_source = if remote_unlock || home {
                 PasswordSource::RemoteUnlock
             } else if password_fd.is_some() {
                 PasswordSource::Descriptor
@@ -2420,7 +2424,11 @@ mod owner_key_startup_tests {
             (PasswordSource::File, false),
             (PasswordSource::None, false),
         ] {
-            assert_eq!(is_home_profile(source, false), without_local_owner, "{source:?}");
+            assert_eq!(
+                is_home_profile(source, false),
+                without_local_owner,
+                "{source:?}"
+            );
             assert!(is_home_profile(source, true), "{source:?}");
         }
     }
@@ -2512,7 +2520,7 @@ mod owner_key_startup_tests {
     #[test]
     fn local_owner_authority_cannot_be_enabled_by_config() {
         let (_dir, cfg) = config(None);
-        for flag in ["local_owner_device", "remote_unlock"] {
+        for flag in ["home", "local_owner_device", "remote_unlock"] {
             let mut value = toml::Value::try_from(&cfg).unwrap();
             let _: NodeConfig = value.clone().try_into().unwrap();
             value

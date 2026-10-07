@@ -5,6 +5,18 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+### Node
+
+- Add `konsensus start --home` as the home-box mode: remote unlock plus local
+  owner-device authority, without owner-control console authority. Empty-box
+  setup exits 75 for a supervised restart into LOCKED; device unlock continues
+  into UNLOCKED in the same process. Existing flags remain supported. Home mode
+  conflicts with console mode and all startup password sources.
+- Add a hardened, dedicated-user [systemd system unit](docs/operations/bitsov.service)
+  with forced restart on exit 75 and bounded restart attempts. The
+  [installation guide](docs/operations/home-node.md#install-the-system-service)
+  supports installing it before first-device enrollment on an empty box.
+
 ## [0.3.0-rc12] — 2026-10-07 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Includes all three PRs merged after
