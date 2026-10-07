@@ -360,17 +360,31 @@ impl KonsensusNode {
         };
 
         info!("chain provider initialized");
-        let tower_service = konsensus_lightning::tower::server::TowerServer::open(
+        // Serving other clients must never prevent our own Lightning monitoring
+        // from starting. A failed open/status read disables only the tower.
+        let tower = konsensus_lightning::tower::server::TowerServer::open(
             &config.services.tower,
             &data_dir.join("tower"),
-        )?;
-        let tower_serve_status = Arc::new(std::sync::RwLock::new(
-            tower_service
+        )
+        .and_then(|service| {
+            let status = service
                 .as_ref()
                 .map(|s| s.status())
                 .transpose()?
-                .unwrap_or_default(),
-        ));
+                .unwrap_or_default();
+            Ok((service, status))
+        });
+        let (tower_service, tower_status) = tower.unwrap_or_else(|error| {
+            warn!(%error, "tower service disabled; continuing node startup");
+            (
+                None,
+                konsensus_core::tower::TowerServeStatus {
+                    error: Some(error.to_string()),
+                    ..Default::default()
+                },
+            )
+        });
+        let tower_serve_status = Arc::new(std::sync::RwLock::new(tower_status));
 
         // ── 5. Initialize Pricing engine ────────────────────────────────
         let base_pricing_config = konsensus_pricing::StaticPricingConfig {
