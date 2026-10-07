@@ -899,8 +899,11 @@ async fn cmd_start(
     // Relative configs must become absolute before any parent()/data_dir use.
     let config_path = owner_cmd::absolute_config_path(config_path)?;
     let config_path = config_path.as_path();
-    let (startup_mode, mut config) = owner_cmd::prepare_start(config_path)
-        .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
+    let (startup_mode, mut config) = owner_cmd::prepare_start(
+        config_path,
+        password_source == PasswordSource::RemoteUnlock || local_owner_device,
+    )
+    .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
 
     // ── First-run / partial-state gate (#76) ───────────────────────
     // Before any component is built, classify the data directory from file

@@ -27,10 +27,10 @@ use konsensus_api::rate_limit::RemoteTunnelClients;
 use konsensus_api::spend_budget::{self, GrantTerms};
 
 /// Prepare startup without constructing a wallet, node or listener.
-pub fn prepare_start(config_path: &Path) -> Result<(StartupMode, NodeConfig)> {
+pub fn prepare_start(config_path: &Path, home_profile: bool) -> Result<(StartupMode, NodeConfig)> {
     let data_dir = data_dir_of(config_path);
     let layout = DataDirLayout::new(&data_dir);
-    let config = if config_path.try_exists()? {
+    let mut config = if config_path.try_exists()? {
         NodeConfig::load_before_identity_validation(config_path)?
     } else {
         NodeConfig::default_for_tier(
@@ -39,6 +39,9 @@ pub fn prepare_start(config_path: &Path) -> Result<(StartupMode, NodeConfig)> {
             &data_dir,
         )
     };
+    // Resolve the home floor before generic W0 validation, bootstrap serving,
+    // or locked mode, so even a value below 144 reports the home floor of 288.
+    config.lightning.apply_home_to_self_delay(home_profile)?;
     let layout = configured_layout(&data_dir, &config);
     let probe = bootstrap::DataDirProbe::inspect(&layout)?;
     for stray in &probe.stray_staging {
@@ -74,6 +77,62 @@ pub fn prepare_start(config_path: &Path) -> Result<(StartupMode, NodeConfig)> {
     }
     Ok((mode, config))
 }
+
+#[cfg(test)]
+mod to_self_delay_tests {
+    use super::*;
+    use crate::config::LightningConfig;
+
+    #[test]
+    fn home_to_self_delay_is_applied_before_bootstrap_or_identity_validation() {
+        for (setting, expected) in [
+            (None, Some(2016)),
+            (Some(200), None),
+            (Some(143), None),
+            (Some(288), Some(288)),
+            (Some(500), Some(500)),
+            (Some(2017), None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("konsensus.toml");
+            let mut config = NodeConfig::default_for_tier(
+                NodeTier::Full,
+                dir.path().join("identity/mnemonic.txt"),
+                dir.path(),
+            );
+            if let LightningConfig::Ldk {
+                our_to_self_delay_blocks,
+                ..
+            } = &mut config.lightning
+            {
+                *our_to_self_delay_blocks = setting;
+            }
+            config.save(&path).unwrap();
+            match expected {
+                Some(expected) => {
+                    let (_, config) = prepare_start(&path, true).unwrap();
+                    assert!(
+                        matches!(config.lightning, LightningConfig::Ldk { our_to_self_delay_blocks: Some(value), .. } if value == expected)
+                    );
+                    // Applying the runtime profile must not write a default to disk.
+                    let saved = NodeConfig::load_before_identity_validation(&path).unwrap();
+                    assert!(
+                        matches!(saved.lightning, LightningConfig::Ldk { our_to_self_delay_blocks, .. } if our_to_self_delay_blocks == setting)
+                    );
+                }
+                None => {
+                    let error = prepare_start(&path, true).unwrap_err().to_string();
+                    assert!(
+                        error.contains("lightning.our_to_self_delay_blocks"),
+                        "{error}"
+                    );
+                    assert!(error.contains("288"), "{error}");
+                }
+            }
+        }
+    }
+}
+
 
 fn configured_layout(data_dir: &Path, config: &NodeConfig) -> DataDirLayout {
     // The configured store is a connection string, not a path: the runtime
@@ -1100,7 +1159,7 @@ mod startup_tests {
         );
         assert!(DataDirLayout::new(&data).marker().exists());
 
-        let (mode, _) = prepare_start(&link).unwrap();
+        let (mode, _) = prepare_start(&link, false).unwrap();
         assert_eq!(
             mode,
             StartupMode::Initialized,
@@ -1160,7 +1219,7 @@ mod startup_tests {
     #[test]
     fn empty_install_prepares_bootstrap_without_identity_or_config() {
         let dir = tempfile::tempdir().unwrap();
-        let (mode, config) = prepare_start(&dir.path().join("konsensus.toml")).unwrap();
+        let (mode, config) = prepare_start(&dir.path().join("konsensus.toml"), false).unwrap();
         assert_eq!(mode, StartupMode::Bootstrap);
         assert!(config.api.listen_addr.ip().is_loopback());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
@@ -1174,7 +1233,7 @@ mod startup_tests {
         let config = NodeConfig::default_for_tier(NodeTier::Full, phrase, dir.path());
         let path = dir.path().join("konsensus.toml");
         config.save(&path).unwrap();
-        let err = prepare_start(&path).expect_err("markerless identity must refuse");
+        let err = prepare_start(&path, false).expect_err("markerless identity must refuse");
         assert!(err.to_string().contains("refusing to start"));
         assert!(!DataDirLayout::new(dir.path()).marker().exists());
     }
@@ -1185,7 +1244,7 @@ mod startup_tests {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let layout = DataDirLayout::new(dir.path());
         let outcome = bootstrap::commit_first_run(&layout, phrase, None).unwrap();
-        let (mode, config) = prepare_start(&dir.path().join("konsensus.toml")).unwrap();
+        let (mode, config) = prepare_start(&dir.path().join("konsensus.toml"), false).unwrap();
         assert_eq!(mode, StartupMode::Initialized);
         assert_eq!(config.identity.mnemonic_file, outcome.mnemonic_path);
     }
@@ -1207,12 +1266,12 @@ mod startup_tests {
             );
             let path = dir.path().join("konsensus.toml");
             config.save(&path).unwrap();
-            assert_eq!(prepare_start(&path).unwrap().0, StartupMode::Bootstrap);
+            assert_eq!(prepare_start(&path, false).unwrap().0, StartupMode::Bootstrap);
             let ldk = identity_dir.join("ldk");
             std::fs::create_dir_all(&ldk).unwrap();
             let monitor = ldk.join("channel-monitor-fixture");
             std::fs::write(&monitor, b"retained channel state").unwrap();
-            assert!(prepare_start(&path)
+            assert!(prepare_start(&path, false)
                 .unwrap_err()
                 .to_string()
                 .contains("state_without_identity"));
@@ -1251,7 +1310,7 @@ mod startup_tests {
             };
             let path = dir.path().join("konsensus.toml");
             config.save(&path).unwrap();
-            assert_eq!(prepare_start(&path).unwrap().0, StartupMode::Bootstrap);
+            assert_eq!(prepare_start(&path, false).unwrap().0, StartupMode::Bootstrap);
 
             // A committed identity, then the database the runtime creates
             // through the very same connection string.
@@ -1262,7 +1321,7 @@ mod startup_tests {
                 .unwrap();
             assert!(store_file.exists(), "{spelling}: runtime store not created");
             assert_eq!(
-                prepare_start(&path).unwrap().0,
+                prepare_start(&path, false).unwrap().0,
                 StartupMode::Initialized,
                 "{spelling}"
             );
@@ -1271,7 +1330,7 @@ mod startup_tests {
             std::fs::remove_file(&outcome.mnemonic_path).unwrap();
             std::fs::remove_dir_all(layout.identity_dir()).unwrap();
             std::fs::remove_file(layout.marker()).unwrap();
-            let err = prepare_start(&path)
+            let err = prepare_start(&path, false)
                 .expect_err("retained store with no identity must refuse")
                 .to_string();
             assert!(
@@ -1304,7 +1363,7 @@ mod startup_tests {
             config.backup.scb_dir = backup_dir.to_string_lossy().into_owned();
             let path = dir.path().join("konsensus.toml");
             config.save(&path).unwrap();
-            assert_eq!(prepare_start(&path).unwrap().0, StartupMode::Bootstrap);
+            assert_eq!(prepare_start(&path, false).unwrap().0, StartupMode::Bootstrap);
             let _store = if artifact == "sqlite" {
                 Some(
                     konsensus_storage::SqliteStorage::open(store_path.to_str().unwrap())
@@ -1316,7 +1375,7 @@ mod startup_tests {
                 std::fs::write(backup_dir.join(artifact), b"encrypted backup fixture").unwrap();
                 None
             };
-            assert!(prepare_start(&path)
+            assert!(prepare_start(&path, false)
                 .unwrap_err()
                 .to_string()
                 .contains("state_without_identity"));
@@ -1336,7 +1395,7 @@ mod startup_tests {
         config.identity.passphrase = "public test passphrase".into();
         let path = dir.path().join("konsensus.toml");
         config.save(&path).unwrap();
-        let err = prepare_start(&path).expect_err("passphrase layout must fail closed");
+        let err = prepare_start(&path, false).expect_err("passphrase layout must fail closed");
         assert!(
             err.to_string().contains("passphrase"),
             "expected passphrase refusal, got: {err}"
@@ -1453,7 +1512,7 @@ mod startup_tests {
             assert!(!state.layout.marker().exists());
             assert!(state.pairing.device_keys().is_empty());
             drop(state);
-            assert!(prepare_start(&config_path).is_err());
+            assert!(prepare_start(&config_path, false).is_err());
             assert!(cmd_repair_mark_initialized(&config_path, false).is_err());
             cmd_repair_mark_initialized(&config_path, true).unwrap();
             assert_eq!(
@@ -1462,11 +1521,11 @@ mod startup_tests {
                 "repair only writes marker"
             );
             assert!(
-                prepare_start(&config_path).is_err(),
+                prepare_start(&config_path, false).is_err(),
                 "repair must not guess a new config path"
             );
             align_config_mnemonic(&config_path, &dir.path().join("identity/mnemonic.enc")).unwrap();
-            let (mode, repaired) = prepare_start(&config_path).unwrap();
+            let (mode, repaired) = prepare_start(&config_path, false).unwrap();
             assert_eq!(mode, StartupMode::Initialized);
             let node_id = konsensus_core::NodeIdentity::from_mnemonic(phrase, "")
                 .unwrap()
@@ -1518,7 +1577,7 @@ mod startup_tests {
         config.api.listen_addr = "127.0.0.1:0".parse().unwrap();
         let path = dir.path().join("custom.toml");
         config.save(&path).unwrap();
-        assert_eq!(prepare_start(&path).unwrap().0, StartupMode::Bootstrap);
+        assert_eq!(prepare_start(&path, false).unwrap().0, StartupMode::Bootstrap);
 
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let pairing = std::sync::Arc::new(
@@ -1544,7 +1603,7 @@ mod startup_tests {
         let aligned = NodeConfig::load_before_identity_validation(&path).unwrap();
         assert_eq!(aligned.identity.mnemonic_file, outcome.mnemonic_path);
 
-        let (mode, started) = prepare_start(&path).unwrap();
+        let (mode, started) = prepare_start(&path, false).unwrap();
         assert_eq!(mode, StartupMode::Initialized);
         assert_eq!(started.identity.mnemonic_file, outcome.mnemonic_path);
     }
@@ -1639,7 +1698,7 @@ mod startup_tests {
         let path = dir.path().join("custom.toml");
         config.save(&path).unwrap();
 
-        let err = prepare_start(&path)
+        let err = prepare_start(&path, false)
             .expect_err("markerless custom identity must refuse")
             .to_string();
         assert!(err.contains("identity_without_marker") || err.contains("refusing to start"));
@@ -1647,7 +1706,7 @@ mod startup_tests {
         // Default-name repair cannot see custom.toml; the start -c path can.
         cmd_repair_mark_initialized(&path, true).unwrap();
         assert!(DataDirLayout::new(dir.path()).marker().exists());
-        let (mode, started) = prepare_start(&path).unwrap();
+        let (mode, started) = prepare_start(&path, false).unwrap();
         assert_eq!(mode, StartupMode::Initialized);
         assert_eq!(started.identity.mnemonic_file, custom);
     }

@@ -112,29 +112,55 @@ Remote sends/acks/deletes and authenticated expiry triggers are TODO(W2b).
 
 ### Longer breach window (optional)
 
-You can ask channel peers for a longer window to respond to a revoked state:
+Home starts with `--remote-unlock` (with or without `--local-owner-device`),
+or with `--password-fd` and `--local-owner-device`, default to **2016 blocks**
+(about two weeks) on the embedded LDK backend. This includes the
+`HUB_ONLY_WHILE_LOCKABLE` profile for the whole run, after unlock too. There is
+no separate home-node config flag: the startup flags select this policy, not
+`tier`, `identity.hosted`, or the display-only `node.hosted_by` label.
+
+An explicit value overrides the default, with a **288-block floor** (about two
+days) for home nodes:
 
 ```toml
 [lightning]
 backend = "ldk"
-our_to_self_delay_blocks = 288  # about two days
+our_to_self_delay_blocks = 500  # optional: about 3.5 days instead of two weeks
 ```
 
-The value is the number of blocks a peer must wait before it can claim its own
-balance after it force-closes. During that wait the unlocked node can punish an
-old state, so 288 gives roughly two days to unlock instead of one. It applies to
-channels opened after the change, in both directions (including channels the
-hub opens to you); existing channels keep the value they were opened with.
-Accepted values are 144 to 2016 blocks; others are refused at startup. Omitting
-the key keeps LDK's default of 144, the behaviour of earlier releases.
+Home values outside 288..=2016 are refused at startup, before serving locked
+mode or building the node, with an error naming
+`lightning.our_to_self_delay_blocks` and the allowed range. The hub/LSP service
+role (`[lightning.lsps2_service] enabled = true`) and ordinary starts without
+either home flag retain W0's 144..=2016 range and LDK's 144-block default when
+unset. A local-owner flag does not turn an enabled service into a home node;
+`--remote-unlock` still refuses that conflicting service role under #257.
 
-The peer must agree. LDK peers accept up to 2016 by default; a peer with a
-lower limit refuses the channel, and the open fails rather than falling back to
-144. A larger value delays the peer's funds after its force-close, so some peers
-may prefer not to accept it. It does not delay your own funds when you
-force-close; that wait is set by the peer. It is not a watchtower: if the box
-stays locked or offline for longer than the window, the risk above still
-applies.
+The value is the number of blocks a peer must wait before it can claim its own
+balance after it force-closes. During that wait the unlocked node can punish a
+revoked state. **This applies only to new channels**, in both directions,
+including LSPS2 channels the hub opens to you. Existing channels keep their
+negotiated value; restarting or changing this setting does not extend their
+window.
+
+The peer must agree. LDK peers accept up to 2016 by default, which is why the
+setting cannot exceed 2016. **A peer whose maximum is below 2016 will refuse a
+channel requesting the home default.** There is no automatic fallback to 144
+or another shorter value. A channel open may initially return a channel id
+before the peer rejects the handshake; the channel then never becomes ready,
+and the node logs `LDK: channel closed` with the reason when LDK reports the
+closure. An immediate failure is returned as a channel-open error. Inspect the
+node/LDK logs for the peer's rejection reason; for a hub-initiated open, the hub
+also sees the refusal. Agree on a supported delay (at least 288 for a home
+node) with the hub/LSP before retrying.
+
+The trade-off is the hub's liquidity: **the hub's own funds are locked for up
+to about two weeks after the hub itself force-closes** under the home default
+(the relative delay runs from commitment confirmation; block times vary).
+A hub or LSP may price that lock-up into its fees. This setting does not set
+your own wait when you force-close; that is chosen by the peer. It is not a
+watchtower: if the box stays locked or offline beyond the breach window, the
+risk above still applies.
 
 ## Hub-only channels: `HUB_ONLY_WHILE_LOCKABLE`
 
