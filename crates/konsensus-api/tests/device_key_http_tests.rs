@@ -696,6 +696,97 @@ async fn pending_registration_cap_is_node_wide_and_cancel_frees_a_slot() {
 }
 
 #[tokio::test]
+async fn tunnel_client_cannot_cancel_another_clients_pending_device_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = test_state();
+    let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
+    let service = Arc::new(
+        PairingService::open(dir.path(), fp.clone(), true)
+            .unwrap()
+            .with_owner_console(Box::new(OwnerConsole::default()))
+            .without_stdout_code()
+            .with_owner_approval_key(SigningKey::from_bytes(&[42; 32]).verifying_key()),
+    );
+    let state = Arc::new(AppState {
+        pairing: Some(service.clone()),
+        ..(*base).clone()
+    });
+    let mut clients = Vec::new();
+    for seed in [1, 2] {
+        let signer = SigningKey::from_bytes(&[seed; 32]);
+        let client = service
+            .create_ticket_remote_pairing(
+                "phone",
+                &hex::encode(signer.verifying_key().to_bytes()),
+                &[seed; 32],
+            )
+            .unwrap();
+        let challenge = service.issue_token_challenge(&client.client_id).unwrap();
+        let signature = hex::encode(signer.sign(challenge.as_bytes()).to_bytes());
+        let token = service
+            .issue_token(
+                &state.identity.node_id().to_hex(),
+                &state.jwt_secret,
+                &client.client_id,
+                &challenge,
+                &signature,
+            )
+            .unwrap()
+            .token;
+        clients.push((client, token));
+    }
+    let (a, a_token) = &clients[0];
+    let (_, b_token) = &clients[1];
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let device =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+    let public = hex::encode(device.public_key().as_ref());
+    let proof = hex::encode(
+        device
+            .sign(
+                &rng,
+                registration_message(&fp, &a.client_id, &public).as_bytes(),
+            )
+            .unwrap()
+            .as_ref(),
+    );
+    let (status, reg) = remote_call(
+        &state,
+        "POST",
+        "/api/v1/pair/device-key",
+        Some(json!({"public_key": public, "name": "phone", "proof": proof})),
+        Some(a_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reg}");
+    let op_id = reg["op_id"].as_str().unwrap();
+    let path = format!("/api/v1/pair/device-key/{op_id}");
+    assert_eq!(
+        service.device_key_status(&a.client_id, op_id),
+        pairing::DeviceKeyStatus::Pending
+    );
+
+    let unknown = remote_call(
+        &state,
+        "DELETE",
+        "/api/v1/pair/device-key/unknown-operation",
+        None,
+        Some(b_token),
+    )
+    .await;
+    assert_eq!(unknown.0, StatusCode::NOT_FOUND, "{:?}", unknown.1);
+    let refused = remote_call(&state, "DELETE", &path, None, Some(b_token)).await;
+    assert_eq!(refused.0, StatusCode::NOT_FOUND, "{:?}", refused.1);
+    assert_eq!(refused, unknown, "another client's op must look unknown");
+
+    let (status, pending) = remote_call(&state, "GET", &path, None, Some(a_token)).await;
+    assert_eq!(status, StatusCode::OK, "{pending}");
+    assert_eq!(pending["status"], "pending");
+}
+
+#[tokio::test]
 async fn tunnel_keeps_approval_and_owner_management_routes_absent() {
     let dir = tempfile::tempdir().unwrap();
     let base = test_state();
