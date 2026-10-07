@@ -31,6 +31,7 @@ on:
       - '.github/workflows/postgres.yml'
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'crates/konsensus-storage/**'
       - 'crates/konsensus-core/**'
@@ -43,8 +44,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: postgres-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -52,6 +53,7 @@ env:
 jobs:
   postgres:
     name: PostgreSQL ignored tests
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -76,15 +78,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/cache@v4
+      # Cache compiled dependencies as well as downloads. rust-cache includes
+      # Cargo.lock, the compiler, and the runner platform in its cache key.
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-postgres-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-postgres-
+          shared-key: postgres-${{ hashFiles('Cargo.lock') }}
 
       - name: cargo test (ignored PostgreSQL tests)
         run: |
