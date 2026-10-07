@@ -669,3 +669,26 @@ Enabling after earlier channel use cannot recover historical commitments missed
 while disabled. Quarantining corruption can leave historical states unguarded;
 this recovery policy avoids a permanent startup loop and does not claim repair of
 lost tower data. Fable + Grok PASS on the same SHA remains the money-path merge gate.
+
+## Offline safety diagnostics (2026-10-07)
+
+- `types.rs`: forward `ChannelDetails.counterparty_force_close_spend_delay`
+  from the companion Lightning patch. It is backed by
+  `holder_selected_contest_delay` (`our_to_self_delay`), the delay protecting us
+  on the counterparty's commitment, rather than our `force_close_spend_delay`.
+  Lightning serializes this optional diagnostic as backward-compatible odd
+  TLV 49: older readers skip it and older records yield `None`. This local TLV
+  allocation must be checked for upstream collisions on upgrades/rebases.
+- `lib.rs`: `NodeMetrics::record_lightning_sync` captures height and timestamp
+  together in `latest_lightning_wallet_sync`, exposed through `NodeStatus`.
+  The checkpoint is deliberately non-persisted and resets to `None` on load;
+  restored manager state and the persisted legacy sync timestamp are not proof
+  of a completed sync in this process.
+- `chain/bitcoind.rs`, `chain/electrum.rs`, and `chain/esplora.rs`: call
+  `record_lightning_sync` only after successful Lightning synchronization,
+  including Bitcoind's initial listener sync and subsequent polling. This avoids
+  pairing an in-progress manager height with an older successful timestamp.
+
+These additions are read-only diagnostics. No LDK channel, commitment, sync,
+broadcast, or safety behaviour changes; the existing sync results and persisted
+metrics format remain unchanged.
