@@ -174,10 +174,10 @@ impl TowerClient {
                 continue;
             }
             if pending.candidate.ladder[0].output[0].script_pubkey != state.destination {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Tower destination mismatch",
-                ));
+                // A quarantined journal may have allocated a fresh destination. Keep
+                // the archive for diagnosis, but do not fail LDK startup over this gap.
+                log::warn!("Watchtower skipping retired candidate {} for channel {}: destination mismatch", key, id);
+                continue;
             }
             state.pending.push(pending);
         }

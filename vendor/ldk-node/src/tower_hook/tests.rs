@@ -1906,3 +1906,37 @@ fn candidate_cap_prunes_only_oldest_superseded_alternatives() {
         10_001
     );
 }
+
+#[test]
+fn restore_retired_skips_destination_mismatch_and_keeps_archive() {
+    use bitcoin::{absolute, transaction, Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
+    let dir = tempfile::tempdir().unwrap();
+    let client = TowerClient::new(Arc::new(FilesystemStore::new(dir.path().into())));
+    let id = ChannelId([42; 32]);
+    let candidate = JusticeCandidate {
+        channel_id: id,
+        commitment_number: 3,
+        ladder: vec![Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn { previous_output: OutPoint::null(), script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME, witness: Witness::new() }],
+            output: vec![TxOut { value: Amount::from_sat(9_000), script_pubkey: ScriptBuf::new() }],
+        }],
+        value: 10_000,
+    };
+    let key = candidate_key(&candidate);
+    client.store.write("tower_retired", &id.to_string(), &key, RetiredCandidate {
+        pending: PendingCandidate { candidate, observed_update_id: 1, funding_outpoint: None },
+        reason: "funding retired by splice".into(),
+    }.encode()).unwrap();
+    let mut state = PendingChannel { destination: ScriptBuf::from_bytes(vec![0x51]),
+        pending: vec![], funding: None, retired_funding: vec![] };
+    client.restore_retired(id, &mut state, 2).unwrap();
+    assert!(state.pending.is_empty());
+    assert!(client.read_retired(id, &key).unwrap().is_some());
+    // A later compatible journal can still recover it.
+    state.destination = ScriptBuf::new();
+    client.restore_retired(id, &mut state, 2).unwrap();
+    assert_eq!(state.pending.len(), 1);
+}
