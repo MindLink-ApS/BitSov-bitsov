@@ -33,6 +33,8 @@ use crate::config::{ChainConfig, LightningConfig, NodeConfig, PricingMode, Stora
 /// Owns all components and manages their lifecycle. Created via
 /// [`KonsensusNode::from_config`], started with [`KonsensusNode::start`].
 pub struct KonsensusNode {
+    tower_service: std::sync::Mutex<Option<konsensus_lightning::tower::server::TowerServer>>,
+    pub(crate) tower_serve_status: Arc<std::sync::RwLock<konsensus_core::tower::TowerServeStatus>>,
     /// The node's cryptographic identity.
     identity: Arc<NodeIdentity>,
 
@@ -358,6 +360,17 @@ impl KonsensusNode {
         };
 
         info!("chain provider initialized");
+        let tower_service = konsensus_lightning::tower::server::TowerServer::open(
+            &config.services.tower,
+            &data_dir.join("tower"),
+        )?;
+        let tower_serve_status = Arc::new(std::sync::RwLock::new(
+            tower_service
+                .as_ref()
+                .map(|s| s.status())
+                .transpose()?
+                .unwrap_or_default(),
+        ));
 
         // ── 5. Initialize Pricing engine ────────────────────────────────
         let base_pricing_config = konsensus_pricing::StaticPricingConfig {
@@ -468,6 +481,8 @@ impl KonsensusNode {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Ok(Self {
+            tower_service: std::sync::Mutex::new(tower_service),
+            tower_serve_status,
             _state_guard: state_guard,
             disk,
             identity,
@@ -517,6 +532,17 @@ impl KonsensusNode {
         }
 
         tokio::spawn(self.disk.clone().monitor(self.shutdown_rx()));
+        if let Some(service) = self.tower_service.lock().unwrap().take() {
+            let chain = self.chain.clone();
+            let status = self.tower_serve_status.clone();
+            let shutdown = self.shutdown_rx();
+            // Retain the generation lock through scanner shutdown, as for LDK.
+            let state_guard = self._state_guard.clone();
+            tokio::spawn(async move {
+                let _guard = state_guard;
+                service.run(chain, status, shutdown).await;
+            });
+        }
 
         // Start routing table maintenance (periodic decay + pruning)
         self.routing.spawn_maintenance();

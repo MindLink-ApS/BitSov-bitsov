@@ -67,6 +67,8 @@ pub struct WsDeliveryStatus {
 /// All fields are `Arc`-wrapped so cloning is cheap (required by Axum).
 #[derive(Clone)]
 pub struct AppState {
+    /// Cached aggregate diagnostics; never initiates chain I/O from an API request.
+    pub tower_serve_status: Arc<std::sync::RwLock<konsensus_core::tower::TowerServeStatus>>,
     /// The node's cryptographic identity.
     pub identity: Arc<NodeIdentity>,
 

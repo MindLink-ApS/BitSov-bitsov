@@ -59,8 +59,8 @@ impl TowerStorage {
         config.validate()?;
         let db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
-        // Rollback journal (not an unbounded WAL); at most one DB-sized journal.
-        // Half the disk budget bounds the DB, the other half covers that journal.
+        // Rollback journal (not an unbounded WAL). Reserve journal record/header
+        // overhead as well as its page images within the total disk ceiling.
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA auto_vacuum=INCREMENTAL;
             CREATE TABLE IF NOT EXISTS sessions(id BLOB PRIMARY KEY CHECK(length(id)=32), retention INTEGER NOT NULL, arrivals TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS blobs(id INTEGER PRIMARY KEY, session BLOB NOT NULL REFERENCES sessions(id), hint BLOB NOT NULL CHECK(length(hint)=16), seq INTEGER NOT NULL, nonce BLOB NOT NULL CHECK(length(nonce)=24), cipher BLOB NOT NULL CHECK(length(cipher)<=4072), received INTEGER NOT NULL,
@@ -73,7 +73,7 @@ impl TowerStorage {
             CREATE TABLE IF NOT EXISTS totals(id INTEGER PRIMARY KEY CHECK(id=1), seen INTEGER NOT NULL, broadcast INTEGER NOT NULL);
             INSERT OR IGNORE INTO totals VALUES(1,0,0);")?;
         let page_size: u64 = db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
-        let pages = config.max_storage_mb * 1024 * 1024 / 2 / page_size;
+        let pages = (config.max_storage_mb * 1024 * 1024 - 64 * 1024) / (2 * (page_size + 8));
         let current: u64 = db.query_row("PRAGMA page_count", [], |r| r.get(0))?;
         if current > pages {
             return Err(Error::Rejected("tower storage exceeds configured disk cap"));

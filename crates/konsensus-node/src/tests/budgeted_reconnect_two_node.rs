@@ -214,6 +214,7 @@ async fn start_sender(
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         gossip_validator: None,
         file_staging: Default::default(),
+        tower_serve_status: Default::default(),
     });
 
     // A's control plane: the invoice replies it is waiting for.

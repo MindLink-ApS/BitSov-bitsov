@@ -9,10 +9,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServiceConfig {
     pub enabled: bool,
+    /// Disk ceiling including rollback-journal headroom; conservative admission
+    /// reserves space for scan progress and may report full before this ceiling.
     pub max_storage_mb: u64,
     pub max_blobs_per_session: u64,
 }

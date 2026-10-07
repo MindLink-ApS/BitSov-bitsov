@@ -18,6 +18,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
     )
     .unwrap();
     NodeConfig {
+        services: Default::default(),
         tower: Default::default(),
         node: Default::default(),
         logging: Default::default(),
@@ -60,6 +61,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
 /// Helper: create a config struct for snapshot tests (no temp dir needed).
 fn snapshot_config(storage: StorageConfig) -> NodeConfig {
     NodeConfig {
+        services: Default::default(),
         tower: Default::default(),
         node: Default::default(),
         logging: Default::default(),

@@ -334,6 +334,7 @@ impl App {
             custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
             gossip_validator: None,
             file_staging: Default::default(),
+            tower_serve_status: Default::default(),
         });
 
         let expected_height: u64 = chain.bitcoin.client.call("getblockcount", &[]).unwrap();

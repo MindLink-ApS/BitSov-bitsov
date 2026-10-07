@@ -3035,3 +3035,38 @@ fn tower_clients_reject_unsupported_backend_and_more_than_five() {
     for n in 0..5 { base.tower.clients.insert(format!("friend-{n}"), entry.clone()); }
     assert!(base.tower.validate().unwrap_err().to_string().contains("at most five"));
 }
+
+#[test]
+fn tower_service_default_off_strict_limits_and_backend() {
+    let mut base = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    assert!(!base.services.tower.enabled);
+    assert!(!toml::to_string(&base).unwrap().contains("[services"));
+    assert_eq!(base.services.tower.max_storage_mb, 10 * 1024);
+    for text in [
+        "other = true",
+        "[tower]\ncredit_msat = 1",
+        "[tower]\nunknown = true",
+    ] {
+        assert!(toml::from_str::<ServicesConfig>(text).is_err());
+    }
+    let configured: ServicesConfig =
+        toml::from_str("[tower]\nenabled=true\nmax_storage_mb=100\nmax_blobs_per_session=42")
+            .unwrap();
+    assert!(configured.tower.enabled);
+    assert_eq!(configured.tower.max_blobs_per_session, 42);
+    base.services = configured;
+    base.chain = ChainConfig::Mock;
+    assert!(base
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("tower service requires"));
+    base.services.tower.max_storage_mb = 0;
+    assert!(base.services.tower.validate().is_err());
+    base.services.tower.max_storage_mb = u64::MAX;
+    assert!(base.services.tower.validate().is_err());
+}

@@ -246,6 +246,7 @@ async fn start_sender(
     let invoice_requests: InvoiceRequests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let state = Arc::new(konsensus_api::AppState {
         file_staging: Default::default(),
+        tower_serve_status: Default::default(),
         identity: Arc::clone(identity),
         storage: storage().await,
         lightning: Arc::clone(&wallet) as Arc<dyn LightningProvider>,

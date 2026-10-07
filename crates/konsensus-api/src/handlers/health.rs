@@ -345,6 +345,7 @@ pub fn status_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/tower/status", get(tower_status))
+        .route("/api/v1/tower/serve/status", get(tower_serve_status))
 }
 
 #[derive(Serialize)]
@@ -366,4 +367,11 @@ async fn tower_status(
         coverage_scope: "to_local_only",
         status,
     })
+}
+
+async fn tower_serve_status(
+    _auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+) -> Json<konsensus_core::tower::TowerServeStatus> {
+    Json(state.tower_serve_status.read().unwrap().clone())
 }
