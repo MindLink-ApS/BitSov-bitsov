@@ -5,26 +5,31 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
-- Allow paired clients on the unlocked Noise tunnel to request, poll and cancel
+## [0.3.0-rc12] — 2026-10-07 (prep; not tagged yet)
+
+**Pre-release.** Not for production use. Includes all three PRs merged after
+rc11 release commit `834968b`: #269 (`0425505`), #270 (`4ce5a37`) and #273
+(`c5b2119`). These are the squash-merge commits in `git log 834968b..HEAD` at
+preparation time; there are no two-parent merge commits in that range.
+Signing checklist: [`docs/releases/v0.3.0-rc12.md`](docs/releases/v0.3.0-rc12.md).
+Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc11--rc12-procedure).
+
+### Security
+
+- Tunnel device-key enrolment (#273; squash merge `c5b2119`). Four operations
+  let paired clients on the unlocked Noise tunnel request, poll and cancel
   device-key registration and list their keys. Cap pending registrations at
   eight node-wide (HTTP 429), preserving per-client limits. Approval authority
   is unchanged: console approval or owner-local delegation; delegation,
   self-revocation and other owner-management writes stay off the tunnel.
   Locked mode retains its four routes. Tests cover the route boundary and
   tunnel registration → console approval → locked restart → signed unlock.
-  Update the [owner-enrollment runbook](docs/operations/home-node.md#enroll-your-first-owner-device):
-  `--owner-control` requires a typed password; `--password-fd` disables owner
-  device authority in that mode.
 
-- Node-local offline safety alert (v1 safety PR 2): persist an atomic synced-height
-  heartbeat while unlocked, warn at 50% and report critical at 80% of each open
-  channel's negotiated breach window. Owner `GET /api/v1/status` exposes
-  amount-free diagnostics and retains startup alerts after catch-up; stalled
-  chain observation uses an explicitly marked time estimate. No hub push.
-  See [the home-node runbook](docs/operations/home-node.md#local-offline-safety-alert).
+### Money
 
-- Home-node breach window (v1 safety PR 1, building on W0/#261): embedded LDK
-  starts with `--remote-unlock` or `--local-owner-device` default to 2016 blocks
+- Home-node breach window (#269; squash merge `0425505`; v1 safety PR 1,
+  building on W0/#261): embedded LDK starts with `--remote-unlock` or
+  `--local-owner-device` default to 2016 blocks
   (about two weeks). Explicit `lightning.our_to_self_delay_blocks` values must
   be 288..=2016 for this profile; lower values fail startup. The enabled
   hub/LSP service role and plain non-home starts retain W0's 144-block default
@@ -33,6 +38,22 @@ also live on the corresponding GitHub pre-release pages.
   the channel without fallback. The hub's funds can remain locked for about
   two weeks after its own force-close, which a hub/LSP may price into fees.
   See [the home-node runbook](docs/operations/home-node.md#longer-breach-window-optional).
+
+### Node
+
+- Node-local offline safety alert (#270; squash merge `4ce5a37`; v1 safety PR 2):
+  persist an atomic synced-height heartbeat while unlocked, warn at 50% and
+  report critical at 80% of each open
+  channel's negotiated breach window. Owner `GET /api/v1/status` exposes
+  amount-free diagnostics and retains startup alerts after catch-up; stalled
+  chain observation uses an explicitly marked time estimate. No hub push.
+  See [the home-node runbook](docs/operations/home-node.md#local-offline-safety-alert).
+
+### Docs
+
+- Update the [owner-enrollment runbook](docs/operations/home-node.md#enroll-your-first-owner-device):
+  `--owner-control` requires a typed password; `--password-fd` disables owner
+  device authority in that mode (#273).
 
 ## [0.3.0-rc11] — 2026-10-07 (prep; not tagged yet)
 
