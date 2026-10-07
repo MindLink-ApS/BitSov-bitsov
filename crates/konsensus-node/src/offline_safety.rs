@@ -15,6 +15,7 @@ use tokio::sync::watch;
 const HEARTBEAT_FILE: &str = "offline-heartbeat.json";
 const WINDOWS_FILE: &str = "offline-channel-windows.json";
 const SECONDS_PER_BLOCK: u64 = 600;
+const TIME_ESTIMATE_GRACE_SECS: u64 = 2 * SECONDS_PER_BLOCK;
 
 fn severity(blocks: u64, window: u16) -> Option<Severity> {
     if window == 0 {
@@ -64,7 +65,14 @@ fn lag(heartbeat: Option<Heartbeat>, tip: Option<u64>, now: u64) -> (Option<u64>
         return (None, false);
     };
     let observed = tip.map(|h| h.saturating_sub(last.height));
-    let elapsed_blocks = now.saturating_sub(last.unix_secs) / SECONDS_PER_BLOCK;
+    let elapsed = now.saturating_sub(last.unix_secs);
+    // A quiet block interval is not evidence of downtime. After a small grace,
+    // keep the full elapsed estimate so longer outages remain conservative.
+    let elapsed_blocks = if elapsed <= TIME_ESTIMATE_GRACE_SECS {
+        0
+    } else {
+        elapsed / SECONDS_PER_BLOCK
+    };
     let estimated = observed.is_none_or(|blocks| elapsed_blocks > blocks);
     (Some(observed.unwrap_or(0).max(elapsed_blocks)), estimated)
 }
@@ -80,6 +88,21 @@ struct OfflineTracker {
 
 impl OfflineTracker {
     fn load(directory: &Path) -> Self {
+        // Atomic writes may leave an incomplete temporary file after a crash.
+        // Startup runs before this tracker's first write; only prune regular files.
+        if let Ok(entries) = std::fs::read_dir(directory) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_str().is_some_and(|name| {
+                    name.starts_with(".offline-heartbeat-") && name.ends_with(".tmp")
+                }) && entry.file_type().is_ok_and(|kind| kind.is_file())
+                {
+                    if let Err(error) = std::fs::remove_file(entry.path()) {
+                        tracing::warn!(%error, "offline safety: stale temporary file cleanup failed");
+                    }
+                }
+            }
+        }
         fn read<T: serde::de::DeserializeOwned>(path: PathBuf) -> io::Result<Option<T>> {
             match std::fs::read(path) {
                 Ok(bytes) => serde_json::from_slice(&bytes)
@@ -297,6 +320,69 @@ mod tests {
             channel_id: "a".into(),
             window_blocks: Some(200),
         }]
+    }
+
+    #[test]
+    fn offline_start_prunes_stale_heartbeat_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join(".offline-heartbeat-0123456789abcdef.tmp");
+        let unrelated = dir.path().join("unrelated.tmp");
+        let other_suffix = dir.path().join(".offline-heartbeat-backup.json");
+        let matching_directory = dir.path().join(".offline-heartbeat-directory.tmp");
+        std::fs::write(&stale, b"partial heartbeat").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+        std::fs::write(&other_suffix, b"keep").unwrap();
+        std::fs::create_dir(&matching_directory).unwrap();
+        std::fs::write(
+            dir.path().join(HEARTBEAT_FILE),
+            br#"{"height":1000,"unix_secs":100}"#,
+        )
+        .unwrap();
+
+        let tracker = OfflineTracker::load(dir.path());
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+        assert!(other_suffix.exists());
+        assert!(matching_directory.is_dir());
+        assert_eq!(tracker.heartbeat.unwrap().height, 1000);
+        assert!(tracker.status.heartbeat_error.is_none());
+    }
+
+    #[test]
+    fn offline_time_estimate_allows_a_quiet_block_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = OfflineTracker::load(dir.path());
+        let sync = Heartbeat {
+            height: 1000,
+            unix_secs: 100,
+        };
+        tracker
+            .observe(&channels(), Some(sync), Some(1000), 100)
+            .unwrap();
+        let saved = std::fs::read(dir.path().join(HEARTBEAT_FILE)).unwrap();
+        for now in [700, 701, 1300] {
+            let report = tracker
+                .observe(&channels(), Some(sync), Some(1000), now)
+                .unwrap();
+            assert_eq!(report.current.blocks_offline, Some(0));
+            assert!(!report.current.estimated);
+        }
+        // Grace does not hide observed chain progress or refresh the durable checkpoint.
+        let report = tracker
+            .observe(&channels(), Some(sync), Some(1001), 1300)
+            .unwrap();
+        assert_eq!(report.current.blocks_offline, Some(1));
+        assert!(!report.current.estimated);
+        assert_eq!(
+            saved,
+            std::fs::read(dir.path().join(HEARTBEAT_FILE)).unwrap()
+        );
+        // Beyond the grace period, retain the full conservative elapsed estimate.
+        let report = tracker
+            .observe(&channels(), None, Some(1000), 1900)
+            .unwrap();
+        assert_eq!(report.current.blocks_offline, Some(3));
+        assert!(report.current.estimated);
     }
 
     #[test]
