@@ -1919,19 +1919,43 @@ fn restore_retired_skips_destination_mismatch_and_keeps_archive() {
         ladder: vec![Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn { previous_output: OutPoint::null(), script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME, witness: Witness::new() }],
-            output: vec![TxOut { value: Amount::from_sat(9_000), script_pubkey: ScriptBuf::new() }],
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
         }],
         value: 10_000,
     };
     let key = candidate_key(&candidate);
-    client.store.write("tower_retired", &id.to_string(), &key, RetiredCandidate {
-        pending: PendingCandidate { candidate, observed_update_id: 1, funding_outpoint: None },
-        reason: "funding retired by splice".into(),
-    }.encode()).unwrap();
-    let mut state = PendingChannel { destination: ScriptBuf::from_bytes(vec![0x51]),
-        pending: vec![], funding: None, retired_funding: vec![] };
+    client
+        .store
+        .write(
+            "tower_retired",
+            &id.to_string(),
+            &key,
+            RetiredCandidate {
+                pending: PendingCandidate {
+                    candidate,
+                    observed_update_id: 1,
+                    funding_outpoint: None,
+                },
+                reason: "funding retired by splice".into(),
+            }
+            .encode(),
+        )
+        .unwrap();
+    let mut state = PendingChannel {
+        destination: ScriptBuf::from_bytes(vec![0x51]),
+        pending: vec![],
+        funding: None,
+        retired_funding: vec![],
+    };
     client.restore_retired(id, &mut state, 2).unwrap();
     assert!(state.pending.is_empty());
     assert!(client.read_retired(id, &key).unwrap().is_some());
@@ -1939,4 +1963,140 @@ fn restore_retired_skips_destination_mismatch_and_keeps_archive() {
     state.destination = ScriptBuf::new();
     client.restore_retired(id, &mut state, 2).unwrap();
     assert_eq!(state.pending.len(), 1);
+}
+
+// Instrument the storage boundary, rather than asserting a particular index implementation.
+struct CountTowerIo {
+    store: FilesystemStore,
+    candidate_lists: std::sync::atomic::AtomicUsize,
+    overflow_writes: std::sync::atomic::AtomicUsize,
+}
+impl KVStoreSync for CountTowerIo {
+    fn read(&self, p: &str, s: &str, k: &str) -> Result<Vec<u8>, lightning::io::Error> {
+        self.store.read(p, s, k)
+    }
+    fn write(&self, p: &str, s: &str, k: &str, b: Vec<u8>) -> Result<(), lightning::io::Error> {
+        if p == "tower_overflow" {
+            self.overflow_writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.store.write(p, s, k, b)
+    }
+    fn remove(&self, p: &str, s: &str, k: &str, lazy: bool) -> Result<(), lightning::io::Error> {
+        self.store.remove(p, s, k, lazy)
+    }
+    fn list(&self, p: &str, s: &str) -> Result<Vec<String>, lightning::io::Error> {
+        if p == "tower_candidates" {
+            self.candidate_lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.store.list(p, s)
+    }
+}
+
+#[test]
+fn bounded_candidates_retain_overflow_and_ack_deduplicates_redelivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = create_chanmon_cfgs(2);
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let store = Arc::new(CountTowerIo {
+        store: FilesystemStore::new(dir.path().into()),
+        candidate_lists: 0.into(),
+        overflow_writes: 0.into(),
+    });
+    let client = Arc::new(TowerClient::new_bounded(store.clone(), 1));
+    let hook = TowerPersister::new(
+        TestPersister::new(),
+        Some(client.clone()),
+        Arc::new(|| 1000),
+        Arc::new(move || Ok(script.clone())),
+    );
+    let other = TowerPersister::new(
+        TestPersister::new(),
+        None,
+        Arc::new(|| 1000),
+        Arc::new(|| Ok(ScriptBuf::new())),
+    );
+    let configs = create_node_cfgs_with_persisters(2, &cfg, vec![&other, &hook]);
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    assert_eq!(
+        store
+            .candidate_lists
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "index is rebuilt once, never listed per write"
+    );
+    let overflow_writes = store
+        .overflow_writes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                hook.persist_new_channel(monitor.persistence_key(), &monitor),
+                ChannelMonitorUpdateStatus::Completed
+            );
+        }
+    }
+    assert_eq!(
+        store
+            .overflow_writes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        overflow_writes,
+        "full capacity must not re-sign/rewrite known overflow"
+    );
+    let first = client.candidate_page(id, None, 10).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(client.pending_candidates(id).unwrap().len(), 1);
+    assert!(client.diagnostics(id).unwrap().unsigned_pending > 1);
+    let key = candidate_key(&first[0]);
+    client.acknowledge_candidate(id, &key).unwrap();
+    let monitor = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap();
+    assert_eq!(
+        hook.persist_new_channel(monitor.persistence_key(), &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    let next = client.candidate_page(id, None, 10).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_ne!(candidate_key(&next[0]), key);
+    drop(monitor);
+    // Ack tombstones survive process restart and retain the hard limit.
+    let restored = TowerClient::new_bounded(Arc::new(FilesystemStore::new(dir.path().into())), 1);
+    assert_eq!(restored.candidate_page(id, None, 10).unwrap(), next);
+    assert!(restored.delivered(id, &key).unwrap());
+    // Roll back a deferred observation: its marker must not become a phantom state.
+    let channel = id.to_string();
+    let mut journal: PendingChannel =
+        decode(&store.read("tower", "pending", &channel).unwrap()).unwrap();
+    let deferred: Vec<_> = store.list("tower_overflow", &channel).unwrap();
+    for pending in &mut journal.pending {
+        if deferred.contains(&candidate_key(&pending.candidate)) {
+            pending.observed_update_id = u64::MAX;
+        }
+    }
+    store
+        .write("tower", "pending", &channel, journal.encode())
+        .unwrap();
+    let monitor = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap();
+    assert_eq!(
+        hook.persist_new_channel(monitor.persistence_key(), &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    assert!(store.list("tower_overflow", &channel).unwrap().is_empty());
 }

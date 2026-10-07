@@ -12,6 +12,9 @@ use lightning::util::ser::{Readable, Writeable};
 use std::io;
 use std::sync::{Arc, Mutex};
 
+mod bounded;
+pub use bounded::TowerDiagnostics;
+
 const SIGNED_CANDIDATE_TARGET: usize = 10_000;
 
 /// A revoked commitment's signed, lowest-fee-first justice transaction ladder.
@@ -32,6 +35,8 @@ pub struct JusticeCandidate {
 pub struct TowerClient {
     store: Arc<dyn KVStoreSync + Send + Sync>,
     gate: Mutex<()>,
+    limit: Option<usize>,
+    index: bounded::CandidateIndex,
 }
 impl std::fmt::Debug for TowerClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -44,6 +49,8 @@ impl TowerClient {
         Self {
             store,
             gate: Mutex::new(()),
+            limit: None,
+            index: Mutex::new(Default::default()),
         }
     }
     /// Returns valid signed candidates without acknowledging or removing them.
@@ -82,6 +89,13 @@ impl TowerClient {
         // while preserving different corrupt versions of the same source key.
         self.store.write(namespace, channel, &saved_key, bytes)?;
         self.store.remove(primary, secondary, key, false)?;
+        if primary == "tower" && self.limit.is_some() {
+            // Quarantining the journal invalidates its deferred-state markers too.
+            for overflow in self.store.list("tower_overflow", channel)? {
+                self.store
+                    .remove("tower_overflow", channel, &overflow, false)?;
+            }
+        }
         log::error!(
             "Quarantined corrupt watchtower record {}/{}/{} at {}/{}/{}: {}",
             primary,
@@ -176,7 +190,11 @@ impl TowerClient {
             if pending.candidate.ladder[0].output[0].script_pubkey != state.destination {
                 // A quarantined journal may have allocated a fresh destination. Keep
                 // the archive for diagnosis, but do not fail LDK startup over this gap.
-                log::warn!("Watchtower skipping retired candidate {} for channel {}: destination mismatch", key, id);
+                log::warn!(
+                    "Watchtower skipping retired candidate {} for channel {}: destination mismatch",
+                    key,
+                    id
+                );
                 continue;
             }
             state.pending.push(pending);
@@ -490,8 +508,29 @@ impl<P> TowerPersister<P> {
         let id = monitor.channel_id();
         let channel = id.to_string();
         // Startup also checks signed records which no pending entry currently references.
-        if update.is_none() {
+        if update.is_none() && client.limit.is_none() {
             client.read_candidates(id)?;
+        }
+        if client.limit.is_some() {
+            // Persist only when first observed; W1 has one stable peer per channel.
+            match client.store.read("tower_peers", "", &channel) {
+                Ok(_) => {}
+                Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => {
+                    client.store.write(
+                        "tower_peers",
+                        "",
+                        &channel,
+                        monitor.get_counterparty_node_id().encode(),
+                    )?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+            client.store.write(
+                "tower_monitor_channels",
+                "",
+                &monitor.persistence_key().to_string(),
+                id.encode(),
+            )?;
         }
         let loaded = match client.store.read("tower", "pending", &channel) {
             Ok(bytes) => {
@@ -538,6 +577,20 @@ impl<P> TowerPersister<P> {
         // Those unsigned commitments were never acknowledged, so the manager can choose
         // different transactions at the same commitment number on restart. Drop only entries
         // beyond the restored monitor; they are not acknowledged states of its channel history.
+        if client.limit.is_some() {
+            for pending in state
+                .pending
+                .iter()
+                .filter(|p| p.observed_update_id > monitor.get_latest_update_id())
+            {
+                client.store.remove(
+                    "tower_overflow",
+                    &channel,
+                    &candidate_key(&pending.candidate),
+                    false,
+                )?;
+            }
+        }
         state
             .pending
             .retain(|p| p.observed_update_id <= monitor.get_latest_update_id());
@@ -574,7 +627,8 @@ impl<P> TowerPersister<P> {
                 {
                     continue;
                 }
-                if client.read_candidate(id, &key)?.is_none()
+                if !client.delivered(id, &key)?
+                    && client.read_candidate(id, &key)?.is_none()
                     && !client.is_retired(id, &key, &state.retired_funding)?
                 {
                     state.pending.push(PendingCandidate {
@@ -596,6 +650,19 @@ impl<P> TowerPersister<P> {
         let mut index = 0;
         while let Some(pending) = state.pending.get(index) {
             let candidate = &pending.candidate;
+            let key = candidate_key(candidate);
+            if client.delivered(id, &key)? {
+                if client.limit.is_some() {
+                    client
+                        .store
+                        .remove("tower_overflow", &channel, &key, false)?;
+                }
+                state.pending.remove(index);
+                client
+                    .store
+                    .write("tower", "pending", &channel, state.encode())?;
+                continue;
+            }
             if pending.funding_outpoint.is_some_and(|funding| {
                 funding != active_funding && state.retired_funding.contains(&funding)
             }) {
@@ -609,6 +676,11 @@ impl<P> TowerPersister<P> {
                 client
                     .store
                     .write("tower_retired", &channel, &key, retired.encode())?;
+                if client.limit.is_some() {
+                    client
+                        .store
+                        .remove("tower_overflow", &channel, &key, false)?;
+                }
                 state.pending.remove(index);
                 client
                     .store
@@ -619,6 +691,16 @@ impl<P> TowerPersister<P> {
                     channel,
                     retired.reason
                 );
+                continue;
+            }
+            // Known quota overflow is already revoked. While still full, avoid
+            // re-signing/re-writing every deferred ladder on every monitor update.
+            // Unsigned recovery data remains durable (and may grow until drained).
+            if client.limit.is_some()
+                && !client.room_for(id, &key)?
+                && client.overflowed(id, &key)?
+            {
+                index += 1;
                 continue;
             }
             let mut signed = candidate.clone();
@@ -649,6 +731,14 @@ impl<P> TowerPersister<P> {
             };
             signed.ladder = ladder;
             let key = candidate_key(&signed);
+            if !client.room_for(id, &key)? {
+                client
+                    .store
+                    .write("tower_overflow", &channel, &key, vec![1])?;
+                log::warn!("Watchtower channel {} reached hard candidate limit; retaining unguarded state {} in pending journal", id, key);
+                index += 1;
+                continue;
+            }
             // Idempotent write BEFORE dequeue. A crash at either write cannot lose the state.
             client.store.write(
                 "tower_candidates",
@@ -659,7 +749,20 @@ impl<P> TowerPersister<P> {
             )?;
             // Persist the replacement before pruning any older alternative. The target is
             // soft when every retained commitment is distinct; age alone never loses one.
-            client.prune_candidates(id, &state.retired_funding, active_funding)?;
+            if client.limit.is_some() {
+                client
+                    .index
+                    .lock()
+                    .unwrap()
+                    .get_mut(&id)
+                    .unwrap()
+                    .insert(key.clone());
+                client
+                    .store
+                    .remove("tower_overflow", &channel, &key, false)?;
+            } else {
+                client.prune_candidates(id, &state.retired_funding, active_funding)?;
+            }
             state.pending.remove(index);
             client
                 .store
@@ -693,6 +796,24 @@ impl<S: EcdsaChannelSigner, P: Persist<S>> Persist<S> for TowerPersister<P> {
         self.inner.update_persisted_channel(name, update, monitor)
     }
     fn archive_persisted_channel(&self, name: MonitorName) {
+        if let Some(client) = &self.client {
+            if client.limit.is_some() {
+                let result = (|| -> io::Result<()> {
+                    let id: ChannelId = decode(&client.store.read(
+                        "tower_monitor_channels",
+                        "",
+                        &name.to_string(),
+                    )?)?;
+                    client
+                        .store
+                        .write("tower_closed", "", &id.to_string(), vec![1])?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    log::warn!("Watchtower archive marker failed: {}", error);
+                }
+            }
+        }
         self.inner.archive_persisted_channel(name);
     }
     fn get_and_clear_completed_updates(&self) -> Vec<(ChannelId, u64)> {
