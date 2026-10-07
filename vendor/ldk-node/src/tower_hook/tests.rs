@@ -205,6 +205,704 @@ fn restart_mid_queue_keeps_later_pending_with_anchors() {
     forming_justice(false, true, true);
 }
 
+#[test]
+fn inbound_splice_retires_dead_head_and_restart_signs_later_justice() {
+    inbound_splice_retirement(false);
+}
+
+#[test]
+fn retirement_ahead_of_durable_monitor_restores_head_on_rollback() {
+    inbound_splice_retirement(true);
+}
+
+fn inbound_splice_retirement(rollback: bool) {
+    use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
+    use lightning::ln::funding::SpliceContribution;
+    use lightning::ln::splicing_tests::{lock_splice_after_blocks, splice_channel};
+
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let cfg = create_chanmon_cfgs(2);
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let persisters = [
+        Restartable(Mutex::new(hook(dirs[0].path(), script.clone()))),
+        Restartable(Mutex::new(hook(dirs[1].path(), script))),
+    ];
+    let configs = create_node_cfgs_with_persisters(2, &cfg, persisters.iter().collect());
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    let before = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    let monitor_bytes = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap()
+        .encode();
+    let splice = splice_channel(
+        &nodes[0],
+        &nodes[1],
+        id,
+        SpliceContribution::SpliceOut {
+            outputs: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: cfg[0].keys_manager.get_destination_script([0; 32]).unwrap(),
+            }],
+        },
+    );
+    mine_transaction(&nodes[0], &splice);
+    mine_transaction(&nodes[1], &splice);
+    lock_splice_after_blocks(&nodes[0], &nodes[1], ANTI_REORG_DELAY - 1);
+    // The acceptor now cannot sign the old funding scope, even after its secret arrives.
+    let client = persisters[1]
+        .0
+        .lock()
+        .unwrap()
+        .client
+        .as_ref()
+        .unwrap()
+        .clone();
+    let state: PendingChannel = decode(
+        &client
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(state
+        .retired_funding
+        .contains(&before.input[0].previous_output));
+    assert!(!state
+        .pending
+        .iter()
+        .any(|p| candidate_key(&p.candidate) == before.compute_txid().to_string()));
+    let retired_key = before.compute_txid().to_string();
+    let retired_bytes = client
+        .store
+        .read("tower_retired", &id.to_string(), &retired_key)
+        .unwrap();
+    let retired: RetiredCandidate = decode(&retired_bytes).unwrap();
+    assert_eq!(retired.reason, "funding retired by splice");
+    assert_eq!(
+        retired.pending.funding_outpoint,
+        Some(before.input[0].previous_output)
+    );
+    assert!(retired
+        .pending
+        .candidate
+        .ladder
+        .iter()
+        .all(|tx| tx.input[0].witness.is_empty()));
+    if rollback {
+        use lightning::util::ser::ReadableArgs;
+        use lightning::util::test_channel_signer::TestChannelSigner;
+        let (_, monitor) = <(bitcoin::BlockHash, ChannelMonitor<TestChannelSigner>)>::read(
+            &mut io::Cursor::new(&monitor_bytes),
+            (nodes[1].keys_manager, nodes[1].keys_manager),
+        )
+        .unwrap();
+        let dequeued = state.encode();
+        // Keep the post-dequeue journal. Neither startup nor the next secret update
+        // is required to redeliver the archived commitment's original update.
+        for same_id in [false, true] {
+            let mut state: PendingChannel = decode(&dequeued).unwrap();
+            if same_id {
+                state.funding.as_mut().unwrap().1 = monitor.get_latest_update_id();
+            }
+            client
+                .store
+                .write("tower", "pending", &id.to_string(), state.encode())
+                .unwrap();
+            let restored = hook(dirs[1].path(), ScriptBuf::new());
+            assert_eq!(
+                restored.persist_new_channel(monitor.persistence_key(), &monitor),
+                ChannelMonitorUpdateStatus::Completed
+            );
+            let recovered: PendingChannel = decode(
+                &client
+                    .store
+                    .read("tower", "pending", &id.to_string())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(recovered.retired_funding.is_empty());
+            let head = recovered
+                .pending
+                .iter()
+                .find(|p| candidate_key(&p.candidate) == retired_key)
+                .expect("invalidated retirement must restore the archived head without redelivery");
+            assert_eq!(head.observed_update_id, retired.pending.observed_update_id);
+            assert_eq!(head.candidate, retired.pending.candidate);
+            assert!(recovered
+                .pending
+                .iter()
+                .all(|p| p.observed_update_id <= monitor.get_latest_update_id()));
+        }
+        return;
+    }
+    let after = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    assert_ne!(
+        before.input[0].previous_output,
+        after.input[0].previous_output
+    );
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let candidates = client.pending_candidates(id).unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|c| candidate_key(c) == after.compute_txid().to_string())
+        .expect("pre-splice head must not block post-splice justice");
+    for tx in &candidate.ladder {
+        lightning::check_spends!(tx, after);
+    }
+    assert!(candidates.iter().all(|c| candidate_key(c) != retired_key));
+    // A fresh client must not resurrect retired heads, even on update redelivery.
+    let mut restored = hook(dirs[1].path(), ScriptBuf::new());
+    let replay_store = Arc::new(FailStore {
+        store: FilesystemStore::new(dirs[1].path().into()),
+        writes_until_failure: usize::MAX.into(),
+    });
+    restored.client = Some(Arc::new(TowerClient::new(replay_store.clone())));
+    {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        assert_eq!(
+            restored.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+        let updates = nodes[1].chain_monitor.monitor_updates.lock().unwrap();
+        for update in updates.get(&id).unwrap() {
+            // Only the normal journal write is needed. Re-enqueueing and retiring
+            // a head again would attempt a second write and fail this replay.
+            replay_store
+                .writes_until_failure
+                .store(2, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                restored.update_persisted_channel(
+                    monitor.persistence_key(),
+                    Some(update),
+                    &monitor
+                ),
+                ChannelMonitorUpdateStatus::Completed
+            );
+        }
+        replay_store
+            .writes_until_failure
+            .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+        let state: PendingChannel = decode(
+            &client
+                .store
+                .read("tower", "pending", &id.to_string())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(state
+            .pending
+            .iter()
+            .all(|p| p.funding_outpoint != Some(before.input[0].previous_output)));
+        assert_eq!(
+            client
+                .store
+                .read("tower_retired", &id.to_string(), &retired_key)
+                .unwrap(),
+            retired_bytes
+        );
+    }
+    *persisters[1].0.lock().unwrap() = restored;
+    let later = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let candidates = persisters[1].candidates(id);
+    let candidate = candidates
+        .iter()
+        .find(|c| candidate_key(c) == later.compute_txid().to_string())
+        .unwrap();
+    for tx in &candidate.ladder {
+        lightning::check_spends!(tx, later);
+    }
+}
+
+#[test]
+fn unretired_funding_scope_keeps_unsigned_head() {
+    use lightning::ln::funding::SpliceContribution;
+    use lightning::ln::splicing_tests::splice_channel;
+
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let cfg = create_chanmon_cfgs(2);
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let persisters = [
+        Restartable(Mutex::new(hook(dirs[0].path(), script.clone()))),
+        Restartable(Mutex::new(hook(dirs[1].path(), script))),
+    ];
+    let configs = create_node_cfgs_with_persisters(2, &cfg, persisters.iter().collect());
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    let splice = splice_channel(
+        &nodes[0],
+        &nodes[1],
+        id,
+        SpliceContribution::SpliceOut {
+            outputs: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: cfg[0].keys_manager.get_destination_script([0; 32]).unwrap(),
+            }],
+        },
+    );
+    let hook = persisters[1].0.lock().unwrap();
+    let client = hook.client.as_ref().unwrap();
+    let monitor = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap();
+    let before = client
+        .store
+        .read("tower", "pending", &id.to_string())
+        .unwrap();
+    let state: PendingChannel = decode(&before).unwrap();
+    assert!(state.retired_funding.is_empty());
+    // This different-funding head is live but cannot yet be signed: no revocation secret.
+    let head = state
+        .pending
+        .iter()
+        .find(|p| p.funding_outpoint.unwrap().txid == splice.compute_txid())
+        .unwrap();
+    assert_ne!(
+        head.funding_outpoint.unwrap(),
+        monitor.get_funding_txo().into_bitcoin_outpoint()
+    );
+    assert!(monitor
+        .sign_to_local_justice_tx(
+            head.candidate.ladder[0].clone(),
+            0,
+            head.candidate.value,
+            head.candidate.commitment_number
+        )
+        .is_err());
+    assert_eq!(
+        hook.persist_new_channel(monitor.persistence_key(), &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    assert_eq!(
+        client
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+        before
+    );
+    assert!(client
+        .store
+        .list("tower_retired", &id.to_string())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn transient_signing_error_keeps_head_until_retry() {
+    let cfg = create_chanmon_cfgs(2);
+    let configs = create_node_cfgs(2, &cfg);
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    let dir = tempfile::tempdir().unwrap();
+    let hook = hook(
+        dir.path(),
+        cfg[1].keys_manager.get_destination_script([0; 32]).unwrap(),
+    );
+    let client = hook.client.as_ref().unwrap();
+    {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        assert_eq!(
+            hook.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+    }
+    let revoked = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    let monitor = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap();
+    let before: PendingChannel = decode(
+        &client
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    let head = &before.pending[0];
+    assert_eq!(
+        head.funding_outpoint,
+        Some(monitor.get_funding_txo().into_bitcoin_outpoint())
+    );
+    // The same-funding signing error is transient: the secret arrives with revocation.
+    assert!(monitor
+        .sign_to_local_justice_tx(
+            head.candidate.ladder[0].clone(),
+            0,
+            head.candidate.value,
+            head.candidate.commitment_number
+        )
+        .is_err());
+    assert_eq!(
+        hook.persist_new_channel(monitor.persistence_key(), &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    let state: PendingChannel = decode(
+        &client
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(state
+        .pending
+        .iter()
+        .any(|p| candidate_key(&p.candidate) == revoked.compute_txid().to_string()));
+    assert!(client.pending_candidates(id).unwrap().is_empty());
+    assert!(client
+        .store
+        .list("tower_retired", &id.to_string())
+        .unwrap()
+        .is_empty());
+    drop(monitor);
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let monitor = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap();
+    assert_eq!(
+        hook.persist_new_channel(monitor.persistence_key(), &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    let candidates = client.pending_candidates(id).unwrap();
+    assert_eq!(candidates.len(), 1);
+    for tx in &candidates[0].ladder {
+        lightning::check_spends!(tx, revoked);
+    }
+    let state: PendingChannel = decode(
+        &client
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(state.pending.is_empty());
+}
+
+#[test]
+fn candidate_cap_keeps_both_funding_scopes_until_splice_lock() {
+    use bitcoin::hashes::Hash;
+    use lightning::ln::funding::SpliceContribution;
+    use lightning::ln::splicing_tests::{lock_splice_after_blocks, splice_channel};
+    let cfg = create_chanmon_cfgs(2);
+    let persisters: Vec<_> = cfg
+        .iter()
+        .map(|cfg| {
+            let script = cfg.keys_manager.get_destination_script([0; 32]).unwrap();
+            TowerPersister::new(
+                TestPersister::new(),
+                Some(Arc::new(TowerClient::new(Arc::new(
+                    lightning::util::test_utils::TestStore::new(false),
+                )))),
+                Arc::new(|| 1000),
+                Arc::new(move || Ok(script.clone())),
+            )
+        })
+        .collect();
+    let configs = create_node_cfgs_with_persisters(2, &cfg, persisters.iter().collect());
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    let original = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    let client = persisters[1].client.as_ref().unwrap();
+    let state: PendingChannel = decode(
+        &client
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    // Fill the signed inbox with distinct storage fixtures. Only the real commitments
+    // below are used for the signing/spending assertions.
+    for i in 0u64..10_000 {
+        let mut fixture = state.pending[0].candidate.clone();
+        fixture.commitment_number = i;
+        for tx in &mut fixture.ladder {
+            tx.input[0].previous_output.txid = bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::hash(&i.to_le_bytes()),
+            );
+            tx.input[0].witness.push([1]);
+        }
+        client
+            .store
+            .write(
+                "tower_candidates",
+                &id.to_string(),
+                &candidate_key(&fixture),
+                fixture.encode(),
+            )
+            .unwrap();
+    }
+    let splice = splice_channel(
+        &nodes[0],
+        &nodes[1],
+        id,
+        SpliceContribution::SpliceOut {
+            outputs: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: cfg[0].keys_manager.get_destination_script([0; 32]).unwrap(),
+            }],
+        },
+    );
+    let alternative = {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        assert_eq!(
+            monitor.get_funding_txo().into_bitcoin_outpoint(),
+            original.input[0].previous_output
+        );
+        nodes[1]
+            .chain_monitor
+            .monitor_updates
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .iter()
+            .rev()
+            .flat_map(|update| monitor.counterparty_commitment_txs_from_update(update))
+            .find(|tx| {
+                tx.trust().built_transaction().transaction.input[0]
+                    .previous_output
+                    .txid
+                    == splice.compute_txid()
+            })
+            .unwrap()
+            .trust()
+            .built_transaction()
+            .transaction
+            .clone()
+    };
+    // No simulated confirmation yet: both revoked transactions can still be broadcast.
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let candidates = client.pending_candidates(id).unwrap();
+    for commitment in [&original, &alternative] {
+        let candidate = candidates
+            .iter()
+            .find(|c| candidate_key(c) == commitment.compute_txid().to_string())
+            .expect("cap must retain every still-live funding alternative");
+        for tx in &candidate.ladder {
+            lightning::check_spends!(tx, *commitment);
+        }
+    }
+    // Once LDK promotes the splice, the original scope is eligible for pruning.
+    mine_transaction(&nodes[0], &splice);
+    mine_transaction(&nodes[1], &splice);
+    lock_splice_after_blocks(
+        &nodes[0],
+        &nodes[1],
+        lightning::chain::channelmonitor::ANTI_REORG_DELAY - 1,
+    );
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let candidates = client.pending_candidates(id).unwrap();
+    assert!(!candidates
+        .iter()
+        .any(|c| candidate_key(c) == original.compute_txid().to_string()));
+    assert!(candidates
+        .iter()
+        .any(|c| candidate_key(c) == alternative.compute_txid().to_string()));
+}
+
+#[test]
+fn replay_redelivery_of_some_update_does_not_duplicate_pending_or_signed() {
+    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let cfg = create_chanmon_cfgs(2);
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let persisters = [
+        hook(dirs[0].path(), script.clone()),
+        hook(dirs[1].path(), script),
+    ];
+    let configs = create_node_cfgs_with_persisters(2, &cfg, persisters.iter().collect());
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let revoked = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    let key = revoked.compute_txid().to_string();
+    let update = {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        nodes[1]
+            .chain_monitor
+            .monitor_updates
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .iter()
+            .find(|update| {
+                monitor
+                    .counterparty_commitment_txs_from_update(update)
+                    .iter()
+                    .any(|tx| tx.trust().txid().to_string() == key)
+            })
+            .expect("must replay an update carrying commitment data")
+            .clone()
+    };
+    let client = persisters[1].client.as_ref().unwrap();
+    for signed in [false, true] {
+        if signed {
+            send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+        }
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        let pending_before = client
+            .store
+            .read("tower", "pending", &id.to_string())
+            .unwrap();
+        let state: PendingChannel = decode(&pending_before).unwrap();
+        assert_eq!(
+            state
+                .pending
+                .iter()
+                .filter(|p| candidate_key(&p.candidate) == key)
+                .count(),
+            usize::from(!signed)
+        );
+        let mut signed_before = client.pending_candidates(id).unwrap();
+        signed_before.sort_by_key(candidate_key);
+        assert_eq!(
+            signed_before
+                .iter()
+                .filter(|c| candidate_key(c) == key)
+                .count(),
+            usize::from(signed)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                persisters[1].update_persisted_channel(
+                    monitor.persistence_key(),
+                    Some(&update),
+                    &monitor
+                ),
+                ChannelMonitorUpdateStatus::Completed
+            );
+            assert_eq!(
+                client
+                    .store
+                    .read("tower", "pending", &id.to_string())
+                    .unwrap(),
+                pending_before
+            );
+            let mut signed_after = client.pending_candidates(id).unwrap();
+            signed_after.sort_by_key(candidate_key);
+            assert_eq!(signed_after, signed_before);
+        }
+        if signed {
+            let candidate = signed_before
+                .iter()
+                .find(|c| candidate_key(c) == key)
+                .unwrap();
+            for tx in &candidate.ladder {
+                lightning::check_spends!(tx, revoked);
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_pending_record_stages_initial_commitment_with_some_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = create_chanmon_cfgs(2);
+    let configs = create_node_cfgs(2, &cfg);
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    let initial = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let later = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    let update = {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        nodes[1]
+            .chain_monitor
+            .monitor_updates
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .iter()
+            .find(|update| {
+                monitor
+                    .counterparty_commitment_txs_from_update(update)
+                    .iter()
+                    .any(|tx| tx.trust().txid() == later.compute_txid())
+            })
+            .unwrap()
+            .clone()
+    };
+    // Deliver an older Some(update) to an advanced monitor, as can happen on replay.
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let hook = hook(dir.path(), script);
+    let monitor = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap();
+    assert!(monitor.get_latest_update_id() > update.update_id);
+    assert_eq!(
+        hook.update_persisted_channel(monitor.persistence_key(), Some(&update), &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    let client = hook.client.as_ref().unwrap();
+    let candidates = client.pending_candidates(id).unwrap();
+    for commitment in [initial, later.clone()] {
+        let candidate = candidates
+            .iter()
+            .find(|c| candidate_key(c) == commitment.compute_txid().to_string())
+            .unwrap();
+        for tx in &candidate.ladder {
+            lightning::check_spends!(tx, commitment);
+        }
+    }
+    let stored: StoredCandidate = decode(
+        &client
+            .store
+            .read(
+                "tower_candidates",
+                &id.to_string(),
+                &later.compute_txid().to_string(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        stored.observed_update_id,
+        Some(update.update_id),
+        "redelivery must not make an old alternative newer for cap pruning"
+    );
+}
+
 type PersistedCall = (String, Vec<u8>, Option<Vec<u8>>);
 
 #[derive(Default)]
@@ -255,11 +953,11 @@ impl<S: EcdsaChannelSigner> Persist<S> for Recorder {
     }
 }
 
-struct FailStore {
-    store: FilesystemStore,
+struct FailStore<S = FilesystemStore> {
+    store: S,
     writes_until_failure: std::sync::atomic::AtomicUsize,
 }
-impl KVStoreSync for FailStore {
+impl<S: KVStoreSync> KVStoreSync for FailStore<S> {
     fn read(&self, p: &str, s: &str, k: &str) -> Result<Vec<u8>, lightning::io::Error> {
         KVStoreSync::read(&self.store, p, s, k)
     }
@@ -361,6 +1059,146 @@ fn storage_failure_does_not_advance_monitor_and_restart_retries() {
                 .unwrap(),
             candidates
         );
+    }
+}
+
+#[test]
+fn retirement_writes_are_retryable_and_rollback_clears_proof() {
+    let cfg = create_chanmon_cfgs(2);
+    let configs = create_node_cfgs(2, &cfg);
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FailStore {
+        store: FilesystemStore::new(dir.path().into()),
+        writes_until_failure: usize::MAX.into(),
+    });
+    let hook = TowerPersister::new(
+        Recorder::default(),
+        Some(Arc::new(TowerClient::new(store.clone()))),
+        Arc::new(|| 1000),
+        Arc::new(move || Ok(script.clone())),
+    );
+    {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        assert_eq!(
+            hook.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+    }
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let monitor = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap();
+    let mut state: PendingChannel =
+        decode(&store.read("tower", "pending", &id.to_string()).unwrap()).unwrap();
+    // Storage-policy fixture: mark this head's scope retired. Its secret is available,
+    // so accidentally attempting signing before retirement would emit a signed record.
+    let retired_funding = bitcoin::OutPoint::null();
+    state.pending[0].funding_outpoint = Some(retired_funding);
+    state.retired_funding.push(retired_funding);
+    let key = candidate_key(&state.pending[0].candidate);
+    let pending_bytes = state.encode();
+    for write in 1..=3 {
+        store
+            .write("tower", "pending", &id.to_string(), pending_bytes.clone())
+            .unwrap();
+        let calls_before = hook.inner.calls.lock().unwrap().len();
+        store
+            .writes_until_failure
+            .store(write, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            hook.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::UnrecoverableError
+        );
+        assert_eq!(hook.inner.calls.lock().unwrap().len(), calls_before);
+        let pending: PendingChannel =
+            decode(&store.read("tower", "pending", &id.to_string()).unwrap()).unwrap();
+        assert_eq!(pending.pending.len(), 1);
+        assert_eq!(
+            store.list("tower_retired", &id.to_string()).unwrap().len(),
+            usize::from(write == 3)
+        );
+        let restored = super::tests::hook(dir.path(), ScriptBuf::new());
+        assert_eq!(
+            restored.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+        let pending: PendingChannel =
+            decode(&store.read("tower", "pending", &id.to_string()).unwrap()).unwrap();
+        assert!(pending.pending.is_empty());
+        assert!(restored
+            .client
+            .as_ref()
+            .unwrap()
+            .pending_candidates(id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.list("tower_retired", &id.to_string()).unwrap(),
+            vec![key.clone()]
+        );
+        store
+            .remove("tower_retired", &id.to_string(), &key, false)
+            .unwrap();
+    }
+    // Inconclusive journal history must clear retirement proof before processing heads.
+    // Keep the archive too: it must not act as independent proof on update redelivery.
+    store
+        .write(
+            "tower_retired",
+            &id.to_string(),
+            &key,
+            RetiredCandidate {
+                pending: state.pending.remove(0),
+                reason: "funding retired by splice".to_string(),
+            }
+            .encode(),
+        )
+        .unwrap();
+    for funding in [
+        Some((retired_funding, monitor.get_latest_update_id() + 1)),
+        Some((retired_funding, monitor.get_latest_update_id())),
+        None,
+    ] {
+        let mut state: PendingChannel = decode(&pending_bytes).unwrap();
+        state.funding = funding;
+        store
+            .write("tower", "pending", &id.to_string(), state.encode())
+            .unwrap();
+        assert_eq!(
+            hook.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+        let recovered: PendingChannel =
+            decode(&store.read("tower", "pending", &id.to_string()).unwrap()).unwrap();
+        assert!(recovered.retired_funding.is_empty());
+        assert!(!hook
+            .client
+            .as_ref()
+            .unwrap()
+            .is_retired(id, &key, &recovered.retired_funding)
+            .unwrap());
+        assert_eq!(
+            hook.client
+                .as_ref()
+                .unwrap()
+                .pending_candidates(id)
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .remove("tower_candidates", &id.to_string(), &key, false)
+            .unwrap();
     }
 }
 
@@ -618,7 +1456,7 @@ fn production_tower_fee_uses_unadjusted_one_block_estimate() {
 }
 
 #[test]
-fn malformed_candidate_records_are_rejected() {
+fn malformed_candidate_records_are_quarantined() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = create_chanmon_cfgs(2);
     let configs = create_node_cfgs(2, &cfg);
@@ -665,8 +1503,8 @@ fn malformed_candidate_records_are_rejected() {
             .write("tower_candidates", &id.to_string(), &key, bad.encode())
             .unwrap();
         assert!(
-            client.pending_candidates(id).is_err(),
-            "malformed signed record {mutation} accepted"
+            client.pending_candidates(id).unwrap().is_empty(),
+            "malformed signed record {mutation} must be quarantined"
         );
     }
     client
@@ -683,14 +1521,18 @@ fn malformed_candidate_records_are_rejected() {
             original.encode(),
         )
         .unwrap();
-    assert!(
-        client.pending_candidates(id).is_err(),
-        "record txid must match key"
+    assert_eq!(
+        client.pending_candidates(id).unwrap(),
+        vec![original.clone()]
     );
-    client
-        .store
-        .remove("tower_candidates", &id.to_string(), &wrong_key, false)
-        .unwrap();
+    assert_eq!(
+        client
+            .store
+            .list("tower_quarantine_candidates", &id.to_string())
+            .unwrap()
+            .len(),
+        5
+    );
     let mut state: PendingChannel = decode(
         &client
             .store
@@ -702,14 +1544,365 @@ fn malformed_candidate_records_are_rejected() {
     bad.ladder.clear();
     state.pending.push(PendingCandidate {
         candidate: bad,
+        funding_outpoint: None,
         observed_update_id: monitor.get_latest_update_id(),
     });
+    let corrupt = state.encode();
     client
         .store
-        .write("tower", "pending", &id.to_string(), state.encode())
+        .write("tower", "pending", &id.to_string(), corrupt.clone())
         .unwrap();
     assert_eq!(
         hook.persist_new_channel(monitor.persistence_key(), &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    let keys = client
+        .store
+        .list("tower_quarantine_pending", &id.to_string())
+        .unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(
+        client
+            .store
+            .read("tower_quarantine_pending", &id.to_string(), &keys[0])
+            .unwrap(),
+        corrupt
+    );
+    // Unparseable bytes also recover, and a second startup must not quarantine healthy data.
+    client
+        .store
+        .write("tower", "pending", &id.to_string(), vec![255])
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            hook.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+    }
+    assert_eq!(
+        client
+            .store
+            .list("tower_quarantine_pending", &id.to_string())
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(client.pending_candidates(id).unwrap().len(), 1);
+}
+
+#[test]
+fn quarantine_write_failure_never_completes_monitor_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = create_chanmon_cfgs(2);
+    let configs = create_node_cfgs(2, &cfg);
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    let store = Arc::new(FailStore {
+        store: FilesystemStore::new(dir.path().into()),
+        writes_until_failure: usize::MAX.into(),
+    });
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let hook = TowerPersister::new(
+        Recorder::default(),
+        Some(Arc::new(TowerClient::new(store.clone()))),
+        Arc::new(|| 1000),
+        Arc::new(move || Ok(script.clone())),
+    );
+    let monitor = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap();
+    // Startup must inspect signed records even if no pending entry references their keys.
+    for (primary, secondary, key, quarantine) in [
+        (
+            "tower",
+            "pending".to_string(),
+            id.to_string(),
+            "tower_quarantine_pending",
+        ),
+        (
+            "tower_candidates",
+            id.to_string(),
+            "00".repeat(32),
+            "tower_quarantine_candidates",
+        ),
+    ] {
+        store.write(primary, &secondary, &key, vec![255]).unwrap();
+        store
+            .writes_until_failure
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let before = hook.inner.calls.lock().unwrap().len();
+        assert_eq!(
+            hook.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::UnrecoverableError
+        );
+        assert_eq!(hook.inner.calls.lock().unwrap().len(), before);
+        assert_eq!(store.read(primary, &secondary, &key).unwrap(), vec![255]);
+        assert!(store.list(quarantine, &id.to_string()).unwrap().is_empty());
+        // Retrying after the disk recovers moves the original bytes aside and proceeds.
+        assert_eq!(
+            hook.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+        let keys = store.list(quarantine, &id.to_string()).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            store.read(quarantine, &id.to_string(), &keys[0]).unwrap(),
+            vec![255]
+        );
+    }
+}
+
+// Encode the existing candidate TLVs plus optional observation metadata. Old W1 readers
+// ignore this odd TLV; the public JusticeCandidate and its encoding remain unchanged.
+fn dated_candidate(
+    candidate: &JusticeCandidate,
+    observed_update_id: u64,
+    funding_outpoint: Option<bitcoin::OutPoint>,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    lightning::write_tlv_fields!(&mut bytes, {
+        (0, candidate.channel_id, required),
+        (2, candidate.commitment_number, required),
+        (4, candidate.ladder, required_vec),
+        (6, candidate.value, required),
+        (9, observed_update_id, required),
+        (11, funding_outpoint, option),
+    });
+    Ok(bytes)
+}
+
+#[test]
+fn candidate_cap_prunes_only_oldest_superseded_alternatives() {
+    use bitcoin::hashes::Hash;
+    let cfg = create_chanmon_cfgs(2);
+    let configs = create_node_cfgs(2, &cfg);
+    let managers = create_node_chanmgrs(2, &configs, &[None, None]);
+    let nodes = create_network(2, &configs, &managers);
+    let (_, _, id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+    let store = Arc::new(FailStore {
+        store: lightning::util::test_utils::TestStore::new(false),
+        writes_until_failure: usize::MAX.into(),
+    });
+    let script = cfg[1].keys_manager.get_destination_script([0; 32]).unwrap();
+    let hook = TowerPersister::new(
+        Recorder::default(),
+        Some(Arc::new(TowerClient::new(store.clone()))),
+        Arc::new(|| 1000),
+        Arc::new(move || Ok(script.clone())),
+    );
+    {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        assert_eq!(
+            hook.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+    }
+    let revoked = lightning::get_local_commitment_txn!(nodes[0], id).remove(0);
+    send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+    let monitor = nodes[1]
+        .chain_monitor
+        .chain_monitor
+        .get_monitor(id)
+        .unwrap();
+    let mut state: PendingChannel =
+        decode(&store.read("tower", "pending", &id.to_string()).unwrap()).unwrap();
+    // Storage fixtures model a previously retired funding scope. The real splice test
+    // above separately proves that retirement is detected only after LDK promotion.
+    let retired = bitcoin::OutPoint::null();
+    state.retired_funding.push(retired);
+    let pending_bytes = state.encode();
+    store
+        .write("tower", "pending", &id.to_string(), pending_bytes.clone())
+        .unwrap();
+    let mut fixture = state.pending[0].candidate.clone();
+    fixture.ladder = fixture
+        .ladder
+        .iter()
+        .map(|tx| {
+            monitor
+                .sign_to_local_justice_tx(tx.clone(), 0, fixture.value, fixture.commitment_number)
+                .unwrap()
+        })
+        .collect();
+    // Storage-policy fixtures: 9,998 distinct commitments plus two newer alternatives for
+    // one number. Txids are synthetic; actual emitted justice is verified with check_spends.
+    let mut keys = Vec::new();
+    for i in 0u64..10_000 {
+        let mut candidate = fixture.clone();
+        candidate.commitment_number = if i < 9_998 { i } else { 0 };
+        for tx in &mut candidate.ladder {
+            tx.input[0].previous_output.txid = bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::hash(&i.to_le_bytes()),
+            );
+        }
+        let key = candidate_key(&candidate);
+        store
+            .write(
+                "tower_candidates",
+                &id.to_string(),
+                &key,
+                dated_candidate(&candidate, i, Some(retired)).unwrap(),
+            )
+            .unwrap();
+        keys.push(key);
+    }
+    // A journal ahead of the restored monitor must not turn the reverse funding change
+    // into retirement proof. Same-ID transitions and legacy journals are inconclusive too.
+    for funding in [
+        Some((retired, monitor.get_latest_update_id() + 1)),
+        Some((retired, monitor.get_latest_update_id())),
+        None,
+    ] {
+        let mut ahead: PendingChannel = decode(&pending_bytes).unwrap();
+        ahead.funding = funding;
+        ahead.retired_funding = vec![monitor.get_funding_txo().into_bitcoin_outpoint(), retired];
+        store
+            .write("tower", "pending", &id.to_string(), ahead.encode())
+            .unwrap();
+        assert_eq!(
+            hook.persist_new_channel(monitor.persistence_key(), &monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
+        assert!(keys
+            .iter()
+            .all(|key| store.read("tower_candidates", &id.to_string(), key).is_ok()));
+        let recovered: PendingChannel =
+            decode(&store.read("tower", "pending", &id.to_string()).unwrap()).unwrap();
+        assert!(recovered.retired_funding.is_empty());
+        assert_eq!(
+            recovered.funding,
+            Some((
+                monitor.get_funding_txo().into_bitcoin_outpoint(),
+                monitor.get_latest_update_id()
+            ))
+        );
+        store
+            .remove(
+                "tower_candidates",
+                &id.to_string(),
+                &candidate_key(&fixture),
+                false,
+            )
+            .unwrap();
+    }
+    store
+        .write("tower", "pending", &id.to_string(), pending_bytes.clone())
+        .unwrap();
+    // A failed incoming signed write must not evict any existing candidate or advance LDK.
+    let calls_before_failure = hook.inner.calls.lock().unwrap().len();
+    store
+        .writes_until_failure
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        hook.update_persisted_channel(monitor.persistence_key(), None, &monitor),
         ChannelMonitorUpdateStatus::UnrecoverableError
+    );
+    assert_eq!(hook.inner.calls.lock().unwrap().len(), calls_before_failure);
+    assert!(keys
+        .iter()
+        .all(|key| store.read("tower_candidates", &id.to_string(), key).is_ok()));
+    assert_eq!(
+        store
+            .list("tower_candidates", &id.to_string())
+            .unwrap()
+            .len(),
+        10_000
+    );
+    assert_eq!(
+        hook.update_persisted_channel(monitor.persistence_key(), None, &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    let candidates = hook
+        .client
+        .as_ref()
+        .unwrap()
+        .pending_candidates(id)
+        .unwrap();
+    assert_eq!(candidates.len(), 10_000);
+    assert!(store
+        .read("tower_candidates", &id.to_string(), &keys[0])
+        .is_err());
+    assert!(
+        store
+            .read("tower_candidates", &id.to_string(), &keys[9_998])
+            .is_ok(),
+        "drop oldest superseded first"
+    );
+    assert!(
+        store
+            .read("tower_candidates", &id.to_string(), &keys[9_999])
+            .is_ok(),
+        "keep newest per commitment"
+    );
+    assert!(keys[1..9_998]
+        .iter()
+        .all(|key| store.read("tower_candidates", &id.to_string(), key).is_ok()));
+    let candidate = candidates
+        .iter()
+        .find(|c| candidate_key(c) == revoked.compute_txid().to_string())
+        .unwrap();
+    for tx in &candidate.ladder {
+        lightning::check_spends!(tx, revoked);
+    }
+    // Replay at the cap does not evict anything or duplicate the signed candidate.
+    store
+        .write("tower", "pending", &id.to_string(), pending_bytes.clone())
+        .unwrap();
+    assert_eq!(
+        hook.persist_new_channel(monitor.persistence_key(), &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    assert_eq!(
+        hook.client
+            .as_ref()
+            .unwrap()
+            .pending_candidates(id)
+            .unwrap()
+            .len(),
+        10_000
+    );
+    // If the target is exceeded by distinct commitments, keep them all and continue.
+    store
+        .remove("tower_candidates", &id.to_string(), &keys[9_998], false)
+        .unwrap();
+    for i in 10_000u64..10_002 {
+        let mut candidate = fixture.clone();
+        candidate.commitment_number = i;
+        for tx in &mut candidate.ladder {
+            tx.input[0].previous_output.txid = bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::hash(&i.to_le_bytes()),
+            );
+        }
+        store
+            .write(
+                "tower_candidates",
+                &id.to_string(),
+                &candidate_key(&candidate),
+                dated_candidate(&candidate, i, Some(retired)).unwrap(),
+            )
+            .unwrap();
+    }
+    store
+        .write("tower", "pending", &id.to_string(), pending_bytes)
+        .unwrap();
+    assert_eq!(
+        hook.persist_new_channel(monitor.persistence_key(), &monitor),
+        ChannelMonitorUpdateStatus::Completed
+    );
+    assert_eq!(
+        hook.client
+            .as_ref()
+            .unwrap()
+            .pending_candidates(id)
+            .unwrap()
+            .len(),
+        10_001
     );
 }
