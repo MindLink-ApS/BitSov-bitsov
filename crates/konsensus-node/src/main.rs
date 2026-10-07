@@ -20,6 +20,7 @@ mod move_home_cmd;
 mod msg_handler;
 mod node;
 mod onboarding;
+mod offline_safety;
 #[path = "cli/owner.rs"]
 mod owner_cmd;
 mod password;
@@ -1508,6 +1509,13 @@ async fn start_node_services<'a>(
 
     // ── Spawn background tasks ─────────────────────────────────────────
 
+    let offline_safety_handle = tokio::spawn(offline_safety::run(
+        Arc::clone(node.lightning()),
+        Arc::clone(node.chain()),
+        data_dir.clone(),
+        node.shutdown_rx(),
+    ));
+
     // R3 SEAM-B (Route B, default-off). Build the relay engine ONLY when
     // `[relay] enabled`; a disabled node holds `None`, allocates no engine/store,
     // and its receive path is byte-identical to a non-relay build. The backend is
@@ -1871,6 +1879,9 @@ async fn start_node_services<'a>(
         }
         if let Err(e) = session_handle.await {
             warn!(error = %e, "session handler task panicked");
+        }
+        if let Err(e) = offline_safety_handle.await {
+            warn!(error = %e, "offline safety task panicked");
         }
         if let Err(e) = nonce_cleanup_handle.await {
             warn!(error = %e, "nonce cleanup task panicked");
