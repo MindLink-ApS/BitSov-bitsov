@@ -5,22 +5,27 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
-- Optional `[lightning] our_to_self_delay_blocks` (144 to 2016) sets the breach
-  window peers must accept on new channels, inbound and outbound. Home nodes
-  that may stay locked can set 288 (about two days). Omitting it keeps LDK's 144;
-  existing channels keep their negotiated value. See [the home-node runbook](docs/operations/home-node.md#longer-breach-window-optional).
+## [0.3.0-rc11] — 2026-10-07 (prep; not tagged yet)
 
-## [0.3.0-rc10] — 2026-10-06 (prep; not tagged yet)
-
-**Pre-release.** Not for production use. Covers the 14 merged commits from
-`v0.3.0-rc9` (`cd75c69`) through **#257** (`1ae4e62`), including #250
-(`a0062b2`), #251 (`29385e7`), #252 (`64b4542`), #256 (`d59031f`) and #257
-(`1ae4e62`).
-Signing checklist: [`docs/releases/v0.3.0-rc10.md`](docs/releases/v0.3.0-rc10.md).
-Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
+**Pre-release.** Not for production use. Includes everything since rc9
+(`cd75c69`): the rc10 scope through #257, its docs/version PR #255 (`83fb6c6`),
+and all eight PRs merged after `83fb6c6`, through #266 (`52670e7`).
+rc10 was tagged at `83fb6c6` but never published: tag CI failed on the
+pairing-ticket revocation bug fixed by #266. rc11 supersedes it.
+Signing checklist: [`docs/releases/v0.3.0-rc11.md`](docs/releases/v0.3.0-rc11.md).
+Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc11-procedure).
 
 ### Security
 
+- Pairing-ticket revocation fix (#266; merge `52670e7`). The cache uses a
+  content digest and byte length instead of file modification time, so replacing
+  a ticket revokes the old code even when timestamp and length are unchanged.
+  Missing/deleted tickets invalidate the cache; unchanged tickets retain expiry
+  and single-use handling. This fixes the failure that blocked rc10 publication.
+- Hardening sweep (#259; merge `9a059a1`): owner front-door admission/message
+  price overrides pass the admission floor; `[node] hosted_by` also rejects
+  U+206A–U+206F and Unicode tag characters. Regression coverage confirms that a
+  `remote_first_run` owner device counts and can approve delegated enrollment.
 - DoS edge on the unpaid peer doorway (#250). Per-IP and per-IPv6-/64
   connection and handshake token buckets, per-source and global concurrency
   caps, and bounded source tables apply before any Noise work, in both
@@ -117,6 +122,37 @@ Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
   Existing channels are not closed. Starts without the flag are unchanged. See
   [hub-only channels](docs/operations/home-node.md#hub-only-channels-hub_only_while_lockable).
 
+### Lightning and local watchtower staging
+
+- Optional `[lightning] our_to_self_delay_blocks` (144 to 2016) sets the breach
+  window peers must accept on new inbound, outbound and LSPS2 channels (#261,
+  W0; merge `a28c84d`). Home nodes that may stay locked can set 288 (about two
+  days). Omitting it keeps LDK's 144; existing channels keep their negotiated
+  value. Peers may refuse a longer window. See
+  [the home-node runbook](docs/operations/home-node.md#longer-breach-window-optional).
+- W1 vendor hook stages durable signed `to_local` justice candidates (#262;
+  merge `6bacdb0`). W1 hardening handles unsignable splice heads, corrupt-record
+  quarantine, bounded pruning and replay coverage (#263; merge `f4aee2f`).
+- W2a client core adds encrypted blind blobs, a durable bounded outbox and
+  owner-only `GET /api/v1/tower/status` guarded/unguarded diagnostics (#264;
+  merge `110bb5c`). Follow-up isolates reconciliation errors per channel and
+  writes monitor mappings only when changed (#265; merge `a540c03`).
+- **All W1/W2a functionality is off by default.** Omitting `[tower.clients]`
+  or leaving it empty keeps staging off. Configured clients enable local LDK
+  staging only: **no transport, no payments, no generated tower acknowledgments
+  and no active offline protection**. Counts cover `to_local_only`, not HTLCs;
+  staging cannot recover all missed historical states. The signed handoff and
+  outbox are bounded, but unsigned recovery data can still grow. The hub-only
+  channel restriction remains. See
+  [local watchtower staging](docs/operations/home-node.md#local-watchtower-staging-w2a-optional).
+
+### CI
+
+- Reduce Actions minutes (#260; merge `44e3628`) with fail-closed docs-only PR
+  classification, Rust dependency caching and cancellation of superseded PR
+  runs. Draft PRs use the same checks as ready PRs; main and release-tag pushes
+  retain full validation. No measured overall savings are claimed.
+
 ### Docs
 
 - Reaching a home node off the LAN over Tailscale: listeners and
@@ -124,18 +160,25 @@ Upgrade steps: [UPGRADING](docs/UPGRADING.md#rc9--rc10-procedure).
   tailnet can see, and that the hub never relays for its LSP role. Port mapping
   and Tor are documented as not shipped (#254;
   [docs/operations/reachability.md](docs/operations/reachability.md)).
-- rc10 release notes and signing checklist, plus an rc9 → rc10 upgrade
+- rc11 release notes and signing checklist, plus an rc9 → rc11 upgrade
   procedure with every new config key and the state-generation-2 rollback rule.
 
 ### Upgrade and version
 
-- **State generation 2:** the first rc10 node start raises `STATE_GENERATION`.
+- **State generation 2:** the first rc11 node start raises `STATE_GENERATION`.
   rc9 then refuses the data directory with `state_generation_newer`. Roll
   forward only.
 - No numbered SQL migration since rc9 (still **001–028**).
-- `[dos_edge]` and `[node]` are new tables, and NodeConfig rejects unknown
-  fields, so rc9 will not parse a config that uses them.
-- Workspace version is `0.3.0-rc10` (all 13 packages).
+- `[dos_edge]`, `[node]` and `[tower.clients]` are new since rc9, as is
+  `[lightning] our_to_self_delay_blocks`. rc9 rejects these unknown fields.
+- Workspace version is `0.3.0-rc11` (all 13 packages).
+
+## [0.3.0-rc10] — 2026-10-06 (tagged, never published, superseded by rc11)
+
+Tagged at `83fb6c6`, but tag CI failed on pairing-ticket revocation (#266).
+No release was published. Its full scope is included in rc11 above; upgrade
+from rc9 directly to rc11. The historical
+[rc10 checklist](docs/releases/v0.3.0-rc10.md) is retained for reference.
 
 ## [0.3.0-rc9] — 2026-10-06
 

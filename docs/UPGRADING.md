@@ -3,13 +3,14 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-**rc10 preparation:** covers `main` from `v0.3.0-rc9` (`cd75c69`) through #257
-(`1ae4e62`), 2026-10-06, including #250 (`a0062b2`), #251 (`29385e7`), #252
-(`64b4542`), #256 (`d59031f`) and #257 (`1ae4e62`, hub-only channels while
-lockable). The rc9 and older procedures remain below for nodes skipping
-releases: apply them first, then this one.
+**rc11 preparation (2026-10-07):** includes all rc10 changes since rc9
+(`cd75c69`), plus #259–#266 through `52670e7`. rc10 was tagged at `83fb6c6`
+but never published because tag CI failed on pairing-ticket revocation, fixed
+by #266. Skip rc10 and upgrade directly to rc11. The release commit will be the
+`main` HEAD after the rc11 docs/version PR merges. The rc9 and older procedures
+remain below for nodes skipping releases: apply them first, then this one.
 
-## rc9 → rc10 procedure
+## rc9 → rc11 procedure
 
 1. **Before stopping rc9**, reconcile pending payments, channel opens and LSPS2
    top-ups as for rc9. Upgrade one host at a time. Verify the replacement
@@ -17,19 +18,20 @@ releases: apply them first, then this one.
    `B299274C200301714DC6F51A7C2D6F8AC842EF6E`) under
    [release policy](ops/RELEASE_POLICY.md). Then stop the node cleanly and keep
    the same config and data directory. Do not re-run `init`.
-2. **State generation 2 makes the upgrade one-way.** The first rc10 start
+2. **State generation 2 makes the upgrade one-way.** The first rc11 start
    raises `STATE_GENERATION` to `bitsov-state-v1:2` before SQLite or LDK opens.
    With `--remote-unlock`, that happens at unlock, not while locked. After that,
    an rc9 binary refuses the directory with `state_generation_newer`. A stopped
    copy of the rc9 directory is a rollback option only **before** the first
-   rc10 start. Never lower or delete the marker, and never restore a
+   rc11 start. Never lower or delete the marker, and never restore a
    pre-upgrade LDK directory; see
    [state generation](#state-generation-and-rollback-safety). No numbered SQL
    migration was added: the embedded set remains **001–028**.
 3. **No config change is required.** Every new key below is optional and
    defaults safely. Add any of them only after the binary is replaced: rc9
-   rejects unknown fields, so a config containing `[dos_edge]` or `[node]` will
-   not load on rc9.
+   rejects unknown fields, so a config containing `[dos_edge]`, `[node]`,
+   `[tower.clients]` or `[lightning] our_to_self_delay_blocks` will not load
+   on rc9.
 4. **Peer doorway defaults change (#250).** `cookie_mode` now
    defaults to `adaptive` (was `disabled`), and the new `[dos_edge]` limits
    always apply. Under load, sources must return a stateless cookie before the
@@ -57,7 +59,7 @@ releases: apply them first, then this one.
    `forward_to_private_channels` are forced off for the maintenance run only;
    the config is not changed. See
    [SCB restore lock and move-home](#scb-restore-lock-and-move-home-157).
-7. **Box transport key (#244).** The first unlocked rc10 start creates
+7. **Box transport key (#244).** The first unlocked rc11 start creates
    `pairing/box-transport.key` (0600) and signs it into `identity/identity.json`.
    The data directory must be on a filesystem with hard links; key publication
    fails on exFAT/FAT. Preserve both files from then on and back them up with
@@ -73,14 +75,14 @@ releases: apply them first, then this one.
 9. **Owner-device delegation (#251).** With `--local-owner-device` (which
    needs `--password-fd` or `--remote-unlock`), the node now keeps the owner signing key in zeroizing memory for the life of
    the process, so an enrolled owner device can approve another device. Without
-   that flag, delegation is refused. Pending device-key requests created before
-   rc10 have no nonce: request them again to delegate. Check
+   that flag, delegation is refused. Pending device-key requests created on rc9
+   have no nonce: request them again to delegate. Check
    `owner_device_count` in `GET /api/v1/pair/device-keys`. Keep at least one
    non-phone owner device; console revoke and recovery are unchanged.
 10. **Pairing tickets and box label (#252).**
     `konsensus pair-ticket --config <cfg> [--qr] [--ttl 24h]` needs
     `[remote_access]` with `listen_addr` and `advertised_endpoint`, Unix file
-    locking, and, on an initialized node, one unlocked rc10 start first so
+    locking, and, on an initialized node, one unlocked rc11 start first so
     `identity/identity.json` holds both signed transport proofs.
     It is refused while locked. Keep its output out of service journals and
     package logs: anyone holding the ticket can pair once as `read+receive`.
@@ -93,12 +95,34 @@ releases: apply them first, then this one.
     to the client that consumed a pre-bootstrap `pair-ticket`, then exits 75.
     The supervisor must restart on failure (`Restart=on-failure`) to come back
     locked for the first remote unlock. Retained nodes need no action.
-12. **After restart:** inspect authenticated `/api/v1/status` as in the rc9
+12. **Longer breach window (#261, W0) is optional.** Under `[lightning]`,
+    `our_to_self_delay_blocks` accepts 144–2016; omission retains LDK's 144.
+    A value of 288 is about two days, with variable block times. It applies only
+    to new channels in either direction, including LSPS2; existing channels keep
+    their negotiated delay. Peers may refuse a longer value. This does not
+    provide watchtower protection or lift the hub-only restriction.
+13. **Local watchtower staging (#262–#265) is off by default.** Omit
+    `[tower.clients]` or leave it empty to keep it off. Only the embedded LDK
+    backend supports opt-in entries under `[tower.clients.NAME]`, each with
+    `node_id` and `endpoint` (at most five). W1/W2a writes local candidates and
+    encrypted outbox data under `ldk/tower/`, with owner-only
+    `GET /api/v1/tower/status` diagnostics. It has **no transport, no payments,
+    no generated acknowledgments and no active offline protection**. Coverage
+    counts are `to_local_only`, not HTLC protection. The bounded outbox has no
+    sender to drain it, and unsigned recovery data can still grow; enabling it
+    later cannot recover all missed historical states. The hub-only restriction
+    remains. See [local staging](operations/home-node.md#local-watchtower-staging-w2a-optional).
+14. **Hardening and ticket revocation (#259, #266).** Owner front-door price
+    overrides now respect the admission floor. Remove U+206A–U+206F and Unicode
+    tag characters from any retained `hosted_by` label. Ticket replacement now
+    revokes the old code even if file timestamp and length are unchanged; no
+    ticket format or config migration is needed.
+15. **After restart:** inspect authenticated `/api/v1/status` as in the rc9
     procedure. For remote unlock, also check `GET /api/v1/node/lock`.
     App-side remote unlock, delegation and tickets need an app build re-pinned to
-    rc10; the node cannot establish app support.
+    rc11; the node cannot establish app support.
 
-### New config keys and switches (rc9 → rc10)
+### New config keys and switches (rc9 → rc11)
 
 | Key / switch | Where | Default | Source |
 |---|---|---|---|
@@ -110,6 +134,9 @@ releases: apply them first, then this one.
 | `cookie_threshold`, `max_tracked_sources` | `[dos_edge]` | `32`, `4096` | #250 |
 | `cookie_timeout_secs`, `handshake_timeout_secs` | `[dos_edge]` | `3`, `10` | #250 |
 | `hosted_by` | `[node]` | unset (`null` in API) | #252 |
+| `our_to_self_delay_blocks` | `[lightning]`, embedded LDK | unset (LDK uses `144`); optional `144`–`2016`, new channels only | #261 |
+| `clients` | `[tower]` / `[tower.clients]` | empty (off); at most five named entries, embedded LDK only | #264 |
+| `node_id`, `endpoint` | `[tower.clients.NAME]` | required per entry: unique compressed Lightning public key and `host:port`; endpoint is reserved, never contacted in W2a | #264 |
 | `forward_to_private_channels` | `[lightning]` | `false` (unchanged since rc9, #226) | forced off only during `move-home` (#246) |
 | `--remote-unlock` | `start` argv | off; excludes `--password`, `--password-file`, `--password-fd`, `--owner-control` | #247 |
 | `konsensus pair-ticket [-c <cfg>] [--qr] [--ttl 24h]` | CLI | config `konsensus.toml`; TTL `24h`, `s`/`m`/`h`/`d`, max 365 days | #252 |
@@ -121,9 +148,11 @@ inconsistent limits (for example `max_per_ip` > `max_per_subnet`, or
 `cookie_threshold` ≥ `max_handshakes`); see
 [protecting the peer doorway](operations/dos-edge.md).
 `[node]` rejects unknown fields; `hosted_by` must be 1–64 printable characters
-without surrounding whitespace, control, bidi-override or zero-width characters.
+without surrounding whitespace, control, bidi-override, zero-width or Unicode
+tag characters. `[tower]` and its named clients reject unknown fields; there
+are no tower pricing, retention or payment-cap config keys in W2a.
 
-**Hubs and `forward_to_private_channels`:** rc10 does not change this key. An
+**Hubs and `forward_to_private_channels`:** rc11 does not change this key. An
 ordinary LDK hub that forwards into its clients' unannounced channels still
 needs `forward_to_private_channels = true` in `[lightning]`. The default is
 false. An LSPS2 service hub (`[lightning.lsps2_service] enabled = true`)
@@ -144,7 +173,7 @@ manual/descriptor startup remains available. New pairing while locked is not
 supported. Remote first-run bootstrap on an empty data directory (#256) is
 supported; see
 [remote first run on an empty box](operations/home-node.md#remote-first-run-on-an-empty-box).
-A locked node does not monitor channels. rc10 enforces this (#257): with
+A locked node does not monitor channels. rc11 enforces this (#257): with
 `--remote-unlock`, new channels in or out are refused with `HUB_ONLY_WHILE_LOCKABLE`
 unless the peer is in `[lightning.liquidity] providers`; existing non-hub channels
 are not closed, so close them first. Read
@@ -289,7 +318,7 @@ read as `console`; the owner signature remains mandatory. Never install an
 owner public key file as a replacement for startup derivation.
 
 Without this flag, descriptor passwords keep `seed_password_not_typed` and
-sidecar grants remain inactive. From rc10 (#251), local mode retains the
+sidecar grants remain inactive. From rc11 (#251), local mode retains the
 zeroizing owner signing key for enrollment delegated by an existing owner
 device. The live mode does
 not open `control.sock`, enable console grants or alter remote rules. Apps can
