@@ -38,7 +38,8 @@ const PAIRING_CODE_TTL: Duration = Duration::from_secs(5 * 60);
 struct ActivePairingCode {
     value: String,
     expires_at: tokio::time::Instant,
-    modified: Option<std::time::SystemTime>,
+    content_digest: blake3::Hash,
+    content_len: usize,
 }
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -435,7 +436,8 @@ impl RemoteAccessServer {
 }
 
 // Called only under the interprocess ticket lock. A missing/deleted file
-// invalidates the cache; mtime detects atomic CLI replacement without reparsing.
+// invalidates the cache; a digest and byte length detect atomic CLI replacement
+// even with an unchanged mtime, without reparsing unchanged contents.
 fn reload_pairing_code(
     pairing: &PairingService,
     active: &mut Option<ActivePairingCode>,
@@ -453,23 +455,25 @@ fn reload_pairing_code(
             return Err(e.into());
         }
     };
-    let modified = metadata.modified()?;
-    if active
-        .as_ref()
-        .is_some_and(|code| code.modified == Some(modified))
-    {
+    let cached = active.take();
+    anyhow::ensure!(
+        metadata.len() <= 16 * 1024,
+        "remote pairing ticket is too large"
+    );
+    let contents = std::fs::read_to_string(&path)?;
+    let content_digest = blake3::hash(contents.as_bytes());
+    let content_len = contents.len();
+    if cached.as_ref().is_some_and(|code| {
+        code.content_len == content_len && code.content_digest == content_digest
+    }) {
+        *active = cached;
         if active.as_ref().unwrap().expires_at <= tokio::time::Instant::now() {
             *active = None;
             pairing.remove_remote_access_link()?;
         }
         return Ok(());
     }
-    *active = None;
-    anyhow::ensure!(
-        metadata.len() <= 16 * 1024,
-        "remote pairing ticket is too large"
-    );
-    let link = PairLink::from_uri(std::fs::read_to_string(&path)?.trim())
+    let link = PairLink::from_uri(contents.trim())
         .map_err(|_| anyhow::anyhow!("invalid remote pairing ticket"))?;
     if link.expires_at <= chrono::Utc::now().timestamp() {
         pairing.remove_remote_access_link()?;
@@ -495,7 +499,8 @@ fn reload_pairing_code(
     *active = Some(ActivePairingCode {
         value: link.code,
         expires_at: tokio::time::Instant::now() + remaining,
-        modified: Some(modified),
+        content_digest,
+        content_len,
     });
     Ok(())
 }
@@ -881,6 +886,72 @@ mod tests {
             original,
             "an unused ticket must survive clean shutdown and restart"
         );
+    }
+
+    #[tokio::test]
+    async fn ticket_reload_revokes_old_code_when_replacement_has_same_mtime_and_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = identity();
+        let node_id = node.node_id().to_hex();
+        let fingerprint = konsensus_api::pairing::identity_fingerprint(&node_id);
+        let pairing = Arc::new(PairingService::open(dir.path(), fingerprint, false).unwrap());
+        let config = RemoteAccessConfig {
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            advertised_endpoint: Some("node.example:8443".into()),
+        };
+        let server = RemoteAccessServer::bind(
+            &config,
+            node.clone(),
+            pairing.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            Arc::new(RemoteTunnelClients::default()),
+        )
+        .await
+        .unwrap();
+        let path = pairing.remote_access_link_path();
+        let mut ticket = PairLink::from_uri(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let old_code = ticket.code.clone();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let modified = metadata.modified().unwrap();
+        ticket.code = URL_SAFE_NO_PAD.encode([0x42; 32]);
+        if ticket.code == old_code {
+            ticket.code = URL_SAFE_NO_PAD.encode([0x43; 32]);
+        }
+        {
+            let _guard = crate::ticket_cmd::lock_ticket(path.parent().unwrap()).unwrap();
+            pairing
+                .write_remote_access_link(&ticket.to_uri().unwrap())
+                .unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+        let replacement = std::fs::metadata(&path).unwrap();
+        assert_eq!(replacement.modified().unwrap(), modified);
+        assert_eq!(replacement.len(), metadata.len());
+
+        let transport = [0x18; 32];
+        let key = SigningKey::from_bytes(&[0x28; 32]);
+        assert!(authenticate_from_file(
+            &request(&node, &transport, &old_code, &key),
+            &transport,
+            &node_id,
+            &pairing,
+            &server.pairing_code,
+        )
+        .is_err());
+        assert!(authenticate_from_file(
+            &request(&node, &transport, &ticket.code, &key),
+            &transport,
+            &node_id,
+            &pairing,
+            &server.pairing_code,
+        )
+        .is_ok());
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -1617,7 +1688,8 @@ mod tests {
         Mutex::new(Some(ActivePairingCode {
             value: value.to_string(),
             expires_at: tokio::time::Instant::now() + PAIRING_CODE_TTL,
-            modified: None,
+            content_digest: blake3::hash(value.as_bytes()),
+            content_len: value.len(),
         }))
     }
 
