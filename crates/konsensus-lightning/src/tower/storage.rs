@@ -9,8 +9,15 @@ use std::path::Path;
 
 pub const GRACE_SECONDS: u64 = 7 * 24 * 3600;
 const RESERVE: u64 = 256 * 1024;
-const ROW_BUDGET: u64 = 32 * 1024;
+const ROW_OVERHEAD: u64 = 128;
 const SESSION_BUDGET: u64 = 16 * 1024;
+// Admission charges cipher bytes + 24-byte nonce + 16-byte hint + 128 bytes
+// for row/index metadata. Replacements subtract the old charge first. Sessions
+// separately reserve 16 KiB for bounded rate history; quota() keeps journal
+// headroom and the scan reserve, while max_page_count enforces the disk ceiling.
+fn blob_charge(cipher_bytes: usize) -> u64 {
+    cipher_bytes as u64 + 24 + 16 + ROW_OVERHEAD
+}
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -87,8 +94,8 @@ impl TowerStorage {
     }
     fn charged(&self) -> Result<u64> {
         Ok(self.db.query_row(
-            "SELECT (SELECT count(*) FROM blobs)*?1+(SELECT count(*) FROM sessions)*?2",
-            params![ROW_BUDGET, SESSION_BUDGET],
+            "SELECT (SELECT coalesce(sum(length(cipher)+24+16+?1),0) FROM blobs)+(SELECT count(*) FROM sessions)*?2",
+            params![ROW_OVERHEAD, SESSION_BUDGET],
             |r| r.get(0),
         )?)
     }
@@ -117,9 +124,9 @@ impl TowerStorage {
         {
             return Err(Error::Rejected("invalid tower blob or retention"));
         }
-        if self.status()?.full {
-            return Err(Error::Rejected("tower_full"));
-        }
+        // Status conservatively reserves a maximum blob and a new session.
+        // Check this request's actual growth instead: existing sessions and
+        // smaller replacements may still fit. SQLite enforces the disk ceiling.
         let quota = self.quota();
         let charged = self.charged()?;
         let tx = self
@@ -161,9 +168,14 @@ impl TowerStorage {
         if existing.is_none() && count >= self.config.max_blobs_per_session {
             return Err(Error::Rejected("tower session blob cap reached"));
         }
-        let extra = if existing.is_none() { ROW_BUDGET } else { 0 }
+        let old_charge = existing
+            .as_ref()
+            .map(|(_, _, cipher, _)| blob_charge(cipher.len()))
+            .unwrap_or(0);
+        let required = charged - old_charge
+            + blob_charge(blob.ciphertext.len())
             + if new_session { SESSION_BUDGET } else { 0 };
-        if charged + extra > quota {
+        if required > quota {
             return Err(Error::Rejected("tower_full"));
         }
         arrivals.push(now);
@@ -218,7 +230,8 @@ impl TowerStorage {
         let page_size: u64 = self.db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         status.storage_bytes = pages * page_size;
         status.max_storage_bytes = self.config.max_storage_mb * 1024 * 1024;
-        status.full = self.charged()? + ROW_BUDGET + SESSION_BUDGET > self.quota()
+        status.full = self.charged()? + blob_charge(MAX_BLOB_BYTES - 24) + SESSION_BUDGET
+            > self.quota()
             || status.storage_bytes + RESERVE >= status.max_storage_bytes / 2;
         Ok(status)
     }
@@ -272,6 +285,69 @@ mod tests {
             .accept([2; 32], 603, &blob(4), 703_601, 800_000)
             .unwrap();
     }
+    #[test]
+    fn tower_storage_charges_bytes_and_replacements() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ServiceConfig {
+            max_storage_mb: 1,
+            ..Default::default()
+        };
+        let mut store = TowerStorage::open(&dir.path().join("serve.sqlite"), &config).unwrap();
+        let mut small = blob(1);
+        small.ciphertext = vec![0; 600];
+        // 600 cipher + 24 nonce + 16 hint + 128 row/index overhead per blob;
+        // one 16 KiB session reservation for bounded arrival history.
+        for n in 0..200 {
+            small.hint = [n; 16];
+            store.accept([1; 32], 0, &small, 1, 100).unwrap();
+        }
+        assert_eq!(
+            store.charged().unwrap(),
+            200 * (600 + 24 + 16 + 128) + 16_384
+        );
+        assert_eq!(store.status().unwrap().blob_bytes, 200 * (600 + 24 + 16));
+        let mut larger = small.clone();
+        larger.ciphertext.resize(3_000, 0);
+        store.accept([1; 32], 1, &larger, 2, 100).unwrap();
+        assert_eq!(store.charged().unwrap(), 172_384);
+        store.accept([1; 32], 2, &small, 3, 100).unwrap();
+        assert_eq!(store.charged().unwrap(), 169_984);
+        store.delete([1; 32], &[small.hint]).unwrap();
+        assert_eq!(store.charged().unwrap(), 169_216);
+        drop(store);
+        let store = TowerStorage::open(&dir.path().join("serve.sqlite"), &config).unwrap();
+        assert_eq!(store.charged().unwrap(), 169_216);
+    }
+
+    #[test]
+    fn tower_storage_replacement_growth_cannot_exceed_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ServiceConfig {
+            max_storage_mb: 1,
+            ..Default::default()
+        };
+        let mut store = TowerStorage::open(&dir.path().join("serve.sqlite"), &config).unwrap();
+        let mut small = blob(1);
+        small.ciphertext = vec![0; 600];
+        for session in 0..15 {
+            store.accept([session; 32], 0, &small, 1, 100).unwrap();
+        }
+        // 257,280 bytes charged, with 4,864 bytes left in the 256 KiB quota.
+        assert_eq!(store.charged().unwrap(), 257_280);
+        let mut large = small.clone();
+        large.ciphertext.resize(4_000, 0);
+        store.accept([0; 32], 1, &large, 2, 100).unwrap();
+        assert!(matches!(
+            store.accept([1; 32], 1, &large, 2, 100),
+            Err(Error::Rejected("tower_full"))
+        ));
+        assert_eq!(store.charged().unwrap(), 260_680);
+        assert_eq!(store.matches(&small.hint).unwrap()[1].blob, small);
+        store.accept([0; 32], 2, &small, 3, 100).unwrap();
+        store.accept([1; 32], 1, &large, 3, 100).unwrap();
+        assert_eq!(store.charged().unwrap(), 260_680);
+    }
+
     #[test]
     fn tower_storage_full_and_oversize_refused() {
         let dir = tempfile::tempdir().unwrap();
