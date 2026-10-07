@@ -380,6 +380,8 @@ pub struct ElevationRequestBody {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetProposal {
+    #[serde(default)]
+    pub payee_allowlist: Option<std::collections::BTreeSet<String>>,
     /// Proposal only: the owner must explicitly approve this at the control socket.
     #[serde(default)]
     pub allow_liquidity_fees: bool,
@@ -405,6 +407,7 @@ impl BudgetProposal {
         if let Some(ttl) = self.ttl_secs {
             terms = terms.for_secs(ttl);
         }
+        terms.payee_allowlist = self.payee_allowlist;
         terms.allow_liquidity_fees = self.allow_liquidity_fees;
         terms.per_recipient_msat = self.per_recipient_msat;
         terms

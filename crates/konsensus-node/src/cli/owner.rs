@@ -441,6 +441,9 @@ fn read_owner_code() -> Result<Option<String>> {
 /// The owner's flags for `konsensus grant`.
 #[derive(Debug, Default)]
 pub struct GrantFlags {
+    /// Exclusive allowed payees; replaces a proposal's allowlist when supplied.
+    pub payees: Vec<String>,
+    pub deny_all_payees: bool,
     /// Explicit opt-in; never inherited from an app proposal.
     pub allow_liquidity_fees: bool,
     /// `--budget <sats>`.
@@ -497,6 +500,13 @@ pub fn resolve_terms(flags: &GrantFlags, proposal: Option<&GrantTerms>) -> Resul
         map
     };
     GrantTerms {
+        payee_allowlist: if flags.deny_all_payees {
+            Some(Default::default())
+        } else if !flags.payees.is_empty() {
+            Some(flags.payees.iter().cloned().collect())
+        } else {
+            proposal.and_then(|p| p.payee_allowlist.clone())
+        },
         allow_liquidity_fees: flags.allow_liquidity_fees,
         budget_msat,
         per_call_max_msat,
@@ -544,11 +554,13 @@ pub fn front_door_ttl(flags: &GrantFlags) -> Result<i64> {
     if flags.budget_sats.is_some()
         || flags.per_call_sats.is_some()
         || !flags.recipients.is_empty()
+        || !flags.payees.is_empty()
+        || flags.deny_all_payees
         || flags.allow_liquidity_fees
     {
         anyhow::bail!(
             "this request asks for front_door only, which carries no budget; drop --budget, \
-             --per-call, --recipient and --allow-liquidity-fees (keep --for)"
+             --per-call, --recipient, --payee, --deny-all-payees and --allow-liquidity-fees (keep --for)"
         );
     }
     let ttl = match &flags.window {
@@ -1719,6 +1731,34 @@ mod startup_tests {
             window: window.map(str::to_string),
             ..GrantFlags::default()
         }
+    }
+
+    #[test]
+    fn owner_payee_flags_override_proposals_and_display_exact_authority() {
+        let mut proposal = GrantTerms::new(10_000);
+        proposal.payee_allowlist = Some(["aa".repeat(32)].into());
+        let mut flags = GrantFlags::default();
+        assert_eq!(
+            resolve_terms(&flags, Some(&proposal))
+                .unwrap()
+                .payee_allowlist,
+            proposal.payee_allowlist
+        );
+        flags.payees = vec!["BB".repeat(32)];
+        let terms = resolve_terms(&flags, Some(&proposal)).unwrap();
+        assert_eq!(terms.payee_allowlist, Some(["bb".repeat(32)].into()));
+        let summary = spend_budget::describe_terms(&terms);
+        assert!(summary.contains(&"bb".repeat(32)));
+        assert!(!summary.contains("any, within the total"));
+        flags.payees.clear();
+        flags.deny_all_payees = true;
+        assert_eq!(
+            resolve_terms(&flags, Some(&proposal))
+                .unwrap()
+                .payee_allowlist,
+            Some(Default::default())
+        );
+        assert!(front_door_ttl(&flags).is_err());
     }
 
     #[test]

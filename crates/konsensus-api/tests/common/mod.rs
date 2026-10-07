@@ -1393,10 +1393,14 @@ impl MessageTransport for ConnectedStubTransport {
 ///
 /// Uses the lightning-invoice InvoiceBuilder with a deterministic key.
 pub fn create_test_bolt11(amount_msat: u64) -> String {
+    create_test_bolt11_with_hash(amount_msat, [0xcc; 32])
+}
+
+pub fn create_test_bolt11_with_hash(amount_msat: u64, hash_seed: [u8; 32]) -> String {
     use bitcoin::hashes::{sha256, Hash};
     use lightning_invoice::{Currency, InvoiceBuilder};
 
-    let payment_hash = sha256::Hash::hash(&[0xcc; 32]);
+    let payment_hash = sha256::Hash::hash(&hash_seed);
     let payment_secret = lightning_invoice::PaymentSecret([42u8; 32]);
 
     let invoice = InvoiceBuilder::new(Currency::BitcoinTestnet)

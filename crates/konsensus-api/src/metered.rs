@@ -156,6 +156,39 @@ impl MeteredSpend {
         self.debit_purpose(state, charges, false)
     }
 
+    /// An identified payment may enter the backend only once per grant.
+    pub(crate) fn debit_payment(
+        &self,
+        state: &AppState,
+        charges: Vec<Charge>,
+        payment_hash: Option<&str>,
+        request_id: Option<&str>,
+    ) -> Result<Debit, ApiError> {
+        let mut ids = Vec::new();
+        if let Some(id) = request_id {
+            if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(ApiError::BadRequest(
+                    "request_id must be 1–128 printable ASCII bytes without spaces".into(),
+                ));
+            }
+            ids.push(format!("request:{id}"));
+        }
+        if let Some(hash) = payment_hash {
+            ids.push(format!("hash:{hash}"));
+        }
+        let Meter::Grant { client_id, epoch } = &self.meter else {
+            return Ok(Debit::unmetered());
+        };
+        let service = state
+            .pairing
+            .as_ref()
+            .ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
+        let reservation = service
+            .reserve_payment(client_id, *epoch, charges, ids)
+            .map_err(ApiError::BudgetExceeded)?;
+        Ok(Debit::reserved(Arc::clone(service), reservation))
+    }
+
     /// Link an operation's durable journal before committing its G1 debit.
     /// The callback is synchronous and cannot call the pairing service.
     pub(crate) fn debit_linked(

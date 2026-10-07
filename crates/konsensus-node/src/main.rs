@@ -186,6 +186,8 @@ async fn main() -> Result<()> {
             owner_cmd::cmd_pair_status(&config).await?;
         }
         Command::Grant {
+            payee,
+            deny_all_payees,
             op_id,
             budget,
             for_,
@@ -196,6 +198,8 @@ async fn main() -> Result<()> {
             allow_liquidity_fees,
         } => {
             let flags = owner_cmd::GrantFlags {
+                payees: payee,
+                deny_all_payees,
                 allow_liquidity_fees,
                 budget_sats: budget,
                 window: for_,
