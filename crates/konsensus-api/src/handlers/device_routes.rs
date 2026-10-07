@@ -85,7 +85,7 @@ pub struct DeviceKeyResponse {
     pub delegation_message: Option<String>,
 }
 
-async fn request_device_key(
+pub(crate) async fn request_device_key(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<DeviceKeyRequest>,
@@ -107,7 +107,7 @@ async fn request_device_key(
     }))
 }
 
-async fn device_key_status(
+pub(crate) async fn device_key_status(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
@@ -161,7 +161,7 @@ async fn delegate_device_key(
 
 /// `DELETE /api/v1/pair/device-key/{op_id}` and
 /// `DELETE /api/v1/pair/elevation/{op_id}`: withdraw your own pending request.
-async fn cancel_pending(
+pub(crate) async fn cancel_pending(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(op_id): Path<String>,
@@ -173,7 +173,7 @@ async fn cancel_pending(
     Ok(Json(serde_json::json!({ "op_id": op_id, "status": "cancelled" })))
 }
 
-async fn list_device_keys(
+pub(crate) async fn list_device_keys(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

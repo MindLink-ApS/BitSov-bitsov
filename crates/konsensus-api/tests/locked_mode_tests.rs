@@ -199,20 +199,33 @@ async fn locked_router_allowlist_and_tunnel_only_unlock() {
         "/health",
         "/auth/local",
         "/api/v1/auth/local",
+        "/api/v1/pair",
+        "/api/v1/pair/revoke",
+        "/api/v1/pair/window",
+        "/api/v1/pair/relation-intent",
+        "/api/v1/pair/first-contact-grant",
+        "/api/v1/identity/replacement-request",
         "/api/v1/pair/request",
         "/api/v1/pair/confirm",
         "/api/v1/pair/token",
         "/api/v1/pair/device-keys",
+        "/api/v1/pair/device-key",
+        "/api/v1/pair/device-key/op",
+        "/api/v1/pair/device-key/op/delegate",
+        "/api/v1/pair/device-keys/key",
         "/api/v1/status",
         "/ws",
         "/metrics",
     ] {
         for method in ["GET", "POST", "DELETE"] {
-            assert_eq!(
-                f.request(None, method, path, json!({})).await.0,
-                StatusCode::NOT_FOUND,
-                "{method} {path}"
-            );
+            for client in [None, Some(0)] {
+                assert_eq!(
+                    f.request(client, method, path, json!({})).await.0,
+                    StatusCode::NOT_FOUND,
+                    "{method} {path}, paired={}",
+                    client.is_some()
+                );
+            }
         }
     }
     assert_eq!(

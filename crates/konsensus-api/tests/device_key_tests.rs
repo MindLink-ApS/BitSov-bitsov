@@ -529,6 +529,36 @@ fn a_client_cancels_only_its_own_pending_request() {
 }
 
 #[test]
+fn a_client_cannot_cancel_another_clients_pending_device_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _) = owner_run(tmp.path());
+    let (a, _) = pair(&service, 1);
+    let (b, _) = pair(&service, 2);
+    let device = Device::new();
+    let op = service
+        .request_device_key(
+            &a.client_id,
+            &device.public_hex(),
+            "mac",
+            &device.proof(&a.client_id),
+        )
+        .unwrap();
+    assert_eq!(
+        service.device_key_status(&a.client_id, &op.op_id),
+        DeviceKeyStatus::Pending
+    );
+
+    assert!(matches!(
+        service.cancel_pending(&b.client_id, &op.op_id),
+        Err(PairingError::UnknownOperation)
+    ));
+    assert_eq!(
+        service.device_key_status(&a.client_id, &op.op_id),
+        DeviceKeyStatus::Pending
+    );
+}
+
+#[test]
 fn a_rotated_pairing_can_register_the_same_device_again() {
     let tmp = tempfile::tempdir().unwrap();
     let (service, console, client, device, _) = registered(tmp.path());

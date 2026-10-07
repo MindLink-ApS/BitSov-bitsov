@@ -237,6 +237,9 @@ struct Tunnel {
 }
 impl Tunnel {
     async fn connect(f: &Fixture, auth: Value) -> (Self, Value) {
+        Self::connect_pinned(f, &f.box_pin, auth).await
+    }
+    async fn connect_pinned(f: &Fixture, pin: &[u8; 32], auth: Value) -> (Self, Value) {
         let mut stream = TcpStream::connect(f.remote).await.unwrap();
         let mut noise = NoiseSession::initiator(&[18; 32]).unwrap();
         wire::write_frame(&mut stream, &noise.write_handshake(&[]).unwrap())
@@ -249,7 +252,7 @@ impl Tunnel {
                     .unwrap(),
             )
             .unwrap();
-        assert_eq!(noise.remote_static_key().unwrap(), &f.box_pin);
+        assert_eq!(noise.remote_static_key().unwrap(), pin);
         wire::write_frame(&mut stream, &noise.write_handshake(&[]).unwrap())
             .await
             .unwrap();
@@ -270,8 +273,28 @@ impl Tunnel {
         (Self { stream, noise }, response)
     }
     async fn post(&mut self, path: &str, body: Value) -> (u16, Value) {
+        self.post_with_token(path, body, None).await
+    }
+    async fn post_with_token(
+        &mut self,
+        path: &str,
+        body: Value,
+        token: Option<&str>,
+    ) -> (u16, Value) {
+        self.request("POST", path, body, token).await
+    }
+    async fn request(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Value,
+        token: Option<&str>,
+    ) -> (u16, Value) {
+        let authorization = token
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
         let body = Zeroizing::new(body.to_string());
-        let request = Zeroizing::new(format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",body.len(),body.as_str()));
+        let request = Zeroizing::new(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",body.len(),body.as_str()));
         wire::write_frame(
             &mut self.stream,
             &wire::encode_transport(&mut self.noise, request.as_bytes()).unwrap(),
@@ -369,6 +392,19 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         }
         let (mut tunnel, auth) = Tunnel::connect(&f, json!({"v":1})).await;
         assert_eq!(auth["status"], "ok");
+        for path in [
+            "/api/v1/pair/device-key",
+            "/api/v1/pair/device-key/op/delegate",
+        ] {
+            assert_eq!(tunnel.post(path, json!({})).await.0, 404, "locked {path}");
+        }
+        for (method, path) in [
+            ("GET", "/api/v1/pair/device-keys"),
+            ("GET", "/api/v1/pair/device-key/op"),
+            ("DELETE", "/api/v1/pair/device-key/op"),
+        ] {
+            assert_eq!(tunnel.request(method, path, json!({}), None).await.0, 404);
+        }
         let c = tunnel.challenge().await;
         assert_eq!(
             tunnel
@@ -428,6 +464,53 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
             .unwrap();
         let token:Value=http.post(format!("http://{}/api/v1/pair/token",f.api)).json(&json!({"client_id":f.record.client_id,"challenge":challenge["challenge"],"signature":hex::encode(f.client.sign(challenge["challenge"].as_str().unwrap().as_bytes()).to_bytes())})).send().await.unwrap().json().await.unwrap();
         let token = token["token"].as_str().unwrap();
+        // Enrollment requests are available while unlocked; authority writes
+        // (including delegation) remain absent even with a paired token.
+        let (mut unlocked_tunnel, auth) =
+            Tunnel::connect_pinned(&f, f.identity.x25519_public().as_bytes(), json!({"v": 1}))
+                .await;
+        assert_eq!(auth["status"], "ok");
+        for path in [
+            "/api/v1/pair/device-key/op/delegate",
+            "/api/v1/pair/relation-intent",
+            "/api/v1/pair/first-contact-grant",
+            "/api/v1/identity/replacement-request",
+        ] {
+            assert_eq!(
+                unlocked_tunnel
+                    .post_with_token(path, json!({}), Some(token))
+                    .await
+                    .0,
+                404,
+                "unlocked {path}"
+            );
+        }
+        let (status, keys) = unlocked_tunnel.request("GET", "/api/v1/pair/device-keys", json!({}), Some(token)).await;
+        assert_eq!(status, 200);
+        assert_eq!(keys["device_keys"][0]["key_id"], f.record.key_id);
+        let rng = ring::rand::SystemRandom::new();
+        let device = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING,
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap().as_ref(), &rng).unwrap();
+        let public = hex::encode(device.public_key().as_ref());
+        let message = device::registration_message(
+            &pairing::identity_fingerprint(&f.identity.node_id().to_hex()), &f.record.client_id, &public);
+        let proof = hex::encode(device.sign(&rng, message.as_bytes()).unwrap().as_ref());
+        let (status, reg) = unlocked_tunnel.post_with_token("/api/v1/pair/device-key",
+            json!({"public_key": public, "name": "new phone", "proof": proof}), Some(token)).await;
+        if local {
+            assert_eq!(status, 200, "{reg}");
+            let path = format!("/api/v1/pair/device-key/{}", reg["op_id"].as_str().unwrap());
+            let (status, pending) = unlocked_tunnel.request("GET", &path, json!({}), Some(token)).await;
+            assert_eq!(status, 200);
+            assert_eq!(pending["status"], "pending");
+            assert_eq!(unlocked_tunnel.request("DELETE", &path, json!({}), Some(token)).await.0, 200);
+            let (status, gone) = unlocked_tunnel.request("GET", &path, json!({}), Some(token)).await;
+            assert_eq!(status, 200);
+            assert_eq!(gone["status"], "absent");
+        } else {
+            assert_eq!(status, 403, "authority stays disabled without local-owner mode");
+        }
+        drop(unlocked_tunnel);
         let keys: Value = http
             .get(format!("http://{}/api/v1/pair/device-keys", f.api))
             .bearer_auth(token)
