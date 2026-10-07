@@ -1,4 +1,5 @@
 use super::*;
+use crate::tower::blob::SealedBlob;
 use async_trait::async_trait;
 use bitcoin::{
     hashes::Hash,
@@ -15,7 +16,9 @@ use std::result::Result;
 use std::sync::Mutex;
 
 // A real LDK commitment and W1-shaped, revocation-signed three-tier candidate.
-fn revoked_candidate() -> (
+fn revoked_candidate_at(
+    number: u64,
+) -> (
     bitcoin::Transaction,
     ldk_node::tower_hook::JusticeCandidate,
     ScriptBuf,
@@ -47,7 +50,7 @@ fn revoked_candidate() -> (
         channel_value_satoshis: 100_000,
     };
     let commitment = CommitmentTransaction::new(
-        42,
+        number,
         &pk(30),
         80_000,
         10_000,
@@ -108,6 +111,7 @@ struct Chain {
     blocks: Mutex<Vec<bitcoin::Block>>,
     sent: Mutex<Vec<bitcoin::Transaction>>,
     fail: Mutex<bool>,
+    reject: Mutex<Vec<Txid>>,
 }
 impl Chain {
     fn push(&self, txdata: Vec<bitcoin::Transaction>) {
@@ -151,7 +155,7 @@ impl ChainProvider for Chain {
             .ok_or(ChainError::BlockNotFound(h))
     }
     async fn broadcast_transaction(&self, tx: &bitcoin::Transaction) -> Result<(), ChainError> {
-        if *self.fail.lock().unwrap() {
+        if *self.fail.lock().unwrap() || self.reject.lock().unwrap().contains(&tx.compute_txid()) {
             return Err(ChainError::Connection("offline".into()));
         }
         self.sent.lock().unwrap().push(tx.clone());
@@ -182,7 +186,7 @@ async fn tower_server_revoked_commitment_ladder_restart_reorg_and_confirmation()
     };
     let chain = Chain::default();
     chain.push(vec![]);
-    let (breach, candidate, dest) = revoked_candidate();
+    let (breach, candidate, dest) = revoked_candidate_at(42);
     let blob = SealedBlob::encrypt(breach.compute_txid(), &candidate.ladder).unwrap();
     let mut core = TowerServer::open(&cfg, dir.path()).unwrap().unwrap();
     core.storage
@@ -233,7 +237,7 @@ async fn tower_server_revoked_commitment_ladder_restart_reorg_and_confirmation()
 
 #[tokio::test]
 async fn tower_server_wrong_key_invalid_spend_and_confirmed_ladder_never_broadcast() {
-    let (breach, candidate, _) = revoked_candidate();
+    let (breach, candidate, _) = revoked_candidate_at(42);
     for mode in 0..3 {
         let dir = tempfile::tempdir().unwrap();
         let cfg = ServiceConfig {
@@ -277,4 +281,146 @@ fn tower_server_off_has_no_filesystem_effect() {
         .unwrap()
         .is_none());
     assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn tower_server_rejection_does_not_starve_other_breaches_or_fee_bumps() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = ServiceConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let mut core = TowerServer::open(&cfg, dir.path()).unwrap().unwrap();
+    let (breach, a, _) = revoked_candidate_at(42);
+    let (other, b, _) = revoked_candidate_at(43);
+    assert_ne!(breach.compute_txid(), other.compute_txid());
+    core.storage
+        .accept(
+            [1; 32],
+            0,
+            &SealedBlob::encrypt(breach.compute_txid(), &a.ladder).unwrap(),
+            1,
+            1_000_000,
+        )
+        .unwrap();
+    core.storage
+        .accept(
+            [2; 32],
+            0,
+            &SealedBlob::encrypt(other.compute_txid(), &b.ladder).unwrap(),
+            1,
+            1_000_000,
+        )
+        .unwrap();
+    let chain = Chain::default();
+    chain
+        .reject
+        .lock()
+        .unwrap()
+        .push(a.ladder[0].compute_txid());
+    chain.push(vec![breach, other]);
+    assert!(core.sync(&chain, 2).await.is_err());
+    assert_eq!(*chain.sent.lock().unwrap(), vec![b.ladder[0].clone()]);
+    drop(core);
+    let mut core = TowerServer::open(&cfg, dir.path()).unwrap().unwrap();
+    for _ in 0..3 {
+        chain.push(vec![]);
+        let _ = core.sync(&chain, 3).await;
+    }
+    assert!(chain.sent.lock().unwrap().contains(&a.ladder[1]));
+}
+
+#[tokio::test]
+async fn tower_server_old_unfired_breach_is_not_pruned_before_first_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = ServiceConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let mut core = TowerServer::open(&cfg, dir.path()).unwrap().unwrap();
+    let (breach, candidate, _) = revoked_candidate_at(42);
+    core.storage
+        .accept(
+            [1; 32],
+            0,
+            &SealedBlob::encrypt(breach.compute_txid(), &candidate.ladder).unwrap(),
+            1,
+            1_000_000,
+        )
+        .unwrap();
+    let chain = Chain::default();
+    chain.push(vec![breach]);
+    for _ in 0..1001 {
+        chain.push(vec![]);
+    }
+    for _ in 0..8 {
+        core.sync(&chain, 2).await.unwrap();
+    }
+    assert_eq!(*chain.sent.lock().unwrap(), candidate.ladder[..1]);
+    core.storage.prune(3, 2000).unwrap();
+    assert_eq!(core.status().unwrap().blobs, 1);
+    core.storage.prune(3, 2001).unwrap();
+    assert_eq!(core.status().unwrap().blobs, 0);
+}
+
+#[tokio::test]
+async fn tower_server_expiry_prunes_even_when_chain_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = ServiceConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let mut core = TowerServer::open(&cfg, dir.path()).unwrap().unwrap();
+    let (breach, candidate, _) = revoked_candidate_at(42);
+    core.storage
+        .accept(
+            [1; 32],
+            0,
+            &SealedBlob::encrypt(breach.compute_txid(), &candidate.ladder).unwrap(),
+            1,
+            10,
+        )
+        .unwrap();
+    let chain = konsensus_chain::MockChainProvider::new(); // Full blocks unsupported; no I/O.
+    assert!(core
+        .sync(&chain, 10 + super::super::storage::GRACE_SECONDS)
+        .await
+        .is_err());
+    assert_eq!(core.status().unwrap().blobs, 0);
+}
+
+#[tokio::test]
+async fn tower_server_same_hint_multiple_sessions_deduplicates_and_isolates_wrong_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = ServiceConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let mut core = TowerServer::open(&cfg, dir.path()).unwrap().unwrap();
+    let (breach, candidate, _) = revoked_candidate_at(42);
+    let mut wrong = breach.compute_txid().to_byte_array();
+    wrong[31] ^= 1;
+    for (session, key) in [
+        (1, Txid::from_byte_array(wrong)),
+        (2, breach.compute_txid()),
+        (3, breach.compute_txid()),
+    ] {
+        core.storage
+            .accept(
+                [session; 32],
+                0,
+                &SealedBlob::encrypt(key, &candidate.ladder).unwrap(),
+                1,
+                1_000_000,
+            )
+            .unwrap();
+    }
+    let chain = Chain::default();
+    chain.push(vec![breach]);
+    core.sync(&chain, 2).await.unwrap();
+    core.sync(&chain, 3).await.unwrap();
+    assert_eq!(*chain.sent.lock().unwrap(), candidate.ladder[..1]);
+    assert_eq!(core.status().unwrap().blobs, 3);
+    assert_eq!(core.status().unwrap().breaches_seen, 1);
+    assert_eq!(core.status().unwrap().breaches_broadcast, 1);
 }

@@ -1,8 +1,5 @@
 //! Decision-neutral tower service. Broadcasts only the client's sealed transactions.
-use super::{
-    blob::SealedBlob,
-    storage::{Error, Result, TowerStorage},
-};
+use super::storage::{Error, Result, TowerStorage};
 use bitcoin::{hashes::Hash, Transaction, Txid};
 use konsensus_core::{tower::TowerServeStatus, traits::chain::ChainProvider};
 use rusqlite::{params, OptionalExtension};
@@ -66,6 +63,8 @@ impl TowerServer {
     /// Bounded catch-up through the node's selected chain source. Rewind to the
     /// common ancestor; retain submission receipts across forks and restarts.
     pub async fn sync(&mut self, chain: &dyn ChainProvider, now: u64) -> Result<()> {
+        // Retention expiry is independent of chain availability.
+        self.storage.prune(now, 0)?;
         let tip = chain.get_block_height().await?;
         let cursor: Option<(u64, u64, String)> = self
             .storage
@@ -235,6 +234,8 @@ impl TowerServer {
         Ok(())
     }
     async fn broadcast_due(&mut self, chain: &dyn ChainProvider, tip: u64) -> Result<()> {
+        let mut failure = None;
+        let mut attempted = std::collections::HashSet::new();
         for row in self.storage.active()? {
             let (Some(breach), Some(height), Some(hash)) = (row.breach, row.height, row.hash)
             else {
@@ -257,29 +258,41 @@ impl TowerServer {
             let ladder = row.blob.decrypt(txid)?;
             for (tier, justice) in ladder.iter().enumerate() {
                 let id = justice.compute_txid().to_string();
-                let sent: Option<bool> = self
+                let receipt: Option<(bool, u64)> = self
                     .storage
                     .db
-                    .query_row("SELECT sent FROM broadcasts WHERE txid=?1", [&id], |r| {
-                        r.get(0)
-                    })
+                    .query_row(
+                        "SELECT sent,height FROM broadcasts WHERE txid=?1",
+                        [&id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
                     .optional()?;
-                if sent == Some(true) {
+                // Attempts, including fee-floor rejections, start the three-block
+                // escalation timer. Success is independently tracked for dedup.
+                if tier + 1 < ladder.len()
+                    && receipt.is_some_and(|(_, at)| tip >= at.max(height).saturating_add(3))
+                {
                     continue;
+                }
+                if receipt.is_some_and(|(sent, _)| sent) {
+                    break;
                 }
                 if tier > 0 {
                     let last: Option<u64> = self
                         .storage
                         .db
                         .query_row(
-                            "SELECT height FROM broadcasts WHERE txid=?1 AND sent=1",
+                            "SELECT height FROM broadcasts WHERE txid=?1",
                             [ladder[tier - 1].compute_txid().to_string()],
                             |r| r.get(0),
                         )
                         .optional()?;
-                    if !last.is_some_and(|last| tip >= last.max(height).saturating_add(3)) {
+                    if !last.is_some_and(|at| tip >= at.max(height).saturating_add(3)) {
                         break;
                     }
+                }
+                if !attempted.insert(id.clone()) {
+                    break;
                 }
                 // Durable intent, then exact byte-for-byte submission. A crash between
                 // external acceptance and this receipt may retry the SAME txid; an
@@ -289,7 +302,10 @@ impl TowerServer {
                     "INSERT OR IGNORE INTO broadcasts(txid,breach,tier,height) VALUES(?1,?2,?3,?4)",
                     params![id, breach, tier as u64, tip],
                 )?;
-                chain.broadcast_transaction(justice).await?;
+                if let Err(error) = chain.broadcast_transaction(justice).await {
+                    failure = Some(error);
+                    break; // One rejected breach must not starve other clients.
+                }
                 let db = self.storage.db.transaction()?;
                 let first: bool = db.query_row(
                     "SELECT NOT EXISTS(SELECT 1 FROM broadcasts WHERE breach=?1 AND sent=1)",
@@ -299,13 +315,17 @@ impl TowerServer {
                 if first {
                     db.execute("UPDATE totals SET broadcast=broadcast+1", [])?;
                 }
+                db.execute("UPDATE broadcasts SET sent=1 WHERE txid=?1", params![id])?;
                 db.execute(
-                    "UPDATE broadcasts SET sent=1,height=?1 WHERE txid=?2",
-                    params![tip, id],
+                    "UPDATE blobs SET fired=COALESCE(fired,?1) WHERE breach=?2",
+                    params![tip, breach],
                 )?;
                 db.commit()?;
                 break;
             }
+        }
+        if let Some(error) = failure {
+            return Err(error.into());
         }
         Ok(())
     }

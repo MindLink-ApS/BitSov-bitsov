@@ -64,7 +64,7 @@ impl TowerStorage {
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA auto_vacuum=INCREMENTAL;
             CREATE TABLE IF NOT EXISTS sessions(id BLOB PRIMARY KEY CHECK(length(id)=32), retention INTEGER NOT NULL, arrivals TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS blobs(id INTEGER PRIMARY KEY, session BLOB NOT NULL REFERENCES sessions(id), hint BLOB NOT NULL CHECK(length(hint)=16), seq INTEGER NOT NULL, nonce BLOB NOT NULL CHECK(length(nonce)=24), cipher BLOB NOT NULL CHECK(length(cipher)<=4072), received INTEGER NOT NULL,
-                breach TEXT, height INTEGER, hash TEXT, confirmed INTEGER, UNIQUE(session,hint));
+                breach TEXT, height INTEGER, hash TEXT, confirmed INTEGER, fired INTEGER, UNIQUE(session,hint));
             CREATE INDEX IF NOT EXISTS hints ON blobs(hint);
             CREATE INDEX IF NOT EXISTS fired ON blobs(breach) WHERE breach IS NOT NULL;
             CREATE TABLE IF NOT EXISTS broadcasts(txid TEXT PRIMARY KEY, breach TEXT NOT NULL, tier INTEGER NOT NULL, height INTEGER NOT NULL, sent INTEGER NOT NULL DEFAULT 0);
@@ -187,7 +187,7 @@ impl TowerStorage {
     }
     pub(super) fn prune(&mut self, now: u64, height: u64) -> Result<()> {
         let tx = self.db.transaction()?;
-        tx.execute("DELETE FROM blobs WHERE session IN (SELECT id FROM sessions WHERE retention+?1<=?2) OR (height IS NOT NULL AND height+1000<=?3)",params![GRACE_SECONDS,now,height])?;
+        tx.execute("DELETE FROM blobs WHERE session IN (SELECT id FROM sessions WHERE retention+?1<=?2) OR (height IS NOT NULL AND fired IS NOT NULL AND fired+1000<=?3)",params![GRACE_SECONDS,now,height])?;
         tx.execute(
             "DELETE FROM sessions WHERE id NOT IN (SELECT session FROM blobs) AND retention+?1<=?2",
             params![GRACE_SECONDS, now],
@@ -258,6 +258,7 @@ mod tests {
                 .accept([2; 32], seq, &blob(4), 700_000, 800_000)
                 .unwrap();
         }
+        store.delete([2; 32], &[[4; 16]]).unwrap();
         assert!(store
             .accept([2; 32], 601, &blob(4), 700_001, 800_000)
             .is_err());
