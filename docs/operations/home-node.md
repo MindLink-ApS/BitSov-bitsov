@@ -54,14 +54,17 @@ approval during an unlocked start**. A ticket pairs a client; it does not approv
 its owner key. A locked node needs an already approved key, so first enrollment
 must happen before enabling remote unlock.
 
-**Current transport limitation:** the normal Noise tunnel does not expose
-`/api/v1/pair/device-key` or its delegation route. The steps below require a
-client that can send enrollment requests to the owner-local API, for example
-through a private SSH port forward terminating at that loopback API. Keep the
-API bound to loopback. A tunnel-only desktop client cannot complete enrollment
-or delegation on this node version; ticket pairing and subsequent remote unlock
-are available over Noise.
+While unlocked, the Noise tunnel exposes enrollment requests, status polling,
+cancellation, and read-only key listing. A tunnel-only paired client can request
+its key and wait for console approval. The HTTP API stays bound to loopback;
+no SSH port forward is needed for those four operations. Nothing on the tunnel
+can approve a device: delegation remains on the owner-local API.
 
+Pending registrations are capped at eight node-wide across local and tunnel
+requests (HTTP 429 at capacity), with the existing 30-second per-client floor,
+one in flight per client, 15-minute expiry, and four live keys per client.
+Replacing your own pending request after the floor uses the same slot;
+cancellation, approval, or expiry frees a slot.
 1. Stop the node service. Use the same config, data directory and OS account for
    every step. Configure the Noise endpoint your device can reach; see the
    [`[remote_access]` Tailscale example](reachability.md#settings). Keep the HTTP
@@ -89,7 +92,10 @@ are available over Noise.
 4. On the paired device, request owner-key enrollment (for example, **Set up
    Touch ID approvals** in a supporting app). The device creates its P-256 key,
    proves possession, and sends `POST /api/v1/pair/device-key` with its paired
-   token to the owner-local API. It receives a pending `op_id` and fingerprint.
+   token over the unlocked Noise tunnel (or to the owner-local API). It receives
+   a pending `op_id` and fingerprint. Poll `GET /api/v1/pair/device-key/{op_id}`
+   until registered; `DELETE` on that path cancels the request, and
+   `GET /api/v1/pair/device-keys` lists this client's registered keys.
    At the box, run:
 
    ```sh
@@ -118,12 +124,14 @@ are available over Noise.
 
 Use **option D** while the node is unlocked after a
 `--remote-unlock --local-owner-device` start. Issue another ticket, pair the new
-device, and have it request `POST /api/v1/pair/device-key`. An already approved
+device, and have it request `POST /api/v1/pair/device-key` over the unlocked
+Noise tunnel or owner-local API. An already approved
 owner device verifies the node and compares the new device's fingerprint, then
 signs the exact pending `delegation_message`. Using **the approving device's
 paired token**, it submits `{approver_key_id, signature}` to
 `POST /api/v1/pair/device-key/{op_id}/delegate` on the owner-local API (available
-in rc11, but not exposed on the Noise tunnel).
+only through a local connection or a private SSH port forward to the loopback
+API, never through the Noise tunnel).
 
 This needs client support for delegation; see the
 [delegation contract](../security/device-keys.md#delegating-another-owner-device).

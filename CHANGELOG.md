@@ -5,14 +5,16 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
-- Document first owner-device enrollment by console approval before remote
-  unlock, and later enrollment by delegation. Correct the tunnel route
-  description and document its enrollment and password-descriptor limitations.
-  Contract tests cover local API approval/delegation, persisted keys across
-  locked service restarts and unapproved-key rejection; process tests pin
-  device-key/delegation 404s over Noise. Locked route restrictions are checked
-  for paired and unpaired callers. No node mode,
-  route or cryptographic behavior changes.
+- Allow paired clients on the unlocked Noise tunnel to request, poll and cancel
+  device-key registration and list their keys. Cap pending registrations at
+  eight node-wide (HTTP 429), preserving per-client limits. Approval authority
+  is unchanged: console approval or owner-local delegation; delegation,
+  self-revocation and other owner-management writes stay off the tunnel.
+  Locked mode retains its four routes. Tests cover the route boundary and
+  tunnel registration → console approval → locked restart → signed unlock.
+  Update the [owner-enrollment runbook](docs/operations/home-node.md#enroll-your-first-owner-device):
+  `--owner-control` requires a typed password; `--password-fd` disables owner
+  device authority in that mode.
 
 - Node-local offline safety alert (v1 safety PR 2): persist an atomic synced-height
   heartbeat while unlocked, warn at 50% and report critical at 80% of each open

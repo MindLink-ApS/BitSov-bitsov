@@ -214,21 +214,36 @@ exactly the same JWT, live pairing binding and `read` scope checks as loopback:
   Another client's operation and an unknown operation both return `UnknownOperation` (HTTP 404).
 - `DELETE /api/v1/pair/elevation/{op_id}` withdraws the caller's own request.
 - `GET /api/v1/pair/grant` reads the caller's own grant (or `null`).
+- `POST /api/v1/pair/device-key` requests device-key registration with proof of
+  possession. At most eight unexpired requests may be pending node-wide across
+  local and tunnel callers; additional requests return HTTP 429 before an owner
+  challenge is produced. The existing per-client bounds remain: a 30-second
+  request floor, one in flight (a later request replaces it), a 15-minute TTL,
+  and four live keys. Replacement uses the same slot; cancellation, approval,
+  or expiry frees capacity.
+- `GET /api/v1/pair/device-key/{op_id}` reads the caller's registration status;
+  `DELETE` on that path cancels its pending request.
+- Read-only `GET /api/v1/pair/device-keys` lists the caller's registered keys.
 
 These routes never issue a grant. The unlocked Noise bridge forwards HTTP bytes
 without a path allowlist, but its destination is `build_remote_router_with_limiter`,
-which selects `pairing_routes::remote_routes`. That router omits device-key
-management, delegation and relation intents, as well as first-contact approval
-writes. They remain absent on the tunnel; the device-key handlers are mounted
-only on the owner-local API. Spend elevation is still granted only through the
-owner control socket. Asking or quoting confers no spend scope.
+which selects `pairing_routes::remote_routes`. Only the four device-key operations
+above are exposed. Delegation (`POST /pair/device-key/{op_id}/delegate`),
+self-revocation (`DELETE /pair/device-keys/{key_id}`), pairing list/revoke/window/
+request/confirm, relation intents, first-contact-grant POST and identity replacement
+requests remain absent on the tunnel. Nothing on the tunnel approves a key.
+Approval stays at `konsensus device approve` or existing owner-device delegation
+on the owner-local API. Console enrollment requires `--owner-control` with a
+**typed** seed password; `--password-fd` disables owner device authority in that
+mode. Spend elevation is still granted only through the owner control socket.
+Asking or quoting confers no spend scope.
 
-The remote router also omits the loopback token mint, public probes, metrics and
-local first-pair ceremony. Locked mode uses a separate router with only
-`GET /livez`, `GET /api/v1/node/lock`, `POST /api/v1/node/unlock/challenge` and
-`POST /api/v1/node/unlock`; device-key enrollment is unavailable until unlocked.
+The remote router also omits the loopback token mint, public probes and metrics.
+Locked mode uses a separate router with only `GET /livez`,
+`GET /api/v1/node/lock`, `POST /api/v1/node/unlock/challenge` and
+`POST /api/v1/node/unlock`; all device-key enrollment routes stay 404 while locked.
 See the [first owner device runbook](../operations/home-node.md#enroll-your-first-owner-device)
-for the current enrollment transport limitation.
+for tunnel registration followed by console approval and locked restart.
 
 `POST /api/v1/messages/first-contact/quote` requires `read`, including for a
 `read` + `receive` pairing with no spend grant. It performs only bounded payment

@@ -49,6 +49,9 @@ pub fn device_approvals_off_message(reason: &str) -> &'static str {
     }
 }
 
+/// Unexpired device-key registrations across all clients and both routers.
+pub const MAX_PENDING_DEVICE_KEYS: usize = 8;
+
 /// Registered device keys per paired client.
 pub const MAX_DEVICE_KEYS_PER_CLIENT: usize = 4;
 
@@ -393,6 +396,19 @@ impl PairingService {
         if inner.file.pending_device_keys.iter().any(|p| {
             p.client_id == client_id && p.expires_at - ELEVATION_TTL_SECS > now - 30
         }) {
+            return Err(PairingError::TooManyPending);
+        }
+        // Replacement by this client does not consume another slot. Expired
+        // requests are pruned below. Check under the same lock as insertion,
+        // before printing/writing any owner challenge, on both HTTP routers.
+        if inner
+            .file
+            .pending_device_keys
+            .iter()
+            .filter(|p| p.expires_at > now && p.client_id != client_id)
+            .count()
+            >= MAX_PENDING_DEVICE_KEYS
+        {
             return Err(PairingError::TooManyPending);
         }
         // Keys retired by a rotation or epoch bump no longer block the device.
