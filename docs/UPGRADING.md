@@ -3,12 +3,63 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-**rc11 preparation (2026-10-07):** includes all rc10 changes since rc9
-(`cd75c69`), plus #259–#266 through `52670e7`. rc10 was tagged at `83fb6c6`
-but never published because tag CI failed on pairing-ticket revocation, fixed
-by #266. Skip rc10 and upgrade directly to rc11. The release commit will be the
-`main` HEAD after the rc11 docs/version PR merges. The rc9 and older procedures
-remain below for nodes skipping releases: apply them first, then this one.
+**rc12 preparation (2026-10-07):** includes #269, #270 and #273 after the
+rc11 release commit `834968b`. The release commit will be the `main` HEAD after
+this rc12 docs/version PR merges, not the preparation tip `c5b2119`.
+For nodes skipping releases, apply the older procedures below first, then
+[rc11 → rc12](#rc11--rc12-procedure). Earlier sections describe their release's
+behavior; the rc12 home-node delay policy supersedes rc11's optional W0 default.
+
+## rc11 → rc12 procedure
+
+1. **Replace the binary without reinitializing.** Verify the rc12 artifact and
+   signed checksums under the [release policy](ops/RELEASE_POLICY.md), stop the
+   node cleanly, and retain the same config and data directory. Follow the
+   [signing checklist](releases/v0.3.0-rc12.md) for release verification.
+2. **Home-node breach window (#269).** On embedded LDK, starts with
+   `--remote-unlock` or `--local-owner-device` now default to **2016 blocks**
+   (about two weeks). Under `[lightning]`, an explicit
+   `our_to_self_delay_blocks` must be **288–2016** for this profile. Raise or
+   remove a retained value below 288 before starting; it now fails startup.
+   Ordinary non-home starts and the enabled hub/LSP service role
+   (`[lightning.lsps2_service] enabled = true`) retain the 144-block default
+   and 144–2016 explicit range. **Only new channels are affected**; restarting
+   does not extend existing channels' negotiated delay. Peers with a lower
+   maximum may refuse the channel; there is no automatic fallback. The delay
+   holds the peer's own funds after its force-close, which a hub/LSP may price
+   into fees. It does not provide watchtower protection or lift the hub-only
+   restriction. See [breach windows](operations/home-node.md#longer-breach-window-optional).
+3. **Check the owner offline alert (#270).** Owner `GET /api/v1/status` now
+   includes amount-free `offline_safety` diagnostics: warning at **50%** and
+   critical at **80%** of each channel's negotiated breach window. Preserve
+   `offline-heartbeat.json` and `offline-channel-windows.json` with the node
+   data. On the first upgraded start, missing heartbeat history cannot establish
+   past offline time. `estimated: true` marks a time-based estimate when chain
+   observation stalls; `startup_alert` retains a startup warning after catch-up.
+   Unlock, restore chain connectivity, let the node sync, then check channels.
+   This is a local reminder, with no hub push or live notification from a
+   locked/offline node, and no active offline protection. See
+   [offline safety](operations/home-node.md#local-offline-safety-alert).
+4. **Paired tunnel clients can request device-key enrolment (#273).** While
+   unlocked, the Noise tunnel now allows four operations:
+   `POST /api/v1/pair/device-key`, `GET /api/v1/pair/device-key/{op_id}`,
+   `DELETE /api/v1/pair/device-key/{op_id}`, and
+   `GET /api/v1/pair/device-keys`. These request, poll, cancel and list keys for
+   the paired client; they do not approve a key. Pending registrations are
+   capped at **eight node-wide** (HTTP 429), with existing per-client limits
+   retained. For this enrolment flow, approval remains at the node's console
+   via `konsensus device approve`; compare fingerprints before approving.
+   Existing owner-local delegation remains separate and unavailable through the
+   tunnel. The locked router retains its four routes; it cannot enrol keys.
+5. **Use a typed password for console approval.** Start with `--owner-control`
+   and type the encrypted seed's password at the prompt. `--password-fd`
+   disables owner device authority in this mode. Descriptor-based authority
+   requires `--local-owner-device`, which conflicts with `--owner-control`.
+   These are existing authority rules clarified by #273, not a new approval
+   capability. Follow the [owner-enrolment runbook](operations/home-node.md#enroll-your-first-owner-device)
+   before restarting for remote unlock. Tunnel enrolment and status display
+   require supporting client software; the node release alone does not establish
+   app support.
 
 ## rc9 → rc11 procedure
 
