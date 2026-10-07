@@ -373,6 +373,9 @@ pub struct ChannelDetails {
 	///
 	/// This value will be `None` for outbound channels until the counterparty accepts the channel.
 	pub force_close_spend_delay: Option<u16>,
+	/// Our negotiated delay on the counterparty commitment: the breach window
+	/// protecting us. Unlike `force_close_spend_delay`, this delays the peer.
+	pub counterparty_force_close_spend_delay: Option<u16>,
 	/// The smallest value HTLC (in msat) we will accept, for this channel.
 	pub inbound_htlc_minimum_msat: u64,
 	/// The largest value HTLC (in msat) we currently will accept, for this channel.
@@ -428,6 +431,7 @@ impl From<LdkChannelDetails> for ChannelDetails {
 			next_outbound_htlc_limit_msat: value.next_outbound_htlc_limit_msat,
 			next_outbound_htlc_minimum_msat: value.next_outbound_htlc_minimum_msat,
 			force_close_spend_delay: value.force_close_spend_delay,
+			counterparty_force_close_spend_delay: value.counterparty_force_close_spend_delay,
 			// unwrap safety: This field is only `None` for objects serialized prior to LDK 0.0.107
 			inbound_htlc_minimum_msat: value.inbound_htlc_minimum_msat.unwrap_or(0),
 			inbound_htlc_maximum_msat: value.inbound_htlc_maximum_msat,

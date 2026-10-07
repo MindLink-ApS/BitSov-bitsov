@@ -22,6 +22,7 @@ struct State {
 }
 
 pub struct RecoveringLightning {
+    offline_safety: konsensus_core::offline_safety::SharedOfflineSafety,
     state: Arc<RwLock<State>>,
     stop: watch::Sender<bool>,
     worker: Mutex<Option<JoinHandle<Result<(), LightningError>>>>,
@@ -72,6 +73,7 @@ impl RecoveringLightning {
             Err(LightningError::ChainSourceUnavailable { .. }) => None,
             Err(e) => return Err(e),
         };
+        let offline_safety = backend.as_ref().and_then(|p| p.offline_safety()).unwrap_or_default();
         let state = Arc::new(RwLock::new(State {
             backend,
             readiness: LightningReadiness {
@@ -166,6 +168,7 @@ impl RecoveringLightning {
             result
         });
         Ok(Self {
+            offline_safety,
             state,
             stop,
             worker: Mutex::new(Some(worker)),
@@ -197,6 +200,14 @@ impl LightningProvider for RecoveringLightning {
                 error: Some("Lightning backend unavailable; tower coverage unknown".into()),
                 ..Default::default()
             })
+    }
+
+    fn offline_safety(&self) -> Option<konsensus_core::offline_safety::SharedOfflineSafety> {
+        Some(self.offline_safety.clone())
+    }
+
+    fn offline_chain_state(&self) -> Option<konsensus_core::offline_safety::OfflineChainState> {
+        self.state.read().unwrap().backend.as_ref().and_then(|p| p.offline_chain_state())
     }
 
     fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {

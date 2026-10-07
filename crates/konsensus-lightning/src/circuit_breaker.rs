@@ -247,6 +247,14 @@ impl LightningProvider for CircuitBreakerLightning {
         self.inner.tower_status()
     }
 
+    fn offline_safety(&self) -> Option<konsensus_core::offline_safety::SharedOfflineSafety> {
+        self.inner.offline_safety()
+    }
+
+    fn offline_chain_state(&self) -> Option<konsensus_core::offline_safety::OfflineChainState> {
+        self.inner.offline_chain_state()
+    }
+
     fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
         self.inner.chain_sync_status()
     }

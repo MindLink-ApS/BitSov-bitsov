@@ -238,7 +238,9 @@ impl ElectrumChainSource {
 				SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
 			{
 				let mut locked_node_metrics = self.node_metrics.write().unwrap();
-				locked_node_metrics.latest_lightning_wallet_sync_timestamp = unix_time_secs_opt;
+				locked_node_metrics.record_lightning_sync(
+					channel_manager.current_best_block().height, unix_time_secs_opt,
+				);
 				write_node_metrics(
 					&*locked_node_metrics,
 					Arc::clone(&self.kv_store),

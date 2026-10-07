@@ -1174,6 +1174,7 @@ fn ready_sync_status(now: u64) -> ldk_node::NodeStatus {
             bitcoin::Network::Regtest,
         ),
         latest_lightning_wallet_sync_timestamp: Some(now),
+        latest_lightning_wallet_sync: Some((0, now)),
         latest_onchain_wallet_sync_timestamp: Some(now),
         latest_fee_rate_cache_update_timestamp: Some(now),
         latest_rgs_snapshot_timestamp: None,
@@ -1286,4 +1287,21 @@ async fn default_open_reaches_ldk_without_fee_estimates() {
             "{result:?}"
         );
     }
+}
+
+#[test]
+fn offline_safety_checkpoint_never_uses_partial_best_block() {
+    let mut status = ready_sync_status(10_000);
+    status.latest_lightning_wallet_sync = Some((1000, 9_900));
+    status.current_best_block.height = 1170;
+    // The manager has advanced during scanning, but complete sync still stands at 1000.
+    let checkpoint = offline_synced_block(&status).unwrap();
+    assert_eq!((checkpoint.height, checkpoint.unix_secs), (1000, 9_900));
+    // A loaded manager and persisted timestamps are not a sync in this process.
+    status.latest_lightning_wallet_sync = None;
+    assert!(offline_synced_block(&status).is_none());
+    status.latest_lightning_wallet_sync = Some((1170, 10_000));
+    assert_eq!(offline_synced_block(&status).unwrap().height, 1170);
+    status.is_running = false;
+    assert!(offline_synced_block(&status).is_none());
 }
