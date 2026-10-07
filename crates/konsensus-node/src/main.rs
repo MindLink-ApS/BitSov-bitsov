@@ -803,7 +803,7 @@ enum PasswordSource {
     None,
 }
 
-/// Channel policy never depends on how an embedded home node was unlocked.
+/// Lockable starts are always hub-only, regardless of the configured opt-out.
 fn channel_peers_for_start(
     lightning: &LightningConfig,
     source: PasswordSource,
@@ -813,7 +813,7 @@ fn channel_peers_for_start(
     {
         anyhow::bail!("HUB_ONLY_WHILE_LOCKABLE: --remote-unlock cannot run an LSPS2 service");
     }
-    if source == PasswordSource::RemoteUnlock && !matches!(lightning, LightningConfig::Ldk { .. }) {
+    if source == PasswordSource::RemoteUnlock {
         guarded_lightning::ChannelPeers::hub_only(lightning)
     } else {
         guarded_lightning::ChannelPeers::from_config(lightning)
@@ -2423,7 +2423,7 @@ mod owner_key_startup_tests {
     use konsensus_api::pairing::device::{SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
 
     #[test]
-    fn home_channels_are_hub_only_in_every_start_mode_unless_owner_opts_out() {
+    fn home_channels_are_hub_only_and_only_non_lockable_starts_can_opt_out() {
         let default: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
         let opt_out: LightningConfig =
             toml::from_str("backend = 'ldk'\nhub_only_channels = false").unwrap();
@@ -2446,7 +2446,11 @@ mod owner_key_startup_tests {
                 channel_peers_for_start(&opt_out, source)
                     .unwrap()
                     .allowlist(),
-                None,
+                if source == PasswordSource::RemoteUnlock {
+                    Some(vec![])
+                } else {
+                    None
+                },
                 "{source:?}"
             );
         }

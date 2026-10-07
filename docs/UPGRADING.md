@@ -16,8 +16,11 @@ Every non-LSPS2-service LDK node defaults to `lightning.hub_only_channels = true
 in **every start mode**, including ordinary unlocked starts. Configure the hub
 keys in `[lightning.liquidity] providers` or legacy `lightning.lsp_node_id` before
 opening channels. An empty set refuses every new channel. Owners who accept the
-additional counterparty trust can explicitly set `hub_only_channels = false`;
-this also opts out under `--remote-unlock`, while capacity ceilings remain.
+additional counterparty trust can explicitly set `hub_only_channels = false`
+only for non-lockable starts. Under `--remote-unlock`, hub-only remains mandatory
+for the whole run, including after unlock: the opt-out is ignored, and an empty
+hub set refuses every new channel (`HUB_ONLY_WHILE_LOCKABLE`). Capacity ceilings
+remain in all modes.
 Enabled LSPS2 services default to unrestricted peers, cannot be explicitly
 hub-only and still cannot start under `--remote-unlock`.
 

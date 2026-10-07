@@ -36,6 +36,7 @@ pub enum ChannelPeers {
 
 impl ChannelPeers {
     /// All non-service embedded nodes are home nodes, independent of unlock mode.
+    /// Lockable startup must use `hub_only` instead, so an opt-out cannot relax it.
     pub fn from_config(lightning: &crate::config::LightningConfig) -> anyhow::Result<Self> {
         match lightning {
             crate::config::LightningConfig::Ldk {

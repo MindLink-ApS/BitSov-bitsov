@@ -35,11 +35,21 @@ fn node_with_limits(
 	allowlist: Option<Vec<PublicKey>>,
 	limits: Option<crate::channel_limits::ChannelLimits>,
 ) -> (tempfile::TempDir, crate::Node, Arc<Log>) {
+	node_with_trusted_peers(seed, allowlist, limits, Vec::new())
+}
+
+fn node_with_trusted_peers(
+	seed: u8,
+	allowlist: Option<Vec<PublicKey>>,
+	limits: Option<crate::channel_limits::ChannelLimits>,
+	trusted_peers_0conf: Vec<PublicKey>,
+) -> (tempfile::TempDir, crate::Node, Arc<Log>) {
 	let dir = tempfile::tempdir().unwrap();
 	let log = Arc::new(Log::default());
 	let mut builder = crate::Builder::from_config(crate::Config {
 		channel_peer_allowlist: allowlist,
 		channel_limits: limits,
+		trusted_peers_0conf,
 		// No on-chain reserve, so an unfunded node's decision rests on the allowlist alone.
 		anchor_channels_config: Some(AnchorChannelsConfig {
 			per_channel_reserve_sats: 0,
@@ -169,6 +179,46 @@ async fn allowlist_accepts_hub_and_refuses_other_inbound_requests() {
 		.channel_manager
 		.accept_inbound_channel(&refused, &stranger.node_id(), 8, None)
 		.is_err());
+}
+
+#[tokio::test]
+async fn trusted_zero_conf_inbound_still_obeys_capacity_limits() {
+	// Separate peers avoid replaying an earlier open during reconnect.
+	for (amount, refused) in [(100_001, true), (100_000, false)] {
+		let (_peer_dir, peer, _) = node(65, None);
+		let (_home_dir, home, _) = node_with_trusted_peers(
+			66,
+			Some(vec![peer.node_id()]),
+			Some(crate::channel_limits::ChannelLimits::new(100_000, 100_000)),
+			vec![peer.node_id()],
+		);
+		let id = propose_amount(&peer, &home, amount).await;
+		let channels = home.channel_manager.list_channels();
+		if refused {
+			assert!(channels.is_empty());
+			let refusal = home
+				.channel_manager
+				.get_and_clear_pending_msg_events()
+				.into_iter()
+				.find_map(|event| match event {
+					MessageSendEvent::HandleError {
+						action: lightning::ln::msgs::ErrorAction::SendErrorMessage { msg },
+						..
+					} => Some(msg),
+					_ => None,
+				})
+				.expect("capacity refusal sent to peer");
+			assert_eq!(refusal.data, "CHANNEL_CAPACITY_EXCEEDED");
+			assert!(home
+				.channel_manager
+				.accept_inbound_channel_from_trusted_peer_0conf(&id, &peer.node_id(), 8, None)
+				.is_err());
+		} else {
+			// The boundary control must really take the zero-conf acceptance path.
+			assert_eq!(channels.len(), 1);
+			assert_eq!(channels[0].confirmations_required, Some(0));
+		}
+	}
 }
 
 #[tokio::test]

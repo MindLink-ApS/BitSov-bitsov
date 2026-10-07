@@ -203,6 +203,43 @@ async fn explicit_opt_out_allows_any_peer() {
     }
 }
 
+#[tokio::test]
+async fn remote_unlock_hub_only_refuses_non_hub_even_with_opt_out() {
+    for hubs in [String::new(), format!("lsp_node_id = '{HUB}'")] {
+        let config = toml::from_str(&format!(
+            "backend = 'ldk'\nhub_only_channels = false\n{hubs}"
+        ))
+        .unwrap();
+        let peers =
+            crate::channel_peers_for_start(&config, crate::PasswordSource::RemoteUnlock).unwrap();
+        // The same policy supplies the backend's inbound allowlist.
+        let allowlist = peers.allowlist();
+        let (status, body, opened) = open_over_api(peers, STRANGER).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(allowlist.is_some());
+        assert_eq!(body["code"], HUB_ONLY_WHILE_LOCKABLE);
+        assert_eq!(body["retry_allowed"], false);
+        assert!(
+            opened.is_empty(),
+            "refused open reached the backend: {opened:?}"
+        );
+    }
+}
+
+#[test]
+fn remote_unlock_hub_only_rejects_service_even_with_opt_out() {
+    let config = toml::from_str(
+        "backend = 'ldk'\nhub_only_channels = false\n[lsps2_service]\nenabled = true\nrequire_token = 't'",
+    )
+    .unwrap();
+    let error =
+        crate::channel_peers_for_start(&config, crate::PasswordSource::RemoteUnlock).unwrap_err();
+    assert!(
+        error.to_string().starts_with(HUB_ONLY_WHILE_LOCKABLE),
+        "{error}"
+    );
+}
+
 #[test]
 fn hub_only_policy_is_the_configured_liquidity_providers() {
     let ldk = |extra: &str| -> crate::config::LightningConfig {

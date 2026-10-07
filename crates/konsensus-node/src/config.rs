@@ -465,6 +465,7 @@ pub enum LightningConfig {
         #[serde(default = "default_max_total_channel_capacity_sats")]
         max_total_channel_capacity_sats: u64,
         /// Non-service LDK nodes default to hub-only in every startup mode.
+        /// `false` opts out only for non-lockable starts; remote-unlock is always hub-only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hub_only_channels: Option<bool>,
         /// Bounded LSPS2 bootstrap; disabled unless explicitly enabled.

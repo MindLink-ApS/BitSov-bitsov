@@ -306,9 +306,12 @@ Owner `POST /api/v1/payments/open-channel` to any other peer returns HTTP 403,
 `"code": "HUB_ONLY_WHILE_LOCKABLE"`, and `"retry_allowed": false` before
 connection or funding. Automatic opens get the same refusal; inbound non-hub
 requests are rejected before acceptance. The owner can explicitly set
-`hub_only_channels = false` to allow other peers, including under
-`--remote-unlock`; the capacity caps still apply. This increases the set of
-counterparties the owner must trust during unmonitored periods. An enabled
+`hub_only_channels = false` to allow other peers only in non-lockable start
+modes; the capacity caps still apply. Under `--remote-unlock`, this opt-out is
+ignored: hub-only is mandatory for the whole run, including after unlock, and
+an empty hub set refuses every new channel (`HUB_ONLY_WHILE_LOCKABLE`). Opting
+out in a non-lockable mode increases the set of counterparties the owner must
+trust during unmonitored periods. An enabled
 LSPS2 service defaults to unrestricted peers, refuses explicit hub-only config,
 and still cannot run with `--remote-unlock`.
 
