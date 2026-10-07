@@ -643,8 +643,28 @@ Validation commands (no node is started and no RPC, regtest daemon or e2e runs):
     cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib tower_hook
     cargo check --offline --locked --workspace --all-targets
 
-This does **not** claim tower protection: W2 encryption/outbox, transport, tower
-configuration, payment, acknowledgement/pruning and app status are not built.
+W2a adds `TowerClient::new_bounded`: the configured client uses a hard maximum
+of 10,000 signed candidates per channel and an in-memory key index rebuilt once
+per channel after restart. Ordinary writes do not list/decode the signed store.
+The legacy `new` constructor retains W1's pruning policy for existing users.
+Capacity overflow stays in the unsigned recovery journal, with durable deferred
+markers and warnings; known overflow is not re-signed/re-written while full.
+This bounds the signed handoff, **not the recovery journal's total disk usage**.
+Do not discard recovery data to satisfy the handoff quota. Rollback, retirement,
+quarantine and delivery remove obsolete deferred markers. Destination-mismatched
+retired records now warn and skip while preserving the archive.
+
+The bounded handoff exposes pages, diagnostics and durable ack tombstones. The
+W2a caller removes a signed source only after all its deliveries are durably acked.
+An LDK monitor archive records a durable close marker for local pruning; a
+`ChannelClosed` event alone is not closure proof. Failed archive-marker writes
+warn and conservatively retain tower data. No remote delete is sent in W2a.
+The new offline tests cover destination mismatch, hard-cap overflow, one index
+rebuild instead of per-write listing, restart/ack cleanup, and deferred rollback.
+
+This does **not** claim tower protection: W2a encryption, local outbox, opt-in
+configuration and owner status exist, but transport, sessions and payments are
+TODO(W2b). No production acknowledgements are generated in W2a.
 Enabling after earlier channel use cannot recover historical commitments missed
 while disabled. Quarantining corruption can leave historical states unguarded;
 this recovery policy avoids a permanent startup loop and does not claim repair of

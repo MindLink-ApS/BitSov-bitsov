@@ -258,6 +258,7 @@ pub async fn lightning(dir: &std::path::Path, chain: &Chain) -> (Arc<LdkProvider
 pub fn lightning_config(dir: &std::path::Path, url: &str) -> konsensus_lightning::LdkConfig {
     let (mnemonic, _) = NodeIdentity::generate().unwrap();
     konsensus_lightning::LdkConfig {
+        tower: Default::default(),
         forward_to_private_channels: false,
         our_to_self_delay_blocks: None,
         lsps2_service: Default::default(),

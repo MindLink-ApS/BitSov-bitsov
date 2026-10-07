@@ -191,6 +191,14 @@ impl Drop for RecoveringLightning {
 
 #[async_trait]
 impl LightningProvider for RecoveringLightning {
+    fn tower_status(&self) -> konsensus_core::tower::TowerStatus {
+        self.state.read().unwrap().backend.as_ref().map(|p| p.tower_status())
+            .unwrap_or_else(|| konsensus_core::tower::TowerStatus {
+                error: Some("Lightning backend unavailable; tower coverage unknown".into()),
+                ..Default::default()
+            })
+    }
+
     fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
         // Diagnostics must bypass backend(), which deliberately gates money work.
         self.state.read().unwrap().backend.as_ref().and_then(|p| p.chain_sync_status())

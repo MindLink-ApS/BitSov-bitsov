@@ -342,5 +342,28 @@ pub fn routes(operator_probes_enabled: bool) -> Router<Arc<AppState>> {
 /// Authenticated status only, for the encrypted remote API. Public/operator
 /// liveness endpoints belong exclusively to the owner's local listener.
 pub fn status_routes() -> Router<Arc<AppState>> {
-    Router::new().route("/api/v1/status", get(status))
+    Router::new()
+        .route("/api/v1/status", get(status))
+        .route("/api/v1/tower/status", get(tower_status))
+}
+
+#[derive(Serialize)]
+struct TowerResponse {
+    coverage_scope: &'static str,
+    #[serde(flatten)]
+    status: konsensus_core::tower::TowerStatus,
+}
+
+/// Cached local diagnostics only. TODO(W2b): decide HTLC-gap UX before any
+/// broader guarded claim or HUB_ONLY_WHILE_LOCKABLE relaxation.
+async fn tower_status(
+    _auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+) -> Json<TowerResponse> {
+    let mut status = state.lightning.tower_status();
+    status.warnings = konsensus_core::tower::warnings();
+    Json(TowerResponse {
+        coverage_scope: "to_local_only",
+        status,
+    })
 }

@@ -59,12 +59,56 @@ Resolution moves funds on-chain, with fees; exact settlement depends on the HTLC
 state and deadlines. Outgoing HTLCs also resolve on-chain through the peer.
 Unlock promptly after every restart; do not treat these estimates as guarantees.
 
-LDK has no watchtower client here, and creating a justice transaction requires
-keys: there is no keyless watch-only protection. Started with `--remote-unlock`,
+The local watchtower client core cannot yet send to a guard. There is no active
+keyless watch-only protection in W2a. Started with `--remote-unlock`,
 the node therefore opens and accepts new channels only with the configured
 hub/LSPs (see [hub-only channels](#hub-only-channels-hub_only_while_lockable)).
 A longer breach window (below) gives more time to unlock but does not lift that
 rule.
+
+### Local watchtower staging (W2a, optional)
+
+Omitting `[tower.clients]`, or leaving it empty, keeps tower staging off and
+preserves existing node behaviour. Only the embedded `ldk` backend supports it.
+To opt into local staging, configure up to five named entries:
+
+```toml
+[tower.clients.friend]
+node_id = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+endpoint = "guard.example:9736"
+```
+
+This is an example key/address, not a recommended guard. Unknown fields are
+rejected. W2a stores candidates and encrypted outbox data under `ldk/tower/`;
+it does not connect, create sessions, spend sats or generate tower acks.
+Pricing, retention periods and payment caps are TODO(W2b), pending decisions.
+The hub-only channel rule remains unchanged.
+
+Owner-authenticated `GET /api/v1/tower/status` returns a cached snapshot with
+per-channel guarded/unguarded state counts, queued/sent/acked/expired deliveries,
+W1 quarantine/retirement counts, capacity and coverage-gap flags, and the last
+64 tower warnings from the current process. `available = false` and `error`
+mean the snapshot is incomplete or stale. W1 record counts survive restarts;
+warning history does not. Counts describe `to_local_only`; they make no HTLC
+coverage claim. Corrupt unsigned journals may contain an unknown number of
+missing states, so a coverage-gap flag is significant even when counts are zero.
+Enabling staging after channel use cannot recover all missed historical states.
+
+A channel counterparty is always excluded as its own guard. At least one
+eligible ack is needed to count a state as guarded; every assigned delivery
+must ack before the W1 signed source is removed. The signed handoff and outbox
+have hard 10,000-state limits per channel. At capacity W1 retains unsigned
+recovery data and reports deferred unguarded states; that recovery journal can
+still grow. W2a has no sender to drain it, so this opt-in mode is for preparing
+the core, not for claiming offline protection on a busy node.
+
+Removed towers lose their local guard receipts; newly configured towers receive
+candidates still in W1. Backfilling already-drained historical states and session
+renewal are TODO(W2b). Explicit service expiry prunes local payloads once no
+queued/sent delivery remains and makes expired receipts unguarded; commitment
+age alone never expires a state. Runtime close pruning waits for LDK to archive
+a resolved monitor, rather than the earlier `ChannelClosed` notification.
+Remote sends/acks/deletes and authenticated expiry triggers are TODO(W2b).
 
 ### Longer breach window (optional)
 

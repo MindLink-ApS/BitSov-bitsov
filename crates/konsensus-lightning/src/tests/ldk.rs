@@ -85,6 +85,7 @@ fn convert_direction_mapping() {
 #[test]
 fn ldk_config_construction() {
     let mut config = LdkConfig {
+        tower: Default::default(),
         forward_to_private_channels: false,
         our_to_self_delay_blocks: None,
         lsps2_service: Default::default(),
@@ -207,6 +208,7 @@ fn ldk_entropy_is_64_bytes() {
 #[tokio::test]
 async fn invalid_mnemonic_errors() {
     let config = LdkConfig {
+        tower: Default::default(),
         forward_to_private_channels: false,
         our_to_self_delay_blocks: None,
         lsps2_service: Default::default(),
@@ -239,6 +241,7 @@ async fn invalid_mnemonic_errors() {
 #[tokio::test]
 async fn out_of_range_our_to_self_delay_refuses_startup() {
     let config = LdkConfig {
+        tower: Default::default(),
         forward_to_private_channels: false,
         our_to_self_delay_blocks: Some(143),
         lsps2_service: Default::default(),
@@ -283,6 +286,7 @@ async fn hub_only_allowlist_parses_hub_keys_and_refuses_the_hub_service() {
     }
     // Wired before any key derivation or network work.
     let config = LdkConfig {
+        tower: Default::default(),
         forward_to_private_channels: false,
         our_to_self_delay_blocks: None,
         lsps2_service: crate::lsps2_service::Lsps2ServiceConfig {

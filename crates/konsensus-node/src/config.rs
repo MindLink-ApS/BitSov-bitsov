@@ -145,6 +145,9 @@ fn is_invisible_format(c: char) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    /// Opt-in local tower client core; transport and payments are W2b.
+    #[serde(default)]
+    pub tower: konsensus_lightning::tower::TowerConfig,
     /// Display metadata only; independent of identity.hosted custody.
     #[serde(default)]
     pub node: NodeDisplayConfig,
@@ -1245,6 +1248,10 @@ impl NodeConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.tower.validate()?;
+        if !self.tower.clients.is_empty() && !matches!(self.lightning, LightningConfig::Ldk { .. }) {
+            anyhow::bail!("tower.clients requires the embedded LDK backend");
+        }
         self.dos_edge.validate().map_err(anyhow::Error::msg)?;
         self.validate_routing_fee_backend()?;
         self.node.validate()?;
@@ -1679,6 +1686,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            tower: Default::default(),
             node: NodeDisplayConfig::default(),
             logging: Default::default(),
             privacy: PrivacyConfig::default(),

@@ -241,6 +241,7 @@ impl KonsensusNode {
                     });
                 let ldk_storage_dir = data_dir.join("ldk");
                 let ldk_config = LdkConfig {
+                    tower: config.tower.clone(),
                     logging: config.logging,
                     electrum: match &config.chain {
                         ChainConfig::Electrum(server) => Some(server.clone()),

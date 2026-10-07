@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod tower;
 mod balance;
 pub mod circuit_breaker;
 pub mod move_home;

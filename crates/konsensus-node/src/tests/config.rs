@@ -21,6 +21,7 @@ backend = "esplora"
 backend = "sqlite"
 "#;
     let config: NodeConfig = toml::from_str(toml).unwrap();
+    assert!(config.tower.clients.is_empty());
     assert_eq!(config.disk_free_floor_bytes, 2147483648);
     assert_eq!(config.logging.max_file_size_bytes.get(), 10 * 1024 * 1024);
     assert_eq!(config.logging.max_files.get(), 5);
@@ -2994,4 +2995,43 @@ fn node_validation_rejects_unsafe_dos_edge_before_startup() {
     let mut config = NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/tmp/unused-mnemonic"), std::path::Path::new("/tmp/unused-dos-edge"));
     config.dos_edge.cookie_threshold = config.dos_edge.max_handshakes;
     assert!(config.validate().unwrap_err().to_string().contains("dos_edge"));
+}
+
+#[test]
+fn tower_clients_default_off_and_strict_decision_neutral_config() {
+    let base = NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
+    assert!(base.tower.clients.is_empty());
+    let text = toml::to_string(&base).unwrap();
+    let key = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    let configured = format!("{text}\n[tower.clients.friend]\nnode_id = '{key}'\nendpoint = 'guard.example:9736'\n");
+    let parsed: NodeConfig = toml::from_str(&configured).unwrap();
+    assert_eq!(parsed.tower.clients.len(), 1);
+    parsed.tower.validate().unwrap();
+    for field in ["unknown = true", "price_msat = 1", "max_spend_msat_per_day = 10"] {
+        assert!(toml::from_str::<NodeConfig>(&format!("{configured}\n{field}\n")).is_err());
+    }
+    assert!(toml::from_str::<konsensus_lightning::tower::TowerConfig>("unknown = true").is_err());
+    let mut bad = parsed.tower.clone();
+    bad.clients.get_mut("friend").unwrap().node_id = "not-a-key".into();
+    assert!(bad.validate().is_err());
+    bad = parsed.tower.clone();
+    bad.clients.get_mut("friend").unwrap().endpoint = "https://guard.example:9736".into();
+    assert!(bad.validate().is_err());
+    bad = parsed.tower.clone();
+    bad.clients.insert("duplicate".into(), bad.clients["friend"].clone());
+    assert!(bad.validate().is_err());
+}
+
+#[test]
+fn tower_clients_reject_unsupported_backend_and_more_than_five() {
+    let mut base = NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
+    let entry = konsensus_lightning::tower::TowerEndpoint {
+        node_id: "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5".into(),
+        endpoint: "guard.example:9736".into(),
+    };
+    base.tower.clients.insert("friend".into(), entry.clone());
+    let error = base.validate().unwrap_err().to_string();
+    assert!(error.contains("embedded LDK"), "{error}");
+    for n in 0..5 { base.tower.clients.insert(format!("friend-{n}"), entry.clone()); }
+    assert!(base.tower.validate().unwrap_err().to_string().contains("at most five"));
 }
