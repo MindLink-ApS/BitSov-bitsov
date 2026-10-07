@@ -222,3 +222,72 @@ fn decode_terminal_qr(rendered: &str) -> Vec<u8> {
     assert_eq!(codes.len(), 1);
     codes[0].as_ref().unwrap().decode().unwrap().payload
 }
+
+#[test]
+fn auto_endpoint_v2_and_explicit_legacy_use_first_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("konsensus.toml");
+    std::fs::write(
+        &config,
+        r#"
+[node]
+[identity]
+mnemonic_file = "absent.enc"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+[remote_access]
+listen_addr = "127.0.0.1:18443"
+"#,
+    )
+    .unwrap();
+    for legacy in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_konsensus"));
+        command.args(["pair-ticket", "--config"]).arg(&config);
+        if legacy {
+            command.arg("--legacy");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let uri = String::from_utf8(output.stdout).unwrap();
+        let link = konsensus_api::remote_access::PairLink::from_uri(uri.trim()).unwrap();
+        assert_eq!(link.endpoint, "127.0.0.1:18443");
+        assert_eq!(link.v, if legacy { 1 } else { 2 });
+        if legacy {
+            assert!(link.endpoints.is_empty());
+            let json: serde_json::Value = serde_json::from_slice(
+                &URL_SAFE_NO_PAD
+                    .decode(uri.trim().strip_prefix("bitsov://pair/").unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            let allowed = [
+                "v",
+                "endpoint",
+                "node_id",
+                "transport_pubkey",
+                "transport_signature",
+                "box_transport_pubkey",
+                "box_transport_signature",
+                "code",
+                "expires_at",
+                "hosted_by",
+            ];
+            assert!(json
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|key| allowed.contains(&key.as_str())));
+        } else {
+            assert_eq!(link.endpoints, ["127.0.0.1:18443"]);
+        }
+    }
+}

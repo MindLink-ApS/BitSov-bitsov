@@ -124,6 +124,7 @@ pub fn write_identity_metadata(
         data_dir,
         identity,
         pairing,
+        None,
         konsensus_api::pairing::fsync_dir_strict,
     )
 }
@@ -132,6 +133,7 @@ fn write_identity_metadata_with_sync(
     data_dir: &std::path::Path,
     identity: &NodeIdentity,
     pairing: &PairingService,
+    endpoints: Option<&[String]>,
     sync_dir: impl Fn(&std::path::Path) -> std::io::Result<()>,
 ) -> Result<()> {
     use konsensus_api::pairing::{restrict_dir, write_protected};
@@ -149,6 +151,34 @@ fn write_identity_metadata_with_sync(
         identity,
         &pairing.box_transport_pubkey(),
     ));
+    if let Some(endpoints) = endpoints {
+        let mut descriptor = PairLink {
+            v: wire::PAIR_LINK_VERSION,
+            endpoint: endpoints[0].clone(),
+            endpoints: endpoints.to_vec(),
+            endpoints_signature: None,
+            node_id: identity.node_id().to_hex(),
+            transport_pubkey: hex::encode(identity.x25519_public().as_bytes()),
+            transport_signature: String::new(),
+            box_transport_pubkey: hex::encode(pairing.box_transport_pubkey()),
+            box_transport_signature: None,
+            code: String::new(),
+            expires_at: 0,
+            hosted_by: None,
+        };
+        descriptor.endpoints_signature = Some(
+            URL_SAFE_NO_PAD.encode(
+                identity
+                    .sign(descriptor.endpoints_proof_message().as_bytes())
+                    .to_bytes(),
+            ),
+        );
+        document.insert("endpoints".into(), serde_json::to_value(endpoints)?);
+        document.insert(
+            "endpoints_signature".into(),
+            descriptor.endpoints_signature.unwrap().into(),
+        );
+    }
     if document != previous {
         // Publish all fields together; a crash must not leave half a proof.
         let temporary = dir.join(format!(".identity-{}.tmp", uuid::Uuid::new_v4()));
@@ -197,6 +227,8 @@ impl ResponderIdentity {
 }
 
 pub struct RemoteAccessServer {
+    #[cfg(feature = "mdns")]
+    _mdns: Option<crate::mdns::Advertisement>,
     listener: TcpListener,
     identity: ResponderIdentity,
     pairing: Arc<PairingService>,
@@ -205,6 +237,20 @@ pub struct RemoteAccessServer {
     pairing_code: Arc<Mutex<Option<ActivePairingCode>>>,
     pair_link_path: Option<std::path::PathBuf>,
     pairing_deadline: Option<tokio::time::Instant>,
+}
+
+/// Wildcard IPv6 is explicitly dual-stack on every supported platform, so
+/// endpoint discovery need not guess the OS IPV6_V6ONLY default.
+async fn bind_remote_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    if addr.is_ipv6() && addr.ip().is_unspecified() {
+        let socket = tokio::net::TcpSocket::new_v6()?;
+        socket2::SockRef::from(&socket).set_only_v6(false)?;
+        socket.set_reuseaddr(true)?;
+        socket.bind(addr)?;
+        socket.listen(1024)
+    } else {
+        TcpListener::bind(addr).await
+    }
 }
 
 impl RemoteAccessServer {
@@ -218,16 +264,23 @@ impl RemoteAccessServer {
         let listen_addr = config
             .listen_addr
             .context("remote access is disabled (no listen_addr)")?;
-        let endpoint = config
-            .advertised_endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context("remote access advertised_endpoint is missing")?;
-        let listener = TcpListener::bind(listen_addr)
+        let listener = bind_remote_listener(listen_addr)
             .await
             .with_context(|| format!("could not bind remote access listener at {listen_addr}"))?;
 
+        let endpoints = crate::endpoints::discover(config, listener.local_addr()?)?;
+        write_identity_metadata_with_sync(
+            pairing
+                .remote_access_link_path()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap(),
+            &identity,
+            &pairing,
+            Some(&endpoints),
+            konsensus_api::pairing::fsync_dir_strict,
+        )?;
         let path = pairing.remote_access_link_path();
         let _guard = crate::ticket_cmd::lock_ticket(path.parent().unwrap())?;
         let mut pairing_code = None;
@@ -247,9 +300,11 @@ impl RemoteAccessServer {
             );
             let (box_transport_pubkey, box_transport_signature) =
                 box_transport_proof(&identity, &pairing);
-            let link = PairLink {
-                v: VERSION,
-                endpoint: endpoint.to_owned(),
+            let mut link = PairLink {
+                v: wire::PAIR_LINK_VERSION,
+                endpoint: endpoints[0].clone(),
+                endpoints: endpoints.clone(),
+                endpoints_signature: None,
                 node_id,
                 transport_pubkey,
                 transport_signature: signature,
@@ -258,15 +313,23 @@ impl RemoteAccessServer {
                 code: crate::ticket_cmd::new_code(),
                 expires_at: chrono::Utc::now().timestamp() + PAIRING_CODE_TTL.as_secs() as i64,
                 hosted_by: pairing.hosted_by().map(str::to_owned),
-            }
-            .to_uri()?;
-            pairing.write_remote_access_link(&link)?;
+            };
+            link.endpoints_signature = Some(
+                URL_SAFE_NO_PAD.encode(
+                    identity
+                        .sign(link.endpoints_proof_message().as_bytes())
+                        .to_bytes(),
+                ),
+            );
+            pairing.write_remote_access_link(&link.to_uri()?)?;
             reload_pairing_code(&pairing, &mut pairing_code, &identity.node_id().to_hex())?;
         }
         let pairing_deadline = pairing_code.as_ref().map(|code| code.expires_at);
         let pair_link_path = pairing_code.as_ref().map(|_| path);
 
         Ok(Self {
+            #[cfg(feature = "mdns")]
+            _mdns: crate::mdns::Advertisement::start(config, listener.local_addr()?, &pairing),
             listener,
             identity: ResponderIdentity::Live(identity),
             pairing,
@@ -287,7 +350,7 @@ impl RemoteAccessServer {
         tunnel_clients: Arc<RemoteTunnelClients>,
     ) -> Result<Self> {
         anyhow::ensure!(!pairing.pairing_open(), "locked pairing must be closed");
-        let listener = TcpListener::bind(
+        let listener = bind_remote_listener(
             config
                 .listen_addr
                 .context("remote unlock requires remote_access.listen_addr")?,
@@ -295,6 +358,8 @@ impl RemoteAccessServer {
         .await?;
         crate::ticket_cmd::set_locked(pairing.remote_access_link_path().parent().unwrap(), true)?;
         Ok(Self {
+            #[cfg(feature = "mdns")]
+            _mdns: crate::mdns::Advertisement::start(config, listener.local_addr()?, &pairing),
             listener,
             identity: ResponderIdentity::Locked(Arc::new(identity)),
             pairing,
@@ -322,7 +387,7 @@ impl RemoteAccessServer {
         let listen_addr = config
             .listen_addr
             .context("remote bootstrap requires remote_access.listen_addr")?;
-        let listener = TcpListener::bind(listen_addr)
+        let listener = bind_remote_listener(listen_addr)
             .await
             .with_context(|| format!("could not bind remote access listener at {listen_addr}"))?;
         let path = pairing.remote_access_link_path();
@@ -335,6 +400,8 @@ impl RemoteAccessServer {
         let pairing_deadline = pairing_code.as_ref().map(|code| code.expires_at);
         let pair_link_path = pairing_code.as_ref().map(|_| path);
         Ok(Self {
+            #[cfg(feature = "mdns")]
+            _mdns: crate::mdns::Advertisement::start(config, listener.local_addr()?, &pairing),
             listener,
             identity: ResponderIdentity::Bootstrap,
             pairing,
@@ -863,6 +930,7 @@ mod tests {
         let config = RemoteAccessConfig {
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
             advertised_endpoint: Some("node.example:8443".into()),
+            ..Default::default()
         };
         let bind = || {
             RemoteAccessServer::bind(
@@ -898,6 +966,7 @@ mod tests {
         let config = RemoteAccessConfig {
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
             advertised_endpoint: Some("node.example:8443".into()),
+            ..Default::default()
         };
         let server = RemoteAccessServer::bind(
             &config,
@@ -964,6 +1033,7 @@ mod tests {
         let config = RemoteAccessConfig {
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
             advertised_endpoint: Some("node.example:8443".into()),
+            ..Default::default()
         };
         let server = RemoteAccessServer::bind(
             &config,
@@ -1123,6 +1193,7 @@ mod tests {
             let config = RemoteAccessConfig {
                 listen_addr: Some("127.0.0.1:0".parse().unwrap()),
                 advertised_endpoint: Some("node.example:8443".into()),
+                ..Default::default()
             };
             let bind = || {
                 RemoteAccessServer::bind(
@@ -1174,6 +1245,7 @@ mod tests {
         let config = RemoteAccessConfig {
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
             advertised_endpoint: Some("node.example:8443".into()),
+            ..Default::default()
         };
         let server = RemoteAccessServer::bind(
             &config,
@@ -1274,6 +1346,7 @@ mod tests {
         let config = RemoteAccessConfig {
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
             advertised_endpoint: Some("node.example:8443".into()),
+            ..Default::default()
         };
         let bind = |pairing| {
             RemoteAccessServer::bind_bootstrap(
@@ -1292,6 +1365,8 @@ mod tests {
         let mut ticket = PairLink {
             v: VERSION,
             endpoint: "node.example:8443".into(),
+            endpoints: vec![],
+            endpoints_signature: None,
             node_id: String::new(),
             transport_pubkey: String::new(),
             transport_signature: String::new(),
@@ -1398,6 +1473,7 @@ mod tests {
         let config = RemoteAccessConfig {
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
             advertised_endpoint: Some("node.example:8443".into()),
+            ..Default::default()
         };
         let server = RemoteAccessServer::bind(
             &config,
@@ -1516,7 +1592,7 @@ mod tests {
                 let dir = data.path().join("identity");
                 let failed_path = if fail_parent { data.path() } else { &dir };
                 let result =
-                    write_identity_metadata_with_sync(data.path(), &node, &pairing, |path| {
+                    write_identity_metadata_with_sync(data.path(), &node, &pairing, None, |path| {
                         if path == failed_path {
                             Err(std::io::Error::other("injected directory sync failure"))
                         } else {
@@ -1991,6 +2067,7 @@ mod tests {
                 &RemoteAccessConfig {
                     listen_addr: Some("127.0.0.1:0".parse().unwrap()),
                     advertised_endpoint: Some("node.example:18443".into()),
+                    ..Default::default()
                 },
                 Arc::clone(&node),
                 Arc::clone(&pairing),
@@ -2075,6 +2152,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv6_wildcard_listener_accepts_ipv4() {
+        let listener = bind_remote_listener("[::]:0".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(!socket2::SockRef::from(&listener).only_v6().unwrap());
+        let target = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(target))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cli_reuses_signed_endpoint_metadata_and_rejects_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = identity();
+        let pairing = Arc::new(
+            PairingService::open(
+                dir.path(),
+                konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex()),
+                false,
+            )
+            .unwrap(),
+        );
+        let server = RemoteAccessServer::bind(
+            &RemoteAccessConfig {
+                listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+                advertised_endpoint: Some("node.example:9737".into()),
+                ..Default::default()
+            },
+            node.clone(),
+            pairing.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            Arc::new(RemoteTunnelClients::default()),
+        )
+        .await
+        .unwrap();
+        #[cfg(feature = "mdns")]
+        assert!(
+            server._mdns.is_none(),
+            "ordinary listeners must not start mDNS"
+        );
+        let automatic = PairLink::from_uri(
+            &std::fs::read_to_string(pairing.remote_access_link_path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(automatic.v, wire::PAIR_LINK_VERSION);
+        automatic
+            .verify_endpoints(&node.node_id().to_hex())
+            .unwrap();
+        assert_eq!(
+            automatic.endpoints,
+            [
+                "node.example:9737".to_string(),
+                server.local_addr().unwrap().to_string()
+            ]
+        );
+        let mut config = crate::config::NodeConfig::default_for_tier(
+            crate::config::NodeTier::Light,
+            dir.path().join("absent.enc"),
+            dir.path(),
+        );
+        config.remote_access = RemoteAccessConfig {
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            advertised_endpoint: Some("node.example:9737".into()),
+            ..Default::default()
+        };
+        let path = dir.path().join("konsensus.toml");
+        config.save(&path).unwrap();
+        crate::ticket_cmd::cmd_pair_ticket(&path, false, Duration::from_secs(60), false).unwrap();
+        let uri = std::fs::read_to_string(pairing.remote_access_link_path()).unwrap();
+        let link = PairLink::from_uri(&uri).unwrap();
+        link.verify_endpoints(&node.node_id().to_hex()).unwrap();
+        assert_eq!(link.endpoints, automatic.endpoints);
+        assert_ne!(link.code, automatic.code);
+        assert!(
+            !config.identity.mnemonic_file.exists(),
+            "CLI must need no seed"
+        );
+        // Corrupt one cached signature byte. The existing grant must survive.
+        let metadata = dir.path().join("identity/identity.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+        document["endpoints_signature"] = URL_SAFE_NO_PAD.encode([0; 64]).into();
+        std::fs::write(metadata, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(
+            crate::ticket_cmd::cmd_pair_ticket(&path, false, Duration::from_secs(60), false)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(pairing.remote_access_link_path()).unwrap(),
+            uri
+        );
+    }
+
+    #[tokio::test]
     async fn pairing_link_signature_and_noise_tunnel_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let node = identity();
@@ -2108,6 +2281,7 @@ mod tests {
         let config = RemoteAccessConfig {
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
             advertised_endpoint: Some("node.example:18443".into()),
+            ..Default::default()
         };
         let server = RemoteAccessServer::bind(
             &config,

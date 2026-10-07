@@ -8,12 +8,15 @@ mod config;
 mod content_server;
 mod contracts;
 mod delivery_prices;
+mod endpoints;
 mod guarded_lightning;
 mod housekeeping;
 mod invoice_refusals;
 #[path = "cli/locked.rs"]
 mod locked_cmd;
 mod logging;
+#[cfg(feature = "mdns")]
+mod mdns;
 mod mnemonic_crypto;
 #[path = "cli/move_home.rs"]
 mod move_home_cmd;
@@ -171,6 +174,7 @@ async fn main() -> Result<()> {
                 admission_mode.as_deref(),
                 owner_control,
                 local_owner_device,
+                home,
                 &file_logging,
             )
             .await?;
@@ -229,8 +233,13 @@ async fn main() -> Result<()> {
         } => {
             owner_cmd::cmd_pair_revoke(&config, &client_id, keep_pairing).await?;
         }
-        Command::PairTicket { config, qr, ttl } => {
-            ticket_cmd::cmd_pair_ticket(&config, qr, ttl)?;
+        Command::PairTicket {
+            config,
+            qr,
+            ttl,
+            legacy,
+        } => {
+            ticket_cmd::cmd_pair_ticket(&config, qr, ttl, legacy)?;
         }
         Command::PairWindow { seconds, config } => {
             owner_cmd::cmd_pair_window(&config, seconds).await?;
@@ -897,6 +906,7 @@ fn custody_mode(config: &NodeConfig) -> konsensus_api::custody::CustodyMode {
 const REMOTE_BOOTSTRAP_RESTART_EXIT: i32 = 75;
 
 /// `konsensus start` — boot the node.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_start(
     config_path: &Path,
     password: Option<Zeroizing<String>>,
@@ -904,6 +914,7 @@ async fn cmd_start(
     admission_mode: Option<&str>,
     owner_control: bool,
     local_owner_device: bool,
+    home: bool,
     file_logging: &logging::FileLogging,
 ) -> Result<()> {
     // Relative configs must become absolute before any parent()/data_dir use.
@@ -914,6 +925,8 @@ async fn cmd_start(
         is_home_profile(password_source, local_owner_device),
     )
     .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
+
+    config.remote_access.apply_home(home);
 
     // ── First-run / partial-state gate (#76) ───────────────────────
     // Before any component is built, classify the data directory from file

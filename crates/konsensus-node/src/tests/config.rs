@@ -25,7 +25,8 @@ backend = "sqlite"
     assert_eq!(config.disk_free_floor_bytes, 2147483648);
     assert_eq!(config.logging.max_file_size_bytes.get(), 10 * 1024 * 1024);
     assert_eq!(config.logging.max_files.get(), 5);
-    let override_config: NodeConfig = toml::from_str(&format!("disk_free_floor_bytes = 4096\n{toml}")).unwrap();
+    let override_config: NodeConfig =
+        toml::from_str(&format!("disk_free_floor_bytes = 4096\n{toml}")).unwrap();
     assert_eq!(override_config.disk_free_floor_bytes, 4096);
     assert_eq!(
         config.identity.mnemonic_file,
@@ -65,15 +66,16 @@ backend = "sqlite"
 }
 
 #[test]
-fn remote_access_requires_loopback_plaintext_api_and_advertised_endpoint() {
+fn remote_access_requires_loopback_api_but_allows_auto_endpoints() {
     let mut config = NodeConfig::default_for_tier(
         NodeTier::Light,
         PathBuf::from("/dev/null"),
         Path::new("/tmp"),
     );
     config.remote_access.listen_addr = Some("0.0.0.0:18443".parse().unwrap());
-    let error = config.validate().unwrap_err().to_string();
-    assert!(error.contains("advertised_endpoint"), "{error}");
+    config
+        .validate()
+        .expect("automatic endpoints need no configured override");
 
     config.remote_access.advertised_endpoint = Some("node.example:18443".into());
     config.api.listen_addr = "0.0.0.0:18080".parse().unwrap();
@@ -133,8 +135,11 @@ fn remote_access_rejects_tcp_port_collisions() {
         PathBuf::from("/dev/null"),
         Path::new("/tmp"),
     );
-    config.remote_access.listen_addr =
-        Some(format!("0.0.0.0:{}", config.network.listen_addr.port()).parse().unwrap());
+    config.remote_access.listen_addr = Some(
+        format!("0.0.0.0:{}", config.network.listen_addr.port())
+            .parse()
+            .unwrap(),
+    );
     config.remote_access.advertised_endpoint = Some("node.example:18443".into());
     let error = config.validate().unwrap_err().to_string();
     assert!(error.contains("same TCP port"), "{error}");
@@ -157,7 +162,7 @@ fn remote_access_endpoint_uses_the_apps_host_grammar() {
     ] {
         config.remote_access.advertised_endpoint = Some(endpoint.into());
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("valid host:port"), "{endpoint}: {error}");
+        assert!(error.contains("host:port"), "{endpoint}: {error}");
     }
 
     for endpoint in [
@@ -1778,11 +1783,8 @@ fn config_save_atomic_replace_leaves_no_tmp_and_survives_reread() {
 fn config_save_dir_sync_failure_propagates() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("custom.toml");
-    let config = NodeConfig::default_for_tier(
-        NodeTier::Full,
-        dir.path().join("mnemonic.txt"),
-        dir.path(),
-    );
+    let config =
+        NodeConfig::default_for_tier(NodeTier::Full, dir.path().join("mnemonic.txt"), dir.path());
     config.save(&path).unwrap();
 
     super::fail_next_config_dir_sync();
@@ -2148,7 +2150,9 @@ esplora_url_fallback = "https://fallback.example.com"
                 Some("https://fallback.example.com".to_string())
             );
         }
-        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => panic!("expected esplora config"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => {
+            panic!("expected esplora config")
+        }
     }
 }
 
@@ -2178,7 +2182,9 @@ fn issue66_existing_config_omitting_primary_keeps_its_provider() {
                 "and must not inject a third-party fallback it never chose"
             );
         }
-        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => panic!("expected esplora"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => {
+            panic!("expected esplora")
+        }
     }
 
     // [lightning] backend = "ldk", esplora_url omitted -> legacy default, no fallback.
@@ -2217,7 +2223,9 @@ fn issue66_explicit_primary_is_never_overridden() {
                 "an operator running their own Esplora must not silently gain a public one"
             );
         }
-        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => panic!("expected esplora"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => {
+            panic!("expected esplora")
+        }
     }
 }
 
@@ -2284,7 +2292,9 @@ api_url = "https://legacy.example.com"
             assert_eq!(api_url, "https://legacy.example.com");
             assert_eq!(esplora_url_fallback, None);
         }
-        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => panic!("expected esplora config"),
+        ChainConfig::Mock | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => {
+            panic!("expected esplora config")
+        }
     }
 }
 
@@ -2445,25 +2455,54 @@ fn validate_allows_settlement_on_with_non_mock_backend() {
 
 #[test]
 fn configured_endpoint_reports_its_source_and_blank_advertised_is_unset() {
-    let mut net = NetworkConfig { listen_addr: "0.0.0.0:9000".parse().unwrap(), ..Default::default() };
-    assert_eq!(net.configured_endpoint(), None, "wildcard alone needs discovery");
+    let mut net = NetworkConfig {
+        listen_addr: "0.0.0.0:9000".parse().unwrap(),
+        ..Default::default()
+    };
+    assert_eq!(
+        net.configured_endpoint(),
+        None,
+        "wildcard alone needs discovery"
+    );
     net.advertised_addr = Some("   ".into());
-    assert_eq!(net.configured_endpoint(), None, "a blank advertised_addr is unset");
+    assert_eq!(
+        net.configured_endpoint(),
+        None,
+        "a blank advertised_addr is unset"
+    );
     net.listen_addr = "192.168.1.5:9000".parse().unwrap();
-    assert_eq!(net.configured_endpoint(), Some(("192.168.1.5:9000".into(), "listen")));
+    assert_eq!(
+        net.configured_endpoint(),
+        Some(("192.168.1.5:9000".into(), "listen"))
+    );
     net.advertised_addr = Some(" node.example.org:9000 ".into());
-    assert_eq!(net.configured_endpoint(), Some(("node.example.org:9000".into(), "advertised")));
+    assert_eq!(
+        net.configured_endpoint(),
+        Some(("node.example.org:9000".into(), "advertised"))
+    );
     // A stun_server never changes the configured endpoint.
     net.stun_server = Some("stun:stun.example.org:3478".into());
-    assert_eq!(net.configured_endpoint(), Some(("node.example.org:9000".into(), "advertised")));
+    assert_eq!(
+        net.configured_endpoint(),
+        Some(("node.example.org:9000".into(), "advertised"))
+    );
 }
 
 #[test]
 fn stun_server_is_parsed_and_validated() {
     use crate::config::parse_stun_server;
-    assert_eq!(parse_stun_server("stun:stun.example.org:3478").unwrap(), "stun.example.org:3478");
-    assert_eq!(parse_stun_server(" 203.0.113.7:3478 ").unwrap(), "203.0.113.7:3478");
-    assert_eq!(parse_stun_server("stun:[2001:db8::1]:3478").unwrap(), "[2001:db8::1]:3478");
+    assert_eq!(
+        parse_stun_server("stun:stun.example.org:3478").unwrap(),
+        "stun.example.org:3478"
+    );
+    assert_eq!(
+        parse_stun_server(" 203.0.113.7:3478 ").unwrap(),
+        "203.0.113.7:3478"
+    );
+    assert_eq!(
+        parse_stun_server("stun:[2001:db8::1]:3478").unwrap(),
+        "[2001:db8::1]:3478"
+    );
     for bad in [
         "",
         "stun:",
@@ -2502,12 +2541,25 @@ fn stun_server_is_parsed_and_validated() {
 
 #[test]
 fn introduction_endpoint_prefers_advertised_and_skips_wildcards() {
-    let mut net = NetworkConfig { listen_addr: "0.0.0.0:9000".parse().unwrap(), ..Default::default() };
-    assert_eq!(net.configured_endpoint(), None, "a wildcard bind is not dialable");
+    let mut net = NetworkConfig {
+        listen_addr: "0.0.0.0:9000".parse().unwrap(),
+        ..Default::default()
+    };
+    assert_eq!(
+        net.configured_endpoint(),
+        None,
+        "a wildcard bind is not dialable"
+    );
     net.listen_addr = "192.168.1.5:9000".parse().unwrap();
-    assert_eq!(net.configured_endpoint().map(|e| e.0).as_deref(), Some("192.168.1.5:9000"));
+    assert_eq!(
+        net.configured_endpoint().map(|e| e.0).as_deref(),
+        Some("192.168.1.5:9000")
+    );
     net.advertised_addr = Some(" node.example.org:9000 ".into());
-    assert_eq!(net.configured_endpoint().map(|e| e.0).as_deref(), Some("node.example.org:9000"));
+    assert_eq!(
+        net.configured_endpoint().map(|e| e.0).as_deref(),
+        Some("node.example.org:9000")
+    );
     let toml_net: NetworkConfig = toml::from_str("advertised_addr = \"n.example:1\"").unwrap();
     assert_eq!(toml_net.advertised_addr.as_deref(), Some("n.example:1"));
 }
@@ -2515,13 +2567,21 @@ fn introduction_endpoint_prefers_advertised_and_skips_wildcards() {
 #[test]
 fn introduction_network_normalizes_ldk_names() {
     for (configured, canonical) in [
-        ("mainnet", Some("bitcoin")), ("BITCOIN", Some("bitcoin")),
-        ("testnet3", Some("testnet")), ("Testnet", Some("testnet")),
-        ("Signet", Some("signet")), ("Regtest", Some("regtest")),
+        ("mainnet", Some("bitcoin")),
+        ("BITCOIN", Some("bitcoin")),
+        ("testnet3", Some("testnet")),
+        ("Testnet", Some("testnet")),
+        ("Signet", Some("signet")),
+        ("Regtest", Some("regtest")),
         ("unknown", None),
     ] {
-        let config: LightningConfig = toml::from_str(&format!("backend = \"ldk\"\nnetwork = \"{configured}\"\n")).unwrap();
-        assert_eq!(config.bitcoin_network().as_deref(), canonical, "{configured}");
+        let config: LightningConfig =
+            toml::from_str(&format!("backend = \"ldk\"\nnetwork = \"{configured}\"\n")).unwrap();
+        assert_eq!(
+            config.bitcoin_network().as_deref(),
+            canonical,
+            "{configured}"
+        );
     }
 }
 
@@ -2530,9 +2590,15 @@ fn sponsor_is_off_by_default_and_clamped_to_the_spec() {
     let cfg: SponsorConfig = toml::from_str("").unwrap();
     assert!(!cfg.enabled);
     assert!(!cfg.policy().unwrap().enabled);
-    let on: SponsorConfig = toml::from_str("enabled = true\ngift_sats = 20000\nfee_sats = 100\npurse_sats = 100000\nkits_per_day = 2").unwrap();
+    let on: SponsorConfig = toml::from_str(
+        "enabled = true\ngift_sats = 20000\nfee_sats = 100\npurse_sats = 100000\nkits_per_day = 2",
+    )
+    .unwrap();
     let p = on.policy().unwrap();
-    assert_eq!((p.gift_msat, p.fee_msat, p.purse_msat, p.kits_per_day), (20_000_000, 100_000, 100_000_000, 2));
+    assert_eq!(
+        (p.gift_msat, p.fee_msat, p.purse_msat, p.kits_per_day),
+        (20_000_000, 100_000, 100_000_000, 2)
+    );
     for bad in [
         "enabled = true\ngift_sats = 50000\nfee_sats = 100",
         "enabled = true\npurse_sats = 200000",
@@ -2542,7 +2608,10 @@ fn sponsor_is_off_by_default_and_clamped_to_the_spec() {
         let cfg: SponsorConfig = toml::from_str(bad).unwrap();
         assert!(cfg.policy().is_err(), "{bad}");
     }
-    assert!(toml::from_str::<SponsorConfig>("enabled = true\nfree_lane = true").is_err(), "unknown keys refused");
+    assert!(
+        toml::from_str::<SponsorConfig>("enabled = true\nfree_lane = true").is_err(),
+        "unknown keys refused"
+    );
 }
 
 #[test]
@@ -2574,13 +2643,25 @@ backend = "mock"
 backend = "sqlite"
 "#;
     let off: NodeConfig = toml::from_str(base).unwrap();
-    assert!(off.calls.stun_listen.is_none(), "no STUN socket unless the owner sets one");
+    assert!(
+        off.calls.stun_listen.is_none(),
+        "no STUN socket unless the owner sets one"
+    );
 
-    let on: NodeConfig = toml::from_str(&format!("{base}\n[calls]\nstun_listen = \"0.0.0.0:3478\"\n")).unwrap();
+    let on: NodeConfig = toml::from_str(&format!(
+        "{base}\n[calls]\nstun_listen = \"0.0.0.0:3478\"\n"
+    ))
+    .unwrap();
     assert_eq!(on.calls.stun_listen, Some("0.0.0.0:3478".parse().unwrap()));
 
-    assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\nturn_listen = \"0.0.0.0:3478\"\n")).is_err());
-    assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\nstun_listen = \"not-an-addr\"\n")).is_err());
+    assert!(toml::from_str::<NodeConfig>(&format!(
+        "{base}\n[calls]\nturn_listen = \"0.0.0.0:3478\"\n"
+    ))
+    .is_err());
+    assert!(toml::from_str::<NodeConfig>(&format!(
+        "{base}\n[calls]\nstun_listen = \"not-an-addr\"\n"
+    ))
+    .is_err());
 }
 
 #[test]
@@ -2591,7 +2672,8 @@ fn bitcoind_config_accepts_file_auth_and_rejects_inline_secrets() {
     ] {
         let parsed: ChainConfig = toml::from_str(&format!(
             "backend = 'bitcoind'\nrpc_host = '127.0.0.1'\nrpc_port = 18443\n{auth}"
-        )).expect("file-authenticated Bitcoin Core must be supported");
+        ))
+        .expect("file-authenticated Bitcoin Core must be supported");
         assert_eq!(parsed.backend_name(), "bitcoind");
     }
     for auth in [
@@ -2601,7 +2683,8 @@ fn bitcoind_config_accepts_file_auth_and_rejects_inline_secrets() {
     ] {
         assert!(toml::from_str::<ChainConfig>(&format!(
             "backend = 'bitcoind'\nrpc_host = '127.0.0.1'\nrpc_port = 18443\n{auth}"
-        )).is_err());
+        ))
+        .is_err());
     }
 }
 
@@ -2609,9 +2692,13 @@ fn bitcoind_config_accepts_file_auth_and_rejects_inline_secrets() {
 fn rejected_inline_rpc_secret_is_absent_from_startup_errors() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("node.toml");
-    let mut config = NodeConfig::default_for_tier(NodeTier::Full, dir.path().join("mnemonic"), dir.path());
+    let mut config =
+        NodeConfig::default_for_tier(NodeTier::Full, dir.path().join("mnemonic"), dir.path());
     config.chain = ChainConfig::Mock;
-    let content = toml::to_string(&config).unwrap().replace("backend = \"mock\"", "backend = \"bitcoind\"\nrpc_password = \"NEVER_LOG_THIS_PASSWORD\"");
+    let content = toml::to_string(&config).unwrap().replace(
+        "backend = \"mock\"",
+        "backend = \"bitcoind\"\nrpc_password = \"NEVER_LOG_THIS_PASSWORD\"",
+    );
     std::fs::write(&path, content).unwrap();
     let error = NodeConfig::load(&path).unwrap_err();
     assert!(!format!("{error:?}").contains("NEVER_LOG_THIS_PASSWORD"));
@@ -2713,34 +2800,69 @@ fn logging_config_defaults_partial_sections_and_rejects_invalid_limits() {
 
 #[test]
 fn issue204_chain_accepts_api_url_fallback_alias() {
-    let chain: ChainConfig = toml::from_str(r#"
+    let chain: ChainConfig = toml::from_str(
+        r#"
 backend = "esplora"
 api_url = "https://primary.invalid"
 api_url_fallback = "https://fallback.invalid/api"
-"#).unwrap();
-    assert!(matches!(chain, ChainConfig::Esplora { esplora_url_fallback: Some(url), .. } if url == "https://fallback.invalid/api"));
+"#,
+    )
+    .unwrap();
+    assert!(
+        matches!(chain, ChainConfig::Esplora { esplora_url_fallback: Some(url), .. } if url == "https://fallback.invalid/api")
+    );
 }
 
 #[test]
 fn issue204_chain_fallback_resolution_keeps_primary_and_reuses_ldk() {
-    let chain: ChainConfig = toml::from_str("backend = 'esplora'\napi_url = 'https://chain.invalid'\n").unwrap();
+    let chain: ChainConfig =
+        toml::from_str("backend = 'esplora'\napi_url = 'https://chain.invalid'\n").unwrap();
     let ldk: LightningConfig = toml::from_str("backend = 'ldk'\nesplora_url = 'https://ldk.invalid/api'\nesplora_url_fallback = 'https://backup.invalid/api'\n").unwrap();
-    assert_eq!(chain.esplora_fallbacks(&ldk), vec!["https://ldk.invalid/api", "https://backup.invalid/api"]);
-    let explicit: ChainConfig = toml::from_str("backend = 'esplora'\napi_url_fallback = 'https://explicit.invalid'\n").unwrap();
-    assert_eq!(explicit.esplora_fallbacks(&ldk), vec!["https://explicit.invalid"]);
-    assert!(chain.esplora_fallbacks(&LightningConfig::Mock { initial_balance_msat: 0 }).is_empty());
+    assert_eq!(
+        chain.esplora_fallbacks(&ldk),
+        vec!["https://ldk.invalid/api", "https://backup.invalid/api"]
+    );
+    let explicit: ChainConfig =
+        toml::from_str("backend = 'esplora'\napi_url_fallback = 'https://explicit.invalid'\n")
+            .unwrap();
+    assert_eq!(
+        explicit.esplora_fallbacks(&ldk),
+        vec!["https://explicit.invalid"]
+    );
+    assert!(chain
+        .esplora_fallbacks(&LightningConfig::Mock {
+            initial_balance_msat: 0
+        })
+        .is_empty());
 }
 
 #[test]
 fn oauth_credentials_files_are_explicit_and_optional() {
     let chain: ChainConfig = toml::from_str("backend = 'esplora'\napi_url = 'https://paid.invalid/api'\ncredentials_file = '/private/chain.toml'").unwrap();
-    assert!(matches!(chain, ChainConfig::Esplora { credentials_file: Some(path), .. } if path == std::path::Path::new("/private/chain.toml")));
-    let ldk: LightningConfig = toml::from_str("backend = 'ldk'\ncredentials_file = '/private/ldk.toml'").unwrap();
-    assert!(matches!(ldk, LightningConfig::Ldk { credentials_file: Some(path), .. } if path == std::path::Path::new("/private/ldk.toml")));
+    assert!(
+        matches!(chain, ChainConfig::Esplora { credentials_file: Some(path), .. } if path == std::path::Path::new("/private/chain.toml"))
+    );
+    let ldk: LightningConfig =
+        toml::from_str("backend = 'ldk'\ncredentials_file = '/private/ldk.toml'").unwrap();
+    assert!(
+        matches!(ldk, LightningConfig::Ldk { credentials_file: Some(path), .. } if path == std::path::Path::new("/private/ldk.toml"))
+    );
     let chain: ChainConfig = toml::from_str("backend = 'esplora'").unwrap();
-    assert!(matches!(chain, ChainConfig::Esplora { credentials_file: None, .. }));
+    assert!(matches!(
+        chain,
+        ChainConfig::Esplora {
+            credentials_file: None,
+            ..
+        }
+    ));
     let ldk: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
-    assert!(matches!(ldk, LightningConfig::Ldk { credentials_file: None, .. }));
+    assert!(matches!(
+        ldk,
+        LightningConfig::Ldk {
+            credentials_file: None,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -2844,10 +2966,14 @@ fn private_forwarding_is_opt_in_and_round_trips() {
         ("forward_to_private_channels = false", false),
         ("forward_to_private_channels = true", true),
     ] {
-        let config: LightningConfig = toml::from_str(&format!("backend = 'ldk'\n{setting}")).unwrap();
+        let config: LightningConfig =
+            toml::from_str(&format!("backend = 'ldk'\n{setting}")).unwrap();
         let serialized = toml::to_string(&config).unwrap();
         let table: toml::Value = toml::from_str(&serialized).unwrap();
-        assert_eq!(table["forward_to_private_channels"].as_bool(), Some(expected));
+        assert_eq!(
+            table["forward_to_private_channels"].as_bool(),
+            Some(expected)
+        );
         let round_trip: LightningConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(toml::to_string(&round_trip).unwrap(), serialized);
     }
@@ -2858,7 +2984,8 @@ fn private_forwarding_rejects_non_boolean_values() {
     for value in ["1", "'true'", "[]"] {
         assert!(toml::from_str::<LightningConfig>(&format!(
             "backend = 'ldk'\nforward_to_private_channels = {value}"
-        )).is_err());
+        ))
+        .is_err());
     }
 }
 
@@ -2867,17 +2994,31 @@ fn our_to_self_delay_is_omitted_by_default_and_round_trips() {
     let omitted: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
     assert!(matches!(
         omitted,
-        LightningConfig::Ldk { our_to_self_delay_blocks: None, .. }
+        LightningConfig::Ldk {
+            our_to_self_delay_blocks: None,
+            ..
+        }
     ));
-    assert!(!toml::to_string(&omitted).unwrap().contains("our_to_self_delay"));
-    let full = NodeConfig::default_for_tier(NodeTier::Full, PathBuf::from("/dev/null"), Path::new("/tmp"));
-    assert!(!toml::to_string(&full).unwrap().contains("our_to_self_delay"));
+    assert!(!toml::to_string(&omitted)
+        .unwrap()
+        .contains("our_to_self_delay"));
+    let full = NodeConfig::default_for_tier(
+        NodeTier::Full,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    assert!(!toml::to_string(&full)
+        .unwrap()
+        .contains("our_to_self_delay"));
 
     let config: LightningConfig =
         toml::from_str("backend = 'ldk'\nour_to_self_delay_blocks = 288").unwrap();
     assert!(matches!(
         config,
-        LightningConfig::Ldk { our_to_self_delay_blocks: Some(288), .. }
+        LightningConfig::Ldk {
+            our_to_self_delay_blocks: Some(288),
+            ..
+        }
     ));
     let serialized = toml::to_string(&config).unwrap();
     let round_trip: LightningConfig = toml::from_str(&serialized).unwrap();
@@ -2923,7 +3064,9 @@ fn our_to_self_delay_validation_bounds_precede_node_startup() {
             Err(error) => {
                 assert!(!accepted, "{setting}: {error}");
                 assert!(
-                    error.to_string().contains("our_to_self_delay_blocks must be between 144 and 2016"),
+                    error
+                        .to_string()
+                        .contains("our_to_self_delay_blocks must be between 144 and 2016"),
                     "{setting}: {error}"
                 );
             }
@@ -3033,9 +3176,9 @@ fn lsps2_service_validation_precedes_node_startup() {
 
 #[test]
 fn dos_edge_partial_config_uses_defaults_and_rejects_typos() {
-    let limits: konsensus_message::DosEdgeConfig = toml::from_str(
-        "max_handshakes = 16\ncookie_threshold = 8\nconnections_per_second = 3.0"
-    ).unwrap();
+    let limits: konsensus_message::DosEdgeConfig =
+        toml::from_str("max_handshakes = 16\ncookie_threshold = 8\nconnections_per_second = 3.0")
+            .unwrap();
     assert_eq!(limits.max_handshakes, 16);
     assert_eq!(limits.cookie_threshold, 8);
     assert_eq!(limits.connection_burst, 40);
@@ -3045,22 +3188,40 @@ fn dos_edge_partial_config_uses_defaults_and_rejects_typos() {
 
 #[test]
 fn node_validation_rejects_unsafe_dos_edge_before_startup() {
-    let mut config = NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/tmp/unused-mnemonic"), std::path::Path::new("/tmp/unused-dos-edge"));
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/tmp/unused-mnemonic"),
+        std::path::Path::new("/tmp/unused-dos-edge"),
+    );
     config.dos_edge.cookie_threshold = config.dos_edge.max_handshakes;
-    assert!(config.validate().unwrap_err().to_string().contains("dos_edge"));
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("dos_edge"));
 }
 
 #[test]
 fn tower_clients_default_off_and_strict_decision_neutral_config() {
-    let base = NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
+    let base = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
     assert!(base.tower.clients.is_empty());
     let text = toml::to_string(&base).unwrap();
     let key = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
-    let configured = format!("{text}\n[tower.clients.friend]\nnode_id = '{key}'\nendpoint = 'guard.example:9736'\n");
+    let configured = format!(
+        "{text}\n[tower.clients.friend]\nnode_id = '{key}'\nendpoint = 'guard.example:9736'\n"
+    );
     let parsed: NodeConfig = toml::from_str(&configured).unwrap();
     assert_eq!(parsed.tower.clients.len(), 1);
     parsed.tower.validate().unwrap();
-    for field in ["unknown = true", "price_msat = 1", "max_spend_msat_per_day = 10"] {
+    for field in [
+        "unknown = true",
+        "price_msat = 1",
+        "max_spend_msat_per_day = 10",
+    ] {
         assert!(toml::from_str::<NodeConfig>(&format!("{configured}\n{field}\n")).is_err());
     }
     assert!(toml::from_str::<konsensus_lightning::tower::TowerConfig>("unknown = true").is_err());
@@ -3071,13 +3232,18 @@ fn tower_clients_default_off_and_strict_decision_neutral_config() {
     bad.clients.get_mut("friend").unwrap().endpoint = "https://guard.example:9736".into();
     assert!(bad.validate().is_err());
     bad = parsed.tower.clone();
-    bad.clients.insert("duplicate".into(), bad.clients["friend"].clone());
+    bad.clients
+        .insert("duplicate".into(), bad.clients["friend"].clone());
     assert!(bad.validate().is_err());
 }
 
 #[test]
 fn tower_clients_reject_unsupported_backend_and_more_than_five() {
-    let mut base = NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), Path::new("/tmp"));
+    let mut base = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
     let entry = konsensus_lightning::tower::TowerEndpoint {
         node_id: "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5".into(),
         endpoint: "guard.example:9736".into(),
@@ -3085,6 +3251,15 @@ fn tower_clients_reject_unsupported_backend_and_more_than_five() {
     base.tower.clients.insert("friend".into(), entry.clone());
     let error = base.validate().unwrap_err().to_string();
     assert!(error.contains("embedded LDK"), "{error}");
-    for n in 0..5 { base.tower.clients.insert(format!("friend-{n}"), entry.clone()); }
-    assert!(base.tower.validate().unwrap_err().to_string().contains("at most five"));
+    for n in 0..5 {
+        base.tower
+            .clients
+            .insert(format!("friend-{n}"), entry.clone());
+    }
+    assert!(base
+        .tower
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("at most five"));
 }
