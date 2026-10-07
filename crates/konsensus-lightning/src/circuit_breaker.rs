@@ -243,6 +243,10 @@ impl CircuitBreakerLightning {
 
 #[async_trait]
 impl LightningProvider for CircuitBreakerLightning {
+    fn tower_status(&self) -> konsensus_core::tower::TowerStatus {
+        self.inner.tower_status()
+    }
+
     fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
         self.inner.chain_sync_status()
     }

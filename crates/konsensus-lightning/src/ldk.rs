@@ -47,6 +47,8 @@ use konsensus_core::traits::lightning::{
 /// Configuration for the embedded LDK Lightning provider.
 #[derive(Debug, Clone)]
 pub struct LdkConfig {
+    /// Optional local-only watchtower staging; empty leaves the hook disabled.
+    pub tower: crate::tower::TowerConfig,
     /// Opt in to forwarding into private channels, without enabling announcements.
     pub forward_to_private_channels: bool,
     /// Breach window (blocks) we ask peers to accept on new channels; `None` keeps LDK's 144.
@@ -379,6 +381,7 @@ fn inbound_payment_from_received_event(
 /// on any successful payment. This ensures `is_available()` reflects actual
 /// payment capability, not just whether the LDK node is running.
 pub struct LdkProvider {
+    tower: Option<Arc<crate::tower::client::ClientCore>>,
     sync_baseline: (Option<u64>, Option<u64>),
     sync_intervals: BackgroundSyncConfig,
     routing_fee_policy: konsensus_core::traits::lightning::RoutingFeePolicy,
@@ -688,7 +691,15 @@ impl LdkProvider {
         let mut node_config = config.node_config(admission);
         node_config.cooperative_close_only = moving_home;
         node_config.channel_peer_allowlist = channel_peer_allowlist;
+        let tower = crate::tower::client::ClientCore::open(
+            &config.tower,
+            &config.storage_dir.join("tower"),
+        )
+        .map_err(|e| LightningError::InvalidStartupConfig(format!("tower client: {e}")))?;
         let mut builder = LdkBuilder::from_config(node_config);
+        if let Some(core) = &tower {
+            builder.set_tower_client(core.candidates.clone());
+        }
         builder.set_network(network);
         builder.set_entropy_seed_bytes(*ldk_seed);
         builder.set_storage_dir_path(
@@ -891,7 +902,11 @@ impl LdkProvider {
             });
         }
 
+        if let Some(core) = &tower {
+            core.spawn(drainer_shutdown.clone());
+        }
         let provider = Self {
+            tower,
             sync_intervals,
             sync_baseline: (
                 baseline.latest_lightning_wallet_sync_timestamp,
@@ -940,6 +955,7 @@ impl LdkProvider {
         let (inbound_tx, _) = broadcast::channel(INBOUND_BROADCAST_CAPACITY);
         let (outgoing_tx, _) = broadcast::channel(OUTGOING_BROADCAST_CAPACITY);
         Self {
+            tower: None,
             sync_baseline: (None, None),
             sync_intervals: BackgroundSyncConfig::default(),
             routing_fee_policy: Default::default(),
@@ -1400,6 +1416,15 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
+    fn tower_status(&self) -> konsensus_core::tower::TowerStatus {
+        self.tower.as_ref().map(|t| t.status()).unwrap_or_else(|| {
+            konsensus_core::tower::TowerStatus {
+                available: true,
+                ..Default::default()
+            }
+        })
+    }
+
     fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
         self.node.status().chain_sync_failure.map(|failure| {
             konsensus_core::traits::lightning::ChainSyncStatus::Stalled {

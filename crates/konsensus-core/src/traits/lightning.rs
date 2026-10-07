@@ -381,6 +381,14 @@ pub struct LightningReadiness {
 /// Every message must have its payment verified through this interface.
 #[async_trait]
 pub trait LightningProvider: Send + Sync {
+    /// Owner-only cached tower diagnostics; reading never starts network work.
+    fn tower_status(&self) -> crate::tower::TowerStatus {
+        crate::tower::TowerStatus {
+            available: true,
+            ..Default::default()
+        }
+    }
+
     /// Local diagnostics only. None means no observed failure, not proof of sync.
     fn chain_sync_status(&self) -> Option<ChainSyncStatus> { None }
 

@@ -1967,6 +1967,7 @@ async fn bitcoind_chain_source_pruned_and_full() {
         assert!(!provider.is_tx_confirmed(txid, 2).await.unwrap());
         assert_eq!(provider.chain_view().trust_level, "own_node");
         let ldk = LdkProvider::new(konsensus_lightning::LdkConfig {
+            tower: Default::default(),
             forward_to_private_channels: false,
             our_to_self_delay_blocks: None,
             lsps2_service: Default::default(),

@@ -57,6 +57,47 @@ fn launcher_redirects_to(path: &std::path::Path) -> bool {
         })
 }
 
+/// LogTracer carries facade targets as `log.target`; native tracing uses metadata.
+/// Capture only tower warnings, independently of console filters, for owner status.
+struct TowerLogBridge;
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TowerLogBridge {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        #[derive(Default)]
+        struct Fields {
+            target: Option<String>,
+            message: String,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "log.target" {
+                    self.target = Some(value.into());
+                } else if field.name() == "message" {
+                    self.message.push_str(value);
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if matches!(field.name(), "message" | "error") {
+                    if !self.message.is_empty() {
+                        self.message.push(' ');
+                    }
+                    self.message.push_str(&format!("{value:?}"));
+                }
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        let target = fields
+            .target
+            .as_deref()
+            .unwrap_or(event.metadata().target());
+        if target.starts_with("ldk_node::tower_hook")
+            || target.starts_with("konsensus_lightning::tower")
+        {
+            konsensus_core::tower::record_warning(&fields.message);
+        }
+    }
+}
+
 pub(crate) fn init() -> FileLogging {
     let file = std::sync::Arc::new(std::sync::Mutex::new(None::<RotatingLog>));
     let handle = FileLogging(file.clone());
@@ -93,6 +134,11 @@ pub(crate) fn init() -> FileLogging {
         // Inner layers receive events first: reject plaintext before formatting
         // it to either output (including the new persistent file).
         .with(konsensus_api::metrics::PlaintextGuardLayer)
+        .with(
+            TowerLogBridge.with_filter(tracing_subscriber::filter::filter_fn(|m| {
+                *m.level() <= tracing::Level::WARN
+            })),
+        )
         .with(file_layer)
         .with(
             tracing_subscriber::fmt::layer()
@@ -344,5 +390,35 @@ mod file_tests {
                 assert!(!text.contains("secret-plaintext-canary"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tower_tests {
+    #[test]
+    fn tower_log_bridge_keeps_w1_warnings_bounded_even_with_rust_log_off() {
+        const CHILD: &str = "BITSOV_TEST_TOWER_LOG_BRIDGE";
+        if std::env::var_os(CHILD).is_some() {
+            super::init();
+            for n in 0..100 {
+                log::warn!(target: "ldk_node::tower_hook", "Quarantined tower test record {}", n);
+            }
+            log::info!(target: "ldk_node::tower_hook", "not a warning");
+            log::warn!(target: "ldk_node::unrelated", "unrelated warning");
+            let warnings = konsensus_core::tower::warnings();
+            assert_eq!(warnings.len(), 64);
+            assert!(warnings[0].message.contains("record 36"));
+            assert!(warnings[63].message.contains("record 99"));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "logging::tower_tests::tower_log_bridge_keeps_w1_warnings_bounded_even_with_rust_log_off", "--nocapture"])
+            .env(CHILD, "1").env("RUST_LOG", "off").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

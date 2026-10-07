@@ -118,6 +118,7 @@ pub async fn run(args: MoveHomeArgs) -> Result<()> {
         password.as_deref().map(String::as_str),
     )?;
     let ldk_config = LdkConfig {
+        tower: Default::default(),
         logging: config.logging,
         electrum: match &config.chain {
             ChainConfig::Electrum(server) => Some(server.clone()),
