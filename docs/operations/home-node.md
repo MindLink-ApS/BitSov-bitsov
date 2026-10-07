@@ -290,3 +290,65 @@ stored password immediately. Under a supervisor that does not restart on 75,
 start the same command again yourself. If the password is lost before that
 unlock, only the recorded phrase can recover the node. Details and error codes:
 [remote first run](../security/pairing.md#remote-first-run-over-the-tunnel).
+### Local offline safety alert
+
+The unlocked node saves `offline-heartbeat.json` in its data directory: the last
+successfully synced chain height and a Unix wall-clock timestamp. It atomically
+replaces and syncs this file only when the synced height advances. Keep it with
+the node data across restarts. Locked mode does not update it. The checkpoint comes from completion of the full
+Lightning sync, not the manager height that can advance during a partial scan.
+A separate atomic `offline-channel-windows.json` caches channel IDs and negotiated
+windows when that list changes. This allows the reminder to work even when
+startup cannot construct LDK because the chain source is unreachable. Such
+cached channel data is marked `coverage_complete: false` until LDK is available;
+it may include channels that have since closed. Neither file contains amounts.
+
+On each start/unlock, and every 30 seconds while running, the node compares the
+chain tip with that heartbeat. Each funded channel still listed by LDK is checked,
+including disconnected or unusable channels. The window is **that channel's
+negotiated `our_to_self_delay`**: how long the counterparty must wait after its
+commitment confirms. It is not the delay on our own force-close, and is not read
+from today's configuration. The shortest known window determines the overall
+severity:
+
+- Below 50%: no alert.
+- At least 50%: **warning**.
+- At least 80%: **critical**.
+
+For a 2016-block channel, warning starts at 1008 blocks and critical at 1613
+blocks. Existing channels may have much shorter windows. No open channels means
+no breach-window alert. If the tip cannot be read or stops advancing, elapsed
+time since the heartbeat is converted at 600 seconds per block; the larger of
+observed lag and that estimate is used. `estimated: true` identifies this
+fallback: it is a reminder based on time, not proof that those blocks were mined.
+Clock jumps or unusually slow blocks can therefore produce an early reminder.
+
+Read the amount-free `offline_safety` object on the existing owner-authenticated
+`GET /api/v1/status`. It contains `blocks_offline`, `smallest_window_blocks`,
+`percentage`, `severity` (`null`, `warning`, or `critical`), `estimated`, and
+per-channel IDs, negotiated windows, percentages and severities. It is available
+even when sync failure blocks payment operations. It is absent from the public
+health response; unsupported Lightning backends return `offline_safety: null`.
+`startup_alert` retains a startup warning/critical finding until exit, even after
+catch-up makes the current severity clear. One WARN/ERROR alert line is emitted
+per run when an alert is first raised; the status continues to update if the
+severity changes.
+
+A missing heartbeat (including the first start after upgrading) cannot establish
+past offline time: `blocks_offline` is `null` until a heartbeat is established.
+`coverage_complete: false` means heartbeat history or a channel's window is
+unknown, or only cached channel data is available. `history_available_on_start` preserves whether this run had history;
+`heartbeat_error` reports an unreadable heartbeat or a failed durable write.
+Unknown history is not a clean bill of health.
+
+**Unlock now**, leave the node running, and restore connectivity to its configured
+chain source so it can sync and react. **Then check channels** in the owner status
+and channel list for unexpected closes or pending recovery. For a critical alert,
+act immediately; the remaining window may be short. An alert indicates time at
+risk, not evidence that a peer cheated, and catching up does not prove a prior
+breach was harmless. Do not reset the heartbeat to silence it. Keep the node
+unlocked and syncing whenever channels are open.
+
+This is a node-local reminder. The hub neither computes nor pushes it, and an
+offline/locked node cannot deliver a live notification: it reports on unlock.
+It does not extend negotiated windows or replace monitoring or a watchtower.

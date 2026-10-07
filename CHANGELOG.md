@@ -5,6 +5,13 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Node-local offline safety alert (v1 safety PR 2): persist an atomic synced-height
+  heartbeat while unlocked, warn at 50% and report critical at 80% of each open
+  channel's negotiated breach window. Owner `GET /api/v1/status` exposes
+  amount-free diagnostics and retains startup alerts after catch-up; stalled
+  chain observation uses an explicitly marked time estimate. No hub push.
+  See [the home-node runbook](docs/operations/home-node.md#local-offline-safety-alert).
+
 - Home-node breach window (v1 safety PR 1, building on W0/#261): embedded LDK
   starts with `--remote-unlock` or `--local-owner-device` default to 2016 blocks
   (about two weeks). Explicit `lightning.our_to_self_delay_blocks` values must
