@@ -113,7 +113,7 @@ Remote sends/acks/deletes and authenticated expiry triggers are TODO(W2b).
 ### Longer breach window (optional)
 
 Home starts with `--remote-unlock` (with or without `--local-owner-device`),
-or with `--password-fd` and `--local-owner-device`, default to **2016 blocks**
+or with `--local-owner-device` and any password source, default to **2016 blocks**
 (about two weeks) on the embedded LDK backend. This includes the
 `HUB_ONLY_WHILE_LOCKABLE` profile for the whole run, after unlock too. There is
 no separate home-node config flag: the startup flags select this policy, not

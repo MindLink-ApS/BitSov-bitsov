@@ -802,6 +802,11 @@ enum PasswordSource {
     None,
 }
 
+/// Startup flags select the home safety profile, independently of password provenance.
+fn is_home_profile(source: PasswordSource, local_owner_device: bool) -> bool {
+    source == PasswordSource::RemoteUnlock || local_owner_device
+}
+
 /// Authority selected for this invocation, never loaded from configuration.
 struct StartAuthority {
     device_authority: std::result::Result<OwnerDeviceAuthority, &'static str>,
@@ -901,7 +906,7 @@ async fn cmd_start(
     let config_path = config_path.as_path();
     let (startup_mode, mut config) = owner_cmd::prepare_start(
         config_path,
-        password_source == PasswordSource::RemoteUnlock || local_owner_device,
+        is_home_profile(password_source, local_owner_device),
     )
     .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
 
@@ -2393,6 +2398,21 @@ mod tests;
 mod owner_key_startup_tests {
     use super::*;
     use konsensus_api::pairing::device::{SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
+
+    #[test]
+    fn home_profile_all_password_sources() {
+        for (source, without_local_owner) in [
+            (PasswordSource::Typed, false),
+            (PasswordSource::Descriptor, false),
+            (PasswordSource::RemoteUnlock, true),
+            (PasswordSource::Flag, false),
+            (PasswordSource::File, false),
+            (PasswordSource::None, false),
+        ] {
+            assert_eq!(is_home_profile(source, false), without_local_owner, "{source:?}");
+            assert!(is_home_profile(source, true), "{source:?}");
+        }
+    }
 
     const PHRASE: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
