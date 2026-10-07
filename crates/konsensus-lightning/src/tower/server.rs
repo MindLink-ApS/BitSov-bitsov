@@ -254,10 +254,21 @@ impl TowerServer {
             if confirmed.is_some() {
                 continue;
             }
-            let txid: Txid = breach
-                .parse()
-                .map_err(|_| Error::Rejected("invalid stored breach txid"))?;
-            let ladder = row.blob.decrypt(txid)?;
+            let txid: Txid = match breach.parse() {
+                Ok(txid) => txid,
+                Err(_) => {
+                    failure = Some(Error::Rejected("invalid stored breach txid"));
+                    continue;
+                }
+            };
+            let ladder = match row.blob.decrypt(txid) {
+                Ok(ladder) => ladder,
+                Err(error) => {
+                    // Report corruption to owner status after serving other rows.
+                    failure = Some(Error::from(error));
+                    continue;
+                }
+            };
             for (tier, justice) in ladder.iter().enumerate() {
                 let id = justice.compute_txid().to_string();
                 let receipt: Option<(bool, u64)> = self
@@ -305,7 +316,7 @@ impl TowerServer {
                     params![id, breach, tier as u64, tip],
                 )?;
                 if let Err(error) = chain.broadcast_transaction(justice).await {
-                    failure = Some(error);
+                    failure = Some(Error::from(error));
                     break; // One rejected breach must not starve other clients.
                 }
                 let db = self.storage.db.transaction()?;
@@ -327,7 +338,7 @@ impl TowerServer {
             }
         }
         if let Some(error) = failure {
-            return Err(error.into());
+            return Err(error);
         }
         Ok(())
     }

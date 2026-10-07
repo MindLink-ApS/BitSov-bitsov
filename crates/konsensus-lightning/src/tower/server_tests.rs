@@ -334,6 +334,69 @@ async fn tower_server_rejection_does_not_starve_other_breaches_or_fee_bumps() {
 }
 
 #[tokio::test]
+async fn tower_server_corrupt_fired_row_reports_error_without_starving_good_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = ServiceConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let mut core = TowerServer::open(&cfg, dir.path()).unwrap().unwrap();
+    let mut candidates = [revoked_candidate_at(42), revoked_candidate_at(43)];
+    // Keep the corrupt row first whether SQLite uses rowid or the breach index.
+    candidates.sort_by_key(|(breach, _, _)| breach.compute_txid().to_string());
+    for (i, (breach, candidate, _)) in candidates.iter().enumerate() {
+        core.storage
+            .accept(
+                [i as u8; 32],
+                0,
+                &SealedBlob::encrypt(breach.compute_txid(), &candidate.ladder).unwrap(),
+                1,
+                4_000_000_000,
+            )
+            .unwrap();
+    }
+    let chain = Arc::new(Chain::default());
+    chain.push(
+        candidates
+            .iter()
+            .map(|(breach, _, _)| breach.clone())
+            .collect(),
+    );
+    core.scan_block(0, &chain.get_block(0).await.unwrap())
+        .unwrap();
+    let corrupt_id = core.storage.active().unwrap()[0].id;
+    core.storage
+        .db
+        .execute(
+            "UPDATE blobs SET cipher=zeroblob(length(cipher)),fired=0 WHERE id=?1",
+            [corrupt_id],
+        )
+        .unwrap();
+
+    let status = Arc::new(RwLock::new(TowerServeStatus::default()));
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(core.run(chain.clone(), status.clone(), receiver));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !status.read().unwrap().enabled {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+
+    assert_eq!(*chain.sent.lock().unwrap(), candidates[1].1.ladder[..1]);
+    let status = status.read().unwrap();
+    assert_eq!(status.breaches_broadcast, 1);
+    assert!(status
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("invalid or unauthenticated tower blob"));
+}
+
+#[tokio::test]
 async fn tower_server_old_unfired_breach_is_not_pruned_before_first_attempt() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = ServiceConfig {
