@@ -227,6 +227,7 @@ impl KonsensusNode {
                 lsp_token,
                 listening_address,
                 forward_to_private_channels,
+                our_to_self_delay_blocks,
                 ..
             } => {
                 let data_dir = config
@@ -268,6 +269,7 @@ impl KonsensusNode {
                     lsp_token: lsp_token.clone(),
                     listening_address: listening_address.clone(),
                     forward_to_private_channels: *forward_to_private_channels,
+                    our_to_self_delay_blocks: *our_to_self_delay_blocks,
                 };
                 info!(
                     backend = "ldk",

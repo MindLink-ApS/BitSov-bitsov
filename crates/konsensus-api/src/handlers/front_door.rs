@@ -467,8 +467,12 @@ async fn put_front_door(
             seq: next_seq,
             issued_at: now_unix()?,
             prices: FrontDoorPrices {
-                admission_msat: req.admission_msat.unwrap_or(default_admission),
-                message_msat: req.message_msat.unwrap_or(default_message),
+                admission_msat: state
+                    .gate
+                    .price_with_floor_msat(req.admission_msat.unwrap_or(default_admission)),
+                message_msat: state
+                    .gate
+                    .price_with_floor_msat(req.message_msat.unwrap_or(default_message)),
                 page_msat,
                 price_epoch: height / 2016,
             },

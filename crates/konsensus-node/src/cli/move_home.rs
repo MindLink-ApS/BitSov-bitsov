@@ -146,6 +146,7 @@ pub async fn run(args: MoveHomeArgs) -> Result<()> {
         lsp_token: None,
         listening_address: listening_address.clone(),
         forward_to_private_channels: false,
+        our_to_self_delay_blocks: None,
     };
     // Refuse a changed plan BEFORE constructing LDK, including reconnects.
     let seed = zeroize::Zeroizing::new(konsensus_lightning::scb_restore::derive_ldk_entropy_seed(
