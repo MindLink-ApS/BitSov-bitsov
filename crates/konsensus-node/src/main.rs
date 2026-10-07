@@ -20,6 +20,7 @@ mod move_home_cmd;
 mod msg_handler;
 mod node;
 mod onboarding;
+mod offline_safety;
 #[path = "cli/owner.rs"]
 mod owner_cmd;
 mod password;
@@ -802,6 +803,11 @@ enum PasswordSource {
     None,
 }
 
+/// Startup flags select the home safety profile, independently of password provenance.
+fn is_home_profile(source: PasswordSource, local_owner_device: bool) -> bool {
+    source == PasswordSource::RemoteUnlock || local_owner_device
+}
+
 /// Authority selected for this invocation, never loaded from configuration.
 struct StartAuthority {
     device_authority: std::result::Result<OwnerDeviceAuthority, &'static str>,
@@ -901,7 +907,7 @@ async fn cmd_start(
     let config_path = config_path.as_path();
     let (startup_mode, mut config) = owner_cmd::prepare_start(
         config_path,
-        password_source == PasswordSource::RemoteUnlock || local_owner_device,
+        is_home_profile(password_source, local_owner_device),
     )
     .with_context(|| format!("failed to prepare startup from {}", config_path.display()))?;
 
@@ -1503,6 +1509,13 @@ async fn start_node_services<'a>(
 
     // ── Spawn background tasks ─────────────────────────────────────────
 
+    let offline_safety_handle = tokio::spawn(offline_safety::run(
+        Arc::clone(node.lightning()),
+        Arc::clone(node.chain()),
+        data_dir.clone(),
+        node.shutdown_rx(),
+    ));
+
     // R3 SEAM-B (Route B, default-off). Build the relay engine ONLY when
     // `[relay] enabled`; a disabled node holds `None`, allocates no engine/store,
     // and its receive path is byte-identical to a non-relay build. The backend is
@@ -1866,6 +1879,9 @@ async fn start_node_services<'a>(
         }
         if let Err(e) = session_handle.await {
             warn!(error = %e, "session handler task panicked");
+        }
+        if let Err(e) = offline_safety_handle.await {
+            warn!(error = %e, "offline safety task panicked");
         }
         if let Err(e) = nonce_cleanup_handle.await {
             warn!(error = %e, "nonce cleanup task panicked");
@@ -2393,6 +2409,21 @@ mod tests;
 mod owner_key_startup_tests {
     use super::*;
     use konsensus_api::pairing::device::{SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
+
+    #[test]
+    fn home_profile_all_password_sources() {
+        for (source, without_local_owner) in [
+            (PasswordSource::Typed, false),
+            (PasswordSource::Descriptor, false),
+            (PasswordSource::RemoteUnlock, true),
+            (PasswordSource::Flag, false),
+            (PasswordSource::File, false),
+            (PasswordSource::None, false),
+        ] {
+            assert_eq!(is_home_profile(source, false), without_local_owner, "{source:?}");
+            assert!(is_home_profile(source, true), "{source:?}");
+        }
+    }
 
     const PHRASE: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";

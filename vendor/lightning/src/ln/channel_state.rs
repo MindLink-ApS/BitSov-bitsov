@@ -438,6 +438,10 @@ pub struct ChannelDetails {
 	///
 	/// This value will be `None` for outbound channels until the counterparty accepts the channel.
 	pub force_close_spend_delay: Option<u16>,
+	/// Blocks the counterparty must wait after its commitment confirms. This is
+	/// our negotiated `our_to_self_delay`, protecting us against a revoked state.
+	/// Older serialized ChannelDetails may not contain this diagnostic field.
+	pub counterparty_force_close_spend_delay: Option<u16>,
 	/// True if the channel was initiated (and thus funded) by us.
 	pub is_outbound: bool,
 	/// True if the channel is confirmed, channel_ready messages have been exchanged, and the
@@ -586,6 +590,7 @@ impl ChannelDetails {
 			confirmations_required: channel.minimum_depth(),
 			confirmations: Some(funding.get_funding_tx_confirmations(best_block_height)),
 			force_close_spend_delay: funding.get_counterparty_selected_contest_delay(),
+			counterparty_force_close_spend_delay: Some(funding.get_holder_selected_contest_delay()),
 			is_outbound: funding.is_outbound(),
 			is_channel_ready: context.is_usable(),
 			is_usable: context.is_live(),
@@ -636,6 +641,7 @@ impl_writeable_tlv_based!(ChannelDetails, {
 	(43, pending_inbound_htlcs, optional_vec),
 	(45, pending_outbound_htlcs, optional_vec),
 	(47, funding_redeem_script, option),
+	(49, counterparty_force_close_spend_delay, option),
 	(_unused, user_channel_id, (static_value,
 		_user_channel_id_low.unwrap_or(0) as u128 | ((_user_channel_id_high.unwrap_or(0) as u128) << 64)
 	)),
@@ -730,6 +736,7 @@ mod tests {
 			confirmations_required: Some(5),
 			confirmations: Some(73),
 			force_close_spend_delay: Some(10),
+			counterparty_force_close_spend_delay: Some(2016),
 			is_outbound: true,
 			is_channel_ready: false,
 			is_usable: true,

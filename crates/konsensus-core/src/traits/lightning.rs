@@ -389,6 +389,12 @@ pub trait LightningProvider: Send + Sync {
         }
     }
 
+    /// Local safety state; unsupported backends return None. Never initiates I/O.
+    fn offline_chain_state(&self) -> Option<crate::offline_safety::OfflineChainState> { None }
+
+    /// Shared node-local report, populated by the unlocked node's heartbeat task.
+    fn offline_safety(&self) -> Option<crate::offline_safety::SharedOfflineSafety> { None }
+
     /// Local diagnostics only. None means no observed failure, not proof of sync.
     fn chain_sync_status(&self) -> Option<ChainSyncStatus> { None }
 

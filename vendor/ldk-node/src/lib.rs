@@ -860,6 +860,7 @@ impl Node {
 			is_running,
 			current_best_block,
 			latest_lightning_wallet_sync_timestamp,
+			latest_lightning_wallet_sync: locked_node_metrics.latest_lightning_wallet_sync,
 			latest_onchain_wallet_sync_timestamp,
 			latest_fee_rate_cache_update_timestamp,
 			latest_rgs_snapshot_timestamp,
@@ -2047,6 +2048,9 @@ pub struct NodeStatus {
 	pub is_running: bool,
 	/// The best block to which our Lightning wallet is currently synced.
 	pub current_best_block: BestBlock,
+	/// Height and UNIX timestamp captured together only after a complete Lightning
+	/// sync succeeds in this process. The live manager height can advance mid-sync.
+	pub latest_lightning_wallet_sync: Option<(u32, u64)>,
 	/// The timestamp, in seconds since start of the UNIX epoch, when we last successfully synced
 	/// our Lightning wallet to the chain tip.
 	///
@@ -2083,6 +2087,8 @@ pub struct NodeStatus {
 /// Status fields that are persisted across restarts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NodeMetrics {
+	// Deliberately not serialized: loaded manager state is not a sync in this run.
+	latest_lightning_wallet_sync: Option<(u32, u64)>,
 	latest_lightning_wallet_sync_timestamp: Option<u64>,
 	latest_onchain_wallet_sync_timestamp: Option<u64>,
 	latest_fee_rate_cache_update_timestamp: Option<u64>,
@@ -2092,10 +2098,18 @@ pub(crate) struct NodeMetrics {
 	latest_channel_monitor_archival_height: Option<u32>,
 }
 
+impl NodeMetrics {
+	fn record_lightning_sync(&mut self, height: u32, timestamp: Option<u64>) {
+		self.latest_lightning_wallet_sync_timestamp = timestamp;
+		self.latest_lightning_wallet_sync = timestamp.map(|time| (height, time));
+	}
+}
+
 impl Default for NodeMetrics {
 	fn default() -> Self {
 		Self {
 			latest_lightning_wallet_sync_timestamp: None,
+			latest_lightning_wallet_sync: None,
 			latest_onchain_wallet_sync_timestamp: None,
 			latest_fee_rate_cache_update_timestamp: None,
 			latest_rgs_snapshot_timestamp: None,
@@ -2107,6 +2121,7 @@ impl Default for NodeMetrics {
 }
 
 impl_writeable_tlv_based!(NodeMetrics, {
+	(_unused, latest_lightning_wallet_sync, (static_value, None)),
 	(0, latest_lightning_wallet_sync_timestamp, option),
 	(1, latest_pathfinding_scores_sync_timestamp, option),
 	(2, latest_onchain_wallet_sync_timestamp, option),

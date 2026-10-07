@@ -178,6 +178,25 @@ impl EsploraSyncIntervals {
     }
 }
 
+fn offline_synced_block(status: &ldk_node::NodeStatus) -> Option<konsensus_core::offline_safety::SyncedBlock> {
+    if !status.is_running { return None; }
+    status.latest_lightning_wallet_sync.map(|(height, unix_secs)| {
+        konsensus_core::offline_safety::SyncedBlock { height: u64::from(height), unix_secs }
+    })
+}
+
+fn offline_channel_windows(
+    channels: Vec<ldk_node::ChannelDetails>,
+) -> Vec<konsensus_core::offline_safety::ChannelWindow> {
+    channels.into_iter()
+        // Include disconnected/unusable and closing channels while LDK lists them.
+        .filter(|ch| ch.funding_txo.is_some())
+        .map(|ch| konsensus_core::offline_safety::ChannelWindow {
+            channel_id: ch.channel_id.to_string(),
+            window_blocks: ch.counterparty_force_close_spend_delay,
+        }).collect()
+}
+
 fn sync_status_is_ready(
     status: &ldk_node::NodeStatus,
     baseline: (Option<u64>, Option<u64>),
@@ -381,6 +400,7 @@ fn inbound_payment_from_received_event(
 /// on any successful payment. This ensures `is_available()` reflects actual
 /// payment capability, not just whether the LDK node is running.
 pub struct LdkProvider {
+    offline_safety: konsensus_core::offline_safety::SharedOfflineSafety,
     tower: Option<Arc<crate::tower::client::ClientCore>>,
     sync_baseline: (Option<u64>, Option<u64>),
     sync_intervals: BackgroundSyncConfig,
@@ -906,6 +926,7 @@ impl LdkProvider {
             core.spawn(drainer_shutdown.clone());
         }
         let provider = Self {
+            offline_safety: Default::default(),
             tower,
             sync_intervals,
             sync_baseline: (
@@ -955,6 +976,7 @@ impl LdkProvider {
         let (inbound_tx, _) = broadcast::channel(INBOUND_BROADCAST_CAPACITY);
         let (outgoing_tx, _) = broadcast::channel(OUTGOING_BROADCAST_CAPACITY);
         Self {
+            offline_safety: Default::default(),
             tower: None,
             sync_baseline: (None, None),
             sync_intervals: BackgroundSyncConfig::default(),
@@ -1416,6 +1438,18 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
+    fn offline_safety(&self) -> Option<konsensus_core::offline_safety::SharedOfflineSafety> {
+        Some(self.offline_safety.clone())
+    }
+
+    fn offline_chain_state(&self) -> Option<konsensus_core::offline_safety::OfflineChainState> {
+        let status = self.node.status();
+        Some(konsensus_core::offline_safety::OfflineChainState {
+            last_sync: offline_synced_block(&status),
+            channels: offline_channel_windows(self.node.list_channels()),
+        })
+    }
+
     fn tower_status(&self) -> konsensus_core::tower::TowerStatus {
         self.tower.as_ref().map(|t| t.status()).unwrap_or_else(|| {
             konsensus_core::tower::TowerStatus {
