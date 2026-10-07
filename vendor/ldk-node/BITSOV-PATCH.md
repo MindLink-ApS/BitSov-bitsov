@@ -524,12 +524,24 @@ No lightning source, dependency, lockfile, wire protocol or monitor encoding cha
   registration. Whenever the pending record is missing (also after quarantine),
   the initial counterparty commitment is staged if LDK supplies it, including on
   `Some(update)` calls. Commitments carried by that update are also staged.
-  A missing secret or signer error retains that entry for retry and continues
-  through the queue. Funding outpoint mismatches are logged with the candidate,
-  channel, old input and active input; obsolete inbound-splice heads no longer
-  block later states. Failed entries remain available because a funding mismatch
-  may also be an unconfirmed splice. Legacy entries without funding metadata also
-  cannot block the queue.
+  Before signing, heads whose funding scope is in the LDK-observed
+  `retired_funding` set (the same proof used by cap pruning) are copied to
+  `tower_retired/<channel_id>/<revoked_txid>`, with their complete unsigned pending
+  record and reason `funding retired by splice`, then dequeued. The archive write
+  precedes the pending rewrite, so either write can be retried after a crash;
+  storage failures stop monitor advancement. Retired heads are never signed.
+  Restart and update redelivery consult the archive to avoid re-adding retired
+  heads while their retirement proof remains valid. The archive itself is not
+  retirement proof after rollback or a same-ID funding change. When proof is
+  invalidated, recover eligible archived heads before rewriting the pending
+  journal, excluding observations newer than the restored monitor and existing
+  signed/pending entries. This also covers a crash after dequeue but before the
+  newer monitor became durable. Ordinary persists do not scan the archive.
+  A missing secret or signer error without retirement proof retains that entry
+  for retry and continues through the queue. Funding outpoint mismatches are
+  logged with the candidate, channel, old input and active input: a mismatch may
+  be an unconfirmed splice. Same-funding failures and legacy entries without
+  funding metadata also remain pending without blocking later states.
   On restart, unsigned entries newer than the restored monitor are discarded:
   they preceded a monitor write that never completed, and their commitment may
   never be sent. Funding-retirement proof is discarded on monitor rollback or an
@@ -584,8 +596,12 @@ No lightning source, dependency, lockfile, wire protocol or monitor encoding cha
   when disabled. A further crash regression restores serialized monitor AND
   channel-manager snapshots with a newer tower journal, then makes/revokes a
   different commitment. The reference test's simulated confirmation and recovered
-  balance checks are also ported. W1b adds a real in-memory inbound splice and
-  client restart followed by further signing, corrupt-record quarantine and restart,
+  balance checks are also ported. W1b adds a real in-memory inbound splice with
+  dead-head retirement, client restart/redelivery followed by further signing,
+  retention of a not-yet-retired splice scope, a transient same-funding signing
+  error retried after the revocation secret arrives, retirement-write failures
+  and restart, rollback/same-ID recovery of already-dequeued heads against a
+  serialized pre-splice monitor, corrupt-record quarantine and restart,
   failed quarantine writes, oldest-superseded cap pruning, replay at the cap,
   failed signed writes at the cap, retention of more than 10,000 distinct states,
   protection of both funding scopes during an unconfirmed splice under cap pressure,

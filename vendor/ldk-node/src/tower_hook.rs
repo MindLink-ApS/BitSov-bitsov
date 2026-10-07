@@ -125,6 +125,65 @@ impl TowerClient {
         Ok(candidates)
     }
 
+    fn read_retired(&self, id: ChannelId, key: &str) -> io::Result<Option<RetiredCandidate>> {
+        let bytes = match self.store.read("tower_retired", &id.to_string(), key) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let retired = decode::<RetiredCandidate>(&bytes)?;
+        validate_candidate(&retired.pending.candidate, id, Some(key), false)?;
+        Ok(Some(retired))
+    }
+
+    fn is_retired(
+        &self,
+        id: ChannelId,
+        key: &str,
+        retired_funding: &[bitcoin::OutPoint],
+    ) -> io::Result<bool> {
+        // An archive is not fresh retirement proof. Rollback/same-ID transitions
+        // clear the journal's proof and must allow redelivery of restored scopes.
+        Ok(self
+            .read_retired(id, key)?
+            .and_then(|retired| retired.pending.funding_outpoint)
+            .is_some_and(|funding| retired_funding.contains(&funding)))
+    }
+
+    fn restore_retired(
+        &self,
+        id: ChannelId,
+        state: &mut PendingChannel,
+        update_id: u64,
+    ) -> io::Result<()> {
+        for key in self.store.list("tower_retired", &id.to_string())? {
+            let Some(retired) = self.read_retired(id, &key)? else {
+                continue;
+            };
+            let pending = retired.pending;
+            if pending.observed_update_id > update_id
+                || pending
+                    .funding_outpoint
+                    .is_some_and(|funding| state.retired_funding.contains(&funding))
+                || state
+                    .pending
+                    .iter()
+                    .any(|p| candidate_key(&p.candidate) == key)
+                || self.read_candidate(id, &key)?.is_some()
+            {
+                continue;
+            }
+            if pending.candidate.ladder[0].output[0].script_pubkey != state.destination {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Tower destination mismatch",
+                ));
+            }
+            state.pending.push(pending);
+        }
+        Ok(())
+    }
+
     fn prune_candidates(
         &self,
         id: ChannelId,
@@ -215,12 +274,18 @@ impl StoredCandidate {
     }
 }
 
+#[derive(Clone)]
 struct PendingCandidate {
     candidate: JusticeCandidate,
     observed_update_id: u64,
     // Optional for journals written by W1. This is the commitment's funding input,
     // not the monitor's active input (a pending splice may use a different one).
     funding_outpoint: Option<bitcoin::OutPoint>,
+}
+
+struct RetiredCandidate {
+    pending: PendingCandidate,
+    reason: String,
 }
 
 struct PendingChannel {
@@ -231,11 +296,13 @@ struct PendingChannel {
     retired_funding: Vec<bitcoin::OutPoint>,
 }
 impl PendingChannel {
-    fn reconcile_funding(&mut self, active: bitcoin::OutPoint, update_id: u64) {
+    fn reconcile_funding(&mut self, active: bitcoin::OutPoint, update_id: u64) -> bool {
+        let mut invalidated = false;
         if let Some((previous, observed)) = self.funding {
             if observed > update_id || (previous != active && observed == update_id) {
                 // Write-ahead rollback or a same-ID chain transition: do not mistake a
                 // restored older monitor for proof that its newer funding was retired.
+                invalidated = true;
                 self.retired_funding.clear();
             } else if previous != active && !self.retired_funding.contains(&previous) {
                 // Follow LDK's scope-retirement policy (including configured splice depth),
@@ -243,10 +310,13 @@ impl PendingChannel {
                 self.retired_funding.push(previous);
             }
         } else {
+            invalidated = !self.retired_funding.is_empty();
             self.retired_funding.clear();
         }
+        invalidated |= self.retired_funding.contains(&active);
         self.retired_funding.retain(|funding| *funding != active);
         self.funding = Some((active, update_id));
+        invalidated
     }
 }
 
@@ -272,6 +342,10 @@ mod encoding {
         (0, candidate, required),
         (2, observed_update_id, required),
         (3, funding_outpoint, option),
+    });
+    impl_writeable_tlv_based!(RetiredCandidate, {
+        (0, pending, required),
+        (2, reason, required),
     });
     impl_writeable_tlv_based!(PendingChannel, {
         (0, destination, required),
@@ -458,7 +532,8 @@ impl<P> TowerPersister<P> {
             ),
         };
         let active_funding = monitor.get_funding_txo().into_bitcoin_outpoint();
-        state.reconcile_funding(active_funding, monitor.get_latest_update_id());
+        let retirement_invalidated =
+            state.reconcile_funding(active_funding, monitor.get_latest_update_id());
         // A crash can leave the tower write-ahead record newer than the durable monitor.
         // Those unsigned commitments were never acknowledged, so the manager can choose
         // different transactions at the same commitment number on restart. Drop only entries
@@ -466,6 +541,12 @@ impl<P> TowerPersister<P> {
         state
             .pending
             .retain(|p| p.observed_update_id <= monitor.get_latest_update_id());
+        if retirement_invalidated {
+            // Retirement/dequeue can precede the durable monitor write. Recover live
+            // heads from the archive if that write rolled back. Ordinary persists do
+            // not scan retired records; the proof and restored queue are written together.
+            client.restore_retired(id, &mut state, monitor.get_latest_update_id())?;
+        }
         let mut commitments = Vec::new();
         if fresh {
             commitments.extend(
@@ -493,7 +574,9 @@ impl<P> TowerPersister<P> {
                 {
                     continue;
                 }
-                if client.read_candidate(id, &key)?.is_none() {
+                if client.read_candidate(id, &key)?.is_none()
+                    && !client.is_retired(id, &key, &state.retired_funding)?
+                {
                     state.pending.push(PendingCandidate {
                         candidate,
                         // Redelivery to a newer monitor must not refresh an old alternative's age.
@@ -513,6 +596,31 @@ impl<P> TowerPersister<P> {
         let mut index = 0;
         while let Some(pending) = state.pending.get(index) {
             let candidate = &pending.candidate;
+            if pending.funding_outpoint.is_some_and(|funding| {
+                funding != active_funding && state.retired_funding.contains(&funding)
+            }) {
+                let key = candidate_key(candidate);
+                let retired = RetiredCandidate {
+                    pending: pending.clone(),
+                    reason: "funding retired by splice".to_string(),
+                };
+                // Copy BEFORE dequeue, just like signed candidates. Retrying either
+                // write after a crash is idempotent, and retired heads are never signed.
+                client
+                    .store
+                    .write("tower_retired", &channel, &key, retired.encode())?;
+                state.pending.remove(index);
+                client
+                    .store
+                    .write("tower", "pending", &channel, state.encode())?;
+                log::warn!(
+                    "Retired unsigned watchtower candidate {} for channel {}: {}",
+                    key,
+                    channel,
+                    retired.reason
+                );
+                continue;
+            }
             let mut signed = candidate.clone();
             let ladder = candidate
                 .ladder
@@ -526,10 +634,9 @@ impl<P> TowerPersister<P> {
                     )
                 })
                 .collect::<Result<Vec<_>, _>>();
-            // A locked splice removes the old funding scope from LDK's signer. Never let
-            // that entry (including legacy entries with no funding metadata) block later
-            // states. Retain failures for retry: a differing input can also be a pending
-            // splice, and Err alone does not distinguish a missing secret/signer outage.
+            // Without retirement proof, retain every failure for retry and continue
+            // the queue (including legacy entries with no funding metadata). A differing
+            // input can be a pending splice; Err alone cannot prove funding retirement.
             let Ok(ladder) = ladder else {
                 let active_funding = monitor.get_funding_txo().into_bitcoin_outpoint();
                 if let Some(funding) = pending.funding_outpoint.filter(|f| *f != active_funding) {
