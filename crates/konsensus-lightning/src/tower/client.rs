@@ -91,10 +91,24 @@ impl ClientCore {
             let page = self
                 .candidates
                 .candidate_page(channel, cursor.as_deref(), 128)?;
+            let mut at_capacity = false;
             for candidate in &page {
                 let key = candidate_key(candidate)?;
-                self.outbox
-                    .enqueue(candidate, &peer.to_string(), &self.towers)?;
+                if let Err(error) = self
+                    .outbox
+                    .enqueue(candidate, &peer.to_string(), &self.towers)
+                {
+                    match error.kind() {
+                        io::ErrorKind::WouldBlock => at_capacity = true,
+                        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
+                            status.available = false;
+                            status.error = Some(format!("channel {id}: {error}"));
+                        }
+                        _ => return Err(error),
+                    }
+                    tracing::warn!(target: "konsensus_lightning::tower", channel = %id, %error, "tower channel enqueue failed; continuing reconciliation");
+                    continue;
+                }
                 if self.outbox.fully_acked(&id, &key)? {
                     self.candidates.acknowledge_candidate(channel, &key)?;
                 }
@@ -122,7 +136,8 @@ impl ClientCore {
             view.quarantined_pending = diagnostics.quarantined_pending;
             view.quarantined_candidates = diagnostics.quarantined_candidates;
             view.retired_records = diagnostics.retired;
-            view.at_capacity = diagnostics.at_capacity
+            view.at_capacity = at_capacity
+                || diagnostics.at_capacity
                 || self.outbox.pending_count(&id)? >= MAX_PENDING_PER_CHANNEL;
             view.coverage_gap = diagnostics.quarantined_pending
                 + diagnostics.quarantined_candidates
@@ -289,6 +304,136 @@ mod tests {
         assert_eq!(channel.guarded_states, 0);
         assert_eq!(channel.quarantined_candidates, 1);
         assert!(channel.coverage_gap);
+    }
+
+    #[test]
+    fn tower_handoff_continues_past_channel_at_outbox_capacity() {
+        handoff_continues_past_channel_enqueue_error(true);
+    }
+
+    #[test]
+    fn tower_handoff_continues_past_channel_with_oversized_blob() {
+        handoff_continues_past_channel_enqueue_error(false);
+    }
+
+    fn handoff_continues_past_channel_enqueue_error(at_capacity: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, tower, candidate) = fixture(dir.path());
+        let store = SqliteStore::new(dir.path().into(), None, None).unwrap();
+        let mut second = candidate.clone();
+        second.channel_id = ldk_node::lightning::ln::types::ChannelId([3; 32]);
+        store
+            .write(
+                "tower_peers",
+                "",
+                &second.channel_id.to_string(),
+                store
+                    .read("tower_peers", "", &candidate.channel_id.to_string())
+                    .unwrap(),
+            )
+            .unwrap();
+        let key = candidate_key(&second).unwrap();
+        store
+            .write(
+                "tower_candidates",
+                &second.channel_id.to_string(),
+                &key,
+                second.encode(),
+            )
+            .unwrap();
+        let core = ClientCore::open(&config, dir.path()).unwrap().unwrap();
+        // Use the store's enumeration order so the failing channel is visited first.
+        let channels = core.candidates.channels().unwrap();
+        assert_eq!(channels.len(), 2);
+        let capped = channels[0].0.to_string();
+        let later = channels[1].0.to_string();
+        let total_states = if at_capacity {
+            let db = rusqlite::Connection::open(dir.path().join("outbox.sqlite")).unwrap();
+            db.execute(
+                "WITH RECURSIVE fixtures(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixtures WHERE n<?2)
+             INSERT INTO states(channel, txid, blob, pending)
+             SELECT ?1, 'fixture-' || n, NULL, 1 FROM fixtures",
+                rusqlite::params![capped, MAX_PENDING_PER_CHANNEL],
+            )
+            .unwrap();
+            assert_eq!(
+                core.outbox.pending_count(&capped).unwrap(),
+                MAX_PENDING_PER_CHANNEL
+            );
+            MAX_PENDING_PER_CHANNEL + 1
+        } else {
+            let mut oversized = candidate.clone();
+            oversized.channel_id = channels[0].0;
+            oversized.ladder[0].input[0]
+                .witness
+                .push(vec![0; super::super::blob::MAX_BLOB_BYTES]);
+            store
+                .write("tower_candidates", &capped, &key, oversized.encode())
+                .unwrap();
+            1
+        };
+
+        core.reconcile().unwrap();
+        let status = core.status();
+        assert_eq!(status.available, at_capacity);
+        if at_capacity {
+            assert!(status.error.is_none());
+        } else {
+            assert!(status.error.as_ref().unwrap().contains(&capped));
+        }
+        assert_eq!(status.channels.len(), 2);
+        let full = status
+            .channels
+            .iter()
+            .find(|c| c.channel_id == capped)
+            .unwrap();
+        assert_eq!(full.at_capacity, at_capacity);
+        assert_eq!(full.total_states, total_states);
+        assert_eq!(full.unguarded_states, total_states);
+        assert_eq!(
+            core.candidates.candidate_keys(channels[0].0).unwrap(),
+            vec![key.clone()]
+        );
+        assert!(!core.outbox.contains(&capped, &key).unwrap());
+        assert!(core.outbox.contains(&later, &key).unwrap());
+        let healthy = status
+            .channels
+            .iter()
+            .find(|c| c.channel_id == later)
+            .unwrap();
+        assert!(!healthy.at_capacity);
+        assert_eq!(healthy.total_states, 1);
+
+        core.outbox.mark_sent(&later, &key, &tower).unwrap();
+        core.outbox.ack(&later, &key, &tower).unwrap();
+        core.reconcile().unwrap();
+        assert!(core
+            .candidates
+            .candidate_keys(channels[1].0)
+            .unwrap()
+            .is_empty());
+        let status = core.status();
+        let healthy = status
+            .channels
+            .iter()
+            .find(|c| c.channel_id == later)
+            .unwrap();
+        assert_eq!(healthy.guarded_states, 1);
+        assert_eq!(healthy.unguarded_states, 0);
+    }
+
+    #[test]
+    fn tower_handoff_storage_failure_remains_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _, _) = fixture(dir.path());
+        let core = ClientCore::open(&config, dir.path()).unwrap().unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("outbox.sqlite")).unwrap();
+        db.execute("DROP TABLE deliveries", []).unwrap();
+
+        assert!(core.reconcile().is_err());
+        let status = core.status();
+        assert!(!status.available);
+        assert!(status.error.is_some());
     }
 
     #[test]
