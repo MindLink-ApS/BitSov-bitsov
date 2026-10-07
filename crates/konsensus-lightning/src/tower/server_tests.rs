@@ -277,6 +277,22 @@ async fn tower_server_wrong_key_invalid_spend_and_confirmed_ladder_never_broadca
     }
 }
 #[test]
+fn tower_server_valid_ladder_requires_rbf_in_every_later_tier() {
+    let (breach, candidate, _) = revoked_candidate_at(42);
+    assert!(valid_ladder(&breach, &candidate.ladder));
+    for tier in 1..candidate.ladder.len() {
+        for sequence in [bitcoin::Sequence::MAX, bitcoin::Sequence(0xffff_fffe)] {
+            let mut ladder = candidate.ladder.clone();
+            ladder[tier].input[0].sequence = sequence;
+            assert!(
+                !valid_ladder(&breach, &ladder),
+                "non-RBF tier {tier} accepted: {sequence:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn tower_server_off_has_no_filesystem_effect() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("absent");
