@@ -185,6 +185,18 @@ fn offline_synced_block(status: &ldk_node::NodeStatus) -> Option<konsensus_core:
     })
 }
 
+fn offline_channel_windows(
+    channels: Vec<ldk_node::ChannelDetails>,
+) -> Vec<konsensus_core::offline_safety::ChannelWindow> {
+    channels.into_iter()
+        // Include disconnected/unusable and closing channels while LDK lists them.
+        .filter(|ch| ch.funding_txo.is_some())
+        .map(|ch| konsensus_core::offline_safety::ChannelWindow {
+            channel_id: ch.channel_id.to_string(),
+            window_blocks: ch.counterparty_force_close_spend_delay,
+        }).collect()
+}
+
 fn sync_status_is_ready(
     status: &ldk_node::NodeStatus,
     baseline: (Option<u64>, Option<u64>),
@@ -1434,13 +1446,7 @@ impl LightningProvider for LdkProvider {
         let status = self.node.status();
         Some(konsensus_core::offline_safety::OfflineChainState {
             last_sync: offline_synced_block(&status),
-            channels: self.node.list_channels().into_iter()
-                // Include disconnected/unusable and closing channels while LDK lists them.
-                .filter(|ch| ch.funding_txo.is_some())
-                .map(|ch| konsensus_core::offline_safety::ChannelWindow {
-                    channel_id: ch.channel_id.to_string(),
-                    window_blocks: ch.counterparty_force_close_spend_delay,
-                }).collect(),
+            channels: offline_channel_windows(self.node.list_channels()),
         })
     }
 

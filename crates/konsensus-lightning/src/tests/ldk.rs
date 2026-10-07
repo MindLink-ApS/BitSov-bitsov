@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn offline_safety_window_uses_our_to_self_delay() {
+    let our_to_self_delay = 2016;
+    let channel = ldk_node::ChannelDetails {
+        channel_id: ldk_node::lightning::ln::types::ChannelId::new_zero(),
+        counterparty_node_id: bitcoin::secp256k1::PublicKey::from_slice(&[2; 33]).unwrap(),
+        funding_txo: Some(bitcoin::OutPoint::null()),
+        short_channel_id: None,
+        outbound_scid_alias: None,
+        inbound_scid_alias: None,
+        channel_value_sats: 100_000,
+        unspendable_punishment_reserve: None,
+        user_channel_id: ldk_node::UserChannelId(1),
+        feerate_sat_per_1000_weight: 253,
+        outbound_capacity_msat: 0,
+        inbound_capacity_msat: 0,
+        confirmations_required: Some(6),
+        confirmations: Some(6),
+        is_outbound: true,
+        is_channel_ready: true,
+        is_usable: false,
+        is_announced: false,
+        cltv_expiry_delta: None,
+        counterparty_unspendable_punishment_reserve: 0,
+        counterparty_outbound_htlc_minimum_msat: None,
+        counterparty_outbound_htlc_maximum_msat: None,
+        counterparty_forwarding_info_fee_base_msat: None,
+        counterparty_forwarding_info_fee_proportional_millionths: None,
+        counterparty_forwarding_info_cltv_expiry_delta: None,
+        next_outbound_htlc_limit_msat: 0,
+        next_outbound_htlc_minimum_msat: 0,
+        force_close_spend_delay: Some(144),
+        counterparty_force_close_spend_delay: Some(our_to_self_delay),
+        inbound_htlc_minimum_msat: 0,
+        inbound_htlc_maximum_msat: None,
+        config: Default::default(),
+    };
+    let windows = offline_channel_windows(vec![channel]);
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].window_blocks, Some(2016));
+}
+
+#[test]
 fn parse_network_variants() {
     assert_eq!(parse_network("bitcoin").unwrap(), bitcoin::Network::Bitcoin);
     assert_eq!(parse_network("mainnet").unwrap(), bitcoin::Network::Bitcoin);
