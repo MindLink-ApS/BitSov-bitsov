@@ -48,17 +48,32 @@ impl Default for Lsps2ServiceConfig {
     }
 }
 
+// Keep credentials out of diagnostics, including nested and pretty Debug output.
 impl std::fmt::Debug for Lsps2ServiceConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Lsps2ServiceConfig")
             .field("enabled", &self.enabled)
+            .field("require_token", &"<redacted>")
+            .field("channel_opening_fee_ppm", &self.channel_opening_fee_ppm)
             .field(
-                "require_token",
-                &self.require_token.as_ref().map(|_| "[redacted]"),
+                "channel_over_provisioning_ppm",
+                &self.channel_over_provisioning_ppm,
             )
+            .field(
+                "min_channel_opening_fee_msat",
+                &self.min_channel_opening_fee_msat,
+            )
+            .field("min_channel_lifetime", &self.min_channel_lifetime)
+            .field("max_client_to_self_delay", &self.max_client_to_self_delay)
+            .field("min_payment_size_msat", &self.min_payment_size_msat)
+            .field("max_payment_size_msat", &self.max_payment_size_msat)
+            .field("funding_priority", &self.funding_priority)
+            .field("max_funding_fee_sats", &self.max_funding_fee_sats)
+            .field("max_concurrent_jit_opens", &self.max_concurrent_jit_opens)
+            .field("max_jit_capital_sats", &self.max_jit_capital_sats)
             .field("forwarding_fee_ppm", &self.forwarding_fee_ppm)
             .field("forwarding_fee_base_msat", &self.forwarding_fee_base_msat)
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 

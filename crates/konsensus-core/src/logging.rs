@@ -8,6 +8,20 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// Hide URLs with credential-capable components from diagnostics.
+///
+/// Userinfo, query parameters, and fragments can contain passwords or tokens.
+/// Redact the entire URL when any of their delimiters is present, even for
+/// malformed URLs, without parsing or normalizing ordinary public endpoints.
+/// This does not attempt to identify arbitrary secrets embedded in URL paths.
+pub fn redact_url_for_debug(url: &str) -> &str {
+    if url.contains(['@', '?', '#']) {
+        "<redacted>"
+    } else {
+        url
+    }
+}
+
 /// Limits apply independently to each log, including the active file.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
