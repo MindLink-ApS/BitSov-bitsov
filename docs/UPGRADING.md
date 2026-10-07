@@ -318,7 +318,7 @@ read as `console`; the owner signature remains mandatory. Never install an
 owner public key file as a replacement for startup derivation.
 
 Without this flag, descriptor passwords keep `seed_password_not_typed` and
-sidecar grants remain inactive. From rc10 (#251), local mode retains the
+sidecar grants remain inactive. From rc11 (#251), local mode retains the
 zeroizing owner signing key for enrollment delegated by an existing owner
 device. The live mode does
 not open `control.sock`, enable console grants or alter remote rules. Apps can
