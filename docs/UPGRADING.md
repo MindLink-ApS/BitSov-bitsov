@@ -3,6 +3,38 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## Unreleased: channel capacity and home hub trust
+
+Embedded LDK now applies `lightning.max_channel_capacity_sats = 1000000` and
+`lightning.max_total_channel_capacity_sats = 2000000` when omitted. These are
+inclusive full-capacity ceilings for new outbound/inbound channels, separate
+from the unchanged onboarding subsidy `max_channel_sats`. Hub service operators
+also receive these defaults and should set appropriate explicit ceilings before
+restart. Zero refuses positive new capacity; there is no implicit unlimited mode.
+
+Every non-LSPS2-service LDK node defaults to `lightning.hub_only_channels = true`
+in **every start mode**, including ordinary unlocked starts. Configure the hub
+keys in `[lightning.liquidity] providers` or legacy `lightning.lsp_node_id` before
+opening channels. An empty set refuses every new channel. Owners who accept the
+additional counterparty trust can explicitly set `hub_only_channels = false`;
+this also opts out under `--remote-unlock`, while capacity ceilings remain.
+Enabled LSPS2 services default to unrestricted peers, cannot be explicitly
+hub-only and still cannot start under `--remote-unlock`.
+
+Check owner `GET /api/v1/status` → `channel_safety` for the active limits and
+`hub_only` flag (`null` for unavailable/unsupported backends). Review retained
+channels yourself: upgrades do not close existing non-hub/over-cap channels or
+shrink their capacity. All manager-listed channels, including accepted pending
+and disconnected channels, consume the total allowance on subsequent opens.
+Splices are refused while capped; already-negotiated splices are not undone.
+
+Hub-only does **not** protect against the hub cheating while the box is locked
+or offline. Keys stay local, but the owner still trusts the hub during periods
+without an active local monitor or independent watchtower. These admission caps
+are not a bound on wallet funds, closing claims, fees, pre-existing exposure or
+all possible losses. External LND/mock inbound policy is outside this change.
+See [the precise scope and error codes](operations/home-node.md#channel-capacity-and-hub-only-admission).
+
 **rc12 preparation (2026-10-07):** includes #269, #270 and #273 after the
 rc11 release commit `834968b`. The release commit will be the `main` HEAD after
 this rc12 docs/version PR merges, not the preparation tip `c5b2119`.

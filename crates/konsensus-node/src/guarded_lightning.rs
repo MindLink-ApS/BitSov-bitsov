@@ -24,29 +24,52 @@ mod funding_tests;
 mod hub_only_tests;
 
 /// Who new channels may be opened with, in either direction. Selected for this
-/// invocation, never loaded from configuration.
+/// invocation from the owner configuration.
 #[derive(Clone, Debug, Default)]
 pub enum ChannelPeers {
     #[default]
     Any,
-    /// `--remote-unlock`: nothing watches this node's channels while it sits
+    /// Nothing watches this node's channels while it sits
     /// locked (no watchtower yet), so only the configured hub/LSP node ids qualify.
     HubOnly(Arc<[String]>),
 }
 
 impl ChannelPeers {
+    /// All non-service embedded nodes are home nodes, independent of unlock mode.
+    pub fn from_config(lightning: &crate::config::LightningConfig) -> anyhow::Result<Self> {
+        match lightning {
+            crate::config::LightningConfig::Ldk {
+                hub_only_channels,
+                lsps2_service,
+                ..
+            } if hub_only_channels.unwrap_or(!lsps2_service.enabled) => Self::hub_only(lightning),
+            _ => Ok(Self::Any),
+        }
+    }
+
     /// Hub-only policy from `[lightning.liquidity] providers`, the configured
     /// LSP/hub set. Other backends configure no hub, so every peer is refused.
     pub fn hub_only(lightning: &crate::config::LightningConfig) -> anyhow::Result<Self> {
-        let crate::config::LightningConfig::Ldk { liquidity, lsps2_service, .. } = lightning else {
+        let crate::config::LightningConfig::Ldk {
+            liquidity,
+            lsps2_service,
+            lsp_node_id,
+            ..
+        } = lightning
+        else {
             return Ok(Self::HubOnly(Arc::from([])));
         };
         anyhow::ensure!(
             !lsps2_service.enabled,
-            "{HUB_ONLY_WHILE_LOCKABLE}: lsps2_service opens channels to any client; disable it to start with --remote-unlock"
+            "{HUB_ONLY_WHILE_LOCKABLE}: lsps2_service opens channels to any client; disable it to use hub_only_channels"
         );
         Ok(Self::HubOnly(
-            liquidity.providers.iter().map(|p| p.node_id.to_ascii_lowercase()).collect(),
+            liquidity
+                .providers
+                .iter()
+                .map(|p| p.node_id.to_ascii_lowercase())
+                .chain(lsp_node_id.iter().map(|p| p.to_ascii_lowercase()))
+                .collect(),
         ))
     }
 
@@ -79,6 +102,10 @@ pub struct GuardedLightning {
 
 #[async_trait]
 impl LightningProvider for GuardedLightning {
+    fn channel_safety(&self) -> Option<ChannelSafetyStatus> {
+        self.inner.channel_safety()
+    }
+
     fn tower_status(&self) -> konsensus_core::tower::TowerStatus {
         self.inner.tower_status()
     }

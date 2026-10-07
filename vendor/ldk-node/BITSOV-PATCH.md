@@ -692,3 +692,46 @@ lost tower data. Fable + Grok PASS on the same SHA remains the money-path merge 
 These additions are read-only diagnostics. No LDK channel, commitment, sync,
 broadcast, or safety behaviour changes; the existing sync results and persisted
 metrics format remain unchanged.
+
+## V1 safety 3: channel-capacity admission (2026-10-07)
+
+A vendor change is necessary: inbound `OpenChannelRequest` acceptance and the
+LSPS2 JIT `create_channel` path are internal to ldk-node; an application wrapper
+cannot atomically cap them alongside outbound opens.
+
+- `channel_limits.rs`, `config.rs`: optional finite per-channel/total full-capacity
+  ceilings with a shared admission mutex. Upstream default `None` is unchanged;
+  BitSov configures finite ceilings. Arithmetic overflow/poison refuses admission.
+- `lib.rs`, `event.rs`, `liquidity/jit.rs`: serialize snapshot plus create/accept
+  across manual outbound, inbound (including 0conf) and service JIT opens. Count
+  every `ChannelManager::list_channels()` entry, including unfunded accepted and
+  disconnected/restored channels. Unaccepted requests are not in that list.
+  A refused request is rejected with the capacity code; outbound errors use the
+  new `ChannelCapacityExceeded` / `TotalChannelCapacityExceeded` variants.
+  Manual opens also check before connecting and recheck under lock at creation.
+- `config.rs`, `lib.rs`: refuse inbound and outbound splices when caps are set,
+  because this LDK version exposes no atomic splice-capacity admission hook.
+  Current manager config is applied to restored managers. Already negotiated
+  splices and existing over-cap/non-hub channels are not undone. Closing claims
+  no longer manager-listed are outside capacity accounting.
+- Tests exercise real open messages and the production acceptance handler,
+  inclusive per-channel/total edges, pending reservations, outbound refusals,
+  splicing refusal, hub admission, concurrent inbound requests, restored funded
+  capacity after lowering caps, peer error codes, overflow and poisoned locks.
+
+No wire protocol, persistence encoding, lockfile or Lightning source change.
+BitSov now configures the existing peer allowlist on every non-service LDK start
+unless explicitly opted out, including legacy configured LSP keys. The earlier
+remote-unlock-only description above is superseded for BitSov startup. The caps
+remain separate from the onboarding subsidy and LSPS2 service spend budgets.
+These are admission limits, not deployed watchtower coverage or a maximum-loss
+promise. See `docs/operations/home-node.md` for retained-state and trust limits.
+
+Validation:
+
+    cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib
+    cargo clippy --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib --tests
+
+Standalone Clippy emits 281 existing warnings on both the base commit and this
+patch; none are introduced here. Workspace affected-crate Clippy passes with
+`-D warnings` (dependency lints are not promoted by that workspace invocation).

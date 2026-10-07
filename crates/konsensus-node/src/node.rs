@@ -74,10 +74,11 @@ pub struct KonsensusNode {
 }
 
 impl KonsensusNode {
-    /// Build a node with no channel-peer limit.
+    /// Build a node using its configured channel-peer policy.
     #[cfg(test)]
     pub async fn from_config(config: NodeConfig, mnemonic_password: Option<&str>) -> Result<Self> {
-        Self::from_config_with_channel_peers(config, mnemonic_password, Default::default()).await
+        let peers = crate::guarded_lightning::ChannelPeers::from_config(&config.lightning)?;
+        Self::from_config_with_channel_peers(config, mnemonic_password, peers).await
     }
 
     /// Build a node from configuration, limiting new channels in both directions
@@ -254,6 +255,10 @@ impl KonsensusNode {
                     liquidity: liquidity.clone(),
                     lsps2_service: lsps2_service.clone(),
                     channel_peers: channel_peers.allowlist(),
+                    channel_capacity_limits: config
+                        .lightning
+                        .channel_capacity_limits()
+                        .expect("LDK config"),
                     storage_dir: ldk_storage_dir,
                     scb_backup_dir: Some(std::path::PathBuf::from(&config.backup.scb_dir)),
                     scb_rotation_count: config.backup.rotation_count,

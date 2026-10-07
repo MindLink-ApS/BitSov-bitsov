@@ -159,6 +159,25 @@ where
 			.peer
 			.parse::<PublicKey>()
 			.map_err(|e| e.to_string())?;
+		// Refuse policy violations before funding work; retain the lock through creation.
+		let _admission = self
+			.config
+			.channel_limits
+			.as_ref()
+			.map(|limits| limits.lock())
+			.transpose()
+			.map_err(|e| e.to_string())?;
+		if let Some(limits) = &self.config.channel_limits {
+			limits
+				.check(
+					request.amount_sats,
+					self.channel_manager
+						.list_channels()
+						.iter()
+						.map(|c| c.channel_value_satoshis),
+				)
+				.map_err(|e| e.to_string())?;
+		}
 		if self
 			.peer_manager
 			.read()
@@ -458,7 +477,17 @@ where
 mod tests {
 	use super::*;
 	fn builder(path: &std::path::Path, cap: u64) -> crate::Builder {
-		let mut b = crate::Builder::new();
+		builder_with_limits(path, cap, None)
+	}
+	fn builder_with_limits(
+		path: &std::path::Path,
+		cap: u64,
+		limits: Option<crate::channel_limits::ChannelLimits>,
+	) -> crate::Builder {
+		let mut b = crate::Builder::from_config(crate::Config {
+			channel_limits: limits,
+			..Default::default()
+		});
 		b.set_storage_dir_path(path.to_str().unwrap().into());
 		b.set_network(bitcoin::Network::Regtest);
 		b.set_entropy_seed_bytes([45; 64]);
@@ -492,6 +521,33 @@ mod tests {
 				},
 			))
 			.await;
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn bitsov_jit_full_channel_capacity_obeys_node_caps_before_funding() {
+		// 99,000 sats forwarded plus 100% service over-provisioning = 198,000 capacity.
+		for (per_channel, total, error) in [
+			(197_999, 500_000, "CHANNEL_CAPACITY_EXCEEDED"),
+			(250_000, 197_999, "TOTAL_CHANNEL_CAPACITY_EXCEEDED"),
+			(198_000, 198_000, "peer offline"),
+		] {
+			let dir = tempfile::tempdir().unwrap();
+			let node = builder_with_limits(
+				dir.path(),
+				250_000,
+				Some(crate::channel_limits::ChannelLimits::new(
+					per_channel,
+					total,
+				)),
+			)
+			.build_with_fs_store()
+			.unwrap();
+			let source = node.liquidity_source.as_ref().unwrap();
+			let id = crate::funding::new_jit_channel_id();
+			request(source, node.node_id(), id).await;
+			assert_eq!(source.try_jit_open(id).unwrap_err(), error);
+			assert!(node.list_channels().is_empty());
+		}
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
