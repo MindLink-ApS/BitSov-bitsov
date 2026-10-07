@@ -289,7 +289,7 @@ impl TowerServer {
                             |r| r.get(0),
                         )
                         .optional()?;
-                    if !last.is_some_and(|at| tip >= at.max(height).saturating_add(3)) {
+                    if last.is_none_or(|at| tip < at.max(height).saturating_add(3)) {
                         break;
                     }
                 }

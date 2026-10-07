@@ -25,6 +25,7 @@ pub enum Error {
     Rejected(&'static str),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+type ExistingBlob = (u64, Vec<u8>, Vec<u8>, Option<String>);
 
 pub struct TowerStorage {
     pub(super) db: Connection,
@@ -137,7 +138,7 @@ impl TowerStorage {
         if arrivals.len() >= 600 {
             return Err(Error::Rejected("tower session blob rate exceeded"));
         }
-        let existing: Option<(u64, Vec<u8>, Vec<u8>, Option<String>)> = tx
+        let existing: Option<ExistingBlob> = tx
             .query_row(
                 "SELECT seq,nonce,cipher,breach FROM blobs WHERE session=?1 AND hint=?2",
                 params![session.as_slice(), blob.hint.as_slice()],
