@@ -126,7 +126,12 @@ impl TowerStorage {
         }
         // Status conservatively reserves a maximum blob and a new session.
         // Check this request's actual growth instead: existing sessions and
-        // smaller replacements may still fit. SQLite enforces the disk ceiling.
+        // smaller replacements may still fit. Preserve the physical scan reserve
+        // independently; SQLite enforces the overall disk ceiling.
+        let status = self.status()?;
+        if status.storage_bytes + RESERVE >= status.max_storage_bytes / 2 {
+            return Err(Error::Rejected("tower_full"));
+        }
         let quota = self.quota();
         let charged = self.charged()?;
         let tx = self
@@ -346,6 +351,28 @@ mod tests {
         store.accept([0; 32], 2, &small, 3, 100).unwrap();
         store.accept([1; 32], 1, &large, 3, 100).unwrap();
         assert_eq!(store.charged().unwrap(), 260_680);
+    }
+
+    #[test]
+    fn tower_storage_preserves_physical_scan_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ServiceConfig {
+            max_storage_mb: 1,
+            ..Default::default()
+        };
+        let mut store = TowerStorage::open(&dir.path().join("serve.sqlite"), &config).unwrap();
+        // Simulate pages occupied by scan/receipt history rather than blob charges.
+        store
+            .db
+            .execute_batch("CREATE TABLE history_padding AS SELECT zeroblob(262144) AS data")
+            .unwrap();
+        assert_eq!(store.charged().unwrap(), 0);
+        assert!(store.status().unwrap().full);
+        assert!(matches!(
+            store.accept([1; 32], 1, &blob(1), 1, 100),
+            Err(Error::Rejected("tower_full"))
+        ));
+        assert_eq!(store.status().unwrap().blobs, 0);
     }
 
     #[test]
