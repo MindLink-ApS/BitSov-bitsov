@@ -93,6 +93,15 @@ pub trait ChainProvider: Send + Sync {
         ChainView { backend: "unknown", trust_level: "unknown", host: None }
     }
 
+    /// Full blocks and exact pre-signed submission for the opt-in tower service.
+    /// Unsupported providers fail closed; defaults perform no I/O.
+    async fn get_block(&self, _height: u64) -> Result<bitcoin::Block, ChainError> {
+        Err(ChainError::NotAvailable("full block scanning unsupported".into()))
+    }
+    async fn broadcast_transaction(&self, _tx: &bitcoin::Transaction) -> Result<(), ChainError> {
+        Err(ChainError::NotAvailable("transaction broadcast unsupported".into()))
+    }
+
     /// The trust level of this chain data source.
     fn trust_level(&self) -> TrustLevel;
 
