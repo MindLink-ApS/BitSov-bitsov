@@ -33,6 +33,17 @@ fn storage(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+fn enqueue_error(e: rusqlite::Error) -> io::Error {
+    if let rusqlite::Error::SqliteFailure(code, Some(message)) = &e {
+        if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+            && message == "tower outbox hard limit reached"
+        {
+            return io::Error::new(io::ErrorKind::WouldBlock, message.clone());
+        }
+    }
+    storage(e)
+}
+
 pub fn candidate_key(candidate: &JusticeCandidate) -> io::Result<String> {
     let first = candidate
         .ladder
@@ -88,6 +99,7 @@ impl Outbox {
     /// Idempotent per full txid, never per truncated hint. New configured towers
     /// receive candidates still held by W1; previously acked/expired rows never reset.
     /// False means no eligible tower. The W1 source remains untouched in all cases.
+    /// The per-channel hard limit returns `WouldBlock`; storage failures remain errors.
     pub fn enqueue(
         &self,
         candidate: &JusticeCandidate,
@@ -144,13 +156,13 @@ impl Outbox {
                 "UPDATE states SET blob=COALESCE(blob,?3),pending=1 WHERE channel=?1 AND txid=?2",
                 params![channel, key, bytes],
             )
-            .map_err(storage)?;
+            .map_err(enqueue_error)?;
         } else {
             tx.execute(
                 "INSERT INTO states VALUES(?1,?2,?3,1)",
                 params![channel, key, bytes],
             )
-            .map_err(storage)?;
+            .map_err(enqueue_error)?;
         }
         for tower in missing {
             tx.execute(

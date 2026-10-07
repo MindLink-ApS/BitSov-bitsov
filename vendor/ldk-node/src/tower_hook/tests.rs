@@ -1970,6 +1970,7 @@ struct CountTowerIo {
     store: FilesystemStore,
     candidate_lists: std::sync::atomic::AtomicUsize,
     overflow_writes: std::sync::atomic::AtomicUsize,
+    monitor_channel_writes: std::sync::atomic::AtomicUsize,
     fail_overflow_remove: std::sync::atomic::AtomicBool,
 }
 impl KVStoreSync for CountTowerIo {
@@ -1977,6 +1978,10 @@ impl KVStoreSync for CountTowerIo {
         self.store.read(p, s, k)
     }
     fn write(&self, p: &str, s: &str, k: &str, b: Vec<u8>) -> Result<(), lightning::io::Error> {
+        if p == "tower_monitor_channels" {
+            self.monitor_channel_writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if p == "tower_overflow" {
             self.overflow_writes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2011,6 +2016,7 @@ fn bounded_candidates_retain_overflow_and_ack_deduplicates_redelivery() {
         store: FilesystemStore::new(dir.path().into()),
         candidate_lists: 0.into(),
         overflow_writes: 0.into(),
+        monitor_channel_writes: 0.into(),
         fail_overflow_remove: false.into(),
     });
     let client = Arc::new(TowerClient::new_bounded(store.clone(), 1));
@@ -2063,6 +2069,49 @@ fn bounded_candidates_retain_overflow_and_ack_deduplicates_redelivery() {
         "full capacity must not re-sign/rewrite known overflow"
     );
     let first = client.candidate_page(id, None, 10).unwrap();
+    assert_eq!(
+        store
+            .monitor_channel_writes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "unchanged monitor mapping must not be rewritten on updates or replay"
+    );
+    {
+        let monitor = nodes[1]
+            .chain_monitor
+            .chain_monitor
+            .get_monitor(id)
+            .unwrap();
+        let name = monitor.persistence_key().to_string();
+        // Simulate a stale mapping; staging must repair a changed value.
+        store
+            .store
+            .write(
+                "tower_monitor_channels",
+                "",
+                &name,
+                ChannelId([42; 32]).encode(),
+            )
+            .unwrap();
+        hook.stage(&monitor, None).unwrap();
+        assert_eq!(
+            store.read("tower_monitor_channels", "", &name).unwrap(),
+            id.encode()
+        );
+        assert_eq!(
+            store
+                .monitor_channel_writes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        hook.stage(&monitor, None).unwrap();
+        assert_eq!(
+            store
+                .monitor_channel_writes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
     assert_eq!(first.len(), 1);
     assert_eq!(client.pending_candidates(id).unwrap().len(), 1);
     assert!(client.diagnostics(id).unwrap().unsigned_pending > 1);
@@ -2117,6 +2166,7 @@ fn bounded_quarantine_retries_deferred_marker_cleanup_before_source_removal() {
         store: FilesystemStore::new(dir.path().into()),
         candidate_lists: 0.into(),
         overflow_writes: 0.into(),
+        monitor_channel_writes: 0.into(),
         fail_overflow_remove: true.into(),
     });
     let client = TowerClient::new_bounded(store.clone(), 10_000);

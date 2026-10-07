@@ -527,12 +527,21 @@ impl<P> TowerPersister<P> {
                 }
                 Err(e) => return Err(e.into()),
             }
-            client.store.write(
-                "tower_monitor_channels",
-                "",
-                &monitor.persistence_key().to_string(),
-                id.encode(),
-            )?;
+            let monitor_key = monitor.persistence_key().to_string();
+            let channel_bytes = id.encode();
+            let changed = match client
+                .store
+                .read("tower_monitor_channels", "", &monitor_key)
+            {
+                Ok(bytes) => bytes != channel_bytes,
+                Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => true,
+                Err(e) => return Err(e.into()),
+            };
+            if changed {
+                client
+                    .store
+                    .write("tower_monitor_channels", "", &monitor_key, channel_bytes)?;
+            }
         }
         let loaded = match client.store.read("tower", "pending", &channel) {
             Ok(bytes) => {
