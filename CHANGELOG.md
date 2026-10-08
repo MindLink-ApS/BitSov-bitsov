@@ -5,77 +5,113 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+## [0.3.0-rc13] — 2026-10-08 (prep; not tagged yet)
+
+**Pre-release.** Not for production use. Includes all 12 PRs merged after
+`v0.3.0-rc12` (`41b9e78`), through preparation tip `fc103f1`: #275–#282 and
+#284–#287. The [signing checklist](docs/releases/v0.3.0-rc13.md) lists every
+squash-merge commit. Upgrade steps, including the test Pi's planned fresh setup:
+[UPGRADING](docs/UPGRADING.md#rc12--rc13-procedure).
+
 ### Security
 
-- Add the `--home` LAN setup page (port 8080): one-use QR tickets, four-word SAS
-  comparison and box approval, with a 15-minute startup window, three-cancel
-  limit, private-source/Host checks, CSRF, Strict cookies and nonce-only CSP.
-  Approval only marks the pending ceremony; SAS finalize requires it. The page
-  becomes status-only after setup and never handles passwords, claim codes or
-  recovery phrases. Page and CLI tickets share one bounded in-memory authority
-  during home SETUP. Empty-box remote first run now requires `--home`.
-- Refuse legacy enrollment when a claim code exists, including pre-existing
-  legacy pending operations at approval/delegation. Legacy boxes without a
-  claim code retain their existing flows.
-
-- Add per-box, owner-console-only claim codes and opt-in SAS v1 for remote
-  first-run and device enrollment. Four BIP-39 words bind the completed Noise
-  transcript, committed device key, fresh box nonce and physical claim code.
-  Finalization requires the matching digest and device proof. One pending
-  ceremony, 15-minute SAS expiry, and three mismatch/cancel attempts per run
-  limit grinding. App integration follows separately; the N4 rules above apply
-  to boxes with claim codes.
-
-- Add owner-approved optional spend-grant payee allowlists. Unlisted payees
-  fail closed with `payee_not_allowed`; grants without a list keep their
-  existing recipient rules. Pairing store version 5 prevents older nodes from
-  ignoring the restrictions.
-- Deduplicate invoice payment hashes and optional payment request IDs within
-  each grant, atomically with budget reservation and across restarts. Retry
-  storms receive `duplicate_payment` without another debit or dispatch.
+- Channel admission caps and hub-only defaults (#275; `3290694`). Embedded LDK
+  enforces full-capacity ceilings of 1,000,000 sats per channel and 2,000,000
+  sats total by default, including accepted pending channels. Inbound,
+  manual/automatic outbound and LSPS2 service admissions share atomic accounting;
+  splices are refused. Configure `lightning.max_channel_capacity_sats` and
+  `lightning.max_total_channel_capacity_sats` explicitly for other limits.
+  Non-service LDK nodes default to configured-hub/LSP-only channels in every
+  start mode; **an empty hub set refuses all new channels**. Explicit
+  `lightning.hub_only_channels = false` opts out only in non-lockable modes;
+  `--remote-unlock` and `--home` remain hub-only after unlock. Enabled LSPS2
+  services default to unrestricted peers, with the capacity caps still applied.
+  Existing channels and the separate onboarding subsidy `max_channel_sats`
+  are unchanged. Owner status exposes `channel_safety`. This does not provide
+  active protection while locked/offline or bound all possible losses.
+- Copied-state fence (#276; `03701b5`). Bind `ldk/INSTANCE` to a random instance
+  ID, host and filesystem/volume; refuse mismatches before constructing LDK.
+  Existing nodes bind on their first upgraded start. Missing platform IDs fail
+  closed. State generation 3 prevents older guard-aware binaries from ignoring
+  the fence and open/invalid `ldk/recover.json` journals. A legitimate move of
+  the latest cleanly stopped live store requires console-only `rebind-instance`
+  with an exact typed challenge. **Never restore a copied data directory.**
+  Same-host SD-image rollback and copies retaining both identifiers can escape
+  detection; the fence is not a freshness proof. See the
+  [hardware-move runbook](docs/operations/home-node.md#copied-directories-and-hardware-moves-271).
+- Spend-grant payee allowlists and payment deduplication (#278; `c9d1e36`).
+  Owner-approved `payee_allowlist` restricts payees independently of recipient
+  budget caps; omitted/null preserves existing rules and an empty list denies
+  all payees. Refusals use `budget_exceeded` / `payee_not_allowed` before dispatch.
+  Invoice payment hashes and optional pay/keysend `request_id` values are
+  durably deduplicated within each grant, atomically with budget reservation.
+  Duplicates return `budget_exceeded` / `duplicate_payment`, without a second
+  debit or dispatch; this does not replay the original result. Keysend without
+  an ID remains a separate payment on each call. **Pairing schema v5 is
+  forward-only**: older nodes refuse it. See [spend grants](docs/SPEND_BUDGET_GRANTS.md).
+- Credential Debug redaction (#280; `9c30179`). Secret-bearing configuration
+  formatters redact dedicated credentials and URLs containing userinfo, query
+  parameters or fragments, including nested provider and node configuration.
+- Physical claim codes and SAS enrollment (#284; `ce079c3`). A per-box code is
+  created on init or empty-box setup and disclosed only through the trusted
+  owner console, never an API, ticket, setup page or service journal. Preserve
+  **all 18 characters: 16 random base32 characters plus 2 checksum characters**;
+  never shorten the code. Four BIP-39 SAS words bind the completed Noise
+  transcript, device key, fresh box nonce and claim code. Finalization requires
+  the matching digest and device proof. Only one ceremony is pending, with a
+  15-minute expiry and three mismatch/cancel attempts per run. Boxes with a
+  claim code refuse legacy enrollment, including pre-existing legacy pending
+  operations (#286); legacy initialized boxes without a code retain their flow.
+- LAN-only box setup page (#286; `88bab0e`). `--home` serves a separate page
+  on port 8080 with one-use QR tickets, four-word SAS comparison and box approval.
+  Finalize requires that approval. The 15-minute startup window, three-cancel
+  limit, private-source/Host checks, CSRF, Strict cookies and nonce-only CSP
+  bound setup. Page and CLI tickets share one in-memory authority. After setup
+  the page is status-only; it never handles passwords, claim codes or recovery
+  phrases. **Empty-box remote first run now requires `--home`**; the old
+  `--remote-unlock` flags alone are refused. Supporting app integration is
+  separate from this node release.
+- Signed live transport pin after first run (#287; `fc103f1`). Finalize returns
+  `client_id`, `epoch`, `transport_pubkey` and `transport_signature`, alongside
+  the signed box key. Clients can verify and retain the seed-derived live
+  transport pin before restarting into LOCKED, then reconnect securely after
+  unlock. The locked box pin and unlocked live pin are distinct; clients must
+  verify identity signatures and never replace pins based on discovery alone.
 
 ### Node
 
-- Add `konsensus start --home` as the home-box mode: remote unlock plus local
-  owner-device authority, without owner-control console authority. Empty-box
-  setup exits 75 for a supervised restart into LOCKED; device unlock continues
-  into UNLOCKED in the same process. Existing flags remain supported. Home mode
-  conflicts with console mode and all startup password sources.
-- Add a hardened, dedicated-user [systemd system unit](docs/operations/bitsov.service)
-  with forced restart on exit 75 and bounded restart attempts. The
-  [installation guide](docs/operations/home-node.md#install-the-system-service)
-  supports installing it before first-device enrollment on an empty box.
+- Home mode and system service (#277; `1a013b6`). `konsensus start --home`
+  combines remote unlock and local owner-device authority without owner-control
+  console authority. Empty-box setup exits 75 for a supervised restart into
+  LOCKED; device unlock continues into UNLOCKED in the same process. Initialized
+  boxes retain existing flags. Home mode conflicts with console mode and every
+  startup password source. The dedicated-user
+  [system unit](docs/operations/bitsov.service) forces restart on exit 75 and
+  limits starts to five per 300 seconds; the older user unit allows three.
+- Signed endpoint lists and optional LAN mDNS (#281; `ddf4947`). PairLink v2
+  carries an ordered, identity-signed endpoint descriptor after identity exists:
+  configured endpoint first, then discovered LAN and Tailscale addresses.
+  Discovery uses local interfaces, not an external service. `pair-ticket --legacy`
+  emits v1 for compatible legacy flows. mDNS requires **both the `mdns` build
+  feature and `--home`**, configured remote access, and no explicit
+  `remote_access.mdns = false`; other start modes stay silent. It advertises
+  LAN discovery information, not authentication authority. New direct
+  dependencies include `if-addrs` and optional `mdns-sd`; the default release
+  build does not enable mDNS. See [endpoint discovery](docs/operations/home-node.md#endpoint-discovery).
+- Recovery library groundwork (#282; `dbb893c`). Add `konsensus-recovery` for
+  offline derivation and sweep construction for LDK v2 static `to_remote`
+  outputs from a 32-byte LDK seed. It is **not wired into the node** and does
+  not scan the chain or broadcast. HTLCs and v1 keys are outside its scope.
+  **`konsensus recover` is not shipped**; this is not an operational recovery
+  procedure or permission to restart a backup.
 
-### Security
+### CI / Docs
 
-- Safe-restore PR1 (#271): bind `ldk/INSTANCE` to the host, filesystem/volume
-  and a random instance ID; refuse mismatches before constructing LDK.
-  Existing nodes bind on their first upgraded start. Missing platform IDs
-  fail closed. A legitimate latest-live-store hardware move requires the
-  documented `rebind-instance` owner-console typed confirmation. Open or
-  invalid `ldk/recover.json` journals block startup; generation 3 prevents
-  older guard-aware binaries from ignoring these guards. The example systemd
-  unit caps rapid restart loops at three starts per 300 seconds.
-  **Never restore a copied data directory. Same-host SD-image rollback is not
-  detected yet.** `konsensus recover` is coming; use the
-  [recovery guidance](docs/v2/RECOVERY.md) and
-  [hardware-move runbook](docs/operations/home-node.md#copied-directories-and-hardware-moves-271).
-- Embedded LDK channel admission now enforces configurable full-capacity ceilings:
-  `lightning.max_channel_capacity_sats` (default 1,000,000) and
-  `lightning.max_total_channel_capacity_sats` (default 2,000,000). Inbound,
-  manual/automatic outbound and LSPS2 service admissions share atomic accounting,
-  including accepted pending channels; distinct capacity refusal codes reach the
-  owner API. Splices are refused to prevent bypassing caps. Existing channels
-  and the separate onboarding subsidy `max_channel_sats` are unchanged.
-- Non-service embedded LDK nodes default to configured-hub/LSP-only channels in
-  every start mode. Explicit `lightning.hub_only_channels = false` opts out only
-  in non-lockable start modes. `--remote-unlock` remains unconditionally hub-only
-  for the whole run, including after unlock (`HUB_ONLY_WHILE_LOCKABLE`); an empty
-  hub set refuses every new channel even with the opt-out set. Enabled hub
-  services default to unrestricted peers. Owner status exposes the
-  active `channel_safety` limits and hub-only flag. The home-node and upgrade docs
-  disclose continuing trust in the hub while locked/offline, and distinguish new
-  admission limits from protection against all losses or deployed watchtowers.
+- Pin Semgrep to 1.179.0 (#279; `255d7bb`), avoiding the 1.180.0 installation
+  failure caused by missing `semgrep-core`.
+- Clarify the Linux filesystem-ID caveat and polish review nits (#285;
+  `d25cdd6`): XFS/F2FS device renumbering may trip the copied-state fence on a
+  legitimate live store. Consult the hardware-move runbook before rebinding.
 
 ## [0.3.0-rc12] — 2026-10-07 (prep; not tagged yet)
 
