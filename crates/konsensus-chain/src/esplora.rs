@@ -39,7 +39,7 @@ use konsensus_core::traits::chain::{
 const TIP_HEIGHT_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Configuration for the Esplora provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EsploraConfig {
     /// Base URL of the Esplora API (e.g. `https://mempool.space`).
     pub api_url: String,
@@ -48,6 +48,20 @@ pub struct EsploraConfig {
     pub trust_level: TrustLevel,
     /// HTTP request timeout in seconds.
     pub timeout_secs: u64,
+}
+
+// Endpoint URLs may embed authentication credentials.
+impl std::fmt::Debug for EsploraConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EsploraConfig")
+            .field(
+                "api_url",
+                &konsensus_core::logging::redact_url_for_debug(&self.api_url),
+            )
+            .field("trust_level", &self.trust_level)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 impl EsploraConfig {

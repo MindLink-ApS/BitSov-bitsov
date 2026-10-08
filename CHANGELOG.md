@@ -16,6 +16,36 @@ also live on the corresponding GitHub pre-release pages.
   with forced restart on exit 75 and bounded restart attempts. The
   [installation guide](docs/operations/home-node.md#install-the-system-service)
   supports installing it before first-device enrollment on an empty box.
+### Security
+
+- Safe-restore PR1 (#271): bind `ldk/INSTANCE` to the host, filesystem/volume
+  and a random instance ID; refuse mismatches before constructing LDK.
+  Existing nodes bind on their first upgraded start. Missing platform IDs
+  fail closed. A legitimate latest-live-store hardware move requires the
+  documented `rebind-instance` owner-console typed confirmation. Open or
+  invalid `ldk/recover.json` journals block startup; generation 3 prevents
+  older guard-aware binaries from ignoring these guards. The example systemd
+  unit caps rapid restart loops at three starts per 300 seconds.
+  **Never restore a copied data directory. Same-host SD-image rollback is not
+  detected yet.** `konsensus recover` is coming; use the
+  [recovery guidance](docs/v2/RECOVERY.md) and
+  [hardware-move runbook](docs/operations/home-node.md#copied-directories-and-hardware-moves-271).
+- Embedded LDK channel admission now enforces configurable full-capacity ceilings:
+  `lightning.max_channel_capacity_sats` (default 1,000,000) and
+  `lightning.max_total_channel_capacity_sats` (default 2,000,000). Inbound,
+  manual/automatic outbound and LSPS2 service admissions share atomic accounting,
+  including accepted pending channels; distinct capacity refusal codes reach the
+  owner API. Splices are refused to prevent bypassing caps. Existing channels
+  and the separate onboarding subsidy `max_channel_sats` are unchanged.
+- Non-service embedded LDK nodes default to configured-hub/LSP-only channels in
+  every start mode. Explicit `lightning.hub_only_channels = false` opts out only
+  in non-lockable start modes. `--remote-unlock` remains unconditionally hub-only
+  for the whole run, including after unlock (`HUB_ONLY_WHILE_LOCKABLE`); an empty
+  hub set refuses every new channel even with the opt-out set. Enabled hub
+  services default to unrestricted peers. Owner status exposes the
+  active `channel_safety` limits and hub-only flag. The home-node and upgrade docs
+  disclose continuing trust in the hub while locked/offline, and distinguish new
+  admission limits from protection against all losses or deployed watchtowers.
 
 ## [0.3.0-rc12] — 2026-10-07 (prep; not tagged yet)
 

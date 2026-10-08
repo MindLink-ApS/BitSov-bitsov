@@ -3263,3 +3263,243 @@ fn tower_clients_reject_unsupported_backend_and_more_than_five() {
         .to_string()
         .contains("at most five"));
 }
+
+fn assert_debug_redacted(value: &impl std::fmt::Debug, secrets: &[&str], visible: &[&str]) {
+    for output in [format!("{value:?}"), format!("{value:#?}")] {
+        for secret in secrets {
+            assert!(!output.contains(secret), "credential leaked through Debug");
+        }
+        assert!(output.contains("<redacted>"));
+        for field in visible {
+            assert!(output.contains(field), "missing diagnostic field: {field}");
+        }
+    }
+}
+
+#[test]
+fn lightning_debug_redacts_credentials_for_all_real_backends() {
+    for (input, secrets, visible) in [
+        (
+            r#"backend = "lnd"
+api_url = "https://localhost:8080"
+macaroon_hex = "deadbeef0123456789"
+tls_cert_path = "/certs/lnd.pem""#,
+            vec!["deadbeef0123456789"],
+            vec!["macaroon_hex", "https://localhost:8080", "/certs/lnd.pem"],
+        ),
+        (
+            r#"backend = "lnbits"
+api_url = "http://localhost:5000"
+admin_key = "private-admin-key""#,
+            vec!["private-admin-key"],
+            vec!["admin_key", "http://localhost:5000"],
+        ),
+        (
+            r#"backend = "ldk"
+network = "regtest"
+lsp_token = "private-legacy-token"
+[liquidity]
+[[liquidity.providers]]
+node_id = "public-node-id"
+address = "localhost:9735"
+token = "private-provider-token"
+[lsps2_service]
+require_token = "private-service-token""#,
+            vec![
+                "private-legacy-token",
+                "private-provider-token",
+                "private-service-token",
+            ],
+            vec!["lsp_token", "regtest", "public-node-id", "localhost:9735"],
+        ),
+    ] {
+        let config: LightningConfig = toml::from_str(input).unwrap();
+        assert_debug_redacted(&config, &secrets, &visible);
+    }
+}
+
+#[test]
+fn identity_and_api_debug_redact_secrets() {
+    let identity = IdentityConfig {
+        mnemonic_file: "/data/mnemonic.enc".into(),
+        passphrase: "private-identity-passphrase".into(),
+        hosted: false,
+    };
+    assert_debug_redacted(
+        &identity,
+        &[&identity.passphrase],
+        &["passphrase", "/data/mnemonic.enc", "hosted"],
+    );
+    let api = ApiConfig {
+        jwt_secret: Some("private-jwt-secret".into()),
+        ..Default::default()
+    };
+    assert_debug_redacted(
+        &api,
+        &["private-jwt-secret"],
+        &[
+            "jwt_secret",
+            "listen_addr",
+            "rate_limit_rps",
+            "audit_log_path",
+        ],
+    );
+}
+
+#[test]
+fn postgres_debug_redacts_connection_credentials() {
+    // URL userinfo and query parameters can both contain credentials.
+    for url in [
+        "postgres://alice:private-db-password@localhost/bitsov",
+        "postgres://localhost/bitsov?password=private-db-password&sslkey=private-tls-key",
+        "invalid-url-with-private-db-password",
+    ] {
+        let config = StorageConfig::Postgres {
+            url: url.into(),
+            encrypted: true,
+            retention_days: 7,
+        };
+        assert_debug_redacted(
+            &config,
+            &["private-db-password", "private-tls-key"],
+            &["url", "encrypted", "retention_days", "7"],
+        );
+    }
+}
+
+#[test]
+fn node_debug_redacts_nested_credentials() {
+    let config: NodeConfig = toml::from_str(
+        r#"
+[identity]
+mnemonic_file = "/data/mnemonic.enc"
+passphrase = "private-identity-passphrase"
+[network]
+listen_addr = "127.0.0.1:9735"
+[lightning]
+backend = "lnd"
+api_url = "https://localhost:8080"
+macaroon_hex = "deadbeef0123456789"
+[chain]
+backend = "mock"
+[storage]
+backend = "postgres"
+url = "postgres://alice:private-db-password@localhost/bitsov"
+[api]
+jwt_secret = "private-jwt-secret"
+"#,
+    )
+    .unwrap();
+    assert_debug_redacted(
+        &config,
+        &[
+            "private-identity-passphrase",
+            "deadbeef0123456789",
+            "private-db-password",
+            "private-jwt-secret",
+        ],
+        &[
+            "NodeConfig",
+            "127.0.0.1:9735",
+            "https://localhost:8080",
+            "/data/mnemonic.enc",
+        ],
+    );
+}
+
+#[test]
+fn endpoint_debug_redacts_url_credentials() {
+    for url in [
+        "https://alice:private-url-password@localhost:8080",
+        "https://localhost:8080?api_key=private-url-password",
+        "https://localhost:8080#private-url-password",
+    ] {
+        for input in [
+            format!("backend = \"lnd\"\napi_url = {url:?}\nmacaroon_hex = \"test\""),
+            format!("backend = \"lnbits\"\napi_url = {url:?}\nadmin_key = \"test\""),
+            format!("backend = \"ldk\"\nesplora_url = {url:?}\nesplora_url_fallback = {url:?}\nrgs_url = {url:?}"),
+        ] {
+            let config: LightningConfig = toml::from_str(&input).unwrap();
+            assert_debug_redacted(&config, &["private-url-password"], &[]);
+        }
+        let config = ChainConfig::Esplora {
+            api_url: url.into(),
+            esplora_url_fallback: Some(url.into()),
+            credentials_file: None,
+        };
+        assert_debug_redacted(
+            &config,
+            &["private-url-password"],
+            &["api_url", "esplora_url_fallback"],
+        );
+    }
+}
+
+#[test]
+fn channel_capacity_config_defaults_overrides_and_invalid_values() {
+    let config: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
+    let limits = config.channel_capacity_limits().unwrap();
+    assert_eq!(limits.max_channel_capacity_sats, 1_000_000);
+    assert_eq!(limits.max_total_channel_capacity_sats, 2_000_000);
+    let config: LightningConfig = toml::from_str("backend = 'ldk'\nmax_channel_capacity_sats = 50000\nmax_total_channel_capacity_sats = 0\nhub_only_channels = false").unwrap();
+    let roundtrip: LightningConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(
+        roundtrip
+            .channel_capacity_limits()
+            .unwrap()
+            .max_channel_capacity_sats,
+        50_000
+    );
+    assert_eq!(
+        roundtrip
+            .channel_capacity_limits()
+            .unwrap()
+            .max_total_channel_capacity_sats,
+        0
+    );
+    for invalid in [
+        "max_channel_capacity_sats = -1",
+        "max_total_channel_capacity_sats = 0.5",
+        "hub_only_channels = 'false'",
+        "max_channel_capcity_sats = 1",
+    ] {
+        assert!(
+            toml::from_str::<LightningConfig>(&format!("backend = 'ldk'\n{invalid}")).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn ldk_debug_redacts_token_and_keeps_channel_safety_config() {
+    for (hub_only, expected) in [
+        ("", "hub_only_channels: None"),
+        ("hub_only_channels = true", "hub_only_channels: Some(true)"),
+        (
+            "hub_only_channels = false",
+            "hub_only_channels: Some(false)",
+        ),
+    ] {
+        let config: LightningConfig = toml::from_str(&format!(
+            "backend = 'ldk'\nmax_channel_capacity_sats = 50000\nmax_total_channel_capacity_sats = 125000\nlsp_token = 'private-legacy-token'\n{hub_only}"
+        ))
+        .unwrap();
+        assert_debug_redacted(
+            &config,
+            &["private-legacy-token"],
+            &[
+                "max_channel_capacity_sats: 50000",
+                "max_total_channel_capacity_sats: 125000",
+                "hub_only_channels",
+            ],
+        );
+        for output in [format!("{config:?}"), format!("{config:#?}")] {
+            // Pretty Debug adds whitespace and a trailing comma inside Some.
+            let normalized: String = output
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != ',')
+                .collect();
+            assert!(normalized.contains(&expected.replace(' ', "")));
+        }
+    }
+}

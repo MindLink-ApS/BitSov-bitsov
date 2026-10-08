@@ -342,31 +342,108 @@ your own wait when you force-close; that is chosen by the peer. It is not a
 watchtower: if the box stays locked or offline beyond the breach window, the
 risk above still applies.
 
-## Hub-only channels: `HUB_ONLY_WHILE_LOCKABLE`
+## Channel capacity and hub-only admission
 
-Started with `--remote-unlock`, the node opens and accepts new channels only with
-the hub/LSP node ids listed under `[lightning.liquidity] providers` (every listed
-provider, not only `selected_provider`). The rule holds for the whole run, after
-unlock too, because the next reboot leaves every channel unwatched again:
+For embedded LDK (`[lightning] backend = "ldk"`), new channels have inclusive
+capacity ceilings in **satoshis**. Defaults apply to existing configs that omit
+the keys, in every start mode:
 
-- Owner `POST /api/v1/payments/open-channel` to any other peer returns 403 with
-  `"code": "HUB_ONLY_WHILE_LOCKABLE"` and `"retry_allowed": false`. Nothing is
-  dialed, funded or signed.
-- The onboarding auto-channel worker gets the same refusal and leaves the invite
-  pending.
-- Inbound channel requests from any other peer are rejected before acceptance
-  (`HUB_ONLY_WHILE_LOCKABLE: refusing inbound channel` in `ldk_node.log`).
-  The hub's LSPS2 JIT channels are accepted as before.
-- `[lightning.lsps2_service] enabled = true` opens channels to arbitrary clients,
-  so `--remote-unlock` refuses to start with it.
-- With no provider listed, or with a non-LDK backend, every new channel is refused.
+```toml
+[lightning]
+backend = "ldk"
+max_channel_capacity_sats = 1000000       # 0.01 BTC per channel
+max_total_channel_capacity_sats = 2000000 # 0.02 BTC across channels
+hub_only_channels = true
+```
 
-Existing channels, payments, forwarding and closes are unaffected. The flag does
-not close channels a node opened during an earlier start without it; close any
-non-hub channels before relying on remote unlock. A start without
-`--remote-unlock` keeps the previous behaviour. The rule relaxes only once
-watchtowers exist that are not the channel's counterparty; a hub-run tower cannot
-guard against the hub itself.
+The caps count the **full funding capacity**, including the peer's contribution,
+not just your local balance. Manual outbound opens, automatic onboarding opens,
+LSPS2 service opens and inbound requests (including trusted zero-confirmation
+LSP requests) use the same admission lock. Ready, disconnected, unusable and
+accepted-but-unfunded channels in LDK's channel manager all count. The snapshot
+is taken from current manager state, including restored channels, on each
+admission; parallel requests cannot each spend the same capacity allowance.
+Unaccepted requests do not reserve capacity. Overflow or an unavailable admission
+lock fails closed. Exact ceilings are allowed; zero refuses positive new capacity.
+
+An outbound cap refusal reaches the owner API as HTTP 403 with
+`"code": "CHANNEL_CAPACITY_EXCEEDED"` (per-channel) or
+`"TOTAL_CHANNEL_CAPACITY_EXCEEDED"` (total), and `"retry_allowed": false`.
+No channel is created by that refused operation. Inbound requests are rejected
+before acceptance with the same code in the peer rejection and `ldk_node.log`.
+LDK service retries still obey both ceilings. Changing config requires a restart.
+An LSPS2 hub service has the same default caps; its operator must explicitly
+raise them for a larger deployment. The onboarding subsidy
+`[onboarding_subsidy] max_channel_sats` remains a separate spend ceiling and
+neither overrides nor replaces these capacity limits.
+
+For this **channel policy**, a home node is any embedded LDK node without
+`[lightning.lsps2_service] enabled = true`. It defaults to hub-only whether the
+seed is plaintext, typed at startup, supplied by descriptor, or remotely unlocked,
+and whether or not `--local-owner-device` is used. This classification is broader
+than the flag-based longer-breach-window profile described above.
+Allowed peers are every node id in `[lightning.liquidity] providers` plus the
+legacy `lightning.lsp_node_id`, if configured; selection or enabled state of
+liquidity purchasing does not narrow this set. No configured peers means no new
+channels. Invalid peer keys fail LDK startup.
+
+Owner `POST /api/v1/payments/open-channel` to any other peer returns HTTP 403,
+`"code": "HUB_ONLY_WHILE_LOCKABLE"`, and `"retry_allowed": false` before
+connection or funding. Automatic opens get the same refusal; inbound non-hub
+requests are rejected before acceptance. The owner can explicitly set
+`hub_only_channels = false` to allow other peers only in non-lockable start
+modes; the capacity caps still apply. Under `--remote-unlock`, this opt-out is
+ignored: hub-only is mandatory for the whole run, including after unlock, and
+an empty hub set refuses every new channel (`HUB_ONLY_WHILE_LOCKABLE`). Opting
+out in a non-lockable mode increases the set of counterparties the owner must
+trust during unmonitored periods. An enabled
+LSPS2 service defaults to unrestricted peers, refuses explicit hub-only config,
+and still cannot run with `--remote-unlock`.
+
+Owner-authenticated `GET /api/v1/status` exposes the active backend policy:
+
+```json
+"channel_safety": {
+  "max_channel_capacity_sats": 1000000,
+  "max_total_channel_capacity_sats": 2000000,
+  "hub_only": true
+}
+```
+
+This object is absent from public health, and is `null` in owner status when the
+backend is unavailable or does not implement capacity enforcement. Locked mode
+has no live owner status or LDK backend. These caps are implemented only for the
+embedded LDK backend, not external LND or mock backends. The pre-existing
+remote-unlock outbound peer refusal on non-LDK backends remains, but does not
+claim control over their inbound channels.
+
+### Limits and hub trust
+
+**Hub-only is a trust restriction, not protection against a dishonest hub.**
+The home node retains its keys, but while it is locked/offline no local LDK
+monitor checks the chain or punishes a revoked commitment. Without an effective
+independent watchtower, the owner trusts the hub/LSP not to exploit that absence.
+A tower operated only by the channel counterparty is not independent protection
+against that counterparty. The current tower staging/transport work must not be
+read as a promise of deployed watchtower coverage.
+
+Caps bound **newly admitted channel capacity**, not all possible losses or the
+wallet's total value. They do not close, shrink or reject startup because of
+existing over-cap or non-hub channels. Existing channels continue payments,
+forwarding and closes; their full listed capacity counts against subsequent
+opens. If already above the total ceiling, no positive-capacity open fits. Review
+and close unwanted existing channels before relying on this policy. Lowering
+config does not retroactively make existing exposure comply. Closing/on-chain
+claims no longer listed by the channel manager, wallet funds, fees and HTLC
+resolution risks are not included in the total; the policy is not a lifetime
+spend budget or a guaranteed maximum loss.
+
+Capacity-changing splices could otherwise bypass these ceilings. Embedded LDK
+therefore rejects new inbound splices and both outbound splice-in and splice-out
+operations while caps are active. A splice already negotiated before upgrading
+is not undone; let it resolve and inspect actual capacity. There is no automatic
+fund movement or channel closure on upgrade, and the caps do not extend breach
+windows or keep a locked/offline box monitored.
 
 Peers get connection refused while the node is locked. The tier-2 relay is not a
 session forwarder and does not queue messages for it. Paid messages are not
@@ -589,3 +666,65 @@ can cause a failed connection but cannot replace an existing pin. Initial pairin
 still requires obtaining the ticket from a trusted box; discovery alone supplies
 no first-use authenticity. The setup page and per-box claim-code ceremony are
 separate later onboarding work.
+## Copied directories and hardware moves (#271)
+
+**Never restore a copied data directory, rsync backup, VM snapshot or SD-card
+image as a running Lightning node.** It may contain revoked commitments:
+broadcasting one can lose the whole channel balance, even before reconnecting
+to the peer. `STATE_GENERATION` travels with a copy and proves no freshness.
+
+On init or first upgraded start, the node writes `ldk/INSTANCE` beside the LDK
+store (under the configured mnemonic's parent). It records a random instance ID
+and a hash binding it to the machine and the filesystem containing `ldk/`.
+Linux uses `/etc/machine-id` (with `/var/lib/dbus/machine-id` as a fallback) and
+the kernel filesystem ID; macOS uses `IOPlatformUUID` and the volume UUID.
+Raw machine IDs are not saved. A changed host or filesystem refuses startup
+before LDK is constructed; `move-home` also checks the fence. Missing, invalid
+or unavailable platform IDs fail closed with an explanation, including during
+an override. Provision a persistent, unique Linux machine-id using your OS
+installation tooling; do not substitute a shared or temporary ID.
+
+**Limits:** this is an accidental-copy fence, not a freshness proof or an
+anti-tamper boundary. Same-host SD-image rollback is **not detected yet**.
+Copies on the same host/filesystem, cloned machine/volume identifiers, deleted
+binding files, and old directories without a binding can escape detection.
+Existing installations without `INSTANCE` bind on their first upgraded start
+without refusing; that upgrade cannot determine whether their state is stale.
+Never delete or edit safety markers to get a node to start.
+
+`konsensus recover` is **coming**, not implemented. For a lost disk, stop and
+follow [the recovery guidance](../v2/RECOVERY.md); contact the operator rather
+than starting an old copy. For a healthy node, prefer
+[`konsensus move-home`](move-home.md) on its original live store.
+
+### Owner override for a legitimate hardware move
+
+Use this only when relocating the **latest, cleanly stopped live store**, never
+a backup or snapshot. It changes the binding; it does not verify freshness.
+
+1. Stop the service on both machines. Verify the source shut down cleanly,
+   preserve its latest state, and ensure the old node cannot restart. Never
+   run two nodes with this identity.
+2. Move the current store and update paths in `konsensus.toml` as needed.
+3. At the destination's owner console (a terminal or SSH with a controlling
+   terminal), run `konsensus rebind-instance --config /path/konsensus.toml`.
+   Read the warning and type the exact `REBIND … TO …` challenge displayed.
+   Confirmation is read from `/dev/tty`, never stdin, a flag, or an API.
+   Wrong text, EOF or no console leaves the binding unchanged. This command
+   constructs no LDK node and does not start the service.
+4. Start normally. Keep the old node disabled. Do not add the override to a
+   service or unattended script. An open recovery or move-home journal cannot
+   be bypassed by rebinding.
+
+The recovery-journal skeleton is `ldk/recover.json`, version 1, with `state`
+`open` or `done` (for example `{"version":1,"state":"open"}`). Any open,
+malformed, unreadable or unsupported journal refuses startup before LDK.
+Only a valid `done` journal permits normal startup. No recovery workflow writes
+or completes this journal yet; do not create, remove or mark it done manually
+to bypass recovery.
+
+The example systemd unit limits starts to three within 300 seconds. After a
+panic or safety refusal, inspect `journalctl --user -u konsensus.service` and
+resolve the cause before `systemctl --user reset-failed konsensus.service`
+and a deliberate restart. This caps rapid crash loops; it cannot suppress a
+revoked-commitment broadcast or stop failures spaced outside the limit window.

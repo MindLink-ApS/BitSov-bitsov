@@ -3,6 +3,41 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## Unreleased: channel capacity and home hub trust
+
+Embedded LDK now applies `lightning.max_channel_capacity_sats = 1000000` and
+`lightning.max_total_channel_capacity_sats = 2000000` when omitted. These are
+inclusive full-capacity ceilings for new outbound/inbound channels, separate
+from the unchanged onboarding subsidy `max_channel_sats`. Hub service operators
+also receive these defaults and should set appropriate explicit ceilings before
+restart. Zero refuses positive new capacity; there is no implicit unlimited mode.
+
+Every non-LSPS2-service LDK node defaults to `lightning.hub_only_channels = true`
+in **every start mode**, including ordinary unlocked starts. Configure the hub
+keys in `[lightning.liquidity] providers` or legacy `lightning.lsp_node_id` before
+opening channels. An empty set refuses every new channel. Owners who accept the
+additional counterparty trust can explicitly set `hub_only_channels = false`
+only for non-lockable starts. Under `--remote-unlock`, hub-only remains mandatory
+for the whole run, including after unlock: the opt-out is ignored, and an empty
+hub set refuses every new channel (`HUB_ONLY_WHILE_LOCKABLE`). Capacity ceilings
+remain in all modes.
+Enabled LSPS2 services default to unrestricted peers, cannot be explicitly
+hub-only and still cannot start under `--remote-unlock`.
+
+Check owner `GET /api/v1/status` → `channel_safety` for the active limits and
+`hub_only` flag (`null` for unavailable/unsupported backends). Review retained
+channels yourself: upgrades do not close existing non-hub/over-cap channels or
+shrink their capacity. All manager-listed channels, including accepted pending
+and disconnected channels, consume the total allowance on subsequent opens.
+Splices are refused while capped; already-negotiated splices are not undone.
+
+Hub-only does **not** protect against the hub cheating while the box is locked
+or offline. Keys stay local, but the owner still trusts the hub during periods
+without an active local monitor or independent watchtower. These admission caps
+are not a bound on wallet funds, closing claims, fees, pre-existing exposure or
+all possible losses. External LND/mock inbound policy is outside this change.
+See [the precise scope and error codes](operations/home-node.md#channel-capacity-and-hub-only-admission).
+
 **rc12 preparation (2026-10-07):** includes #269, #270 and #273 after the
 rc11 release commit `834968b`. The release commit will be the `main` HEAD after
 this rc12 docs/version PR merges, not the preparation tip `c5b2119`.
@@ -32,6 +67,36 @@ unit remains supported. Follow the [installation steps](operations/home-node.md#
 including data ownership, writable paths, restart limits and recovery from a
 start-limit failure. Stop any previous service before enabling the new one.
 The setup page and endpoint discovery are separate onboarding changes.
+
+## Next upgrade: copied-directory fence (#271)
+
+Keep the current live directory on its existing host. **Never restore a copied
+data directory, rsync backup or SD image to start a Lightning node.** A stale
+copy can broadcast a revoked commitment and lose the channel balance.
+
+On init or first upgraded start, `ldk/INSTANCE` binds a random instance ID to a
+hash of the machine ID and filesystem/volume ID. Existing nodes without this
+file bind automatically; no reinitialization or owner confirmation is required.
+That first binding cannot recognize an already-stale legacy copy. Subsequent
+host/volume mismatches refuse before LDK construction. Missing platform IDs or
+corrupt binding files also refuse; fix the underlying cause, never delete the
+markers. **Same-host SD-image rollback is not detected yet**, nor are same-host,
+same-filesystem copies or clones retaining both identifiers. This is not a
+freshness proof.
+
+Generation **3** prevents generation-2 binaries from ignoring the new fence and
+`ldk/recover.json` journal. An open, malformed, unreadable or unsupported journal
+blocks normal startup. `konsensus recover` is **coming**, not built yet: use the
+[recovery guidance](v2/RECOVERY.md) and contact the operator for a lost disk.
+For a healthy source use [move-home](operations/move-home.md). A legitimate move
+of the latest cleanly stopped live store has a separate console-only
+`konsensus rebind-instance --config …` override requiring an exact typed
+challenge; it never bypasses recovery/migration journals or proves freshness.
+See the [hardware-move runbook](operations/home-node.md#owner-override-for-a-legitimate-hardware-move).
+
+Update any installed example systemd unit to include `StartLimitIntervalSec=300`
+and `StartLimitBurst=3` in `[Unit]`, then reload the user daemon. Inspect and fix
+startup failures before resetting the failed service; do not automate resets.
 
 ## rc11 → rc12 procedure
 
@@ -663,7 +728,7 @@ that server's responsibility.
 Before opening SQLite or constructing LDK, startup durably writes
 `STATE_GENERATION` beside the configured mnemonic (the same parent as `ldk/`).
 The marker uses format `bitsov-state-v1:<generation>`; this release introduces
-binary/state compatibility generation **2** (move-home journal safety). Future incompatible migrations or
+binary/state compatibility generation **3** (host-binding and recovery journal safety). Future incompatible migrations or
 LDK persistence changes must increment `STATE_GENERATION` in the binary before
 state is opened. Publication uses a temporary file, file fsync, atomic rename,
 and directory fsync. A process lease (`STATE_GENERATION.lock`) prevents concurrent

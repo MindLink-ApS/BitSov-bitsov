@@ -1224,6 +1224,54 @@ where
                     }
                     return Ok(());
                 }
+				// The lock covers snapshot + accept and is shared with outbound/JIT opens.
+				// Unaccepted inbound requests are not in list_channels; accepted unfunded
+				// channels are, so acceptance reserves capacity immediately.
+				let admission = self
+					.config
+					.channel_limits
+					.as_ref()
+					.map(|limits| limits.lock())
+					.transpose();
+				let cap_result = match &admission {
+					Err(error) => Err(*error),
+					Ok(_) => self
+						.config
+						.channel_limits
+						.as_ref()
+						.map_or(Ok(()), |limits| {
+							limits.check(
+								funding_satoshis,
+								self.channel_manager
+									.list_channels()
+									.iter()
+									.map(|c| c.channel_value_satoshis),
+							)
+						}),
+				};
+				if let Err(error) = cap_result {
+					log_info!(
+						self.logger,
+						"{}: refusing inbound channel from peer {}",
+						error,
+						counterparty_node_id
+					);
+					self.channel_manager
+						.force_close_broadcasting_latest_txn(
+							&temporary_channel_id,
+							&counterparty_node_id,
+							error.to_string(),
+						)
+						.map_err(|e| {
+							log_error!(
+								self.logger,
+								"Failed to reject inbound capacity request: {:?}",
+								e
+							);
+							ReplayEvent()
+						})?;
+					return Ok(());
+				}
 				if is_announced {
 					if let Err(err) = may_announce_channel(&*self.config) {
 						log_error!(self.logger, "Rejecting inbound announced channel from peer {} due to missing configuration: {}", counterparty_node_id, err);

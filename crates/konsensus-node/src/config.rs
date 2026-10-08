@@ -287,7 +287,7 @@ pub struct NodeConfig {
 /// `deny_unknown_fields` protects against typos in the `passphrase` field —
 /// a misspelled field name would silently use an empty passphrase, producing
 /// a completely different identity from the same mnemonic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityConfig {
     /// Path to the file containing the BIP-39 mnemonic (24 words).
@@ -305,6 +305,17 @@ pub struct IdentityConfig {
     /// (`docs/protocol/REMOTE-SIGNER.md` §6). The Cloud tier implies it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hosted: bool,
+}
+
+// Keep credentials out of diagnostics, including nested and pretty Debug output.
+impl std::fmt::Debug for IdentityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentityConfig")
+            .field("mnemonic_file", &self.mnemonic_file)
+            .field("passphrase", &"<redacted>")
+            .field("hosted", &self.hosted)
+            .finish()
+    }
 }
 
 /// Network configuration — listen address and sovereignty tier.
@@ -425,7 +436,7 @@ impl Default for NetworkConfig {
 ///
 /// `deny_unknown_fields` prevents typos in optional fields (e.g., `lsp_nod_id`
 /// instead of `lsp_node_id`) from being silently ignored with a default value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "backend", deny_unknown_fields)]
 // Config is parsed once at startup; boxing a variant would only complicate the
 // internally tagged serde shape for no runtime benefit.
@@ -472,6 +483,15 @@ pub enum LightningConfig {
     /// The node IS its own Lightning node. Keys derived from the same mnemonic.
     #[serde(rename = "ldk")]
     Ldk {
+        /// Full capacity ceilings for new channels in either direction (zero refuses opens).
+        #[serde(default = "default_max_channel_capacity_sats")]
+        max_channel_capacity_sats: u64,
+        #[serde(default = "default_max_total_channel_capacity_sats")]
+        max_total_channel_capacity_sats: u64,
+        /// Non-service LDK nodes default to hub-only in every startup mode.
+        /// `false` opts out only for non-lockable starts; remote-unlock is always hub-only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hub_only_channels: Option<bool>,
         /// Bounded LSPS2 bootstrap; disabled unless explicitly enabled.
         #[serde(default)]
         liquidity: konsensus_lightning::liquidity::LiquidityConfig,
@@ -546,7 +566,146 @@ pub enum LightningConfig {
     },
 }
 
+// Keep credentials out of diagnostics, including nested and pretty Debug output.
+impl std::fmt::Debug for LightningConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lnbits {
+                api_url,
+                admin_key: _,
+            } => f
+                .debug_struct("Lnbits")
+                .field(
+                    "api_url",
+                    &konsensus_core::logging::redact_url_for_debug(api_url),
+                )
+                .field("admin_key", &"<redacted>")
+                .finish(),
+            Self::Mock {
+                initial_balance_msat,
+            } => f
+                .debug_struct("Mock")
+                .field("initial_balance_msat", initial_balance_msat)
+                .finish(),
+            Self::SharedMock {
+                ledger_path,
+                initial_balance_msat,
+            } => f
+                .debug_struct("SharedMock")
+                .field("ledger_path", ledger_path)
+                .field("initial_balance_msat", initial_balance_msat)
+                .finish(),
+            Self::Lnd {
+                api_url,
+                macaroon_hex: _,
+                tls_cert_path,
+            } => f
+                .debug_struct("Lnd")
+                .field(
+                    "api_url",
+                    &konsensus_core::logging::redact_url_for_debug(api_url),
+                )
+                .field("macaroon_hex", &"<redacted>")
+                .field("tls_cert_path", tls_cert_path)
+                .finish(),
+            Self::Ldk {
+                max_channel_capacity_sats,
+                max_total_channel_capacity_sats,
+                hub_only_channels,
+                liquidity,
+                lsps2_service,
+                network,
+                esplora_url,
+                esplora_url_fallback,
+                onchain_wallet_sync_interval_secs,
+                lightning_wallet_sync_interval_secs,
+                fee_rate_cache_update_interval_secs,
+                credentials_file,
+                rgs_url,
+                lsp_node_id,
+                lsp_address,
+                lsp_token: _,
+                forward_to_private_channels,
+                our_to_self_delay_blocks,
+                listening_address,
+                advertised_address,
+            } => f
+                .debug_struct("Ldk")
+                .field("max_channel_capacity_sats", max_channel_capacity_sats)
+                .field(
+                    "max_total_channel_capacity_sats",
+                    max_total_channel_capacity_sats,
+                )
+                .field("hub_only_channels", hub_only_channels)
+                .field("liquidity", liquidity)
+                .field("lsps2_service", lsps2_service)
+                .field("network", network)
+                .field(
+                    "esplora_url",
+                    &konsensus_core::logging::redact_url_for_debug(esplora_url),
+                )
+                .field(
+                    "esplora_url_fallback",
+                    &esplora_url_fallback
+                        .as_deref()
+                        .map(konsensus_core::logging::redact_url_for_debug),
+                )
+                .field(
+                    "onchain_wallet_sync_interval_secs",
+                    onchain_wallet_sync_interval_secs,
+                )
+                .field(
+                    "lightning_wallet_sync_interval_secs",
+                    lightning_wallet_sync_interval_secs,
+                )
+                .field(
+                    "fee_rate_cache_update_interval_secs",
+                    fee_rate_cache_update_interval_secs,
+                )
+                .field("credentials_file", credentials_file)
+                .field(
+                    "rgs_url",
+                    &rgs_url
+                        .as_deref()
+                        .map(konsensus_core::logging::redact_url_for_debug),
+                )
+                .field("lsp_node_id", lsp_node_id)
+                .field("lsp_address", lsp_address)
+                .field("lsp_token", &"<redacted>")
+                .field("forward_to_private_channels", forward_to_private_channels)
+                .field("our_to_self_delay_blocks", our_to_self_delay_blocks)
+                .field("listening_address", listening_address)
+                .field("advertised_address", advertised_address)
+                .finish(),
+        }
+    }
+}
+
+fn default_max_channel_capacity_sats() -> u64 {
+    konsensus_core::traits::lightning::ChannelCapacityLimits::default().max_channel_capacity_sats
+}
+fn default_max_total_channel_capacity_sats() -> u64 {
+    konsensus_core::traits::lightning::ChannelCapacityLimits::default()
+        .max_total_channel_capacity_sats
+}
+
 impl LightningConfig {
+    pub(crate) fn channel_capacity_limits(
+        &self,
+    ) -> Option<konsensus_core::traits::lightning::ChannelCapacityLimits> {
+        match self {
+            Self::Ldk {
+                max_channel_capacity_sats,
+                max_total_channel_capacity_sats,
+                ..
+            } => Some(konsensus_core::traits::lightning::ChannelCapacityLimits {
+                max_channel_capacity_sats: *max_channel_capacity_sats,
+                max_total_channel_capacity_sats: *max_total_channel_capacity_sats,
+            }),
+            _ => None,
+        }
+    }
+
     /// Apply the startup profile before any identity or network work.
     pub(crate) fn apply_home_to_self_delay(&mut self, home_profile: bool) -> anyhow::Result<()> {
         if let Self::Ldk {
@@ -647,7 +806,7 @@ impl LightningConfig {
 /// Chain data provider backend selection.
 ///
 /// `deny_unknown_fields` ensures typos in optional fields cause a parse error.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "backend", deny_unknown_fields)]
 pub enum ChainConfig {
     /// Esplora/mempool.space compatible HTTP API.
@@ -679,6 +838,35 @@ pub enum ChainConfig {
     /// Explicit Electrum server; also selects LDK's chain source.
     #[serde(rename = "electrum")]
     Electrum(konsensus_chain::ElectrumConfig),
+}
+
+// Endpoint URLs may embed authentication credentials.
+impl std::fmt::Debug for ChainConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Esplora {
+                api_url,
+                esplora_url_fallback,
+                credentials_file,
+            } => f
+                .debug_struct("Esplora")
+                .field(
+                    "api_url",
+                    &konsensus_core::logging::redact_url_for_debug(api_url),
+                )
+                .field(
+                    "esplora_url_fallback",
+                    &esplora_url_fallback
+                        .as_deref()
+                        .map(konsensus_core::logging::redact_url_for_debug),
+                )
+                .field("credentials_file", credentials_file)
+                .finish(),
+            Self::Mock => f.write_str("Mock"),
+            Self::Bitcoind(config) => f.debug_tuple("Bitcoind").field(config).finish(),
+            Self::Electrum(config) => f.debug_tuple("Electrum").field(config).finish(),
+        }
+    }
 }
 
 impl ChainConfig {
@@ -996,7 +1184,7 @@ pub struct CallsConfig {
 ///
 /// `deny_unknown_fields` prevents typos in optional fields (e.g., `encrypred`
 /// instead of `encrypted`) from silently using the default value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "backend", deny_unknown_fields)]
 pub enum StorageConfig {
     /// SQLite (T1 Light, development, single-node).
@@ -1024,6 +1212,35 @@ pub enum StorageConfig {
         #[serde(default)]
         retention_days: u32,
     },
+}
+
+// Keep credentials out of diagnostics, including nested and pretty Debug output.
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sqlite {
+                path,
+                encrypted,
+                retention_days,
+            } => f
+                .debug_struct("Sqlite")
+                .field("path", path)
+                .field("encrypted", encrypted)
+                .field("retention_days", retention_days)
+                .finish(),
+            // The URL can embed passwords and TLS credentials in userinfo or query parameters.
+            Self::Postgres {
+                url: _,
+                encrypted,
+                retention_days,
+            } => f
+                .debug_struct("Postgres")
+                .field("url", &"<redacted>")
+                .field("encrypted", encrypted)
+                .field("retention_days", retention_days)
+                .finish(),
+        }
+    }
 }
 
 impl StorageConfig {
@@ -1076,7 +1293,7 @@ impl Default for BackupConfig {
 }
 
 /// HTTP/WebSocket API configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     /// Address to listen on for API connections.
@@ -1105,6 +1322,20 @@ pub struct ApiConfig {
     /// Path to the audit log file (append-only, JSON-lines format).
     #[serde(default = "default_audit_log_path")]
     pub audit_log_path: String,
+}
+
+// Keep credentials out of diagnostics, including nested and pretty Debug output.
+impl std::fmt::Debug for ApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiConfig")
+            .field("listen_addr", &self.listen_addr)
+            .field("jwt_secret", &"<redacted>")
+            .field("rate_limit_rps", &self.rate_limit_rps)
+            .field("cors_enabled", &self.cors_enabled)
+            .field("operator_probes_enabled", &self.operator_probes_enabled)
+            .field("audit_log_path", &self.audit_log_path)
+            .finish()
+    }
 }
 
 impl Default for ApiConfig {
@@ -1702,6 +1933,9 @@ impl NodeConfig {
             ),
             NodeTier::Full => (
                 LightningConfig::Ldk {
+                    max_channel_capacity_sats: default_max_channel_capacity_sats(),
+                    max_total_channel_capacity_sats: default_max_total_channel_capacity_sats(),
+                    hub_only_channels: None,
                     network: default_ldk_network(),
                     // #66: a fresh node ships with two chain providers, written
                     // into the generated konsensus.toml so the operator can see

@@ -28,7 +28,7 @@ use konsensus_core::traits::lightning::{
 };
 
 /// Configuration for the LND REST provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LndConfig {
     /// Base URL of the LND REST API (e.g. `https://localhost:8080`).
     pub api_url: String,
@@ -37,6 +37,20 @@ pub struct LndConfig {
     /// Optional path to TLS cert for self-signed LND certificates.
     /// If not provided, system CA roots are used.
     pub tls_cert_path: Option<String>,
+}
+
+// Keep credentials out of diagnostics, including nested and pretty Debug output.
+impl std::fmt::Debug for LndConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LndConfig")
+            .field(
+                "api_url",
+                &konsensus_core::logging::redact_url_for_debug(&self.api_url),
+            )
+            .field("macaroon_hex", &"<redacted>")
+            .field("tls_cert_path", &self.tls_cert_path)
+            .finish()
+    }
 }
 
 /// LND REST provider implementing `LightningProvider`.

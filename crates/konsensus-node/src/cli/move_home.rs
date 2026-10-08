@@ -104,6 +104,7 @@ pub async fn run(args: MoveHomeArgs) -> Result<()> {
         data_dir,
         crate::safety::STATE_GENERATION,
     )?);
+    crate::restore_fence::ensure_bound(data_dir)?;
     let password = if let Some(fd) = args.password_fd {
         Some(crate::password::read_password_fd(fd)?)
     } else if crate::mnemonic_crypto::is_encrypted_path(&config.identity.mnemonic_file) {
@@ -130,7 +131,12 @@ pub async fn run(args: MoveHomeArgs) -> Result<()> {
         },
         liquidity: Default::default(),
         lsps2_service: Default::default(),
-        channel_peers: None,
+        channel_peers: crate::guarded_lightning::ChannelPeers::from_config(&config.lightning)?
+            .allowlist(),
+        channel_capacity_limits: config
+            .lightning
+            .channel_capacity_limits()
+            .expect("LDK config"),
         storage_dir: storage_dir.clone(),
         scb_backup_dir: Some(PathBuf::from(&config.backup.scb_dir)),
         scb_rotation_count: config.backup.rotation_count,

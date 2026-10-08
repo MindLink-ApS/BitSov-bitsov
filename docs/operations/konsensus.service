@@ -3,6 +3,9 @@
 [Unit]
 Description=BitSov node
 After=network-online.target
+# Stop repeated startup/panic failures; inspect the journal before reset-failed.
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
