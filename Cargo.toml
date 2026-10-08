@@ -1,6 +1,7 @@
 [workspace]
 exclude = ["vendor/lightning", "vendor/ldk-node", "vendor/x25519-dalek", "vendor/esplora-client"]
 members = [
+    "crates/konsensus-recovery",
     "crates/konsensus-core",
     "crates/konsensus-chain",
     "crates/konsensus-lightning",

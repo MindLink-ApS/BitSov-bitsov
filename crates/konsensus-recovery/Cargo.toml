@@ -1,0 +1,19 @@
+[package]
+name = "konsensus-recovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitcoin.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+lightning = { path = "../../vendor/lightning", features = ["std"] }
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+hex.workspace = true
+# Already resolved through BDK; used to execute both recovery script types.
+miniscript = "=12.3.5"
