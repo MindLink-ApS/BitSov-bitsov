@@ -154,8 +154,8 @@ struct Tunnel {
 }
 
 impl Tunnel {
-    /// Pin the box static from the ticket; never learn it from the node.
-    async fn connect(remote: SocketAddr, box_pin: &str, auth: Value) -> (Self, Value) {
+    /// Pin the static from a verified ticket or identity proof before authenticating.
+    async fn connect(remote: SocketAddr, pin: &str, auth: Value) -> (Self, Value) {
         let mut stream = TcpStream::connect(remote).await.unwrap();
         let mut noise = NoiseSession::initiator(&CLIENT_STATIC).unwrap();
         wire::write_frame(&mut stream, &noise.write_handshake(&[]).unwrap())
@@ -168,7 +168,7 @@ impl Tunnel {
                     .unwrap(),
             )
             .unwrap();
-        assert_eq!(hex::encode(noise.remote_static_key().unwrap()), box_pin);
+        assert_eq!(hex::encode(noise.remote_static_key().unwrap()), pin);
         wire::write_frame(&mut stream, &noise.write_handshake(&[]).unwrap())
             .await
             .unwrap();
@@ -414,6 +414,13 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
         .await;
     assert_eq!(status, 200, "{token}");
     let bst = token["token"].as_str().unwrap().to_string();
+    let claims: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(bst.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let epoch = claims["epc"].as_u64().unwrap();
     let (_, state) = tunnel
         .send("GET", "/api/v1/bootstrap/state", None, None)
         .await;
@@ -548,6 +555,24 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
         .await;
     assert_eq!(status, 200, "{result}");
     assert_eq!(result["node_id"], node_id);
+    assert_eq!(result["client_id"], client_id);
+    assert_eq!(result["epoch"], epoch);
+    let live_pin = result["transport_pubkey"].as_str().unwrap();
+    let identity = NodeIdentity::from_mnemonic(&phrase, "").unwrap();
+    assert_eq!(live_pin, hex::encode(identity.x25519_public().as_bytes()));
+    let live_signature = ed25519_dalek::Signature::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(result["transport_signature"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    identity
+        .ed25519_verifying_key()
+        .verify_strict(
+            format!("bitsov-remote-transport-v1:{node_id}:{live_pin}").as_bytes(),
+            &live_signature,
+        )
+        .unwrap();
     assert!(result.get("mnemonic").is_none());
     assert_eq!(result["box_transport_pubkey"], box_pin);
     verify_box_proof(
@@ -628,6 +653,8 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     let (mut tunnel, auth) = Tunnel::connect(f.remote, &box_pin, json!({"v": 1})).await;
     assert_eq!(auth["status"], "ok", "{auth}");
     assert_eq!(auth["client_id"], client_id);
+    assert_eq!(auth["transport_pubkey"], result["transport_pubkey"]);
+    assert_eq!(auth["transport_signature"], result["transport_signature"]);
     verify_box_proof(
         &node_id,
         &box_pin,
@@ -667,6 +694,9 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     // 8. Normal startup in the same process, with the device's authority.
     let health = f.ready(&mut node, "/api/v1/health", &log).await;
     assert_eq!(health["hosted_by"], "Rasmus's Pi");
+    let (_live_tunnel, live_auth) = Tunnel::connect(f.remote, live_pin, json!({"v": 1})).await;
+    assert_eq!(live_auth["status"], "ok");
+    assert_eq!(live_auth["client_id"], client_id);
     assert_eq!(node.0.id(), locked_pid);
     assert!(node.0.try_wait().unwrap().is_none());
     assert!(!f.dir.path().join("control.sock").exists());

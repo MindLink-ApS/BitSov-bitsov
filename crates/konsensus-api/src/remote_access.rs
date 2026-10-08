@@ -292,6 +292,12 @@ pub enum AuthResponse {
         box_transport_pubkey: String,
         /// Base64url-no-pad Ed25519 proof over [`box_transport_proof_message`].
         box_transport_signature: String,
+        /// Seed-derived X25519 public key for re-pinning from locked mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport_pubkey: Option<String>,
+        /// Base64url-no-pad Ed25519 proof over [`transport_proof_message`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport_signature: Option<String>,
     },
     Error {
         v: u8,
