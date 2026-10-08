@@ -728,3 +728,35 @@ panic or safety refusal, inspect `journalctl --user -u konsensus.service` and
 resolve the cause before `systemctl --user reset-failed konsensus.service`
 and a deliberate restart. This caps rapid crash loops; it cannot suppress a
 revoked-commitment broadcast or stop failures spaced outside the limit window.
+
+
+## Box claim code and SAS enrollment
+
+N3 initializes a per-box claim code on `konsensus init` or the first empty-box
+SETUP start. Keep it on a sticker with the box. It is shown once on a controlling
+console, never in the service journal. A service without a terminal still creates
+the protected `claim-code` file; the owner can display it locally with:
+
+```sh
+konsensus claim-code --show --config /var/lib/bitsov/konsensus.toml
+```
+
+Run as the data-directory owner from a console (including the existing owner SSH
+console). Redirection will not capture the code: the command requires and writes
+to the terminal itself. It is never available via the app, API, pairing link or
+tunnel. Do not delete or edit the file; it is stable across restarts and stored
+with `0600` permissions. A damaged code file fails closed.
+
+SAS-capable clients opt into four BIP-39 comparison words bound to the completed
+Noise session, device key, fresh box nonce and this physical code. Enter only the
+code from the sticker or trusted console into the client. Do not use a code
+provided by an untrusted setup page. Compare before submitting the password.
+Only one ceremony can be pending. Setup closes after 15 minutes, or after three
+mismatches/cancels; restart to reopen it. Reconnecting requires cancelling the
+pending SAS ceremony and starting again.
+
+The box web page and app integration are separate work (N4 and A1). Existing app
+versions keep their current console enrollment path. Already initialized legacy
+boxes without a claim code continue on that path; N3 does not migrate a funded
+box. See [the SAS wire contract](../security/pairing.md#sas-v1-and-the-box-claim-code-n3)
+for the exact digest, signature domains and compatibility behavior.

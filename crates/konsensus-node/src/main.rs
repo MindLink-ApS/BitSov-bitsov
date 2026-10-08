@@ -3,6 +3,7 @@
 //! Entry point for `konsensus init` and `konsensus start`.
 
 mod admission_quotes;
+mod claim_code;
 mod cli;
 mod config;
 mod content_server;
@@ -117,6 +118,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::ClaimCode { config, show: _ } => claim_code::show(&config)?,
         Command::RebindInstance { config } => restore_fence::rebind_instance(&config)?,
         Command::Init {
             dir,
@@ -351,6 +353,8 @@ fn cmd_init(
     let _state_lease = safety::ensure_generation(dir, safety::STATE_GENERATION)?;
     konsensus_lightning::ldk::ensure_no_move_home(&dir.join("ldk"))?;
     restore_fence::ensure_bound(dir)?;
+
+    claim_code::initialize(dir)?;
 
     // Select tier: CLI flag > interactive prompt > default
     let tier = if let Some(t) = tier_arg {

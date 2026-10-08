@@ -20,17 +20,50 @@ use std::sync::Arc;
 /// pairing authenticated by Noise. Never populated from HTTP headers or JWTs.
 #[derive(Default)]
 pub struct RemoteTunnelClients {
-    clients: Mutex<HashMap<SocketAddr, Arc<str>>>,
+    clients: Mutex<HashMap<SocketAddr, Arc<TunnelIdentity>>>,
+}
+
+struct TunnelIdentity {
+    client_id: Arc<str>,
+    noise: Option<crate::sas::NoiseBinding>,
+}
+
+/// Server-authenticated transcript attached by the tunnel middleware.
+#[derive(Clone)]
+pub struct AuthenticatedNoise {
+    /// Authenticated pairing identity.
+    pub client_id: Arc<str>,
+    /// Completed Noise transcript and static keys.
+    pub binding: crate::sas::NoiseBinding,
 }
 
 impl RemoteTunnelClients {
+    /// Resolve the transcript of a registered bridge.
+    pub fn noise(&self, peer: SocketAddr) -> Option<AuthenticatedNoise> {
+        let clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = clients.get(&peer)?;
+        Some(AuthenticatedNoise {
+            client_id: entry.client_id.clone(),
+            binding: entry.noise?,
+        })
+    }
+    /// Register an authenticated, completed Noise connection before forwarding HTTP.
+    pub fn register_noise(
+        self: &Arc<Self>,
+        peer: SocketAddr,
+        client_id: String,
+        noise: crate::sas::NoiseBinding,
+    ) -> RemoteTunnelRegistration {
+        self.register_inner(peer, client_id, Some(noise))
+    }
+
     /// Resolve only a server-registered TCP bridge, never a caller's headers.
     pub fn client_id(&self, peer: SocketAddr) -> Option<Arc<str>> {
         self.clients
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&peer)
-            .cloned()
+            .map(|entry| entry.client_id.clone())
     }
 
     /// Register before forwarding any HTTP bytes. Keep the guard alive for the
@@ -40,7 +73,19 @@ impl RemoteTunnelClients {
         peer: SocketAddr,
         client_id: String,
     ) -> RemoteTunnelRegistration {
-        let client_id: Arc<str> = client_id.into();
+        self.register_inner(peer, client_id, None)
+    }
+
+    fn register_inner(
+        self: &Arc<Self>,
+        peer: SocketAddr,
+        client_id: String,
+        noise: Option<crate::sas::NoiseBinding>,
+    ) -> RemoteTunnelRegistration {
+        let client_id = Arc::new(TunnelIdentity {
+            client_id: client_id.into(),
+            noise,
+        });
         self.clients
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -58,7 +103,7 @@ impl RemoteTunnelClients {
 pub struct RemoteTunnelRegistration {
     clients: Arc<RemoteTunnelClients>,
     peer: SocketAddr,
-    client_id: Arc<str>,
+    client_id: Arc<TunnelIdentity>,
 }
 
 impl Drop for RemoteTunnelRegistration {
@@ -104,8 +149,14 @@ pub async fn remote_tunnel_identity(
         )
             .into_response();
     };
+    if let Some(binding) = client.noise {
+        req.extensions_mut().insert(AuthenticatedNoise {
+            client_id: client.client_id.clone(),
+            binding,
+        });
+    }
     req.extensions_mut()
-        .insert(RemotePairingRateLimitKey(client));
+        .insert(RemotePairingRateLimitKey(client.client_id.clone()));
     next.run(req).await
 }
 
@@ -232,7 +283,7 @@ impl RateLimiter {
     pub fn cleanup(&self) {
         let now = Instant::now();
         let expiry = self.window * 2; // Keep entries for 2x the window duration
-        // See check() for poisoning rationale
+                                      // See check() for poisoning rationale
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| {
             tracing::warn!("rate limiter mutex poisoned during cleanup, recovering");
             e.into_inner()
@@ -456,10 +507,7 @@ mod tests {
         let limiter = Arc::new(RateLimiter::new(5));
         let app = middleware_router(limiter);
 
-        let mut req = HttpRequest::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let mut req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
         req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             54321,
@@ -480,10 +528,7 @@ mod tests {
         let app = middleware_router(limiter.clone());
 
         // No ConnectInfo extension inserted -> Option<ConnectInfo> resolves None.
-        let req = HttpRequest::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
 
@@ -514,10 +559,7 @@ mod tests {
 
         for _ in 0..3 {
             let app = middleware_router(limiter.clone());
-            let req = HttpRequest::builder()
-                .uri("/")
-                .body(Body::empty())
-                .unwrap();
+            let req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
             let resp = app.oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }

@@ -520,3 +520,115 @@ authentication or unlock secrets. Endpoint fallback never resets that pin.
 The home-only optional `_bitsov._tcp` advertisement exposes only a fingerprint
 prefix and the TCP port; it is not an identity, pairing or authorization channel.
 See [operating endpoint discovery](../operations/home-node.md#endpoint-discovery).
+
+
+## SAS v1 and the box claim code (N3)
+
+Newly initialized boxes and empty-directory SETUP generate a local `claim-code`
+file beside `konsensus.toml`, mode `0600`. It contains 16 uppercase RFC 4648
+base32 characters (80 random bits) plus two checksum characters. The checksum
+is the first 10 bits, MSB first, of BLAKE3 over the first 16 ASCII characters,
+encoded with the same alphabet. There are no separators or trailing newline in
+the file. Provisioning may put the code on the box's sticker. Self-flashed boxes
+show it once on the controlling terminal when available. Headless daemons never
+send it to stdout, stderr, journald, tracing, a QR, HTTP, or a Noise tunnel.
+`konsensus claim-code --show --config /path/to/konsensus.toml` reads it only on
+an owner console (the data-directory owner on Unix); output goes directly to
+that console, including when stdout is redirected. Missing, malformed or
+symlinked claim files fail closed; a malformed file is never silently replaced.
+Keep the code with the box. Disk access to this file defeats this additional
+physical-origin check.
+
+Existing initialized boxes without a claim code retain their console enrollment
+flow; this release does not migrate their identity or provision a code remotely.
+The new flow is for boxes initialized or put through empty-directory SETUP with
+N3. Do not wipe a funded node merely to enable this flow.
+
+For clients explicitly requesting `sas_version: 1`, the exact binary transcript is:
+
+```text
+sas_digest = BLAKE3(
+  ASCII("bitsov-sas-v1") ||
+  noise_handshake_hash[32] || box_transport_pubkey[32] || client_static[32] ||
+  device_public_key[65] || box_nonce[16] || claim_code_commitment[32])
+claim_code_commitment = BLAKE3(ASCII("bitsov-claim-code-v1") || claim_code_ASCII[18])
+```
+
+Keys are raw bytes, not hex text. The device key is an uncompressed SEC1 P-256
+point. The box key is the persistent transport key advertised in the pair link
+(the live legacy transport may still use its identity-derived Noise responder
+key). The handshake hash is the **completed** Noise XX transcript, retained by
+the server before switching to transport. The first 44 digest bits, most
+significant bit first, become four successive 11-bit indices into the BIP-39
+English list. These four words are an authentication string, not recovery words.
+Finalization compares the full 32-byte digest in constant time.
+
+A fixed interoperability vector uses handshake bytes `00..1f`, box key `22` × 32,
+client static `33` × 32, device key `04 || 44` × 64, nonce `55` × 16 and claim
+commitment `66` × 32. Its digest is
+`960be0e8e070d1089b55da2113669f8530ee396eb36cd0fa04e82cb9ae346f35`;
+indices are `1200, 760, 465, 1543`: **noodle gallery demand science**.
+
+### Remote first run
+
+`POST /api/v1/identity/create-pending` accepts:
+
+```json
+{"password_commitment":"<64 lowercase hex>","sas_version":1,
+ "device":{"public_key":"<130 hex>","name":"My phone"}}
+```
+
+The server verifies the caller's registered Noise bridge, commits the device
+key and label under the single-pending lock, then generates a fresh 16-byte
+nonce. The existing response gains `sas_version: 1` and `box_nonce` (32 lowercase
+hex characters). It never returns the claim code, its commitment, the SAS words,
+or the expected digest. Clients derive the commitment locally from the sticker
+or trusted console code; they must never send that code to the box. Unsupported
+versions and incomplete version/device combinations fail closed.
+
+`finalize` adds `sas_version: 1` and `sas_digest` (64 hex characters); the device
+key and label must match create-pending. `device.proof` signs the UTF-8 message
+returned by `sas_registration_message`: the existing registration message with
+its domain changed from `v1` to `v2`, followed by `\nsas_digest:<lowercase digest>`.
+The Noise binding is checked again under the finalization lock after reading the
+body. Reconnecting requires cancelling and starting a new ceremony. Correct SAS
+cannot replace the password commitment, backup-word check or device proof.
+
+There is one pending ceremony. SAS ceremonies expire within 15 minutes and
+cannot outlive the 15-minute process setup window; `expires_at` reports the
+earlier deadline. Three SAS mismatches or cancellations close setup until process
+restart, including attempts to downgrade to the legacy protocol. Dropping a
+ceremony after repeated incorrect password/backup confirmations also counts as
+a cancellation. A retry cannot replace a pending nonce. Cancelling an absent
+operation does not consume an attempt.
+
+Requests without SAS fields keep the pre-N3 first-run behavior, including its
+30-minute pending lifetime. Existing live enrollment keeps console approval.
+N3 provides the node protocol only: the trusted box-page display and approval
+gate are N4. SAS knowledge alone does not add an owner approval route. The app
+must compare the words before sending its password or trusting recovery words.
+A fake box lacking the physical code computes different words; accepting a
+code supplied by that same untrusted page defeats this protection (T2). One-use
+pairing tickets, a single pending operation and the rejection budget limit
+photographed-QR abuse (T3) and nonce grinding (I3).
+
+### Live device-key enrollment
+
+`POST /api/v1/pair/device-key` can add `sas_version: 1` to the existing key,
+name and v1 possession proof. It requires the authenticated Noise bridge and
+returns `sas_version` and `box_nonce`. At most one SAS enrollment is pending
+box-wide; a legacy request cannot replace it. The 15-minute enrollment expiry
+remains, with a monotonic deadline as well as the durable wall-clock expiry.
+
+The enrolling client then sends the tunnel-only
+`POST /api/v1/pair/device-key/{op_id}/finalize` with `sas_version: 1`,
+`sas_digest` and `proof` over `sas_registration_message`. This records only SAS
+confirmation. Existing console approval or an already enrolled device's signed
+delegation is still required. The v2 delegation domain additionally binds
+`\nsas_digest:<digest>`; its signing message is available only after confirmation.
+This PR does not expose delegation or ticket-minting over the tunnel.
+
+Three mismatches/cancellations close new device ceremonies for that process.
+SAS confirmation is memory-only; its durable version marker ensures a restart
+cannot approve an old SAS request as legacy. Cancel the old request and retry.
+Omitting `sas_version` preserves current clients' console/delegation messages.

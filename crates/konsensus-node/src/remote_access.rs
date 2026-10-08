@@ -729,7 +729,17 @@ async fn handle_connection(
         .context("could not connect to internal remote API")?;
     // The server supplies the pairing, never an HTTP header. Registration must
     // precede the first forwarded byte so Axum can resolve every request.
-    let _registration = tunnel_clients.register(internal.local_addr()?, client.client_id.clone());
+    let _registration = tunnel_clients.register_noise(
+        internal.local_addr()?,
+        client.client_id.clone(),
+        konsensus_api::sas::NoiseBinding {
+            handshake_hash: *noise
+                .handshake_hash()
+                .context("completed Noise hash unavailable")?,
+            box_public_key: pairing.box_transport_pubkey(),
+            client_static: remote_static,
+        },
+    );
     let (mut internal_reader, mut internal_writer) = internal.into_split();
     let mut internal_buf = zeroize::Zeroizing::new(vec![0u8; wire::MAX_TUNNEL_PLAINTEXT]);
     info!(client_id = %client.client_id, "remote access tunnel authenticated");

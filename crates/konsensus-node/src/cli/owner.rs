@@ -133,7 +133,6 @@ mod to_self_delay_tests {
     }
 }
 
-
 fn configured_layout(data_dir: &Path, config: &NodeConfig) -> DataDirLayout {
     // The configured store is a connection string, not a path: the runtime
     // hands it to sqlx, which strips a `sqlite:` / `sqlite://` scheme and any
@@ -285,7 +284,12 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             pending_device_keys,
         } => {
             for k in &device_keys {
-                safe_println!("DEVICE KEY {}  {:?}  client={}", k.fingerprint, k.name, k.client_id);
+                safe_println!(
+                    "DEVICE KEY {}  {:?}  client={}",
+                    k.fingerprint,
+                    k.name,
+                    k.client_id
+                );
             }
             for p in pending_device_keys.iter().filter(|p| !p.lost) {
                 safe_println!(
@@ -321,13 +325,14 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                 safe_println!(
                     "FRONT DOOR GRANT client={}  may publish the front-door card only  \
                      expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
-                    g.client_id, g.expires_at, g.client_id
+                    g.client_id,
+                    g.expires_at,
+                    g.client_id
                 );
             }
             for e in &pending_elevations {
                 let next = if e.lost {
-                    "cancelled by wrong codes; ask again from the app"
-                        .to_string()
+                    "cancelled by wrong codes; ask again from the app".to_string()
                 } else {
                     format!("approve with: konsensus grant --op {}", e.op_id)
                 };
@@ -491,10 +496,9 @@ pub fn resolve_terms(flags: &GrantFlags, proposal: Option<&GrantTerms>) -> Resul
             let (key, sats) = entry
                 .split_once('=')
                 .with_context(|| format!("--recipient {entry:?} must be <key>=<sats>"))?;
-            let sats: u64 = sats
-                .trim()
-                .parse()
-                .with_context(|| format!("--recipient {entry:?}: {sats:?} is not a whole number of sats"))?;
+            let sats: u64 = sats.trim().parse().with_context(|| {
+                format!("--recipient {entry:?}: {sats:?} is not a whole number of sats")
+            })?;
             map.insert(key.trim().to_string(), sats_to_msat(sats, "--recipient")?);
         }
         map
@@ -642,7 +646,11 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
             report(
                 send(
                     &config,
-                    ControlRequest::ApproveDeviceKey { op_id, confirmation, owner_signature },
+                    ControlRequest::ApproveDeviceKey {
+                        op_id,
+                        confirmation,
+                        owner_signature,
+                    },
                 )
                 .await?,
             )
@@ -651,7 +659,11 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
             report(send(&config, ControlRequest::RevokeDeviceKey { key_id }).await?)
         }
         DeviceCommand::List { config } => match send(&config, ControlRequest::Status).await? {
-            ControlResponse::Status { device_keys, pending_device_keys, .. } => {
+            ControlResponse::Status {
+                device_keys,
+                pending_device_keys,
+                ..
+            } => {
                 if device_keys.is_empty() && pending_device_keys.is_empty() {
                     safe_println!("no device keys");
                 }
@@ -669,7 +681,11 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
                     };
                     safe_println!(
                         "PENDING DEVICE KEY {}  {:?}  client={} ({})  expires_at={}\n  {next}",
-                        p.fingerprint, p.name, p.client_name, p.client_id, p.expires_at
+                        p.fingerprint,
+                        p.name,
+                        p.client_name,
+                        p.client_id,
+                        p.expires_at
                     );
                 }
                 Ok(())
@@ -715,7 +731,10 @@ fn protected_owner_secret(config_path: &Path) -> Result<NodeConfig> {
 /// the recovery phrase must be encrypted (`.enc`, `konsensus init --encrypt`),
 /// no plaintext copy may sit beside it, and its password is typed at this
 /// prompt. There is no flag, environment variable or config field for it.
-fn sign_device_approval(config_path: &Path, tuple: &control::DeviceApprovalTuple) -> Result<String> {
+fn sign_device_approval(
+    config_path: &Path,
+    tuple: &control::DeviceApprovalTuple,
+) -> Result<String> {
     sign_device_approval_with(config_path, tuple, || {
         print!("Password for the encrypted recovery phrase: ");
         std::io::stdout().flush().ok();
@@ -734,7 +753,12 @@ fn sign_device_approval_with(
     let path = &config.identity.mnemonic_file;
     let password = password()?;
     let mnemonic = crate::mnemonic_crypto::read_mnemonic(path, Some(password.as_str()))
-        .with_context(|| format!("failed to decrypt the recovery phrase at {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to decrypt the recovery phrase at {}",
+                path.display()
+            )
+        })?;
     // The BIP-39 passphrase is a derivation input shared with the node, not
     // the protection; the protection is the encryption password above.
     let passphrase = config.identity.passphrase.as_str();
@@ -762,7 +786,11 @@ fn sign_device_approval_with(
 }
 
 /// `konsensus grant-revoke --client-id <id> | --all` — stop spend now.
-pub async fn cmd_grant_revoke(config_path: &Path, client_id: Option<&str>, all: bool) -> Result<()> {
+pub async fn cmd_grant_revoke(
+    config_path: &Path,
+    client_id: Option<&str>,
+    all: bool,
+) -> Result<()> {
     if client_id.is_none() && !all {
         anyhow::bail!("pass --client-id <id> or --all");
     }
@@ -994,6 +1022,8 @@ pub async fn serve_bootstrap_mode(
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("failed to create {}", data_dir.display()))?;
 
+    crate::claim_code::initialize(&data_dir)?;
+
     // No identity exists, so the pairing service binds to the empty
     // fingerprint; the transition commit rebinds every record to the committed
     // identity. Owner control is off: there is nothing to elevate on a node
@@ -1125,7 +1155,10 @@ mod startup_tests {
             let data = data_dir_of(Path::new("konsensus.toml"));
             assert!(data.is_absolute());
             assert!(!data.as_os_str().is_empty());
-            assert_eq!(data.canonicalize().unwrap(), tmp.path().canonicalize().unwrap());
+            assert_eq!(
+                data.canonicalize().unwrap(),
+                tmp.path().canonicalize().unwrap()
+            );
         });
         std::env::set_current_dir(prev).unwrap();
         result.unwrap();
@@ -1278,7 +1311,10 @@ mod startup_tests {
             );
             let path = dir.path().join("konsensus.toml");
             config.save(&path).unwrap();
-            assert_eq!(prepare_start(&path, false).unwrap().0, StartupMode::Bootstrap);
+            assert_eq!(
+                prepare_start(&path, false).unwrap().0,
+                StartupMode::Bootstrap
+            );
             let ldk = identity_dir.join("ldk");
             std::fs::create_dir_all(&ldk).unwrap();
             let monitor = ldk.join("channel-monitor-fixture");
@@ -1322,7 +1358,10 @@ mod startup_tests {
             };
             let path = dir.path().join("konsensus.toml");
             config.save(&path).unwrap();
-            assert_eq!(prepare_start(&path, false).unwrap().0, StartupMode::Bootstrap);
+            assert_eq!(
+                prepare_start(&path, false).unwrap().0,
+                StartupMode::Bootstrap
+            );
 
             // A committed identity, then the database the runtime creates
             // through the very same connection string.
@@ -1351,7 +1390,10 @@ mod startup_tests {
             );
             assert!(!layout.marker().exists());
             assert!(!layout.identity_dir().exists());
-            assert!(store_file.exists(), "{spelling}: the probe must not touch the store");
+            assert!(
+                store_file.exists(),
+                "{spelling}: the probe must not touch the store"
+            );
         }
     }
 
@@ -1375,7 +1417,10 @@ mod startup_tests {
             config.backup.scb_dir = backup_dir.to_string_lossy().into_owned();
             let path = dir.path().join("konsensus.toml");
             config.save(&path).unwrap();
-            assert_eq!(prepare_start(&path, false).unwrap().0, StartupMode::Bootstrap);
+            assert_eq!(
+                prepare_start(&path, false).unwrap().0,
+                StartupMode::Bootstrap
+            );
             let _store = if artifact == "sqlite" {
                 Some(
                     konsensus_storage::SqliteStorage::open(store_path.to_str().unwrap())
@@ -1589,7 +1634,10 @@ mod startup_tests {
         config.api.listen_addr = "127.0.0.1:0".parse().unwrap();
         let path = dir.path().join("custom.toml");
         config.save(&path).unwrap();
-        assert_eq!(prepare_start(&path, false).unwrap().0, StartupMode::Bootstrap);
+        assert_eq!(
+            prepare_start(&path, false).unwrap().0,
+            StartupMode::Bootstrap
+        );
 
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let pairing = std::sync::Arc::new(
@@ -1604,7 +1652,9 @@ mod startup_tests {
                     .map_err(|e| bootstrap::CommitError::Io(e.to_string()))
             });
 
-        let outcome = state.transition(phrase, bootstrap::CommitFault::None).unwrap();
+        let outcome = state
+            .transition(phrase, bootstrap::CommitFault::None)
+            .unwrap();
         assert!(
             DataDirLayout::new(dir.path()).marker().exists(),
             "marker must publish only after config alignment"
@@ -1679,9 +1729,8 @@ mod startup_tests {
         let state = bootstrap::BootstrapState::new(configured_layout(dir.path(), &config), pairing)
             .with_before_marker(move |outcome| {
                 crate::config::fail_next_config_dir_sync();
-                align_config_mnemonic(&align_path, &outcome.mnemonic_path).map_err(|e| {
-                    bootstrap::CommitError::Io(format!("{e:#}"))
-                })
+                align_config_mnemonic(&align_path, &outcome.mnemonic_path)
+                    .map_err(|e| bootstrap::CommitError::Io(format!("{e:#}")))
             });
 
         let err = state
@@ -1766,11 +1815,19 @@ mod startup_tests {
         assert_eq!(front_door_ttl(&flags(None, None)).unwrap(), 3600);
         assert_eq!(front_door_ttl(&flags(None, Some("10m"))).unwrap(), 600);
         assert!(front_door_ttl(&flags(None, Some("25h"))).is_err());
-        let err = front_door_ttl(&flags(Some(100), Some("10m"))).unwrap_err().to_string();
+        let err = front_door_ttl(&flags(Some(100), Some("10m")))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no budget"), "{err}");
-        let per_call = GrantFlags { per_call_sats: Some(1), ..GrantFlags::default() };
+        let per_call = GrantFlags {
+            per_call_sats: Some(1),
+            ..GrantFlags::default()
+        };
         assert!(front_door_ttl(&per_call).is_err());
-        let fees = GrantFlags { allow_liquidity_fees: true, ..GrantFlags::default() };
+        let fees = GrantFlags {
+            allow_liquidity_fees: true,
+            ..GrantFlags::default()
+        };
         assert!(front_door_ttl(&fees).is_err());
     }
 
@@ -1793,7 +1850,10 @@ mod startup_tests {
         // Owner flags override field by field; a smaller budget also narrows
         // the proposal's per-call maximum rather than failing.
         let t = resolve_terms(&flags(Some(50), Some("30m")), Some(&proposal)).unwrap();
-        assert_eq!((t.budget_msat, t.per_call_max_msat, t.ttl_secs), (50_000, 50_000, 1800));
+        assert_eq!(
+            (t.budget_msat, t.per_call_max_msat, t.ttl_secs),
+            (50_000, 50_000, 1800)
+        );
     }
 
     #[test]
@@ -1807,7 +1867,10 @@ mod startup_tests {
         let t = resolve_terms(&f, None).unwrap();
         assert_eq!(t.per_recipient_msat[&"ab".repeat(32)], 5_000);
         f.per_call_sats = Some(101);
-        assert!(resolve_terms(&f, None).is_err(), "per-call above the budget");
+        assert!(
+            resolve_terms(&f, None).is_err(),
+            "per-call above the budget"
+        );
     }
 }
 
@@ -1819,9 +1882,17 @@ mod liquidity_authority_tests {
         let mut proposal = GrantTerms::new(10_000);
         proposal.allow_liquidity_fees = true;
         let mut flags = GrantFlags::default();
-        assert!(!resolve_terms(&flags, Some(&proposal)).unwrap().allow_liquidity_fees);
+        assert!(
+            !resolve_terms(&flags, Some(&proposal))
+                .unwrap()
+                .allow_liquidity_fees
+        );
         flags.allow_liquidity_fees = true;
-        assert!(resolve_terms(&flags, Some(&proposal)).unwrap().allow_liquidity_fees);
+        assert!(
+            resolve_terms(&flags, Some(&proposal))
+                .unwrap()
+                .allow_liquidity_fees
+        );
     }
 }
 
@@ -1830,30 +1901,60 @@ mod liquidity_authority_tests {
 pub async fn cmd_approve(command: crate::cli::ApprovalCommand) -> Result<()> {
     use crate::cli::ApprovalCommand;
     let (config, request, summary) = match command {
-        ApprovalCommand::FirstContact { client, op, to, max_msat, contact_budget_msat, config } => {
+        ApprovalCommand::FirstContact {
+            client,
+            op,
+            to,
+            max_msat,
+            contact_budget_msat,
+            config,
+        } => {
             let summary = format!(
                 "Approve first contact: client {client:?}, grant {op:?}, recipient {to:?}, maximum {max_msat} msat, contact budget {}.",
                 contact_budget_msat.map(|n| format!("{n} msat")).unwrap_or_else(|| "unchanged".into())
             );
-            (config, ControlRequest::ApproveFirstContact {
-                client_id: client, grant_op_id: op, recipient: to,
-                max_total_msat: max_msat, contact_budget_msat,
-            }, summary)
+            (
+                config,
+                ControlRequest::ApproveFirstContact {
+                    client_id: client,
+                    grant_op_id: op,
+                    recipient: to,
+                    max_total_msat: max_msat,
+                    contact_budget_msat,
+                },
+                summary,
+            )
         }
-        ApprovalCommand::Gift { intro, newcomer, hash, gift_msat, fee_max_msat, code, config } => {
+        ApprovalCommand::Gift {
+            intro,
+            newcomer,
+            hash,
+            gift_msat,
+            fee_max_msat,
+            code,
+            config,
+        } => {
             let summary = format!(
                 "Approve gift: introduction {intro:?}, newcomer {newcomer:?}, payment hash {hash:?}, gift {gift_msat} msat, maximum fee {fee_max_msat} msat, code {code:?}."
             );
-            (config, ControlRequest::ApproveGift {
-                intro_id: intro, newcomer, payment_hash: hash, gift_msat, fee_max_msat, code,
-            }, summary)
+            (
+                config,
+                ControlRequest::ApproveGift {
+                    intro_id: intro,
+                    newcomer,
+                    payment_hash: hash,
+                    gift_msat,
+                    fee_max_msat,
+                    code,
+                },
+                summary,
+            )
         }
     };
     println!("{summary}");
     std::io::stdout().flush()?;
     report(send(&config, request).await?)
 }
-
 
 #[cfg(all(test, unix))]
 mod connection_error_tests {
@@ -1862,17 +1963,27 @@ mod connection_error_tests {
     #[tokio::test]
     async fn socket_errors_escape_controls_even_without_approval_parsing() {
         let dir = tempfile::tempdir().unwrap();
-        for control in ['\u{061c}', '\u{feff}', '\r', '\n', '\u{1b}'].into_iter()
+        for control in ['\u{061c}', '\u{feff}', '\r', '\n', '\u{1b}']
+            .into_iter()
             .chain('\u{200b}'..='\u{200f}')
             .chain('\u{202a}'..='\u{202e}')
             .chain('\u{2066}'..='\u{2069}')
         {
-            let config = dir.path().join(format!("missing{control}dir")).join("konsensus.toml");
+            let config = dir
+                .path()
+                .join(format!("missing{control}dir"))
+                .join("konsensus.toml");
             let error = send(&config, ControlRequest::Status).await.unwrap_err();
             let diagnostic = format!("{error:#}");
             assert!(diagnostic.contains("owner control socket"));
-            assert!(!diagnostic.contains(&format!("missing{control}dir")), "{diagnostic:?}");
-            assert!(diagnostic.contains(&control.escape_debug().to_string()), "{diagnostic:?}");
+            assert!(
+                !diagnostic.contains(&format!("missing{control}dir")),
+                "{diagnostic:?}"
+            );
+            assert!(
+                diagnostic.contains(&control.escape_debug().to_string()),
+                "{diagnostic:?}"
+            );
         }
     }
 }
@@ -1889,14 +2000,26 @@ mod owner_signing_tests {
     /// (or plaintext when `None`).
     fn node(password: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let phrase_path = crate::mnemonic_crypto::write_mnemonic(&dir.path().join("mnemonic.txt"), PHRASE, password).unwrap();
+        let phrase_path = crate::mnemonic_crypto::write_mnemonic(
+            &dir.path().join("mnemonic.txt"),
+            PHRASE,
+            password,
+        )
+        .unwrap();
         let config_path = dir.path().join("konsensus.toml");
-        NodeConfig::default_for_tier(NodeTier::Light, phrase_path, dir.path()).save(&config_path).unwrap();
+        NodeConfig::default_for_tier(NodeTier::Light, phrase_path, dir.path())
+            .save(&config_path)
+            .unwrap();
         (dir, config_path)
     }
 
     fn tuple(node: String) -> control::DeviceApprovalTuple {
-        control::DeviceApprovalTuple { node, client_pubkey: "11".repeat(32), epoch: 3, device_public_key: DEVICE.into() }
+        control::DeviceApprovalTuple {
+            node,
+            client_pubkey: "11".repeat(32),
+            epoch: 3,
+            device_public_key: DEVICE.into(),
+        }
     }
 
     fn fingerprint() -> String {
@@ -1911,18 +2034,33 @@ mod owner_signing_tests {
     #[test]
     fn signs_with_the_owner_key_only_behind_the_typed_password() {
         let (_dir, config) = node(Some("correct horse"));
-        let sig = sign_device_approval_with(&config, &tuple(fingerprint()), typed("correct horse")).unwrap();
-        let message = konsensus_api::pairing::device::owner_approval_message(&fingerprint(), &"11".repeat(32), 3, DEVICE);
+        let sig = sign_device_approval_with(&config, &tuple(fingerprint()), typed("correct horse"))
+            .unwrap();
+        let message = konsensus_api::pairing::device::owner_approval_message(
+            &fingerprint(),
+            &"11".repeat(32),
+            3,
+            DEVICE,
+        );
         let sig = ed25519_dalek::Signature::from_slice(&hex::decode(sig).unwrap()).unwrap();
         let id = konsensus_core::NodeIdentity::from_mnemonic(PHRASE, "").unwrap();
-        let secret = crate::mnemonic_crypto::owner_secret("correct horse", &id.node_id().to_hex()).unwrap();
+        let secret =
+            crate::mnemonic_crypto::owner_secret("correct horse", &id.node_id().to_hex()).unwrap();
         let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &secret).unwrap();
-        assert!(owner.verifying_key().verify_strict(message.as_bytes(), &sig).is_ok());
-        assert!(id.ed25519_verifying_key().verify_strict(message.as_bytes(), &sig).is_err());
+        assert!(owner
+            .verifying_key()
+            .verify_strict(message.as_bytes(), &sig)
+            .is_ok());
+        assert!(id
+            .ed25519_verifying_key()
+            .verify_strict(message.as_bytes(), &sig)
+            .is_err());
         // A wrong password signs nothing.
         assert!(sign_device_approval_with(&config, &tuple(fingerprint()), typed("wrong")).is_err());
         // Nor for a node that is not this identity.
-        let err = sign_device_approval_with(&config, &tuple("0".repeat(32)), typed("correct horse")).unwrap_err();
+        let err =
+            sign_device_approval_with(&config, &tuple("0".repeat(32)), typed("correct horse"))
+                .unwrap_err();
         assert!(err.to_string().contains("nothing was signed"), "{err}");
     }
 
@@ -1943,7 +2081,13 @@ mod owner_signing_tests {
     fn terminal_safe_escapes_controls_and_bidi_but_keeps_text() {
         let raw = "fp: AAAA\x1b[8m hidden \u{202E}rev\u{200B}\nnext";
         let safe = terminal_safe(raw);
-        assert!(!safe.contains('\x1b') && !safe.contains('\u{202E}') && !safe.contains('\u{200B}'), "{safe}");
-        assert!(safe.contains("\\u{1b}[8m") && safe.contains("\\u{202e}") && safe.contains("\nnext"), "{safe}");
+        assert!(
+            !safe.contains('\x1b') && !safe.contains('\u{202E}') && !safe.contains('\u{200B}'),
+            "{safe}"
+        );
+        assert!(
+            safe.contains("\\u{1b}[8m") && safe.contains("\\u{202e}") && safe.contains("\nnext"),
+            "{safe}"
+        );
     }
 }
