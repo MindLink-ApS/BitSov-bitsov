@@ -2264,6 +2264,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "konsensus-recovery"
+version = "0.3.0-rc12"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "hex",
+ "lightning",
+ "miniscript",
+ "proptest",
+ "thiserror 2.0.21",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "konsensus-routing"
 version = "0.3.0-rc12"
 dependencies = [
