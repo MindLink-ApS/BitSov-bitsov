@@ -101,11 +101,11 @@ advertised_endpoint = "{remote}"
         }
     }
 
-    fn start(&self, log: &std::fs::File) -> Node {
+    fn start(&self, log: &std::fs::File, flags: &[&str]) -> Node {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_konsensus"));
         cmd.args(["start", "--config"])
             .arg(&self.config)
-            .args(["--remote-unlock", "--local-owner-device"])
+            .args(flags)
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log.try_clone().unwrap());
@@ -279,6 +279,19 @@ fn scan_for_password(path: &Path) {
 
 #[tokio::test]
 async fn remote_bootstrap_over_tunnel_restarts_locked_and_first_unlock_succeeds() {
+    bootstrap_restarts_locked_and_first_unlock_succeeds(&[
+        "--remote-unlock",
+        "--local-owner-device",
+    ])
+    .await;
+}
+
+#[tokio::test]
+async fn home_bootstrap_restarts_locked_and_unlocks_without_console_authority() {
+    bootstrap_restarts_locked_and_first_unlock_succeeds(&["--home"]).await;
+}
+
+async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     let f = Fixture::new();
     let log = tempfile::tempfile().unwrap();
     let http = reqwest::Client::new();
@@ -300,8 +313,9 @@ async fn remote_bootstrap_over_tunnel_restarts_locked_and_first_unlock_succeeds(
     let box_pin = ticket.box_transport_pubkey.clone();
 
     // 2. Fresh box: bootstrap with the tunnel, no startup password.
-    let mut node = f.start(&log);
+    let mut node = f.start(&log, flags);
     f.ready(&mut node, "/livez", &log).await;
+    assert!(!f.dir.path().join("control.sock").exists());
     assert!(
         TcpStream::connect(f.peer).await.is_err(),
         "bootstrap binds no peer port"
@@ -482,9 +496,11 @@ async fn remote_bootstrap_over_tunnel_restarts_locked_and_first_unlock_succeeds(
     .unwrap();
 
     // 7. Supervised restart: same command, now locked; first unlock works.
-    let mut node = f.start(&log);
+    let mut node = f.start(&log, flags);
     let lock = f.ready(&mut node, "/api/v1/node/lock", &log).await;
     assert_eq!(lock["state"], "locked");
+    assert!(!f.dir.path().join("control.sock").exists());
+    let locked_pid = node.0.id();
     assert_eq!(lock["node_id"], node_id);
     assert_eq!(lock["fingerprint"], fingerprint);
     let (mut tunnel, auth) = Tunnel::connect(f.remote, &box_pin, json!({"v": 1})).await;
@@ -529,6 +545,9 @@ async fn remote_bootstrap_over_tunnel_restarts_locked_and_first_unlock_succeeds(
     // 8. Normal startup in the same process, with the device's authority.
     let health = f.ready(&mut node, "/api/v1/health", &log).await;
     assert_eq!(health["hosted_by"], "Rasmus's Pi");
+    assert_eq!(node.0.id(), locked_pid);
+    assert!(node.0.try_wait().unwrap().is_none());
+    assert!(!f.dir.path().join("control.sock").exists());
     assert!(
         TcpStream::connect(f.peer).await.is_ok(),
         "live node binds peers"

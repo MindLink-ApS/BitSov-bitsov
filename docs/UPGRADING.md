@@ -45,6 +45,29 @@ For nodes skipping releases, apply the older procedures below first, then
 [rc11 → rc12](#rc11--rc12-procedure). Earlier sections describe their release's
 behavior; the rc12 home-node delay policy supersedes rc11's optional W0 default.
 
+## Home service mode (N1, unreleased)
+
+`konsensus start --home` is shorthand for `--remote-unlock --local-owner-device`.
+Existing flags and starts are unchanged. `--home` conflicts with `--owner-control`
+and every startup password source (`--password`, `--password-fd`,
+`--password-file`); it never enables console authority. It is a CLI switch,
+not a configuration key. No password belongs in the unit, environment or argv.
+
+For existing remote-unlock services, replace the two switches with `--home`
+after installing a binary that supports it. The command stays the same across
+SETUP → exit 75 → service restart → LOCKED → device unlock → UNLOCKED. Unlock
+continues in the locked process. Retained boxes still need an enrolled owner
+device and a pinned identity-signed box key before remote unlock; do not
+reinitialize them. Empty boxes may install the service **before enrollment**
+and enroll their first device through remote first run.
+
+A new dedicated-user **system** unit is provided at
+[`docs/operations/bitsov.service`](operations/bitsov.service); the existing user
+unit remains supported. Follow the [installation steps](operations/home-node.md#install-the-system-service),
+including data ownership, writable paths, restart limits and recovery from a
+start-limit failure. Stop any previous service before enabling the new one.
+The setup page and endpoint discovery are separate onboarding changes.
+
 ## Next upgrade: copied-directory fence (#271)
 
 Keep the current live directory on its existing host. **Never restore a copied
@@ -280,11 +303,12 @@ hub.
 
 ## Remote unlock (U2)
 
-Before enabling `--remote-unlock`, start unlocked once on U1 or newer, enroll an
-owner device, and connect a supporting client so it pins the identity-signed box
-transport key. Preserve `identity/identity.json` and `pairing/box-transport.key`.
-The home-node systemd example now uses `--remote-unlock --local-owner-device`;
-remove any password file or credential directive when adopting it. Existing
+For an already initialized box, before enabling `--remote-unlock` (or `--home`),
+start unlocked once on U1 or newer, enroll an owner device, and connect a
+supporting client so it pins the identity-signed box transport key. Preserve `identity/identity.json` and `pairing/box-transport.key`.
+The legacy user unit uses `--remote-unlock --local-owner-device`; the new system
+unit uses the equivalent `--home`. In either case, remove any password file or
+credential directive when adopting it. Existing
 manual/descriptor startup remains available. New pairing while locked is not
 supported. Remote first-run bootstrap on an empty data directory (#256) is
 supported; see
