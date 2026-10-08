@@ -128,6 +128,8 @@ pub(crate) const EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS: u64 = 5;
 ///
 /// [`Node`]: crate::Node
 pub struct Config {
+	/// Node-wide capacity admission. None preserves upstream admission behavior.
+	pub channel_limits: Option<crate::channel_limits::ChannelLimits>,
 	/// Owner maintenance: stalled cooperative negotiation must await explicit force consent.
 	pub cooperative_close_only: bool,
 	/// Opt in to forwarding payments into private channels, even without a node alias.
@@ -227,6 +229,7 @@ impl Default for Config {
 		Self {
 			work_admission: None,
 			channel_peer_allowlist: None,
+			channel_limits: None,
 			cooperative_close_only: false,
 			accept_forwards_to_priv_channels: false,
 			our_to_self_delay: None,
@@ -364,9 +367,11 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	let mut user_config = UserConfig::default();
 	user_config.channel_handshake_limits.force_announced_channel_preference = false;
 	user_config.manually_accept_inbound_channels = true;
-	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
-		config.anchor_channels_config.is_some();
-	user_config.reject_inbound_splices = false;
+	user_config
+		.channel_handshake_config
+		.negotiate_anchors_zero_fee_htlc_tx = config.anchor_channels_config.is_some();
+	// Capacity-changing splices have no admission hook in this LDK version.
+	user_config.reject_inbound_splices = config.channel_limits.is_some();
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;

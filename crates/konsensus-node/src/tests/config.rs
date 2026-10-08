@@ -3088,3 +3088,38 @@ fn tower_clients_reject_unsupported_backend_and_more_than_five() {
     for n in 0..5 { base.tower.clients.insert(format!("friend-{n}"), entry.clone()); }
     assert!(base.tower.validate().unwrap_err().to_string().contains("at most five"));
 }
+
+#[test]
+fn channel_capacity_config_defaults_overrides_and_invalid_values() {
+    let config: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
+    let limits = config.channel_capacity_limits().unwrap();
+    assert_eq!(limits.max_channel_capacity_sats, 1_000_000);
+    assert_eq!(limits.max_total_channel_capacity_sats, 2_000_000);
+    let config: LightningConfig = toml::from_str("backend = 'ldk'\nmax_channel_capacity_sats = 50000\nmax_total_channel_capacity_sats = 0\nhub_only_channels = false").unwrap();
+    let roundtrip: LightningConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(
+        roundtrip
+            .channel_capacity_limits()
+            .unwrap()
+            .max_channel_capacity_sats,
+        50_000
+    );
+    assert_eq!(
+        roundtrip
+            .channel_capacity_limits()
+            .unwrap()
+            .max_total_channel_capacity_sats,
+        0
+    );
+    for invalid in [
+        "max_channel_capacity_sats = -1",
+        "max_total_channel_capacity_sats = 0.5",
+        "hub_only_channels = 'false'",
+        "max_channel_capcity_sats = 1",
+    ] {
+        assert!(
+            toml::from_str::<LightningConfig>(&format!("backend = 'ldk'\n{invalid}")).is_err(),
+            "{invalid}"
+        );
+    }
+}

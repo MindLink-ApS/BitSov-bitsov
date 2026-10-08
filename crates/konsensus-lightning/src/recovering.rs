@@ -194,6 +194,15 @@ impl Drop for RecoveringLightning {
 
 #[async_trait]
 impl LightningProvider for RecoveringLightning {
+    fn channel_safety(&self) -> Option<konsensus_core::traits::lightning::ChannelSafetyStatus> {
+        self.state
+            .read()
+            .unwrap()
+            .backend
+            .as_ref()
+            .and_then(|p| p.channel_safety())
+    }
+
     fn tower_status(&self) -> konsensus_core::tower::TowerStatus {
         self.state.read().unwrap().backend.as_ref().map(|p| p.tower_status())
             .unwrap_or_else(|| konsensus_core::tower::TowerStatus {

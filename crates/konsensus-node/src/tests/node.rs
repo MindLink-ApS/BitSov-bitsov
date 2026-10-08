@@ -488,6 +488,9 @@ async fn offline_fee_barrier_preserves_local_identity_and_storage() {
         .unwrap()
         .node_id();
     config.lightning = LightningConfig::Ldk {
+        max_channel_capacity_sats: 1_000_000,
+        max_total_channel_capacity_sats: 2_000_000,
+        hub_only_channels: None,
         forward_to_private_channels: false,
         our_to_self_delay_blocks: None,
         lsps2_service: Default::default(),
