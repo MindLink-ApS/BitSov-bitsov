@@ -16,6 +16,22 @@ also live on the corresponding GitHub pre-release pages.
   with forced restart on exit 75 and bounded restart attempts. The
   [installation guide](docs/operations/home-node.md#install-the-system-service)
   supports installing it before first-device enrollment on an empty box.
+- Embedded LDK channel admission now enforces configurable full-capacity ceilings:
+  `lightning.max_channel_capacity_sats` (default 1,000,000) and
+  `lightning.max_total_channel_capacity_sats` (default 2,000,000). Inbound,
+  manual/automatic outbound and LSPS2 service admissions share atomic accounting,
+  including accepted pending channels; distinct capacity refusal codes reach the
+  owner API. Splices are refused to prevent bypassing caps. Existing channels
+  and the separate onboarding subsidy `max_channel_sats` are unchanged.
+- Non-service embedded LDK nodes default to configured-hub/LSP-only channels in
+  every start mode. Explicit `lightning.hub_only_channels = false` opts out only
+  in non-lockable start modes. `--remote-unlock` remains unconditionally hub-only
+  for the whole run, including after unlock (`HUB_ONLY_WHILE_LOCKABLE`); an empty
+  hub set refuses every new channel even with the opt-out set. Enabled hub
+  services default to unrestricted peers. Owner status exposes the
+  active `channel_safety` limits and hub-only flag. The home-node and upgrade docs
+  disclose continuing trust in the hub while locked/offline, and distinguish new
+  admission limits from protection against all losses or deployed watchtowers.
 
 ## [0.3.0-rc12] — 2026-10-07 (prep; not tagged yet)
 

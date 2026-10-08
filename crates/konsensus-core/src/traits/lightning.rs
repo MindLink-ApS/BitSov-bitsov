@@ -7,6 +7,33 @@ use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Admission ceilings for embedded LDK. These bound full channel capacity,
+/// not wallet balance, closing claims, or onboarding subsidy spending.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelCapacityLimits {
+    pub max_channel_capacity_sats: u64,
+    pub max_total_channel_capacity_sats: u64,
+}
+impl Default for ChannelCapacityLimits {
+    fn default() -> Self {
+        Self {
+            max_channel_capacity_sats: 1_000_000,
+            max_total_channel_capacity_sats: 2_000_000,
+        }
+    }
+}
+
+/// Active new-channel policy; absent for backends without this enforcement.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelSafetyStatus {
+    #[serde(flatten)]
+    pub limits: ChannelCapacityLimits,
+    pub hub_only: bool,
+}
+
+pub const CHANNEL_CAPACITY_EXCEEDED: &str = "CHANNEL_CAPACITY_EXCEEDED";
+pub const TOTAL_CHANNEL_CAPACITY_EXCEEDED: &str = "TOTAL_CHANNEL_CAPACITY_EXCEEDED";
 
 /// Routing-fee authorization, independent of the recipient's principal price.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -381,6 +408,11 @@ pub struct LightningReadiness {
 /// Every message must have its payment verified through this interface.
 #[async_trait]
 pub trait LightningProvider: Send + Sync {
+    /// Active embedded-LDK admission policy, without network work.
+    fn channel_safety(&self) -> Option<ChannelSafetyStatus> {
+        None
+    }
+
     /// Owner-only cached tower diagnostics; reading never starts network work.
     fn tower_status(&self) -> crate::tower::TowerStatus {
         crate::tower::TowerStatus {
