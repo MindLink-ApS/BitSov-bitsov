@@ -5,13 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+konsensus-crypto = { path = "../konsensus-crypto" }
 bitcoin.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
-lightning = { path = "../../vendor/lightning", features = ["std"] }
+lightning = { path = "../../vendor/lightning", features = ["std", "_test_utils"] }
+tempfile = "3"
+rusqlite = "0.31"
+rand.workspace = true
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 hex.workspace = true

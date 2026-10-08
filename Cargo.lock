@@ -431,6 +431,7 @@ dependencies = [
  "bitcoin-io",
  "bitcoin-units",
  "bitcoin_hashes",
+ "bitcoinconsensus",
  "hex-conservative 0.2.2",
  "hex_lit",
  "secp256k1",
@@ -485,6 +486,15 @@ dependencies = [
  "bitcoin-io",
  "hex-conservative 0.2.2",
  "serde",
+]
+
+[[package]]
+name = "bitcoinconsensus"
+version = "0.105.0+25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f260ac8fb2c621329013fc0ed371c940fcc512552dcbcb9095ed0179098c9e18"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -2273,9 +2283,13 @@ dependencies = [
  "async-trait",
  "bitcoin",
  "hex",
+ "konsensus-crypto",
  "lightning",
  "miniscript",
  "proptest",
+ "rand 0.8.6",
+ "rusqlite",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "zeroize",
@@ -2423,6 +2437,7 @@ dependencies = [
  "lightning-macros",
  "lightning-types",
  "possiblyrandom",
+ "regex",
 ]
 
 [[package]]
