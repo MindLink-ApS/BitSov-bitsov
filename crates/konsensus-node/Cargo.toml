@@ -32,6 +32,9 @@ konsensus-api = { path = "../konsensus-api" }
 konsensus-routing = { path = "../konsensus-routing" }
 konsensus-gossip = { path = "../konsensus-gossip" }
 axum.workspace = true
+# Explicit HTTP/1 header deadline on the isolated LAN setup listener.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true

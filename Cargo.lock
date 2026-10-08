@@ -2219,6 +2219,8 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hex",
+ "hyper",
+ "hyper-util",
  "if-addrs",
  "konsensus-api",
  "konsensus-chain",
