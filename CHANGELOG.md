@@ -16,6 +16,20 @@ also live on the corresponding GitHub pre-release pages.
   with forced restart on exit 75 and bounded restart attempts. The
   [installation guide](docs/operations/home-node.md#install-the-system-service)
   supports installing it before first-device enrollment on an empty box.
+### Security
+
+- Safe-restore PR1 (#271): bind `ldk/INSTANCE` to the host, filesystem/volume
+  and a random instance ID; refuse mismatches before constructing LDK.
+  Existing nodes bind on their first upgraded start. Missing platform IDs
+  fail closed. A legitimate latest-live-store hardware move requires the
+  documented `rebind-instance` owner-console typed confirmation. Open or
+  invalid `ldk/recover.json` journals block startup; generation 3 prevents
+  older guard-aware binaries from ignoring these guards. The example systemd
+  unit caps rapid restart loops at three starts per 300 seconds.
+  **Never restore a copied data directory. Same-host SD-image rollback is not
+  detected yet.** `konsensus recover` is coming; use the
+  [recovery guidance](docs/v2/RECOVERY.md) and
+  [hardware-move runbook](docs/operations/home-node.md#copied-directories-and-hardware-moves-271).
 - Embedded LDK channel admission now enforces configurable full-capacity ceilings:
   `lightning.max_channel_capacity_sats` (default 1,000,000) and
   `lightning.max_total_channel_capacity_sats` (default 2,000,000). Inbound,

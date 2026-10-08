@@ -24,12 +24,25 @@ use konsensus_core::traits::lightning::{
 };
 
 /// Configuration for the LNbits provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LnbitsConfig {
     /// Base URL of the LNbits instance (e.g. `http://localhost:5000`).
     pub api_url: String,
     /// Admin key for the wallet (required for creating invoices and paying).
     pub admin_key: String,
+}
+
+// Keep credentials out of diagnostics, including nested and pretty Debug output.
+impl std::fmt::Debug for LnbitsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LnbitsConfig")
+            .field(
+                "api_url",
+                &konsensus_core::logging::redact_url_for_debug(&self.api_url),
+            )
+            .field("admin_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// LNbits HTTP provider implementing `LightningProvider`.
