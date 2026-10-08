@@ -12,13 +12,24 @@ use serde::{Deserialize, Serialize};
 pub const QUOTE_TTL_SECS: u32 = 120;
 const MAX_QUOTES: usize = 16;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LspConfig {
     pub node_id: String,
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+// Keep credentials out of diagnostics, including nested and pretty Debug output.
+impl std::fmt::Debug for LspConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LspConfig")
+            .field("node_id", &self.node_id)
+            .field("address", &self.address)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// One active peer per LDK Node 0.7 instance. Switching is explicit at startup,
