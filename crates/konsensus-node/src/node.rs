@@ -112,6 +112,7 @@ impl KonsensusNode {
             crate::safety::STATE_GENERATION,
         )?);
         konsensus_lightning::ldk::ensure_no_move_home(&data_dir.join("ldk"))?;
+        crate::restore_fence::ensure_bound(data_dir)?;
         let disk = Arc::new(crate::safety::DiskGuard::new(
             data_dir.to_path_buf(),
             config.disk_free_floor_bytes,

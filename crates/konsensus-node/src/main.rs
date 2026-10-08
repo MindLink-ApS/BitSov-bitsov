@@ -19,8 +19,8 @@ mod mnemonic_crypto;
 mod move_home_cmd;
 mod msg_handler;
 mod node;
-mod onboarding;
 mod offline_safety;
+mod onboarding;
 #[path = "cli/owner.rs"]
 mod owner_cmd;
 mod password;
@@ -29,6 +29,7 @@ mod pending_handler;
 mod profile_handler;
 mod relay;
 mod remote_access;
+mod restore_fence;
 mod safety;
 #[path = "cli/scb_restore.rs"]
 mod scb_restore;
@@ -113,6 +114,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::RebindInstance { config } => restore_fence::rebind_instance(&config)?,
         Command::Init {
             dir,
             non_interactive,
@@ -327,6 +329,11 @@ fn cmd_init(
             config_path.display()
         );
     }
+
+    // Hold the state lease through initialization; bind before writing identity.
+    let _state_lease = safety::ensure_generation(dir, safety::STATE_GENERATION)?;
+    konsensus_lightning::ldk::ensure_no_move_home(&dir.join("ldk"))?;
+    restore_fence::ensure_bound(dir)?;
 
     // Select tier: CLI flag > interactive prompt > default
     let tier = if let Some(t) = tier_arg {
@@ -967,6 +974,19 @@ async fn cmd_start(
         konsensus_api::bootstrap::StartupMode::Initialized => {}
         // `prepare_start` has already turned this into an error.
         konsensus_api::bootstrap::StartupMode::Refuse(_) => unreachable!(),
+    }
+
+    // Fail before waiting for unlock; construction checks again under its lifetime lease.
+    {
+        let state_dir = config
+            .identity
+            .mnemonic_file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let _lease = safety::ensure_generation(state_dir, safety::STATE_GENERATION)?;
+        konsensus_lightning::ldk::ensure_no_move_home(&state_dir.join("ldk"))?;
+        restore_fence::ensure_bound(state_dir)?;
     }
 
     let channel_peers = channel_peers_for_start(&config.lightning, password_source)?;
@@ -2466,7 +2486,11 @@ mod owner_key_startup_tests {
             (PasswordSource::File, false),
             (PasswordSource::None, false),
         ] {
-            assert_eq!(is_home_profile(source, false), without_local_owner, "{source:?}");
+            assert_eq!(
+                is_home_profile(source, false),
+                without_local_owner,
+                "{source:?}"
+            );
             assert!(is_home_profile(source, true), "{source:?}");
         }
     }

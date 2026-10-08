@@ -27,6 +27,11 @@ pub enum Command {
     },
     /// Close channels and send funds to an owner-specified home address (local console only).
     MoveHome(crate::move_home_cmd::MoveHomeArgs),
+    /// Rebind the latest cleanly stopped live store after a hardware move (owner console only).
+    RebindInstance {
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
     /// Initialize a new node: generate identity and create config file.
     Init {
         /// Directory to create the node data in.
