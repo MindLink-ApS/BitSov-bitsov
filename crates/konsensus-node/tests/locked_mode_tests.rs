@@ -100,6 +100,7 @@ impl Fixture {
         let api = address();
         let remote = address();
         let peer = address();
+        cfg["setup_page"]["port"] = i64::from(address().port()).into();
         cfg["api"]["listen_addr"] = api.to_string().into();
         cfg["network"]["listen_addr"] = peer.to_string().into();
         cfg["lightning"]["backend"] = "mock".into();
@@ -485,30 +486,70 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
                 "unlocked {path}"
             );
         }
-        let (status, keys) = unlocked_tunnel.request("GET", "/api/v1/pair/device-keys", json!({}), Some(token)).await;
+        let (status, keys) = unlocked_tunnel
+            .request("GET", "/api/v1/pair/device-keys", json!({}), Some(token))
+            .await;
         assert_eq!(status, 200);
         assert_eq!(keys["device_keys"][0]["key_id"], f.record.key_id);
         let rng = ring::rand::SystemRandom::new();
-        let device = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING,
-            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap().as_ref(), &rng).unwrap();
+        let device = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P256_SHA256_ASN1_SIGNING,
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+                .unwrap()
+                .as_ref(),
+            &rng,
+        )
+        .unwrap();
         let public = hex::encode(device.public_key().as_ref());
         let message = device::registration_message(
-            &pairing::identity_fingerprint(&f.identity.node_id().to_hex()), &f.record.client_id, &public);
+            &pairing::identity_fingerprint(&f.identity.node_id().to_hex()),
+            &f.record.client_id,
+            &public,
+        );
         let proof = hex::encode(device.sign(&rng, message.as_bytes()).unwrap().as_ref());
-        let (status, reg) = unlocked_tunnel.post_with_token("/api/v1/pair/device-key",
-            json!({"public_key": public, "name": "new phone", "proof": proof}), Some(token)).await;
+        let (legacy_status, _) = unlocked_tunnel
+            .post_with_token(
+                "/api/v1/pair/device-key",
+                json!({"public_key": public, "name": "new phone", "proof": proof}),
+                Some(token),
+            )
+            .await;
+        assert_eq!(
+            legacy_status, 403,
+            "claimed boxes must refuse legacy enrollment"
+        );
+        let (status, reg) = unlocked_tunnel
+            .post_with_token(
+                "/api/v1/pair/device-key",
+                json!({"sas_version":1,"public_key": public, "name": "new phone", "proof": proof}),
+                Some(token),
+            )
+            .await;
         if local {
             assert_eq!(status, 200, "{reg}");
             let path = format!("/api/v1/pair/device-key/{}", reg["op_id"].as_str().unwrap());
-            let (status, pending) = unlocked_tunnel.request("GET", &path, json!({}), Some(token)).await;
+            let (status, pending) = unlocked_tunnel
+                .request("GET", &path, json!({}), Some(token))
+                .await;
             assert_eq!(status, 200);
             assert_eq!(pending["status"], "pending");
-            assert_eq!(unlocked_tunnel.request("DELETE", &path, json!({}), Some(token)).await.0, 200);
-            let (status, gone) = unlocked_tunnel.request("GET", &path, json!({}), Some(token)).await;
+            assert_eq!(
+                unlocked_tunnel
+                    .request("DELETE", &path, json!({}), Some(token))
+                    .await
+                    .0,
+                200
+            );
+            let (status, gone) = unlocked_tunnel
+                .request("GET", &path, json!({}), Some(token))
+                .await;
             assert_eq!(status, 200);
             assert_eq!(gone["status"], "absent");
         } else {
-            assert_eq!(status, 403, "authority stays disabled without local-owner mode");
+            assert_eq!(
+                status, 403,
+                "authority stays disabled without local-owner mode"
+            );
         }
         drop(unlocked_tunnel);
         let keys: Value = http

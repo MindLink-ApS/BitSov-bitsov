@@ -602,10 +602,15 @@ ceremony after repeated incorrect password/backup confirmations also counts as
 a cancellation. A retry cannot replace a pending nonce. Cancelling an absent
 operation does not consume an attempt.
 
-Requests without SAS fields keep the pre-N3 first-run behavior, including its
-30-minute pending lifetime. Existing live enrollment keeps console approval.
-N3 provides the node protocol only: the trusted box-page display and approval
-gate are N4. SAS knowledge alone does not add an owner approval route. The app
+Requests without SAS fields are refused as soon as a claim-code file exists
+(including malformed or unreadable files); this is checked again at finalize.
+Legacy boxes without that file retain the pre-N3 behavior. Local descriptor
+bootstrap remains the separate trusted sidecar path. SAS first-run finalization
+also requires `box_approved`, set only by the separate home box page; otherwise
+it returns `409 box_approval_pending` before password processing or signing.
+On an empty box use `--home`; remote-unlock without home now fails early with
+that instruction. Initialized boxes retain their existing unlock flags.
+SAS knowledge alone does not add an owner approval route. The app
 must compare the words before sending its password or trusting recovery words.
 A fake box lacking the physical code computes different words; accepting a
 code supplied by that same untrusted page defeats this protection (T2). One-use
@@ -631,4 +636,58 @@ This PR does not expose delegation or ticket-minting over the tunnel.
 Three mismatches/cancellations close new device ceremonies for that process.
 SAS confirmation is memory-only; its durable version marker ensures a restart
 cannot approve an old SAS request as legacy. Cancel the old request and retry.
-Omitting `sas_version` preserves current clients' console/delegation messages.
+Omitting `sas_version` preserves legacy console/delegation messages only on
+boxes without a claim code. Claimed boxes reject legacy requests and legacy
+pending operations at approval/delegation, so restart cannot enable downgrade.
+
+
+## LAN box approval (N4)
+
+`--home` starts a separate listener on each private LAN interface (default port
+8080, `[setup_page].port` overrides it). Its router is never mounted on the
+loopback API or the Noise tunnel. RFC1918, link-local and IPv6 ULA sources are
+accepted, with both Tailscale ranges excluded; IPv4-mapped IPv6 is normalized.
+Forwarded headers confer no trust. Public and loopback sources are refused.
+Every route requires an exact own IP/port or `bitsov.local`/port Host, rejecting
+DNS rebinding through arbitrary attacker domains.
+
+GET `/` creates a bounded, random per-page session and CSRF token. The cookie is
+HttpOnly, SameSite=Strict, path `/`, maximum age 900 seconds; HTTP is intentional
+on the local appliance, so it is not marked Secure. All mutations require both
+the cookie and `X-CSRF-Token`; `/setup/state` also checks both. There is no CORS.
+Responses use `Cache-Control: no-store`, `nosniff`, no referrer and a strict CSP:
+nonce-only inline script/style, same-origin fetch, no other assets, forms,
+frames or base URLs. Device labels enter the DOM as text, not HTML.
+
+POST `/setup/start` rotates the five-minute, one-use bootstrap ticket. Its QR
+and text are returned only after Start setup. GET `/setup/state` shows the
+claimed label and four SAS words. POST `/setup/approve` accepts exactly
+`{ceremony_id, sas_digest}`: under the same transition lock as finalize, it
+checks the current pending ceremony and all 32 digest bytes using
+`subtle::ConstantTimeEq`, then sets only `box_approved`. It does not sign,
+install a device, write a seed, commit identity or grant scopes (I1).
+No page response contains the claim code, claim commitment, seed, backup words
+or password (I2). The app must compare SAS before sending its password.
+
+POST `/setup/cancel` (“Words differ / Not me”) invalidates the shared ticket,
+revokes the bootstrap pairing and discards the pending ceremony, pre-commit
+only. Ticket consumption and revocation share one lock; approval, cancellation
+and finalize share the transition lock. Three cancellations/SAS failures close
+the process setup window (I3). Every page action rechecks the 15-minute monotonic
+window and SETUP state. After commit or restart into LOCKED/UNLOCKED, only status
+HTML is served; old approval sessions confer no authority (T4/T5).
+
+The in-memory ticket slot is the sole home SETUP authority (design item 9).
+CLI `pair-ticket` files are imported as a protected mailbox into that same slot,
+then removed, with TTL capped by five minutes and the remaining window. Page
+rotation, CLI replacement, consumption and revocation cannot leave two valid
+tickets. CLI imports cannot replace a claim or reopen an expired window.
+Other daemon modes retain the existing protected-file ticket authority.
+
+An attacker on the LAN can still claim and approve an **empty** box (T1); the
+page identifies the claim and the owner's app cannot pair until it is cancelled.
+A fake appliance is not authenticated by DNS or Host validation: the separate
+physical claim code and the owner's word comparison remain necessary (T2).
+One use, short ticket lifetime and cancellation limit photographed-QR abuse
+(T3). Host, session/CSRF checks, no CORS and the submitted digest prevent a
+foreign website from approving a ceremony through the owner's browser (T6).

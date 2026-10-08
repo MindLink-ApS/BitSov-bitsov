@@ -8,7 +8,9 @@ konsensus start --config /path/to/konsensus.toml --home
 ```
 
 `--home` combines `--remote-unlock` and `--local-owner-device`. The existing
-flags keep their behavior and may also be supplied alongside `--home`.
+flags remain supported on initialized boxes and may also be supplied alongside
+`--home`. Empty-box remote first run now requires `--home`, because SAS
+finalization needs the LAN box approval surface.
 It conflicts with `--owner-control`, `--password`, `--password-fd` and
 `--password-file`. It never opens the owner-control console or grants console
 spend authority. After unlock it retains the owner key in memory for existing
@@ -37,8 +39,8 @@ metadata by starting normally with the correct encrypted seed first.
 Configure `[api].listen_addr` on loopback and `[remote_access].listen_addr` for
 the Noise listener. `advertised_endpoint` is optional: the node discovers local
 addresses automatically (see [endpoint discovery](#endpoint-discovery)). To reach
-it off the LAN, see [reachability](reachability.md). Home mode does not yet
-provide a box setup page.
+it off the LAN, see [reachability](reachability.md). The separate home page is
+LAN-only at `http://bitsov.local:8080` (with mDNS enabled), or the box IP and port.
 There is no password file, systemd password credential, or password in
 argv/environment. On reboot the box waits for a device to unlock it.
 
@@ -475,7 +477,9 @@ service journals. Anyone who can read the ticket can pair once as `read+receive`
 Owner-device enrollment still requires [console approval or delegation](#enroll-your-first-owner-device);
 a ticket never grants spend or identity authority on an initialized node.
 
-The protected file `pairing/remote-access-link` (0600) is the ticket authority.
+On initialized, unlocked nodes, the protected file
+`pairing/remote-access-link` (0600) is the ticket authority.
+Home SETUP uses the in-memory authority described below instead.
 The daemon reloads atomic replacements within a second and at authentication.
 Issuing a new ticket replaces the previous one. The default lifetime is 24 hours;
 `--ttl` accepts positive `s`, `m`, `h` and `d` durations up to 365 days. Expiry is
@@ -494,7 +498,7 @@ proofs, and the CLI never reads or decrypts the seed. Pre-bootstrap tickets omit
 On an empty box such a ticket grants the one first-run pairing, which can create
 the identity (see below), so guard it like the seed itself.
 
-The daemon continues to create a five-minute first-pairing ticket when no ticket
+Outside home SETUP, the daemon continues to create a five-minute first-pairing ticket when no ticket
 or paired clients exist. It only prints the protected file's path, never its URI
 or code. CLI tickets can pair a second device on a running node. A ticket is
 its own one-shot grant: it never opens the local `/api/v1/pair/request` window,
@@ -520,25 +524,62 @@ risk above still applies per person.
 
 ## Remote first run on an empty box
 
-A headless box can be set up entirely from the owner's phone or Mac. Configure
+A headless box can be set up from a supporting phone or Mac app. Configure
 `[api]`, `[remote_access]` and an `identity.mnemonic_file` that does not exist
-yet, leave the data directory otherwise empty, and issue a ticket on the box:
+yet, leave the data directory otherwise empty, and start `--home`. Open
+`http://<box-LAN-IP>:8080` or `http://bitsov.local:8080` with mDNS enabled.
+The node binds this separate HTTP listener only to its private LAN interfaces;
+it accepts RFC1918, link-local and IPv6 ULA sources, excluding Tailscale IPv4
+CGNAT and IPv6 addresses. Loopback, public addresses and proxy-forwarded source
+headers cannot authorize page requests. Do not reverse-proxy it from an
+untrusted network.
 
-```sh
-konsensus pair-ticket --config /path/to/konsensus.toml --qr
+The port is configurable (nonzero; default 8080):
+
+```toml
+[setup_page]
+port = 8080
 ```
 
-Then start the same command as above (`--home`, no password source), for example
-through the system unit, which may be installed before enrollment. The box serves
-bootstrap mode over the box-static Noise tunnel and binds no peer port. The client:
+Port 80 needs the appropriate OS binding capability or packaging support.
+The exact box IP/port or `bitsov.local`/port must be the HTTP Host. The page
+uses no external assets and has no password, claim-code or recovery-phrase field.
+The physical claim code comes only from the sticker or trusted local console.
 
-1. Scans the ticket, pins its box key, and pairs with its code. This is the only
-   first-run pairing; a second ticket is refused.
-2. Stores the startup password (user-chosen for v1) and sends only
-   `blake3(password)` to `create-pending`. It shows the phrase to the owner.
-3. Sends the backup words, its Secure Enclave device key and the password to
-   `finalize`, over the tunnel only. The loopback API refuses both calls.
-4. Re-pins the box key from the identity-signed proof in the finalize response.
+1. Click **Start setup**. The page shows a QR, link and copyable text for a
+   five-minute, one-use bootstrap ticket. Clicking again rotates it.
+2. The app pins the box key, pairs, commits its device key and password hash,
+   and shows the recovery phrase and backup check. Only one client can claim
+   the box. The page shows the claimed device; it hides the ticket.
+3. Compare the four SAS words in the app and page. Click **Approve** on the
+   page, then finish the backup check and device proof in the app. The app
+   sends its password only over the pinned Noise tunnel. Finalize before box
+   approval returns `409 box_approval_pending`.
+4. If the device is not yours or the words differ, use **Words differ / Not me**.
+   This revokes the bootstrap pairing, discards the ceremony and ticket, and
+   permits another attempt. If your app cannot pair, someone else may have
+   claimed this empty box: cancel before proceeding or funding it.
+
+Setup closes 15 minutes after process startup, or after three mismatches/cancels;
+restart the box to reopen it. Tickets cannot outlive that window. In LOCKED or
+UNLOCKED, the page contains only label, state, fingerprint and “Use the BitSov
+app”; no QR, approval controls or secrets. Adding later devices still requires
+an existing owner device or the trusted console flow, with SAS on claimed boxes.
+Client app support is delivered separately (A1); old clients cannot downgrade a
+box that has a claim code.
+
+**Ticket authority (design open item 9):** in home SETUP, the daemon's single
+in-memory ticket slot is authoritative. The page mints directly into that slot.
+`pairing/remote-access-link` is only a protected CLI-to-daemon mailbox: a
+`pair-ticket` issued before or during setup is imported once, unlinked, and
+limited to five minutes and the remaining setup window. CLI imports and page
+rotation replace the same slot. Consumption and cancellation share its lock;
+a claimed box accepts no replacement ticket. Outside the window, imports are
+discarded. Page tickets are never written to disk or logs; restart discards them.
+The CLI remains an explicit local operator action and may supply a ticket
+without pressing Start setup. It does not bypass box approval or the window.
+
+The app re-pins the box key from the identity-signed finalize response.
 
 The box writes only `identity/mnemonic.enc`, records the device as
 `enrolled_by: remote_first_run`, and exits with status 75. The system unit
@@ -755,8 +796,8 @@ Only one ceremony can be pending. Setup closes after 15 minutes, or after three
 mismatches/cancels; restart to reopen it. Reconnecting requires cancelling the
 pending SAS ceremony and starting again.
 
-The box web page and app integration are separate work (N4 and A1). Existing app
-versions keep their current console enrollment path. Already initialized legacy
-boxes without a claim code continue on that path; N3 does not migrate a funded
-box. See [the SAS wire contract](../security/pairing.md#sas-v1-and-the-box-claim-code-n3)
+The node box page is available; app integration follows in A1. On boxes with
+a claim code, enrollment without `sas_version` is refused, including legacy
+console/delegation pending operations. Already initialized legacy boxes without
+a claim code retain their existing path; this does not migrate a funded box. See [the SAS wire contract](../security/pairing.md#sas-v1-and-the-box-claim-code-n3)
 for the exact digest, signature domains and compatibility behavior.

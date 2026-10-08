@@ -7,13 +7,24 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Security
 
+- Add the `--home` LAN setup page (port 8080): one-use QR tickets, four-word SAS
+  comparison and box approval, with a 15-minute startup window, three-cancel
+  limit, private-source/Host checks, CSRF, Strict cookies and nonce-only CSP.
+  Approval only marks the pending ceremony; SAS finalize requires it. The page
+  becomes status-only after setup and never handles passwords, claim codes or
+  recovery phrases. Page and CLI tickets share one bounded in-memory authority
+  during home SETUP. Empty-box remote first run now requires `--home`.
+- Refuse legacy enrollment when a claim code exists, including pre-existing
+  legacy pending operations at approval/delegation. Legacy boxes without a
+  claim code retain their existing flows.
+
 - Add per-box, owner-console-only claim codes and opt-in SAS v1 for remote
   first-run and device enrollment. Four BIP-39 words bind the completed Noise
   transcript, committed device key, fresh box nonce and physical claim code.
   Finalization requires the matching digest and device proof. One pending
   ceremony, 15-minute SAS expiry, and three mismatch/cancel attempts per run
-  limit grinding. Existing clients retain their approval flows; box UI/app
-  integration follows separately.
+  limit grinding. App integration follows separately; the N4 rules above apply
+  to boxes with claim codes.
 
 - Add owner-approved optional spend-grant payee allowlists. Unlisted payees
   fail closed with `payee_not_allowed`; grants without a list keep their

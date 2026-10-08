@@ -1572,6 +1572,147 @@ fn sas_finalize(
     body
 }
 
+async fn approve_on_box(r: &Remote, body: &Value) {
+    use axum::extract::ConnectInfo;
+    use bootstrap::setup::{router, SetupPage};
+    let page = Arc::new(SetupPage::new(
+        Some(r.state.clone()),
+        None,
+        vec!["bitsov.local".into()],
+        "Box".into(),
+        "SETUP".into(),
+    ));
+    let peer = ConnectInfo("192.168.1.2:9000".parse::<std::net::SocketAddr>().unwrap());
+    let mut req = Request::builder()
+        .uri("/")
+        .header("host", "bitsov.local")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut().insert(peer);
+    let response = router(page.clone()).oneshot(req).await.unwrap();
+    let cookie = response.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let html = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), 100000)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let csrf = html
+        .split("const csrf = '")
+        .nth(1)
+        .unwrap()
+        .split('\'')
+        .next()
+        .unwrap();
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/setup/approve")
+        .header("host", "bitsov.local")
+        .header("cookie", cookie)
+        .header("x-csrf-token", csrf)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"ceremony_id":body["ceremony_id"],"sas_digest":body["sas_digest"]}).to_string(),
+        ))
+        .unwrap();
+    req.extensions_mut().insert(peer);
+    assert_eq!(
+        router(page).oneshot(req).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn claim_code_refuses_remote_legacy_before_any_sas_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    konsensus_api::sas::initialize(dir.path()).unwrap();
+    let r = setup_remote(dir.path());
+    let (status, _) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/create-pending",
+        commitment(REMOTE_PASSWORD),
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!r.state.is_committed());
+}
+
+#[tokio::test]
+async fn claim_code_also_blocks_an_already_pending_legacy_finalize() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = setup_remote(dir.path());
+    let (status, p) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/create-pending",
+        commitment(REMOTE_PASSWORD),
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    konsensus_api::sas::initialize(dir.path()).unwrap();
+    let (mut body, _) = device_body(&p, &r.client);
+    body["password"] = json!(REMOTE_PASSWORD);
+    assert_eq!(
+        call_via(
+            &r.state,
+            &r.token,
+            "/api/v1/identity/finalize",
+            body,
+            Some(TUNNEL_PEER)
+        )
+        .await,
+        (StatusCode::FORBIDDEN, json!("sas_required"))
+    );
+    assert!(!r.state.is_committed());
+    assert!(!dir.path().join("NODE_INITIALIZED").exists());
+}
+
+#[tokio::test]
+async fn sas_finalize_waits_for_box_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, _) = konsensus_api::sas::initialize(dir.path()).unwrap();
+    let r = setup_remote(dir.path());
+    let _guard = r.tunnel.register_noise(
+        TUNNEL_PEER.parse().unwrap(),
+        r.client.clone(),
+        sas_binding(&r),
+    );
+    let key = sas_device();
+    let (status, p) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/create-pending",
+        sas_create(&key),
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/finalize",
+        sas_finalize(&r, &p, &key, &code),
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::CONFLICT, json!("box_approval_pending"))
+    );
+    assert!(!r.state.is_committed());
+    assert!(!dir.path().join("NODE_INITIALIZED").exists());
+}
+
 #[tokio::test]
 async fn sas_remote_round_trip_binds_device_and_never_returns_claim_material() {
     let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1628,6 +1769,7 @@ async fn sas_remote_round_trip_binds_device_and_never_returns_claim_material() {
         StatusCode::CONFLICT
     );
     let body = sas_finalize(&r, &p, &key, &code);
+    approve_on_box(&r, &body).await;
     let (status, result) = call_via(
         &r.state,
         &r.token,

@@ -433,6 +433,7 @@ struct PendingIdentity {
 }
 
 struct PendingSas {
+    box_approved: bool,
     device_key: [u8; 65],
     device_name: String,
     binding: crate::sas::NoiseBinding,
@@ -790,6 +791,16 @@ impl BootstrapState {
         }
     }
 
+    /// Remaining home setup window; also used by the shared CLI/page ticket authority.
+    pub fn setup_remaining(&self) -> Option<std::time::Duration> {
+        if self.is_committed() || self.sas_failures.load(Ordering::SeqCst) >= 3 {
+            return None;
+        }
+        std::time::Duration::from_secs(900)
+            .checked_sub(self.sas_started_at.elapsed())
+            .filter(|d| !d.is_zero())
+    }
+
     /// Run `hook` after identity rebind and before writing `NODE_INITIALIZED`.
     pub fn with_before_marker<F>(mut self, hook: F) -> Self
     where
@@ -927,6 +938,9 @@ impl BootstrapState {
         if self.sas_failures.load(Ordering::SeqCst) >= 3 {
             return Err(ceremony_error(StatusCode::FORBIDDEN, "setup_closed"));
         }
+        if remote && pending.sas.is_none() && crate::sas::required(&self.layout.data_dir) {
+            return Err(ceremony_error(StatusCode::FORBIDDEN, "sas_required"));
+        }
         if let Some(sas) = &pending.sas {
             if noise != Some(sas.binding) {
                 return Err(ceremony_error(
@@ -952,6 +966,9 @@ impl BootstrapState {
                 self.sas_failures.fetch_add(1, Ordering::SeqCst);
                 *slot = None;
                 return Err(ceremony_error(StatusCode::BAD_REQUEST, "sas_mismatch"));
+            }
+            if !sas.box_approved {
+                return Err(ceremony_error(StatusCode::CONFLICT, "box_approval_pending"));
             }
         } else if body.sas_version.is_some() || body.sas_digest.is_some() {
             return Err(ceremony_error(StatusCode::BAD_REQUEST, "unexpected_sas"));
@@ -1538,6 +1555,16 @@ fn begin_pending(
     if !available {
         return Err(ceremony_error(StatusCode::CONFLICT, "password_unavailable"));
     }
+    // Cancellation may revoke an extracted token while this request waits for the lock.
+    if password_commitment.is_some()
+        && !state
+            .pairing
+            .list_clients()
+            .iter()
+            .any(|c| c.client_id == client_id)
+    {
+        return Err(ceremony_error(StatusCode::FORBIDDEN, "pairing_revoked"));
+    }
     let mut slot = state.pending.lock().unwrap();
     if slot.as_ref().is_some_and(PendingIdentity::expired) {
         *slot = None;
@@ -1547,6 +1574,12 @@ fn begin_pending(
     }
     if state.sas_failures.load(Ordering::SeqCst) >= 3 {
         return Err(ceremony_error(StatusCode::FORBIDDEN, "setup_closed"));
+    }
+    if password_commitment.is_some()
+        && sas_input.is_none()
+        && crate::sas::required(&state.layout.data_dir)
+    {
+        return Err(ceremony_error(StatusCode::FORBIDDEN, "sas_required"));
     }
     if sas_input.is_some()
         && state.sas_started_at.elapsed() >= std::time::Duration::from_secs(15 * 60)
@@ -1563,6 +1596,7 @@ fn begin_pending(
         let digest = crate::sas::digest(&binding, &device_key, &nonce, &claim.commitment());
         (
             Some(PendingSas {
+                box_approved: false,
                 device_key,
                 device_name,
                 binding,
@@ -1812,3 +1846,6 @@ pub async fn until_terminal(
         }
     }
 }
+
+/// Separate LAN-only home setup surface; never merged into the API or tunnel router.
+pub mod setup;

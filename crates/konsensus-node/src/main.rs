@@ -40,6 +40,7 @@ mod scb_restore;
 #[path = "cli/seed.rs"]
 mod seed_cmd;
 mod session_handler;
+mod setup_page;
 mod stun;
 #[path = "cli/ticket.rs"]
 mod ticket_cmd;
@@ -989,7 +990,7 @@ async fn cmd_start(
             file_logging
                 .enable(&config_path.with_file_name("node.log"), config.logging)
                 .context("failed to initialize bounded node logging")?;
-            if owner_cmd::serve_bootstrap_mode(config_path, &config, local, remote).await? {
+            if owner_cmd::serve_bootstrap_mode(config_path, &config, local, remote, home).await? {
                 // EX_TEMPFAIL: `Restart=on-failure` restarts the same
                 // `--remote-unlock` command, which now serves locked mode.
                 std::process::exit(REMOTE_BOOTSTRAP_RESTART_EXIT);
@@ -1016,6 +1017,22 @@ async fn cmd_start(
 
     let channel_peers = channel_peers_for_start(&config.lightning, password_source)?;
 
+    let home_status = if home {
+        let metadata: remote_access::LockedIdentity =
+            serde_json::from_slice(&std::fs::read(data_dir.join("identity/identity.json"))?)?;
+        Some(
+            setup_page::start(
+                &config,
+                None,
+                None,
+                format!("LOCKED · {}", metadata.identity_fingerprint),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     let password = if password_source == PasswordSource::RemoteUnlock {
         // No node, wallet, peer transport or live API exists before this returns.
         let signal = shutdown_signal()?;
@@ -1028,6 +1045,10 @@ async fn cmd_start(
     } else {
         password
     };
+
+    if let Some(page) = &home_status {
+        page.set_unlocked();
+    }
 
     // M1a: apply the optional `--admission-mode` CLI override BEFORE building the
     // node, so the configured mode reaches every wall (gate carrier + handshake +
