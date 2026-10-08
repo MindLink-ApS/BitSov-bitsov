@@ -489,7 +489,8 @@ impl PairingFile {
 ///
 /// 4 (remote access): pairings may bind an X25519 transport public key.
 /// 5: optional payee allowlists and durable payment deduplication.
-pub const PAIRING_FILE_VERSION: u32 = 5;
+/// 6: durable circuit breaker limits, rolling history and failure pauses.
+pub const PAIRING_FILE_VERSION: u32 = 6;
 
 /// A pending pairing request. Held in memory; the challenge itself lives in the
 /// protected file under `data_dir`, which is the actual control.
@@ -2999,7 +3000,10 @@ impl PairingService {
                 "too many unresolved reservations".into(),
             ));
         }
-        budget.reserve_at(&charges, now)?;
+        if let Err(refusal) = budget.reserve_at(&charges, now) {
+            tracing::warn!(client_id, grant_op_id = %op_id, reason = refusal.reason(), "grant reservation refused");
+            return Err(refusal);
+        }
         budget.payment_ids.extend(authority.payment_ids);
         let mut recipients = std::collections::BTreeMap::new();
         for charge in &charges {
@@ -3043,6 +3047,7 @@ impl PairingService {
         {
             return Err(BudgetRefusal::NoGrant);
         }
+        tracing::info!(client_id, grant_op_id = %op_id, reservation_id = %reservation.id, "grant spend reserved");
         Ok(reservation)
     }
 
@@ -3584,6 +3589,13 @@ impl PairingService {
         if !valid {
             return Err(BudgetRefusal::NoGrant);
         }
+        if inner.file.grants.iter().any(|g| {
+            g.op_id == reservation.op_id
+                && g.client_id == reservation.client_id
+                && g.budget.as_ref().is_some_and(|b| b.is_paused())
+        }) {
+            return Err(BudgetRefusal::GrantPaused);
+        }
         Ok(action())
     }
 
@@ -3646,6 +3658,7 @@ impl PairingService {
             budget.operation_links.remove(&reservation.id);
         }
         budget.resolve(recipient, reserved, actual_msat);
+        budget.record_outcome(reserved, actual_msat, chrono::Utc::now().timestamp());
         if let Err(e) = self.persist(&mut inner.file) {
             if let Some(grant) = inner
                 .file
@@ -3657,6 +3670,49 @@ impl PairingService {
             }
             return Err(e);
         }
+        tracing::info!(client_id = %reservation.client_id, grant_op_id = %reservation.op_id,
+            reservation_id = %reservation.id, actual_msat, "grant spend resolved");
+        Ok(())
+    }
+
+    /// Reset only the exact grant the independent owner reviewed. No HTTP route
+    /// or device intent can call this; budget and payment identities survive.
+    pub(crate) fn reset_grant_breakers(
+        &self,
+        client_id: &str,
+        op_id: &str,
+    ) -> Result<(), PairingError> {
+        if !self.owner_control_enabled {
+            return Err(PairingError::OwnerChannelUnavailable);
+        }
+        let mut inner = self.lock();
+        let idx = inner
+            .file
+            .grants
+            .iter()
+            .position(|g| {
+                g.client_id == client_id
+                    && g.op_id == op_id
+                    && g.is_live(chrono::Utc::now().timestamp())
+            })
+            .ok_or(PairingError::UnknownOperation)?;
+        let budget = inner.file.grants[idx]
+            .budget
+            .as_mut()
+            .ok_or(PairingError::UnknownOperation)?;
+        let before = budget.clone();
+        budget.reset_breakers();
+        if let Err(e) = self.persist(&mut inner.file) {
+            if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
+                g.budget = Some(before);
+            }
+            return Err(e);
+        }
+        tracing::info!(
+            client_id,
+            grant_op_id = op_id,
+            "owner reset grant circuit breakers"
+        );
         Ok(())
     }
 
@@ -3812,6 +3868,7 @@ pub enum ElevationStatus {
 fn grant_view(g: &SpendGrant) -> Option<GrantView> {
     let b = g.budget.as_ref()?;
     Some(GrantView {
+        breakers: b.breaker_status(chrono::Utc::now().timestamp()),
         payee_allowlist: b.payee_allowlist.clone(),
         allow_liquidity_fees: b.allow_liquidity_fees,
         op_id: g.op_id.clone(),

@@ -3,14 +3,25 @@ use super::*;
 fn first_contact_service(dir: &Path) -> PairingService {
     let service = PairingService::open(dir, "identity".into(), true).unwrap();
     let key = ed25519_dalek::SigningKey::from_bytes(&[12; 32]);
-    let client = service.create_verified_remote_pairing("app", &hex::encode(key.verifying_key().to_bytes()), &[13; 32]).unwrap();
+    let client = service
+        .create_verified_remote_pairing(
+            "app",
+            &hex::encode(key.verifying_key().to_bytes()),
+            &[13; 32],
+        )
+        .unwrap();
     let now = chrono::Utc::now().timestamp();
     let mut inner = service.lock();
     inner.file.grants.push(SpendGrant {
-        op_id: "grant".into(), client_id: client.client_id,
-        scopes: vec![Scope::Spend], granted_at: now, expires_at: now + 600,
-        identity_fingerprint: "identity".into(), epoch: client.epoch,
-        granted_by: "cli".into(), budget: Some(GrantBudget::from_terms(&GrantTerms::new(10_000))),
+        op_id: "grant".into(),
+        client_id: client.client_id,
+        scopes: vec![Scope::Spend],
+        granted_at: now,
+        expires_at: now + 600,
+        identity_fingerprint: "identity".into(),
+        epoch: client.epoch,
+        granted_by: "cli".into(),
+        budget: Some(GrantBudget::from_terms(&GrantTerms::new(10_000))),
     });
     service.persist(&mut inner.file).unwrap();
     drop(inner);
@@ -24,17 +35,41 @@ fn first_contact_expiry_is_observable_but_never_spendable() {
     let service = first_contact_service(dir.path());
     let client = service.snapshot().clients[0].client_id.clone();
     let recipient = "aa".repeat(32);
-    service.grant_first_contact(&client, "grant", &recipient, 4000, None).unwrap();
+    service
+        .grant_first_contact(&client, "grant", &recipient, 4000, None)
+        .unwrap();
     // Age the actual node record to its boundary; Tokio's clock cannot age
     // Unix timestamps, and waiting five minutes would hide boundary mistakes.
-    service.lock().first_contact.get_mut(&client).unwrap().grant.expires_at = chrono::Utc::now().timestamp();
-    assert_eq!(service.first_contact_approval_status(&client, 1, "grant", &recipient).unwrap().state, State::Expired);
+    service
+        .lock()
+        .first_contact
+        .get_mut(&client)
+        .unwrap()
+        .grant
+        .expires_at = chrono::Utc::now().timestamp();
+    assert_eq!(
+        service
+            .first_contact_approval_status(&client, 1, "grant", &recipient)
+            .unwrap()
+            .state,
+        State::Expired
+    );
     assert!(service.take_first_contact(&client, 1, &recipient).is_none());
-    assert_eq!(service.first_contact_approval_status(&client, 1, "grant", &recipient).unwrap().state, State::Expired);
-    assert!(service.first_contact_approval_status(&client, 2, "grant", &recipient).is_none());
+    assert_eq!(
+        service
+            .first_contact_approval_status(&client, 1, "grant", &recipient)
+            .unwrap()
+            .state,
+        State::Expired
+    );
+    assert!(service
+        .first_contact_approval_status(&client, 2, "grant", &recipient)
+        .is_none());
     // Expiry and revocation of the underlying op cannot be masked by a read.
     service.revoke_grants(Some(&client)).unwrap();
-    assert!(service.first_contact_approval_status(&client, 1, "grant", &recipient).is_none());
+    assert!(service
+        .first_contact_approval_status(&client, 1, "grant", &recipient)
+        .is_none());
 }
 
 #[test]
@@ -43,7 +78,9 @@ fn simultaneous_first_contact_consumers_get_exactly_one_authorization() {
     let service = std::sync::Arc::new(first_contact_service(dir.path()));
     let client = service.snapshot().clients[0].client_id.clone();
     let recipient = "aa".repeat(32);
-    service.grant_first_contact(&client, "grant", &recipient, 4000, None).unwrap();
+    service
+        .grant_first_contact(&client, "grant", &recipient, 4000, None)
+        .unwrap();
     let barrier = std::sync::Barrier::new(3);
     std::thread::scope(|scope| {
         let consume = || {
@@ -59,7 +96,10 @@ fn simultaneous_first_contact_consumers_get_exactly_one_authorization() {
             service.reserve_first_contact(approval, None).unwrap();
         }
     });
-    let budget = service.reload_from_disk().unwrap().grants[0].budget.clone().unwrap();
+    let budget = service.reload_from_disk().unwrap().grants[0]
+        .budget
+        .clone()
+        .unwrap();
     assert_eq!(budget.used_msat, 4000);
     assert_eq!(budget.pending.len(), 1);
 }
@@ -362,4 +402,217 @@ fn payment_dedupe_rolls_back_with_failed_persistence_and_never_evicts() {
             .used_msat,
         1000
     );
+}
+
+fn breaker_service(dir: &Path, minute: u64, failures: u64, velocity: u64) -> PairingService {
+    let service = first_contact_service(dir);
+    let mut inner = service.lock();
+    let b = inner.file.grants[0].budget.as_mut().unwrap();
+    b.breakers.max_payments_per_minute = minute;
+    b.breakers.max_payments_per_hour = 100;
+    b.breakers.max_consecutive_failures = failures;
+    b.breakers.max_msat_per_10_minutes = velocity;
+    service.persist(&mut inner.file).unwrap();
+    drop(inner);
+    service
+}
+
+#[test]
+fn concurrent_breaker_reservations_cannot_overshoot_rate_or_velocity() {
+    for (minute, velocity, reason) in [
+        (1, 10_000, "rate_limit_minute"),
+        (100, 1_000, "velocity_limit"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let service = breaker_service(dir.path(), minute, 100, velocity);
+        let client = service.snapshot().clients[0].clone();
+        let barrier = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        service.reserve_spend(
+                            &client.client_id,
+                            client.epoch,
+                            vec![Charge {
+                                recipient: "aa".repeat(32),
+                                amount_msat: 1_000,
+                            }],
+                        )
+                    })
+                })
+                .collect();
+            barrier.wait();
+            let outcomes: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+            assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
+            assert!(outcomes
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .all(|e| e.reason() == reason));
+        });
+        let b = service.reload_from_disk().unwrap().grants[0]
+            .budget
+            .clone()
+            .unwrap();
+        assert_eq!(b.used_msat, 1000);
+        assert_eq!(
+            b.breaker_status(chrono::Utc::now().timestamp())
+                .payments_last_minute,
+            1
+        );
+    }
+}
+
+#[test]
+fn failures_latch_pause_through_restart_success_and_owner_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = breaker_service(dir.path(), 100, 2, 10_000);
+    let client = service.snapshot().clients[0].clone();
+    let peer = "aa".repeat(32);
+    let pay = || {
+        vec![Charge {
+            recipient: peer.clone(),
+            amount_msat: 1000,
+        }]
+    };
+    let a = service
+        .reserve_spend(&client.client_id, client.epoch, pay())
+        .unwrap();
+    let b = service
+        .reserve_spend(&client.client_id, client.epoch, pay())
+        .unwrap();
+    assert_eq!(
+        service
+            .reserve_spend(&client.client_id, client.epoch, pay())
+            .unwrap_err()
+            .reason(),
+        "failure_limit_pending"
+    );
+    service.resolve_spend(&a, &peer, 0);
+    service.resolve_spend(&a, &peer, 0); // duplicate must not increment the streak
+    assert!(!service.grant_views()[0].breakers.paused);
+    service.resolve_spend(&b, &peer, 0);
+    assert!(service.grant_views()[0].breakers.paused);
+    drop(service);
+    let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
+    assert_eq!(
+        service
+            .reserve_spend(&client.client_id, client.epoch, pay())
+            .unwrap_err()
+            .reason(),
+        "grant_paused"
+    );
+    service.resolve_spend(&b, &peer, 1000); // duplicate success cannot unpause
+    assert!(service.grant_views()[0].breakers.paused);
+    service
+        .reset_grant_breakers(&client.client_id, "grant")
+        .unwrap();
+    let a = service
+        .reserve_spend(&client.client_id, client.epoch, pay())
+        .unwrap();
+    service.resolve_spend(&a, &peer, 0);
+    let a = service
+        .reserve_spend(&client.client_id, client.epoch, pay())
+        .unwrap();
+    service.resolve_spend(&a, &peer, 500);
+    assert_eq!(service.grant_views()[0].breakers.consecutive_failures, 0);
+    assert_eq!(service.grant_views()[0].used_msat, 500);
+}
+
+#[test]
+fn breaker_crash_and_failed_writes_keep_unknown_outcomes_charged() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = breaker_service(dir.path(), 100, 1, 10_000);
+    let client = service.snapshot().clients[0].clone();
+    let peer = "aa".repeat(32);
+    let pay = || {
+        vec![Charge {
+            recipient: peer.clone(),
+            amount_msat: 1000,
+        }]
+    };
+    let blocked = service.file_path.with_extension("json.tmp");
+    let before = service.snapshot().grants[0].budget.clone();
+    std::fs::create_dir(&blocked).unwrap();
+    assert!(matches!(
+        service.reserve_spend(&client.client_id, client.epoch, pay()),
+        Err(BudgetRefusal::Ledger(_))
+    ));
+    assert_eq!(service.snapshot().grants[0].budget, before);
+    std::fs::remove_dir(&blocked).unwrap();
+    let a = service
+        .reserve_spend(&client.client_id, client.epoch, pay())
+        .unwrap();
+    let before = service.snapshot().grants[0].budget.clone();
+    std::fs::create_dir(&blocked).unwrap();
+    assert!(service.try_resolve_spend(&a, &peer, 0).is_err());
+    assert_eq!(service.snapshot().grants[0].budget, before);
+    assert!(service
+        .reset_grant_breakers(&client.client_id, "grant")
+        .is_err());
+    assert_eq!(service.snapshot().grants[0].budget, before);
+    std::fs::remove_dir(&blocked).unwrap();
+    drop(service); // crash before the failure outcome could be persisted
+    let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
+    assert_eq!(
+        service
+            .reserve_spend(&client.client_id, client.epoch, pay())
+            .unwrap_err()
+            .reason(),
+        "failure_limit_pending"
+    );
+    assert_eq!(service.grant_views()[0].breakers.payments_last_minute, 1);
+    service.resolve_spend(&a, &peer, 0);
+    assert!(service.grant_views()[0].breakers.paused);
+    drop(service);
+    let sidecar = PairingService::open(dir.path(), "identity".into(), false).unwrap();
+    assert!(matches!(
+        sidecar.reset_grant_breakers(&client.client_id, "grant"),
+        Err(PairingError::OwnerChannelUnavailable)
+    ));
+}
+
+#[test]
+fn failure_slots_bound_fanout_and_pause_stops_queued_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = breaker_service(dir.path(), 100, 2, 10_000);
+    let client = service.snapshot().clients[0].clone();
+    let charge = |key: &str| Charge {
+        recipient: key.repeat(32),
+        amount_msat: 1000,
+    };
+    let r = service
+        .reserve_spend(&client.client_id, client.epoch, vec![charge("aa")])
+        .unwrap();
+    assert_eq!(
+        service
+            .reserve_spend(
+                &client.client_id,
+                client.epoch,
+                vec![charge("bb"), charge("cc")]
+            )
+            .unwrap_err()
+            .reason(),
+        "failure_limit_pending"
+    );
+    let queued = service
+        .reserve_spend(&client.client_id, client.epoch, vec![charge("bb")])
+        .unwrap();
+    service.resolve_spend(&r, &"aa".repeat(32), 0);
+    // Model a threshold lowered in approved terms while an earlier reservation
+    // remains queued. A successful late result must not unlatch the pause.
+    {
+        let mut inner = service.lock();
+        let budget = inner.file.grants[0].budget.as_mut().unwrap();
+        budget.breakers.max_consecutive_failures = 1;
+        budget.record_outcome(1000, 0, chrono::Utc::now().timestamp());
+        service.persist(&mut inner.file).unwrap();
+    }
+    assert_eq!(
+        service.with_spend_authority(&queued, || panic!("paused grant dispatched")),
+        Err(BudgetRefusal::GrantPaused)
+    );
+    service.resolve_spend(&queued, &"bb".repeat(32), 500);
+    assert!(service.grant_views()[0].breakers.paused);
 }
