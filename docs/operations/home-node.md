@@ -1,29 +1,45 @@
 # Home node: unlock after a restart
 
-Run one process, data directory, identity and password per person. Initialize
-and [enroll an owner device](#enroll-your-first-owner-device) first. On a U1-capable unlocked start, the node writes
-`identity/identity.json` and advertises its identity-signed box transport public
-key to paired clients. Before enabling remote unlock, connect the owner device
-to that unlocked node and ensure its client supports and pins that signed key.
-Never learn a new pin from a locked node. Keep `pairing/box-transport.key` (0600)
-and the public identity metadata intact across restarts.
+Run one process, data directory, identity and password per person. Use one
+command throughout setup and later reboots:
+
+```sh
+konsensus start --config /path/to/konsensus.toml --home
+```
+
+`--home` combines `--remote-unlock` and `--local-owner-device`. The existing
+flags keep their behavior and may also be supplied alongside `--home`.
+It conflicts with `--owner-control`, `--password`, `--password-fd` and
+`--password-file`. It never opens the owner-control console or grants console
+spend authority. After unlock it retains the owner key in memory for existing
+owner-device spend envelopes and delegation.
+
+```text
+SETUP --remote first-run commit--> exit 75 --service restart--> LOCKED
+LOCKED --owner-device unlock--> UNLOCKED (same process)
+UNLOCKED --power cut / restart--> LOCKED
+```
+
+On a **positively empty box**, install the service before enrollment and follow
+[remote first run](#remote-first-run-on-an-empty-box). Setup commits the encrypted
+seed and first owner device, then exits 75; the service restarts the same command
+into locked mode. No API call starts live services during setup.
+
+On an **already initialized box**, [enroll an owner device](#enroll-your-first-owner-device)
+first. On a U1-capable unlocked start, the node writes `identity/identity.json`
+and advertises its identity-signed box transport public key to paired clients.
+Connect a supporting client to that unlocked node so it pins the signed key
+before enabling the service. Never learn a new pin from a locked node. Keep
+`pairing/box-transport.key` (0600) and public identity metadata across restarts.
+Plaintext seeds and missing/stale public identity metadata are refused; repair
+metadata by starting normally with the correct encrypted seed first.
 
 Configure `[api].listen_addr` on loopback and `[remote_access].listen_addr` plus
 `advertised_endpoint` for the Noise endpoint reachable by your device. To reach
-it off the LAN, see [reachability](reachability.md). Then run:
-
-```sh
-konsensus start --config /path/to/konsensus.toml --remote-unlock --local-owner-device
-```
-
-The example [systemd unit](konsensus.service) uses these switches and
-`Restart=on-failure`. Install it only after the unlocked migration and owner
-key enrollment. There is no password file, `LoadCredentialEncrypted`, or
-password in argv/environment. On reboot the box waits for the device to unlock;
-it does not automatically retrieve a password from its disk. A plaintext seed or
-missing/stale public identity metadata is refused. Repair metadata by starting
-normally with the correct encrypted seed first. A positively empty data
-directory starts [remote first run](#remote-first-run-on-an-empty-box) instead.
+it off the LAN, see [reachability](reachability.md). Home mode still requires
+this configuration; it does not yet provide a box setup page or auto-discovery.
+There is no password file, systemd password credential, or password in
+argv/environment. On reboot the box waits for a device to unlock it.
 
 While locked, the only routes are `GET /livez`, `GET /api/v1/node/lock`,
 `POST /api/v1/node/unlock/challenge` and `POST /api/v1/node/unlock`. The first two
@@ -44,8 +60,76 @@ A forged `clients.json` device record cannot unlock the node. Success returns
 the same process. Clients reconnect to the normal seed-static tunnel after start.
 Wrong unlocks are limited to five per key in a sliding 15-minute window and 20
 per process run; exhaustion returns 429 (the process cap requires a restart).
-`--local-owner-device` additionally enables existing owner-approved spend intents;
-without it those intents remain off with `seed_password_not_typed`.
+`--home` includes local owner-device authority for existing owner-approved spend
+intents. With `--remote-unlock` alone those intents remain off with
+`seed_password_not_typed`.
+
+## Install the system service
+
+The [bitsov.service system unit](bitsov.service) runs as a dedicated `bitsov`
+user, starts at boot, and restarts after failures and setup exit 75. The older
+[konsensus.service user unit](konsensus.service) remains available for existing
+installations. Run only one service against a data directory.
+
+On a Linux system with systemd, from the repository root, install the verified
+binary at `/usr/bin/konsensus` and create the account and data directory:
+
+```sh
+sudo useradd --system --user-group --home-dir /var/lib/bitsov --shell /usr/sbin/nologin bitsov
+sudo install -d -o bitsov -g bitsov -m 0700 /var/lib/bitsov
+```
+
+Prepare `/var/lib/bitsov/konsensus.toml` with ownership `bitsov:bitsov` and mode
+0600. Use the node configuration for your chain and Lightning provider, a
+loopback API, and a reachable Noise listener with an explicit advertised
+endpoint. Keep all writable paths (seed, SQLite database, LDK state, backups,
+and logs) under `/var/lib/bitsov`; the unit makes the rest of the filesystem
+read-only and hides home directories. Provider credential files must be readable
+by `bitsov`. Adjust binary and data paths in the unit if your layout differs.
+The config itself must be writable by `bitsov` for first-run finalization.
+
+For a **new box**, point `identity.mnemonic_file` at the not-yet-created
+`/var/lib/bitsov/identity/mnemonic.enc`. Do not run `konsensus init`: remote first
+run creates the identity and enrolls the first device. Apart from the config
+and pairing material, leave the data directory empty. Issue the ticket as the
+service user, on a trusted terminal (never in `ExecStartPre` or the journal):
+
+```sh
+sudo -u bitsov /usr/bin/konsensus pair-ticket --config /var/lib/bitsov/konsensus.toml --qr
+```
+
+For a **retained box**, finish the enrollment and key-pinning steps above first;
+preserve the existing identity, pairing records and channel state. Stop its old
+process before enabling this unit, and ensure `bitsov` owns the data directory
+and can access every configured path. Do not reinitialize or wipe retained data.
+
+Install and enable the system unit (no `--user`):
+
+```sh
+sudo install -m 0644 docs/operations/bitsov.service /etc/systemd/system/bitsov.service
+sudo systemd-analyze verify /etc/systemd/system/bitsov.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now bitsov.service
+sudo systemctl status bitsov.service
+sudo journalctl -u bitsov.service -n 50 --no-pager
+```
+
+An empty box is now in SETUP; use a client supporting remote first run to finish
+the ceremony below. An initialized box waits in LOCKED. After setup, systemd
+restarts it automatically, and the device unlocks it into UNLOCKED without a
+second process restart. No mode change is needed between these states.
+
+The unit uses `Restart=on-failure`, `RestartForceExitStatus=75`, a 10-second
+restart delay, and at most five starts per 300 seconds. A repeated configuration
+failure therefore stops retrying rather than looping indefinitely. Inspect the
+journal and fix the reported cause, then run
+`sudo systemctl reset-failed bitsov.service` and
+`sudo systemctl start bitsov.service`. An explicit
+`systemctl stop` keeps it stopped. See the upstream
+[systemd service documentation](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml)
+for restart semantics. `NoNewPrivileges`, `ProtectSystem=strict`,
+`ReadWritePaths=/var/lib/bitsov`, and `PrivateTmp` confine the service's writes;
+none supplies or stores the seed password.
 
 ## Enroll your first owner device
 
@@ -110,10 +194,10 @@ cancellation, approval, or expiry frees a slot.
 5. Stop the foreground node, then restart with:
 
    ```sh
-   konsensus start --config /path/to/konsensus.toml --remote-unlock --local-owner-device
+   konsensus start --config /path/to/konsensus.toml --home
    ```
 
-   Or start the [systemd unit](konsensus.service) configured with those switches.
+   Or start the [system unit](bitsov.service) configured with `--home`.
    The node now waits locked. A supporting device connects using its saved box
    pin, requests an unlock challenge, and submits its approved key's signature
    plus the seed password over Noise. Success returns 204; reconnect after normal
@@ -443,20 +527,20 @@ yet, leave the data directory otherwise empty, and issue a ticket on the box:
 konsensus pair-ticket --config /path/to/konsensus.toml --qr
 ```
 
-Then start the same command as above (`--remote-unlock --local-owner-device`, no
-password source), for example through the systemd unit. The box serves bootstrap
-mode over the box-static Noise tunnel and binds no peer port. The client:
+Then start the same command as above (`--home`, no password source), for example
+through the system unit, which may be installed before enrollment. The box serves
+bootstrap mode over the box-static Noise tunnel and binds no peer port. The client:
 
 1. Scans the ticket, pins its box key, and pairs with its code. This is the only
    first-run pairing; a second ticket is refused.
-2. Generates the startup password, stores it, and sends only
+2. Stores the startup password (user-chosen for v1) and sends only
    `blake3(password)` to `create-pending`. It shows the phrase to the owner.
 3. Sends the backup words, its Secure Enclave device key and the password to
    `finalize`, over the tunnel only. The loopback API refuses both calls.
 4. Re-pins the box key from the identity-signed proof in the finalize response.
 
 The box writes only `identity/mnemonic.enc`, records the device as
-`enrolled_by: remote_first_run`, and exits with status 75. `Restart=on-failure`
+`enrolled_by: remote_first_run`, and exits with status 75. The system unit
 restarts it into locked mode, and the client performs the first unlock with the
 stored password immediately. Under a supervisor that does not restart on 75,
 start the same command again yourself. If the password is lost before that
@@ -524,3 +608,66 @@ unlocked and syncing whenever channels are open.
 This is a node-local reminder. The hub neither computes nor pushes it, and an
 offline/locked node cannot deliver a live notification: it reports on unlock.
 It does not extend negotiated windows or replace monitoring or a watchtower.
+
+## Copied directories and hardware moves (#271)
+
+**Never restore a copied data directory, rsync backup, VM snapshot or SD-card
+image as a running Lightning node.** It may contain revoked commitments:
+broadcasting one can lose the whole channel balance, even before reconnecting
+to the peer. `STATE_GENERATION` travels with a copy and proves no freshness.
+
+On init or first upgraded start, the node writes `ldk/INSTANCE` beside the LDK
+store (under the configured mnemonic's parent). It records a random instance ID
+and a hash binding it to the machine and the filesystem containing `ldk/`.
+Linux uses `/etc/machine-id` (with `/var/lib/dbus/machine-id` as a fallback) and
+the kernel filesystem ID; macOS uses `IOPlatformUUID` and the volume UUID.
+Raw machine IDs are not saved. A changed host or filesystem refuses startup
+before LDK is constructed; `move-home` also checks the fence. Missing, invalid
+or unavailable platform IDs fail closed with an explanation, including during
+an override. Provision a persistent, unique Linux machine-id using your OS
+installation tooling; do not substitute a shared or temporary ID.
+
+**Limits:** this is an accidental-copy fence, not a freshness proof or an
+anti-tamper boundary. Same-host SD-image rollback is **not detected yet**.
+Copies on the same host/filesystem, cloned machine/volume identifiers, deleted
+binding files, and old directories without a binding can escape detection.
+Existing installations without `INSTANCE` bind on their first upgraded start
+without refusing; that upgrade cannot determine whether their state is stale.
+Never delete or edit safety markers to get a node to start.
+
+`konsensus recover` is **coming**, not implemented. For a lost disk, stop and
+follow [the recovery guidance](../v2/RECOVERY.md); contact the operator rather
+than starting an old copy. For a healthy node, prefer
+[`konsensus move-home`](move-home.md) on its original live store.
+
+### Owner override for a legitimate hardware move
+
+Use this only when relocating the **latest, cleanly stopped live store**, never
+a backup or snapshot. It changes the binding; it does not verify freshness.
+
+1. Stop the service on both machines. Verify the source shut down cleanly,
+   preserve its latest state, and ensure the old node cannot restart. Never
+   run two nodes with this identity.
+2. Move the current store and update paths in `konsensus.toml` as needed.
+3. At the destination's owner console (a terminal or SSH with a controlling
+   terminal), run `konsensus rebind-instance --config /path/konsensus.toml`.
+   Read the warning and type the exact `REBIND … TO …` challenge displayed.
+   Confirmation is read from `/dev/tty`, never stdin, a flag, or an API.
+   Wrong text, EOF or no console leaves the binding unchanged. This command
+   constructs no LDK node and does not start the service.
+4. Start normally. Keep the old node disabled. Do not add the override to a
+   service or unattended script. An open recovery or move-home journal cannot
+   be bypassed by rebinding.
+
+The recovery-journal skeleton is `ldk/recover.json`, version 1, with `state`
+`open` or `done` (for example `{"version":1,"state":"open"}`). Any open,
+malformed, unreadable or unsupported journal refuses startup before LDK.
+Only a valid `done` journal permits normal startup. No recovery workflow writes
+or completes this journal yet; do not create, remove or mark it done manually
+to bypass recovery.
+
+The example systemd unit limits starts to three within 300 seconds. After a
+panic or safety refusal, inspect `journalctl --user -u konsensus.service` and
+resolve the cause before `systemctl --user reset-failed konsensus.service`
+and a deliberate restart. This caps rapid crash loops; it cannot suppress a
+revoked-commitment broadcast or stop failures spaced outside the limit window.

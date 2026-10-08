@@ -45,7 +45,7 @@ use konsensus_core::traits::lightning::{
 };
 
 /// Configuration for the embedded LDK Lightning provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LdkConfig {
     /// Full-capacity admission ceilings applied to every channel open path.
     pub channel_capacity_limits: konsensus_core::traits::lightning::ChannelCapacityLimits,
@@ -101,6 +101,57 @@ pub struct LdkConfig {
     pub lsp_token: Option<String>,
     /// Listening address for Lightning P2P (e.g., "0.0.0.0:9735").
     pub listening_address: Option<String>,
+}
+
+// Keep credentials out of diagnostics, including nested and pretty Debug output.
+impl std::fmt::Debug for LdkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LdkConfig")
+            .field("channel_capacity_limits", &self.channel_capacity_limits)
+            .field("tower", &self.tower)
+            .field(
+                "forward_to_private_channels",
+                &self.forward_to_private_channels,
+            )
+            .field("our_to_self_delay_blocks", &self.our_to_self_delay_blocks)
+            .field("logging", &self.logging)
+            .field("bitcoind", &self.bitcoind)
+            .field("electrum", &self.electrum)
+            .field("liquidity", &self.liquidity)
+            .field("lsps2_service", &self.lsps2_service)
+            .field("channel_peers", &self.channel_peers)
+            .field("storage_dir", &self.storage_dir)
+            .field("scb_backup_dir", &self.scb_backup_dir)
+            .field("scb_rotation_count", &self.scb_rotation_count)
+            .field("mnemonic", &"<redacted>")
+            .field("passphrase", &"<redacted>")
+            .field("network", &self.network)
+            .field(
+                "esplora_url",
+                &konsensus_core::logging::redact_url_for_debug(&self.esplora_url),
+            )
+            .field(
+                "esplora_url_fallback",
+                &self
+                    .esplora_url_fallback
+                    .as_deref()
+                    .map(konsensus_core::logging::redact_url_for_debug),
+            )
+            .field("esplora_sync_intervals", &self.esplora_sync_intervals)
+            .field("credentials_file", &self.credentials_file)
+            .field(
+                "rgs_url",
+                &self
+                    .rgs_url
+                    .as_deref()
+                    .map(konsensus_core::logging::redact_url_for_debug),
+            )
+            .field("lsp_node_id", &self.lsp_node_id)
+            .field("lsp_address", &self.lsp_address)
+            .field("lsp_token", &"<redacted>")
+            .field("listening_address", &self.listening_address)
+            .finish()
+    }
 }
 
 impl LdkConfig {

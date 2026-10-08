@@ -1,0 +1,36 @@
+# System unit: /etc/systemd/system/bitsov.service.
+# Create the bitsov system user and configure /var/lib/bitsov first; see home-node.md.
+[Unit]
+Description=BitSov home node
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=bitsov
+Group=bitsov
+WorkingDirectory=/var/lib/bitsov
+StateDirectory=bitsov
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/konsensus start --config /var/lib/bitsov/konsensus.toml --home
+Restart=on-failure
+# A committed remote first run must restart into LOCKED, never start live services.
+RestartForceExitStatus=75
+RestartSec=10
+# The node allows 15s for Lightning, 10s for cleanup, and enforces a 30s deadline.
+TimeoutStopSec=45
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/bitsov
+PrivateTmp=true
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bitsov
+
+[Install]
+WantedBy=multi-user.target

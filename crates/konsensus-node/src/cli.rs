@@ -27,6 +27,11 @@ pub enum Command {
     },
     /// Close channels and send funds to an owner-specified home address (local console only).
     MoveHome(crate::move_home_cmd::MoveHomeArgs),
+    /// Rebind the latest cleanly stopped live store after a hardware move (owner console only).
+    RebindInstance {
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
     /// Initialize a new node: generate identity and create config file.
     Init {
         /// Directory to create the node data in.
@@ -54,6 +59,7 @@ pub enum Command {
     },
 
     /// Start the node using an existing configuration.
+    #[command(group(clap::ArgGroup::new("owner_password").multiple(true)))]
     Start {
         /// Path to the configuration file.
         #[arg(short, long, default_value = "konsensus.toml")]
@@ -77,6 +83,12 @@ pub enum Command {
         /// --local-owner-device too. Nonzero descriptors require Unix.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with_all = ["password", "password_file"], group = "owner_password")]
         password_fd: Option<i32>,
+
+        /// Home box: remote setup/unlock and local owner-device spend envelopes.
+        /// Setup exits 75 for a service-manager restart; unlock continues in-process.
+        /// Equivalent to --remote-unlock --local-owner-device; never opens a console.
+        #[arg(long, group = "owner_password", conflicts_with_all = ["password", "password_file", "password_fd", "owner_control"])]
+        home: bool,
 
         /// Wait for an existing owner device to unlock the encrypted seed over Noise.
         #[arg(long, group = "owner_password", conflicts_with_all = ["password", "password_file", "password_fd", "owner_control"])]
@@ -229,6 +241,12 @@ pub enum Command {
     /// `front_door` (publish the front-door card only) takes no budget:
     /// `konsensus grant --op <id> [--for 1h]`.
     Grant {
+        /// Allow only these payees (node ID or Lightning pubkey). Repeatable.
+        #[arg(long, conflicts_with = "deny_all_payees")]
+        payee: Vec<String>,
+        /// Approve an empty payee allowlist (deny all payments).
+        #[arg(long)]
+        deny_all_payees: bool,
         /// Also authorize capped LSP deductions from this same budget.
         #[arg(long)]
         allow_liquidity_fees: bool,
@@ -586,6 +604,43 @@ fn approval_code(value: &str) -> Result<String, String> {
 mod local_owner_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn home_flags_and_conflicts() {
+        for flags in [
+            vec!["--home"],
+            vec!["--home", "--remote-unlock"],
+            vec!["--home", "--local-owner-device"],
+            vec!["--home", "--remote-unlock", "--local-owner-device"],
+        ] {
+            let cli = Cli::try_parse_from([vec!["konsensus", "start"], flags].concat())
+                .expect("home mode accepts redundant legacy flags");
+            let Command::Start { owner_control, .. } = cli.command else {
+                panic!("expected start");
+            };
+            assert!(
+                !owner_control,
+                "home mode must never grant console authority"
+            );
+        }
+        for conflicting in [
+            vec!["--owner-control"],
+            vec!["--password", "secret"],
+            vec!["--password-file", "secret.txt"],
+            vec!["--password-fd", "0"],
+        ] {
+            for flags in [
+                [vec!["--home"], conflicting.clone()].concat(),
+                [conflicting, vec!["--home"]].concat(),
+            ] {
+                let error = Cli::try_parse_from([vec!["konsensus", "start"], flags].concat())
+                    .err()
+                    .expect("home mode rejects console authority and password sources");
+                assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+                assert!(error.to_string().contains("--home"));
+            }
+        }
+    }
 
     #[test]
     fn remote_unlock_flags() {

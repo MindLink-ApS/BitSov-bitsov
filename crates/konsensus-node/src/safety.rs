@@ -12,9 +12,9 @@ use tokio::sync::watch;
 
 /// Monotonic binary/state compatibility generation. Bump BEFORE shipping any
 /// incompatible SQLite migration or LDK state change; never derive from SemVer.
-// Generation 2 adds move-home's durable migration lock/consent journal. Older
-// binaries must never open a migrating store while ignoring that journal.
-pub const STATE_GENERATION: u64 = 2;
+// Generation 3 adds host binding and the recovery journal. Older binaries
+// must never open this state while ignoring either admission fence.
+pub const STATE_GENERATION: u64 = 3;
 
 pub struct DiskGuard {
     path: PathBuf,

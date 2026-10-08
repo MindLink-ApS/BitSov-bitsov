@@ -104,6 +104,7 @@ pub async fn run(args: MoveHomeArgs) -> Result<()> {
         data_dir,
         crate::safety::STATE_GENERATION,
     )?);
+    crate::restore_fence::ensure_bound(data_dir)?;
     let password = if let Some(fd) = args.password_fd {
         Some(crate::password::read_password_fd(fd)?)
     } else if crate::mnemonic_crypto::is_encrypted_path(&config.identity.mnemonic_file) {
