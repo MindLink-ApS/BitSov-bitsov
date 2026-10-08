@@ -1,102 +1,168 @@
 # Upgrading a retained node
 
 This note covers common failure modes when replacing the `konsensus` binary on a
-retained data directory without re-running `konsensus init`.
+retained data directory without re-running `konsensus init`. The test Pi's
+planned wipe and fresh onboarding are documented separately below.
 
-## Unreleased: channel capacity and home hub trust
+**rc13 preparation (2026-10-08):** includes all 12 PRs after `v0.3.0-rc12`
+(`41b9e78`), through `fc103f1`. The release commit will be the `main` HEAD after
+this rc13 docs/version PR merges, not the preparation tip. See the
+[signing checklist](releases/v0.3.0-rc13.md). For nodes skipping releases, apply
+older procedures below first, then rc12 → rc13. Historical sections describe
+their release's behavior; the rc13 restrictions here supersede those descriptions.
 
-Embedded LDK now applies `lightning.max_channel_capacity_sats = 1000000` and
-`lightning.max_total_channel_capacity_sats = 2000000` when omitted. These are
-inclusive full-capacity ceilings for new outbound/inbound channels, separate
-from the unchanged onboarding subsidy `max_channel_sats`. Hub service operators
-also receive these defaults and should set appropriate explicit ceilings before
-restart. Zero refuses positive new capacity; there is no implicit unlimited mode.
+## rc12 → rc13 procedure
 
-Every non-LSPS2-service LDK node defaults to `lightning.hub_only_channels = true`
-in **every start mode**, including ordinary unlocked starts. Configure the hub
-keys in `[lightning.liquidity] providers` or legacy `lightning.lsp_node_id` before
-opening channels. An empty set refuses every new channel. Owners who accept the
-additional counterparty trust can explicitly set `hub_only_channels = false`
-only for non-lockable starts. Under `--remote-unlock`, hub-only remains mandatory
-for the whole run, including after unlock: the opt-out is ignored, and an empty
-hub set refuses every new channel (`HUB_ONLY_WHILE_LOCKABLE`). Capacity ceilings
-remain in all modes.
-Enabled LSPS2 services default to unrestricted peers, cannot be explicitly
-hub-only and still cannot start under `--remote-unlock`.
+1. **Prepare and replace the binary.** Reconcile pending payments, channel
+   opens and top-ups, verify the rc13 artifact and signed checksums under the
+   [release policy](ops/RELEASE_POLICY.md), then stop the node cleanly. For the
+   test Pi use the Linux aarch64 artifact after confirming its OS architecture.
+   Keep the same config and latest live data directory on the same host and
+   filesystem. Do not re-run `init`, restore an SD image, or start a backup.
+   Preserve identity, pairing/grant records, box transport key, LDK state,
+   offline heartbeat and safety markers. Confirm `konsensus --version` reports
+   `konsensus 0.3.0-rc13` before restarting.
+2. **Configure hubs and capacity limits before opening channels (#275).**
+   Embedded LDK defaults to `lightning.max_channel_capacity_sats = 1000000`
+   and `lightning.max_total_channel_capacity_sats = 2000000`. These inclusive
+   full-capacity ceilings include accepted pending and disconnected channels;
+   zero refuses positive new capacity. Hub services also receive the caps and
+   should set appropriate explicit values. The separate onboarding subsidy
+   `max_channel_sats` is unchanged. Non-service LDK nodes now default to
+   `lightning.hub_only_channels = true` in every start mode. Configure the hub
+   keys in `[lightning.liquidity] providers` or legacy `lightning.lsp_node_id`:
+   **hub-less nodes refuse every new channel** under this policy. Explicit
+   `hub_only_channels = false` opts out only in non-lockable starts;
+   `--remote-unlock` and `--home` enforce hub-only for the entire run, including
+   after unlock (`HUB_ONLY_WHILE_LOCKABLE`). Enabled LSPS2 services default to
+   unrestricted peers and cannot start lockable or explicitly hub-only.
+   Existing non-hub or over-cap channels are not closed or shrunk; they count
+   toward subsequent admission. Splices are refused; already-negotiated splices
+   are not undone. External LND/mock inbound policy is outside this change.
+3. **Keep the live store in place; the copied-state fence is forward-only
+   (#276).** On init or first upgraded start, `ldk/INSTANCE` binds a random
+   instance ID to the host and filesystem/volume. Legacy stores without it bind
+   automatically, so this cannot recognize an already-stale copy. A later
+   host/volume mismatch, missing platform ID or corrupt marker refuses startup
+   before LDK construction. State generation **3** prevents older guard-aware
+   binaries from ignoring the fence and `ldk/recover.json`; open, invalid,
+   unreadable or unsupported recovery journals refuse startup. Do not lower,
+   delete or hand-edit these files. Same-host SD-image rollback and copies or
+   clones retaining both identifiers can escape detection: this is not a
+   freshness proof. XFS/F2FS device renumbering may also trigger a legitimate
+   mismatch (#285). Only a move of the latest cleanly stopped live store may
+   use console-only `konsensus rebind-instance --config …`, with the exact typed
+   challenge and the old process disabled. It cannot bypass journals or prove
+   freshness. Follow the [hardware-move runbook](operations/home-node.md#owner-override-for-a-legitimate-hardware-move).
+   **`konsensus recover` is not shipped**: #282 adds an unwired library only.
+   For lost disks follow [recovery guidance](v2/RECOVERY.md); for a healthy
+   source use [move-home](operations/move-home.md).
+4. **Treat pairing schema v5 as forward-only (#278).** rc13 reads existing
+   v2–v4 grant stores, but writes `pairing/clients.json` as v5; older nodes
+   refuse v5 instead of ignoring payee restrictions or duplicate-payment
+   records. Preserve the current store and roll forward; no reverse migration
+   is provided. An omitted/null `payee_allowlist` retains existing recipient
+   rules, an empty list denies all, and an explicit list permits only its keys.
+   Owner approval is required; recipient budget caps do not create an allowlist.
+   Unlisted recipients return HTTP 409 `budget_exceeded` with reason
+   `payee_not_allowed`. Within a grant, invoice hashes and optional pay/keysend
+   `request_id` values remain consumed across restart and even failed attempts;
+   duplicates return `duplicate_payment` without another debit or dispatch.
+   This is refusal, not replay of the original response: reconcile invoices via
+   `/payments/:hash`. Keysend without an ID is not deduplicated. See
+   [grant rules and retry limits](SPEND_BUDGET_GRANTS.md#optional-payee-allowlist-and-payment-retries).
+5. **Update the service deliberately (#277, #286).** On retained boxes, an
+   existing `--remote-unlock --local-owner-device` start can become `--home`.
+   Existing initialized-box flags remain supported. `--home` is a CLI switch,
+   not a config key; it conflicts with `--owner-control` and `--password`,
+   `--password-fd`, `--password-file`. It grants local owner-device authority,
+   never console authority. Retained remote-unlock boxes still need an enrolled
+   owner device and a verified identity-signed box pin. Do not reinitialize them
+   to obtain the new ceremony. **On empty boxes, `--remote-unlock` without
+   `--home` (even with `--local-owner-device`) now refuses remote first run.**
+   Use `--home` so SAS finalization has the required LAN approval surface.
+   The new [system unit](operations/bitsov.service) runs as `bitsov`, restarts
+   on setup exit 75 and permits five starts per 300 seconds; the older user
+   unit permits three. Follow [service installation](operations/home-node.md#install-the-system-service)
+   for permissions and writable paths. Stop the old service before enabling a
+   replacement; never run two processes on one identity. Reload the correct
+   system or user daemon and fix failures before resetting a start limit.
+6. **Check client compatibility and discovery (#281, #284, #286, #287).**
+   PairLink v2 carries an ordered endpoint list, signed after identity exists.
+   Strict older clients may need `pair-ticket --legacy`, but that only changes
+   link format: it cannot bypass mandatory SAS on a box with a claim code.
+   Initialized legacy boxes without a claim code keep their existing enrollment
+   flow. New boxes require a supporting client; node changes do not establish
+   app support. Preserve the full **18-character claim code** (16 random
+   base32 characters plus 2 checksum characters); never shorten it or replace
+   it with the four SAS comparison words. Read it only from the box sticker or
+   trusted owner console, never the setup page. Verify signed endpoint and
+   transport descriptors against the saved identity before sending credentials.
+   First-run finalize now returns `client_id`, `epoch`, `transport_pubkey` and
+   `transport_signature` as well as the signed box pin: save the verified box
+   pin for LOCKED and the verified live pin for UNLOCKED. Never learn a new pin
+   from a locked node or discovery response. Endpoint changes require an
+   unlocked restart to refresh the cached signed descriptor before issuing new
+   tickets. mDNS requires a build with `--features mdns` **and `--home`**,
+   configured remote access, and no `remote_access.mdns = false`. Default release
+   builds have no mDNS responder; use the numeric LAN address. The old flag pair
+   alone does not enable mDNS even in a feature-enabled build. See
+   [endpoint discovery](operations/home-node.md#endpoint-discovery).
+7. **Restart, unlock and inspect the retained node.** Start exactly one configured
+   service, check the journal for startup refusals, then unlock with the enrolled
+   device and wait for chain sync. Inspect owner `/api/v1/status` for
+   `channel_safety`, `offline_safety` and money readiness, then reconcile channels
+   and payment state. Preserve the rc12 delay policy: new home channels default
+   to 2016 blocks and explicit values must be 288–2016; existing channels keep
+   their negotiated delay. Hub-only and capacity caps do not protect against
+   a cheating hub while locked/offline, replace a monitor/watchtower, or bound
+   wallet funds, closing claims, fees and all losses. The owner still trusts
+   the hub during periods without an active local monitor or independent
+   watchtower. See [channel safety](operations/home-node.md#channel-capacity-and-hub-only-admission).
 
-Check owner `GET /api/v1/status` → `channel_safety` for the active limits and
-`hub_only` flag (`null` for unavailable/unsupported backends). Review retained
-channels yourself: upgrades do not close existing non-hub/over-cap channels or
-shrink their capacity. All manager-listed channels, including accepted pending
-and disconnected channels, consume the total allowance on subsequent opens.
-Splices are refused while capped; already-negotiated splices are not undone.
+### Test Pi: planned wipe and fresh rc13 onboarding
 
-Hub-only does **not** protect against the hub cheating while the box is locked
-or offline. Keys stay local, but the owner still trusts the hub during periods
-without an active local monitor or independent watchtower. These admission caps
-are not a bound on wallet funds, closing claims, fees, pre-existing exposure or
-all possible losses. External LND/mock inbound policy is outside this change.
-See [the precise scope and error codes](operations/home-node.md#channel-capacity-and-hub-only-admission).
+**The test Pi will be wiped and set up fresh with the new onboarding.** This is
+an intentional new installation, separate from the retained-state procedure
+above; this release-docs preparation does not perform the wipe. Before wiping,
+reconcile outstanding payments, close/resolve channels and move any funds from
+the live node using the [move-home procedure](operations/move-home.md). Verify
+that no funds or unresolved claims depend on the old store, retain required
+recovery records securely, and disable the old service. Do not wipe a funded or
+unresolved node and expect the new recovery library to recover it.
 
-**rc12 preparation (2026-10-07):** includes #269, #270 and #273 after the
-rc11 release commit `834968b`. The release commit will be the `main` HEAD after
-this rc12 docs/version PR merges, not the preparation tip `c5b2119`.
-For nodes skipping releases, apply the older procedures below first, then
-[rc11 → rc12](#rc11--rc12-procedure). Earlier sections describe their release's
-behavior; the rc12 home-node delay policy supersedes rc11's optional W0 default.
-
-## Home service mode (N1, unreleased)
-
-`konsensus start --home` is shorthand for `--remote-unlock --local-owner-device`.
-Existing flags and starts are unchanged. `--home` conflicts with `--owner-control`
-and every startup password source (`--password`, `--password-fd`,
-`--password-file`); it never enables console authority. It is a CLI switch,
-not a configuration key. No password belongs in the unit, environment or argv.
-
-For existing remote-unlock services, replace the two switches with `--home`
-after installing a binary that supports it. The command stays the same across
-SETUP → exit 75 → service restart → LOCKED → device unlock → UNLOCKED. Unlock
-continues in the locked process. Retained boxes still need an enrolled owner
-device and a pinned identity-signed box key before remote unlock; do not
-reinitialize them. Empty boxes may install the service **before enrollment**
-and enroll their first device through remote first run.
-
-A new dedicated-user **system** unit is provided at
-[`docs/operations/bitsov.service`](operations/bitsov.service); the existing user
-unit remains supported. Follow the [installation steps](operations/home-node.md#install-the-system-service),
-including data ownership, writable paths, restart limits and recovery from a
-start-limit failure. Stop any previous service before enabling the new one.
-The setup page and endpoint discovery are separate onboarding changes.
-
-## Next upgrade: copied-directory fence (#271)
-
-Keep the current live directory on its existing host. **Never restore a copied
-data directory, rsync backup or SD image to start a Lightning node.** A stale
-copy can broadcast a revoked commitment and lose the channel balance.
-
-On init or first upgraded start, `ldk/INSTANCE` binds a random instance ID to a
-hash of the machine ID and filesystem/volume ID. Existing nodes without this
-file bind automatically; no reinitialization or owner confirmation is required.
-That first binding cannot recognize an already-stale legacy copy. Subsequent
-host/volume mismatches refuse before LDK construction. Missing platform IDs or
-corrupt binding files also refuse; fix the underlying cause, never delete the
-markers. **Same-host SD-image rollback is not detected yet**, nor are same-host,
-same-filesystem copies or clones retaining both identifiers. This is not a
-freshness proof.
-
-Generation **3** prevents generation-2 binaries from ignoring the new fence and
-`ldk/recover.json` journal. An open, malformed, unreadable or unsupported journal
-blocks normal startup. `konsensus recover` is **coming**, not built yet: use the
-[recovery guidance](v2/RECOVERY.md) and contact the operator for a lost disk.
-For a healthy source use [move-home](operations/move-home.md). A legitimate move
-of the latest cleanly stopped live store has a separate console-only
-`konsensus rebind-instance --config …` override requiring an exact typed
-challenge; it never bypasses recovery/migration journals or proves freshness.
-See the [hardware-move runbook](operations/home-node.md#owner-override-for-a-legitimate-hardware-move).
-
-Update any installed example systemd unit to include `StartLimitIntervalSec=300`
-and `StartLimitBurst=3` in `[Unit]`, then reload the user daemon. Inspect and fix
-startup failures before resetting the failed service; do not automate resets.
+1. After the old node is safely retired, wipe/reimage the test Pi for a new
+   identity, provision a persistent unique machine ID and install the verified
+   rc13 Linux aarch64 binary. Follow the [system-service guide](operations/home-node.md#install-the-system-service)
+   to create the `bitsov` account and protected `/var/lib/bitsov` directory.
+   Do not restore old LDK state, pairings, pins or safety markers into this new
+   installation.
+2. Prepare the service-owned config with a loopback API, a reachable Noise
+   listener, the intended hub keys/capacity limits and a not-yet-created
+   `/var/lib/bitsov/identity/mnemonic.enc`. Keep writable paths under
+   `/var/lib/bitsov`. **Do not run `konsensus init`** for remote first run.
+   Install and enable the system unit with `--home`; an empty box enters SETUP.
+3. On a trusted controlling terminal, as the data-directory owner, run
+   `sudo -u bitsov /usr/bin/konsensus claim-code --show --config /var/lib/bitsov/konsensus.toml`.
+   Record all **18 characters** securely with the physical box. Never shorten
+   the code, publish it, put it in the service, or enter it into the LAN page.
+4. Within 15 minutes of startup, open `http://<Pi-LAN-IP>:8080` from the private
+   LAN and click **Start setup**. `http://bitsov.local:8080` is available only
+   with the optional mDNS build and home configuration. Use a supporting app
+   to scan the five-minute one-use ticket, enter the physical claim code in
+   the app, commit its device key and complete the recovery-phrase backup check.
+   Compare **all four SAS words** between app and box page, then approve on
+   the page and finalize in the app. Passwords travel only over pinned Noise;
+   the page has no password, claim-code or recovery-phrase field. A mismatch
+   means cancel, not approve; three mismatches/cancels or the elapsed setup
+   window require a restart. See [remote first run](operations/home-node.md#remote-first-run-on-an-empty-box).
+5. Have the app verify and retain both identity-signed transport pins from
+   finalize. Setup exits **75**; systemd restarts the same command into LOCKED.
+   Unlock with the newly enrolled device, then reconnect using the verified
+   live pin. Check readiness, chain sync and `channel_safety` before funding.
+   Reboot once to verify LOCKED → device unlock → UNLOCKED, the status-only
+   box page and the absence of seed/password prompts in the service. Record
+   results separately; this checklist does not claim the Pi smoke test ran.
 
 ## rc11 → rc12 procedure
 
