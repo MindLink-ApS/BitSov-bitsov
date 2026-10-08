@@ -373,6 +373,10 @@ pub struct CommitOutcome {
     pub mnemonic_path: PathBuf,
     /// Box transport key and its identity proof, written to `identity.json`.
     pub box_transport: Option<(String, String)>,
+    /// Live transport public key (hex), written to `identity.json`.
+    pub transport_pubkey: Option<String>,
+    /// Identity signature over the live transport key, written to `identity.json`.
+    pub transport_signature: Option<String>,
 }
 
 /// Hook after rebind and before `NODE_INITIALIZED` (clippy::type_complexity).
@@ -523,6 +527,10 @@ pub struct FinalizeBody {
 pub struct FinalizeResponse {
     /// Committed node id.
     pub node_id: String,
+    /// Paired client that completed the ceremony.
+    pub client_id: String,
+    /// Pairing epoch preserved by the commit.
+    pub epoch: u64,
     /// The supervisor must restart explicitly.
     pub restart_required: bool,
     /// Enrolled device key id, if requested.
@@ -538,6 +546,12 @@ pub struct FinalizeResponse {
     /// Base64url-no-pad Ed25519 signature over `box_transport_proof_message`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub box_transport_signature: Option<String>,
+    /// Seed-derived X25519 public key (hex) for the unlocked listener.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_pubkey: Option<String>,
+    /// Base64url-no-pad Ed25519 signature over `transport_proof_message`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_signature: Option<String>,
 }
 
 /// Errors from the transition.
@@ -663,6 +677,14 @@ fn commit_first_run_local(
                 .and_then(|v| v.as_str()),
         )
         .map(|(key, signature)| (key.to_owned(), signature.to_owned()));
+    let transport_pubkey = metadata
+        .get("transport_pubkey")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let transport_signature = metadata
+        .get("transport_signature")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     metadata.insert("identity_fingerprint".into(), fingerprint.clone().into());
     metadata.insert("committed_at".into(), chrono::Utc::now().timestamp().into());
     pairing::write_protected(
@@ -710,6 +732,8 @@ fn commit_first_run_local(
         identity_fingerprint: fingerprint.clone(),
         mnemonic_path: target.join(mnemonic_name),
         box_transport,
+        transport_pubkey,
+        transport_signature,
     };
 
     // Align any operator config with the committed mnemonic *before* the
@@ -1065,6 +1089,19 @@ impl BootstrapState {
             None
         };
         let device_key_id = device.as_ref().map(|d| d.key_id.clone());
+        // Use the device's binding when enrolled; installation rechecks its epoch
+        // under the pairing lock. Local ceremonies may omit device enrollment.
+        let epoch = match &device {
+            Some(record) => record.epoch,
+            None => {
+                self.pairing
+                    .list_clients()
+                    .into_iter()
+                    .find(|client| client.client_id == client_id)
+                    .ok_or_else(|| pairing_error_response(PairingError::OwnerChannelUnavailable))?
+                    .epoch
+            }
+        };
         // From here even a failed commit consumes the phrase. A post-rename
         // failure additionally requires explicit repair, never a retry.
         let pending = slot.take().unwrap();
@@ -1075,6 +1112,10 @@ impl BootstrapState {
         let (box_transport_pubkey, box_transport_signature) = outcome.box_transport.unzip();
         Ok(FinalizeResponse {
             node_id: outcome.node_id,
+            client_id: client_id.to_owned(),
+            epoch,
+            transport_pubkey: outcome.transport_pubkey,
+            transport_signature: outcome.transport_signature,
             restart_required: true,
             device_fingerprint: device_key_id
                 .as_deref()

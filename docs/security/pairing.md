@@ -64,7 +64,8 @@ still synced before they are published.
 On every **unlocked** start, including when remote access is disabled, the node
 signs the box public key with its Ed25519 identity and atomically creates or
 refreshes `<data_dir>/identity/identity.json`. The public fields are `node_id`,
-`identity_fingerprint`, `box_transport_pubkey`, and `box_transport_signature`;
+`identity_fingerprint`, `transport_pubkey`, `transport_signature`,
+`box_transport_pubkey`, and `box_transport_signature`;
 bootstrap's `committed_at` and other existing metadata are preserved. Keys are
 lowercase hex. The signature is base64url without padding over these exact UTF-8
 bytes (no trailing newline):
@@ -361,8 +362,9 @@ After the normal bootstrap pairing, use its `bst` token with `identity` scope:
    the paired `client_id`. No password field is accepted (`422`) on this local
    path; only [remote first run](#remote-first-run-over-the-tunnel) takes one.
    Missing device is `400`; invalid possession or the wrong fingerprint is `403`.
-3. Finalize returns `node_id`, `restart_required: true`, `device_key_id`,
-   `device_fingerprint`, and `mnemonic_path`, never the phrase. Bootstrap exits;
+3. Finalize returns `node_id`, `client_id`, `epoch`, `restart_required: true`,
+   `device_key_id`, `device_fingerprint`, and `mnemonic_path`, plus the signed
+   transport pairs described below, never the phrase. Bootstrap exits;
    explicitly restart with the same descriptor password and local-owner flag.
 
 The node validates possession, derives the owner signing key transiently from
@@ -454,14 +456,54 @@ ceremony routes change in this mode only:
    owner approval from `owner_secret(password, node_id)`, and the device record
    says `enrolled_by: remote_first_run`. `identity/identity.json` now carries the
    signed public transport proofs that locked mode and `pair-ticket` require.
-   The finalize response adds `box_transport_pubkey` and
-   `box_transport_signature`, the committed identity's proof for re-pinning.
+   The finalize response includes `box_transport_pubkey` and
+   `box_transport_signature` for the bootstrap/locked listener, plus
+   `transport_pubkey` and `transport_signature` for the unlocked listener.
+   Both pairs come from the proofs committed to `identity/identity.json`.
    The tunnel survives the rebind long enough to deliver it, but a revocation
    or epoch change still closes it.
 4. The process exits **75** (`EX_TEMPFAIL`). Under `Restart=on-failure` the same
    command restarts into locked mode. The client completes the
    [first remote unlock](../operations/home-node.md) with the stored password,
    which also proves the stored copy is right.
+
+The additive finalize receipt fields have these wire types:
+
+| Field | JSON type | Meaning |
+|-------|-----------|---------|
+| `client_id` | string | The paired client that completed the ceremony. |
+| `epoch` | integer (u64) | That client's pairing epoch, preserved across commit. |
+| `transport_pubkey` | string, optional | Lowercase hex, 32-byte seed-derived X25519 public key for UNLOCKED. |
+| `transport_signature` | string, optional | Base64url without padding, Ed25519 identity signature over the live-key proof below. |
+| `box_transport_pubkey` | string, optional | Lowercase hex, 32-byte box X25519 public key for bootstrap and LOCKED. |
+| `box_transport_signature` | string, optional | Base64url without padding, Ed25519 identity signature over the box-key proof above. |
+
+The live-key proof uses the same domain as PairLink v2, with these exact UTF-8
+bytes and no trailing newline:
+
+```text
+bitsov-remote-transport-v1:<node_id>:<transport_pubkey>
+```
+
+The proof is identity-scoped; it does not include `client_id` or `epoch`.
+Those receipt fields describe the pairing and do not change the signature
+format. After commit, the bootstrap JWT is invalid; obtain a fresh token after
+unlock and check its `epc` against the saved epoch.
+
+A client verifies both signatures under the committed, trusted `node_id`, saves
+both pins, and requires the corresponding Noise responder static on connection.
+Bootstrap and LOCKED continue to use the box static; UNLOCKED continues to use
+the seed-derived live static.
+
+To recover a lost finalize receipt, successful **locked-mode** `AuthResponse::Ok`
+replies also include the optional `transport_pubkey` and `transport_signature`
+fields with exactly the same values. Reach LOCKED using the box pin already
+trusted, verify the live proof under the already trusted `node_id`, and then use
+that live pin for UNLOCKED. Locked startup verifies the saved live proof before
+serving it. Older `identity.json` files may omit both fields; in that case the
+auth reply omits both. A partial, malformed, or invalid proof refuses locked
+startup. A missing proof gives the client no new pin and must not trigger TOFU.
+Existing clients can ignore the additive fields.
 
 `create-pending` and `finalize` require the caller to arrive through a
 registered tunnel whose server-side pairing is the token's client. The

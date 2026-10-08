@@ -272,6 +272,10 @@ pub struct LockedIdentity {
     pub identity_fingerprint: String,
     pub box_transport_pubkey: String,
     pub box_transport_signature: String,
+    #[serde(default)]
+    pub transport_pubkey: Option<String>,
+    #[serde(default)]
+    pub transport_signature: Option<String>,
 }
 
 #[derive(Clone)]
@@ -856,6 +860,13 @@ async fn handle_connection(
         identity,
         ResponderIdentity::Bootstrap | ResponderIdentity::HomeBootstrap(_)
     );
+    let (transport_pubkey, transport_signature) = match &identity {
+        ResponderIdentity::Locked(identity) => (
+            identity.transport_pubkey.clone(),
+            identity.transport_signature.clone(),
+        ),
+        _ => (None, None),
+    };
     let response = match &authenticated {
         Ok(client) => AuthResponse::Ok {
             v: VERSION,
@@ -863,6 +874,8 @@ async fn handle_connection(
             scopes: client.scopes.clone(),
             box_transport_pubkey,
             box_transport_signature,
+            transport_pubkey,
+            transport_signature,
         },
         Err(error) => AuthResponse::Error {
             v: VERSION,

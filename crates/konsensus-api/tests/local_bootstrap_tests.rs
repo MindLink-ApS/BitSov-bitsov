@@ -1381,6 +1381,13 @@ async fn remote_first_run_password_is_tunnel_only_and_committed() {
     let box_key = hex::encode(r.state.pairing.box_transport_pubkey());
     assert_eq!(metadata["box_transport_pubkey"], box_key);
     assert_eq!(response["box_transport_pubkey"], box_key);
+    assert_eq!(response["client_id"], r.client);
+    assert_eq!(response["epoch"], keys[0].epoch);
+    assert_eq!(response["transport_pubkey"], metadata["transport_pubkey"]);
+    assert_eq!(
+        response["transport_signature"],
+        metadata["transport_signature"]
+    );
     assert_eq!(
         response["box_transport_signature"],
         metadata["box_transport_signature"]

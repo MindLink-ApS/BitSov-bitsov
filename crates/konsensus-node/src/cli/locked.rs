@@ -66,6 +66,23 @@ fn read_identity(data_dir: &Path, pairing: &PairingService) -> Result<LockedIden
         &signature,
     )
     .context("public box transport signature invalid; start unlocked to repair")?;
+    match (&identity.transport_pubkey, &identity.transport_signature) {
+        (None, None) => {} // Older metadata has no live-key proof.
+        (Some(public), Some(signature)) => {
+            let _: [u8; 32] = hex::decode(public)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid live transport public key"))?;
+            let signature =
+                ed25519_dalek::Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature)?)?;
+            key.verify_strict(
+                konsensus_api::remote_access::transport_proof_message(&identity.node_id, public)
+                    .as_bytes(),
+                &signature,
+            )
+            .context("public live transport signature invalid; start unlocked to repair")?;
+        }
+        _ => anyhow::bail!("incomplete live transport proof; start unlocked to repair"),
+    }
     Ok(identity)
 }
 
@@ -188,4 +205,103 @@ pub async fn serve_locked_mode(
     .await
     .context("locked listeners did not stop before startup")??;
     Ok(password)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use konsensus_api::remote_access::public_identity_proofs;
+    use serde_json::Value;
+
+    fn fixture() -> (tempfile::TempDir, PairingService, Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::from_mnemonic(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "",
+        ).unwrap();
+        let pairing = PairingService::open(
+            dir.path(),
+            identity_fingerprint(&identity.node_id().to_hex()),
+            false,
+        )
+        .unwrap();
+        let document = Value::Object(public_identity_proofs(
+            &identity,
+            &pairing.box_transport_pubkey(),
+        ));
+        std::fs::create_dir_all(dir.path().join("identity")).unwrap();
+        (dir, pairing, document)
+    }
+
+    fn save(dir: &Path, document: &Value) {
+        std::fs::write(
+            dir.join("identity/identity.json"),
+            serde_json::to_vec(document).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn read_identity_accepts_signed_live_transport_and_legacy_metadata() {
+        let (dir, pairing, mut document) = fixture();
+        save(dir.path(), &document);
+        assert!(read_identity(dir.path(), &pairing).is_ok());
+        document.as_object_mut().unwrap().remove("transport_pubkey");
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("transport_signature");
+        save(dir.path(), &document);
+        assert!(read_identity(dir.path(), &pairing).is_ok());
+    }
+
+    #[test]
+    fn read_identity_refuses_invalid_live_transport_proofs() {
+        let (dir, pairing, document) = fixture();
+        for field in ["transport_pubkey", "transport_signature"] {
+            let mut partial = document.clone();
+            partial.as_object_mut().unwrap().remove(field);
+            save(dir.path(), &partial);
+            assert!(
+                read_identity(dir.path(), &pairing).is_err(),
+                "missing {field}"
+            );
+            for value in ["", "malformed"] {
+                let mut malformed = document.clone();
+                malformed[field] = value.into();
+                save(dir.path(), &malformed);
+                assert!(
+                    read_identity(dir.path(), &pairing).is_err(),
+                    "malformed {field}"
+                );
+            }
+        }
+        let mut tampered = document.clone();
+        let mut signature = URL_SAFE_NO_PAD
+            .decode(document["transport_signature"].as_str().unwrap())
+            .unwrap();
+        signature[0] ^= 1;
+        tampered["transport_signature"] = URL_SAFE_NO_PAD.encode(signature).into();
+        save(dir.path(), &tampered);
+        assert!(
+            read_identity(dir.path(), &pairing).is_err(),
+            "tampered signature"
+        );
+
+        let mut wrong_key = document.clone();
+        wrong_key["transport_pubkey"] = hex::encode([42; 32]).into();
+        save(dir.path(), &wrong_key);
+        assert!(
+            read_identity(dir.path(), &pairing).is_err(),
+            "wrong live key"
+        );
+
+        let mut wrong_domain = document.clone();
+        wrong_domain["transport_signature"] = document["box_transport_signature"].clone();
+        save(dir.path(), &wrong_domain);
+        assert!(
+            read_identity(dir.path(), &pairing).is_err(),
+            "wrong proof domain"
+        );
+    }
 }
