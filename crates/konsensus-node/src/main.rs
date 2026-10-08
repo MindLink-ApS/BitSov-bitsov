@@ -835,7 +835,9 @@ fn channel_peers_for_start(
     if source == PasswordSource::RemoteUnlock
         && matches!(lightning, LightningConfig::Ldk { lsps2_service, .. } if lsps2_service.enabled)
     {
-        anyhow::bail!("HUB_ONLY_WHILE_LOCKABLE: --remote-unlock cannot run an LSPS2 service");
+        anyhow::bail!(
+            "HUB_ONLY_WHILE_LOCKABLE: --remote-unlock or --home cannot run an LSPS2 service"
+        );
     }
     if source == PasswordSource::RemoteUnlock {
         guarded_lightning::ChannelPeers::hub_only(lightning)

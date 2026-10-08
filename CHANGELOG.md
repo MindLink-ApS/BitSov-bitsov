@@ -14,6 +14,7 @@ also live on the corresponding GitHub pre-release pages.
 - Deduplicate invoice payment hashes and optional payment request IDs within
   each grant, atomically with budget reservation and across restarts. Retry
   storms receive `duplicate_payment` without another debit or dispatch.
+
 ### Node
 
 - Add `konsensus start --home` as the home-box mode: remote unlock plus local
@@ -25,6 +26,7 @@ also live on the corresponding GitHub pre-release pages.
   with forced restart on exit 75 and bounded restart attempts. The
   [installation guide](docs/operations/home-node.md#install-the-system-service)
   supports installing it before first-device enrollment on an empty box.
+
 ### Security
 
 - Safe-restore PR1 (#271): bind `ldk/INSTANCE` to the host, filesystem/volume
