@@ -7,6 +7,14 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Security
 
+- Add per-box, owner-console-only claim codes and opt-in SAS v1 for remote
+  first-run and device enrollment. Four BIP-39 words bind the completed Noise
+  transcript, committed device key, fresh box nonce and physical claim code.
+  Finalization requires the matching digest and device proof. One pending
+  ceremony, 15-minute SAS expiry, and three mismatch/cancel attempts per run
+  limit grinding. Existing clients retain their approval flows; box UI/app
+  integration follows separately.
+
 - Add owner-approved optional spend-grant payee allowlists. Unlisted payees
   fail closed with `payee_not_allowed`; grants without a list keep their
   existing recipient rules. Pairing store version 5 prevents older nodes from

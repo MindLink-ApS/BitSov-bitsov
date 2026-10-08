@@ -427,11 +427,21 @@ struct PendingIdentity {
     failed_backup_attempts: u8,
     /// `blake3(password)` from a remote create-pending; `None` locally.
     password_commitment: Option<[u8; 32]>,
+    #[zeroize(skip)]
+    sas: Option<PendingSas>,
+}
+
+struct PendingSas {
+    device_key: [u8; 65],
+    device_name: String,
+    binding: crate::sas::NoiseBinding,
+    digest: blake3::Hash,
 }
 
 impl PendingIdentity {
     fn expired(&self) -> bool {
-        self.created_at.elapsed() >= std::time::Duration::from_secs(30 * 60)
+        self.created_at.elapsed()
+            >= std::time::Duration::from_secs(if self.sas.is_some() { 15 * 60 } else { 30 * 60 })
     }
 }
 
@@ -448,6 +458,12 @@ pub struct CreatePendingResponse {
     pub expires_at: i64,
     /// Three distinct zero-based word positions.
     pub backup_check: [usize; 3],
+    /// Opt-in SAS protocol version (absent for legacy clients).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sas_version: Option<u8>,
+    /// Fresh 16-byte nonce, lowercase hex. No SAS/claim commitment is returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub box_nonce: Option<String>,
 }
 
 /// Device proof of possession; it is not owner approval.
@@ -468,6 +484,20 @@ pub struct DeviceEnrollment {
 pub struct RemoteCreatePendingBody {
     /// Lowercase hex `blake3(password)`.
     pub password_commitment: String,
+    /// Explicit SAS protocol opt-in.
+    pub sas_version: Option<u8>,
+    /// Key and label committed before the box generates its nonce.
+    pub device: Option<CommittedDevice>,
+}
+
+/// Device commitment carried by SAS create-pending, before proof at finalize.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedDevice {
+    /// Uncompressed P-256 SEC1 key, hex.
+    pub public_key: String,
+    /// Device label, bound for this ceremony.
+    pub name: String,
 }
 
 /// No password is accepted on the loopback path; see [`RemoteOwner`].
@@ -480,6 +510,10 @@ pub struct FinalizeBody {
     pub backup_words: [Zeroizing<String>; 3],
     /// Required only in enrollment mode.
     pub device: Option<DeviceEnrollment>,
+    /// Must be 1 for an SAS ceremony; omission cannot downgrade it.
+    pub sas_version: Option<u8>,
+    /// Full 32-byte SAS digest as lowercase hex.
+    pub sas_digest: Option<String>,
 }
 
 /// Terminal local first-run result. Contains no phrase.
@@ -728,6 +762,8 @@ pub struct BootstrapState {
     local: Option<LocalOwnerHooks>,
     remote: Option<RemoteOwner>,
     pending: Mutex<Option<PendingIdentity>>,
+    sas_failures: std::sync::atomic::AtomicU8,
+    sas_started_at: tokio::time::Instant,
 }
 
 impl BootstrapState {
@@ -748,6 +784,8 @@ impl BootstrapState {
             local: None,
             remote: None,
             pending: Mutex::new(None),
+            sas_failures: std::sync::atomic::AtomicU8::new(0),
+            sas_started_at: tokio::time::Instant::now(),
         }
     }
 
@@ -833,7 +871,7 @@ impl BootstrapState {
         body: FinalizeBody,
         fault: CommitFault,
     ) -> Result<FinalizeResponse, (StatusCode, String)> {
-        self.finalize_with(client_id, body, None, fault)
+        self.finalize_with(client_id, body, None, None, fault)
     }
 
     /// Remote first-run finalize. The caller has already verified that the
@@ -844,9 +882,10 @@ impl BootstrapState {
         client_id: &str,
         body: FinalizeBody,
         password: Zeroizing<String>,
+        noise: Option<crate::sas::NoiseBinding>,
         fault: CommitFault,
     ) -> Result<FinalizeResponse, (StatusCode, String)> {
-        self.finalize_with(client_id, body, Some(password), fault)
+        self.finalize_with(client_id, body, Some(password), noise, fault)
     }
 
     fn finalize_with(
@@ -854,6 +893,7 @@ impl BootstrapState {
         client_id: &str,
         body: FinalizeBody,
         password: Option<Zeroizing<String>>,
+        noise: Option<crate::sas::NoiseBinding>,
         fault: CommitFault,
     ) -> Result<FinalizeResponse, (StatusCode, String)> {
         let _guard = self
@@ -883,6 +923,36 @@ impl BootstrapState {
         if pending.ceremony_id != body.ceremony_id {
             return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
         }
+        if self.sas_failures.load(Ordering::SeqCst) >= 3 {
+            return Err(ceremony_error(StatusCode::FORBIDDEN, "setup_closed"));
+        }
+        if let Some(sas) = &pending.sas {
+            if noise != Some(sas.binding) {
+                return Err(ceremony_error(
+                    StatusCode::FORBIDDEN,
+                    "ceremony_noise_mismatch",
+                ));
+            }
+            if self.sas_started_at.elapsed() >= std::time::Duration::from_secs(900) {
+                *slot = None;
+                return Err(ceremony_error(StatusCode::GONE, "setup_expired"));
+            }
+            let digest = body
+                .sas_digest
+                .as_deref()
+                .and_then(|s| blake3::Hash::from_hex(s).ok());
+            let device_matches = body.device.as_ref().is_some_and(|d| {
+                crate::sas::device_key(&d.public_key).ok() == Some(sas.device_key)
+                    && d.name == sas.device_name
+            });
+            if body.sas_version != Some(1) || digest != Some(sas.digest) || !device_matches {
+                self.sas_failures.fetch_add(1, Ordering::SeqCst);
+                *slot = None;
+                return Err(ceremony_error(StatusCode::BAD_REQUEST, "sas_mismatch"));
+            }
+        } else if body.sas_version.is_some() || body.sas_digest.is_some() {
+            return Err(ceremony_error(StatusCode::BAD_REQUEST, "unexpected_sas"));
+        }
         let remote_hooks = match (password, &self.remote) {
             (Some(password), Some(owner)) => {
                 let commitment = pending.password_commitment.ok_or_else(|| {
@@ -895,6 +965,9 @@ impl BootstrapState {
                 if blake3::hash(password.as_bytes()) != blake3::Hash::from(commitment) {
                     pending.failed_backup_attempts += 1;
                     if pending.failed_backup_attempts >= 3 {
+                        if pending.sas.is_some() {
+                            self.sas_failures.fetch_add(1, Ordering::SeqCst);
+                        }
                         *slot = None;
                         return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
                     }
@@ -926,6 +999,9 @@ impl BootstrapState {
         {
             pending.failed_backup_attempts += 1;
             if pending.failed_backup_attempts >= 3 {
+                if pending.sas.is_some() {
+                    self.sas_failures.fetch_add(1, Ordering::SeqCst);
+                }
                 *slot = None;
                 return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
             }
@@ -943,6 +1019,7 @@ impl BootstrapState {
                     &device.public_key,
                     &device.name,
                     &device.proof,
+                    pending.sas.as_ref().map(|s| &s.digest),
                 )
                 .map_err(|e| {
                     if matches!(e, PairingError::BadProof) {
@@ -1389,7 +1466,7 @@ async fn create_pending(
     auth: BootstrapAuth,
     State(state): State<Arc<BootstrapState>>,
 ) -> Result<Json<CreatePendingResponse>, BootstrapError> {
-    begin_pending(&state, auth.client_id, None).map(Json)
+    begin_pending(&state, auth.client_id, None, None).map(Json)
 }
 
 /// Remote first run: tunnel only, and the password is committed to up front.
@@ -1405,13 +1482,45 @@ async fn create_pending_remote(
     .then(|| blake3::Hash::from_hex(&body.password_commitment).ok())
     .flatten()
     .ok_or_else(|| ceremony_error(StatusCode::BAD_REQUEST, "invalid_password_commitment"))?;
-    begin_pending(&state, auth.client_id, Some(*commitment.as_bytes())).map(Json)
+    let sas = match (body.sas_version, body.device) {
+        (None, None) => None,
+        (Some(1), Some(device)) => {
+            let key = crate::sas::device_key(&device.public_key)
+                .map_err(|code| ceremony_error(StatusCode::BAD_REQUEST, code))?;
+            if device.name.trim().is_empty()
+                || device.name.len() > 128
+                || device.name.chars().any(char::is_control)
+            {
+                return Err(ceremony_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_device_name",
+                ));
+            }
+            let binding = state
+                .remote
+                .as_ref()
+                .and_then(|r| peer.and_then(|p| r.tunnel.noise(p.0)))
+                .filter(|n| n.client_id.as_ref() == auth.client_id)
+                .ok_or_else(|| {
+                    ceremony_error(StatusCode::FORBIDDEN, "noise_transcript_required")
+                })?;
+            Some((key, device.name, binding.binding))
+        }
+        _ => {
+            return Err(ceremony_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_sas_version_or_device",
+            ))
+        }
+    };
+    begin_pending(&state, auth.client_id, Some(*commitment.as_bytes()), sas).map(Json)
 }
 
 fn begin_pending(
     state: &BootstrapState,
     client_id: String,
     password_commitment: Option<[u8; 32]>,
+    sas_input: Option<([u8; 65], String, crate::sas::NoiseBinding)>,
 ) -> Result<CreatePendingResponse, BootstrapError> {
     use rand::seq::SliceRandom;
     let _guard = state
@@ -1433,6 +1542,34 @@ fn begin_pending(
     if slot.is_some() {
         return Err(ceremony_error(StatusCode::CONFLICT, "ceremony_in_progress"));
     }
+    if state.sas_failures.load(Ordering::SeqCst) >= 3 {
+        return Err(ceremony_error(StatusCode::FORBIDDEN, "setup_closed"));
+    }
+    if sas_input.is_some()
+        && state.sas_started_at.elapsed() >= std::time::Duration::from_secs(15 * 60)
+    {
+        return Err(ceremony_error(StatusCode::GONE, "setup_expired"));
+    }
+    // All inputs and the exclusive pending slot are committed before this RNG call.
+    let (sas, box_nonce) = if let Some((device_key, device_name, binding)) = sas_input {
+        use rand::RngCore;
+        let claim = crate::sas::load(&state.layout.data_dir)
+            .map_err(|_| ceremony_error(StatusCode::CONFLICT, "claim_code_unavailable"))?;
+        let mut nonce = [0; 16];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let digest = crate::sas::digest(&binding, &device_key, &nonce, &claim.commitment());
+        (
+            Some(PendingSas {
+                device_key,
+                device_name,
+                binding,
+                digest,
+            }),
+            Some(hex::encode(nonce)),
+        )
+    } else {
+        (None, None)
+    };
     let (mnemonic, identity) = konsensus_core::NodeIdentity::generate().map_err(|_| {
         ceremony_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1455,13 +1592,21 @@ fn begin_pending(
         backup_check,
         failed_backup_attempts: 0,
         password_commitment,
+        sas,
     });
     Ok(CreatePendingResponse {
         ceremony_id,
         node_id,
         mnemonic,
-        expires_at: chrono::Utc::now().timestamp() + 1800,
+        expires_at: chrono::Utc::now().timestamp()
+            + if box_nonce.is_some() {
+                900i64.saturating_sub(state.sas_started_at.elapsed().as_secs() as i64)
+            } else {
+                1800
+            },
         backup_check,
+        sas_version: box_nonce.as_ref().map(|_| 1),
+        box_nonce,
     })
 }
 
@@ -1483,6 +1628,8 @@ struct RemoteFinalizeBody<'a> {
     ceremony_id: String,
     backup_words: [Zeroizing<String>; 3],
     device: Option<DeviceEnrollment>,
+    sas_version: Option<u8>,
+    sas_digest: Option<String>,
     #[serde(borrow)]
     password: &'a serde_json::value::RawValue,
 }
@@ -1497,6 +1644,11 @@ async fn finalize_remote(
     request: Request,
 ) -> Result<Json<FinalizeResponse>, BootstrapError> {
     state.tunnel_peer_is(peer, &auth.client_id)?;
+    let noise = state
+        .remote
+        .as_ref()
+        .and_then(|r| peer.and_then(|p| r.tunnel.noise(p.0)))
+        .map(|n| n.binding);
     let bad = || ceremony_error(StatusCode::BAD_REQUEST, "invalid_finalize_body");
     let raw = crate::locked::body::read(request).await.ok_or_else(bad)?;
     let wire: RemoteFinalizeBody<'_> = serde_json::from_slice(&raw).map_err(|_| bad())?;
@@ -1505,9 +1657,11 @@ async fn finalize_remote(
         ceremony_id: wire.ceremony_id,
         backup_words: wire.backup_words,
         device: wire.device,
+        sas_version: wire.sas_version,
+        sas_digest: wire.sas_digest,
     };
     state
-        .finalize_remote(&auth.client_id, body, password, CommitFault::None)
+        .finalize_remote(&auth.client_id, body, password, noise, CommitFault::None)
         .map(Json)
 }
 
@@ -1538,6 +1692,9 @@ async fn cancel_pending(
         if ceremony_id != "current" && ceremony_id != pending.ceremony_id {
             return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
         }
+    }
+    if slot.as_ref().is_some_and(|p| p.sas.is_some()) {
+        state.sas_failures.fetch_add(1, Ordering::SeqCst);
     }
     *slot = None;
     Ok(StatusCode::NO_CONTENT)

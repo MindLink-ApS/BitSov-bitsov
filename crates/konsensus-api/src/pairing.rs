@@ -648,6 +648,7 @@ struct Inner {
     owner_confirmations: HashMap<String, OwnerConfirmation>,
     // Wrong grant confirmations in this run (see `OWNER_CODE_FAILURES_PER_RUN`).
     owner_code_failures: u32,
+    sas_failures: u8,
     // Requests cancelled by wrong codes in this run, so their status reads
     // `lost` (their durable records are deleted, so a restart cannot revive them).
     cancelled_ops: std::collections::HashMap<String, String>,
@@ -878,6 +879,7 @@ impl PairingService {
                 identity_fingerprint,
                 owner_confirmations: HashMap::new(),
                 owner_code_failures: 0,
+                sas_failures: 0,
                 cancelled_ops: std::collections::HashMap::new(),
                 first_contact: HashMap::new(),
             }),

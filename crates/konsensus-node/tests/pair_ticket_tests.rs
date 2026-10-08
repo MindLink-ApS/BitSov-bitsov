@@ -291,3 +291,35 @@ listen_addr = "127.0.0.1:18443"
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn claim_code_cli_requires_owner_console_and_never_writes_secret_to_pipes() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (code, _) = konsensus_api::sas::initialize(dir.path()).unwrap();
+    let mut secret = Vec::new();
+    code.write_local(&mut secret).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_konsensus"));
+    command
+        .args(["claim-code", "--show", "--config"])
+        .arg(dir.path().join("konsensus.toml"));
+    // SAFETY: setsid has no pointer arguments; detach the child from any owner terminal.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(!output.stdout.windows(secret.len()).any(|s| s == secret));
+    assert!(!output.stderr.windows(secret.len()).any(|s| s == secret));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("owner console"));
+    assert_eq!(
+        std::fs::read(dir.path().join("claim-code")).unwrap(),
+        secret
+    );
+}
