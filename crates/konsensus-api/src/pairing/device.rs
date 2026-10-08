@@ -1128,6 +1128,19 @@ impl PairingService {
                 "the device key changed while checking; sign again".into(),
             ));
         }
+        // A device intent must not reset a console grant's breakers, including
+        // unresolved failure slots. The owner must revoke that grant first.
+        if inner.file.grants.iter().any(|g| {
+            g.client_id == client_id
+                && g.epoch == epoch
+                && g.identity_fingerprint == node
+                && g.is_live(now)
+                && g.budget.as_ref().is_some_and(|b| !b.recipients_only)
+        }) {
+            return Err(PairingError::Malformed(
+                "a live console grant must be revoked through the owner console before opening a relation grant".into(),
+            ));
+        }
         let before = (inner.file.grants.clone(), inner.file.intent_nonces.clone());
 
         let nonce_key = format!("{}:{}", key.key_id, intent.nonce);
@@ -1159,8 +1172,8 @@ impl PairingService {
         let idx = match live_idx {
             Some(idx) => idx,
             None => {
-                // A relation grant replaces a console budget window: one
-                // budget per client, and the device is the owner's now.
+                // Retire expired grants before opening a new relation window.
+                // A live console budget was refused above.
                 for old in &mut inner.file.grants {
                     if old.client_id == client_id {
                         old.budget = None;

@@ -253,6 +253,18 @@ pub enum Command {
     /// `front_door` (publish the front-door card only) takes no budget:
     /// `konsensus grant --op <id> [--for 1h]`.
     Grant {
+        /// Maximum positive payment attempts in a rolling minute (default 10).
+        #[arg(long)]
+        max_payments_per_minute: Option<u64>,
+        /// Maximum positive payment attempts in a rolling hour (default 60).
+        #[arg(long)]
+        max_payments_per_hour: Option<u64>,
+        /// Pause after this many consecutive failed payments (default 5).
+        #[arg(long)]
+        max_consecutive_failures: Option<u64>,
+        /// Maximum all-in reserved sats in a rolling 10 minutes (default 1000).
+        #[arg(long)]
+        max_sats_per_10_minutes: Option<u64>,
         /// Allow only these payees (node ID or Lightning pubkey). Repeatable.
         #[arg(long, conflicts_with = "deny_all_payees")]
         payee: Vec<String>,
@@ -314,9 +326,17 @@ pub enum Command {
         config: PathBuf,
     },
 
-    /// Revoke spend grants now, without touching the pairing (G1).
-    ///
-    /// The client keeps read+receive; spend stops on its next request.
+    /// Reset the exact grant's circuit breakers; retain budget and pending payments.
+    GrantResetBreakers {
+        #[arg(long)]
+        client_id: String,
+        #[arg(long = "op")]
+        grant_op_id: String,
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
+
+    /// Revoke spend grants without touching the pairing.
     GrantRevoke {
         /// Client whose grant to revoke.
         #[arg(long, conflicts_with = "all", required_unless_present = "all")]

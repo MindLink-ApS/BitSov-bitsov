@@ -16,6 +16,14 @@ async fn grant(
     stdin: &str,
     reply: impl Fn(&ControlRequest) -> ControlResponse + Send + 'static,
 ) -> (std::process::Output, Vec<ControlRequest>) {
+    grant_with_args(stdin, &[], reply).await
+}
+
+async fn grant_with_args(
+    stdin: &str,
+    args: &[&str],
+    reply: impl Fn(&ControlRequest) -> ControlResponse + Send + 'static,
+) -> (std::process::Output, Vec<ControlRequest>) {
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::UnixListener::bind(dir.path().join("control.sock")).unwrap();
     let server = tokio::spawn(async move {
@@ -24,7 +32,12 @@ async fn grant(
             tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
         {
             let (reader, mut writer) = stream.into_split();
-            let line = BufReader::new(reader).lines().next_line().await.unwrap().unwrap();
+            let line = BufReader::new(reader)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
             let request: ControlRequest = serde_json::from_str(&line).unwrap();
             let response = reply(&request);
             seen.push(request);
@@ -37,6 +50,7 @@ async fn grant(
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_konsensus"))
         .args(["grant", "--op", "ab12", "--config"])
         .arg(dir.path().join("konsensus.toml"))
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -66,7 +80,9 @@ fn described(request: &ControlRequest) -> ControlResponse {
             front_door: false,
             device: None,
         },
-        _ => ControlResponse::Ok { detail: "granted spend to client c1".into() },
+        _ => ControlResponse::Ok {
+            detail: "granted spend to client c1".into(),
+        },
     }
 }
 
@@ -74,14 +90,27 @@ fn described(request: &ControlRequest) -> ControlResponse {
 async fn one_step_grant_sends_the_typed_code_after_the_terms() {
     let (output, seen) = grant("k7qm-3xwd\n", described).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{stdout}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let terms_at = stdout.find("YOU ARE GRANTING").expect("terms printed");
-    let ask_at = stdout.find("type the approval code").expect("code asked for");
-    assert!(terms_at < ask_at, "the terms come before the question: {stdout}");
+    let ask_at = stdout
+        .find("type the approval code")
+        .expect("code asked for");
+    assert!(
+        terms_at < ask_at,
+        "the terms come before the question: {stdout}"
+    );
     assert!(!stdout.contains("[y/N]"), "{stdout}");
     assert!(stdout.contains("granted spend"), "{stdout}");
     match &seen[..] {
-        [ControlRequest::Describe { op_id }, ControlRequest::Grant { op_id: granted, confirmation, terms }] => {
+        [ControlRequest::Describe { op_id }, ControlRequest::Grant {
+            op_id: granted,
+            confirmation,
+            terms,
+        }] => {
             assert_eq!((op_id.as_str(), granted.as_str()), ("ab12", "ab12"));
             // Sent as typed; the node normalizes and compares.
             assert_eq!(confirmation, "k7qm-3xwd");
@@ -105,11 +134,57 @@ async fn an_empty_line_cancels_and_sends_nothing() {
 #[tokio::test]
 async fn a_lost_request_fails_before_asking_for_a_code() {
     let (output, seen) = grant("K7QM-3XWD\n", |_| ControlResponse::Error {
-        message: "this request can no longer be approved: the node restarted. Ask again from the app".into(),
+        message:
+            "this request can no longer be approved: the node restarted. Ask again from the app"
+                .into(),
     })
     .await;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Ask again"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("type the approval code"));
     assert_eq!(seen.len(), 1);
+}
+
+#[tokio::test]
+async fn owner_breaker_flags_are_reviewed_and_sent_with_units_checked() {
+    let (output, seen) = grant_with_args(
+        "k7qm-3xwd\n",
+        &[
+            "--max-payments-per-minute",
+            "3",
+            "--max-payments-per-hour",
+            "20",
+            "--max-consecutive-failures",
+            "2",
+            "--max-sats-per-10-minutes",
+            "110",
+        ],
+        described,
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout
+        .contains("3 payments/min, 20 payments/hour; pause after 2 failures; 110 sats/10 min"));
+    match &seen[..] {
+        [_, ControlRequest::Grant { terms, .. }] => {
+            assert_eq!(terms.breakers.max_payments_per_minute, 3);
+            assert_eq!(terms.breakers.max_payments_per_hour, 20);
+            assert_eq!(terms.breakers.max_consecutive_failures, 2);
+            assert_eq!(terms.breakers.max_msat_per_10_minutes, 110_000);
+        }
+        _ => panic!("expected approved grant"),
+    }
+    for (flag, value) in [
+        ("--max-payments-per-minute", "0"),
+        ("--max-sats-per-10-minutes", "18446744073709551615"),
+    ] {
+        let (output, seen) = grant_with_args("ignored\n", &[flag, value], described).await;
+        assert!(!output.status.success());
+        assert!(matches!(&seen[..], [ControlRequest::Describe { .. }]));
+    }
 }

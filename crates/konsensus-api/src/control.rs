@@ -135,6 +135,11 @@ pub enum ControlRequest {
         /// Key id.
         key_id: String,
     },
+    /// Owner-only reset of breaker history and pause on an exact grant.
+    ResetGrantBreakers {
+        client_id: String,
+        grant_op_id: String,
+    },
     /// Revoke spend grants now — one client's, or every client's.
     RevokeGrant {
         /// Client whose grant to revoke; `None` revokes all.
@@ -564,6 +569,12 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
             },
             Err(e) => error(e),
         },
+        ControlRequest::ResetGrantBreakers { client_id, grant_op_id } => {
+            match service.reset_grant_breakers(&client_id, &grant_op_id) {
+                Ok(()) => ControlResponse::Ok { detail: format!("reset circuit breakers for {client_id}, grant {grant_op_id}; budget and pending payments retained") },
+                Err(e) => error(e),
+            }
+        }
         ControlRequest::RevokeGrant { client_id } => {
             match service.revoke_grants(client_id.as_deref()) {
                 Ok(n) => ControlResponse::Ok {
@@ -1062,6 +1073,10 @@ fn encode_request(req: &ControlRequest) -> Result<Zeroizing<Vec<u8>>, serde_json
             owner_signature,
         } => fields!("approve-device-key", op_id, confirmation, owner_signature),
         ControlRequest::RevokeDeviceKey { key_id } => fields!("revoke-device-key", key_id),
+        ControlRequest::ResetGrantBreakers {
+            client_id,
+            grant_op_id,
+        } => fields!("reset-grant-breakers", client_id, grant_op_id),
         ControlRequest::RevokeGrant { client_id } => fields!("revoke-grant", client_id),
         ControlRequest::ApproveReplacement {
             op_id,
@@ -1115,26 +1130,46 @@ async fn handle_local(
     req: ControlRequest,
 ) -> ControlResponse {
     let ControlRequest::ApproveGift {
-        intro_id, newcomer, payment_hash, gift_msat, fee_max_msat, code,
-    } = req else {
+        intro_id,
+        newcomer,
+        payment_hash,
+        gift_msat,
+        fee_max_msat,
+        code,
+    } = req
+    else {
         return handle(ctx, req);
     };
     let Some(state) = state.filter(|state| {
         ctx.service.owner_control_enabled()
-            && state.pairing.as_ref().is_some_and(|service| Arc::ptr_eq(service, &ctx.service))
+            && state
+                .pairing
+                .as_ref()
+                .is_some_and(|service| Arc::ptr_eq(service, &ctx.service))
     }) else {
-        return ControlResponse::Error { message: "owner sponsor service unavailable".into() };
+        return ControlResponse::Error {
+            message: "owner sponsor service unavailable".into(),
+        };
     };
     let body = crate::handlers::sponsor::ApproveRequest {
-        intro_id, newcomer, payment_hash, gift_msat, fee_max_msat, code,
+        intro_id,
+        newcomer,
+        payment_hash,
+        gift_msat,
+        fee_max_msat,
+        code,
     };
     let auth = crate::metered::MeteredSpend::owner_control(state);
     match crate::handlers::sponsor::approve_owner(auth, Arc::clone(state), body).await {
         Ok(axum::Json(paid)) => ControlResponse::Ok {
-            detail: format!("gift {}: {:?}; paid {} msat, fee {} msat, payment hash {}",
-                paid.intro_id, paid.state, paid.paid_msat, paid.fee_paid_msat, paid.payment_hash),
+            detail: format!(
+                "gift {}: {:?}; paid {} msat, fee {} msat, payment hash {}",
+                paid.intro_id, paid.state, paid.paid_msat, paid.fee_paid_msat, paid.payment_hash
+            ),
         },
-        Err(e) => ControlResponse::Error { message: e.to_string() },
+        Err(e) => ControlResponse::Error {
+            message: e.to_string(),
+        },
     }
 }
 
@@ -1147,13 +1182,14 @@ mod wire_tests {
         let fixtures = [
             r#"{"op":"status"}"#,
             r#"{"op":"describe","op_id":"test"}"#,
-            r#"{"op":"grant","op_id":"test","confirmation":"yes","terms":{"allow_liquidity_fees":false,"budget_msat":1000,"per_call_max_msat":100,"per_recipient_msat":{},"ttl_secs":60}}"#,
+            r#"{"op":"grant","op_id":"test","confirmation":"yes","terms":{"breakers":{"max_payments_per_minute":10,"max_payments_per_hour":60,"max_consecutive_failures":5,"max_msat_per_10_minutes":1000000},"allow_liquidity_fees":false,"budget_msat":1000,"per_call_max_msat":100,"per_recipient_msat":{},"ttl_secs":60}}"#,
             r#"{"op":"grant-front-door","op_id":"test","confirmation":"yes","ttl_secs":60}"#,
             r#"{"op":"approve-first-contact","client_id":"client","grant_op_id":"grant","recipient":"recipient","max_total_msat":100,"contact_budget_msat":null}"#,
             r#"{"op":"approve-gift","intro_id":"intro","newcomer":"node","payment_hash":"hash","gift_msat":100,"fee_max_msat":1,"code":"123456"}"#,
             r#"{"op":"approve-device-key","op_id":"test","confirmation":"yes","owner_signature":"sig"}"#,
             r#"{"op":"revoke-device-key","key_id":"key"}"#,
             r#"{"op":"revoke-grant","client_id":null}"#,
+            r#"{"op":"reset-grant-breakers","client_id":"client","grant_op_id":"grant"}"#,
             r#"{"op":"approve-replacement","op_id":"test","confirmation":"yes","mnemonic":"abandon \" \\ \n about"}"#,
             r#"{"op":"revoke","client_id":"client","keep_pairing":false}"#,
             r#"{"op":"open-window","seconds":60}"#,

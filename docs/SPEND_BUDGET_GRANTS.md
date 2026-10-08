@@ -6,8 +6,8 @@ A paired client's `spend` now comes only from a **budget grant**: an absolute
 expiry (at most 24 h), a total budget, optional per-recipient budgets and a
 per-call maximum. The 30-day unmetered grant is gone. A pre-G1 grant without a
 budget is dropped when the pairing store is opened and is never honoured. The
-store is now version 5. Older nodes refuse to open it rather than ignore
-allowlists or payment deduplication; existing version 2–4 grants remain readable.
+store is now version 6. Older nodes refuse to open it rather than ignore
+allowlists, payment deduplication or circuit breakers; existing version 2–5 grants remain readable.
 
 ## Owner flow (one command per budget window)
 
@@ -91,6 +91,93 @@ again with a new ID. An invoice hash cannot be retried under the same grant.
 The ledger holds at most 4096 identifiers per grant; reaching that bound
 refuses new identified payments (`reason: ledger`) rather than evicting records.
 No payment identifiers are exposed in the grant view.
+
+## Circuit breakers (N2)
+
+New grants default to **10 payment attempts per rolling minute, 60 per rolling
+hour, 5 consecutive failures, and 1,000 sats per rolling 10 minutes**. These
+limits supplement the total, recipient and per-call caps. The owner chooses
+other positive limits when granting, for example:
+
+```sh
+konsensus grant --op <id> --budget 1000 --per-call 55 \
+  --max-payments-per-minute 3 --max-payments-per-hour 20 \
+  --max-consecutive-failures 3 --max-sats-per-10-minutes 110
+```
+
+The approval summary shows all four limits. The owner socket's `GrantTerms`
+accepts a `breakers` object with `max_payments_per_minute`,
+`max_payments_per_hour`, `max_consecutive_failures` and
+`max_msat_per_10_minutes`. Zero is invalid, never an off switch. The CLI uses
+owner flags or conservative defaults, never an app proposal to widen breakers.
+New device relation grants also receive the defaults; renewing an envelope
+preserves its grant's history and pause. A device intent cannot replace a live
+console grant: revoke it through the owner console first. This prevents a
+conversion from clearing breakers or unresolved failure slots.
+
+Every positive charge counts as an attempt, including each room fan-out member
+and any extra reservation for admission. A combined first-contact approval
+reserves admission plus its first message as one charge, so it counts as one
+attempt and one terminal outcome; velocity includes their full combined amount.
+Empty or zero-value charges do not
+consume rate or velocity capacity. The full all-in reservation, including the
+fee ceiling, counts toward velocity. Failure or a lower final fee does **not**
+refund that rolling allowance. A provider overrun adds the excess at resolution.
+Refused reservations consume nothing. The atomic pairing-store transaction
+checks all limits and records history before authorizing dispatch. History uses
+one-second buckets for the previous hour; windows are `(now - window, now]`.
+A persisted clock high-water mark prevents a backward clock step from granting
+fresh capacity. Forward wall-clock movement expires rolling history normally;
+grant expiry remains an independent absolute deadline.
+
+Each terminal positive recipient reservation resolves once: zero paid
+(including a known pre-dispatch refusal) increments the failure streak; a known
+positive settlement resets the streak. Outcomes are ordered by their atomic
+resolution, not request start time. At the threshold, the grant latches paused.
+A later success, elapsed time, token refresh, envelope renewal or restart cannot
+unpause it. Pending/unknown payments consume possible failure slots as well:
+a crash between backend failure and durable resolution must not give the client
+fresh attempts. `failure_limit_pending` blocks when those slots are exhausted;
+known resolution can free them. A room's charges for the same recipient resolve
+as one aggregated recipient outcome. This accounting deliberately favors
+refusing uncertain work over under-counting it.
+
+HTTP refusals remain 409 with `code: budget_exceeded` and a clear `reason`:
+`rate_limit_minute`, `rate_limit_hour`, `velocity_limit`, `grant_paused`, or
+`failure_limit_pending`. The first three recover as their rolling usage ages
+out. Pausing also blocks reserved work at the existing dispatch authority gate;
+a payment already handed to the backend cannot be recalled.
+
+`konsensus pair-status`, owner socket status and `/api/v1/pair/grant` expose a
+`breakers` view: limits, minute/hour attempt counts, reserved msat in the last
+10 minutes, consecutive failures, unresolved payments, and `paused`.
+The owner console alone can reset the exact reviewed grant:
+
+```sh
+konsensus grant-reset-breakers --client-id <id> --op <grant-op-id>
+```
+
+This clears rolling history, the failure streak and the pause atomically. It
+preserves spent budget, pending/unknown reservations, expiry, payee restrictions
+and consumed payment IDs. Thus a reset cannot refund money or make an uncertain
+payment safe to repeat; pending failure slots still apply. There is no paired
+HTTP or device-intent reset operation. Reset requires the owner control channel
+and names the grant operation to prevent resetting a replacement by accident.
+A failed write refuses reservation/reset and restores the previous meter; a
+failed resolution retains the original reservation and its possible failure slot.
+
+**Legacy compatibility:** persisted grants without breaker fields receive
+`u64::MAX` for all four limits. No finite new threshold can guarantee preserving
+all previously approved usage patterns; this explicit grandfathering adds no
+new restriction to those already bounded, at-most-24-hour grants. Their next
+owner-approved replacement uses conservative defaults. Legacy grants do not gain
+burst protection until replaced. Relation-envelope renewal also preserves grandfathered limits,
+so legacy relation grants need explicit replacement to gain these protections.
+Existing history cannot be reconstructed.
+The schema upgrade prevents older nodes from silently ignoring the new limits.
+Direct payment audit rows (`spend.payment_result`) include pairing ID, epoch,
+route, API result and refusal reason, without invoice, memo, payee or request ID.
+Reservation/resolution/reset diagnostics also name pairing and grant operation.
 
 ## What is debited, and when
 

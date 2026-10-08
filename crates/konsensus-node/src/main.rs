@@ -201,6 +201,10 @@ async fn main() -> Result<()> {
             owner_cmd::cmd_pair_status(&config).await?;
         }
         Command::Grant {
+            max_payments_per_minute,
+            max_payments_per_hour,
+            max_consecutive_failures,
+            max_sats_per_10_minutes,
             payee,
             deny_all_payees,
             op_id,
@@ -213,6 +217,10 @@ async fn main() -> Result<()> {
             allow_liquidity_fees,
         } => {
             let flags = owner_cmd::GrantFlags {
+                max_payments_per_minute,
+                max_payments_per_hour,
+                max_consecutive_failures,
+                max_sats_per_10_minutes,
                 payees: payee,
                 deny_all_payees,
                 allow_liquidity_fees,
@@ -222,6 +230,13 @@ async fn main() -> Result<()> {
                 recipients: recipient,
             };
             owner_cmd::cmd_grant(&config, &op_id, flags).await?;
+        }
+        Command::GrantResetBreakers {
+            client_id,
+            grant_op_id,
+            config,
+        } => {
+            owner_cmd::cmd_grant_reset_breakers(&config, client_id, grant_op_id).await?;
         }
         Command::GrantRevoke {
             client_id,
