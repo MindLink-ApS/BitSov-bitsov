@@ -211,3 +211,155 @@ fn local_device_grant_dispatch_and_staging_keep_deadlines_and_deployment_gates()
         ));
     }
 }
+
+#[test]
+fn payment_dedupe_and_allowlist_survive_restart_and_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].clone();
+    let peer = "aa".repeat(32);
+    {
+        let mut inner = service.lock();
+        inner.file.grants[0]
+            .budget
+            .as_mut()
+            .unwrap()
+            .payee_allowlist = Some([peer.clone()].into());
+        service.persist(&mut inner.file).unwrap();
+    }
+    let charges = vec![Charge {
+        recipient: peer.clone(),
+        amount_msat: 1000,
+    }];
+    let ids = vec!["hash:payment".into(), "request:retry".into()];
+    let reservation = service
+        .reserve_payment(
+            &client.client_id,
+            client.epoch,
+            charges.clone(),
+            ids.clone(),
+        )
+        .unwrap();
+    service.resolve_spend(&reservation, &peer, 500);
+    drop(service);
+    let service = PairingService::open(dir.path(), "identity".into(), true).unwrap();
+    for id in &ids {
+        assert_eq!(
+            service.reserve_payment(
+                &client.client_id,
+                client.epoch,
+                charges.clone(),
+                vec![id.clone()]
+            ),
+            Err(BudgetRefusal::DuplicatePayment)
+        );
+    }
+    let stored = service.reload_from_disk().unwrap();
+    let budget = stored.grants[0].budget.as_ref().unwrap();
+    assert_eq!(budget.used_msat, 500);
+    assert!(budget.pending.is_empty());
+    assert_eq!(budget.payment_ids.len(), 2);
+    assert!(matches!(
+        service.reserve_payment(
+            &client.client_id,
+            client.epoch,
+            vec![Charge {
+                recipient: "bb".repeat(32),
+                amount_msat: 1000
+            }],
+            vec!["request:new".into()]
+        ),
+        Err(BudgetRefusal::PayeeNotAllowed { .. })
+    ));
+    // Refused payments did not consume their IDs; a corrected request can proceed.
+    service
+        .reserve_payment(
+            &client.client_id,
+            client.epoch,
+            charges,
+            vec!["request:new".into()],
+        )
+        .unwrap();
+    assert_eq!(
+        service.reload_from_disk().unwrap().grants[0]
+            .budget
+            .as_ref()
+            .unwrap()
+            .used_msat,
+        1500
+    );
+}
+
+#[test]
+fn payment_dedupe_rolls_back_with_failed_persistence_and_never_evicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = first_contact_service(dir.path());
+    let client = service.snapshot().clients[0].clone();
+    let charges = vec![Charge {
+        recipient: "aa".repeat(32),
+        amount_msat: 1000,
+    }];
+    // A directory in the temporary-file slot forces a real write failure.
+    let blocked = service.file_path.with_extension("json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    assert!(matches!(
+        service.reserve_payment(
+            &client.client_id,
+            client.epoch,
+            charges.clone(),
+            vec!["request:retry".into()]
+        ),
+        Err(BudgetRefusal::Ledger(_))
+    ));
+    assert_eq!(
+        service.snapshot().grants[0]
+            .budget
+            .as_ref()
+            .unwrap()
+            .used_msat,
+        0
+    );
+    std::fs::remove_dir(blocked).unwrap();
+    service
+        .reserve_payment(
+            &client.client_id,
+            client.epoch,
+            charges.clone(),
+            vec!["request:retry".into()],
+        )
+        .unwrap();
+    {
+        let mut inner = service.lock();
+        let budget = inner.file.grants[0].budget.as_mut().unwrap();
+        budget
+            .payment_ids
+            .extend((0..4095).map(|n| format!("request:{n}")));
+        service.persist(&mut inner.file).unwrap();
+    }
+    assert!(matches!(
+        service.reserve_payment(
+            &client.client_id,
+            client.epoch,
+            charges.clone(),
+            vec!["request:overflow".into()]
+        ),
+        Err(BudgetRefusal::Ledger(_))
+    ));
+    assert_eq!(
+        service.reserve_payment(
+            &client.client_id,
+            client.epoch,
+            charges,
+            vec!["request:retry".into()]
+        ),
+        Err(BudgetRefusal::DuplicatePayment)
+    );
+    assert_eq!(
+        service.reload_from_disk().unwrap().grants[0]
+            .budget
+            .as_ref()
+            .unwrap()
+            .used_msat,
+        1000
+    );
+}

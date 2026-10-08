@@ -5,6 +5,15 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+### Security
+
+- Add owner-approved optional spend-grant payee allowlists. Unlisted payees
+  fail closed with `payee_not_allowed`; grants without a list keep their
+  existing recipient rules. Pairing store version 5 prevents older nodes from
+  ignoring the restrictions.
+- Deduplicate invoice payment hashes and optional payment request IDs within
+  each grant, atomically with budget reservation and across restarts. Retry
+  storms receive `duplicate_payment` without another debit or dispatch.
 ### Node
 
 - Add `konsensus start --home` as the home-box mode: remote unlock plus local

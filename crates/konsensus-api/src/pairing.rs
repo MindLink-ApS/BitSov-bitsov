@@ -488,7 +488,8 @@ impl PairingFile {
 /// read a relation grant as an unrestricted budget, so it refuses the file.
 ///
 /// 4 (remote access): pairings may bind an X25519 transport public key.
-pub const PAIRING_FILE_VERSION: u32 = 4;
+/// 5: optional payee allowlists and durable payment deduplication.
+pub const PAIRING_FILE_VERSION: u32 = 5;
 
 /// A pending pairing request. Held in memory; the challenge itself lives in the
 /// protected file under `data_dir`, which is the actual control.
@@ -660,6 +661,7 @@ type ReservationJournal<'a> = Box<dyn FnOnce(&Reservation) -> Result<(), BudgetR
 /// Authority constraints checked inside the same transaction as the debit.
 #[derive(Default)]
 struct ReservationAuthority<'a> {
+    payment_ids: Vec<String>,
     expected_op_id: Option<&'a str>,
     liquidity: bool,
     before_persist: Option<ReservationJournal<'a>>,
@@ -2899,6 +2901,28 @@ impl PairingService {
         )
     }
 
+    /// Consume payment identities in the same durable transaction as the debit.
+    pub(crate) fn reserve_payment(
+        &self,
+        client_id: &str,
+        epoch: u64,
+        charges: Vec<Charge>,
+        payment_ids: Vec<String>,
+    ) -> Result<Reservation, BudgetRefusal> {
+        let mut inner = self.lock();
+        self.reserve_spend_locked(
+            &mut inner,
+            client_id,
+            epoch,
+            charges,
+            ReservationAuthority {
+                payment_ids,
+                ..Default::default()
+            },
+            || chrono::Utc::now().timestamp(),
+        )
+    }
+
     fn reserve_spend_locked(
         &self,
         inner: &mut Inner,
@@ -2951,12 +2975,30 @@ impl PairingService {
             .budget
             .as_mut()
             .ok_or(BudgetRefusal::NoGrant)?;
+        if authority
+            .payment_ids
+            .iter()
+            .any(|id| budget.payment_ids.contains(id))
+        {
+            return Err(BudgetRefusal::DuplicatePayment);
+        }
+        if budget
+            .payment_ids
+            .len()
+            .saturating_add(authority.payment_ids.len())
+            > 4096
+        {
+            return Err(BudgetRefusal::Ledger(
+                "payment deduplication ledger is full; ask the owner for a new grant".into(),
+            ));
+        }
         if budget.pending.len() >= 1024 {
             return Err(BudgetRefusal::Ledger(
                 "too many unresolved reservations".into(),
             ));
         }
         budget.reserve_at(&charges, now)?;
+        budget.payment_ids.extend(authority.payment_ids);
         let mut recipients = std::collections::BTreeMap::new();
         for charge in &charges {
             *recipients.entry(charge.recipient.clone()).or_insert(0u64) += charge.amount_msat;
@@ -3768,6 +3810,7 @@ pub enum ElevationStatus {
 fn grant_view(g: &SpendGrant) -> Option<GrantView> {
     let b = g.budget.as_ref()?;
     Some(GrantView {
+        payee_allowlist: b.payee_allowlist.clone(),
         allow_liquidity_fees: b.allow_liquidity_fees,
         op_id: g.op_id.clone(),
         client_id: g.client_id.clone(),
