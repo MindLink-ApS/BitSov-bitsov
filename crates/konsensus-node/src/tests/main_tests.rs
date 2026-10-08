@@ -182,6 +182,21 @@ fn restore_creates_config_and_mnemonic() -> Result<()> {
 }
 
 #[test]
+fn restore_fences_embedded_lightning_without_blocking_identity_only_tiers() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let full = tmp.path().join("full");
+    cmd_restore(&full, Some(TEST_MNEMONIC), Some("full"), None)?;
+    assert!(konsensus_lightning::recover::ensure_normal_start(&full.join("ldk")).is_err());
+    for tier in ["light", "cloud"] {
+        let dir = tmp.path().join(tier);
+        cmd_restore(&dir, Some(TEST_MNEMONIC), Some(tier), None)?;
+        konsensus_lightning::recover::ensure_normal_start(&dir.join("ldk"))
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn restore_rejects_already_initialized() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
@@ -189,7 +204,7 @@ fn restore_rejects_already_initialized() -> Result<()> {
     cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None)?;
 
     let err = cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None).unwrap_err();
-    assert!(format!("{err}").contains("already initialized"));
+    assert!(format!("{err}").contains("restore requires an empty directory"));
     Ok(())
 }
 

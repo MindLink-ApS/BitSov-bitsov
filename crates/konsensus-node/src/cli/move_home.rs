@@ -40,12 +40,12 @@ pub struct MoveHomeArgs {
 }
 
 /// Never accept stdin, a pipe, an API bearer, or a device budget as consent.
-fn owner_confirm(expected: &str) -> Result<()> {
+pub(super) fn owner_confirm(expected: &str) -> Result<()> {
     let mut tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")
-        .context("move-home requires the owner's controlling console (/dev/tty)")?;
+        .context("maintenance requires the owner's controlling console (/dev/tty)")?;
     writeln!(tty, "Type exactly to authorize:\n{expected}")?;
     tty.flush()?;
     let mut response = String::new();

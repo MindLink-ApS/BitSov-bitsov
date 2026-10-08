@@ -172,13 +172,41 @@ impl EsploraProvider {
 
     /// Authenticate only the primary; fallbacks retain their existing unauthenticated policy.
     pub fn with_bearer(mut self, auth: Arc<crate::bearer::BearerAuth>) -> Result<Self, ChainError> {
-        self.bearer = Some(auth.transport(&self.endpoints[0].0)
-            .map_err(|e| ChainError::Backend(e.to_string()))?);
+        self.bearer = Some(
+            auth.transport(&self.endpoints[0].0)
+                .map_err(|e| ChainError::Backend(e.to_string()))?,
+        );
         Ok(self)
     }
 
     /// Fall through on transport, HTTP and unusable payload errors. All chain
     /// requests share the same limiter as LDK for each configured API endpoint.
+    pub(crate) async fn recovery_broadcast(&self, raw: &str) -> Result<String, ChainError> {
+        let index = self.active.load(Ordering::Relaxed);
+        let (base, limiter) = &self.endpoints[index];
+        let request = self.client.post(format!("{base}/tx")).body(raw.to_owned());
+        let response = limiter
+            .run(false, || async {
+                match if index == 0 {
+                    self.bearer.as_ref().or(self.transport.as_ref())
+                } else {
+                    self.transport.as_ref()
+                } {
+                    Some(transport) => transport.execute(request).await,
+                    None => Ok(request.send().await?),
+                }
+            })
+            .await
+            .map_err(|_| ChainError::Connection("recovery broadcast unavailable".into()))?;
+        if !response.status().is_success() {
+            return Err(ChainError::Backend("recovery broadcast rejected".into()));
+        }
+        response
+            .text()
+            .await
+            .map_err(|_| ChainError::Backend("recovery broadcast response unavailable".into()))
+    }
+
     async fn get_parsed<T>(
         &self,
         path: &str,
@@ -198,7 +226,11 @@ impl EsploraProvider {
                 let request = self.client.get(format!("{base}{path}")).timeout(timeout);
                 let response = limiter
                     .run(false, || async {
-                        match if index == 0 { self.bearer.as_ref().or(self.transport.as_ref()) } else { self.transport.as_ref() } {
+                        match if index == 0 {
+                            self.bearer.as_ref().or(self.transport.as_ref())
+                        } else {
+                            self.transport.as_ref()
+                        } {
                             Some(transport) => transport.execute(request).await,
                             None => Ok(request.send().await?),
                         }
@@ -235,11 +267,14 @@ impl EsploraProvider {
         Err(last_error)
     }
 
-    async fn get_text(&self, path: &str) -> Result<String, ChainError> {
+    pub(crate) async fn get_text(&self, path: &str) -> Result<String, ChainError> {
         self.get_parsed(path, |text| Ok(text.to_owned())).await
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ChainError> {
+    pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, ChainError> {
         self.get_parsed(path, |text| {
             serde_json::from_str(text)
                 .map_err(|_| ChainError::Backend("invalid Esplora JSON".into()))

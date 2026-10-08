@@ -105,7 +105,9 @@ impl ElectrumConfig {
             Err(_) => host.eq_ignore_ascii_case("localhost"),
         };
         if scheme == "tcp" && !local {
-            return Err("electrum tcp requires loopback or a private LAN IP; use ssl for other hosts");
+            return Err(
+                "electrum tcp requires loopback or a private LAN IP; use ssl for other hosts",
+            );
         }
         Ok(host)
     }
@@ -124,7 +126,7 @@ impl ElectrumProvider {
         Ok(Self { config })
     }
 
-    async fn query<T: Send + 'static>(
+    pub(crate) async fn query<T: Send + 'static>(
         &self,
         operation: impl FnOnce(Client) -> Result<T, ChainError> + Send + 'static,
     ) -> Result<T, ChainError> {
@@ -143,7 +145,8 @@ impl ElectrumProvider {
     /// Electrum not-found (including -5 during propagation) cannot prove absence.
     pub async fn funding_present(&self, txid: &str) -> Result<bool, ChainError> {
         let txid = parse_txid(txid)?;
-        self.query(move |client| funding_presence(txid, client.transaction_get(&txid))).await
+        self.query(move |client| funding_presence(txid, client.transaction_get(&txid)))
+            .await
     }
 
     /// Used after LDK's asynchronous broadcast, against this endpoint only.
@@ -171,7 +174,9 @@ fn funding_presence(
 ) -> Result<bool, ChainError> {
     let tx = result.map_err(rpc_error)?;
     if tx.compute_txid() != txid {
-        return Err(ChainError::Backend("Electrum transaction ID mismatch".into()));
+        return Err(ChainError::Backend(
+            "Electrum transaction ID mismatch".into(),
+        ));
     }
     Ok(true)
 }
@@ -314,7 +319,8 @@ mod funding_tests {
     fn returned_funding_is_present_without_a_confirmation_query() {
         // transaction.get returns the same raw transaction whether confirmed
         // or in the mempool; neither status needs a history/tip lookup.
-        let tx = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin).txdata[0].clone();
+        let tx = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin).txdata[0]
+            .clone();
         assert!(funding_presence(tx.compute_txid(), Ok(tx.clone())).unwrap());
         assert!(funding_presence("ab".repeat(32).parse().unwrap(), Ok(tx)).is_err());
     }
@@ -323,12 +329,21 @@ mod funding_tests {
     fn electrum_cannot_prove_absence_including_minus_five() {
         let txid = "ab".repeat(32).parse().unwrap();
         for code in [-5, -1, -32603] {
-            assert!(funding_presence(txid, Err(electrum_client::Error::Protocol(
-                serde_json::json!({"code":code,"message":"not found"}),
-            ))).is_err());
+            assert!(funding_presence(
+                txid,
+                Err(electrum_client::Error::Protocol(
+                    serde_json::json!({"code":code,"message":"not found"}),
+                ))
+            )
+            .is_err());
         }
-        assert!(funding_presence(txid, Err(electrum_client::Error::IOError(
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "offline"),
-        ))).is_err());
+        assert!(funding_presence(
+            txid,
+            Err(electrum_client::Error::IOError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "offline"
+            ),))
+        )
+        .is_err());
     }
 }

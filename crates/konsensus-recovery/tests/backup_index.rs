@@ -125,6 +125,15 @@ fn exported_stale_backups_keep_funding_and_verified_scripts() {
             Err(BackupError::Decryption)
         );
 
+        // Actual ldk-node MonitorUpdatingPersister adds a two-byte sentinel.
+        let original = monitor_bytes();
+        let mut persisted = vec![0xff, 0xff];
+        persisted.extend_from_slice(&original);
+        std::fs::write(store.join("channel"), persisted).unwrap();
+        let envelope = dir.path().join("sentinel.scb");
+        scb_export::write_monitor_store_scb(dir.path(), &envelope).unwrap();
+        assert!(BackupIndex::from_plaintext(&std::fs::read(envelope).unwrap(), &keys).is_ok());
+
         // Primary production store backend, using the real exporter.
         let sql_dir = tempfile::tempdir().unwrap();
         let conn = rusqlite::Connection::open(sql_dir.path().join("ldk_node_data.sqlite")).unwrap();

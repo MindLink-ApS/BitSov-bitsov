@@ -31,6 +31,8 @@ mod password;
 mod peer_exchange;
 mod pending_handler;
 mod profile_handler;
+#[path = "cli/recover.rs"]
+mod recover_cmd;
 mod relay;
 mod remote_access;
 mod restore_fence;
@@ -284,6 +286,7 @@ async fn main() -> Result<()> {
             cmd_sign_challenge(&mnemonic_path, &passphrase, &challenge)?;
         }
         Command::MoveHome(args) => move_home_cmd::run(args).await?,
+        Command::Recover(args) => recover_cmd::run(args).await?,
         Command::Scb { command } => match command {
             ScbCommand::Restore {
                 from,
@@ -480,6 +483,12 @@ fn cmd_restore(
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create directory: {}", dir.display()))?;
 
+    anyhow::ensure!(
+        std::fs::read_dir(dir)?.next().is_none(),
+        "restore requires an empty directory; never reuse a live store or snapshot"
+    );
+    let _lease = safety::ensure_generation(dir, safety::STATE_GENERATION)?;
+
     let config_path = dir.join("konsensus.toml");
     let mnemonic_path = dir.join("mnemonic.txt");
 
@@ -564,6 +573,13 @@ fn cmd_restore(
     };
     let password_ref = password.as_deref();
 
+    // Fence embedded channel recovery before restored identity/config is usable.
+    // Identity-only tiers have no local Lightning state to recover.
+    let embedded_recovery = matches!(tier, NodeTier::Full);
+    if embedded_recovery {
+        konsensus_lightning::recover::initialize(&dir.join("ldk")).map_err(anyhow::Error::msg)?;
+    }
+
     // Write mnemonic to file
     let final_mnemonic_path =
         mnemonic_crypto::write_mnemonic(&mnemonic_path, &mnemonic, password_ref)
@@ -590,7 +606,14 @@ fn cmd_restore(
         println!("  Encrypted:  yes (AES-256-GCM + argon2id)");
     }
     println!();
-    println!("Run: konsensus start -c {}", config_path.display());
+    if embedded_recovery {
+        println!(
+            "Run: konsensus recover -c {} (preview), then --confirm on the owner console",
+            config_path.display()
+        );
+    } else {
+        println!("Run: konsensus start -c {}", config_path.display());
+    }
     println!();
 
     Ok(())
