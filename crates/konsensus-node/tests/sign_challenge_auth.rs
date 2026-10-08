@@ -32,6 +32,7 @@ async fn owner_router(identity: Arc<NodeIdentity>) -> axum::Router {
     let audit = tempfile::NamedTempFile::new().unwrap();
     let state = Arc::new(konsensus_api::AppState {
         file_staging: Default::default(),
+        tower_serve_status: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap()),
         lightning: Arc::new(konsensus_lightning::MockLightningProvider::new())

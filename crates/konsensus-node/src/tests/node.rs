@@ -18,6 +18,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
     )
     .unwrap();
     NodeConfig {
+        services: Default::default(),
         tower: Default::default(),
         node: Default::default(),
         logging: Default::default(),
@@ -60,6 +61,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
 /// Helper: create a config struct for snapshot tests (no temp dir needed).
 fn snapshot_config(storage: StorageConfig) -> NodeConfig {
     NodeConfig {
+        services: Default::default(),
         tower: Default::default(),
         node: Default::default(),
         logging: Default::default(),
@@ -105,6 +107,68 @@ async fn from_config_mock_backends() {
     assert_eq!(node.node_id().to_hex().len(), 64);
     let reg = node.peer_registry().read().await;
     assert_eq!(reg.len(), 0);
+    let status = node.tower_serve_status.read().unwrap();
+    assert!(!status.enabled);
+    assert!(status.error.is_none());
+    assert!(!dir.path().join("tower").exists());
+}
+
+#[tokio::test]
+async fn tower_startup_unreadable_database_preserves_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.services.tower.enabled = true;
+    // A directory at the database path cannot be opened as SQLite, even as root.
+    std::fs::create_dir_all(dir.path().join("tower/serve.sqlite")).unwrap();
+
+    let node = KonsensusNode::from_config(config, None)
+        .await
+        .expect("a tower-only storage failure must not prevent node construction");
+    let status = node.tower_serve_status.read().unwrap().clone();
+    assert!(!status.enabled);
+    assert!(status.error.as_deref().is_some_and(|e| !e.is_empty()));
+    assert!(node.lightning().is_available().await);
+    assert_eq!(node.storage().count_pending_deliveries().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn tower_startup_lowered_disk_cap_preserves_node() {
+    use sqlx::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.services.tower.enabled = true;
+    let tower_dir = dir.path().join("tower");
+    drop(
+        konsensus_lightning::tower::server::TowerServer::open(&config.services.tower, &tower_dir)
+            .unwrap(),
+    );
+    let mut db = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new().filename(tower_dir.join("serve.sqlite")),
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO sessions VALUES(zeroblob(32),1000000,'[]')")
+        .execute(&mut db)
+        .await
+        .unwrap();
+    sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<200) INSERT INTO blobs(session,hint,seq,nonce,cipher,received) SELECT zeroblob(32),CAST(printf('%016d',i) AS BLOB),i,zeroblob(24),zeroblob(4000),1 FROM n")
+        .execute(&mut db).await.unwrap();
+    db.close().await.unwrap();
+    config.services.tower.max_storage_mb = 1;
+
+    let node = KonsensusNode::from_config(config, None)
+        .await
+        .expect("lowering the tower cap must not prevent node construction");
+    let status = node.tower_serve_status.read().unwrap().clone();
+    assert!(!status.enabled);
+    assert!(status
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("exceeds configured disk cap"));
+    assert!(node.lightning().is_available().await);
+    assert_eq!(node.storage().count_pending_deliveries().await.unwrap(), 0);
 }
 
 #[tokio::test]

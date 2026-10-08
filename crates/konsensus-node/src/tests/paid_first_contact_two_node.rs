@@ -509,6 +509,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         gossip_validator: None,
         file_staging: Default::default(),
+        tower_serve_status: Default::default(),
     });
 
     tokio::spawn(run_msg_handler(MsgHandlerDeps {

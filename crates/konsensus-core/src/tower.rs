@@ -70,3 +70,19 @@ pub fn record_warning(message: &str) {
 pub fn warnings() -> Vec<TowerWarning> {
     WARNINGS.lock().unwrap().clone()
 }
+
+/// Aggregate owner-only tower service diagnostics. Contains no session identifiers.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TowerServeStatus {
+    pub enabled: bool,
+    pub transport_enabled: bool,
+    pub sessions: u64,
+    pub blobs: u64,
+    pub blob_bytes: u64,
+    pub storage_bytes: u64,
+    pub max_storage_bytes: u64,
+    pub breaches_seen: u64,
+    pub breaches_broadcast: u64,
+    pub full: bool,
+    pub error: Option<String>,
+}

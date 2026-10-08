@@ -146,10 +146,23 @@ fn is_invisible_format(c: char) -> bool {
     )
 }
 
+/// Optional services. W3a does not expose tower transport or billing settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServicesConfig {
+    pub tower: konsensus_lightning::tower::server::ServiceConfig,
+}
+
+impl ServicesConfig {
+    fn is_default(&self) -> bool { self == &Self::default() }
+}
+
 /// Top-level node configuration, matching `konsensus.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    #[serde(default, skip_serializing_if = "ServicesConfig::is_default")]
+    pub services: ServicesConfig,
     /// Opt-in local tower client core; transport and payments are W2b.
     #[serde(default)]
     pub tower: konsensus_lightning::tower::TowerConfig,
@@ -1539,6 +1552,12 @@ impl NodeConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.services.tower.validate()?;
+        if self.services.tower.enabled
+            && !matches!(self.chain, ChainConfig::Esplora { .. } | ChainConfig::Bitcoind(_))
+        {
+            anyhow::bail!("tower service requires an Esplora or Bitcoin Core full-block chain source");
+        }
         self.tower.validate()?;
         if !self.tower.clients.is_empty() && !matches!(self.lightning, LightningConfig::Ldk { .. })
         {
@@ -1971,6 +1990,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            services: Default::default(),
             tower: Default::default(),
             node: NodeDisplayConfig::default(),
             logging: Default::default(),

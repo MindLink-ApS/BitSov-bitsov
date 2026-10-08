@@ -602,3 +602,119 @@ async fn bearer_token_failure_uses_existing_fallback_and_reports_actual_host() {
     assert_eq!(view.host.as_deref(), Some("fallback.invalid"));
     assert_eq!(view.trust_level, "third_party");
 }
+
+#[tokio::test]
+async fn tower_full_block_and_exact_broadcast() {
+    use axum::routing::post;
+    let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let hash = block.block_hash().to_string();
+    let raw = bitcoin::consensus::serialize(&block);
+    let tx = block.txdata[0].clone();
+    let expected = hex::encode(bitcoin::consensus::serialize(&tx));
+    let id = tx.compute_txid().to_string();
+    let app = Router::new()
+        .route(
+            "/api/block-height/0",
+            get(move || {
+                let hash = hash.clone();
+                async move { hash }
+            }),
+        )
+        .route(
+            "/api/block/:hash/raw",
+            get(move || {
+                let raw = raw.clone();
+                async move { raw }
+            }),
+        )
+        .route(
+            "/api/tx",
+            post(move |body: String| {
+                let expected = expected.clone();
+                let id = id.clone();
+                async move {
+                    assert_eq!(body, expected);
+                    id
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let provider = EsploraProvider::new(EsploraConfig::custom(
+        format!("http://{address}"),
+        TrustLevel::ServerTrust,
+    ))
+    .unwrap();
+    assert_eq!(provider.get_block(0).await.unwrap(), block);
+    provider.broadcast_transaction(&tx).await.unwrap();
+    task.abort();
+}
+
+#[tokio::test]
+async fn tower_malformed_success_uses_healthy_fallback() {
+    use axum::routing::post;
+    let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let hash = block.block_hash().to_string();
+    let raw = bitcoin::consensus::serialize(&block);
+    let id = block.txdata[0].compute_txid().to_string();
+    let mut tasks = Vec::new();
+    let mut urls = Vec::new();
+    for bad in [true, false] {
+        let hash = hash.clone();
+        let raw = raw.clone();
+        let id = id.clone();
+        let app = Router::new()
+            .route(
+                "/api/block-height/0",
+                get(move || {
+                    let hash = hash.clone();
+                    async move { hash }
+                }),
+            )
+            .route(
+                "/api/block/:hash/raw",
+                get(move || {
+                    let raw = raw.clone();
+                    async move {
+                        if bad {
+                            vec![1, 2]
+                        } else {
+                            raw
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/tx",
+                post(move || {
+                    let id = id.clone();
+                    async move {
+                        if bad {
+                            "not a txid".into()
+                        } else {
+                            id
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("http://{}", listener.local_addr().unwrap()));
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+    }
+    let provider = EsploraProvider::with_fallbacks(
+        EsploraConfig::custom(urls[0].clone(), TrustLevel::ServerTrust),
+        vec![urls[1].clone()],
+    )
+    .unwrap();
+    assert_eq!(provider.get_block(0).await.unwrap(), block);
+    provider
+        .broadcast_transaction(&block.txdata[0])
+        .await
+        .unwrap();
+    for task in tasks {
+        task.abort();
+    }
+}
