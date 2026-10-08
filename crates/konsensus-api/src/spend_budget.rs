@@ -111,10 +111,81 @@ pub const MAX_GRANT_BUDGET_MSAT: u64 = 100_000_000_000;
 /// Most per-recipient budgets one grant may carry.
 pub const MAX_RECIPIENT_BUDGETS: usize = 256;
 
+/// Owner-selected circuit breakers. Zero is invalid, never an off switch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BreakerLimits {
+    pub max_payments_per_minute: u64,
+    pub max_payments_per_hour: u64,
+    pub max_consecutive_failures: u64,
+    pub max_msat_per_10_minutes: u64,
+}
+
+impl Default for BreakerLimits {
+    fn default() -> Self {
+        Self {
+            max_payments_per_minute: 10,
+            max_payments_per_hour: 60,
+            max_consecutive_failures: 5,
+            max_msat_per_10_minutes: 1_000_000,
+        }
+    }
+}
+
+impl BreakerLimits {
+    /// Existing grants must retain the allowance the owner already approved.
+    pub fn legacy() -> Self {
+        Self {
+            max_payments_per_minute: u64::MAX,
+            max_payments_per_hour: u64::MAX,
+            max_consecutive_failures: u64::MAX,
+            max_msat_per_10_minutes: u64::MAX,
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.max_payments_per_minute > 0
+            && self.max_payments_per_hour > 0
+            && self.max_consecutive_failures > 0
+            && self.max_msat_per_10_minutes > 0
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BreakerBucket {
+    payments: u64,
+    msat: u64,
+}
+
+/// Durable rolling history, at most 3600 one-second buckets. Future buckets
+/// are retained on clock rollback; advancing time never resurrects capacity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BreakerState {
+    buckets: BTreeMap<i64, BreakerBucket>,
+    last_at: Option<i64>,
+    consecutive_failures: u64,
+    paused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BreakerStatus {
+    pub limits: BreakerLimits,
+    pub payments_last_minute: u64,
+    pub payments_last_hour: u64,
+    pub reserved_msat_last_10_minutes: u64,
+    pub consecutive_failures: u64,
+    pub unresolved_payments: u64,
+    pub paused: bool,
+}
+
 /// What the owner approves: the numbers that bound one budget window.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GrantTerms {
+    #[serde(default)]
+    pub breakers: BreakerLimits,
     /// Exclusive payee set. None preserves legacy behavior; Some(empty) denies all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payee_allowlist: Option<BTreeSet<String>>,
@@ -142,6 +213,7 @@ impl GrantTerms {
     /// equal to the whole budget, no per-recipient budgets.
     pub fn new(budget_msat: u64) -> Self {
         Self {
+            breakers: BreakerLimits::default(),
             payee_allowlist: None,
             allow_liquidity_fees: false,
             budget_msat,
@@ -172,6 +244,9 @@ impl GrantTerms {
     /// Check every bound and canonicalise recipient keys. A term the node
     /// cannot enforce as written is refused, never silently widened.
     pub fn normalized(self) -> Result<Self, String> {
+        if !self.breakers.valid() {
+            return Err("all circuit breaker limits must be greater than zero".into());
+        }
         if self.budget_msat == 0 {
             return Err("the budget must be greater than zero".into());
         }
@@ -244,6 +319,10 @@ pub fn canonical_recipient(key: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GrantBudget {
+    #[serde(default = "BreakerLimits::legacy")]
+    pub breakers: BreakerLimits,
+    #[serde(default)]
+    pub breaker_state: BreakerState,
     /// Payment identities consumed for this grant's entire lifetime, including failures.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub payment_ids: BTreeSet<String>,
@@ -288,6 +367,8 @@ impl GrantBudget {
     /// A fresh meter for approved terms.
     pub fn from_terms(terms: &GrantTerms) -> Self {
         Self {
+            breakers: terms.breakers.clone(),
+            breaker_state: BreakerState::default(),
             payment_ids: BTreeSet::new(),
             payee_allowlist: terms.payee_allowlist.clone(),
             allow_liquidity_fees: terms.allow_liquidity_fees,
@@ -332,7 +413,8 @@ impl GrantBudget {
             .insert(recipient.to_string(), used.saturating_add(budget_msat));
         self.per_act_max_by_recipient
             .insert(recipient.to_string(), per_act_max_msat);
-        self.recipient_expires_at.insert(recipient.to_string(), expires_at);
+        self.recipient_expires_at
+            .insert(recipient.to_string(), expires_at);
         // The total is what was used plus what every envelope has left.
         self.budget_msat = self
             .budget_msat
@@ -343,7 +425,11 @@ impl GrantBudget {
 
     /// Relation grants: refuse any charge outside a live envelope, or above
     /// its per-act maximum. A no-op for owner console grants.
-    fn check_envelopes(&self, per_recipient: &BTreeMap<&str, u64>, now: i64) -> Result<(), BudgetRefusal> {
+    fn check_envelopes(
+        &self,
+        per_recipient: &BTreeMap<&str, u64>,
+        now: i64,
+    ) -> Result<(), BudgetRefusal> {
         if !self.recipients_only {
             return Ok(());
         }
@@ -358,7 +444,11 @@ impl GrantBudget {
                     remaining_msat: 0,
                 });
             }
-            let per_act = self.per_act_max_by_recipient.get(*recipient).copied().unwrap_or(0);
+            let per_act = self
+                .per_act_max_by_recipient
+                .get(*recipient)
+                .copied()
+                .unwrap_or(0);
             if *amount > per_act {
                 return Err(BudgetRefusal::PerCall { max_msat: per_act });
             }
@@ -368,7 +458,11 @@ impl GrantBudget {
 
     /// Whether every recipient still has a live envelope at `now`. Always
     /// true for an owner console grant, whose only deadline is the grant's.
-    pub fn envelopes_live<'a>(&self, mut recipients: impl Iterator<Item = &'a String>, now: i64) -> bool {
+    pub fn envelopes_live<'a>(
+        &self,
+        mut recipients: impl Iterator<Item = &'a String>,
+        now: i64,
+    ) -> bool {
         !self.recipients_only
             || recipients.all(|r| self.recipient_expires_at.get(r).is_some_and(|at| *at > now))
     }
@@ -381,7 +475,138 @@ impl GrantBudget {
             *entry = entry.saturating_add(charge.amount_msat);
         }
         self.check_envelopes(&per_recipient, now)?;
-        self.reserve(charges)
+        let now = self.breaker_state.last_at.map_or(now, |last| now.max(last));
+        let count = charges.iter().filter(|c| c.amount_msat > 0).count() as u64;
+        let total = charges
+            .iter()
+            .try_fold(0u64, |n, c| n.checked_add(c.amount_msat))
+            .ok_or(BudgetRefusal::VelocityLimit)?;
+        let status = self.breaker_status(now);
+        if !self.breakers.valid() {
+            return Err(BudgetRefusal::Ledger(
+                "invalid circuit breaker limits".into(),
+            ));
+        }
+        if status.paused {
+            return Err(BudgetRefusal::GrantPaused);
+        }
+        // Unknown outcomes still consume a possible failure slot. This closes
+        // the crash gap between backend failure and durable resolution.
+        if count
+            > self.breakers.max_consecutive_failures.saturating_sub(
+                status
+                    .consecutive_failures
+                    .saturating_add(status.unresolved_payments),
+            )
+        {
+            return Err(BudgetRefusal::FailuresPending);
+        }
+        if count
+            > self
+                .breakers
+                .max_payments_per_minute
+                .saturating_sub(status.payments_last_minute)
+        {
+            return Err(BudgetRefusal::RateLimitMinute);
+        }
+        if count
+            > self
+                .breakers
+                .max_payments_per_hour
+                .saturating_sub(status.payments_last_hour)
+        {
+            return Err(BudgetRefusal::RateLimitHour);
+        }
+        if total
+            > self
+                .breakers
+                .max_msat_per_10_minutes
+                .saturating_sub(status.reserved_msat_last_10_minutes)
+        {
+            return Err(BudgetRefusal::VelocityLimit);
+        }
+        self.reserve(charges)?;
+        if count > 0 {
+            self.breaker_state
+                .buckets
+                .retain(|at, _| *at > now.saturating_sub(3600));
+            let bucket = self.breaker_state.buckets.entry(now).or_default();
+            bucket.payments = bucket.payments.saturating_add(count);
+            bucket.msat = bucket.msat.saturating_add(total);
+            self.breaker_state.last_at = Some(now);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.breaker_state.paused
+    }
+
+    pub fn breaker_status(&self, now: i64) -> BreakerStatus {
+        let now = self.breaker_state.last_at.map_or(now, |last| now.max(last));
+        let mut status = BreakerStatus {
+            limits: self.breakers.clone(),
+            payments_last_minute: 0,
+            payments_last_hour: 0,
+            reserved_msat_last_10_minutes: 0,
+            consecutive_failures: self.breaker_state.consecutive_failures,
+            unresolved_payments: self
+                .pending
+                .values()
+                .flat_map(|r| r.values())
+                .filter(|v| **v > 0)
+                .count() as u64,
+            paused: self.breaker_state.paused,
+        };
+        for (at, bucket) in &self.breaker_state.buckets {
+            if *at > now.saturating_sub(60) {
+                status.payments_last_minute =
+                    status.payments_last_minute.saturating_add(bucket.payments);
+            }
+            if *at > now.saturating_sub(600) {
+                status.reserved_msat_last_10_minutes = status
+                    .reserved_msat_last_10_minutes
+                    .saturating_add(bucket.msat);
+            }
+            if *at > now.saturating_sub(3600) {
+                status.payments_last_hour =
+                    status.payments_last_hour.saturating_add(bucket.payments);
+            }
+        }
+        status
+    }
+
+    /// Called only after consuming a durable pending recipient, exactly once.
+    pub(crate) fn record_outcome(&mut self, reserved: u64, actual: u64, now: i64) {
+        if reserved == 0 && actual == 0 {
+            return;
+        }
+        if actual == 0 {
+            self.breaker_state.consecutive_failures =
+                self.breaker_state.consecutive_failures.saturating_add(1);
+            if self.breaker_state.consecutive_failures >= self.breakers.max_consecutive_failures {
+                self.breaker_state.paused = true;
+            }
+        } else {
+            self.breaker_state.consecutive_failures = 0;
+        }
+        if actual > reserved {
+            let now = self.breaker_state.last_at.map_or(now, |last| now.max(last));
+            self.breaker_state
+                .buckets
+                .retain(|at, _| *at > now.saturating_sub(3600));
+            let bucket = self.breaker_state.buckets.entry(now).or_default();
+            bucket.msat = bucket.msat.saturating_add(actual - reserved);
+            if reserved == 0 {
+                bucket.payments = bucket.payments.saturating_add(1);
+            }
+            self.breaker_state.last_at = Some(now);
+        }
+    }
+
+    /// Owner console only. Budget, pending reservations and dedupe survive.
+    pub(crate) fn reset_breakers(&mut self) {
+        self.breaker_state = BreakerState::default();
     }
 
     /// Budget left, msat.
@@ -391,7 +616,7 @@ impl GrantBudget {
 
     /// Check a call's charges against every bound and, only if all pass,
     /// reserve them. Either every charge is reserved or none is.
-    pub fn reserve(&mut self, charges: &[Charge]) -> Result<(), BudgetRefusal> {
+    fn reserve(&mut self, charges: &[Charge]) -> Result<(), BudgetRefusal> {
         let mut call_total: u64 = 0;
         let mut per_recipient: BTreeMap<&str, u64> = BTreeMap::new();
         for charge in charges {
@@ -515,6 +740,18 @@ impl Reservation {
 /// Why a debit was refused. Nothing was reserved and nothing was dispatched.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BudgetRefusal {
+    #[error("grant paused after consecutive failures; owner console reset required")]
+    GrantPaused,
+    #[error(
+        "unresolved payments exhaust the failure allowance; await resolution or ask the owner"
+    )]
+    FailuresPending,
+    #[error("grant payment rate exceeds the rolling minute limit")]
+    RateLimitMinute,
+    #[error("grant payment rate exceeds the rolling hour limit")]
+    RateLimitHour,
+    #[error("grant spend velocity exceeds the rolling 10 minute limit")]
+    VelocityLimit,
     #[error(
         "payment hash or request ID already used within this grant — no new payment dispatched"
     )]
@@ -560,6 +797,11 @@ impl BudgetRefusal {
     /// Stable machine-readable reason, returned alongside `budget_exceeded`.
     pub fn reason(&self) -> &'static str {
         match self {
+            BudgetRefusal::GrantPaused => "grant_paused",
+            BudgetRefusal::FailuresPending => "failure_limit_pending",
+            BudgetRefusal::RateLimitMinute => "rate_limit_minute",
+            BudgetRefusal::RateLimitHour => "rate_limit_hour",
+            BudgetRefusal::VelocityLimit => "velocity_limit",
             BudgetRefusal::DuplicatePayment => "duplicate_payment",
             BudgetRefusal::PayeeNotAllowed { .. } => "payee_not_allowed",
             BudgetRefusal::NoGrant => "no_grant",
@@ -576,6 +818,7 @@ impl BudgetRefusal {
 /// A grant as reported to the client that holds it and to the owner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GrantView {
+    pub breakers: BreakerStatus,
     /// Exclusive payee set. None preserves legacy behavior; Some(empty) denies all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payee_allowlist: Option<BTreeSet<String>>,
@@ -621,7 +864,14 @@ pub fn describe_terms(terms: &GrantTerms) -> String {
         sats(terms.per_call_max_msat),
         human_duration(terms.ttl_secs)
     );
-    out.push_str(if terms.allow_liquidity_fees { "\n  LSP fees:      allowed, within this same budget" } else { "\n  LSP fees:      not authorized" });
+    out.push_str(&format!("\n  breakers:      {} payments/min, {} payments/hour; pause after {} failures; {} sats/10 min",
+        terms.breakers.max_payments_per_minute, terms.breakers.max_payments_per_hour,
+        terms.breakers.max_consecutive_failures, sats(terms.breakers.max_msat_per_10_minutes)));
+    out.push_str(if terms.allow_liquidity_fees {
+        "\n  LSP fees:      allowed, within this same budget"
+    } else {
+        "\n  LSP fees:      not authorized"
+    });
     if let Some(payees) = &terms.payee_allowlist {
         out.push_str("\n  allowed payees: only the following (empty means deny all)");
         for key in payees {
@@ -873,7 +1123,6 @@ mod tests {
     }
 }
 
-
 /// Reconciliation identity only; never restores dispatch authority.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OperationReservationLink {
@@ -887,30 +1136,177 @@ mod envelope_tests {
     use super::*;
 
     fn charge(recipient: &str, amount_msat: u64) -> Charge {
-        Charge { recipient: recipient.to_string(), amount_msat }
+        Charge {
+            recipient: recipient.to_string(),
+            amount_msat,
+        }
     }
-
 
     #[test]
     fn a_relation_envelope_binds_recipient_per_act_and_time() {
         let mut b = GrantBudget::relations();
         b.open_envelope("aa", 10_000, 4_000, 100);
         // Unlisted recipients are refused even with budget left.
-        assert!(matches!(b.reserve_at(&[charge("bb", 1)], 50), Err(BudgetRefusal::Recipient { .. })));
-        assert!(matches!(b.reserve_at(&[charge("aa", 4_001)], 50), Err(BudgetRefusal::PerCall { .. })));
+        assert!(matches!(
+            b.reserve_at(&[charge("bb", 1)], 50),
+            Err(BudgetRefusal::Recipient { .. })
+        ));
+        assert!(matches!(
+            b.reserve_at(&[charge("aa", 4_001)], 50),
+            Err(BudgetRefusal::PerCall { .. })
+        ));
         b.reserve_at(&[charge("aa", 4_000)], 50).unwrap();
         // At and after the envelope's end: refused, nothing debited.
         let used = b.used_msat;
-        assert!(matches!(b.reserve_at(&[charge("aa", 1)], 100), Err(BudgetRefusal::Recipient { .. })));
+        assert!(matches!(
+            b.reserve_at(&[charge("aa", 1)], 100),
+            Err(BudgetRefusal::Recipient { .. })
+        ));
         assert_eq!(b.used_msat, used);
         // Renewal adds on top of what was used; other envelopes keep theirs.
         b.open_envelope("bb", 5_000, 5_000, 200);
         b.open_envelope("aa", 10_000, 4_000, 200);
         assert_eq!(b.per_recipient_msat["aa"], 14_000);
         assert_eq!(b.budget_msat, 4_000 + 10_000 + 5_000);
-        b.reserve_at(&[charge("aa", 4_000), charge("bb", 5_000)], 150).unwrap();
+        b.reserve_at(&[charge("aa", 4_000), charge("bb", 5_000)], 150)
+            .unwrap();
         // An owner console grant is unaffected by envelopes.
         let mut console = GrantBudget::from_terms(&GrantTerms::new(10_000));
         console.reserve_at(&[charge("zz", 1_000)], 0).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod breaker_tests {
+    use super::*;
+
+    #[test]
+    fn default_breakers_stop_a_burst_without_debiting_the_refusal() {
+        let mut budget = GrantBudget::from_terms(&GrantTerms::new(1_000_000));
+        let charges = [Charge {
+            recipient: "aa".into(),
+            amount_msat: 1,
+        }];
+        for _ in 0..10 {
+            budget.reserve_at(&charges, 100).unwrap();
+        }
+        let before = budget.clone();
+        assert_eq!(
+            budget.reserve_at(&charges, 100).unwrap_err().reason(),
+            "rate_limit_minute"
+        );
+        assert_eq!(budget, before);
+        budget.reserve_at(&charges, 160).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod breaker_boundaries {
+    use super::*;
+    fn budget() -> GrantBudget {
+        let mut terms = GrantTerms::new(10_000_000);
+        terms.breakers = BreakerLimits {
+            max_payments_per_minute: 2,
+            max_payments_per_hour: 3,
+            max_consecutive_failures: 2,
+            max_msat_per_10_minutes: 100,
+        };
+        GrantBudget::from_terms(&terms)
+    }
+    fn pay(msat: u64) -> Vec<Charge> {
+        vec![Charge {
+            recipient: "aa".into(),
+            amount_msat: msat,
+        }]
+    }
+    #[test]
+    fn rolling_limits_count_fanout_and_do_not_refund_failed_attempts() {
+        let mut b = budget();
+        b.reserve_at(&[pay(20)[0].clone(), pay(20)[0].clone()], 100)
+            .unwrap();
+        assert_eq!(
+            b.reserve_at(&pay(1), 159).unwrap_err().reason(),
+            "rate_limit_minute"
+        );
+        b.resolve("aa", 40, 0);
+        b.reserve_at(&pay(60), 160).unwrap();
+        assert_eq!(
+            b.reserve_at(&pay(1), 220).unwrap_err().reason(),
+            "rate_limit_hour"
+        );
+        b.breakers.max_payments_per_hour = 100;
+        assert_eq!(
+            b.reserve_at(&pay(1), 220).unwrap_err().reason(),
+            "velocity_limit"
+        );
+        b.reserve_at(&pay(40), 700).unwrap();
+        assert_eq!(
+            b.reserve_at(&pay(1), 699).unwrap_err().reason(),
+            "velocity_limit"
+        );
+        b.reserve_at(&pay(60), 760).unwrap();
+    }
+    #[test]
+    fn hour_boundary_and_provider_overruns_remain_conservative() {
+        let mut b = budget();
+        b.breakers.max_payments_per_minute = 10;
+        b.breakers.max_msat_per_10_minutes = 10_000;
+        for _ in 0..3 {
+            b.reserve_at(&pay(1), 100).unwrap();
+        }
+        assert_eq!(
+            b.reserve_at(&pay(1), 3699).unwrap_err().reason(),
+            "rate_limit_hour"
+        );
+        b.reserve_at(&pay(1), 3700).unwrap();
+        b.record_outcome(1, 10_001, 3701);
+        assert_eq!(
+            b.reserve_at(&pay(1), 3701).unwrap_err().reason(),
+            "velocity_limit"
+        );
+        // Clock rollback and serialization cannot erase that overrun.
+        let mut reopened: GrantBudget =
+            serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(
+            reopened.reserve_at(&pay(1), 100).unwrap_err().reason(),
+            "velocity_limit"
+        );
+        reopened.reserve_at(&pay(1), 4301).unwrap();
+        reopened.breakers.max_payments_per_hour = 10;
+        reopened.record_outcome(0, 10_001, 4400);
+        assert_eq!(reopened.breaker_status(4400).payments_last_minute, 1);
+        assert_eq!(
+            reopened.reserve_at(&pay(1), 4400).unwrap_err().reason(),
+            "velocity_limit"
+        );
+    }
+
+    #[test]
+    fn refusals_are_atomic_and_overflow_cannot_bypass_breakers() {
+        let mut b = budget();
+        let before = b.clone();
+        assert!(b.reserve_at(&pay(101), 100).is_err());
+        assert_eq!(b, before);
+        assert!(b
+            .reserve_at(&[pay(u64::MAX)[0].clone(), pay(1)[0].clone()], 100)
+            .is_err());
+        assert_eq!(b, before);
+        b.reserve_at(&[], 100).unwrap();
+        b.reserve_at(&pay(0), 100).unwrap();
+        assert_eq!(b.breaker_status(100).payments_last_minute, 0);
+    }
+    #[test]
+    fn old_grants_keep_legacy_limits_but_new_terms_default_to_breakers() {
+        let mut value = serde_json::to_value(budget()).unwrap();
+        value.as_object_mut().unwrap().remove("breakers");
+        value.as_object_mut().unwrap().remove("breaker_state");
+        let mut legacy: GrantBudget = serde_json::from_value(value).unwrap();
+        for _ in 0..100 {
+            legacy.reserve_at(&pay(10_000), 100).unwrap();
+        }
+        assert_eq!(legacy.used_msat, 1_000_000);
+        let mut terms = GrantTerms::new(1_000);
+        terms.breakers.max_payments_per_minute = 0;
+        assert!(terms.normalized().is_err());
     }
 }

@@ -305,13 +305,13 @@ fn malformed_keys_and_names_are_refused() {
 fn a_signed_intent_opens_a_recipient_bound_envelope() {
     let tmp = tempfile::tempdir().unwrap();
     let (service, _, client, device, key_id) = registered(tmp.path());
-    let i = intent(&key_id, PEER, 200_000, 20_000);
+    let i = intent(&key_id, PEER, 80_000, 20_000);
     let sig = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
     let view = service
         .apply_relation_intent(&client.client_id, client.epoch, &i, &sig)
         .unwrap();
     assert!(view.recipients_only);
-    assert_eq!(view.per_recipient_msat.get(PEER), Some(&200_000));
+    assert_eq!(view.per_recipient_msat.get(PEER), Some(&80_000));
     assert_eq!(view.per_act_max_by_recipient.get(PEER), Some(&20_000));
 
     // The pairing's token now carries spend.
@@ -348,7 +348,8 @@ fn a_signed_intent_opens_a_recipient_bound_envelope() {
         matches!(other, BudgetRefusal::Recipient { .. }),
         "{other:?}"
     );
-    for _ in 0..9 {
+    // Stay below breaker limits so this test isolates recipient exhaustion.
+    for _ in 0..3 {
         service
             .reserve_spend(&client.client_id, client.epoch, charge(PEER, 20_000))
             .unwrap();
@@ -367,7 +368,7 @@ fn a_signed_intent_opens_a_recipient_bound_envelope() {
         .grant_view_for(&client.client_id)
         .unwrap()
         .used_by_recipient[PEER];
-    assert_eq!(used, 200_000, "exactly the envelope, never more");
+    assert_eq!(used, 80_000, "exactly the envelope, never more");
 
     // A new tap renews the envelope on top of what was used.
     let again = intent(&key_id, PEER, 50_000, 20_000);
@@ -637,7 +638,7 @@ fn revoking_the_key_or_the_pairing_ends_the_envelopes() {
 }
 
 #[test]
-fn a_relation_grant_replaces_a_console_budget_window() {
+fn a_relation_grant_requires_console_revocation_before_replacing_its_budget() {
     let tmp = tempfile::tempdir().unwrap();
     let (service, console, client, device, key_id) = registered(tmp.path());
     let op = service
@@ -654,9 +655,16 @@ fn a_relation_grant_replaces_a_console_budget_window() {
     service
         .reserve_spend(&client.client_id, client.epoch, charge(OTHER, 1_000))
         .unwrap();
-    // ...until the device opens an envelope: one budget per client, recipient-bound.
+    // A device intent must not erase the console grant's breaker history,
+    // limits or unresolved outcomes. Only an owner console revocation permits it.
     let i = intent(&key_id, PEER, 10_000, 10_000);
     let s = device.sign(&intent_message(&fingerprint(), &client.client_id, &i));
+    let before = service.grant_views();
+    assert!(service
+        .apply_relation_intent(&client.client_id, client.epoch, &i, &s)
+        .is_err());
+    assert_eq!(service.grant_views(), before);
+    service.revoke_grants(Some(&client.client_id)).unwrap();
     service
         .apply_relation_intent(&client.client_id, client.epoch, &i, &s)
         .unwrap();
