@@ -1,4 +1,6 @@
-//! Stable OS identity probes. No hostname, boot ID, device number or random fallback.
+//! Stable OS identity probes. No hostname, boot ID or random fallback.
+//! On Linux the volume id is `statfs` `f_fsid`; on XFS and F2FS that value is
+//! derived from the device number, so renumbering a device can change the binding.
 use anyhow::{Context, Result};
 use std::path::Path;
 

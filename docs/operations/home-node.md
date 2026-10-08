@@ -719,6 +719,9 @@ store (under the configured mnemonic's parent). It records a random instance ID
 and a hash binding it to the machine and the filesystem containing `ldk/`.
 Linux uses `/etc/machine-id` (with `/var/lib/dbus/machine-id` as a fallback) and
 the kernel filesystem ID; macOS uses `IOPlatformUUID` and the volume UUID.
+On XFS and F2FS, Linux `statfs` `f_fsid` is derived from the device number, so
+renumbering a device can trip `host_binding_mismatch` on a legitimate live
+store (fail-closed; `konsensus rebind-instance` is the fix).
 Raw machine IDs are not saved. A changed host or filesystem refuses startup
 before LDK is constructed; `move-home` also checks the fence. Missing, invalid
 or unavailable platform IDs fail closed with an explanation, including during
