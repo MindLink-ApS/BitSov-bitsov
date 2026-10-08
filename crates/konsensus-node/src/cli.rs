@@ -17,6 +17,9 @@ pub struct Cli {
 pub enum Command {
     /// Print a one-use enrollment ticket (and optionally a terminal QR).
     PairTicket {
+        /// Emit the strict v1 schema using only the first endpoint for older apps.
+        #[arg(long)]
+        legacy: bool,
         #[arg(short, long, default_value = "konsensus.toml")]
         config: PathBuf,
         #[arg(long)]

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use konsensus_api::{
     pairing::{fsync_dir_strict, load_box_transport_key, restrict_dir, write_protected},
-    remote_access::{PairLink, VERSION},
+    remote_access::{PairLink, PAIR_LINK_VERSION},
 };
 use rand::RngCore;
 
@@ -81,20 +81,26 @@ pub fn set_locked(dir: &Path, locked: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_pair_ticket(config_path: &Path, qr: bool, ttl: Duration) -> Result<()> {
+pub fn cmd_pair_ticket(config_path: &Path, qr: bool, ttl: Duration, legacy: bool) -> Result<()> {
     let config = NodeConfig::load_before_identity_validation(config_path)?;
     config.node.validate()?;
     anyhow::ensure!(
         config.remote_access.listen_addr.is_some(),
         "remote access is disabled"
     );
-    let endpoint = config
-        .remote_access
-        .advertised_endpoint
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .context("remote access advertised_endpoint is missing")?;
+    let listen_addr = config.remote_access.listen_addr.unwrap();
+    let endpoints = if listen_addr.port() == 0 {
+        // The daemon's signed descriptor below contains the actual bound port.
+        // A pre-bootstrap CLI can only use an explicit externally dialable hint.
+        config
+            .remote_access
+            .advertised_endpoint
+            .iter()
+            .cloned()
+            .collect()
+    } else {
+        crate::endpoints::discover(&config.remote_access, listen_addr)?
+    };
     let data = data_dir_of(config_path);
     let dir = data.join("pairing");
     let _guard = lock_ticket(&dir)?;
@@ -107,8 +113,10 @@ pub fn cmd_pair_ticket(config_path: &Path, qr: bool, ttl: Duration) -> Result<()
         x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*secret)).as_bytes(),
     );
     let mut link = PairLink {
-        v: VERSION,
-        endpoint: endpoint.into(),
+        v: PAIR_LINK_VERSION,
+        endpoint: endpoints.first().cloned().unwrap_or_default(),
+        endpoints,
+        endpoints_signature: None,
         node_id: String::new(),
         transport_pubkey: String::new(),
         transport_signature: String::new(),
@@ -161,6 +169,27 @@ pub fn cmd_pair_ticket(config_path: &Path, qr: bool, ttl: Duration) -> Result<()
             key.verify_strict(message.as_bytes(), &signature)
                 .context("invalid public transport proof")?;
         }
+        let signed_endpoints: Vec<String> = serde_json::from_value(
+            document
+                .get("endpoints")
+                .cloned()
+                .context("start unlocked once to sign remote-access endpoints")?,
+        )?;
+        if listen_addr.port() == 0 {
+            if let Some(configured) = &config.remote_access.advertised_endpoint {
+                anyhow::ensure!(signed_endpoints.first() == Some(configured),
+                    "configured endpoint changed; restart unlocked to refresh the signed descriptor");
+            }
+            link.endpoint = signed_endpoints
+                .first()
+                .cloned()
+                .context("empty signed endpoints")?;
+            link.endpoints = signed_endpoints;
+        } else {
+            anyhow::ensure!(signed_endpoints == link.endpoints,
+                "remote-access endpoints changed; restart unlocked to refresh the signed descriptor");
+        }
+        link.endpoints_signature = Some(field("endpoints_signature")?.into());
     } else {
         anyhow::ensure!(
             !config.identity.mnemonic_file.try_exists()?
@@ -168,7 +197,12 @@ pub fn cmd_pair_ticket(config_path: &Path, qr: bool, ttl: Duration) -> Result<()
             "start the node unlocked once before issuing an identity ticket"
         );
     }
-    let uri = link.to_uri()?;
+    link.validate_descriptor().map_err(anyhow::Error::msg)?;
+    let uri = if legacy {
+        link.to_legacy_uri()?
+    } else {
+        link.to_uri()?
+    };
     // Render before publication: oversized payloads must not replace a good ticket.
     let rendered = if qr { Some(render_qr(&uri)?) } else { None };
     let temporary = dir.join(format!(".remote-access-{}.tmp", uuid::Uuid::new_v4()));

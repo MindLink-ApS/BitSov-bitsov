@@ -34,10 +34,11 @@ before enabling the service. Never learn a new pin from a locked node. Keep
 Plaintext seeds and missing/stale public identity metadata are refused; repair
 metadata by starting normally with the correct encrypted seed first.
 
-Configure `[api].listen_addr` on loopback and `[remote_access].listen_addr` plus
-`advertised_endpoint` for the Noise endpoint reachable by your device. To reach
-it off the LAN, see [reachability](reachability.md). Home mode still requires
-this configuration; it does not yet provide a box setup page or auto-discovery.
+Configure `[api].listen_addr` on loopback and `[remote_access].listen_addr` for
+the Noise listener. `advertised_endpoint` is optional: the node discovers local
+addresses automatically (see [endpoint discovery](#endpoint-discovery)). To reach
+it off the LAN, see [reachability](reachability.md). Home mode does not yet
+provide a box setup page.
 There is no password file, systemd password credential, or password in
 argv/environment. On reboot the box waits for a device to unlock it.
 
@@ -609,6 +610,62 @@ This is a node-local reminder. The hub neither computes nor pushes it, and an
 offline/locked node cannot deliver a live notification: it reports on unlock.
 It does not extend negotiated windows or replace monitoring or a watchtower.
 
+
+## Endpoint discovery
+
+New tickets use PairLink v2 with an ordered `endpoints` list. The optional
+`[remote_access].advertised_endpoint` comes first, followed by sorted local
+addresses, then Tailscale addresses (CGNAT IPv4 / Tailscale ULA IPv6) if assigned
+to an active interface. Duplicate addresses are removed. Discovery is local;
+it does not run `tailscale`, contact an external service, or guess a public IP.
+Each discovered endpoint uses the listener's actual port and respects its bound
+IP and address family; `[::]:port` is explicitly dual-stack and includes IPv4. Loopback, wildcard, multicast and unscoped IPv6 link-local
+addresses are not LAN candidates; a loopback-bound listener advertises only its
+loopback endpoint. Automatic discovery cannot prove firewall/NAT reachability.
+Set `advertised_endpoint` for a forwarded address or DNS/MagicDNS name.
+
+`endpoint` equals the first entry. Strict older apps reject a v2 link, so issue
+`konsensus pair-ticket --legacy --config /path/to/konsensus.toml` for those apps.
+This emits the exact v1 schema and uses the first endpoint with the same transport
+pins and one-use semantics. The tunnel/auth protocol remains version 1.
+
+Unlocked startup signs the complete ordered endpoint descriptor and caches its
+public signature in `identity/identity.json`. The CLI verifies and reuses it
+without accessing the seed. If the interface addresses or configured endpoint
+change, restart unlocked to refresh this signature before issuing another ticket.
+Existing tickets remain snapshots until replaced. For an ephemeral listener
+(`listen_addr` port `0`), the CLI reuses the signed actual endpoints; before
+bootstrap, an explicit `advertised_endpoint` is required for that configuration.
+Before an identity exists, a ticket is box-key pinned and has no identity signature, as before.
+
+### Optional LAN mDNS
+
+Build with `cargo build -p konsensus-node --release --features mdns`, then start
+with `--home`. Without that build feature there is no mDNS responder. In a build
+with the feature, `--home` enables LAN advertising by default; set
+`[remote_access].mdns = false` to opt out. Every other start mode stays silent,
+even with `mdns = true`; the older `--remote-unlock --local-owner-device` pair
+does not opt into mDNS. Remote access must also be configured.
+
+The responder publishes `bitsov.local.` and a `bitsov-<prefix>._bitsov._tcp.local.`
+service while the remote listener is running in bootstrap, locked or unlocked
+mode. DNS-SD carries the Noise TCP port and only `fp=<12 hex characters>` in TXT.
+Before bootstrap, the prefix identifies the persistent box public key; afterwards
+it is the node identity fingerprint prefix. Neither is an authentication pin.
+There are no tickets, passwords, full keys, labels or other secrets in mDNS.
+Only reachable private/link-local IPv4 or ULA IPv6 LAN addresses are published;
+Tailscale and loopback are excluded. Name collisions may rename the host, so
+clients should browse the service instead of assuming the hostname is unique.
+An mDNS failure does not stop the node; use the ticket's numeric endpoints.
+Restart after network changes to refresh the interface selection.
+
+This is discovery for the encrypted Noise listener, not an HTTP setup page.
+Clients must verify the descriptor with their saved node identity and pin the
+Noise responder key **before** sending a ticket or password. A spoofed DNS answer
+can cause a failed connection but cannot replace an existing pin. Initial pairing
+still requires obtaining the ticket from a trusted box; discovery alone supplies
+no first-use authenticity. The setup page and per-box claim-code ceremony are
+separate later onboarding work.
 ## Copied directories and hardware moves (#271)
 
 **Never restore a copied data directory, rsync backup, VM snapshot or SD-card

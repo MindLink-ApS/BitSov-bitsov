@@ -83,7 +83,9 @@ impl NodeTier {
     /// Short human-readable description of the tier.
     pub fn description(self) -> &'static str {
         match self {
-            Self::Cloud => "Cloud/Relay — paired remote access, hosted custody (the server holds the seed)",
+            Self::Cloud => {
+                "Cloud/Relay — paired remote access, hosted custody (the server holds the seed)"
+            }
             Self::Light => "Light Node — your device, user-selected Lightning",
             Self::Full => "Full Node — fully sovereign",
         }
@@ -115,7 +117,10 @@ impl NodeDisplayConfig {
         if label.chars().count() > HOSTED_BY_MAX_CHARS {
             anyhow::bail!("[node].hosted_by must be at most {HOSTED_BY_MAX_CHARS} characters");
         }
-        if label.chars().any(|c| c.is_control() || is_invisible_format(c)) {
+        if label
+            .chars()
+            .any(|c| c.is_control() || is_invisible_format(c))
+        {
             anyhow::bail!(
                 "[node].hosted_by must contain only printable characters (no control, \
                  bidi-override or zero-width characters)"
@@ -354,13 +359,19 @@ impl NetworkConfig {
             .filter(|a| !a.is_empty())
             .map(|a| (a, source::ADVERTISED))
             .or_else(|| {
-                (!self.listen_addr.ip().is_unspecified()).then(|| (self.listen_addr.to_string(), source::LISTEN))
+                (!self.listen_addr.ip().is_unspecified())
+                    .then(|| (self.listen_addr.to_string(), source::LISTEN))
             })
     }
 
     /// The validated `host:port` of `stun_server`, if the owner set one.
     pub fn stun_server_addr(&self) -> Result<Option<String>, String> {
-        match self.stun_server.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match self
+            .stun_server
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(raw) => parse_stun_server(raw).map(Some),
             None => Ok(None),
         }
@@ -399,7 +410,9 @@ pub fn parse_stun_server(raw: &str) -> Result<String, String> {
         None => {
             !host.is_empty()
                 && host.len() <= 253
-                && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
         }
     };
     if !host_ok {
@@ -695,7 +708,12 @@ impl LightningConfig {
 
     /// Apply the startup profile before any identity or network work.
     pub(crate) fn apply_home_to_self_delay(&mut self, home_profile: bool) -> anyhow::Result<()> {
-        if let Self::Ldk { our_to_self_delay_blocks, lsps2_service, .. } = self {
+        if let Self::Ldk {
+            our_to_self_delay_blocks,
+            lsps2_service,
+            ..
+        } = self
+        {
             // Owner-device authority can also be enabled on a hub service. It
             // does not change that role; remote unlock rejects it separately.
             if home_profile && !lsps2_service.enabled {
@@ -856,12 +874,18 @@ impl ChainConfig {
     /// selected by the operator for LDK; serde defaults remain unchanged.
     pub fn esplora_fallbacks(&self, lightning: &LightningConfig) -> Vec<String> {
         match self {
-            Self::Esplora { esplora_url_fallback: Some(url), .. } => vec![url.clone()],
+            Self::Esplora {
+                esplora_url_fallback: Some(url),
+                ..
+            } => vec![url.clone()],
             Self::Esplora { .. } => match lightning {
-                LightningConfig::Ldk { esplora_url, esplora_url_fallback, .. } => {
-                    std::iter::once(esplora_url.clone())
-                        .chain(esplora_url_fallback.iter().cloned()).collect()
-                }
+                LightningConfig::Ldk {
+                    esplora_url,
+                    esplora_url_fallback,
+                    ..
+                } => std::iter::once(esplora_url.clone())
+                    .chain(esplora_url_fallback.iter().cloned())
+                    .collect(),
                 _ => Vec::new(),
             },
             _ => Vec::new(),
@@ -1335,6 +1359,21 @@ pub struct RemoteAccessConfig {
     pub listen_addr: Option<SocketAddr>,
     #[serde(default)]
     pub advertised_endpoint: Option<String>,
+    /// Home-mode LAN discovery; requires the `mdns` build feature.
+    #[serde(default)]
+    pub mdns: Option<bool>,
+    #[serde(skip)]
+    pub home: bool,
+}
+
+impl RemoteAccessConfig {
+    pub fn apply_home(&mut self, home: bool) {
+        self.home = home;
+    }
+    #[cfg(any(feature = "mdns", test))]
+    pub fn mdns_enabled(&self) -> bool {
+        cfg!(feature = "mdns") && self.home && self.mdns.unwrap_or(true)
+    }
 }
 
 /// Sovereign browser / web content server configuration.
@@ -1451,8 +1490,11 @@ impl NodeConfig {
         let content = std::fs::read_to_string(path)?;
         // TOML errors include the source line, which may contain a rejected
         // inline password. Never attach the raw parser error to startup logs.
-        let mut config: Self = toml::from_str(&content)
-            .map_err(|_| anyhow::anyhow!("invalid node configuration; check field names, types and file-based credentials"))?;
+        let mut config: Self = toml::from_str(&content).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid node configuration; check field names, types and file-based credentials"
+            )
+        })?;
         config.anchor_relative_backup_dir(path);
         Ok(config)
     }
@@ -1498,7 +1540,8 @@ impl NodeConfig {
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         self.tower.validate()?;
-        if !self.tower.clients.is_empty() && !matches!(self.lightning, LightningConfig::Ldk { .. }) {
+        if !self.tower.clients.is_empty() && !matches!(self.lightning, LightningConfig::Ldk { .. })
+        {
             anyhow::bail!("tower.clients requires the embedded LDK backend");
         }
         self.dos_edge.validate().map_err(anyhow::Error::msg)?;
@@ -1516,7 +1559,9 @@ impl NodeConfig {
         }
         self.lightning.esplora_sync_intervals().to_sync_config()?;
         self.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?;
-        self.network.stun_server_addr().map_err(|e| anyhow::anyhow!(e))?;
+        self.network
+            .stun_server_addr()
+            .map_err(|e| anyhow::anyhow!(e))?;
         // Check mnemonic file exists and is readable
         if !self.identity.mnemonic_file.exists() {
             anyhow::bail!(
@@ -1560,18 +1605,9 @@ impl NodeConfig {
                      plaintext HTTP may not be exposed remotely"
                 );
             }
-            let endpoint = self
-                .remote_access
-                .advertised_endpoint
-                .as_deref()
-                .map(str::trim)
-                .filter(|endpoint| !endpoint.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "[remote_access].advertised_endpoint is required when listen_addr is set"
-                    )
-                })?;
-            validate_remote_endpoint(endpoint).map_err(anyhow::Error::msg)?;
+            if let Some(endpoint) = &self.remote_access.advertised_endpoint {
+                validate_remote_endpoint(endpoint).map_err(anyhow::Error::msg)?;
+            }
             for (label, other) in [
                 ("P2P", self.network.listen_addr),
                 ("API", self.api.listen_addr),
@@ -1811,7 +1847,7 @@ impl NodeConfig {
         path.with_extension("toml.tmp")
     }
 
-        fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
@@ -1850,10 +1886,7 @@ impl NodeConfig {
             )
         })?;
         dir.sync_all().map_err(|e| {
-            anyhow::anyhow!(
-                "failed to sync config directory {}: {e}",
-                parent.display()
-            )
+            anyhow::anyhow!("failed to sync config directory {}: {e}", parent.display())
         })?;
         Ok(())
     }
@@ -2022,38 +2055,11 @@ fn tcp_addrs_collide(a: SocketAddr, b: SocketAddr) -> bool {
 }
 
 fn validate_remote_endpoint(endpoint: &str) -> Result<(), String> {
-    if endpoint.bytes().any(|b| b.is_ascii_whitespace()) || endpoint.contains("://") {
-        return Err(format!(
-            "[remote_access].advertised_endpoint {endpoint:?} must be a bare host:port"
-        ));
-    }
-    let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
-        format!("[remote_access].advertised_endpoint {endpoint:?} must be host:port")
-    })?;
-    let valid_host = if host.starts_with('[') && host.ends_with(']') {
-        host[1..host.len() - 1]
-            .parse::<std::net::Ipv6Addr>()
-            .is_ok()
-    } else {
-        host.parse::<std::net::Ipv4Addr>().is_ok()
-            || (host.len() <= 253
-                && host.split('.').all(|label| {
-                    !label.is_empty()
-                        && label.len() <= 63
-                        && !label.starts_with('-')
-                        && !label.ends_with('-')
-                        && label
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                }))
-    };
-    let valid_port = port.parse::<u16>().is_ok_and(|port| port != 0);
-    if !valid_host || !valid_port {
-        return Err(format!(
-            "[remote_access].advertised_endpoint {endpoint:?} must be a valid host:port"
-        ));
-    }
-    Ok(())
+    konsensus_api::remote_access::validate_endpoint(endpoint).map_err(|_| {
+        format!(
+            "[remote_access].advertised_endpoint {endpoint:?} must be a dialable bare host:port"
+        )
+    })
 }
 
 /// DESERIALIZATION default — frozen. An existing `[chain]` stanza that omits
@@ -2191,10 +2197,18 @@ pub struct SponsorConfig {
     pub kits_per_day: u32,
 }
 
-fn default_sponsor_gift_sats() -> u64 { 20_000 }
-fn default_sponsor_fee_sats() -> u64 { 100 }
-fn default_sponsor_purse_sats() -> u64 { 100_000 }
-fn default_sponsor_kits_per_day() -> u32 { 2 }
+fn default_sponsor_gift_sats() -> u64 {
+    20_000
+}
+fn default_sponsor_fee_sats() -> u64 {
+    100
+}
+fn default_sponsor_purse_sats() -> u64 {
+    100_000
+}
+fn default_sponsor_kits_per_day() -> u32 {
+    2
+}
 
 impl Default for SponsorConfig {
     fn default() -> Self {
@@ -2211,7 +2225,10 @@ impl Default for SponsorConfig {
 impl SponsorConfig {
     /// The policy the API enforces; refuses anything above a spec ceiling.
     pub fn policy(&self) -> Result<konsensus_api::handlers::sponsor::SponsorPolicy, String> {
-        let msat = |sats: u64| sats.checked_mul(1000).ok_or_else(|| "[sponsor] amount too large".to_string());
+        let msat = |sats: u64| {
+            sats.checked_mul(1000)
+                .ok_or_else(|| "[sponsor] amount too large".to_string())
+        };
         konsensus_api::handlers::sponsor::SponsorPolicy::new(
             self.enabled,
             msat(self.gift_sats)?,
@@ -2222,4 +2239,6 @@ impl SponsorConfig {
     }
 }
 
-fn default_disk_free_floor_bytes() -> u64 { 2 * 1024 * 1024 * 1024 }
+fn default_disk_free_floor_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}

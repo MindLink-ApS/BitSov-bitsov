@@ -495,3 +495,28 @@ here.
 Scopes landed on `main` in `ade8b536` and are not in `v0.3.0-rc6` or
 `v0.3.0-rc7`. Everything above becomes true of the product only when a build
 carrying it ships and the app is re-pinned.
+
+
+### Versioned remote endpoint descriptors (N2)
+
+PairLink v2 adds ordered `endpoints` and `endpoints_signature`; `endpoint` must
+match entry zero. A non-bootstrap v2 link requires a valid Ed25519 signature over
+the UTF-8 JSON tuple `["bitsov-endpoints-v2", 2, node_id, transport_pubkey,
+box_transport_pubkey, endpoint, endpoints]`, with no whitespace. Array order is
+part of the signature. The signature is base64url without padding, keys are
+lowercase hex. Ticket code, expiry and display label retain their existing
+independent semantics and are not part of this public descriptor proof.
+The transport proofs and Noise/auth wire version remain unchanged.
+
+V1 parsing remains supported; `pair-ticket --legacy` exports a strict v1 link
+using the first address for older apps that reject extra fields. V1 cannot carry
+a v2 list or its signature. Bootstrap has no node identity to sign with and
+retains the box key from the locally obtained ticket as its initial Noise pin.
+
+Endpoints and mDNS are routing hints. A paired client verifies v2 descriptors
+against its **saved** node identity, never an identity learned from DNS, and
+checks the Noise remote static against its saved transport pin before sending
+authentication or unlock secrets. Endpoint fallback never resets that pin.
+The home-only optional `_bitsov._tcp` advertisement exposes only a fingerprint
+prefix and the TCP port; it is not an identity, pairing or authorization channel.
+See [operating endpoint discovery](../operations/home-node.md#endpoint-discovery).

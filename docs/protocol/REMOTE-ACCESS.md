@@ -1,6 +1,6 @@
 # Remote app access over Noise
 
-Status: node implementation, version 1.
+Status: Noise/auth version 1; PairLink versions 1 and 2.
 
 This protocol gives a paired app remote access to the existing HTTP/WebSocket
 API without exposing plaintext HTTP. It does not add a new authorization
@@ -16,8 +16,10 @@ Remote access is closed by default:
 # advertised_endpoint = "node.example:8443"
 ```
 
-Setting `listen_addr` enables the public TCP listener and requires
-`advertised_endpoint`. When enabled, `[api].listen_addr` must be loopback.
+Setting `listen_addr` enables the public TCP listener. `advertised_endpoint` is
+optional and takes priority over discovered LAN and Tailscale endpoints.
+Wildcard IPv6 listeners are explicitly dual-stack. When enabled,
+`[api].listen_addr` must be loopback.
 Startup refuses TCP port collisions with the API, BitSov P2P, or embedded
 Lightning listener. The implementation also creates an ephemeral internal
 Axum listener on `127.0.0.1:0`; plaintext HTTP is never bound non-loopback.
@@ -33,18 +35,38 @@ protected path and expiry. The file contains:
 bitsov://pair/<base64url-no-pad(JSON)>
 ```
 
-The decoded JSON is:
+The decoded v2 JSON is (addresses shown are examples):
 
 ```json
 {
-  "v": 1,
+  "v": 2,
   "endpoint": "node.example:8443",
+  "endpoints": ["node.example:8443", "192.168.1.10:8443"],
+  "endpoints_signature": "<base64url-no-pad Ed25519 descriptor signature>",
   "node_id": "<64 lowercase hex Ed25519 NodeId>",
   "transport_pubkey": "<64 lowercase hex X25519 static key>",
   "transport_signature": "<base64url-no-pad Ed25519 signature>",
+  "box_transport_pubkey": "<64 lowercase hex persistent box X25519 key>",
+  "box_transport_signature": "<base64url-no-pad Ed25519 box proof>",
+  "expires_at": 2000000000,
   "code": "<base64url-no-pad 32 random bytes>"
 }
 ```
+
+`endpoint` must equal entry zero of the nonempty, unique, at-most-32-entry list.
+Entries are bare host:port hints: configured override first, sorted local
+addresses next, Tailscale addresses last. IPv6 literals use brackets. No
+wildcard or multicast address may appear. V2 descriptors bind the version,
+node identity, both transport keys, first entry and complete list order in
+`endpoints_signature`; the exact signed tuple is specified in
+[the pairing security contract](../security/pairing.md#versioned-remote-endpoint-descriptors-n2).
+The CLI reuses the public descriptor signed at unlocked startup.
+
+V1 links remain parseable. Since old decoders reject new fields and versions,
+`pair-ticket --legacy` emits the exact v1 schema with only the first endpoint
+and no list signature. The Noise/auth version is independent of PairLink.
+Pre-bootstrap links omit node identity and identity signatures; their existing
+box-key pin comes from the trusted local ticket.
 
 `transport_signature` signs the exact UTF-8 string:
 
@@ -57,15 +79,23 @@ link, and refuse a Noise responder static that differs from
 `transport_pubkey`. The node test suite verifies its side of the link; pinned
 key refusal is also required in the app.
 
-No link is created when pairing is closed. The server-side code is memory-only;
-the complete link exists only in the protected file, never stdout or tracing.
-It expires after five minutes. Successful pairing consumes it; a wrong code or
-proof does not. The file is removed on success, expiry or clean shutdown.
-Restarting replaces an unused code.
+No automatic link is created when pairing is closed. The daemon's first ticket
+expires after five minutes; operator `pair-ticket` grants have their configured
+TTL. The protected file is authoritative and survives restart until consumed,
+expired or replaced. Only the explicit CLI prints the secret link; the daemon
+never logs it. See [ticket lifecycle](../operations/home-node.md#enrollment-tickets-and-box-labels).
+
+With the optional `mdns` build feature, `--home` advertises `bitsov.local.` and
+`_bitsov._tcp.local.` on selected LAN interfaces unless `remote_access.mdns` is
+false. TXT contains only a fingerprint prefix (`fp`); SRV carries the TCP port.
+Every other mode stays silent. Discovery never grants authority: paired apps
+must verify descriptors against their saved node identity and check the Noise
+static pin before sending authentication or unlock data, even after endpoint
+fallback or a new mDNS answer.
 
 ## Framing and Noise
 
-The app opens TCP to `endpoint` and performs
+The app tries `endpoints` in order (or `endpoint` for v1) and performs
 `Noise_XX_25519_ChaChaPoly_BLAKE2s` as initiator using its own persistent
 X25519 static key. The node uses its identity-derived X25519 key as responder.
 
