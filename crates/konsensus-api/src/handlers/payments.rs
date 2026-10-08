@@ -224,6 +224,9 @@ async fn get_balance(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PayInvoiceRequest {
+    /// Optional retry identity, consumed once within the current grant.
+    #[serde(default)]
+    pub request_id: Option<String>,
     #[serde(default)]
     pub max_routing_fee_msat: Option<u64>,
     /// BOLT11 payment request string.
@@ -274,13 +277,22 @@ async fn pay_invoice(
     // G1: a metered caller's debit needs the amount and payee before paying.
     let debit = if auth.is_metered() {
         let (amount_msat, payee) = invoice_terms(&req.bolt11)?;
+        let payment_hash = req
+            .bolt11
+            .trim()
+            .parse::<lightning_invoice::Bolt11Invoice>()
+            .map_err(|e| ApiError::BadRequest(format!("invalid bolt11 invoice: {e}")))?
+            .payment_hash()
+            .to_string();
         Some((
-            auth.debit(
+            auth.debit_payment(
                 &state,
                 vec![Charge {
                     recipient: payee.clone(),
                     amount_msat: amount_msat.checked_add(max_routing_fee_msat).ok_or_else(|| ApiError::BadRequest("payment debit overflow".into()))?,
                 }],
+                Some(&payment_hash),
+                req.request_id.as_deref(),
             ).map_err(|e| e.with_routing_fee(max_routing_fee_msat))?,
             payee,
         ))
@@ -318,6 +330,9 @@ async fn pay_invoice(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeysendRequest {
+    /// Optional retry identity, consumed once within the current grant.
+    #[serde(default)]
+    pub request_id: Option<String>,
     #[serde(default)]
     pub max_routing_fee_msat: Option<u64>,
     /// Destination Lightning node public key (hex, 66 chars).
@@ -392,14 +407,24 @@ async fn keysend(
     let debit = if auth.is_metered() {
         let key = crate::spend_budget::canonical_recipient(&dest)
             .filter(|k| k.len() == 66)
-            .ok_or_else(|| ApiError::BadRequest("dest_pubkey must be a 33-byte hex pubkey".into()))?;
-        Some(auth.debit(
-            &state,
-            vec![Charge {
-                recipient: key,
-                amount_msat: req.amount_msat.checked_add(max_routing_fee_msat).ok_or_else(|| ApiError::BadRequest("payment debit overflow".into()))?,
-            }],
-        ).map_err(|e| e.with_routing_fee(max_routing_fee_msat))?)
+            .ok_or_else(|| {
+                ApiError::BadRequest("dest_pubkey must be a 33-byte hex pubkey".into())
+            })?;
+        Some(
+            auth.debit_payment(
+                &state,
+                vec![Charge {
+                    recipient: key,
+                    amount_msat: req
+                        .amount_msat
+                        .checked_add(max_routing_fee_msat)
+                        .ok_or_else(|| ApiError::BadRequest("payment debit overflow".into()))?,
+                }],
+                None,
+                req.request_id.as_deref(),
+            )
+            .map_err(|e| e.with_routing_fee(max_routing_fee_msat))?,
+        )
     } else {
         None
     };

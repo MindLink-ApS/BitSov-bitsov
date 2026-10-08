@@ -6,8 +6,8 @@ A paired client's `spend` now comes only from a **budget grant**: an absolute
 expiry (at most 24 h), a total budget, optional per-recipient budgets and a
 per-call maximum. The 30-day unmetered grant is gone. A pre-G1 grant without a
 budget is dropped when the pairing store is opened and is never honoured. The
-store is now version 2, so an older node refuses to open it rather than read a
-metered grant as an unmetered one.
+store is now version 5. Older nodes refuse to open it rather than ignore
+allowlists or payment deduplication; existing version 2–4 grants remain readable.
 
 ## Owner flow (one command per budget window)
 
@@ -53,6 +53,44 @@ what is left. Requests already waiting for an invoice and queued room members
 also recheck their original grant before dispatch. Revocation, rotation,
 replacement or expiry stops those undispatched payments; it cannot recall a
 payment already handed to the Lightning backend.
+
+## Optional payee allowlist and payment retries
+
+Grant terms, proposals and grant views accept `payee_allowlist`, an optional
+array of node IDs or Lightning pubkeys. The owner can set it with repeatable
+`konsensus grant --payee <key>` flags. `--deny-all-payees` approves an empty
+allowlist. A proposal is only a request: only the existing owner console
+approval can create or replace this grant. Paired clients cannot edit it.
+The approval summary displays the exact list independently of recipient caps.
+
+Omitting the field (or `null`) preserves legacy recipient behavior: entries in
+`per_recipient_msat` are caps, and other recipients remain bounded by the total
+and per-call caps. An empty allowlist denies every recipient. A nonempty list
+allows only its canonical lowercase hex keys; all existing budget and fee caps
+still apply. At most 256 payees are accepted. Every charge in a fan-out must
+be allowed before any budget is reserved. Adding a first-contact cap does not
+add a payee to the allowlist. Refusals are HTTP 409 with `code: budget_exceeded`
+and `reason: payee_not_allowed`; nothing is dispatched.
+
+Within each grant, `/payments/pay` automatically deduplicates by the invoice's
+payment hash. Both `/payments/pay` and `/payments/keysend` also accept an
+optional `request_id` (1–128 printable ASCII bytes, without spaces). Reuse the
+same ID on retries; IDs are shared between these two routes within a grant.
+Keysend requests without an ID retain their legacy behavior: two otherwise
+identical keysend calls are separate payments.
+
+The node atomically persists these identifiers with the reservation before
+dispatch. A concurrent or later duplicate receives HTTP 409,
+`code: budget_exceeded`, `reason: duplicate_payment`, without another debit or
+backend call. This is duplicate refusal, not replay of the original response.
+For an invoice, read `/payments/:hash` for payment status. Reusing an ID with
+changed parameters is also refused. IDs remain consumed after settlement,
+confirmed failure, cancellation, unknown outcomes and restart, until the grant
+is replaced, revoked or expires. A failed keysend may be explicitly attempted
+again with a new ID. An invoice hash cannot be retried under the same grant.
+The ledger holds at most 4096 identifiers per grant; reaching that bound
+refuses new identified payments (`reason: ledger`) rather than evicting records.
+No payment identifiers are exposed in the grant view.
 
 ## What is debited, and when
 

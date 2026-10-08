@@ -723,7 +723,7 @@ async fn pay_debits_the_payee_and_refuses_amountless_invoices() {
         .call(
             "POST",
             "/api/v1/payments/pay",
-            Some(json!({"bolt11": create_test_bolt11(1_500)})),
+            Some(json!({"bolt11": create_test_bolt11_with_hash(1_500, [0xdd; 32])})),
             Some(&token),
         )
         .await;
@@ -1733,7 +1733,18 @@ async fn direct_send_fee_refusal_is_not_dispatched_and_releases_budget() {
                 assert_eq!(operations, 0, "direct sends do not create compose operations");
                 assert_eq!(fx.wallet.left(), 0);
 
-                // A route at the cap can spend immediately; refusal consumed no authority.
+                // A fresh payment at the cap can spend immediately. Identified
+                // retries remain consumed even when the budget was released.
+                let mut request = request;
+                if route == "pay" {
+                    if metered {
+                        let (status, body) = fx
+                            .call("POST", &path, Some(request.clone()), Some(&token))
+                            .await;
+                        assert_budget_exceeded(status, &body, "duplicate_payment");
+                    }
+                    request["bolt11"] = json!(create_test_bolt11_with_hash(1000, [0xdd; 32]));
+                }
                 fx.wallet.fee.store(cap, Ordering::SeqCst);
                 let (status, body) = fx.call("POST", &path, Some(request), Some(&token)).await;
                 assert_eq!(status, StatusCode::OK, "{body}");
@@ -2004,4 +2015,158 @@ async fn local_owner_http_intent_spends_and_restart_without_flag_stops_it() {
     }
     assert_eq!(fx.wallet.money(), 1);
     assert_eq!(fx.used(), 1_000);
+}
+
+#[tokio::test]
+async fn invoice_retry_storm_dispatches_and_debits_once() {
+    let fx = fixture().await;
+    let token = fx.grant(None, GrantTerms::new(100_000)).await;
+    let bolt11 = create_test_bolt11(1_500);
+    let requests = (0..16).map(|_| {
+        fx.call(
+            "POST",
+            "/api/v1/payments/pay",
+            Some(json!({"bolt11": bolt11})),
+            Some(&token),
+        )
+    });
+    let results = futures::future::join_all(requests).await;
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::OK)
+            .count(),
+        1
+    );
+    for (status, body) in results
+        .into_iter()
+        .filter(|(status, _)| *status != StatusCode::OK)
+    {
+        assert_budget_exceeded(status, &body, "duplicate_payment");
+    }
+    assert_eq!(fx.wallet.money(), 1);
+    assert_eq!(fx.used(), 1_500);
+}
+
+#[tokio::test]
+async fn allowlist_enforces_pay_and_keysend_and_proposals_cannot_widen_it() {
+    let fx = fixture().await;
+    let bolt11 = create_test_bolt11(1_500);
+    let payee = payee_of(&bolt11);
+    let mut json = serde_json::to_value(GrantTerms::new(100_000).recipient(&payee, 2_000)).unwrap();
+    json["payee_allowlist"] = json!([payee]);
+    let terms: GrantTerms = serde_json::from_value(json).unwrap();
+    let token = fx.grant(None, terms).await;
+    let (status, body) = fx.keysend(&token, OTHER_LN, 1_000).await;
+    assert_budget_exceeded(status, &body, "payee_not_allowed");
+    let (status, _) = fx
+        .call(
+            "POST",
+            "/api/v1/pair/elevation-request",
+            Some(json!({"scopes":["spend"],"budget":{"budget_msat":100_000}})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = fx.keysend(&token, OTHER_LN, 1_000).await;
+    assert_budget_exceeded(status, &body, "payee_not_allowed");
+    assert_eq!(fx.wallet.money(), 0);
+    assert_eq!(fx.used(), 0);
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/pay",
+            Some(json!({"bolt11":bolt11})),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.money(), 1);
+    assert_eq!(fx.used(), 1_500);
+}
+
+#[tokio::test]
+async fn keysend_request_id_is_single_use_even_after_failure() {
+    let fx = fixture().await;
+    let token = fx.grant(None, GrantTerms::new(100_000)).await;
+    fx.wallet.set(FAILED);
+    let request = json!({"dest_pubkey":OTHER_LN,"amount_msat":1000,"request_id":"retry-1"});
+    let _ = fx
+        .call(
+            "POST",
+            "/api/v1/payments/keysend",
+            Some(request.clone()),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(fx.wallet.money(), 1);
+    assert_eq!(fx.used(), 0);
+    fx.wallet.set(SETTLE);
+    let (status, body) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/keysend",
+            Some(request),
+            Some(&token),
+        )
+        .await;
+    assert_budget_exceeded(status, &body, "duplicate_payment");
+    assert_eq!(fx.wallet.money(), 1);
+    assert_eq!(fx.used(), 0);
+}
+
+#[tokio::test]
+async fn invoice_hash_and_request_id_remain_consumed_after_unknown_and_restart() {
+    let mut fx = fixture().await;
+    let token = fx.grant(None, GrantTerms::new(100_000)).await;
+    let bolt11 = create_test_bolt11(1_500);
+    fx.wallet.set(UNKNOWN);
+    let (status, _) = fx
+        .call(
+            "POST",
+            "/api/v1/payments/pay",
+            Some(json!({"bolt11":bolt11,"request_id":"invoice-1"})),
+            Some(&token),
+        )
+        .await;
+    assert!(!status.is_success());
+    assert_eq!(fx.wallet.money(), 1);
+    fx.restart();
+    fx.wallet.set(SETTLE);
+    for request in [
+        json!({"bolt11":bolt11,"request_id":"different-id"}),
+        json!({"bolt11":create_test_bolt11_with_hash(2000, [0xdd;32]),"request_id":"invoice-1"}),
+        json!({"bolt11":bolt11.to_uppercase()}),
+    ] {
+        let (status, body) = fx
+            .call("POST", "/api/v1/payments/pay", Some(request), Some(&token))
+            .await;
+        assert_budget_exceeded(status, &body, "duplicate_payment");
+    }
+    assert_eq!(fx.wallet.money(), 1);
+    assert_eq!(fx.used(), 1_500);
+}
+
+#[tokio::test]
+async fn invalid_request_ids_never_debit_or_dispatch() {
+    let fx = fixture().await;
+    let token = fx.grant(None, GrantTerms::new(100_000)).await;
+    for id in [
+        String::new(),
+        "contains space".into(),
+        "é".into(),
+        "x".repeat(129),
+    ] {
+        let (status, _) = fx
+            .call(
+                "POST",
+                "/api/v1/payments/keysend",
+                Some(json!({"dest_pubkey":OTHER_LN,"amount_msat":1000,"request_id":id})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(fx.wallet.money(), 0);
+    assert_eq!(fx.used(), 0);
 }

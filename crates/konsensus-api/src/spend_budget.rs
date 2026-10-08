@@ -36,7 +36,7 @@
 //! either, and an expired grant is removed on every write and by a periodic
 //! sweep rather than lingering on disk.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +115,10 @@ pub const MAX_RECIPIENT_BUDGETS: usize = 256;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GrantTerms {
+    /// Exclusive payee set. None preserves legacy behavior; Some(empty) denies all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payee_allowlist: Option<BTreeSet<String>>,
+
     /// Explicit authority for LSP deductions, charged to this SAME budget.
     /// Ordinary message grants never imply liquidity-purchase authority.
     #[serde(default)]
@@ -138,6 +142,7 @@ impl GrantTerms {
     /// equal to the whole budget, no per-recipient budgets.
     pub fn new(budget_msat: u64) -> Self {
         Self {
+            payee_allowlist: None,
             allow_liquidity_fees: false,
             budget_msat,
             per_call_max_msat: budget_msat,
@@ -189,6 +194,23 @@ impl GrantTerms {
                 "at most {MAX_RECIPIENT_BUDGETS} per-recipient budgets"
             ));
         }
+        let payee_allowlist = self
+            .payee_allowlist
+            .as_ref()
+            .map(|payees| {
+                if payees.len() > MAX_RECIPIENT_BUDGETS {
+                    return Err(format!("at most {MAX_RECIPIENT_BUDGETS} allowed payees"));
+                }
+                payees
+                    .iter()
+                    .map(|key| {
+                        canonical_recipient(key).ok_or_else(|| {
+                            format!("payee {key:?} is not a node id or Lightning pubkey")
+                        })
+                    })
+                    .collect::<Result<BTreeSet<_>, String>>()
+            })
+            .transpose()?;
         let mut per_recipient = BTreeMap::new();
         for (key, cap) in self.per_recipient_msat {
             let key = canonical_recipient(&key)
@@ -203,6 +225,7 @@ impl GrantTerms {
             }
         }
         Ok(Self {
+            payee_allowlist,
             per_recipient_msat: per_recipient,
             ..self
         })
@@ -221,6 +244,13 @@ pub fn canonical_recipient(key: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GrantBudget {
+    /// Payment identities consumed for this grant's entire lifetime, including failures.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub payment_ids: BTreeSet<String>,
+    /// Exclusive payee set. None preserves legacy behavior; Some(empty) denies all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payee_allowlist: Option<BTreeSet<String>>,
+
     #[serde(default)]
     pub allow_liquidity_fees: bool,
     /// Total budget, msat.
@@ -258,6 +288,8 @@ impl GrantBudget {
     /// A fresh meter for approved terms.
     pub fn from_terms(terms: &GrantTerms) -> Self {
         Self {
+            payment_ids: BTreeSet::new(),
+            payee_allowlist: terms.payee_allowlist.clone(),
             allow_liquidity_fees: terms.allow_liquidity_fees,
             budget_msat: terms.budget_msat,
             per_call_max_msat: terms.per_call_max_msat,
@@ -363,6 +395,15 @@ impl GrantBudget {
         let mut call_total: u64 = 0;
         let mut per_recipient: BTreeMap<&str, u64> = BTreeMap::new();
         for charge in charges {
+            if self
+                .payee_allowlist
+                .as_ref()
+                .is_some_and(|payees| !payees.contains(&charge.recipient))
+            {
+                return Err(BudgetRefusal::PayeeNotAllowed {
+                    recipient: charge.recipient.clone(),
+                });
+            }
             call_total =
                 call_total
                     .checked_add(charge.amount_msat)
@@ -474,6 +515,12 @@ impl Reservation {
 /// Why a debit was refused. Nothing was reserved and nothing was dispatched.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BudgetRefusal {
+    #[error(
+        "payment hash or request ID already used within this grant — no new payment dispatched"
+    )]
+    DuplicatePayment,
+    #[error("payee {recipient} is not on the grant's allowlist — nothing was dispatched")]
+    PayeeNotAllowed { recipient: String },
     /// No live, metered grant for this client (expired, revoked, rotated).
     #[error("no live spend grant for this client — ask the owner for a new budget")]
     NoGrant,
@@ -513,6 +560,8 @@ impl BudgetRefusal {
     /// Stable machine-readable reason, returned alongside `budget_exceeded`.
     pub fn reason(&self) -> &'static str {
         match self {
+            BudgetRefusal::DuplicatePayment => "duplicate_payment",
+            BudgetRefusal::PayeeNotAllowed { .. } => "payee_not_allowed",
             BudgetRefusal::NoGrant => "no_grant",
             BudgetRefusal::PerCall { .. } => "per_call",
             BudgetRefusal::Total { .. } => "total",
@@ -527,6 +576,10 @@ impl BudgetRefusal {
 /// A grant as reported to the client that holds it and to the owner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GrantView {
+    /// Exclusive payee set. None preserves legacy behavior; Some(empty) denies all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payee_allowlist: Option<BTreeSet<String>>,
+
     #[serde(default)]
     pub allow_liquidity_fees: bool,
     /// The grant's operation id.
@@ -569,7 +622,13 @@ pub fn describe_terms(terms: &GrantTerms) -> String {
         human_duration(terms.ttl_secs)
     );
     out.push_str(if terms.allow_liquidity_fees { "\n  LSP fees:      allowed, within this same budget" } else { "\n  LSP fees:      not authorized" });
-    if terms.per_recipient_msat.is_empty() {
+    if let Some(payees) = &terms.payee_allowlist {
+        out.push_str("\n  allowed payees: only the following (empty means deny all)");
+        for key in payees {
+            out.push_str(&format!("\n                  {key}"));
+        }
+    }
+    if terms.per_recipient_msat.is_empty() && terms.payee_allowlist.is_none() {
         out.push_str("\n  recipients:    any, within the total");
     } else {
         for (key, cap) in &terms.per_recipient_msat {
@@ -578,7 +637,11 @@ pub fn describe_terms(terms: &GrantTerms) -> String {
                 sats(*cap)
             ));
         }
-        out.push_str("\n  others:        any, within the total");
+        out.push_str(if terms.payee_allowlist.is_some() {
+            "\n  others:        refused unless allowlisted; all budget caps still apply"
+        } else {
+            "\n  others:        any, within the total"
+        });
     }
     out
 }
@@ -654,6 +717,69 @@ mod tests {
             recipient: r.repeat(32),
             amount_msat,
         }
+    }
+
+    #[test]
+    fn allowlist_validation_and_mixed_fanout_are_atomic() {
+        let mut terms = GrantTerms::new(1000);
+        terms.payee_allowlist = Some(["invalid".into()].into());
+        assert!(terms.clone().normalized().is_err());
+        terms.payee_allowlist = Some((0..257).map(|i| format!("{i:064x}")).collect());
+        assert!(terms.clone().normalized().is_err());
+        terms.payee_allowlist = Some(["aa".repeat(32)].into());
+        let mut budget = GrantBudget::from_terms(&terms.normalized().unwrap());
+        let before = budget.clone();
+        assert_eq!(
+            budget
+                .reserve_at(&[charge("aa", 100), charge("bb", 100)], 0)
+                .unwrap_err()
+                .reason(),
+            "payee_not_allowed"
+        );
+        assert_eq!(budget, before);
+    }
+
+    #[test]
+    fn optional_payee_allowlist_is_fail_closed_and_legacy_is_unchanged() {
+        let legacy = GrantTerms::new(10_000)
+            .per_call(4_000)
+            .recipient(&"aa".repeat(32), 3_000);
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_json.get("payee_allowlist").is_none());
+        let mut json = legacy_json.clone();
+        json["payee_allowlist"] = serde_json::json!(["AA".repeat(32)]);
+        let terms = serde_json::from_value::<GrantTerms>(json)
+            .expect("optional allowlist accepted")
+            .normalized()
+            .unwrap();
+        let mut budget = GrantBudget::from_terms(&terms);
+        let before = budget.clone();
+        assert_eq!(
+            budget.reserve(&[charge("bb", 1)]).unwrap_err().reason(),
+            "payee_not_allowed"
+        );
+        assert_eq!(budget, before);
+        budget.reserve(&[charge("aa", 3_000)]).unwrap();
+        assert_eq!(
+            budget.reserve(&[charge("aa", 1)]).unwrap_err().reason(),
+            "recipient"
+        );
+        let mut old =
+            GrantBudget::from_terms(&serde_json::from_value(legacy_json.clone()).unwrap());
+        old.reserve(&[charge("bb", 4_000)]).unwrap();
+        let mut empty = legacy_json;
+        empty["payee_allowlist"] = serde_json::json!([]);
+        let terms = serde_json::from_value::<GrantTerms>(empty)
+            .unwrap()
+            .normalized()
+            .unwrap();
+        assert_eq!(
+            GrantBudget::from_terms(&terms)
+                .reserve(&[charge("aa", 0)])
+                .unwrap_err()
+                .reason(),
+            "payee_not_allowed"
+        );
     }
 
     #[test]

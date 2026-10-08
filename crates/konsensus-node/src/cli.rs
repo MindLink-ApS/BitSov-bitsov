@@ -241,6 +241,12 @@ pub enum Command {
     /// `front_door` (publish the front-door card only) takes no budget:
     /// `konsensus grant --op <id> [--for 1h]`.
     Grant {
+        /// Allow only these payees (node ID or Lightning pubkey). Repeatable.
+        #[arg(long, conflicts_with = "deny_all_payees")]
+        payee: Vec<String>,
+        /// Approve an empty payee allowlist (deny all payments).
+        #[arg(long)]
+        deny_all_payees: bool,
         /// Also authorize capped LSP deductions from this same budget.
         #[arg(long)]
         allow_liquidity_fees: bool,
