@@ -22,6 +22,8 @@ use crate::state::AppState;
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
+    /// Active channel admission policy; null when backend enforcement is unavailable.
+    pub channel_safety: Option<konsensus_core::traits::lightning::ChannelSafetyStatus>,
     /// Node-local, amount-free breach-window diagnostics. Null for unsupported backends.
     pub offline_safety: Option<konsensus_core::offline_safety::OfflineSafetyStatus>,
     pub local_spends: konsensus_core::traits::lightning::LocalSpendDiagnostics,
@@ -249,7 +251,11 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
     let chain_sync = state.lightning.chain_sync_status();
     let storage_health = state.storage.storage_read_health();
     Json(HealthResponse {
-        offline_safety: state.lightning.offline_safety().map(|shared| shared.read().unwrap().clone()),
+        channel_safety: state.lightning.channel_safety(),
+        offline_safety: state
+            .lightning
+            .offline_safety()
+            .map(|shared| shared.read().unwrap().clone()),
         local_spends: state.lightning.local_spend_diagnostics(),
         storage_unreadable_rows: storage_health.storage_unreadable_rows,
         storage_key_mismatch: storage_health.storage_key_mismatch,

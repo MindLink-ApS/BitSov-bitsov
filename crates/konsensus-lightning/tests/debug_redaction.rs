@@ -93,6 +93,10 @@ fn lsps2_service_debug_redacts_token_and_keeps_limits() {
 #[test]
 fn ldk_debug_redacts_seed_passphrase_and_token() {
     let mut config = LdkConfig {
+        channel_capacity_limits: konsensus_core::traits::lightning::ChannelCapacityLimits {
+            max_channel_capacity_sats: 50_000,
+            max_total_channel_capacity_sats: 125_000,
+        },
         tower: Default::default(),
         forward_to_private_channels: false,
         our_to_self_delay_blocks: Some(2016),
@@ -133,6 +137,9 @@ fn ldk_debug_redacts_seed_passphrase_and_token() {
             "/data/ldk",
             "http://localhost:3002",
             "2016",
+            "channel_capacity_limits",
+            "max_channel_capacity_sats: 50000",
+            "max_total_channel_capacity_sats: 125000",
         ],
     );
     for url in [

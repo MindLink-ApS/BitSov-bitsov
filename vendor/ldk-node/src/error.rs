@@ -41,6 +41,10 @@ pub enum Error {
 	ProbeSendingFailed,
 	/// A channel could not be opened.
 	ChannelCreationFailed,
+	/// Requested channel exceeds its configured capacity ceiling.
+	ChannelCapacityExceeded,
+	/// Projected node-wide channel capacity exceeds the ceiling, or is unknown.
+	TotalChannelCapacityExceeded,
 	/// A channel could not be closed.
 	ChannelClosingFailed,
 	/// A channel could not be spliced.
@@ -155,6 +159,8 @@ impl fmt::Display for Error {
 			Self::InvalidCustomTlvs => write!(f, "Failed to construct payment with custom TLVs."),
 			Self::ProbeSendingFailed => write!(f, "Failed to send the given payment probe."),
 			Self::ChannelCreationFailed => write!(f, "Failed to create channel."),
+			Self::ChannelCapacityExceeded => write!(f, "CHANNEL_CAPACITY_EXCEEDED"),
+			Self::TotalChannelCapacityExceeded => write!(f, "TOTAL_CHANNEL_CAPACITY_EXCEEDED"),
 			Self::ChannelClosingFailed => write!(f, "Failed to close channel."),
 			Self::ChannelSplicingFailed => write!(f, "Failed to splice channel."),
 			Self::ChannelConfigUpdateFailed => write!(f, "Failed to update channel config."),

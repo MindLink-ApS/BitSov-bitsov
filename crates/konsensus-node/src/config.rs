@@ -470,6 +470,15 @@ pub enum LightningConfig {
     /// The node IS its own Lightning node. Keys derived from the same mnemonic.
     #[serde(rename = "ldk")]
     Ldk {
+        /// Full capacity ceilings for new channels in either direction (zero refuses opens).
+        #[serde(default = "default_max_channel_capacity_sats")]
+        max_channel_capacity_sats: u64,
+        #[serde(default = "default_max_total_channel_capacity_sats")]
+        max_total_channel_capacity_sats: u64,
+        /// Non-service LDK nodes default to hub-only in every startup mode.
+        /// `false` opts out only for non-lockable starts; remote-unlock is always hub-only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hub_only_channels: Option<bool>,
         /// Bounded LSPS2 bootstrap; disabled unless explicitly enabled.
         #[serde(default)]
         liquidity: konsensus_lightning::liquidity::LiquidityConfig,
@@ -587,6 +596,9 @@ impl std::fmt::Debug for LightningConfig {
                 .field("tls_cert_path", tls_cert_path)
                 .finish(),
             Self::Ldk {
+                max_channel_capacity_sats,
+                max_total_channel_capacity_sats,
+                hub_only_channels,
                 liquidity,
                 lsps2_service,
                 network,
@@ -606,6 +618,12 @@ impl std::fmt::Debug for LightningConfig {
                 advertised_address,
             } => f
                 .debug_struct("Ldk")
+                .field("max_channel_capacity_sats", max_channel_capacity_sats)
+                .field(
+                    "max_total_channel_capacity_sats",
+                    max_total_channel_capacity_sats,
+                )
+                .field("hub_only_channels", hub_only_channels)
                 .field("liquidity", liquidity)
                 .field("lsps2_service", lsps2_service)
                 .field("network", network)
@@ -650,7 +668,31 @@ impl std::fmt::Debug for LightningConfig {
     }
 }
 
+fn default_max_channel_capacity_sats() -> u64 {
+    konsensus_core::traits::lightning::ChannelCapacityLimits::default().max_channel_capacity_sats
+}
+fn default_max_total_channel_capacity_sats() -> u64 {
+    konsensus_core::traits::lightning::ChannelCapacityLimits::default()
+        .max_total_channel_capacity_sats
+}
+
 impl LightningConfig {
+    pub(crate) fn channel_capacity_limits(
+        &self,
+    ) -> Option<konsensus_core::traits::lightning::ChannelCapacityLimits> {
+        match self {
+            Self::Ldk {
+                max_channel_capacity_sats,
+                max_total_channel_capacity_sats,
+                ..
+            } => Some(konsensus_core::traits::lightning::ChannelCapacityLimits {
+                max_channel_capacity_sats: *max_channel_capacity_sats,
+                max_total_channel_capacity_sats: *max_total_channel_capacity_sats,
+            }),
+            _ => None,
+        }
+    }
+
     /// Apply the startup profile before any identity or network work.
     pub(crate) fn apply_home_to_self_delay(&mut self, home_profile: bool) -> anyhow::Result<()> {
         if let Self::Ldk { our_to_self_delay_blocks, lsps2_service, .. } = self {
@@ -1858,6 +1900,9 @@ impl NodeConfig {
             ),
             NodeTier::Full => (
                 LightningConfig::Ldk {
+                    max_channel_capacity_sats: default_max_channel_capacity_sats(),
+                    max_total_channel_capacity_sats: default_max_total_channel_capacity_sats(),
+                    hub_only_channels: None,
                     network: default_ldk_network(),
                     // #66: a fresh node ships with two chain providers, written
                     // into the generated konsensus.toml so the operator can see

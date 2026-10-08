@@ -3259,3 +3259,72 @@ fn endpoint_debug_redacts_url_credentials() {
         );
     }
 }
+
+#[test]
+fn channel_capacity_config_defaults_overrides_and_invalid_values() {
+    let config: LightningConfig = toml::from_str("backend = 'ldk'").unwrap();
+    let limits = config.channel_capacity_limits().unwrap();
+    assert_eq!(limits.max_channel_capacity_sats, 1_000_000);
+    assert_eq!(limits.max_total_channel_capacity_sats, 2_000_000);
+    let config: LightningConfig = toml::from_str("backend = 'ldk'\nmax_channel_capacity_sats = 50000\nmax_total_channel_capacity_sats = 0\nhub_only_channels = false").unwrap();
+    let roundtrip: LightningConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(
+        roundtrip
+            .channel_capacity_limits()
+            .unwrap()
+            .max_channel_capacity_sats,
+        50_000
+    );
+    assert_eq!(
+        roundtrip
+            .channel_capacity_limits()
+            .unwrap()
+            .max_total_channel_capacity_sats,
+        0
+    );
+    for invalid in [
+        "max_channel_capacity_sats = -1",
+        "max_total_channel_capacity_sats = 0.5",
+        "hub_only_channels = 'false'",
+        "max_channel_capcity_sats = 1",
+    ] {
+        assert!(
+            toml::from_str::<LightningConfig>(&format!("backend = 'ldk'\n{invalid}")).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn ldk_debug_redacts_token_and_keeps_channel_safety_config() {
+    for (hub_only, expected) in [
+        ("", "hub_only_channels: None"),
+        ("hub_only_channels = true", "hub_only_channels: Some(true)"),
+        (
+            "hub_only_channels = false",
+            "hub_only_channels: Some(false)",
+        ),
+    ] {
+        let config: LightningConfig = toml::from_str(&format!(
+            "backend = 'ldk'\nmax_channel_capacity_sats = 50000\nmax_total_channel_capacity_sats = 125000\nlsp_token = 'private-legacy-token'\n{hub_only}"
+        ))
+        .unwrap();
+        assert_debug_redacted(
+            &config,
+            &["private-legacy-token"],
+            &[
+                "max_channel_capacity_sats: 50000",
+                "max_total_channel_capacity_sats: 125000",
+                "hub_only_channels",
+            ],
+        );
+        for output in [format!("{config:?}"), format!("{config:#?}")] {
+            // Pretty Debug adds whitespace and a trailing comma inside Some.
+            let normalized: String = output
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != ',')
+                .collect();
+            assert!(normalized.contains(&expected.replace(' ', "")));
+        }
+    }
+}
