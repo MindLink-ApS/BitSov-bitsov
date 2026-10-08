@@ -315,17 +315,19 @@ mod tests;
 mod sas_hash_tests {
     use super::*;
     #[test]
-    fn transcript_available_only_after_completion_and_equal_on_both_sides() {
-        let mut a = NoiseSession::initiator(&[1; 32]).unwrap();
-        let mut b = NoiseSession::responder(&[2; 32]).unwrap();
+    fn transcript_available_only_after_completion_and_equal_on_both_sides() -> Result<(), NoiseError>
+    {
+        let mut a = NoiseSession::initiator(&[1; 32])?;
+        let mut b = NoiseSession::responder(&[2; 32])?;
         assert!(a.handshake_hash().is_none());
-        b.read_handshake(&a.write_handshake(&[]).unwrap()).unwrap();
-        a.read_handshake(&b.write_handshake(&[]).unwrap()).unwrap();
+        b.read_handshake(&a.write_handshake(&[])?)?;
+        a.read_handshake(&b.write_handshake(&[])?)?;
         assert!(a.handshake_hash().is_none());
-        b.read_handshake(&a.write_handshake(&[]).unwrap()).unwrap();
-        a.try_finish_handshake().unwrap();
-        b.try_finish_handshake().unwrap();
+        b.read_handshake(&a.write_handshake(&[])?)?;
+        a.try_finish_handshake()?;
+        b.try_finish_handshake()?;
         assert!(a.handshake_hash().is_some());
         assert_eq!(a.handshake_hash(), b.handshake_hash());
+        Ok(())
     }
 }

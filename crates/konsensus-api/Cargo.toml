@@ -35,6 +35,7 @@ x25519-dalek.workspace = true
 sha2.workspace = true
 rand.workspace = true
 blake3.workspace = true
+subtle.workspace = true
 bip39.workspace = true
 # P-256 ECDSA verification of device-key signatures (Secure Enclave keys).
 ring = "0.17"

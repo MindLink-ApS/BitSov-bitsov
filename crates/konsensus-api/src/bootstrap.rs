@@ -46,6 +46,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use serde::{Deserialize, Serialize};
@@ -941,11 +942,13 @@ impl BootstrapState {
                 .sas_digest
                 .as_deref()
                 .and_then(|s| blake3::Hash::from_hex(s).ok());
+            let digest_matches = digest
+                .is_some_and(|digest| bool::from(digest.as_bytes().ct_eq(sas.digest.as_bytes())));
             let device_matches = body.device.as_ref().is_some_and(|d| {
                 crate::sas::device_key(&d.public_key).ok() == Some(sas.device_key)
                     && d.name == sas.device_name
             });
-            if body.sas_version != Some(1) || digest != Some(sas.digest) || !device_matches {
+            if body.sas_version != Some(1) || !digest_matches || !device_matches {
                 self.sas_failures.fetch_add(1, Ordering::SeqCst);
                 *slot = None;
                 return Err(ceremony_error(StatusCode::BAD_REQUEST, "sas_mismatch"));
