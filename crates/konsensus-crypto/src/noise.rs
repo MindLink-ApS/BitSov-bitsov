@@ -77,6 +77,7 @@ pub struct NoiseSession {
     is_initiator: bool,
     /// The remote peer's X25519 static public key, available after handshake.
     remote_static: Option<[u8; 32]>,
+    handshake_hash: Option<[u8; 32]>,
 }
 
 impl NoiseSession {
@@ -93,6 +94,7 @@ impl NoiseSession {
             state: Some(SessionState::Handshaking(Box::new(handshake))),
             is_initiator: true,
             remote_static: None,
+            handshake_hash: None,
         })
     }
 
@@ -109,7 +111,13 @@ impl NoiseSession {
             state: Some(SessionState::Handshaking(Box::new(handshake))),
             is_initiator: false,
             remote_static: None,
+            handshake_hash: None,
         })
+    }
+
+    /// Completed Noise transcript hash, retained after entering transport mode.
+    pub fn handshake_hash(&self) -> Option<&[u8; 32]> {
+        self.handshake_hash.as_ref()
     }
 
     /// Whether this side initiated the connection.
@@ -207,6 +215,11 @@ impl NoiseSession {
                         self.remote_static = Some(key);
                     }
                 }
+                self.handshake_hash = Some(
+                    hs.get_handshake_hash()
+                        .try_into()
+                        .map_err(|_| NoiseError::InvalidState)?,
+                );
                 let transport = hs.into_transport_mode()?;
                 self.state = Some(SessionState::Transport(transport));
                 Ok(true)
@@ -237,9 +250,7 @@ impl NoiseSession {
             let mut buf = vec![0u8; chunk.len() + 16];
             let len = transport.write_message(chunk, &mut buf)?;
             // u16 BE length prefix per chunk
-            let chunk_len = u16::try_from(len).map_err(|_| {
-                NoiseError::Snow(snow::Error::Input)
-            })?;
+            let chunk_len = u16::try_from(len).map_err(|_| NoiseError::Snow(snow::Error::Input))?;
             output.extend_from_slice(&chunk_len.to_be_bytes());
             output.extend_from_slice(&buf[..len]);
         }
@@ -299,3 +310,24 @@ impl NoiseSession {
 #[cfg(test)]
 #[path = "tests/noise.rs"]
 mod tests;
+
+#[cfg(test)]
+mod sas_hash_tests {
+    use super::*;
+    #[test]
+    fn transcript_available_only_after_completion_and_equal_on_both_sides() -> Result<(), NoiseError>
+    {
+        let mut a = NoiseSession::initiator(&[1; 32])?;
+        let mut b = NoiseSession::responder(&[2; 32])?;
+        assert!(a.handshake_hash().is_none());
+        b.read_handshake(&a.write_handshake(&[])?)?;
+        a.read_handshake(&b.write_handshake(&[])?)?;
+        assert!(a.handshake_hash().is_none());
+        b.read_handshake(&a.write_handshake(&[])?)?;
+        a.try_finish_handshake()?;
+        b.try_finish_handshake()?;
+        assert!(a.handshake_hash().is_some());
+        assert_eq!(a.handshake_hash(), b.handshake_hash());
+        Ok(())
+    }
+}

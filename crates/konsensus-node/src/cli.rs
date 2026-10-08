@@ -15,6 +15,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Show this box's claim code on the owner console (never stdout).
+    ClaimCode {
+        #[arg(long, required = true)]
+        show: bool,
+        #[arg(short, long, default_value = "konsensus.toml")]
+        config: PathBuf,
+    },
     /// Print a one-use enrollment ticket (and optionally a terminal QR).
     PairTicket {
         /// Emit the strict v1 schema using only the first endpoint for older apps.

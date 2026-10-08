@@ -56,15 +56,15 @@
 pub mod audit;
 pub mod auth;
 pub mod bootstrap;
-pub mod locked;
 pub mod calls;
 pub mod control;
 pub mod custody;
 pub mod error;
-pub mod freshness;
 pub mod file_staging;
+pub mod freshness;
 pub mod handlers;
 pub mod invoice_refusal;
+pub mod locked;
 pub mod metered;
 pub mod metrics;
 pub mod pairing;
@@ -75,8 +75,8 @@ pub mod spend_budget;
 pub mod state;
 pub mod ws;
 // N2 membrane ring (declared last to stay clear of neighbouring module additions).
-pub mod membrane;
 mod local_read;
+pub mod membrane;
 
 pub use audit::AuditLog;
 pub use rate_limit::RateLimiter;
@@ -85,11 +85,11 @@ pub use state::{AppState, InvoiceResponseData, WsMessage};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::Router;
-use axum::http::{HeaderValue, header};
+use axum::http::{header, HeaderValue};
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use axum::Router;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -125,10 +125,7 @@ pub fn build_remote_router(state: Arc<AppState>) -> Router {
 }
 
 /// Build the remote router with an explicitly dedicated limiter.
-pub fn build_remote_router_with_limiter(
-    state: Arc<AppState>,
-    limiter: Arc<RateLimiter>,
-) -> Router {
+pub fn build_remote_router_with_limiter(state: Arc<AppState>, limiter: Arc<RateLimiter>) -> Router {
     build_router_with_options(state, limiter, false, true)
 }
 
@@ -238,7 +235,6 @@ fn parse_cors_allowed_origins(raw: &str) -> Vec<HeaderValue> {
         .collect()
 }
 
-
 /// Start the API server.
 ///
 /// Listens on the given address and serves until the shutdown signal fires.
@@ -267,7 +263,11 @@ pub async fn serve(
 
     // Volatile staging is empty after process startup; sweep expired/revoked
     // grants before serving, then throughout this server's lifetime.
-    state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).sweep(&state);
+    state
+        .file_staging
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .sweep(&state);
     let staging_state = Arc::clone(&state);
     let mut staging_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
@@ -315,15 +315,14 @@ mod tests {
     #[test]
     fn default_cors_origins_are_not_wildcard() {
         let origins = parse_cors_allowed_origins("http://localhost:1420, https://node.example");
-        assert!(
-            origins
-                .iter()
-                .any(|origin| origin == HeaderValue::from_static("http://localhost:1420"))
-        );
-        assert!(
-            !origins
-                .iter()
-                .any(|origin| origin == HeaderValue::from_static("*"))
-        );
+        assert!(origins
+            .iter()
+            .any(|origin| origin == HeaderValue::from_static("http://localhost:1420")));
+        assert!(!origins
+            .iter()
+            .any(|origin| origin == HeaderValue::from_static("*")));
     }
 }
+
+/// Local claim codes and versioned short authentication strings.
+pub mod sas;

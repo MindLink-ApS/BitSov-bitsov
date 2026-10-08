@@ -18,9 +18,7 @@
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use super::{
-    Inner, PairingError, PairingService, SpendGrant, ELEVATION_TTL_SECS,
-};
+use super::{Inner, PairingError, PairingService, SpendGrant, ELEVATION_TTL_SECS};
 use crate::auth::Scope;
 use crate::spend_budget::{GrantBudget, GrantView, MAX_SPEND_GRANT_TTL_SECS};
 
@@ -131,6 +129,48 @@ pub struct PendingDeviceKey {
     /// Older pending console requests have no nonce and cannot be delegated.
     #[serde(default)]
     pub delegation_nonce: String,
+    /// Version marker persists so a restart cannot downgrade SAS to console-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sas_version: Option<u8>,
+    #[serde(skip)]
+    pub(crate) sas: Option<DeviceSas>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DeviceSas {
+    pub nonce: [u8; 16],
+    pub digest: blake3::Hash,
+    pub binding: crate::sas::NoiseBinding,
+    pub confirmed: bool,
+    pub created_at: std::time::Instant,
+}
+impl std::fmt::Debug for DeviceSas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceSas([REDACTED])")
+    }
+}
+impl PendingDeviceKey {
+    /// Public nonce only, never the computed words or digest.
+    pub fn sas_confirmed(&self) -> bool {
+        self.sas_version.is_none() || self.sas.as_ref().is_some_and(|s| s.confirmed)
+    }
+    /// Public nonce used by the enrolling client.
+    pub fn box_nonce(&self) -> Option<String> {
+        self.sas.as_ref().map(|s| hex::encode(s.nonce))
+    }
+    fn require_sas_confirmed(&self) -> Result<(), PairingError> {
+        if self.sas_version.is_some()
+            && !self
+                .sas
+                .as_ref()
+                .is_some_and(|s| s.confirmed && s.created_at.elapsed().as_secs() < 900)
+        {
+            return Err(PairingError::NotGrantable(
+                "SAS confirmation required; restart requires a new ceremony".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Status of a device-key registration, as the requesting client reads it.
@@ -195,7 +235,12 @@ pub fn key_fingerprint(key_id: &str) -> String {
 /// Exact bytes the **owner-approval key** signs to register a device key:
 /// the pairing's `client_pubkey` and `epoch` (the root of the pairing chain),
 /// bound to this node and to the one device key being approved.
-pub fn owner_approval_message(node: &str, client_pubkey: &str, epoch: u64, device_public_key: &str) -> String {
+pub fn owner_approval_message(
+    node: &str,
+    client_pubkey: &str,
+    epoch: u64,
+    device_public_key: &str,
+) -> String {
     format!(
         "bitsov-owner-approval-v1\npurpose:device-key\nnode:{node}\nclient_pubkey:{client_pubkey}\n\
          epoch:{epoch}\ndevice_key:{device_public_key}"
@@ -205,6 +250,10 @@ pub fn owner_approval_message(node: &str, client_pubkey: &str, epoch: u64, devic
 /// Exact UTF-8 bytes an enrolled P-256 device signs to approve a pending key.
 /// All fields come from node state; there is no trailing newline.
 pub fn delegation_message(node: &str, op: &PendingDeviceKey) -> String {
+    if let Some(sas) = &op.sas {
+        return format!("bitsov-owner-delegation-v2\nnode:{node}\nclient_pubkey:{}\nepoch:{}\ndevice_key:{}\nop_id:{}\nnonce:{}\nsas_digest:{}",
+            op.client_pubkey, op.epoch, op.public_key, op.op_id, op.delegation_nonce, sas.digest.to_hex());
+    }
     format!(
         "bitsov-owner-delegation-v1\nnode:{node}\nclient_pubkey:{}\nepoch:{}\ndevice_key:{}\nop_id:{}\nnonce:{}",
         op.client_pubkey, op.epoch, op.public_key, op.op_id, op.delegation_nonce
@@ -219,12 +268,30 @@ pub fn verify_owner_approval(
 ) -> Result<(), PairingError> {
     let raw = hex::decode(signature_hex).map_err(|_| PairingError::BadProof)?;
     let sig = ed25519_dalek::Signature::from_slice(&raw).map_err(|_| PairingError::BadProof)?;
-    owner.verify_strict(message.as_bytes(), &sig).map_err(|_| PairingError::BadProof)
+    owner
+        .verify_strict(message.as_bytes(), &sig)
+        .map_err(|_| PairingError::BadProof)
 }
 
 /// Exact bytes the device signs to prove possession at registration.
+/// SAS possession proof: the registration tuple and full digest, versioned together.
+pub fn sas_registration_message(
+    node: &str,
+    client_id: &str,
+    public_key_hex: &str,
+    digest: &blake3::Hash,
+) -> String {
+    format!(
+        "{}\nsas_digest:{}",
+        registration_message(node, client_id, public_key_hex).replacen("-v1", "-v2", 1),
+        digest.to_hex()
+    )
+}
+
 pub fn registration_message(node: &str, client_id: &str, public_key_hex: &str) -> String {
-    format!("bitsov-device-register-v1\nnode:{node}\nclient:{client_id}\npublic_key:{public_key_hex}")
+    format!(
+        "bitsov-device-register-v1\nnode:{node}\nclient:{client_id}\npublic_key:{public_key_hex}"
+    )
 }
 
 /// Exact bytes a device signs for a relation intent. `node` and `client_id`
@@ -269,7 +336,9 @@ fn clean_name(name: &str) -> Result<String, PairingError> {
     let name = name.trim();
     if name.is_empty()
         || name.chars().count() > 64
-        || name.chars().any(|c| c.is_control() || super::invisible_format(c))
+        || name
+            .chars()
+            .any(|c| c.is_control() || super::invisible_format(c))
     {
         return Err(PairingError::Malformed(
             "device name must be 1–64 visible characters".into(),
@@ -279,7 +348,9 @@ fn clean_name(name: &str) -> Result<String, PairingError> {
 }
 
 fn is_hex(s: &str, len: usize) -> bool {
-    s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl PairingService {
@@ -292,13 +363,17 @@ impl PairingService {
         public_key: &str,
         name: &str,
         proof: &str,
+        sas_digest: Option<&blake3::Hash>,
     ) -> Result<DeviceKey, PairingError> {
         let public_key = public_key.to_ascii_lowercase();
         let raw = parse_public_key(&public_key)?;
         let name = clean_name(name)?;
         verify_p256(
             &raw,
-            registration_message(fingerprint, client_id, &public_key).as_bytes(),
+            sas_digest
+                .map(|d| sas_registration_message(fingerprint, client_id, &public_key, d))
+                .unwrap_or_else(|| registration_message(fingerprint, client_id, &public_key))
+                .as_bytes(),
             proof,
         )?;
         let inner = self.lock();
@@ -360,6 +435,18 @@ impl PairingService {
         name: &str,
         proof_hex: &str,
     ) -> Result<PendingDeviceKey, PairingError> {
+        self.request_device_key_with_sas(client_id, public_key_hex, name, proof_hex, None)
+    }
+
+    /// Versioned enrolment; binding must come from the authenticated Noise bridge.
+    pub fn request_device_key_with_sas(
+        &self,
+        client_id: &str,
+        public_key_hex: &str,
+        name: &str,
+        proof_hex: &str,
+        binding: Option<crate::sas::NoiseBinding>,
+    ) -> Result<PendingDeviceKey, PairingError> {
         if !self.owner_control_enabled && !self.local_owner_device {
             return Err(PairingError::OwnerChannelUnavailable);
         }
@@ -380,7 +467,9 @@ impl PairingService {
         )?;
         let mut inner = self.lock();
         if inner.identity_fingerprint != node {
-            return Err(PairingError::PairingInvalid("the node identity changed; ask again".into()));
+            return Err(PairingError::PairingInvalid(
+                "the node identity changed; ask again".into(),
+            ));
         }
         let client = inner
             .file
@@ -390,12 +479,26 @@ impl PairingService {
             .cloned()
             .ok_or(PairingError::UnknownClient)?;
         let key_id = key_id_for(&raw);
+        if inner.sas_failures >= 3 {
+            return Err(PairingError::Closed);
+        }
         let now = chrono::Utc::now().timestamp();
+        if inner
+            .file
+            .pending_device_keys
+            .iter()
+            .any(|p| p.expires_at > now && (binding.is_some() || p.sas_version.is_some()))
+        {
+            return Err(PairingError::TooManyPending);
+        }
         // At most one new registration request per client every 30 s: each
         // one prints to the owner's terminal and replaces the previous one.
-        if inner.file.pending_device_keys.iter().any(|p| {
-            p.client_id == client_id && p.expires_at - ELEVATION_TTL_SECS > now - 30
-        }) {
+        if inner
+            .file
+            .pending_device_keys
+            .iter()
+            .any(|p| p.client_id == client_id && p.expires_at - ELEVATION_TTL_SECS > now - 30)
+        {
             return Err(PairingError::TooManyPending);
         }
         // Replacement by this client does not consume another slot. Expired
@@ -412,13 +515,20 @@ impl PairingService {
             return Err(PairingError::TooManyPending);
         }
         // Keys retired by a rotation or epoch bump no longer block the device.
-        let live: Vec<(String, u64)> = inner.file.clients.iter().map(|c| (c.client_id.clone(), c.epoch)).collect();
+        let live: Vec<(String, u64)> = inner
+            .file
+            .clients
+            .iter()
+            .map(|c| (c.client_id.clone(), c.epoch))
+            .collect();
         inner
             .file
             .device_keys
             .retain(|k| live.iter().any(|(c, e)| *c == k.client_id && *e == k.epoch));
         if inner.file.device_keys.iter().any(|k| k.key_id == key_id) {
-            return Err(PairingError::Malformed("this device key is already registered".into()));
+            return Err(PairingError::Malformed(
+                "this device key is already registered".into(),
+            ));
         }
         let live = inner
             .file
@@ -431,6 +541,31 @@ impl PairingService {
                 "this pairing already has {MAX_DEVICE_KEYS_PER_CLIENT} device keys; revoke one first"
             )));
         }
+        let sas = if let Some(binding) = binding {
+            if client.remote_transport_pubkey.as_deref()
+                != Some(&hex::encode(binding.client_static))
+            {
+                return Err(PairingError::BadProof);
+            }
+            let claim = crate::sas::load(
+                self.dir
+                    .parent()
+                    .ok_or_else(|| PairingError::Io("claim code directory unavailable".into()))?,
+            )?;
+            let device = crate::sas::device_key(&public_key_hex)
+                .map_err(|e| PairingError::Malformed(e.into()))?;
+            let mut nonce = [0; 16];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            Some(DeviceSas {
+                nonce,
+                digest: crate::sas::digest(&binding, &device, &nonce, &claim.commitment()),
+                binding,
+                confirmed: false,
+                created_at: std::time::Instant::now(),
+            })
+        } else {
+            None
+        };
         let mut nonce = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut nonce);
         let op = PendingDeviceKey {
@@ -444,6 +579,8 @@ impl PairingService {
             name,
             expires_at: now + ELEVATION_TTL_SECS,
             delegation_nonce: hex::encode(nonce),
+            sas_version: sas.as_ref().map(|_| 1),
+            sas,
         };
         if self.owner_control_enabled {
             self.console_challenge(
@@ -479,6 +616,67 @@ impl PairingService {
         Ok(op)
     }
 
+    /// Confirm knowledge of the locally compared SAS. This grants no owner authority.
+    pub fn confirm_device_sas(
+        &self,
+        client_id: &str,
+        op_id: &str,
+        binding: &crate::sas::NoiseBinding,
+        digest: &str,
+        proof: &str,
+    ) -> Result<(), PairingError> {
+        let mut inner = self.lock();
+        if inner.sas_failures >= 3 {
+            return Err(PairingError::Closed);
+        }
+        let op = inner
+            .file
+            .pending_device_keys
+            .iter()
+            .find(|p| p.op_id == op_id && p.client_id == client_id)
+            .cloned()
+            .ok_or(PairingError::UnknownOperation)?;
+        let sas = op.sas.as_ref().ok_or(PairingError::UnknownOperation)?;
+        if op.expires_at <= chrono::Utc::now().timestamp()
+            || sas.created_at.elapsed().as_secs() >= 900
+        {
+            return Err(PairingError::Expired);
+        }
+        if &sas.binding != binding {
+            return Err(PairingError::BadProof);
+        }
+        let matches = blake3::Hash::from_hex(digest).ok() == Some(sas.digest);
+        if !matches {
+            inner.sas_failures = inner.sas_failures.saturating_add(1);
+            inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
+            inner.owner_confirmations.remove(op_id);
+            self.persist(&mut inner.file)?;
+            return Err(PairingError::BadProof);
+        }
+        verify_p256(
+            &parse_public_key(&op.public_key)?,
+            sas_registration_message(
+                &inner.identity_fingerprint,
+                client_id,
+                &op.public_key,
+                &sas.digest,
+            )
+            .as_bytes(),
+            proof,
+        )?;
+        inner
+            .file
+            .pending_device_keys
+            .iter_mut()
+            .find(|p| p.op_id == op_id)
+            .unwrap()
+            .sas
+            .as_mut()
+            .unwrap()
+            .confirmed = true;
+        Ok(())
+    }
+
     /// Read a registration's status. A read, never a consumption.
     pub fn device_key_status(&self, client_id: &str, op_id: &str) -> DeviceKeyStatus {
         let inner = self.lock();
@@ -499,21 +697,20 @@ impl PairingService {
             }
             return DeviceKeyStatus::Pending;
         }
-        if inner
-            .file
-            .registered_ops
-            .get(op_id)
-            .is_some_and(|key_id| {
-                inner
-                    .file
-                    .device_keys
-                    .iter()
-                    .any(|k| &k.key_id == key_id && k.client_id == client_id)
-            })
-        {
+        if inner.file.registered_ops.get(op_id).is_some_and(|key_id| {
+            inner
+                .file
+                .device_keys
+                .iter()
+                .any(|k| &k.key_id == key_id && k.client_id == client_id)
+        }) {
             return DeviceKeyStatus::Registered;
         }
-        if inner.cancelled_ops.get(op_id).is_some_and(|owner| owner == client_id) {
+        if inner
+            .cancelled_ops
+            .get(op_id)
+            .is_some_and(|owner| owner == client_id)
+        {
             return DeviceKeyStatus::Lost;
         }
         DeviceKeyStatus::Absent
@@ -555,6 +752,7 @@ impl PairingService {
             self.persist(&mut inner.file)?;
             return Err(PairingError::Expired);
         }
+        op.require_sas_confirmed()?;
         // The owner key signs first: a wrong signature spends no code attempt.
         let client_pubkey = inner
             .file
@@ -602,7 +800,10 @@ impl PairingService {
         inner.file.pending_device_keys.retain(|p| p.op_id != op_id);
         inner.file.device_keys.retain(|k| k.key_id != key.key_id);
         inner.file.device_keys.push(key.clone());
-        inner.file.registered_ops.insert(op_id.to_string(), key.key_id.clone());
+        inner
+            .file
+            .registered_ops
+            .insert(op_id.to_string(), key.key_id.clone());
         if let Err(e) = self.persist(&mut inner.file) {
             inner.file = before;
             return Err(e);
@@ -644,6 +845,7 @@ impl PairingService {
         if op.expires_at <= now {
             return Err(PairingError::Expired);
         }
+        op.require_sas_confirmed()?;
         if !is_hex(&op.delegation_nonce, 32) {
             return Err(PairingError::BadProof);
         }
@@ -726,9 +928,9 @@ impl PairingService {
             .device_keys
             .iter()
             .filter(|k| {
-                parse_public_key(&k.public_key)
-                    .is_ok_and(|raw| key_id_for(&raw) == k.key_id)
-                    && self.intent_key(&inner, &k.client_id, k.epoch, &k.key_id)
+                parse_public_key(&k.public_key).is_ok_and(|raw| key_id_for(&raw) == k.key_id)
+                    && self
+                        .intent_key(&inner, &k.client_id, k.epoch, &k.key_id)
                         .is_ok()
             })
             .map(|k| &k.key_id)
@@ -749,7 +951,12 @@ impl PairingService {
     /// This client's usable device keys.
     pub fn device_keys_for(&self, client_id: &str) -> Vec<DeviceKey> {
         let inner = self.lock();
-        let epoch = inner.file.clients.iter().find(|c| c.client_id == client_id).map(|c| c.epoch);
+        let epoch = inner
+            .file
+            .clients
+            .iter()
+            .find(|c| c.client_id == client_id)
+            .map(|c| c.epoch);
         inner
             .file
             .device_keys
@@ -762,7 +969,11 @@ impl PairingService {
     /// Revoke a device key (owner, or the client revoking its own). The
     /// relation grant it may have opened ends with it: every envelope of that
     /// client stops on its next request.
-    pub fn revoke_device_key(&self, key_id: &str, only_client: Option<&str>) -> Result<(), PairingError> {
+    pub fn revoke_device_key(
+        &self,
+        key_id: &str,
+        only_client: Option<&str>,
+    ) -> Result<(), PairingError> {
         let mut inner = self.lock();
         let Some(key) = inner
             .file
@@ -795,6 +1006,14 @@ impl PairingService {
     /// working.
     pub fn cancel_pending(&self, client_id: &str, op_id: &str) -> Result<(), PairingError> {
         let mut inner = self.lock();
+        if inner
+            .file
+            .pending_device_keys
+            .iter()
+            .any(|p| p.op_id == op_id && p.client_id == client_id && p.sas_version.is_some())
+        {
+            inner.sas_failures = inner.sas_failures.saturating_add(1);
+        }
         let before = inner.file.pending_elevations.len() + inner.file.pending_device_keys.len();
         inner
             .file
@@ -834,10 +1053,14 @@ impl PairingService {
         self.device_authority()?;
         let peer = intent.peer.to_ascii_lowercase();
         if !is_hex(&peer, 64) || peer != intent.peer {
-            return Err(PairingError::Malformed("peer must be a lowercase 64-hex node id".into()));
+            return Err(PairingError::Malformed(
+                "peer must be a lowercase 64-hex node id".into(),
+            ));
         }
         if !is_hex(&intent.nonce, 32) {
-            return Err(PairingError::Malformed("nonce must be 16 random bytes, lowercase hex".into()));
+            return Err(PairingError::Malformed(
+                "nonce must be 16 random bytes, lowercase hex".into(),
+            ));
         }
         if intent.level != LEVEL_CONTACT {
             return Err(PairingError::NotGrantable(
@@ -845,7 +1068,9 @@ impl PairingService {
             ));
         }
         if !(RELATION_MIN_WINDOW_SECS..=RELATION_MAX_WINDOW_SECS).contains(&intent.window_secs) {
-            return Err(PairingError::Malformed("window must be between 1 minute and 24 hours".into()));
+            return Err(PairingError::Malformed(
+                "window must be between 1 minute and 24 hours".into(),
+            ));
         }
         if intent.budget_msat == 0
             || intent.budget_msat > RELATION_MAX_BUDGET_MSAT
@@ -865,17 +1090,24 @@ impl PairingService {
             (inner.identity_fingerprint.clone(), key)
         };
         let raw = parse_public_key(&key.public_key)?;
-        verify_p256(&raw, intent_message(&node, client_id, intent).as_bytes(), signature_hex)?;
+        verify_p256(
+            &raw,
+            intent_message(&node, client_id, intent).as_bytes(),
+            signature_hex,
+        )?;
 
         let mut inner = self.lock();
         let now = chrono::Utc::now().timestamp();
-        if (i128::from(now) - i128::from(intent.issued_at)).abs() > i128::from(INTENT_MAX_SKEW_SECS) {
+        if (i128::from(now) - i128::from(intent.issued_at)).abs() > i128::from(INTENT_MAX_SKEW_SECS)
+        {
             return Err(PairingError::Expired);
         }
         if inner.identity_fingerprint != node
             || self.intent_key(&inner, client_id, epoch, &intent.device_key_id)? != key
         {
-            return Err(PairingError::NotGrantable("the device key changed while checking; sign again".into()));
+            return Err(PairingError::NotGrantable(
+                "the device key changed while checking; sign again".into(),
+            ));
         }
         let before = (inner.file.grants.clone(), inner.file.intent_nonces.clone());
 
@@ -932,7 +1164,10 @@ impl PairingService {
             }
         };
         let grant = &mut inner.file.grants[idx];
-        let budget = grant.budget.as_mut().ok_or(PairingError::Io("grant vanished".into()))?;
+        let budget = grant
+            .budget
+            .as_mut()
+            .ok_or(PairingError::Io("grant vanished".into()))?;
         budget.open_envelope(&peer, intent.budget_msat, intent.per_act_max_msat, expires);
         // A fresh signature renews the grant: it lives until its last envelope,
         // which is never more than 24 h from now.
@@ -947,10 +1182,10 @@ impl PairingService {
         grant.expires_at = last;
         grant.granted_by = format!("device:{}", key.key_id);
         let view = super::grant_view(grant).ok_or(PairingError::Io("grant vanished".into()))?;
-        inner
-            .file
-            .intent_nonces
-            .insert(nonce_key, (client_id.to_string(), intent.issued_at.max(now)));
+        inner.file.intent_nonces.insert(
+            nonce_key,
+            (client_id.to_string(), intent.issued_at.max(now)),
+        );
         if let Err(e) = self.persist(&mut inner.file) {
             // Never leave authority live in memory that the disk did not take.
             (inner.file.grants, inner.file.intent_nonces) = before;
@@ -979,7 +1214,13 @@ impl PairingService {
             .ok_or(PairingError::DeviceApprovalsDisabled(OWNER_KEY_UNAVAILABLE))
     }
 
-    fn intent_key(&self, inner: &Inner, client_id: &str, epoch: u64, key_id: &str) -> Result<DeviceKey, PairingError> {
+    fn intent_key(
+        &self,
+        inner: &Inner,
+        client_id: &str,
+        epoch: u64,
+        key_id: &str,
+    ) -> Result<DeviceKey, PairingError> {
         let client = inner
             .file
             .clients
@@ -999,13 +1240,19 @@ impl PairingService {
         // The root of the chain: the owner-approval key signed exactly this
         // pairing key, epoch and device key for this node.
         let owner = self.device_authority()?;
-        let unsigned = || PairingError::NotGrantable("device key has no valid owner approval".into());
+        let unsigned =
+            || PairingError::NotGrantable("device key has no valid owner approval".into());
         if key.client_pubkey != client.client_pubkey {
             return Err(unsigned());
         }
         verify_owner_approval(
             &owner,
-            &owner_approval_message(&inner.identity_fingerprint, &key.client_pubkey, key.epoch, &key.public_key),
+            &owner_approval_message(
+                &inner.identity_fingerprint,
+                &key.client_pubkey,
+                key.epoch,
+                &key.public_key,
+            ),
             &key.owner_approval,
         )
         .map_err(|_| unsigned())?;
@@ -1023,13 +1270,33 @@ impl PairingService {
         let now = chrono::Utc::now().timestamp();
         type Todo = (String, String, i64, Option<String>);
         let mut todo: Vec<Todo> = Vec::new();
-        for e in inner.file.pending_elevations.iter().filter(|e| e.expires_at > now) {
+        for e in inner
+            .file
+            .pending_elevations
+            .iter()
+            .filter(|e| e.expires_at > now)
+        {
             let command = Some(self.owner_grant_command(&e.op_id));
-            todo.push((e.op_id.clone(), super::grant_confirmation_phrase(e), e.expires_at, command));
+            todo.push((
+                e.op_id.clone(),
+                super::grant_confirmation_phrase(e),
+                e.expires_at,
+                command,
+            ));
         }
-        for p in inner.file.pending_device_keys.iter().filter(|p| p.expires_at > now) {
+        for p in inner
+            .file
+            .pending_device_keys
+            .iter()
+            .filter(|p| p.expires_at > now)
+        {
             let command = Some(self.owner_device_command(&p.op_id));
-            todo.push((p.op_id.clone(), device_confirmation_phrase(p), p.expires_at, command));
+            todo.push((
+                p.op_id.clone(),
+                device_confirmation_phrase(p),
+                p.expires_at,
+                command,
+            ));
         }
         for a in inner
             .file
@@ -1037,7 +1304,12 @@ impl PairingService {
             .iter()
             .filter(|a| a.expires_at > now && !a.approved)
         {
-            todo.push((a.op_id.clone(), super::replacement_confirmation_phrase(a), a.expires_at, None));
+            todo.push((
+                a.op_id.clone(),
+                super::replacement_confirmation_phrase(a),
+                a.expires_at,
+                None,
+            ));
         }
         let mut issued = 0;
         for (op_id, label, expires_at, command) in todo {
@@ -1079,14 +1351,30 @@ mod tests {
         let ck = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
         let cpub = hex::encode(ck.verifying_key().to_bytes());
         let pending = service.request_pairing("app", &cpub).unwrap();
-        let challenge = std::fs::read(service.dir().join(format!("challenge-{}", pending.pair_id))).unwrap();
+        let challenge =
+            std::fs::read(service.dir().join(format!("challenge-{}", pending.pair_id))).unwrap();
         use ed25519_dalek::Signer;
-        let sig = hex::encode(ck.sign(&PairingService::proof_message(&pending.pair_id, &cpub, &challenge)).to_bytes());
-        let client = service.confirm_pairing(&pending.pair_id, &sig, super::super::default_pairing_scopes()).unwrap();
+        let sig = hex::encode(
+            ck.sign(&PairingService::proof_message(
+                &pending.pair_id,
+                &cpub,
+                &challenge,
+            ))
+            .to_bytes(),
+        );
+        let client = service
+            .confirm_pairing(
+                &pending.pair_id,
+                &sig,
+                super::super::default_pairing_scopes(),
+            )
+            .unwrap();
         // A registered device key (approval tested elsewhere; the record is the effect).
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-        let device = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+        let device =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
         let public = device.public_key().as_ref().to_vec();
         let key_id = key_id_for(&public);
         {
@@ -1102,7 +1390,15 @@ mod tests {
                 client_pubkey: cpub.clone(),
                 owner_approval: hex::encode(
                     owner
-                        .sign(owner_approval_message(&"f".repeat(32), &cpub, client.epoch, &hex::encode(&public)).as_bytes())
+                        .sign(
+                            owner_approval_message(
+                                &"f".repeat(32),
+                                &cpub,
+                                client.epoch,
+                                &hex::encode(&public),
+                            )
+                            .as_bytes(),
+                        )
                         .to_bytes(),
                 ),
             });
@@ -1124,22 +1420,48 @@ mod tests {
             };
             let msg = intent_message(&"f".repeat(32), &client.client_id, &intent);
             let sig = hex::encode(device.sign(&rng, msg.as_bytes()).unwrap().as_ref());
-            service.apply_relation_intent(&client.client_id, client.epoch, &intent, &sig).unwrap();
+            service
+                .apply_relation_intent(&client.client_id, client.epoch, &intent, &sig)
+                .unwrap();
         }
         // Reserved at second ~0, inside A's window.
         let to_a = service
-            .reserve_spend(&client.client_id, client.epoch, vec![Charge { recipient: a.clone(), amount_msat: 1_000 }])
+            .reserve_spend(
+                &client.client_id,
+                client.epoch,
+                vec![Charge {
+                    recipient: a.clone(),
+                    amount_msat: 1_000,
+                }],
+            )
             .unwrap();
         let to_b = service
-            .reserve_spend(&client.client_id, client.epoch, vec![Charge { recipient: b.clone(), amount_msat: 1_000 }])
+            .reserve_spend(
+                &client.client_id,
+                client.epoch,
+                vec![Charge {
+                    recipient: b.clone(),
+                    amount_msat: 1_000,
+                }],
+            )
             .unwrap();
         // Second 59: both may dispatch.
-        assert!(service.with_spend_authority_at(&to_a, || now + 59, || ()).is_ok());
+        assert!(service
+            .with_spend_authority_at(&to_a, || now + 59, || ())
+            .is_ok());
         // Second 61: A's envelope is over; B's grant time does not carry A.
-        assert!(matches!(service.with_spend_authority_at(&to_a, || now + 61, || ()), Err(BudgetRefusal::NoGrant)));
-        assert!(service.with_spend_authority_at(&to_b, || now + 61, || ()).is_ok());
+        assert!(matches!(
+            service.with_spend_authority_at(&to_a, || now + 61, || ()),
+            Err(BudgetRefusal::NoGrant)
+        ));
+        assert!(service
+            .with_spend_authority_at(&to_b, || now + 61, || ())
+            .is_ok());
         // And past B's deadline, B stops too.
-        assert!(matches!(service.with_spend_authority_at(&to_b, || now + 3601, || ()), Err(BudgetRefusal::NoGrant)));
+        assert!(matches!(
+            service.with_spend_authority_at(&to_b, || now + 3601, || ()),
+            Err(BudgetRefusal::NoGrant)
+        ));
     }
 }
 
@@ -1163,7 +1485,10 @@ mod clock_tests {
             id: "r".into(),
             client_id: "c".into(),
             op_id: "op".into(),
-            charges: vec![Charge { recipient: "a".repeat(64), amount_msat: 1 }],
+            charges: vec![Charge {
+                recipient: "a".repeat(64),
+                amount_msat: 1,
+            }],
         };
         let held = std::cell::Cell::new(false);
         let out = service.with_spend_authority_at(
@@ -1175,7 +1500,10 @@ mod clock_tests {
             },
             || (),
         );
-        assert!(held.get(), "the clock must be sampled while holding the lock");
+        assert!(
+            held.get(),
+            "the clock must be sampled while holding the lock"
+        );
         assert!(matches!(out, Err(BudgetRefusal::NoGrant)));
     }
 }

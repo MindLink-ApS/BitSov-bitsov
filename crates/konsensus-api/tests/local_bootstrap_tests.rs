@@ -1486,3 +1486,401 @@ async fn remote_first_run_rejects_foreign_tunnel_and_repeated_wrong_passwords() 
     ));
     assert_eq!(before, snapshot(dir.path()));
 }
+
+#[tokio::test]
+async fn sas_version_requires_committed_device_and_completed_noise() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = setup_remote(dir.path());
+    let mut request = commitment(REMOTE_PASSWORD);
+    request["sas_version"] = json!(1);
+    let (status, _) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/create-pending",
+        request.clone(),
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    request["device"] = json!({"public_key": format!("04{}", "11".repeat(64)), "name": "phone"});
+    let (status, _) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/create-pending",
+        request,
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+fn sas_binding(r: &Remote) -> konsensus_api::sas::NoiseBinding {
+    konsensus_api::sas::NoiseBinding {
+        handshake_hash: [0x19; 32],
+        box_public_key: r.state.pairing.box_transport_pubkey(),
+        client_static: [0x55; 32],
+    }
+}
+fn sas_device() -> ring::signature::EcdsaKeyPair {
+    use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap()
+}
+fn sas_create(key: &ring::signature::EcdsaKeyPair) -> Value {
+    use ring::signature::KeyPair;
+    let mut request = commitment(REMOTE_PASSWORD);
+    request["sas_version"] = json!(1);
+    request["device"] =
+        json!({"public_key": hex::encode(key.public_key().as_ref()), "name": "SAS phone"});
+    request
+}
+fn sas_finalize(
+    r: &Remote,
+    p: &Value,
+    key: &ring::signature::EcdsaKeyPair,
+    code: &konsensus_api::sas::ClaimCode,
+) -> Value {
+    use ring::signature::KeyPair;
+    let nonce: [u8; 16] = hex::decode(p["box_nonce"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let public = hex::encode(key.public_key().as_ref());
+    let digest = konsensus_api::sas::digest(
+        &sas_binding(r),
+        &key.public_key().as_ref().try_into().unwrap(),
+        &nonce,
+        &code.commitment(),
+    );
+    let message = pairing::device::sas_registration_message(
+        &pairing::identity_fingerprint(p["node_id"].as_str().unwrap()),
+        &r.client,
+        &public,
+        &digest,
+    );
+    let proof = hex::encode(
+        key.sign(&ring::rand::SystemRandom::new(), message.as_bytes())
+            .unwrap()
+            .as_ref(),
+    );
+    let mut body = finalize_body(p);
+    body["password"] = json!(REMOTE_PASSWORD);
+    body["sas_version"] = json!(1);
+    body["sas_digest"] = json!(digest.to_hex().to_string());
+    body["device"] = json!({"public_key": public, "name": "SAS phone", "proof": proof});
+    body
+}
+
+#[tokio::test]
+async fn sas_remote_round_trip_binds_device_and_never_returns_claim_material() {
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = CapturedLog(logs.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _capture = tracing::subscriber::set_default(subscriber);
+    tracing::info!("SAS_CAPTURE_SENTINEL");
+    let dir = tempfile::tempdir().unwrap();
+    let (code, _) = konsensus_api::sas::initialize(dir.path()).unwrap();
+    let r = setup_remote(dir.path());
+    let _guard = r.tunnel.register_noise(
+        TUNNEL_PEER.parse().unwrap(),
+        r.client.clone(),
+        sas_binding(&r),
+    );
+    let key = sas_device();
+    let (status, p) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/create-pending",
+        sas_create(&key),
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{p}");
+    assert_eq!(p["sas_version"], 1);
+    assert_eq!(p["box_nonce"].as_str().unwrap().len(), 32);
+    assert!(p["expires_at"].as_i64().unwrap() <= chrono::Utc::now().timestamp() + 900);
+    let mut secret = Vec::new();
+    code.write_local(&mut secret).unwrap();
+    for forbidden in [
+        String::from_utf8(secret).unwrap(),
+        hex::encode(code.commitment()),
+        "sas_digest".into(),
+    ] {
+        assert!(!p.to_string().contains(&forbidden));
+    }
+    // A second request cannot replace or reveal another nonce.
+    assert_eq!(
+        call_via(
+            &r.state,
+            &r.token,
+            "/api/v1/identity/create-pending",
+            sas_create(&key),
+            Some(TUNNEL_PEER)
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let body = sas_finalize(&r, &p, &key, &code);
+    let (status, result) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/finalize",
+        body,
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert!(r.state.is_committed());
+    let captured = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(captured.contains("SAS_CAPTURE_SENTINEL"));
+    let mut secret = Vec::new();
+    code.write_local(&mut secret).unwrap();
+    assert!(!captured.contains(std::str::from_utf8(&secret).unwrap()));
+    assert!(!captured.contains(&hex::encode(code.commitment())));
+}
+
+#[tokio::test]
+async fn sas_three_mismatches_or_cancels_close_setup_including_legacy_downgrade() {
+    for cancel in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (code, _) = konsensus_api::sas::initialize(dir.path()).unwrap();
+        let r = setup_remote(dir.path());
+        let _guard = r.tunnel.register_noise(
+            TUNNEL_PEER.parse().unwrap(),
+            r.client.clone(),
+            sas_binding(&r),
+        );
+        let key = sas_device();
+        let mut nonces = std::collections::HashSet::new();
+        for attempt in 0..3 {
+            let (status, p) = call_via(
+                &r.state,
+                &r.token,
+                "/api/v1/identity/create-pending",
+                sas_create(&key),
+                Some(TUNNEL_PEER),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{p}");
+            assert!(nonces.insert(p["box_nonce"].clone().to_string()));
+            if cancel {
+                assert_eq!(
+                    call(
+                        &r.state,
+                        &r.token,
+                        "DELETE",
+                        &format!(
+                            "/api/v1/identity/pending/{}",
+                            p["ceremony_id"].as_str().unwrap()
+                        ),
+                        json!({})
+                    )
+                    .await
+                    .0,
+                    StatusCode::NO_CONTENT
+                );
+            } else {
+                let mut body = sas_finalize(&r, &p, &key, &code);
+                match attempt {
+                    0 => {
+                        body.as_object_mut().unwrap().remove("sas_digest");
+                    }
+                    1 => body["sas_digest"] = json!("00".repeat(32)),
+                    _ => body["device"]["public_key"] = json!(format!("04{}", "22".repeat(64))),
+                }
+                assert_eq!(
+                    call_via(
+                        &r.state,
+                        &r.token,
+                        "/api/v1/identity/finalize",
+                        body,
+                        Some(TUNNEL_PEER)
+                    )
+                    .await
+                    .0,
+                    StatusCode::BAD_REQUEST
+                );
+            }
+            assert!(!r.state.is_committed());
+        }
+        for request in [sas_create(&key), commitment(REMOTE_PASSWORD)] {
+            let (status, body) = call_via(
+                &r.state,
+                &r.token,
+                "/api/v1/identity/create-pending",
+                request,
+                Some(TUNNEL_PEER),
+            )
+            .await;
+            assert_eq!(
+                (status, body),
+                (StatusCode::FORBIDDEN, json!("setup_closed"))
+            );
+        }
+        // A process restart resets the attempt budget (the protected code stays).
+        let restarted = Arc::new(
+            BootstrapState::new(DataDirLayout::new(dir.path()), r.state.pairing.clone())
+                .with_remote_owner(bootstrap::RemoteOwner {
+                    hooks: Box::new(|password| Ok(remote_hooks(password))),
+                    tunnel: r.tunnel.clone(),
+                }),
+        );
+        let challenge = restarted.pairing.issue_token_challenge(&r.client).unwrap();
+        let signature = hex::encode(
+            SigningKey::from_bytes(&[9; 32])
+                .sign(challenge.as_bytes())
+                .to_bytes(),
+        );
+        let token = restarted
+            .pairing
+            .issue_bootstrap_token(&restarted.jwt_secret, &r.client, &challenge, &signature)
+            .unwrap()
+            .token;
+        assert_eq!(
+            call_via(
+                &restarted,
+                &token,
+                "/api/v1/identity/create-pending",
+                sas_create(&key),
+                Some(TUNNEL_PEER)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sas_expires_after_fifteen_minutes_and_cannot_finalize_on_another_noise_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, _) = konsensus_api::sas::initialize(dir.path()).unwrap();
+    let r = setup_remote(dir.path());
+    let _guard = r.tunnel.register_noise(
+        TUNNEL_PEER.parse().unwrap(),
+        r.client.clone(),
+        sas_binding(&r),
+    );
+    tokio::time::advance(std::time::Duration::from_secs(840)).await;
+    let key = sas_device();
+    let (_, p) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/create-pending",
+        sas_create(&key),
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    assert!(p["expires_at"].as_i64().unwrap() <= chrono::Utc::now().timestamp() + 60);
+    let body = sas_finalize(&r, &p, &key, &code);
+    let mut changed = sas_binding(&r);
+    changed.handshake_hash[0] ^= 1;
+    let _other = r.tunnel.register_noise(
+        "127.0.0.1:49999".parse().unwrap(),
+        r.client.clone(),
+        changed,
+    );
+    assert_eq!(
+        call_via(
+            &r.state,
+            &r.token,
+            "/api/v1/identity/finalize",
+            body.clone(),
+            Some("127.0.0.1:49999")
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    tokio::time::advance(std::time::Duration::from_secs(900)).await;
+    assert_eq!(
+        call_via(
+            &r.state,
+            &r.token,
+            "/api/v1/identity/finalize",
+            body,
+            Some(TUNNEL_PEER)
+        )
+        .await
+        .0,
+        StatusCode::GONE
+    );
+    assert!(!r.state.is_committed());
+}
+
+#[tokio::test]
+async fn sas_noise_binding_is_rechecked_after_a_delayed_finalize_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, _) = konsensus_api::sas::initialize(dir.path()).unwrap();
+    let r = setup_remote(dir.path());
+    let _guard = r.tunnel.register_noise(
+        TUNNEL_PEER.parse().unwrap(),
+        r.client.clone(),
+        sas_binding(&r),
+    );
+    let mut changed = sas_binding(&r);
+    changed.handshake_hash[0] ^= 1;
+    let peer: std::net::SocketAddr = "127.0.0.1:49999".parse().unwrap();
+    let _other = r.tunnel.register_noise(peer, r.client.clone(), changed);
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let body = Body::from_stream(futures::stream::once(async move {
+        started_tx.send(()).unwrap();
+        Ok::<_, std::io::Error>(rx.await.unwrap())
+    }));
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/identity/finalize")
+        .header("authorization", format!("Bearer {}", r.token))
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+    let router = bootstrap::build_bootstrap_router(r.state.clone());
+    let task = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+    started_rx.await.unwrap();
+    let key = sas_device();
+    let (_, p) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/create-pending",
+        sas_create(&key),
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    tx.send(sas_finalize(&r, &p, &key, &code).to_string())
+        .unwrap();
+    assert_eq!(task.await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert!(!r.state.is_committed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn sas_boot_window_cannot_be_reopened_after_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    konsensus_api::sas::initialize(dir.path()).unwrap();
+    let r = setup_remote(dir.path());
+    let _guard = r.tunnel.register_noise(
+        TUNNEL_PEER.parse().unwrap(),
+        r.client.clone(),
+        sas_binding(&r),
+    );
+    tokio::time::advance(std::time::Duration::from_secs(900)).await;
+    let (status, _) = call_via(
+        &r.state,
+        &r.token,
+        "/api/v1/identity/create-pending",
+        sas_create(&sas_device()),
+        Some(TUNNEL_PEER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE);
+}

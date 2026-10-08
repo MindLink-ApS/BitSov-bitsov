@@ -27,9 +27,9 @@ fn service(state: &AppState) -> Result<&Arc<PairingService>, ApiError> {
 }
 
 fn binding(auth: &ScopedAuth<Read>) -> Result<&PairingBinding, ApiError> {
-    auth.pairing
-        .as_ref()
-        .ok_or_else(|| ApiError::Forbidden("device keys belong to a paired client — pair first".into()))
+    auth.pairing.as_ref().ok_or_else(|| {
+        ApiError::Forbidden("device keys belong to a paired client — pair first".into())
+    })
 }
 
 /// A signature problem is a refusal of this request, not of the caller's
@@ -66,6 +66,8 @@ pub struct DeviceKeyRequest {
     pub name: String,
     /// DER signature over the registration message, hex.
     pub proof: String,
+    /// Opt in to SAS v1 over an authenticated Noise connection.
+    pub sas_version: Option<u8>,
 }
 
 /// `POST /api/v1/pair/device-key` response.
@@ -83,28 +85,86 @@ pub struct DeviceKeyResponse {
     pub owner_action: String,
     /// Exact bytes to show and sign on an existing owner device in local mode.
     pub delegation_message: Option<String>,
+    /// Negotiated SAS version, absent for legacy clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sas_version: Option<u8>,
+    /// Fresh nonce after the proof/key and Noise transcript are committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub box_nonce: Option<String>,
 }
 
 pub(crate) async fn request_device_key(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
+    noise: Option<axum::Extension<crate::rate_limit::AuthenticatedNoise>>,
     Json(body): Json<DeviceKeyRequest>,
 ) -> Result<Json<DeviceKeyResponse>, ApiError> {
     let binding = binding(&auth)?;
     let svc = service(&state)?;
+    let noise = match body.sas_version {
+        None => None,
+        Some(1) => Some(
+            noise
+                .filter(|n| n.client_id.as_ref() == binding.client_id)
+                .ok_or_else(|| ApiError::Forbidden("completed Noise transcript required".into()))?
+                .binding,
+        ),
+        Some(_) => return Err(ApiError::BadRequest("unsupported SAS version".into())),
+    };
     let op = svc
-        .request_device_key(&binding.client_id, &body.public_key, &body.name, &body.proof)
+        .request_device_key_with_sas(
+            &binding.client_id,
+            &body.public_key,
+            &body.name,
+            &body.proof,
+            noise,
+        )
         .map_err(map_err)?;
     Ok(Json(DeviceKeyResponse {
+        sas_version: op.sas_version,
+        box_nonce: op.box_nonce(),
         owner_action: svc.owner_device_command(&op.op_id),
-        delegation_message: svc
-            .local_owner_device()
+        delegation_message: (svc.local_owner_device() && op.sas_confirmed())
             .then(|| crate::pairing::device::delegation_message(&svc.bound_fingerprint(), &op)),
         fingerprint: crate::pairing::device::key_fingerprint(&op.key_id),
         op_id: op.op_id,
         key_id: op.key_id,
         expires_at: op.expires_at,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SasFinalizeRequest {
+    sas_version: u8,
+    sas_digest: String,
+    proof: String,
+}
+
+pub(crate) async fn finalize_device_sas(
+    auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    Path(op_id): Path<String>,
+    noise: Option<axum::Extension<crate::rate_limit::AuthenticatedNoise>>,
+    Json(body): Json<SasFinalizeRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let binding = binding(&auth)?;
+    if body.sas_version != 1 {
+        return Err(ApiError::BadRequest("unsupported SAS version".into()));
+    }
+    let noise = noise
+        .filter(|n| n.client_id.as_ref() == binding.client_id)
+        .ok_or_else(|| ApiError::Forbidden("completed Noise transcript required".into()))?;
+    service(&state)?
+        .confirm_device_sas(
+            &binding.client_id,
+            &op_id,
+            &noise.binding,
+            &body.sas_digest,
+            &body.proof,
+        )
+        .map_err(map_err)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 pub(crate) async fn device_key_status(
@@ -119,6 +179,7 @@ pub(crate) async fn device_key_status(
         .pending_device_key(&op_id)
         .filter(|op| {
             svc.local_owner_device()
+                && op.sas_confirmed()
                 && op.client_id == binding.client_id
                 && status == crate::pairing::DeviceKeyStatus::Pending
         })
@@ -170,7 +231,9 @@ pub(crate) async fn cancel_pending(
     service(&state)?
         .cancel_pending(&binding.client_id, &op_id)
         .map_err(map_err)?;
-    Ok(Json(serde_json::json!({ "op_id": op_id, "status": "cancelled" })))
+    Ok(Json(
+        serde_json::json!({ "op_id": op_id, "status": "cancelled" }),
+    ))
 }
 
 pub(crate) async fn list_device_keys(
@@ -216,7 +279,9 @@ async fn revoke_own_device_key(
     service(&state)?
         .revoke_device_key(&key_id, Some(&binding.client_id))
         .map_err(map_err)?;
-    Ok(Json(serde_json::json!({ "key_id": key_id, "status": "revoked" })))
+    Ok(Json(
+        serde_json::json!({ "key_id": key_id, "status": "revoked" }),
+    ))
 }
 
 /// `POST /api/v1/pair/relation-intent` body.
@@ -236,7 +301,12 @@ async fn relation_intent(
 ) -> Result<Json<RelationIntentResponse>, ApiError> {
     let binding = binding(&auth)?;
     let grant = service(&state)?
-        .apply_relation_intent(&binding.client_id, binding.epoch, &body.intent, &body.signature)
+        .apply_relation_intent(
+            &binding.client_id,
+            binding.epoch,
+            &body.intent,
+            &body.signature,
+        )
         .map_err(map_err)?;
     Ok(Json(RelationIntentResponse { grant }))
 }
@@ -261,7 +331,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(delegate_device_key),
         )
         .route("/api/v1/pair/device-keys", get(list_device_keys))
-        .route("/api/v1/pair/device-keys/:key_id", delete(revoke_own_device_key))
+        .route(
+            "/api/v1/pair/device-keys/:key_id",
+            delete(revoke_own_device_key),
+        )
         .route("/api/v1/pair/relation-intent", post(relation_intent))
 }
 
@@ -287,7 +360,10 @@ mod tests {
             format!("{}_elevation", "grant"),
             format!("{}_front_door", "grant"),
         ] {
-            assert!(!src.contains(&forbidden), "HTTP must not reach `{forbidden}`");
+            assert!(
+                !src.contains(&forbidden),
+                "HTTP must not reach `{forbidden}`"
+            );
         }
     }
 }
