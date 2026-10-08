@@ -18,7 +18,8 @@ use konsensus_core::traits::lightning::LightningProvider;
 use konsensus_core::traits::pricing::PricingEngine;
 use konsensus_core::types::NodeId;
 use konsensus_lightning::{
-    LdkConfig, LdkProvider, LndConfig, LndProvider, MockLightningConfig, MockLightningProvider,
+    ClnConfig, ClnProvider, LdkConfig, LdkProvider, LndConfig, LndProvider, MockLightningConfig,
+    MockLightningProvider,
 };
 use konsensus_message::wire::Capability;
 use konsensus_message::{NoiseTransport, PeerRegistry, TransportConfig};
@@ -191,6 +192,31 @@ impl KonsensusNode {
                     .map_err(|e| anyhow::anyhow!("lnd provider: {e}"))?
                     .with_routing_fee_policy(config.routing_fees);
                 provider.probe_payment_capability().await;
+                Arc::new(provider)
+            }
+            LightningConfig::Cln {
+                rest_url,
+                resolve_ip,
+                ca_cert_path,
+                rune_file,
+                network,
+                minimum_version,
+            } => {
+                let provider = ClnProvider::new(ClnConfig {
+                    rest_url: rest_url.clone(),
+                    resolve_ip: *resolve_ip,
+                    ca_cert_path: ca_cert_path.clone(),
+                    rune_file: rune_file.clone(),
+                    network: network.clone(),
+                    minimum_version: minimum_version.clone(),
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("cln provider: {e}"))?
+                .with_routing_fee_policy(config.routing_fees);
+                info!(
+                    backend = "cln",
+                    "lightning provider (CLN preview; payments disabled)"
+                );
                 Arc::new(provider)
             }
             LightningConfig::SharedMock {

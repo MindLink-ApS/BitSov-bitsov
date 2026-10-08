@@ -2162,6 +2162,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest",
  "rusqlite",
+ "rustls 0.23.45",
  "serde",
  "serde_json",
  "sha2",
@@ -2169,6 +2170,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "zeroize",
 ]

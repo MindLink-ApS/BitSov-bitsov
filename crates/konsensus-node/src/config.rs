@@ -500,6 +500,18 @@ pub enum LightningConfig {
         #[serde(default)]
         tls_cert_path: Option<String>,
     },
+    /// Core Lightning clnrest preview: connection/status only, no payments.
+    #[serde(rename = "cln")]
+    Cln {
+        rest_url: String,
+        #[serde(default)]
+        resolve_ip: Option<std::net::IpAddr>,
+        ca_cert_path: PathBuf,
+        rune_file: PathBuf,
+        network: String,
+        #[serde(default = "konsensus_lightning::cln::default_minimum_version")]
+        minimum_version: String,
+    },
     /// LDK embedded Lightning node — fully sovereign, no external daemon.
     /// The node IS its own Lightning node. Keys derived from the same mnemonic.
     #[serde(rename = "ldk")]
@@ -628,6 +640,25 @@ impl std::fmt::Debug for LightningConfig {
                 )
                 .field("macaroon_hex", &"<redacted>")
                 .field("tls_cert_path", tls_cert_path)
+                .finish(),
+            Self::Cln {
+                rest_url,
+                resolve_ip,
+                ca_cert_path,
+                rune_file,
+                network,
+                minimum_version,
+            } => f
+                .debug_struct("Cln")
+                .field(
+                    "rest_url",
+                    &konsensus_core::logging::redact_url_for_debug(rest_url),
+                )
+                .field("resolve_ip", resolve_ip)
+                .field("ca_cert_path", ca_cert_path)
+                .field("rune_file", rune_file)
+                .field("network", network)
+                .field("minimum_version", minimum_version)
                 .finish(),
             Self::Ldk {
                 max_channel_capacity_sats,
@@ -777,6 +808,7 @@ impl LightningConfig {
         match self {
             Self::Lnbits { .. } => "lnbits",
             Self::Lnd { .. } => "lnd",
+            Self::Cln { .. } => "cln",
             Self::Mock { .. } => "mock",
             Self::SharedMock { .. } => "shared_mock",
             Self::Ldk { .. } => "ldk",
@@ -794,6 +826,7 @@ impl LightningConfig {
                 "regtest" => Some("regtest".into()),
                 _ => None,
             },
+            Self::Cln { network, .. } => Some(network.clone()),
             Self::Mock { .. } | Self::SharedMock { .. } => Some("regtest".into()),
             Self::Lnbits { .. } | Self::Lnd { .. } => None,
         }

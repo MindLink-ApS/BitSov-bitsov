@@ -43,6 +43,12 @@ Key settings:
 - **Pricing**: Per-message-kind sat costs
 - **Peers**: Opt-in peers. Node IDs are the protocol identity; network addresses are reachability hints obtained out-of-band.
 
+### CLN (preview)
+
+Connect to an existing Core Lightning node over pinned-CA HTTPS for version,
+network and connectivity checks. Payments remain disabled in this preview.
+See the [CLN configuration reference](docs/CLN.md).
+
 ## Sovereignty Tiers
 
 | Tier | Setup | Identity | Lightning | Storage |
