@@ -80,6 +80,7 @@
 mod balance;
 mod builder;
 mod chain;
+pub mod channel_limits;
 pub mod config;
 mod connection;
 mod data_store;
@@ -1210,6 +1211,17 @@ impl Node {
 			log_error!(self.logger, "HUB_ONLY_WHILE_LOCKABLE: refusing to open a channel to peer {}", node_id);
 			return Err(Error::ChannelCreationFailed);
 		}
+		// Cheap early refusal before dialing; recheck atomically with creation below.
+		if let Some(limits) = &self.config.channel_limits {
+			let _admission = limits.lock()?;
+			limits.check(
+				channel_amount_sats,
+				self.channel_manager
+					.list_channels()
+					.iter()
+					.map(|c| c.channel_value_satoshis),
+			)?;
+		}
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
 		}
@@ -1241,6 +1253,21 @@ impl Node {
 				.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
 		}
 
+		let _admission = self
+			.config
+			.channel_limits
+			.as_ref()
+			.map(|limits| limits.lock())
+			.transpose()?;
+		if let Some(limits) = &self.config.channel_limits {
+			limits.check(
+				channel_amount_sats,
+				self.channel_manager
+					.list_channels()
+					.iter()
+					.map(|c| c.channel_value_satoshis),
+			)?;
+		}
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
 		let user_channel_id: u128 = if let Some(policy) = funding_policy {
 			let id = funding::new_policy_channel_id();
@@ -1455,10 +1482,17 @@ impl Node {
 		counterparty_node_id: PublicKey,
 		splice_amount_sats: u64,
 	) -> Result<(), Error> {
-		let open_channels =
-			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
-		if let Some(channel_details) =
-			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
+		// Fail closed until splice capacity has an atomic admission/reservation hook.
+		if self.config.channel_limits.is_some() {
+			return Err(Error::ChannelCapacityExceeded);
+		}
+
+		let open_channels = self
+			.channel_manager
+			.list_channels_with_counterparty(&counterparty_node_id);
+		if let Some(channel_details) = open_channels
+			.iter()
+			.find(|c| c.user_channel_id == user_channel_id.0)
 		{
 			self.check_sufficient_funds_for_channel(splice_amount_sats, &counterparty_node_id)?;
 
@@ -1573,10 +1607,17 @@ impl Node {
 		address: &Address,
 		splice_amount_sats: u64,
 	) -> Result<(), Error> {
-		let open_channels =
-			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
-		if let Some(channel_details) =
-			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
+		// Fail closed until splice capacity has an atomic admission/reservation hook.
+		if self.config.channel_limits.is_some() {
+			return Err(Error::ChannelCapacityExceeded);
+		}
+
+		let open_channels = self
+			.channel_manager
+			.list_channels_with_counterparty(&counterparty_node_id);
+		if let Some(channel_details) = open_channels
+			.iter()
+			.find(|c| c.user_channel_id == user_channel_id.0)
 		{
 			if splice_amount_sats > channel_details.outbound_capacity_msat {
 				return Err(Error::ChannelSplicingFailed);

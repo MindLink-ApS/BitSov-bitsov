@@ -1,4 +1,4 @@
-//! `--remote-unlock` hub-only channel opens at the owner HTTP boundary, in-process:
+//! Configured hub-only channel opens at the owner HTTP boundary, in-process:
 //! no sockets and no money. The backend records every open that reaches it.
 use super::test_common as common;
 use super::*;
@@ -188,12 +188,56 @@ async fn hub_only_refuses_every_open_entry_point_including_auto_channel() {
 }
 
 #[tokio::test]
-async fn without_remote_unlock_any_peer_opens_as_before() {
+async fn explicit_opt_out_allows_any_peer() {
     for peer in [HUB, STRANGER] {
-        let (status, body, opened) = open_over_api(ChannelPeers::Any, peer).await;
+        let (status, body, opened) = open_over_api(
+            ChannelPeers::from_config(
+                &toml::from_str("backend = 'ldk'\nhub_only_channels = false").unwrap(),
+            )
+            .unwrap(),
+            peer,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(opened, vec![peer.to_string()]);
     }
+}
+
+#[tokio::test]
+async fn remote_unlock_hub_only_refuses_non_hub_even_with_opt_out() {
+    for hubs in [String::new(), format!("lsp_node_id = '{HUB}'")] {
+        let config = toml::from_str(&format!(
+            "backend = 'ldk'\nhub_only_channels = false\n{hubs}"
+        ))
+        .unwrap();
+        let peers =
+            crate::channel_peers_for_start(&config, crate::PasswordSource::RemoteUnlock).unwrap();
+        // The same policy supplies the backend's inbound allowlist.
+        let allowlist = peers.allowlist();
+        let (status, body, opened) = open_over_api(peers, STRANGER).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(allowlist.is_some());
+        assert_eq!(body["code"], HUB_ONLY_WHILE_LOCKABLE);
+        assert_eq!(body["retry_allowed"], false);
+        assert!(
+            opened.is_empty(),
+            "refused open reached the backend: {opened:?}"
+        );
+    }
+}
+
+#[test]
+fn remote_unlock_hub_only_rejects_service_even_with_opt_out() {
+    let config = toml::from_str(
+        "backend = 'ldk'\nhub_only_channels = false\n[lsps2_service]\nenabled = true\nrequire_token = 't'",
+    )
+    .unwrap();
+    let error =
+        crate::channel_peers_for_start(&config, crate::PasswordSource::RemoteUnlock).unwrap_err();
+    assert!(
+        error.to_string().starts_with(HUB_ONLY_WHILE_LOCKABLE),
+        "{error}"
+    );
 }
 
 #[test]
@@ -212,4 +256,125 @@ fn hub_only_policy_is_the_configured_liquidity_providers() {
     // Backends without a configured hub refuse every peer.
     let mock: crate::config::LightningConfig = toml::from_str("backend = 'mock'").unwrap();
     assert_eq!(ChannelPeers::hub_only(&mock).unwrap().allowlist(), Some(vec![]));
+}
+
+#[test]
+fn home_config_enforces_hubs_without_a_startup_flag_and_allows_explicit_opt_out() {
+    let config = |extra: &str| -> crate::config::LightningConfig {
+        toml::from_str(&format!("backend = 'ldk'\n{extra}")).unwrap()
+    };
+    assert_eq!(
+        ChannelPeers::from_config(&config("")).unwrap().allowlist(),
+        Some(vec![])
+    );
+    assert_eq!(
+        ChannelPeers::from_config(&config("hub_only_channels = false"))
+            .unwrap()
+            .allowlist(),
+        None
+    );
+    let legacy = config(&format!(
+        "lsp_node_id = '{HUB}'\nlsp_address = '127.0.0.1:9735'"
+    ));
+    assert_eq!(
+        ChannelPeers::from_config(&legacy).unwrap().allowlist(),
+        Some(vec![HUB.into()])
+    );
+    let service = config("[lsps2_service]\nenabled = true\nrequire_token = 't'");
+    assert_eq!(
+        ChannelPeers::from_config(&service).unwrap().allowlist(),
+        None
+    );
+    assert!(ChannelPeers::from_config(&config(
+        "hub_only_channels = true\n[lsps2_service]\nenabled = true\nrequire_token = 't'"
+    ))
+    .is_err());
+}
+
+#[tokio::test]
+async fn default_home_config_refuses_non_hub_over_owner_api() {
+    let config = toml::from_str(&format!(
+        "backend = 'ldk'\n[[liquidity.providers]]\nnode_id = '{HUB}'\naddress = '127.0.0.1:9735'"
+    ))
+    .unwrap();
+    let (status, body, opened) =
+        open_over_api(ChannelPeers::from_config(&config).unwrap(), STRANGER).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], HUB_ONLY_WHILE_LOCKABLE);
+    assert!(opened.is_empty());
+}
+
+#[tokio::test]
+async fn owner_status_reports_real_backend_policy_through_wrappers_but_public_health_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ldk_node::Builder::from_config(ldk_node::config::Config {
+        channel_limits: Some(ldk_node::channel_limits::ChannelLimits::new(50_000, 80_000)),
+        channel_peer_allowlist: Some(vec![HUB.parse().unwrap()]),
+        ..Default::default()
+    });
+    builder.set_network(ldk_node::bitcoin::Network::Regtest);
+    builder.set_storage_dir_path(dir.path().join("ldk").to_str().unwrap().into());
+    builder.set_entropy_seed_bytes([93; 64]);
+    let node = Arc::new(builder.build().unwrap());
+    let backend = Arc::new(konsensus_lightning::LdkProvider::from_node(node));
+    let recovering = Arc::new(
+        RecoveringLightning::new(
+            move || {
+                let backend = backend.clone();
+                async move { Ok(backend as Arc<dyn LightningProvider>) }
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    let provider = Arc::new(GuardedLightning {
+        inner: recovering.clone(),
+        disk: Arc::new(DiskGuard::new(dir.path().into(), 0)),
+        channel_peers: hub_only(),
+        _state_guard: Arc::new(
+            crate::safety::ensure_generation(dir.path(), crate::safety::STATE_GENERATION).unwrap(),
+        ),
+    });
+    let state = test_state_with_lightning(provider);
+    for (path, authorized) in [
+        ("/api/v1/status", false),
+        ("/api/v1/status", true),
+        ("/api/v1/health", false),
+    ] {
+        let mut request = Request::builder().uri(path);
+        if authorized {
+            request = request.header("authorization", auth_header(&state));
+        }
+        let response = test_router(state.clone())
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        if path == "/api/v1/status" && !authorized {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            continue;
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 100_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        if authorized {
+            assert_eq!(
+                body["channel_safety"],
+                serde_json::json!({
+                    "max_channel_capacity_sats": 50_000,
+                    "max_total_channel_capacity_sats": 80_000,
+                    "hub_only": true,
+                })
+            );
+        } else {
+            assert!(body.get("channel_safety").is_none());
+        }
+    }
+    // The real test backend was deliberately never started; stop reports NotRunning.
+    let error = recovering.shutdown().await.unwrap_err();
+    assert!(error.to_string().contains("not running"), "{error}");
 }
