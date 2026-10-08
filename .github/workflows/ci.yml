@@ -151,7 +151,7 @@ jobs:
 
       - name: cargo test (core crates only — ldk-node too large for CI runner)
         run: |
-          cargo test -p konsensus-core -p konsensus-crypto -p konsensus-storage \
+          cargo test -p konsensus-recovery -p konsensus-core -p konsensus-crypto -p konsensus-storage \
             -p konsensus-message -p konsensus-pricing -p konsensus-chain \
             -p konsensus-routing -p konsensus-gossip -p konsensus-bsx \
             -p konsensus-lightning -p konsensus-api -p konsensus-node

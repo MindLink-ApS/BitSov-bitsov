@@ -10,6 +10,7 @@
 pub mod double_ratchet;
 pub mod noise;
 pub mod plaintext_cache;
+pub mod scb;
 pub mod sender_keys;
 pub mod session;
 pub mod x3dh;

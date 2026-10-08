@@ -10,6 +10,7 @@ license.workspace = true
 ldk-integration-test = ["dep:electrsd"]
 
 [dependencies]
+konsensus-crypto = { path = "../konsensus-crypto" }
 konsensus-chain = { path = "../konsensus-chain" }
 konsensus-core = { path = "../konsensus-core" }
 tokio.workspace = true
@@ -46,5 +47,4 @@ axum.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 konsensus-storage = { path = "../konsensus-storage" }
-konsensus-crypto = { path = "../konsensus-crypto" }
 sqlx.workspace = true

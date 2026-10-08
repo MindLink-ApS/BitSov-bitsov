@@ -1,17 +1,22 @@
-//! Offline seed-only recovery of LDK v2 static `to_remote` outputs.
+//! Offline recovery of LDK v2 static `to_remote` outputs, optionally indexed by backup.
 //!
 //! This library does not start a node, read a wallet, access the network, or broadcast.
 //! Supply the **32-byte LDK seed**, not a BIP39 seed or the BDK wallet seed. Only
 //! channels using LDK's v2 remote-key derivation are covered; HTLCs and v1 keys are not.
+//! [`BackupIndex`] authenticates an SCB export and extracts only seed-verified
+//! public hints. It never restores a manager or monitor; legacy v1 scripts fail
+//! with [`BackupError::UnknownScript`].
 //! Scanners receive public scripts only. The caller must authenticate prevouts against
 //! the chain, check destination network/ownership, and recheck unspentness and maturity
 //! after reorgs before broadcasting. Confirmation counts here are a scanner assertion,
 //! not a chain proof. One confirmation permits CSV-1 spending in the next block.
 #![forbid(unsafe_code)]
 
+mod backup;
 mod keys;
 mod sweep;
 
+pub use backup::{BackupError, BackupIndex, ChannelRecoveryMetadata, MAX_BACKUP_BYTES};
 pub use keys::{OutputKind, RecoveryKeys, RecoveryScript, STATIC_KEY_COUNT};
 pub use sweep::Sweep;
 

@@ -9,16 +9,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Nonce as AesNonce,
-};
 use rand::RngCore;
 use thiserror::Error;
 
-const MAGIC: &[u8; 8] = b"BSOVSCB1";
-const AAD: &[u8] = b"bitsov-scb-backup-v1";
-const NONCE_LEN: usize = 12;
 const SNAPSHOT_PREFIX: &str = "scb-";
 const SNAPSHOT_SUFFIX: &str = ".aes";
 const LATEST_NAME: &str = "scb-latest.aes";
@@ -80,7 +73,8 @@ pub fn rotate_scb_backup(
     fs::create_dir_all(&config.backup_dir)?;
 
     let rotated_at_unix = now_unix()?;
-    let encrypted = encrypt_scb(&plaintext, master_aes_key)?;
+    let encrypted =
+        konsensus_crypto::scb::encrypt_scb(&plaintext, master_aes_key).map_err(map_crypto_error)?;
     let snapshot_path = config.backup_dir.join(snapshot_name()?);
     let latest_path = config.backup_dir.join(LATEST_NAME);
 
@@ -102,53 +96,16 @@ pub fn decrypt_scb_backup(
     encrypted: &[u8],
     master_aes_key: &[u8; 32],
 ) -> Result<Vec<u8>, ScbRotationError> {
-    if encrypted.len() < MAGIC.len() + NONCE_LEN {
-        return Err(ScbRotationError::InvalidFormat("file too short".into()));
-    }
-    if &encrypted[..MAGIC.len()] != MAGIC {
-        return Err(ScbRotationError::InvalidFormat("bad magic".into()));
-    }
-
-    let nonce_start = MAGIC.len();
-    let ciphertext_start = nonce_start + NONCE_LEN;
-    let nonce = AesNonce::from_slice(&encrypted[nonce_start..ciphertext_start]);
-    let ciphertext = &encrypted[ciphertext_start..];
-    let cipher = Aes256Gcm::new_from_slice(master_aes_key)
-        .map_err(|e| ScbRotationError::Crypto(format!("key init: {e}")))?;
-
-    cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: ciphertext,
-                aad: AAD,
-            },
-        )
-        .map_err(|e| ScbRotationError::Crypto(format!("decrypt: {e}")))
+    konsensus_crypto::scb::decrypt_scb_backup(encrypted, master_aes_key).map_err(map_crypto_error)
 }
 
-fn encrypt_scb(plaintext: &[u8], master_aes_key: &[u8; 32]) -> Result<Vec<u8>, ScbRotationError> {
-    let cipher = Aes256Gcm::new_from_slice(master_aes_key)
-        .map_err(|e| ScbRotationError::Crypto(format!("key init: {e}")))?;
-
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = AesNonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: plaintext,
-                aad: AAD,
-            },
-        )
-        .map_err(|e| ScbRotationError::Crypto(format!("encrypt: {e}")))?;
-
-    let mut out = Vec::with_capacity(MAGIC.len() + NONCE_LEN + ciphertext.len());
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
+fn map_crypto_error(error: konsensus_crypto::scb::ScbCryptoError) -> ScbRotationError {
+    match error {
+        konsensus_crypto::scb::ScbCryptoError::Crypto(message) => ScbRotationError::Crypto(message),
+        konsensus_crypto::scb::ScbCryptoError::InvalidFormat(message) => {
+            ScbRotationError::InvalidFormat(message)
+        }
+    }
 }
 
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), ScbRotationError> {
@@ -279,7 +236,7 @@ mod tests {
 
         let encrypted = fs::read(&meta.latest_path).unwrap();
         assert_ne!(encrypted, plaintext);
-        assert!(encrypted.starts_with(MAGIC));
+        assert!(encrypted.starts_with(b"BSOVSCB1"));
         let decrypted = decrypt_scb_backup(&encrypted, &key).unwrap();
         assert_eq!(decrypted, plaintext);
     }
