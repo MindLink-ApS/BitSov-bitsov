@@ -35,6 +35,10 @@ fn checksum(code: &mut [u8; 18]) {
     code[16] = ALPHABET[(hash.as_bytes()[0] >> 3) as usize];
     code[17] = ALPHABET[(((hash.as_bytes()[0] & 7) << 2) | (hash.as_bytes()[1] >> 6)) as usize];
 }
+/// An existing (even unreadable or malformed) claim file prohibits downgrade.
+pub fn required(dir: &Path) -> bool {
+    !matches!(std::fs::symlink_metadata(dir.join(CLAIM_FILE)), Err(e) if e.kind() == io::ErrorKind::NotFound)
+}
 /// Read an existing protected local code; reject malformed files without echoing bytes.
 pub fn load(dir: &Path) -> io::Result<ClaimCode> {
     let path = dir.join(CLAIM_FILE);

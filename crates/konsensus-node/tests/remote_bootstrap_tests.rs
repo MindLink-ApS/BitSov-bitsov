@@ -55,12 +55,14 @@ struct Fixture {
     api: SocketAddr,
     remote: SocketAddr,
     peer: SocketAddr,
+    page_port: u16,
 }
 
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (api, remote, peer) = (address(), address(), address());
+        let page_port = address().port();
         let d = dir.path().display();
         let config = dir.path().join("konsensus.toml");
         std::fs::write(
@@ -68,6 +70,8 @@ impl Fixture {
             format!(
                 r#"
 tier = "light"
+[setup_page]
+port = {page_port}
 [node]
 hosted_by = "Rasmus's Pi"
 [identity]
@@ -98,6 +102,7 @@ advertised_endpoint = "{remote}"
             api,
             remote,
             peer,
+            page_port,
         }
     }
 
@@ -278,12 +283,13 @@ fn scan_for_password(path: &Path) {
 }
 
 #[tokio::test]
-async fn remote_bootstrap_over_tunnel_restarts_locked_and_first_unlock_succeeds() {
-    bootstrap_restarts_locked_and_first_unlock_succeeds(&[
-        "--remote-unlock",
-        "--local-owner-device",
-    ])
-    .await;
+async fn non_home_remote_bootstrap_requires_home_for_box_approval() {
+    let f = Fixture::new();
+    let log = tempfile::tempfile().unwrap();
+    let mut node = f.start(&log, &["--remote-unlock", "--local-owner-device"]);
+    assert!(!exited(&mut node, &log).await.success());
+    assert!(logs(&log).contains("remote first run requires --home"));
+    assert!(!f.dir.path().join("NODE_INITIALIZED").exists());
 }
 
 #[tokio::test]
@@ -307,7 +313,7 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
         "{}",
         String::from_utf8_lossy(&issued.stderr)
     );
-    let ticket =
+    let mut ticket =
         wire::PairLink::from_uri(String::from_utf8(issued.stdout).unwrap().trim()).unwrap();
     assert!(ticket.node_id.is_empty());
     let box_pin = ticket.box_transport_pubkey.clone();
@@ -315,6 +321,52 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     // 2. Fresh box: bootstrap with the tunnel, no startup password.
     let mut node = f.start(&log, flags);
     f.ready(&mut node, "/livez", &log).await;
+    let home = flags.contains(&"--home");
+    let mut page_url = String::new();
+    let mut cookie = String::new();
+    let mut csrf = String::new();
+    if home {
+        let ip = if_addrs::get_if_addrs()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.ip())
+            .find(|ip| ip.is_ipv4() && konsensus_api::bootstrap::setup::lan_source(*ip))
+            .expect("home process test requires a LAN interface");
+        page_url = format!("http://{}", SocketAddr::new(ip, f.page_port));
+        let response = http.get(&page_url).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        cookie = response.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .into();
+        let html = response.text().await.unwrap();
+        csrf = html
+            .split("const csrf = '")
+            .nth(1)
+            .unwrap()
+            .split('\'')
+            .next()
+            .unwrap()
+            .into();
+        let issued: Value = http
+            .post(format!("{page_url}/setup/start"))
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        ticket = wire::PairLink::from_uri(issued["uri"].as_str().unwrap()).unwrap();
+        assert!(!f.dir.path().join("pairing/remote-access-link").exists());
+    }
     assert!(!f.dir.path().join("control.sock").exists());
     assert!(
         TcpStream::connect(f.peer).await.is_err(),
@@ -369,8 +421,17 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     assert_eq!(state["can_restore"], false);
 
     // 4. Commit to the password, then show the phrase.
-    let commitment =
-        json!({"password_commitment": blake3::hash(PASSWORD.as_bytes()).to_hex().to_string()});
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let device_key =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let device_public = hex::encode(device_key.public_key().as_ref());
+    let mut commitment =
+        json!({"password_commitment":blake3::hash(PASSWORD.as_bytes()).to_hex().to_string()});
+    if home {
+        commitment["sas_version"] = json!(1);
+        commitment["device"] = json!({"public_key":device_public,"name":"iPhone"});
+    }
     let loopback = http
         .post(format!("http://{}/api/v1/identity/create-pending", f.api))
         .bearer_auth(&bst)
@@ -387,6 +448,11 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
             Some(&commitment),
         )
         .await;
+    if !home {
+        assert_eq!((status, p), (403, json!("sas_required")));
+        assert!(!f.dir.path().join("NODE_INITIALIZED").exists());
+        return;
+    }
     assert_eq!(status, 200, "{p}");
     let phrase = p["mnemonic"].as_str().unwrap().to_string();
     let node_id = p["node_id"].as_str().unwrap().to_string();
@@ -398,23 +464,33 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
         .iter()
         .map(|i| words[i.as_u64().unwrap() as usize])
         .collect();
-    let rng = ring::rand::SystemRandom::new();
-    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-    let device_key =
-        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
-    let device_public = hex::encode(device_key.public_key().as_ref());
+    let claim = konsensus_api::sas::load(f.dir.path()).unwrap();
+    let digest = konsensus_api::sas::digest(
+        &konsensus_api::sas::NoiseBinding {
+            handshake_hash: *tunnel.noise.handshake_hash().unwrap(),
+            box_public_key: hex::decode(&box_pin).unwrap().try_into().unwrap(),
+            client_static: hex::decode(&client_transport).unwrap().try_into().unwrap(),
+        },
+        &device_key.public_key().as_ref().try_into().unwrap(),
+        &hex::decode(p["box_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        &claim.commitment(),
+    );
     let registration = hex::encode(
         device_key
             .sign(
                 &rng,
-                device::registration_message(&fingerprint, &client_id, &device_public).as_bytes(),
+                device::sas_registration_message(&fingerprint, &client_id, &device_public, &digest)
+                    .as_bytes(),
             )
             .unwrap()
             .as_ref(),
     );
     let finalize = json!({"ceremony_id": p["ceremony_id"], "backup_words": backup,
         "device": {"public_key": device_public, "name": "iPhone", "proof": registration},
-        "password": PASSWORD});
+        "password": PASSWORD, "sas_version":1,"sas_digest":digest.to_hex().to_string()});
 
     // 5. The loopback listener refuses a finalize password.
     let loopback = http
@@ -428,6 +504,39 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     assert_eq!(loopback.text().await.unwrap(), "tunnel_required");
     assert!(!f.dir.path().join("identity").exists());
 
+    let (status, body) = tunnel
+        .send(
+            "POST",
+            "/api/v1/identity/finalize",
+            Some(&bst),
+            Some(&finalize),
+        )
+        .await;
+    assert_eq!((status, body), (409, json!("box_approval_pending")));
+    let page_state: Value = http
+        .get(format!("{page_url}/setup/state"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        page_state["words"],
+        json!(konsensus_api::sas::words(&digest))
+    );
+    let approved = http
+        .post(format!("{page_url}/setup/approve"))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({"ceremony_id":p["ceremony_id"],"sas_digest":digest.to_hex().to_string()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), 204);
+    assert!(!f.dir.path().join("NODE_INITIALIZED").exists());
     // 6. Finalize over the tunnel: encrypted seed, signed box pin, exit 75.
     let (status, result) = tunnel
         .send(
@@ -498,6 +607,19 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     // 7. Supervised restart: same command, now locked; first unlock works.
     let mut node = f.start(&log, flags);
     let lock = f.ready(&mut node, "/api/v1/node/lock", &log).await;
+    let status_html = http
+        .get(&page_url)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(status_html.contains("LOCKED"));
+    assert!(status_html.contains("Use the BitSov app"));
+    for secret in ["Approve", "bitsov://", phrase.as_str(), PASSWORD] {
+        assert!(!status_html.contains(secret));
+    }
     assert_eq!(lock["state"], "locked");
     assert!(!f.dir.path().join("control.sock").exists());
     let locked_pid = node.0.id();
@@ -587,7 +709,7 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     assert_eq!(keys["local_owner_device"], true, "{keys}");
     assert_eq!(keys["owner_device_count"], 1, "{keys}");
 
-    // 9. The remote_first_run device is a delegation approver.
+    // 9. A claimed box refuses legacy enrollment, including the local API.
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
     let second =
         EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
@@ -598,36 +720,26 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
             device::registration_message(&fingerprint, &client_id, &second_public).as_bytes(),
         )
         .unwrap();
-    let reg: Value = http
+    let reg = http
         .post(format!("http://{}/api/v1/pair/device-key", f.api))
         .bearer_auth(token)
         .json(&json!({"public_key": second_public, "name": "iPad",
                       "proof": hex::encode(proof.as_ref())}))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    let delegation = reg["delegation_message"].as_str().unwrap();
-    let signature = device_key.sign(&rng, delegation.as_bytes()).unwrap();
-    let approved = http
-        .post(format!(
-            "http://{}/api/v1/pair/device-key/{}/delegate",
-            f.api,
-            reg["op_id"].as_str().unwrap()
-        ))
-        .bearer_auth(token)
-        .json(&json!({"approver_key_id": record.key_id,
-                      "signature": hex::encode(signature.as_ref())}))
+    assert!(reg.status().is_client_error());
+    assert_eq!(device_keys().await["owner_device_count"], 1);
+    let html = http
+        .get(&page_url)
         .send()
         .await
+        .unwrap()
+        .text()
+        .await
         .unwrap();
-    assert_eq!(approved.status(), 200);
-    let approved: Value = approved.json().await.unwrap();
-    assert_eq!(approved["status"], "registered", "{approved}");
-    assert_eq!(approved["key_id"], reg["key_id"]);
-    assert_eq!(device_keys().await["owner_device_count"], 2);
+    assert!(html.contains("UNLOCKED"));
+    assert!(!html.contains("Approve"));
     drop(node);
 
     let file_log = std::fs::read_to_string(f.dir.path().join("node.log")).unwrap_or_default();

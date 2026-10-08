@@ -146,10 +146,31 @@ fn is_invisible_format(c: char) -> bool {
     )
 }
 
+/// Home page binds individual private interfaces, never a wildcard or VPN.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupPageConfig {
+    #[serde(default = "default_setup_page_port")]
+    pub port: u16,
+}
+fn default_setup_page_port() -> u16 {
+    8080
+}
+impl Default for SetupPageConfig {
+    fn default() -> Self {
+        Self {
+            port: default_setup_page_port(),
+        }
+    }
+}
+
 /// Top-level node configuration, matching `konsensus.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
+    /// Separate LAN box page port; activated only by --home.
+    #[serde(default)]
+    pub setup_page: SetupPageConfig,
     /// Opt-in local tower client core; transport and payments are W2b.
     #[serde(default)]
     pub tower: konsensus_lightning::tower::TowerConfig,
@@ -1971,6 +1992,7 @@ impl NodeConfig {
         let verify_lightning_settlement = !matches!(&lightning, LightningConfig::Mock { .. });
 
         Self {
+            setup_page: Default::default(),
             tower: Default::default(),
             node: NodeDisplayConfig::default(),
             logging: Default::default(),

@@ -44,6 +44,8 @@ lightning-invoice.workspace = true
 futures.workspace = true
 zeroize = { workspace = true, features = ["serde"] }
 
+qrcode = { version = "=0.14.1", default-features = false }
+
 [dev-dependencies]
 sqlx.workspace = true
 mockall.workspace = true

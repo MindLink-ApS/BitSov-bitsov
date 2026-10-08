@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Set up your BitSov box</title>
+<style nonce="__NONCE__">body{font:18px system-ui;margin:3rem auto;padding:1rem;max-width:38rem;color:#132629;background:#f5f7f4}button,a{font:inherit;padding:.7rem;margin:.3rem}button{cursor:pointer}#qr{max-width:22rem}#uri{overflow-wrap:anywhere;font-size:14px}#words{font-size:1.6rem;font-weight:bold}[hidden]{display:none}</style></head>
+<body><h1>Set up your BitSov box</h1><p>__LABEL__</p><p id="clock"></p><p id="message">Open the BitSov app to set up this empty box.</p>
+<button id="start">Start setup</button><section id="ticket" hidden><div id="qr"></div><p id="uri"></p><a id="link">Open in BitSov</a><p id="expiry"></p></section>
+<section id="ceremony" hidden><p>Compare these four words with the app.</p><p id="words"></p><button id="approve">Approve</button><button id="cancel">Words differ / Not me</button></section><p id="error" role="alert"></p>
+<script nonce="__NONCE__">
+'use strict';
+const csrf = '__NONCE__';
+const el = id => document.getElementById(id);
+let ceremony = null, expires = 0;
+async function call(path, body) {
+ const r = await fetch(path,{method:body ? 'POST':'GET',headers:{'X-CSRF-Token':csrf,'Content-Type':'application/json'},body:body ? JSON.stringify(body):undefined,credentials:'same-origin',cache:'no-store'});
+ if (!r.ok) { if ([403,409,410].includes(r.status)) { el('ticket').hidden=true; el('ceremony').hidden=true; el('start').hidden=true; } throw new Error('Setup unavailable. Refresh for status; restart the box if setup has closed.'); }
+ return r.status===204 ? null : r.json();
+}
+async function refresh() {
+ try {
+ const s=await call('/setup/state'); ceremony=s;
+ el('clock').textContent='Setup closes in '+Math.floor(s.seconds/60)+':'+String(s.seconds%60).padStart(2,'0');
+ el('start').hidden=s.state==='claimed'; el('ceremony').hidden=s.state!=='claimed';
+ if(s.state==='claimed') { el('ticket').hidden=true; el('message').textContent='Claimed by '+(s.device_name || 'a device')+(s.claimed_at ? ' at '+new Date(s.claimed_at*1000).toLocaleTimeString() : '')+'. If this is not your device, cancel before continuing. If your app cannot pair, someone else may have claimed this empty box.'; }
+ el('words').textContent=s.words ? s.words.join(' · ') : 'Waiting for the device…';
+ el('approve').hidden=!s.words || s.approved;
+ if(s.approved) el('message').textContent='Approved. Complete setup in the BitSov app.';
+ if(expires && Date.now()>=expires) el('ticket').hidden=true;
+ } catch(e) { el('error').textContent=e.message; }
+}
+el('start').onclick=async()=>{try{const t=await call('/setup/start',{});el('qr').innerHTML=t.qr;el('uri').textContent=t.uri;el('link').href=t.uri;el('ticket').hidden=false;expires=Date.now()+t.expires_in*1000;el('expiry').textContent='One use. Expires in '+t.expires_in+' seconds.';await refresh();}catch(e){el('error').textContent=e.message;}};
+el('approve').onclick=async()=>{try{await call('/setup/approve',{ceremony_id:ceremony.ceremony_id,sas_digest:ceremony.sas_digest});await refresh();}catch(e){el('error').textContent=e.message;}};
+el('cancel').onclick=async()=>{try{await call('/setup/cancel',{});el('ticket').hidden=true;await refresh();}catch(e){el('error').textContent=e.message;}};
+refresh();setInterval(refresh,2000);
+</script></body></html>

@@ -1002,7 +1002,10 @@ pub async fn serve_bootstrap_mode(
     config: &NodeConfig,
     local: Option<LocalOwnerBootstrap>,
     remote_unlock: bool,
+    home: bool,
 ) -> Result<bool> {
+    anyhow::ensure!(!remote_unlock || home,
+        "remote first run requires --home for LAN box approval; use --home instead of --remote-unlock --local-owner-device on an empty box");
     if !config.identity.passphrase.is_empty() {
         anyhow::bail!(
             "bootstrap does not support identity.passphrase: first-run commit derives with an \
@@ -1030,7 +1033,8 @@ pub async fn serve_bootstrap_mode(
     // with no keys, and first-run authority is already scoped to bootstrap.
     let pairing = std::sync::Arc::new(
         PairingService::open(&data_dir, String::new(), false)
-            .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?,
+            .map_err(|e| anyhow::anyhow!("failed to open pairing state: {e}"))?
+            .with_hosted_by(config.node.hosted_by.clone()),
     );
     let align_path = config_path.to_path_buf();
     let mut state = konsensus_api::bootstrap::BootstrapState::new(layout, pairing)
@@ -1078,15 +1082,28 @@ pub async fn serve_bootstrap_mode(
         .with_context(|| format!("could not bind bootstrap API at {api_addr}"))?;
     let mut listeners = vec![api];
     let mut tunnel = None;
+    let mut _home_page = None;
     if remote_unlock {
         let internal = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let server = crate::remote_access::RemoteAccessServer::bind_bootstrap(
+        let mut server = crate::remote_access::RemoteAccessServer::bind_bootstrap(
             &config.remote_access,
             state.pairing.clone(),
             internal.local_addr()?,
             tunnel_clients,
         )
         .await?;
+        if home {
+            let tickets = server.enable_home_setup(&config.remote_access, state.clone())?;
+            _home_page = Some(
+                crate::setup_page::start(
+                    config,
+                    Some(state.clone()),
+                    Some(tickets),
+                    "SETUP".into(),
+                )
+                .await?,
+            );
+        }
         listeners.push(internal);
         // Stop the tunnel with the bootstrap listeners so no bridge outlives
         // the terminal response.

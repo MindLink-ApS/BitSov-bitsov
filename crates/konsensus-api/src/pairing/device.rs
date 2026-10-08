@@ -451,6 +451,11 @@ impl PairingService {
             return Err(PairingError::OwnerChannelUnavailable);
         }
         self.device_authority()?;
+        if binding.is_none() && crate::sas::required(self.dir().parent().unwrap_or(self.dir())) {
+            return Err(PairingError::PairingInvalid(
+                "SAS required on a claimed box".into(),
+            ));
+        }
         let public_key_hex = public_key_hex.to_ascii_lowercase();
         let raw = parse_public_key(&public_key_hex)?;
         let name = clean_name(name)?;
@@ -752,6 +757,13 @@ impl PairingService {
             self.persist(&mut inner.file)?;
             return Err(PairingError::Expired);
         }
+        if op.sas_version.is_none()
+            && crate::sas::required(self.dir().parent().unwrap_or(self.dir()))
+        {
+            return Err(PairingError::PairingInvalid(
+                "SAS required on a claimed box".into(),
+            ));
+        }
         op.require_sas_confirmed()?;
         // The owner key signs first: a wrong signature spends no code attempt.
         let client_pubkey = inner
@@ -844,6 +856,13 @@ impl PairingService {
         let now = chrono::Utc::now().timestamp();
         if op.expires_at <= now {
             return Err(PairingError::Expired);
+        }
+        if op.sas_version.is_none()
+            && crate::sas::required(self.dir().parent().unwrap_or(self.dir()))
+        {
+            return Err(PairingError::PairingInvalid(
+                "SAS required on a claimed box".into(),
+            ));
         }
         op.require_sas_confirmed()?;
         if !is_hex(&op.delegation_nonce, 32) {

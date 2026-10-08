@@ -1977,6 +1977,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mockall",
+ "qrcode",
  "rand 0.8.6",
  "ring",
  "secp256k1",

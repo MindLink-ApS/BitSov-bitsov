@@ -1254,6 +1254,19 @@ async fn sas_enrollment_http_uses_server_noise_context_and_grants_no_authority()
     let public = hex::encode(key.public_key().as_ref());
     let sign = |message: &str| hex::encode(key.sign(&rng, message.as_bytes()).unwrap().as_ref());
     let body = json!({"sas_version":1,"public_key":public,"name":"phone","proof":sign(&registration_message(&fp, &client.client_id, &public))});
+    let mut legacy = body.clone();
+    legacy.as_object_mut().unwrap().remove("sas_version");
+    assert!(remote_call(
+        &state,
+        "POST",
+        "/api/v1/pair/device-key",
+        Some(legacy),
+        Some(&token)
+    )
+    .await
+    .0
+    .is_client_error());
+    assert!(svc.pending_device_keys().is_empty());
     // A valid token and key without server-supplied Noise context cannot generate a nonce.
     assert_eq!(
         remote_call(

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::Verifier;
+use konsensus_api::bootstrap::setup::SetupTicketError;
 use konsensus_api::pairing::{PairedClient, PairingService};
 use konsensus_api::rate_limit::RemoteTunnelClients;
 use konsensus_api::remote_access::{self as wire, AuthRequest, AuthResponse, PairLink, VERSION};
@@ -40,6 +41,72 @@ struct ActivePairingCode {
     expires_at: tokio::time::Instant,
     content_digest: blake3::Hash,
     content_len: usize,
+}
+
+struct HomeTickets {
+    active: Arc<Mutex<Option<ActivePairingCode>>>,
+    pairing: Arc<PairingService>,
+    endpoints: Vec<String>,
+    bootstrap: Arc<konsensus_api::bootstrap::BootstrapState>,
+}
+impl konsensus_api::bootstrap::setup::SetupTickets for HomeTickets {
+    fn mint(&self, ttl: Duration) -> Result<String, SetupTicketError> {
+        // Match mailbox import lock order. Drain tickets published before this action.
+        let _file =
+            crate::ticket_cmd::lock_ticket(self.pairing.dir()).map_err(|_| SetupTicketError)?;
+        let mut active = self.active.lock().unwrap();
+        self.pairing
+            .remove_remote_access_link()
+            .map_err(|_| SetupTicketError)?;
+        if !self.pairing.bound_fingerprint().is_empty() || !self.pairing.list_clients().is_empty() {
+            return Err(SetupTicketError);
+        }
+        let ttl = ttl
+            .min(PAIRING_CODE_TTL)
+            .min(self.bootstrap.setup_remaining().ok_or(SetupTicketError)?);
+        let link = PairLink {
+            v: wire::PAIR_LINK_VERSION,
+            endpoint: self.endpoints[0].clone(),
+            endpoints: self.endpoints.clone(),
+            endpoints_signature: None,
+            node_id: String::new(),
+            transport_pubkey: String::new(),
+            transport_signature: String::new(),
+            box_transport_pubkey: hex::encode(self.pairing.box_transport_pubkey()),
+            box_transport_signature: None,
+            code: crate::ticket_cmd::new_code(),
+            expires_at: chrono::Utc::now().timestamp() + ttl.as_secs() as i64,
+            hosted_by: self.pairing.hosted_by().map(str::to_owned),
+        };
+        let uri = link.to_uri().map_err(|_| SetupTicketError)?;
+        *active = Some(ActivePairingCode {
+            value: link.code,
+            expires_at: tokio::time::Instant::now() + ttl,
+            content_digest: blake3::hash(uri.as_bytes()),
+            content_len: uri.len(),
+        });
+        Ok(uri)
+    }
+    fn cancel(&self) -> Result<(), SetupTicketError> {
+        // Same lock as consumption: no in-flight ticket can claim after revocation.
+        // Match mailbox import lock order. Drain tickets published before this action.
+        let _file =
+            crate::ticket_cmd::lock_ticket(self.pairing.dir()).map_err(|_| SetupTicketError)?;
+        let mut active = self.active.lock().unwrap();
+        self.pairing
+            .remove_remote_access_link()
+            .map_err(|_| SetupTicketError)?;
+        if !self.pairing.bound_fingerprint().is_empty() {
+            return Err(SetupTicketError);
+        }
+        *active = None;
+        for client in self.pairing.list_clients() {
+            self.pairing
+                .revoke(&client.client_id)
+                .map_err(|_| SetupTicketError)?;
+        }
+        Ok(())
+    }
 }
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -213,6 +280,7 @@ enum ResponderIdentity {
     Locked(Arc<LockedIdentity>),
     /// No identity exists yet: box static, pre-bootstrap tickets only.
     Bootstrap,
+    HomeBootstrap(Arc<konsensus_api::bootstrap::BootstrapState>),
 }
 
 impl ResponderIdentity {
@@ -221,6 +289,7 @@ impl ResponderIdentity {
         match self {
             Self::Live(identity) => Some(identity.node_id().to_hex()),
             Self::Bootstrap => Some(String::new()),
+            Self::HomeBootstrap(_) => None,
             Self::Locked(_) => None,
         }
     }
@@ -413,6 +482,30 @@ impl RemoteAccessServer {
         })
     }
 
+    /// Home setup owns a memory-only ticket; CLI files are one-time mailbox imports.
+    pub fn enable_home_setup(
+        &mut self,
+        config: &RemoteAccessConfig,
+        bootstrap: Arc<konsensus_api::bootstrap::BootstrapState>,
+    ) -> Result<Arc<dyn konsensus_api::bootstrap::setup::SetupTickets>> {
+        anyhow::ensure!(
+            matches!(self.identity, ResponderIdentity::Bootstrap),
+            "not bootstrap"
+        );
+        let endpoints = crate::endpoints::discover(config, self.listener.local_addr()?)?;
+        *self.pairing_code.lock().unwrap() = None;
+        import_home_ticket(&self.pairing, &self.pairing_code, &bootstrap)?;
+        self.pair_link_path = None;
+        self.pairing_deadline = None;
+        self.identity = ResponderIdentity::HomeBootstrap(bootstrap.clone());
+        Ok(Arc::new(HomeTickets {
+            active: self.pairing_code.clone(),
+            pairing: self.pairing.clone(),
+            endpoints,
+            bootstrap,
+        }))
+    }
+
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
@@ -437,8 +530,12 @@ impl RemoteAccessServer {
         loop {
             tokio::select! {
                 _ = shutdown.changed() => break,
-                _ = refresh.tick(), if ticket_node_id.is_some() => {
-                    if let Some(node_id) = &ticket_node_id {
+                _ = refresh.tick(), if ticket_node_id.is_some() || matches!(self.identity, ResponderIdentity::HomeBootstrap(_)) => {
+                    if let ResponderIdentity::HomeBootstrap(bootstrap) = &self.identity {
+                        if import_home_ticket(&self.pairing, &self.pairing_code, bootstrap).is_err() {
+                            warn!("could not import home pairing ticket");
+                        }
+                    } else if let Some(node_id) = &ticket_node_id {
                         if refresh_pairing_code(&self.pairing, &self.pairing_code, node_id).is_err() {
                             warn!("could not reload remote pairing ticket");
                         }
@@ -586,6 +683,54 @@ fn refresh_pairing_code(
     )
 }
 
+// The protected CLI file is a mailbox, not a second live authority. Import once
+// into the same memory slot used by Start setup, cap TTL/window and unlink it.
+fn import_home_ticket(
+    pairing: &PairingService,
+    active: &Mutex<Option<ActivePairingCode>>,
+    bootstrap: &konsensus_api::bootstrap::BootstrapState,
+) -> Result<()> {
+    let path = pairing.remote_access_link_path();
+    let _file = crate::ticket_cmd::lock_ticket(path.parent().unwrap())?;
+    let mut active = active.lock().unwrap();
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    let mut incoming = None;
+    let result = reload_pairing_code(pairing, &mut incoming, "");
+    pairing.remove_remote_access_link()?;
+    result?;
+    if let Some(remaining) = bootstrap.setup_remaining() {
+        if pairing.list_clients().is_empty() {
+            if let Some(code) = &mut incoming {
+                code.expires_at = code
+                    .expires_at
+                    .min(tokio::time::Instant::now() + PAIRING_CODE_TTL.min(remaining));
+            }
+            if incoming.is_some() {
+                *active = incoming;
+            }
+        }
+    }
+    Ok(())
+}
+fn authenticate_home(
+    request: &AuthRequest,
+    remote_static: &[u8; 32],
+    pairing: &PairingService,
+    active: &Mutex<Option<ActivePairingCode>>,
+    bootstrap: &konsensus_api::bootstrap::BootstrapState,
+) -> Result<PairedClient> {
+    if request.code.is_some() {
+        anyhow::ensure!(
+            bootstrap.setup_remaining().is_some(),
+            "home setup is closed"
+        );
+        import_home_ticket(pairing, active, bootstrap)?;
+    }
+    authenticate_ticket(request, remote_static, "", pairing, active, false)
+}
+
 fn authenticate_from_file(
     request: &AuthRequest,
     remote_static: &[u8; 32],
@@ -623,9 +768,9 @@ async fn handle_connection(
         // live responder before those clients have had a chance to learn it.
         let secret = match &identity {
             ResponderIdentity::Live(identity) => identity.x25519_secret_bytes(),
-            ResponderIdentity::Locked(_) | ResponderIdentity::Bootstrap => {
-                pairing.box_transport_secret_bytes()
-            }
+            ResponderIdentity::Locked(_)
+            | ResponderIdentity::Bootstrap
+            | ResponderIdentity::HomeBootstrap(_) => pairing.box_transport_secret_bytes(),
         };
         let mut noise = NoiseSession::responder(secret)?;
         let msg1 = wire::read_frame(&mut remote_reader, MAX_NOISE_MSG_LEN).await?;
@@ -696,13 +841,21 @@ async fn handle_connection(
         }
         // No identity can sign the box key yet: the ticket is the pin, and
         // finalize returns the committed identity's proof for re-pinning.
+        ResponderIdentity::HomeBootstrap(bootstrap) => (
+            authenticate_home(&request, &remote_static, &pairing, &pairing_code, bootstrap),
+            hex::encode(pairing.box_transport_pubkey()),
+            String::new(),
+        ),
         ResponderIdentity::Bootstrap => (
             authenticate_from_file(&request, &remote_static, "", &pairing, &pairing_code),
             hex::encode(pairing.box_transport_pubkey()),
             String::new(),
         ),
     };
-    let follow_rebind = matches!(identity, ResponderIdentity::Bootstrap);
+    let follow_rebind = matches!(
+        identity,
+        ResponderIdentity::Bootstrap | ResponderIdentity::HomeBootstrap(_)
+    );
     let response = match &authenticated {
         Ok(client) => AuthResponse::Ok {
             v: VERSION,
@@ -820,6 +973,17 @@ fn authenticate(
     pairing: &PairingService,
     pairing_code: &Mutex<Option<ActivePairingCode>>,
 ) -> Result<PairedClient> {
+    authenticate_ticket(request, remote_static, node_id, pairing, pairing_code, true)
+}
+
+fn authenticate_ticket(
+    request: &AuthRequest,
+    remote_static: &[u8; 32],
+    node_id: &str,
+    pairing: &PairingService,
+    pairing_code: &Mutex<Option<ActivePairingCode>>,
+    remove_file: bool,
+) -> Result<PairedClient> {
     if request.v != VERSION {
         anyhow::bail!("unsupported remote auth version {}", request.v);
     }
@@ -885,9 +1049,11 @@ fn authenticate(
         .context("first-pairing code is unavailable or already used")?;
     if tokio::time::Instant::now() >= active.expires_at {
         *code_guard = None;
-        pairing
-            .remove_remote_access_link()
-            .context("could not remove expired remote pairing link")?;
+        if remove_file {
+            pairing
+                .remove_remote_access_link()
+                .context("could not remove expired remote pairing link")?;
+        }
         anyhow::bail!("first-pairing code expired");
     }
     if blake3::hash(code.as_bytes()) != blake3::hash(active.value.as_bytes()) {
@@ -895,9 +1061,11 @@ fn authenticate(
     }
 
     *code_guard = None;
-    pairing
-        .remove_remote_access_link()
-        .context("could not remove consumed remote pairing link")?;
+    if remove_file {
+        pairing
+            .remove_remote_access_link()
+            .context("could not remove consumed remote pairing link")?;
+    }
     // `node_id` is server state: empty only on the identity-free bootstrap
     // responder, where the pairing service also refuses once one is bound.
     let client = if node_id.is_empty() {
@@ -1349,6 +1517,196 @@ mod tests {
             ),
             Err(konsensus_api::pairing::PairingError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn home_page_rotation_and_cancel_invalidate_queued_cli_ticket() {
+        use konsensus_api::bootstrap::{setup::SetupTickets, BootstrapState, DataDirLayout};
+        let dir = tempfile::tempdir().unwrap();
+        let pairing = Arc::new(PairingService::open(dir.path(), String::new(), false).unwrap());
+        let bootstrap = Arc::new(BootstrapState::new(
+            DataDirLayout::new(dir.path()),
+            pairing.clone(),
+        ));
+        let tickets = HomeTickets {
+            active: Arc::new(Mutex::new(None)),
+            pairing: pairing.clone(),
+            endpoints: vec!["192.168.1.2:9737".into()],
+            bootstrap: bootstrap.clone(),
+        };
+        let old = tickets.mint(Duration::from_secs(300)).unwrap();
+        pairing.write_remote_access_link(&old).unwrap();
+        tickets.cancel().unwrap();
+        import_home_ticket(&pairing, &tickets.active, &bootstrap).unwrap();
+        assert!(
+            tickets.active.lock().unwrap().is_none(),
+            "a queued CLI ticket survived cancellation"
+        );
+        pairing.write_remote_access_link(&old).unwrap();
+        let new = PairLink::from_uri(&tickets.mint(Duration::from_secs(300)).unwrap()).unwrap();
+        import_home_ticket(&pairing, &tickets.active, &bootstrap).unwrap();
+        assert_eq!(
+            tickets.active.lock().unwrap().as_ref().unwrap().value,
+            new.code,
+            "a queued CLI ticket replaced a newer page ticket"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn home_ticket_authority_rotates_expires_consumes_and_cancels() {
+        let config = RemoteAccessConfig {
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let pairing = Arc::new(PairingService::open(dir.path(), String::new(), false).unwrap());
+        let mut server = RemoteAccessServer::bind_bootstrap(
+            &config,
+            pairing.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            Arc::new(RemoteTunnelClients::default()),
+        )
+        .await
+        .unwrap();
+        let bootstrap = Arc::new(konsensus_api::bootstrap::BootstrapState::new(
+            konsensus_api::bootstrap::DataDirLayout::new(dir.path()),
+            pairing.clone(),
+        ));
+        let tickets = server
+            .enable_home_setup(&config, bootstrap.clone())
+            .unwrap();
+        assert!(
+            server.identity.ticket_node_id().is_none(),
+            "home never uses the live-mode disk authority"
+        );
+        assert!(server.pairing_code.lock().unwrap().is_none());
+        let a = PairLink::from_uri(&tickets.mint(Duration::from_secs(300)).unwrap()).unwrap();
+        let b = PairLink::from_uri(&tickets.mint(Duration::from_secs(300)).unwrap()).unwrap();
+        assert_ne!(a.code, b.code);
+        assert!(!pairing.remote_access_link_path().exists());
+        let key = SigningKey::from_bytes(&[43; 32]);
+        let public = hex::encode(key.verifying_key().to_bytes());
+        let transport = [44; 32];
+        let auth = |code: &str| AuthRequest {
+            v: VERSION,
+            code: Some(code.into()),
+            client_name: Some("phone".into()),
+            client_pubkey: Some(public.clone()),
+            signature: Some(
+                URL_SAFE_NO_PAD.encode(
+                    key.sign(
+                        wire::pairing_proof_message("", &hex::encode(transport), code, &public)
+                            .as_bytes(),
+                    )
+                    .to_bytes(),
+                ),
+            ),
+        };
+        assert!(authenticate(
+            &auth(&a.code),
+            &transport,
+            "",
+            &pairing,
+            &server.pairing_code
+        )
+        .is_err());
+        tokio::time::advance(Duration::from_secs(300)).await;
+        // A CLI publication after mailbox import must survive memory-only expiry handling.
+        pairing
+            .write_remote_access_link(&a.to_uri().unwrap())
+            .unwrap();
+        assert!(authenticate_ticket(
+            &auth(&b.code),
+            &transport,
+            "",
+            &pairing,
+            &server.pairing_code,
+            false
+        )
+        .is_err());
+        assert!(pairing.remote_access_link_path().exists());
+        pairing.remove_remote_access_link().unwrap();
+        assert!(authenticate(
+            &auth(&b.code),
+            &transport,
+            "",
+            &pairing,
+            &server.pairing_code
+        )
+        .is_err());
+        let c = PairLink::from_uri(&tickets.mint(Duration::from_secs(300)).unwrap()).unwrap();
+        let client = authenticate(
+            &auth(&c.code),
+            &transport,
+            "",
+            &pairing,
+            &server.pairing_code,
+        )
+        .unwrap();
+        assert_eq!(
+            client.scopes,
+            konsensus_api::pairing::bootstrap_pairing_scopes()
+        );
+        assert!(server.pairing_code.lock().unwrap().is_none());
+        assert!(tickets.mint(Duration::from_secs(300)).is_err());
+        tickets.cancel().unwrap();
+        assert!(pairing.list_clients().is_empty());
+        assert!(pairing.validate_remote_transport(&transport).is_err());
+        assert!(authenticate(
+            &auth(&c.code),
+            &transport,
+            "",
+            &pairing,
+            &server.pairing_code
+        )
+        .is_err());
+        assert!(tickets.mint(Duration::from_secs(300)).is_ok());
+        // The CLI is a mailbox into this same slot, not a parallel authority.
+        let mut cli = c.clone();
+        cli.code = crate::ticket_cmd::new_code();
+        cli.expires_at = chrono::Utc::now().timestamp() + 3600;
+        pairing
+            .write_remote_access_link(&cli.to_uri().unwrap())
+            .unwrap();
+        import_home_ticket(&pairing, &server.pairing_code, &bootstrap).unwrap();
+        assert!(!pairing.remote_access_link_path().exists());
+        assert_eq!(
+            server.pairing_code.lock().unwrap().as_ref().unwrap().value,
+            cli.code
+        );
+        assert!(
+            server
+                .pairing_code
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .expires_at
+                <= tokio::time::Instant::now() + Duration::from_secs(300)
+        );
+        assert!(authenticate_home(
+            &auth(&c.code),
+            &transport,
+            &pairing,
+            &server.pairing_code,
+            &bootstrap
+        )
+        .is_err());
+        tokio::time::advance(Duration::from_secs(600)).await;
+        pairing
+            .write_remote_access_link(&cli.to_uri().unwrap())
+            .unwrap();
+        import_home_ticket(&pairing, &server.pairing_code, &bootstrap).unwrap();
+        assert!(!pairing.remote_access_link_path().exists());
+        assert!(tickets.mint(Duration::from_secs(300)).is_err());
+        assert!(authenticate_home(
+            &auth(&cli.code),
+            &transport,
+            &pairing,
+            &server.pairing_code,
+            &bootstrap
+        )
+        .is_err());
     }
 
     #[tokio::test]
