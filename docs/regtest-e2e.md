@@ -304,13 +304,14 @@ The topology is `CLN -- private -- LDK hub -- private -- LDK recipient`:
 - **T8:** the hub advertises a 5,000-msat base fee and zero ppm to the recipient.
   A private route hint is checked and an `xpay` positive control settles at
   exactly 5,000 msat. A fresh invoice with a 4,999-msat ceiling must fail.
-  The test waits beyond CLN's 60-second retry window, then checks no settled or
-  pending send attempts, no remaining CLN HTLC, an unpaid recipient invoice,
+  The test waits 65 seconds after the provider returns (past CLN's 60-second
+  retry window), then requires nonempty `listpays` and `listsendpays` records,
+  all failed. It also checks no remaining CLN HTLC, an unpaid recipient invoice,
   unchanged CLN channel/on-chain balances and unchanged LDK capacities.
   Another payment at 5,000 msat must still succeed after the refusal.
-  A provider timeout alone cannot pass this check. CLN can reject a route
-  without creating a `listpays` record; an empty history is allowed only after
-  the retry window and those independent checks.
+  A provider timeout alone cannot pass this check. If CLN rejects a route
+  without recording an attempt, the test fails for lack of evidence; empty
+  history never counts as proof of fee enforcement.
 - **T9:** real HTTPS requests with the restricted rune call `xpay` and the
   selected keysend method without `maxfee` and with numeric `maxfee=10001`,
   plus `withdraw` with valid parameters. Each must return an authorization
@@ -328,9 +329,10 @@ runner for release execution. No real wallet keys or funds are used.
 
 The manual-only [Real CLN paid regtest workflow](../.github/workflows/cln-regtest.yml)
 never runs on push or a schedule. It runs only by hand: `workflow_dispatch` once
-the file is on `main`, or when a maintainer adds the `cln-regtest` label to a PR
-(GitHub cannot dispatch a workflow that exists only on a branch). Its two Ubuntu
-24.04 amd64 matrix jobs download from the official Bitcoin Core and
+the file is on `main`, or when a maintainer adds the `cln-regtest` label to a
+same-repository PR; fork PRs are excluded. Permissions remain read-only and no
+secrets are used. (GitHub cannot dispatch a workflow that exists only on a branch.)
+Its two Ubuntu 24.04 amd64 matrix jobs download from the official Bitcoin Core and
 [ElementsProject/lightning releases](https://github.com/ElementsProject/lightning/releases),
 verify these pinned SHA-256 sums **before extraction**, and run the test:
 

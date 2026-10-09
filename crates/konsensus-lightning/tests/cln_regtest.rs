@@ -339,11 +339,10 @@ async fn scenario(binaries: Binaries) {
     let attempts = cln
         .rpc("listsendpays", json!({"payment_hash":denied.payment_hash}))
         .await;
-    assert!(attempts["payments"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|p| p["status"] == "failed"));
+    assert!(
+        recorded_failed_attempts(&attempts["payments"]),
+        "T8 requires at least one failed send attempt and no pending/complete attempts; got {attempts}"
+    );
     // The route must still work after the refusal: a dead peer or route cannot
     // masquerade as enforcement of the lower ceiling.
     let after = recipient

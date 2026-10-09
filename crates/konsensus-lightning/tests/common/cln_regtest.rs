@@ -423,16 +423,16 @@ impl Cln {
         json!({"channels":channels, "outputs":self.rpc("listfunds", json!({})).await["outputs"]})
     }
     pub async fn wait_failed_payment(&self, hash: &str) {
-        // ClnProvider's HTTP timeout is 10s but xpay retry_for is 60s. A route
-        // rejected before attempting an HTLC may leave NO listpays record.
-        // Wait past the full backend retry window; absence alone is not proof.
+        // ClnProvider's HTTP timeout is 10s but xpay retry_for is 60s.
+        // Start this full retry window AFTER the provider returns, including
+        // an ambiguous timeout. Never treat an empty history as fee refusal:
+        // a rejection without a recorded attempt must fail for lack of evidence.
         tokio::time::sleep(Duration::from_secs(65)).await;
         let pays = self.rpc("listpays", json!({"payment_hash":hash})).await;
-        assert!(pays["pays"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|p| p["status"] == "failed"));
+        assert!(
+            recorded_failed_attempts(&pays["pays"]),
+            "T8 requires a recorded failed payment after the retry window; got {pays}"
+        );
     }
     pub async fn assert_rune_denied(&self, method: &str, params: Value) {
         let cert =
@@ -599,4 +599,28 @@ pub fn capacities(nodes: &[&Ldk]) -> Vec<Vec<(String, u64, u64)>> {
             channels
         })
         .collect()
+}
+
+/// Evidence shared by the aggregate and individual send-attempt checks.
+pub fn recorded_failed_attempts(attempts: &Value) -> bool {
+    attempts.as_array().is_some_and(|attempts| {
+        !attempts.is_empty() && attempts.iter().all(|p| p["status"] == "failed")
+    })
+}
+
+#[test]
+fn failed_attempt_evidence_requires_a_record_and_only_failures() {
+    for (attempts, expected) in [
+        (json!([]), false),
+        (json!([{"status":"failed"}]), true),
+        (json!([{"status":"failed"}, {"status":"failed"}]), true),
+        (json!([{"status":"pending"}]), false),
+        (json!([{"status":"complete"}]), false),
+        (json!([{"status":"failed"}, {"status":"pending"}]), false),
+        (json!([{"status":"failed"}, {"status":"complete"}]), false),
+        (json!([{}]), false),
+        (Value::Null, false),
+    ] {
+        assert_eq!(recorded_failed_attempts(&attempts), expected, "{attempts}");
+    }
 }
