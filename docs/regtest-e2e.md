@@ -327,7 +327,9 @@ termination of the test process cannot run Rust destructors; use an isolated
 runner for release execution. No real wallet keys or funds are used.
 
 The manual-only [Real CLN paid regtest workflow](../.github/workflows/cln-regtest.yml)
-has **only `workflow_dispatch`**, no schedule or push/PR trigger. Its two Ubuntu
+never runs on push or a schedule. It runs only by hand: `workflow_dispatch` once
+the file is on `main`, or when a maintainer adds the `cln-regtest` label to a PR
+(GitHub cannot dispatch a workflow that exists only on a branch). Its two Ubuntu
 24.04 amd64 matrix jobs download from the official Bitcoin Core and
 [ElementsProject/lightning releases](https://github.com/ElementsProject/lightning/releases),
 verify these pinned SHA-256 sums **before extraction**, and run the test:

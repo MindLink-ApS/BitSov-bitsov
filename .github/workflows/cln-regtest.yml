@@ -1,8 +1,12 @@
 name: Real CLN paid regtest
 
-# Release evidence only: never run on push, pull_request, or a schedule.
+# Release evidence only: never on push or a schedule. Runs by hand
+# (workflow_dispatch, once this file is on main) or when a maintainer adds the
+# `cln-regtest` label to a PR (manual dispatch cannot reach a branch-only file).
 on:
   workflow_dispatch:
+  pull_request:
+    types: [labeled]
 
 permissions:
   contents: read
@@ -13,6 +17,7 @@ concurrency:
 
 jobs:
   cln-regtest:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'cln-regtest'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
