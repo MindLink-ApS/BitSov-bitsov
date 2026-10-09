@@ -1,0 +1,11 @@
+# Runtime, pinned. Linux-only GPIO/SPI bindings are skipped on macOS so
+# --preview and the tests install everywhere.
+pillow==12.3.0
+luma.core==2.6.0
+luma.oled==3.16.0
+luma.lcd==2.13.0
+smbus2==0.6.1
+cbor2==6.1.5
+spidev==3.8 ; sys_platform == "linux"
+rpi-lgpio==0.6 ; sys_platform == "linux"
+lgpio==0.2.2.0 ; sys_platform == "linux"
