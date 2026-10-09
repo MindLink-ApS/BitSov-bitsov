@@ -7,10 +7,10 @@ also live on the corresponding GitHub pre-release pages.
 
 ## [0.3.0-rc14] — 2026-10-09 (prep; not tagged yet)
 
-**Pre-release.** Not for production use. Includes the six PRs merged after
-`v0.3.0-rc13` (`d625e85`), through preparation tip `945eaf2`: #289–#293 and
-#295. The #297 entry below is prepared for its expected merge and remains
-**pending operator confirmation**; it is not in this preparation tree.
+**Pre-release.** Not for production use. Includes the seven PRs merged after
+`v0.3.0-rc13` (`d625e85`): #289–#293, #295 and #297. CLN receive/read
+(#297) is included at integration commit
+`8644edacd9b4231ad72006605b8a6d1daf457f48`.
 The [signing checklist](docs/releases/v0.3.0-rc14.md) records the scope and
 merge gate. Upgrade steps, including the retained test Pi:
 [UPGRADING](docs/UPGRADING.md#rc13--rc14-procedure).
@@ -69,10 +69,9 @@ merge gate. Upgrade steps, including the retained test Pi:
 - CLN backend preview (#293; `168a271`): opt-in `backend = "cln"`, pinned-CA
   HTTPS without public roots, a restricted rune read from a mode-0600 file,
   and `getinfo` checks for CLN >= v24.11 and the configured network. This
-  merged slice provides connectivity and node identity only, with no money
-  operations. CLN owns its wallet and backups; the BitSov mnemonic does not
-  recover CLN funds. See [configuration](docs/CLN.md).
-- **Pending #297 merge/confirmation:** extend the CLN preview with invoice
+  established connectivity and node identity; #297 adds receive/read below.
+  CLN owns its wallet and backups; the BitSov mnemonic does not recover CLN funds. See [configuration](docs/CLN.md).
+- CLN receive/read preview (#297; `8644eda`): adds invoice
   creation, incoming settlement verification (including keysend receipts and
   overpayment), merged payment history, channel listing and balances.
   Outgoing invoice payments and keysend still refuse before dispatch;
@@ -80,10 +79,10 @@ merge gate. Upgrade steps, including the retained test Pi:
   Reading outgoing history does not enable sending. Use a restricted rune for
   `getinfo`, `invoice`, `listinvoices`, `listpays`, `listpeerchannels` and
   `listfunds`; rotate/restart if upgrading from the getinfo-only preview.
-  Channel management, on-chain sends, hold invoices and inbound keysend TLV
-  watching remain unsupported. Includes mocked REST status and payment-gate
-  tests, credential redaction and local rustls transport tests. Confirm the
-  final merged scope before tagging.
+  Stateless quotes, channel management, on-chain sends, hold invoices and
+  inbound keysend TLV watching remain unsupported. Includes mocked REST
+  status and payment-gate tests, credential redaction and local rustls
+  transport tests; these do not replace real HTLC settlement testing.
 
 ## [0.3.0-rc13] — 2026-10-08 (prep; not tagged yet)
 

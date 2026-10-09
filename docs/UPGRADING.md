@@ -3,10 +3,10 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-**rc14 preparation (2026-10-09):** six merged PRs after `v0.3.0-rc13`
-(`d625e85`), through `945eaf2`: #289–#293 and #295. CLN receive/read (#297)
-is drafted below but **pending merge and operator confirmation**. The release
-commit is the `main` HEAD after #297 and this docs/version PR merge, recorded
+**rc14 preparation (2026-10-09):** seven merged PRs after `v0.3.0-rc13`
+(`d625e85`): #289–#293, #295 and #297. CLN receive/read (#297) is included
+at integration commit `8644edacd9b4231ad72006605b8a6d1daf457f48`. The release
+commit is the `main` HEAD after this docs/version PR merges, recorded
 at signing time. See the [signing checklist](releases/v0.3.0-rc14.md).
 For nodes skipping releases, apply the earlier procedures first, then
 rc13 → rc14. Historical sections describe their release's behavior; the rc14
@@ -72,11 +72,16 @@ pairing schema and recovery guidance supersede those descriptions.
 6. **Retain the backend and home setup policy.** Embedded LDK remains the Pi's
    normal backend. CLN is an opt-in preview, not an LDK wallet migration: use
    pinned HTTPS, the correct network and CLN >= v24.11, and a private mode-0600
-   rune file. #293 supports `getinfo` only. **After #297 is confirmed merged**,
-   receive/read additionally requires rune methods `invoice`, `listinvoices`,
-   `listpays`, `listpeerchannels` and `listfunds`; restart after rotating the
-   file. Even then outgoing payments/keysend refuse and money readiness is
-   false. CLN funds require CLN's own backups, not the BitSov seed.
+   rune file. rc14 includes invoice creation, incoming settlement verification
+   (including keysend receipts and overpayment), merged payment history,
+   channel listing and balances (#297). When upgrading from the getinfo-only
+   preview (#293), permit `getinfo`, `invoice`, `listinvoices`, `listpays`,
+   `listpeerchannels` and `listfunds` in the restricted rune; restart after
+   rotating the file. **CLN cannot pay**: outgoing invoice payments and keysend
+   refuse before dispatch; payment capability and money readiness stay false.
+   Stateless quotes, hold invoices, inbound keysend TLV watching, channel
+   management and on-chain sends remain unsupported. CLN funds require CLN's
+   own backups, not the BitSov seed.
    The LAN page now limits per-IP requests, bodies to 2 KiB, header/body reads
    to five seconds each and concurrent connections to 32 across listeners
    (#292). Avoid aggressive polling; SAS approval, the 15-minute setup window
