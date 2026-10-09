@@ -12,7 +12,7 @@ use std::{
 #[path = "restore_fence/host.rs"]
 mod host;
 
-const GUIDANCE: &str = "refusing state startup: this may be a restored copy. konsensus recover is coming (not implemented); see docs/v2/RECOVERY.md and docs/operations/home-node.md. Never start an old copied data directory";
+const GUIDANCE: &str = "refusing state startup: this may be a restored copy. run konsensus recover in a fresh directory; see docs/v2/RECOVERY.md and docs/operations/home-node.md. Never start an old copied data directory";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,21 +20,6 @@ struct Instance {
     version: u32,
     instance_id: uuid::Uuid,
     binding: String,
-}
-
-/// PR1 reserves only admission state. Future recovery owns journal transitions.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryJournal {
-    version: u32,
-    state: RecoveryState,
-}
-
-#[derive(Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum RecoveryState {
-    Open,
-    Done,
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -55,15 +40,7 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 fn ensure_no_recovery(dir: &Path) -> Result<()> {
-    if let Some(bytes) = read_optional(&dir.join("recover.json"))? {
-        let journal: RecoveryJournal =
-            serde_json::from_slice(&bytes).context("recover.json invalid or unsupported")?;
-        anyhow::ensure!(
-            journal.version == 1 && journal.state == RecoveryState::Done,
-            "recover.json is open or unsupported; {GUIDANCE}"
-        );
-    }
-    Ok(())
+    konsensus_lightning::recover::ensure_normal_start(dir).map_err(anyhow::Error::msg)
 }
 
 fn load_instance(dir: &Path) -> Result<Option<Instance>> {
@@ -156,6 +133,32 @@ pub fn ensure_bound(data_dir: &Path) -> Result<()> {
     result.with_context(|| GUIDANCE)
 }
 
+/// Verify the host binding while the recovery journal deliberately remains open.
+/// The command holds the root process lease and refuses any existing LDK store.
+pub fn ensure_recovery_bound(data_dir: &Path) -> Result<()> {
+    let dir = data_dir.join("ldk");
+    konsensus_lightning::recover::ensure_recovery_root(&dir).map_err(anyhow::Error::msg)?;
+    let (machine, volume) = host::identity(&dir)?;
+    match load_instance(&dir)? {
+        Some(record) => anyhow::ensure!(
+            record.binding == binding(&machine, &volume, record.instance_id)?,
+            "host_binding_mismatch; use a fresh recovery directory"
+        ),
+        None => {
+            let instance_id = uuid::Uuid::new_v4();
+            persist(
+                &dir,
+                &Instance {
+                    version: 1,
+                    instance_id,
+                    binding: binding(&machine, &volume, instance_id)?,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn rebind(
     dir: &Path,
     machine: &str,
@@ -236,7 +239,7 @@ mod tests {
         for (host, volume) in [("host-b", "volume-a"), ("host-a", "volume-b")] {
             let err = admit(copy.path(), host, volume).unwrap_err().to_string();
             assert!(err.contains("konsensus recover"));
-            assert!(err.contains("coming"));
+            assert!(err.contains("fresh directory"));
             assert_eq!(fs::read(copy.path().join("INSTANCE")).unwrap(), before);
         }
     }

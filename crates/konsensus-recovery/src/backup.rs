@@ -157,6 +157,9 @@ fn monitor(
     keys: &RecoveryKeys,
     archived: bool,
 ) -> Result<ChannelRecoveryMetadata, BackupError> {
+    // Pinned MonitorUpdatingPersister prepends 0xffff to distinguish its
+    // monitor envelope. Updates still remain opaque and are never replayed.
+    let bytes = bytes.strip_prefix(&[0xff, 0xff]).unwrap_or(bytes);
     let mut r = Reader::new(bytes);
     r.version()?;
     let monitor_update_id = r.u64()?;

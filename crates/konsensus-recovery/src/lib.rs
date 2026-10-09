@@ -23,7 +23,8 @@ pub use sweep::Sweep;
 use bitcoin::{OutPoint, TxOut};
 
 /// A candidate unspent output from a chain scan. Contains no secret material.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FoundOutput {
     pub outpoint: OutPoint,
     pub txout: TxOut,

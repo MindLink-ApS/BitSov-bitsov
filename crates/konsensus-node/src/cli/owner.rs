@@ -321,6 +321,14 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                     g.client_id
                 );
             }
+            for g in &grants {
+                let b = &g.breakers;
+                safe_println!("  BREAKERS client={} paused={} failures={}/{} unresolved={} minute={}/{} hour={}/{} velocity={}/{} sats per 10 min\n  reset with: konsensus grant-reset-breakers --client-id {} --op {}",
+                    g.client_id, b.paused, b.consecutive_failures, b.limits.max_consecutive_failures,
+                    b.unresolved_payments, b.payments_last_minute, b.limits.max_payments_per_minute,
+                    b.payments_last_hour, b.limits.max_payments_per_hour,
+                    spend_budget::sats(b.reserved_msat_last_10_minutes), spend_budget::sats(b.limits.max_msat_per_10_minutes), g.client_id, g.op_id);
+            }
             for g in &front_door_grants {
                 safe_println!(
                     "FRONT DOOR GRANT client={}  may publish the front-door card only  \
@@ -446,6 +454,10 @@ fn read_owner_code() -> Result<Option<String>> {
 /// The owner's flags for `konsensus grant`.
 #[derive(Debug, Default)]
 pub struct GrantFlags {
+    pub max_payments_per_minute: Option<u64>,
+    pub max_payments_per_hour: Option<u64>,
+    pub max_consecutive_failures: Option<u64>,
+    pub max_sats_per_10_minutes: Option<u64>,
     /// Exclusive allowed payees; replaces a proposal's allowlist when supplied.
     pub payees: Vec<String>,
     pub deny_all_payees: bool,
@@ -503,7 +515,26 @@ pub fn resolve_terms(flags: &GrantFlags, proposal: Option<&GrantTerms>) -> Resul
         }
         map
     };
+    // Breakers are chosen by the owner, never widened by an app proposal.
+    let defaults = spend_budget::BreakerLimits::default();
+    let breakers = spend_budget::BreakerLimits {
+        max_payments_per_minute: flags
+            .max_payments_per_minute
+            .unwrap_or(defaults.max_payments_per_minute),
+        max_payments_per_hour: flags
+            .max_payments_per_hour
+            .unwrap_or(defaults.max_payments_per_hour),
+        max_consecutive_failures: flags
+            .max_consecutive_failures
+            .unwrap_or(defaults.max_consecutive_failures),
+        max_msat_per_10_minutes: flags
+            .max_sats_per_10_minutes
+            .map(|s| sats_to_msat(s, "--max-sats-per-10-minutes"))
+            .transpose()?
+            .unwrap_or(defaults.max_msat_per_10_minutes),
+    };
     GrantTerms {
+        breakers,
         payee_allowlist: if flags.deny_all_payees {
             Some(Default::default())
         } else if !flags.payees.is_empty() {
@@ -555,7 +586,11 @@ pub async fn cmd_grant(config_path: &Path, op_id: &str, flags: GrantFlags) -> Re
 /// The window of a front-door grant: `--for`, else one hour. Budget flags are
 /// refused: a front-door grant moves no value, so a budget would only mislead.
 pub fn front_door_ttl(flags: &GrantFlags) -> Result<i64> {
-    if flags.budget_sats.is_some()
+    if flags.max_payments_per_minute.is_some()
+        || flags.max_payments_per_hour.is_some()
+        || flags.max_consecutive_failures.is_some()
+        || flags.max_sats_per_10_minutes.is_some()
+        || flags.budget_sats.is_some()
         || flags.per_call_sats.is_some()
         || !flags.recipients.is_empty()
         || !flags.payees.is_empty()
@@ -563,7 +598,7 @@ pub fn front_door_ttl(flags: &GrantFlags) -> Result<i64> {
         || flags.allow_liquidity_fees
     {
         anyhow::bail!(
-            "this request asks for front_door only, which carries no budget; drop --budget, \
+            "this request asks for front_door only, which carries no budget; drop circuit-breaker flags, --budget, \
              --per-call, --recipient, --payee, --deny-all-payees and --allow-liquidity-fees (keep --for)"
         );
     }
@@ -799,6 +834,23 @@ pub async fn cmd_grant_revoke(
             config_path,
             ControlRequest::RevokeGrant {
                 client_id: client_id.map(str::to_string),
+            },
+        )
+        .await?,
+    )
+}
+
+pub async fn cmd_grant_reset_breakers(
+    config_path: &Path,
+    client_id: String,
+    grant_op_id: String,
+) -> Result<()> {
+    report(
+        send(
+            config_path,
+            ControlRequest::ResetGrantBreakers {
+                client_id,
+                grant_op_id,
             },
         )
         .await?,
@@ -1846,6 +1898,21 @@ mod startup_tests {
             ..GrantFlags::default()
         };
         assert!(front_door_ttl(&fees).is_err());
+    }
+
+    #[test]
+    fn proposals_cannot_widen_breakers_and_front_door_refuses_them() {
+        let mut proposal = GrantTerms::new(1_000);
+        proposal.breakers = spend_budget::BreakerLimits::legacy();
+        let f = GrantFlags::default();
+        let terms = resolve_terms(&f, Some(&proposal)).unwrap();
+        assert_eq!(terms.breakers, spend_budget::BreakerLimits::default());
+        let f = GrantFlags {
+            max_payments_per_hour: Some(0),
+            ..f
+        };
+        assert!(resolve_terms(&f, Some(&proposal)).is_err());
+        assert!(front_door_ttl(&f).is_err());
     }
 
     #[test]

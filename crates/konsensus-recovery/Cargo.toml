@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
 konsensus-crypto = { path = "../konsensus-crypto" }
 bitcoin.workspace = true
 zeroize.workspace = true
