@@ -250,24 +250,97 @@ now exercises actual JIT service/client negotiation, overprovisioning and
 stateless admission with a configured positive forwarding tariff. It is separate
 from the legacy routing-only service fixture and the #225 opt-in control above.
 
-## CLN coverage gap
+## Real CLN release regtest (T5, T7, T8, T9)
 
-The current runner and `regtest_e2e` topology construct LDK nodes only. They do
-not provision `lightningd`, clnrest TLS, restricted runes or a CLN-to-LDK channel.
-CLN backend PR3 could not run a real-node test: this environment also has neither
-`lightningd` nor Docker installed. No mocked test is evidence of real CLN HTLC
-settlement or rune enforcement.
+`crates/konsensus-lightning/tests/cln_regtest.rs` is an ignored-by-default,
+Unix-only real-node test. It starts Bitcoin Core, CLN with HTTPS clnrest, and
+two `LdkProvider` nodes using Core RPC directly. No electrs, Docker, mock
+Lightning service, or automatic binary download is used.
 
-Pending real-node coverage, on CLN v24.11 and v26.06:
+Prerequisites: Rust dependencies cached for `--offline --locked`, Bitcoin Core
+28.2 (`bitcoin-cli` must be beside `bitcoind`, for CLN's bcli plugin), and a
+complete CLN installation with its plugins and runtime dependencies. Set
+`LIGHTNINGD_EXE` to the extracted release's `bin/lightningd`; preserve its
+relative `libexec`/`share` layout. The 24.11 Python clnrest plugin also needs its
+Python dependencies on PATH; see the workflow provisioning step.
 
-- T7: CLN sends a fee-capped keysend to LDK; the paid-message gate admits it and
-  a paid reply settles in the reverse direction.
-- T8: Route through a high-fee hop above the configured ceiling. Verify `xpay`
-  refuses, no recipient invoice settles, no HTLC remains, and no funds are debited.
-- T9: Using the restricted BitSov rune, submit `xpay` without `maxfee`, with an
-  over-limit numeric `maxfee`, and `withdraw`; all must refuse. Repeat fee checks
-  for the selected keysend method and verify an allowed capped payment succeeds.
+```sh
+BITCOIND_EXE=/path/to/bitcoin-28.2/bin/bitcoind \
+LIGHTNINGD_EXE=/path/to/cln/usr/local/bin/lightningd \
+CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo test --offline --locked -p konsensus-lightning --test cln_regtest \
+  real_cln_regtest -- --exact --ignored --nocapture --test-threads=1
+```
 
-The TLS mocks in `cln_fee_limits.rs` cover the client request/error contract for
-these cases. Implementing CLN lifecycle/topology support is required before this
-runner can claim real-node coverage. See [CLN configuration](CLN.md).
+Ordinary Cargo test runs report the test as ignored. Even with `--ignored`, if
+either environment variable is absent/empty it prints `CLN REGTEST SKIP:` and
+returns successfully **before starting daemons**. Explicit invalid paths,
+missing plugins, startup failures and failed assertions are failures, never
+skips. Compile and check the no-binaries path offline with:
+
+```sh
+cargo test --offline --locked -p konsensus-lightning --test cln_regtest --no-run
+env -u BITCOIND_EXE -u LIGHTNINGD_EXE \
+  cargo test --offline --locked -p konsensus-lightning --test cln_regtest \
+  -- --ignored --nocapture
+```
+
+The topology is `CLN -- private -- LDK hub -- private -- LDK recipient`:
+
+- **T5:** clnrest creates a local CA/server certificate; BitSov verifies that CA
+  and the `localhost` hostname. The fixture provisions a 0600 rune with the
+  BitSov method allowlist and conditional numeric `maxfee < 10001` restrictions.
+  It authorizes only the selected keysend method, making unintended fallback a
+  test failure. Channels must be usable at both ends before any payment.
+- **T7:** CLN pays 2,001 msat by `xkeysend` on 26.06.9; 24.11.2 exercises its
+  supported fee-capped `keysend` compatibility path (it has no `xkeysend`). A
+  signed chat envelope is admitted by the production payment gate using the
+  real LDK incoming settlement. A paid LDK keysend reply is admitted against
+  CLN's real incoming settlement. Forged preimages and under-price envelopes
+  are rejected, as is a valid proof checked against an outgoing settlement.
+  This tests payment/gate interoperability, not Noise transport,
+  encryption, compose endpoints or paired-app budget accounting; those remain
+  covered by the separate LDK app harness above.
+- **T8:** the hub advertises a 5,000-msat base fee and zero ppm to the recipient.
+  A private route hint is checked and an `xpay` positive control settles at
+  exactly 5,000 msat. A fresh invoice with a 4,999-msat ceiling must fail.
+  The test waits beyond CLN's 60-second retry window, then checks no settled or
+  pending send attempts, no remaining CLN HTLC, an unpaid recipient invoice,
+  unchanged CLN channel/on-chain balances and unchanged LDK capacities.
+  Another payment at 5,000 msat must still succeed after the refusal.
+  A provider timeout alone cannot pass this check. CLN can reject a route
+  without creating a `listpays` record; an empty history is allowed only after
+  the retry window and those independent checks.
+- **T9:** real HTTPS requests with the restricted rune call `xpay` and the
+  selected keysend method without `maxfee` and with numeric `maxfee=10001`,
+  plus `withdraw` with valid parameters. Each must return an authorization
+  refusal with rune error code 1502, rather than a parameter or routing error.
+  Send records and balances stay unchanged; an allowed capped payment then
+  succeeds with the same rune.
+
+Core is isolated regtest with external networking disabled. All listeners bind
+loopback; fixtures use disposable directories, explicit RPC credentials and no
+public chain/gossip endpoints. Rust owners terminate/wait daemon process groups
+on completion or panic. The scenario has a 600-second deadline after binary
+preflight (compilation is separate). As with direct Cargo tests, an uncatchable
+termination of the test process cannot run Rust destructors; use an isolated
+runner for release execution. No real wallet keys or funds are used.
+
+The manual-only [Real CLN paid regtest workflow](../.github/workflows/cln-regtest.yml)
+has **only `workflow_dispatch`**, no schedule or push/PR trigger. Its two Ubuntu
+24.04 amd64 matrix jobs download from the official Bitcoin Core and
+[ElementsProject/lightning releases](https://github.com/ElementsProject/lightning/releases),
+verify these pinned SHA-256 sums **before extraction**, and run the test:
+
+| Archive | SHA-256 |
+| --- | --- |
+| `bitcoin-28.2-x86_64-linux-gnu.tar.gz` | `98add5f220c01b387343b70edeb6273403fe081e22cd85fda132704cdcaa98aa` |
+| `clightning-v24.11.2-Ubuntu-24.04-amd64.tar.xz` | `d609319b53ba8261ca4d3f249c49be916bbb64780de520690e81218d436a4e4b` |
+| `clightning-v26.06.9-Ubuntu-24.04-amd64.tar.xz` | `2f5b55838f8de8a7a627f8e34f888afb6770c5f303deee799edac8595bc3d2d1` |
+
+Dispatch it from Actions → Real CLN paid regtest → Run workflow, selecting the
+release branch. Both matrix jobs must pass. The workflow retains per-version
+logs and requires `CLN REGTEST PASS: T5 T7 T8 T9`; a skip or missing completion
+marker fails the lane. Compilation and a clean skip are **not** real-node release
+evidence. This change was developed offline without lightningd; successful
+manual runs on both versions are still required before claiming compatibility.

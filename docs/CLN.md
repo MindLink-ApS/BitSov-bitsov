@@ -106,9 +106,10 @@ For the default absolute policy maximum of 10,000 msat, the restrictions array i
 Use the configured `routing_fees.maximum_msat + 1` instead of `10001` for a
 different maximum. Inner alternatives are OR; outer restrictions are AND.
 Numeric restrictions are defense in depth, independent of the per-payment client
-ceiling. This example has **not** been exercised against a real CLN rune in this
-repository. Before production use, verify absent `maxfee`, an over-limit numeric
-`maxfee`, and `withdraw` are rejected by the installed CLN release (T9). A rune
+ceiling. The [manual real-node regtest](regtest-e2e.md#real-cln-release-regtest-t5-t7-t8-t9)
+exercises these restrictions; successful runs on both pinned releases are still
+required as release evidence. Before production use, verify absent `maxfee`, an
+over-limit numeric `maxfee`, and `withdraw` are rejected by the installed CLN release (T9). A rune
 fee restriction is not a principal-spend budget; BitSov's spend grants still apply.
 
 ## Configuration reference
@@ -169,7 +170,8 @@ Payment RPC references: [xpay](https://docs.corelightning.org/reference/xpay),
 
 PR3 tests in `crates/konsensus-lightning/tests/cln_fee_limits.rs` cover request
 ceilings, discovery, duplicate/cancelled attempts, ambiguous errors, response
-validation and the sticky overspend latch over local TLS. The existing
-[regtest harness](regtest-e2e.md#cln-coverage-gap) only provisions LDK nodes.
-Real CLN-to-LDK keysend/reply (T7), high-fee-hop refusal with no settled HTLC or
-debit (T8), and rune enforcement (T9) remain unverified.
+validation and the sticky overspend latch over local TLS. The ignored
+[real CLN regtest](regtest-e2e.md#real-cln-release-regtest-t5-t7-t8-t9) provisions
+CLN and LDK for keysend/reply (T7), high-fee-hop refusal with no settled HTLC or
+debit (T8), and rune enforcement (T9). Its manual workflow must pass on both
+pinned releases before these behaviors are considered verified against real CLN.
