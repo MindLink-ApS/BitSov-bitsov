@@ -1,0 +1,105 @@
+name: Real CLN paid regtest
+
+# Release evidence only: never on push or a schedule. Runs by hand
+# (workflow_dispatch, once this file is on main) or when a maintainer adds the
+# `cln-regtest` label to a same-repository PR (never a fork PR).
+# Manual dispatch cannot reach a branch-only file.
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cln-regtest-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cln-regtest:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'cln-regtest' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: '24.11.2'
+            sha256: 'd609319b53ba8261ca4d3f249c49be916bbb64780de520690e81218d436a4e4b'
+          - version: '26.06.9'
+            sha256: '2f5b55838f8de8a7a627f8e34f888afb6770c5f303deee799edac8595bc3d2d1'
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      BITCOIND_SKIP_DOWNLOAD: '1'
+      ELECTRS_SKIP_DOWNLOAD: '1'
+      ELECTRSD_SKIP_DOWNLOAD: '1'
+      BITCOIN_VERSION: '28.2'
+      # Same pinned Core archive/checksum as three-node-paid-e2e.yml.
+      BITCOIN_SHA256: '98add5f220c01b387343b70edeb6273403fe081e22cd85fda132704cdcaa98aa'
+      CLN_VERSION: ${{ matrix.version }}
+      CLN_SHA256: ${{ matrix.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install CLN runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgmp10 libsqlite3-0 libsodium23 libpq5 libffi8 libssl3t64 zlib1g python3 python3-venv
+          # The 24.11 clnrest plugin is Python; newer releases may ship it
+          # compiled. Keep a private environment for the Python plugin.
+          python3 -m venv "$RUNNER_TEMP/cln-python"
+          "$RUNNER_TEMP/cln-python/bin/pip" install pyln-client flask flask-cors flask-restx flask-socketio gunicorn gevent gevent-websocket cryptography
+          echo "$RUNNER_TEMP/cln-python/bin" >> "$GITHUB_PATH"
+      - name: Provision hash-pinned Bitcoin Core and official CLN
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_dir="$RUNNER_TEMP/cln-regtest-fixtures"
+          mkdir -p "$fixture_dir"
+          cd "$fixture_dir"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            "https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/bitcoin-${BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz" -o bitcoin.tar.gz
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            "https://github.com/ElementsProject/lightning/releases/download/v${CLN_VERSION}/clightning-v${CLN_VERSION}-Ubuntu-24.04-amd64.tar.xz" -o cln.tar.xz
+          # Verify BOTH immutable pins before extracting or executing either.
+          printf '%s  %s\n' "$BITCOIN_SHA256" bitcoin.tar.gz "$CLN_SHA256" cln.tar.xz | sha256sum --check --strict
+          tar -xzf bitcoin.tar.gz
+          mkdir cln
+          tar -xJf cln.tar.xz -C cln
+          # Preserve the release's bin/libexec/share layout for plugin discovery.
+          mapfile -t lightningd_paths < <(find -L "$fixture_dir/cln" -type f -path '*/bin/lightningd')
+          [[ "${#lightningd_paths[@]}" == 1 ]]
+          test -x "${lightningd_paths[0]}"
+          test -x "$fixture_dir/bitcoin-${BITCOIN_VERSION}/bin/bitcoin-cli"
+          echo "BITCOIND_EXE=$fixture_dir/bitcoin-${BITCOIN_VERSION}/bin/bitcoind" >> "$GITHUB_ENV"
+          echo "LIGHTNINGD_EXE=${lightningd_paths[0]}" >> "$GITHUB_ENV"
+          echo "$fixture_dir/bitcoin-${BITCOIN_VERSION}/bin" >> "$GITHUB_PATH"
+      - name: Cache Rust dependencies for offline execution
+        run: cargo fetch --locked
+      - name: Real CLN test (skip is a CI failure)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --offline --locked -p konsensus-lightning --test cln_regtest \
+            real_cln_regtest -- --exact --ignored --nocapture --test-threads=1 2>&1 | tee cln-regtest.log
+          grep -q '^CLN REGTEST PASS: T5 T7 T8 T9$' cln-regtest.log
+          if grep -q 'CLN REGTEST SKIP:' cln-regtest.log; then
+            echo '::error::Real CLN test skipped; this release lane requires execution.'
+            exit 1
+          fi
+          echo "CLN ${CLN_VERSION}: T5/T7/T8/T9 completed against real nodes." >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cln-regtest-${{ matrix.version }}
+          path: cln-regtest.log
+          if-no-files-found: ignore

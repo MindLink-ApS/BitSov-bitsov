@@ -5,6 +5,19 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+### Lightning
+
+- CLN fee-capped outgoing payments (#299): adds `xpay` and `xkeysend`/`keysend`,
+  startup command discovery, local invoice validation, fresh-hash protection,
+  ambiguous POST handling and a sticky overspend shutdown. Caller limits can
+  only tighten routing policy. Existing preview runes must add `help` and
+  payment methods. Includes mocked TLS money-path tests, Semgrep guards and
+  [configuration documentation](docs/CLN.md).
+- Add an opt-in [real CLN regtest](docs/regtest-e2e.md#real-cln-release-regtest-t5-t7-t8-t9)
+  for settlement/payment-gate interoperability, high-fee refusal and restricted
+  rune enforcement. Successful runs on both pinned CLN releases remain required
+  as release evidence.
+
 ## [0.3.0-rc14] — 2026-10-09 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Includes the seven PRs merged after

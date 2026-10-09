@@ -232,11 +232,11 @@ rules:
       - pattern: $C.https_only(false)
     paths:
       include: ["**/cln.rs"]
-      exclude: ["docs/qa/semgrep-tests/**"]
+      exclude: ["**/docs/qa/semgrep-tests/**"]
 
   - id: bitsov-cln-rune-debug
     paths:
-      exclude: ["docs/qa/semgrep-tests/**"]
+      exclude: ["**/docs/qa/semgrep-tests/**"]
     languages: [generic]
     severity: ERROR
     message: Rune holders need a handwritten redacting Debug implementation; do not derive Debug.
@@ -253,7 +253,7 @@ rules:
       - pattern-regex: '\.(?:arg|args|query|json)\([^;\n]*\b(?:self\.)?rune\b'
     paths:
       include: ["**/cln.rs"]
-      exclude: ["docs/qa/semgrep-tests/**"]
+      exclude: ["**/docs/qa/semgrep-tests/**"]
   - id: bitsov-grant-reserve-must-check-breakers
     languages: [rust]
     severity: ERROR
@@ -288,3 +288,44 @@ rules:
     paths:
       include:
         - "**/crates/konsensus-api/src/**"
+
+  - id: bitsov-cln-uncapped-payment
+    languages: [generic]
+    severity: ERROR
+    message: Every CLN payment JSON object must carry an explicit maxfee, including zero. Never rely on daemon fee defaults.
+    pattern-regex: '\bjson!\s*\(\s*\{(?=[^}]*"(?:invstring|destination)"\s*:)(?![^}]*"maxfee"\s*:)[^}]*\}'
+    paths:
+      include: ["**/cln.rs"]
+      exclude: ["**/docs/qa/semgrep-tests/**", "**/tests/**"]
+
+  - id: bitsov-cln-legacy-pay
+    languages: [rust]
+    severity: ERROR
+    message: Use xpay with an absolute policy ceiling. Do not add a legacy pay fallback.
+    pattern-either:
+      - pattern: $S.rpc("pay", ...)
+      - pattern: $S.post("/v1/pay")
+      - pattern: $S.set_path("/v1/pay")
+    paths:
+      include: ["**/cln.rs"]
+      exclude: ["**/docs/qa/semgrep-tests/**", "**/tests/**"]
+
+  - id: bitsov-cln-post-not-dispatched
+    languages: [generic]
+    severity: ERROR
+    message: The shared CLN RPC transport runs POST; its failures are ambiguous. Classify safe pre-dispatch refusal in the caller only.
+    pattern-regex: '(?s)async fn rpc\b(?:(?!\n    (?:pub )?async fn ).)*?LightningError::PaymentNotDispatched'
+    paths:
+      include: ["**/cln.rs"]
+      exclude: ["**/docs/qa/semgrep-tests/**", "**/tests/**"]
+
+  - id: bitsov-cln-clear-payment-guard
+    languages: [generic]
+    severity: ERROR
+    message: CLN payment attempts and the overspend latch are sticky for the provider lifetime; do not clear them after POST or health checks.
+    pattern-either:
+      - pattern-regex: '\bpayment_capable\s*\.\s*store\s*\(\s*true\b'
+      - pattern-regex: '\battempts\s*\.\s*(?:remove|clear|drain)\s*\('
+    paths:
+      include: ["**/cln.rs"]
+      exclude: ["**/docs/qa/semgrep-tests/**", "**/tests/**"]
