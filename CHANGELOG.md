@@ -73,14 +73,17 @@ merge gate. Upgrade steps, including the retained test Pi:
   operations. CLN owns its wallet and backups; the BitSov mnemonic does not
   recover CLN funds. See [configuration](docs/CLN.md).
 - **Pending #297 merge/confirmation:** extend the CLN preview with invoice
-  creation, settlement lookup, payment history, channel listing and balances.
+  creation, incoming settlement verification (including keysend receipts and
+  overpayment), merged payment history, channel listing and balances.
   Outgoing invoice payments and keysend still refuse before dispatch;
   **CLN cannot pay**, and payment capability / money readiness remain false.
   Reading outgoing history does not enable sending. Use a restricted rune for
   `getinfo`, `invoice`, `listinvoices`, `listpays`, `listpeerchannels` and
   `listfunds`; rotate/restart if upgrading from the getinfo-only preview.
   Channel management, on-chain sends, hold invoices and inbound keysend TLV
-  watching remain unsupported. Confirm the final merged scope before tagging.
+  watching remain unsupported. Includes mocked REST status and payment-gate
+  tests, credential redaction and local rustls transport tests. Confirm the
+  final merged scope before tagging.
 
 ## [0.3.0-rc13] — 2026-10-08 (prep; not tagged yet)
 
