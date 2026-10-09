@@ -270,6 +270,7 @@ async fn pricing_own_chain_aware_reports_mode() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -1292,6 +1293,7 @@ async fn health_lightning_unavailable_shows_null_balance() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -1796,6 +1798,7 @@ async fn chain_status_with_failing_provider() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -1913,6 +1916,7 @@ async fn chain_status_partial_failure() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -2249,6 +2253,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: base.gossip_validator.clone(),
     });
     let auth = auth_header(&state);

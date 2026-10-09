@@ -57,6 +57,35 @@ fn read(path: &Path) -> Result<Option<Journal>> {
     }
     Ok(Some(journal))
 }
+/// Sanitized diagnostics only: never serialize journal contents or parser/I/O errors.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalState {
+    Absent,
+    Open,
+    Done,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Status {
+    pub state: JournalState,
+}
+
+/// Read the same versioned journal used by the startup fence, without changing it.
+/// Completion mirrors that fence, including its legacy `done` skeleton support.
+pub fn status(storage: &Path) -> Status {
+    let state = match read(&storage.join(JOURNAL_FILE)) {
+        Ok(None) => JournalState::Absent,
+        Ok(Some(journal)) if journal.state == "open" => JournalState::Open,
+        Ok(Some(journal)) if journal.recovery.as_ref().is_none_or(|r| r.report.is_some()) => {
+            JournalState::Done
+        }
+        Ok(Some(_)) | Err(_) => JournalState::Unavailable,
+    };
+    Status { state }
+}
+
 fn persist(path: &Path, state: &Journal) -> Result<()> {
     let parent = path.parent().ok_or("journal has no parent")?;
     let temp = parent.join(format!(".recover-{:016x}", rand::random::<u64>()));

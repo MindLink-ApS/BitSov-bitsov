@@ -1930,6 +1930,7 @@ async fn compose_happy_path_keysend() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -2083,6 +2084,7 @@ async fn compose_happy_path_invoice_flow() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -2205,6 +2207,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -2391,6 +2394,7 @@ async fn compose_keysend_fallback_to_invoice() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -2524,6 +2528,7 @@ async fn compose_queues_when_transport_send_fails() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -2635,6 +2640,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -2777,6 +2783,7 @@ async fn compose_broadcasts_to_websocket() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -2880,6 +2887,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -2982,6 +2990,7 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
@@ -3147,6 +3156,7 @@ async fn compose_room_rejects_oversized_member_count() {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
 
