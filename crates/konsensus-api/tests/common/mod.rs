@@ -1014,6 +1014,7 @@ pub fn test_state() -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     })
 }
@@ -1078,6 +1079,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     })
 }
@@ -1130,6 +1132,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     })
 }
@@ -1192,6 +1195,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     })
 }
@@ -1244,6 +1248,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     })
 }
@@ -1503,6 +1508,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: Some(Arc::new(konsensus_gossip::GossipValidator::new(
             Default::default(),
         ))),
@@ -1738,6 +1744,7 @@ pub fn test_state_with_lightning(lightning: Arc<dyn LightningProvider>) -> Arc<A
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     })
 }

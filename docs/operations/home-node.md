@@ -736,10 +736,38 @@ Existing installations without `INSTANCE` bind on their first upgraded start
 without refusing; that upgrade cannot determine whether their state is stale.
 Never delete or edit safety markers to get a node to start.
 
-`konsensus recover` is **coming**, not implemented. For a lost disk, stop and
-follow [the recovery guidance](../v2/RECOVERY.md); contact the operator rather
-than starting an old copy. For a healthy node, prefer
-[`konsensus move-home`](move-home.md) on its original live store.
+### Lost-disk recovery (R1/R2)
+
+For a lost/wiped disk, disable the old node and follow the full
+[R1/R2 recovery runbook](../v2/RECOVERY.md#r1--lost-or-wiped-disk-original-hub-reachable).
+Restore the seed into an empty directory with `konsensus restore --dir
+<absolute-dir> --tier full --encrypt`. Set the generated config to the original
+network, BIP-39 passphrase, chain source and hubs before previewing
+`konsensus recover --config <new-config>`. An optional `--backup <encrypted-scb>`
+narrows the scan using metadata only; no historical channel state enters LDK.
+
+Add `--confirm` from the owner console to reconnect to the hubs, wait for their
+closes and approve each sweep's amount, fee and destination. The default
+sweep goes to the seed's own on-chain wallet. Completion also needs a fresh
+LSPS2 channel funded **from another wallet** and a settled 1-sat hub test.
+Keep the journal and new live verification store; resume the same command and
+plan after interruption. Normal startup remains fenced until completion.
+
+If the hub cannot be reached or does not close (R2), preserve the journal and
+contact its operator. An empty scan does not complete recovery, and there is
+no backup force-close fallback. The hub is trusted to close its latest state;
+in-flight HTLCs may be lost. Keep the seed for late closes even after success.
+For a healthy node, use [`konsensus move-home`](move-home.md) on the original
+live store. Lost owner devices with a healthy box call for console re-pairing,
+not restoring another node with the same seed.
+
+When the normal API is available, owner `/api/v1/status` exposes only
+`recovery.state`: `absent`, `open`, `done` or `unavailable`. This read-only field
+can support “Recovery in progress” / “Recovered” displays; it cannot authorize
+recovery and is absent from public health. The recovery command has no HTTP API,
+and the startup fence blocks normal service while its journal is open. Follow
+the console for active progress, and inspect current readiness after normal
+startup. See the [status contract](../v2/RECOVERY.md#read-only-owner-status).
 
 ### Owner override for a legitimate hardware move
 
@@ -760,12 +788,13 @@ a backup or snapshot. It changes the binding; it does not verify freshness.
    service or unattended script. An open recovery or move-home journal cannot
    be bypassed by rebinding.
 
-The recovery-journal skeleton is `ldk/recover.json`, version 1, with `state`
-`open` or `done` (for example `{"version":1,"state":"open"}`). Any open,
-malformed, unreadable or unsupported journal refuses startup before LDK.
-Only a valid `done` journal permits normal startup. No recovery workflow writes
-or completes this journal yet; do not create, remove or mark it done manually
-to bypass recovery.
+The recovery journal is `ldk/recover.json`, version 1, with `state` `open` or
+`done`. Full-tier seed restore creates it; `recover` adds the immutable plan,
+approved sweeps, verification progress and completion report. Open, malformed,
+unreadable or unsupported journals refuse normal startup before LDK; a full
+recovery record marked done without its report also refuses. Keep this file
+with the recovery-created live store. Do not create, delete or mark it done
+manually to bypass recovery.
 
 The example systemd unit limits starts to three within 300 seconds. After a
 panic or safety refusal, inspect `journalctl --user -u konsensus.service` and

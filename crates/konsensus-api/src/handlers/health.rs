@@ -22,6 +22,9 @@ use crate::state::AppState;
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
+    /// Sanitized restore journal diagnostics, owner-only and read-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<konsensus_lightning::recover::Status>,
     /// Active channel admission policy; null when backend enforcement is unavailable.
     pub channel_safety: Option<konsensus_core::traits::lightning::ChannelSafetyStatus>,
     /// Node-local, amount-free breach-window diagnostics. Null for unsupported backends.
@@ -216,7 +219,24 @@ async fn health(State(state): State<Arc<AppState>>) -> (DataFreshness, Json<Publ
 ///
 /// Includes identity, connected peer IDs, wallet balance, and LN pubkey — the
 /// fields redacted from the public `/health` endpoint.
-async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+async fn status(
+    auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<HealthResponse>, axum::http::StatusCode> {
+    if auth.node_id != state.identity.node_id().to_hex() {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+    let recovery = if let Some(dir) = state.recovery_dir.clone() {
+        Some(
+            tokio::task::spawn_blocking(move || konsensus_lightning::recover::status(&dir))
+                .await
+                .unwrap_or(konsensus_lightning::recover::Status {
+                    state: konsensus_lightning::recover::JournalState::Unavailable,
+                }),
+        )
+    } else {
+        None
+    };
     let readiness = state.lightning.readiness().await;
     let connected = state.transport.connected_peers().await;
     let ln_available = state.lightning.is_available().await;
@@ -250,7 +270,8 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
     let disk = state.lightning.disk_status();
     let chain_sync = state.lightning.chain_sync_status();
     let storage_health = state.storage.storage_read_health();
-    Json(HealthResponse {
+    Ok(Json(HealthResponse {
+        recovery,
         channel_safety: state.lightning.channel_safety(),
         offline_safety: state
             .lightning
@@ -307,7 +328,7 @@ async fn status(_auth: ScopedAuth<Read>, State(state): State<Arc<AppState>>) -> 
         peer_endpoint_source: peer.source.map(String::from),
         peer_endpoint_reason: peer.reason.map(String::from),
         custody_mode: state.custody_mode,
-    })
+    }))
 }
 
 /// Cheap liveness response for deploy/keepalive probes.

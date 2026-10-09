@@ -1542,6 +1542,15 @@ async fn start_node_services<'a>(
             .and_then(|s| s.local_addr().ok())
             .map(|a| a.port()),
         custody_mode: custody_mode(config),
+        recovery_dir: matches!(config.lightning, LightningConfig::Ldk { .. }).then(|| {
+            config
+                .identity
+                .mnemonic_file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .join("ldk")
+        }),
     });
 
     // Public remote access is Noise only. Decrypted bytes go to an ephemeral
