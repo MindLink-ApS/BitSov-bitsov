@@ -13,6 +13,8 @@ mdns = ["dep:mdns-sd"]
 regtest-e2e = ["dep:corepc-node"]
 
 [dependencies]
+konsensus-recovery = { path = "../konsensus-recovery" }
+bitcoin.workspace = true
 if-addrs = "0.15"
 # Already in the lockfile; set an explicit dual-stack policy for wildcard IPv6.
 socket2 = "0.6"
@@ -32,6 +34,9 @@ konsensus-api = { path = "../konsensus-api" }
 konsensus-routing = { path = "../konsensus-routing" }
 konsensus-gossip = { path = "../konsensus-gossip" }
 axum.workspace = true
+# Explicit HTTP/1 header deadline on the isolated LAN setup listener.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true
@@ -78,6 +83,5 @@ async-trait.workspace = true
 tempfile = "3"
 ldk-node.workspace = true
 tower = { workspace = true, features = ["util"] }
-bitcoin.workspace = true
 lightning-invoice.workspace = true
 secp256k1 = "0.29"

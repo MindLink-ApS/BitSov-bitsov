@@ -361,7 +361,9 @@ async fn queued_room_members_stop_on_revoke() {
         );
     }
     let body = json!({"recipient": id, "is_room": true, "kind": 100, "plaintext": "queued", "max_total_msat": 10_000});
-    let token = fx.grant(None, GrantTerms::new(10_000)).await;
+    let mut terms = GrantTerms::new(10_000);
+    terms.breakers.max_consecutive_failures = 10;
+    let token = fx.grant(None, terms).await;
     fx.wallet.pause_dispatch.store(true, Ordering::SeqCst);
     let state = Arc::clone(&fx.state);
     let task = tokio::spawn(async move {
@@ -387,8 +389,14 @@ async fn queued_room_members_stop_on_revoke() {
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["member_outcomes"].as_array().unwrap().len(), 10);
     let events = fx.state.audit_log.membrane().read(None, 500).0;
-    assert_eq!(events.len(), 2, "only the two not-yet-dispatched members are definite budget refusals");
-    assert!(events.iter().all(|e| e.code == konsensus_api::membrane::Code::BudgetExceeded));
+    assert_eq!(
+        events.len(),
+        2,
+        "only the two not-yet-dispatched members are definite budget refusals"
+    );
+    assert!(events
+        .iter()
+        .all(|e| e.code == konsensus_api::membrane::Code::BudgetExceeded));
     assert_eq!(
         fx.wallet.money(),
         0,

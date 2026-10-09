@@ -2,7 +2,8 @@
 //! No signing keys or seed/password serializers are reachable from this surface.
 use super::BootstrapState;
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
+    body::{Body, Bytes},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -12,12 +13,78 @@ use axum::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{atomic::Ordering, Arc, Mutex},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
+use tokio::time::Instant;
+
+const MAX_BODY_BYTES: usize = 2048;
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SOURCES: usize = 1024;
+const SOURCE_IDLE_TTL: Duration = Duration::from_secs(60);
+
+struct Bucket {
+    tokens: f64,
+    updated: Instant,
+}
+impl Bucket {
+    fn take(&mut self, now: Instant, burst: f64, per_second: f64) -> bool {
+        self.tokens =
+            (self.tokens + now.duration_since(self.updated).as_secs_f64() * per_second).min(burst);
+        self.updated = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+struct SourceBuckets {
+    reads: Bucket,
+    posts: Bucket,
+    last_seen: Instant,
+}
+
+#[derive(Default)]
+struct SetupRateLimits(Mutex<HashMap<IpAddr, SourceBuckets>>);
+impl SetupRateLimits {
+    fn allow(&self, ip: IpAddr, post: bool) -> bool {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            _ => ip,
+        };
+        let mut sources = self.0.lock().unwrap();
+        let now = Instant::now();
+        if !sources.contains_key(&ip) && sources.len() >= MAX_SOURCES {
+            // Only reclaim idle entries after both buckets could fully refill.
+            // Never evict an active source and thereby grant it a fresh burst.
+            sources.retain(|_, source| now.duration_since(source.last_seen) < SOURCE_IDLE_TTL);
+            if sources.len() >= MAX_SOURCES {
+                return false;
+            }
+        }
+        let source = sources.entry(ip).or_insert_with(|| SourceBuckets {
+            reads: Bucket {
+                tokens: 8.0,
+                updated: now,
+            },
+            posts: Bucket {
+                tokens: 4.0,
+                updated: now,
+            },
+            last_seen: now,
+        });
+        source.last_seen = now;
+        if post {
+            source.posts.take(now, 4.0, 0.2)
+        } else {
+            source.reads.take(now, 8.0, 2.0)
+        }
+    }
+}
 
 /// Deliberately opaque: ticket failures must not echo secret link material.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +110,7 @@ pub struct SetupPage {
     label: String,
     status: Mutex<String>,
     sessions: Mutex<VecDeque<Session>>,
+    rate_limits: SetupRateLimits,
 }
 impl SetupPage {
     /// Exact HTTP authorities include the actual listener port; never trust forwarded headers.
@@ -60,6 +128,7 @@ impl SetupPage {
             label,
             status: Mutex::new(status),
             sessions: Mutex::new(VecDeque::new()),
+            rate_limits: SetupRateLimits::default(),
         }
     }
     /// Status-only runtime transition, without adding authority routes to the main API.
@@ -117,10 +186,11 @@ pub fn lan_source(ip: IpAddr) -> bool {
     }
 }
 async fn guard(State(page): State<Arc<SetupPage>>, request: Request, next: Next) -> Response {
-    let source_ok = request
+    let source = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .is_some_and(|p| lan_source(p.0.ip()));
+        .map(|p| p.0.ip());
+    let source_ok = source.is_some_and(lan_source);
     let host_ok = request.headers().get_all(header::HOST).iter().count() == 1
         && request
             .headers()
@@ -132,6 +202,18 @@ async fn guard(State(page): State<Arc<SetupPage>>, request: Request, next: Next)
         || (request.method() != axum::http::Method::GET && !page.csrf(request.headers()))
     {
         StatusCode::FORBIDDEN.into_response()
+    } else if !source.is_some_and(|ip| {
+        page.rate_limits
+            .allow(ip, request.method() == axum::http::Method::POST)
+    }) {
+        let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        response
     } else {
         next.run(request).await
     };
@@ -151,6 +233,26 @@ async fn guard(State(page): State<Arc<SetupPage>>, request: Request, next: Next)
             ),
         );
     }
+    response
+}
+
+/// Read every body before entering a handler, including routes without extractors.
+/// This is an absolute deadline, so trickling chunks cannot keep a slot occupied.
+async fn read_body(request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    let read = Bytes::from_request(Request::from_parts(parts.clone(), body), &());
+    let mut response = match tokio::time::timeout(BODY_READ_TIMEOUT, read).await {
+        Ok(Ok(bytes)) => {
+            return next
+                .run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        Ok(Err(rejection)) => rejection.into_response(),
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
     response
 }
 fn random() -> String {
@@ -334,7 +436,8 @@ pub fn router(page: Arc<SetupPage>) -> Router {
         .route("/setup/start", post(start))
         .route("/setup/approve", post(approve))
         .route("/setup/cancel", post(cancel))
-        .layer(DefaultBodyLimit::max(2048))
+        .layer(middleware::from_fn(read_body))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(page.clone(), guard))
         .with_state(page)
 }

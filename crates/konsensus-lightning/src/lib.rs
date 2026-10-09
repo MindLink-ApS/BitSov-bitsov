@@ -9,13 +9,14 @@
 
 #![forbid(unsafe_code)]
 
-pub mod tower;
 mod balance;
 pub mod circuit_breaker;
 pub mod cln;
 pub mod move_home;
 mod onchain;
+pub mod recover;
 pub mod recovering;
+pub mod tower;
 pub use recovering::RecoveringLightning;
 pub mod ldk;
 mod ldk_logging;

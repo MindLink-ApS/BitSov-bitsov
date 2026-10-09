@@ -10,6 +10,7 @@ license.workspace = true
 ldk-integration-test = ["dep:electrsd"]
 
 [dependencies]
+konsensus-recovery = { path = "../konsensus-recovery" }
 konsensus-crypto = { path = "../konsensus-crypto" }
 konsensus-chain = { path = "../konsensus-chain" }
 konsensus-core = { path = "../konsensus-core" }
@@ -40,6 +41,7 @@ rusqlite = "0.31"
 electrsd = { version = "0.36", features = ["corepc-node_28_2", "esplora_a33e97e1"], optional = true }
 
 [dev-dependencies]
+lightning = { path = "../../vendor/lightning", features = ["_test_utils"] }
 metrics-exporter-prometheus.workspace = true
 mockall.workspace = true
 mockito = "1"

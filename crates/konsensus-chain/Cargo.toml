@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+konsensus-recovery = { path = "../konsensus-recovery" }
 konsensus-core = { path = "../konsensus-core" }
 tokio.workspace = true
 async-trait.workspace = true

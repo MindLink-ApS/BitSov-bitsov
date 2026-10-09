@@ -254,3 +254,37 @@ rules:
     paths:
       include: ["**/cln.rs"]
       exclude: ["docs/qa/semgrep-tests/**"]
+  - id: bitsov-grant-reserve-must-check-breakers
+    languages: [rust]
+    severity: ERROR
+    message: Use GrantBudget::reserve_at under the pairing mutex; reserve bypasses circuit breakers.
+    pattern: $B.reserve(...)
+    paths:
+      include:
+        - "**/crates/konsensus-api/src/pairing.rs"
+        - "**/crates/konsensus-api/src/pairing/**"
+
+  - id: bitsov-grant-breakers-owner-reset-only
+    languages: [rust]
+    severity: ERROR
+    message: Grant breaker resets belong only to the independent owner control channel.
+    pattern-either:
+      - pattern: $S.reset_grant_breakers(...)
+      - pattern: $B.reset_breakers(...)
+      - pattern: $B.breaker_state = $V
+      - pattern: $B.breakers = $V
+    paths:
+      include:
+        - "**/crates/konsensus-api/src/handlers/**"
+        - "**/crates/konsensus-api/src/pairing/device.rs"
+
+  - id: bitsov-grant-breaker-refusal-must-propagate
+    languages: [rust]
+    severity: ERROR
+    message: Never discard a grant reservation refusal; dispatch must fail closed.
+    pattern-either:
+      - pattern: let _ = $B.reserve_at(...);
+      - pattern: $B.reserve_at(...).ok();
+    paths:
+      include:
+        - "**/crates/konsensus-api/src/**"

@@ -12,6 +12,17 @@ also live on the corresponding GitHub pre-release pages.
   network. Reports connectivity and node public key; money operations remain
   disabled. Includes credential redaction, local rustls transport tests, and
   [configuration documentation](docs/CLN.md).
+### Security
+
+- Add owner-configurable spend-grant circuit breakers (N2): rolling minute/hour
+  payment rates, all-in 10-minute velocity, and a latched consecutive-failure
+  pause. Checks and history share the durable atomic reservation transaction;
+  unresolved outcomes retain failure capacity across crashes. Grant status
+  exposes limits and usage; only the owner console can reset breakers without
+  refunding budget or clearing dedupe. New defaults: 10/min, 60/hour, 5 failures,
+  1,000 sats/10 min. Store schema 6 preserves legacy grants' existing allowance
+  until replacement and prevents downgrade bypass. See
+  [spend grants](docs/SPEND_BUDGET_GRANTS.md#circuit-breakers-n2).
 
 ## [0.3.0-rc13] — 2026-10-08 (prep; not tagged yet)
 
