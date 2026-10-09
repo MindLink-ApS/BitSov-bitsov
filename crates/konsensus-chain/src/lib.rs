@@ -24,3 +24,5 @@ pub mod mock;
 
 pub use esplora::{EsploraConfig, EsploraProvider};
 pub use mock::{MockChainConfig, MockChainProvider};
+
+pub mod recovery;

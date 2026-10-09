@@ -235,23 +235,34 @@ impl EsploraSyncIntervals {
     }
 }
 
-fn offline_synced_block(status: &ldk_node::NodeStatus) -> Option<konsensus_core::offline_safety::SyncedBlock> {
-    if !status.is_running { return None; }
-    status.latest_lightning_wallet_sync.map(|(height, unix_secs)| {
-        konsensus_core::offline_safety::SyncedBlock { height: u64::from(height), unix_secs }
-    })
+fn offline_synced_block(
+    status: &ldk_node::NodeStatus,
+) -> Option<konsensus_core::offline_safety::SyncedBlock> {
+    if !status.is_running {
+        return None;
+    }
+    status
+        .latest_lightning_wallet_sync
+        .map(
+            |(height, unix_secs)| konsensus_core::offline_safety::SyncedBlock {
+                height: u64::from(height),
+                unix_secs,
+            },
+        )
 }
 
 fn offline_channel_windows(
     channels: Vec<ldk_node::ChannelDetails>,
 ) -> Vec<konsensus_core::offline_safety::ChannelWindow> {
-    channels.into_iter()
+    channels
+        .into_iter()
         // Include disconnected/unusable and closing channels while LDK lists them.
         .filter(|ch| ch.funding_txo.is_some())
         .map(|ch| konsensus_core::offline_safety::ChannelWindow {
             channel_id: ch.channel_id.to_string(),
             window_blocks: ch.counterparty_force_close_spend_delay,
-        }).collect()
+        })
+        .collect()
 }
 
 fn sync_status_is_ready(
@@ -659,6 +670,44 @@ impl LdkProvider {
         Self::new_inner(config, Some(deny_work), true).await
     }
 
+    /// Recovery can only construct a brand-new session. No existing LDK store
+    /// is ever loaded, even on resume. The owner holds the root process lease.
+    pub async fn new_for_recovery(mut config: LdkConfig) -> Result<Self, LightningError> {
+        let mut directory = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(&config.storage_dir).map_err(|_| {
+            LightningError::InvalidStartupConfig("recovery session must be a new directory".into())
+        })?;
+        config.listening_address = None;
+        config.scb_backup_dir = None;
+        config.tower = Default::default();
+        Self::new_for_move_home(config, Arc::new(|| false)).await
+    }
+
+    /// Post-sweep verification in the journal-designated new canonical store.
+    /// No API/listener is started; only the configured LSPS2 hub can open channels.
+    pub async fn new_for_recovery_verification(
+        mut config: LdkConfig,
+        store_id: &str,
+    ) -> Result<Self, LightningError> {
+        crate::recover::ensure_verification_store(&config.storage_dir, store_id)
+            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
+        let hub = config.liquidity.selected()?.ok_or_else(|| {
+            LightningError::InvalidStartupConfig(
+                "verification requires a selected LSPS2 hub".into(),
+            )
+        })?;
+        config.channel_peers = Some(vec![hub.node_id.clone()]);
+        config.listening_address = None;
+        config.lsps2_service = Default::default();
+        config.forward_to_private_channels = false;
+        Self::new_inner(config, None, true).await
+    }
+
     async fn new_inner(
         mut config: LdkConfig,
         admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -666,6 +715,8 @@ impl LdkProvider {
     ) -> Result<Self, LightningError> {
         if !moving_home {
             ensure_no_move_home(&config.storage_dir)?;
+            crate::recover::ensure_normal_start(&config.storage_dir)
+                .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
         }
         // Move the plaintext seed phrase out of `config` into a `Zeroizing`
         // wrapper so the inbound `String` copy is scrubbed from memory when
@@ -683,10 +734,8 @@ impl LdkProvider {
                 .expect("background sync is enabled")
         };
         let lsps2_service = config.lsps2_service.to_ldk(config.liquidity.enabled)?;
-        let channel_peer_allowlist = channel_peer_allowlist(
-            config.channel_peers.as_deref(),
-            lsps2_service.is_some(),
-        )?;
+        let channel_peer_allowlist =
+            channel_peer_allowlist(config.channel_peers.as_deref(), lsps2_service.is_some())?;
         let mnemonic = Mnemonic::from_str(&mnemonic_phrase)
             .map_err(|e| LightningError::InvalidStartupConfig(format!("invalid mnemonic: {e}")))?;
 

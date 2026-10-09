@@ -13,6 +13,8 @@ mdns = ["dep:mdns-sd"]
 regtest-e2e = ["dep:corepc-node"]
 
 [dependencies]
+konsensus-recovery = { path = "../konsensus-recovery" }
+bitcoin.workspace = true
 if-addrs = "0.15"
 # Already in the lockfile; set an explicit dual-stack policy for wildcard IPv6.
 socket2 = "0.6"
@@ -78,6 +80,5 @@ async-trait.workspace = true
 tempfile = "3"
 ldk-node.workspace = true
 tower = { workspace = true, features = ["util"] }
-bitcoin.workspace = true
 lightning-invoice.workspace = true
 secp256k1 = "0.29"

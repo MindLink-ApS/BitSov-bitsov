@@ -37,6 +37,8 @@ pub enum Command {
     },
     /// Close channels and send funds to an owner-specified home address (local console only).
     MoveHome(crate::move_home_cmd::MoveHomeArgs),
+    /// Recover seed-derived funds after the hub closes (local owner console only).
+    Recover(crate::recover_cmd::RecoverArgs),
     /// Rebind the latest cleanly stopped live store after a hardware move (owner console only).
     RebindInstance {
         #[arg(short, long, default_value = "konsensus.toml")]
