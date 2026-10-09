@@ -212,6 +212,7 @@ async fn start_sender(
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
         file_staging: Default::default(),
     });

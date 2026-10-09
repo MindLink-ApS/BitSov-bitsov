@@ -190,6 +190,11 @@ pub struct AppState {
     /// (e.g. the recovery/restore flow).
     pub data_dir: Option<PathBuf>,
 
+    /// Embedded LDK storage directory beside the configured mnemonic, which can
+    /// differ from `data_dir`. Read-only owner journal diagnostics; never a
+    /// request-supplied path. `None` for backends without local recovery.
+    pub recovery_dir: Option<PathBuf>,
+
     /// Durable-backup directory (`backup.scb_dir`) holding the rotated
     /// `scb-latest.aes` channel-state snapshot and the `whitelist-latest.aes`
     /// sidecar. Read by the one-click exit-bundle endpoint (X1) to attach the

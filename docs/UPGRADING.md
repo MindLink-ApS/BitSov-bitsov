@@ -11,6 +11,37 @@ this rc13 docs/version PR merges, not the preparation tip. See the
 older procedures below first, then rc12 → rc13. Historical sections describe
 their release's behavior; the rc13 restrictions here supersede those descriptions.
 
+## Current main: lost-disk recovery (#271)
+
+PRs #289 and #291 add the encrypted backup index and owner-console
+`konsensus recover` flow after the rc13 preparation baseline described below.
+For a lost/wiped disk, follow [R1/R2](v2/RECOVERY.md#r1--lost-or-wiped-disk-original-hub-reachable):
+`konsensus restore --dir <empty-absolute-dir> --tier full` writes an open
+`ldk/recover.json`, then `konsensus recover --config <new-config>` previews
+without starting LDK or contacting the chain. Restore the original network,
+BIP-39 passphrase and hub/chain configuration first. `--backup <encrypted-scb>`
+is optional and supplies metadata only, never live channel state.
+
+`recover --confirm` requires typed owner-console consent for hub closure and
+each sweep. Completion requires confirmed sweeps, a fresh LSPS2 channel funded
+from another wallet, and a settled 1-sat hub payment. It retains the new live
+verification store and marks the journal done only after the final chain
+recheck. Normal startup stays fenced until completion; resume with the same
+plan after interruption. An unreachable hub means waiting/contacting its
+operator, never force-closing from a backup. Preserve the journal, seed and
+report; a seed-only scan cannot prove all old channels have closed.
+
+Owner `GET /api/v1/status` now includes read-only `recovery.state` for embedded
+LDK (`absent`, `open`, `done`, `unavailable`). It exposes no journal contents or
+secrets and adds no recovery controls or public-route data. `recover` serves
+no API, so use its console while maintenance is active. See the
+[status contract](v2/RECOVERY.md#read-only-owner-status).
+
+Retained healthy nodes continue the normal upgrade path; hardware migration
+uses [move-home](operations/move-home.md) on the current live store. The SCB
+import lock and copied-state fence remain in force. Do not downgrade, delete
+markers, or restore a directory snapshot to bypass them.
+
 ## rc12 → rc13 procedure
 
 1. **Prepare and replace the binary.** Reconcile pending payments, channel
@@ -54,8 +85,9 @@ their release's behavior; the rc13 restrictions here supersede those description
    use console-only `konsensus rebind-instance --config …`, with the exact typed
    challenge and the old process disabled. It cannot bypass journals or prove
    freshness. Follow the [hardware-move runbook](operations/home-node.md#owner-override-for-a-legitimate-hardware-move).
-   **`konsensus recover` is not shipped**: #282 adds an unwired library only.
-   For lost disks follow [recovery guidance](v2/RECOVERY.md); for a healthy
+   The rc13 preparation baseline contained only the #282 recovery library.
+   Current main adds `konsensus recover`; follow the [current recovery
+   procedure](#current-main-lost-disk-recovery-271) for lost disks. For a healthy
    source use [move-home](operations/move-home.md).
 4. **Treat pairing schema v5 as forward-only (#278).** rc13 reads existing
    v2–v4 grant stores, but writes `pairing/clients.json` as v5; older nodes
@@ -129,7 +161,8 @@ reconcile outstanding payments, close/resolve channels and move any funds from
 the live node using the [move-home procedure](operations/move-home.md). Verify
 that no funds or unresolved claims depend on the old store, retain required
 recovery records securely, and disable the old service. Do not wipe a funded or
-unresolved node and expect the new recovery library to recover it.
+unresolved node for this onboarding exercise; lost-disk recovery is the separate
+[R1/R2 procedure](v2/RECOVERY.md).
 
 1. After the old node is safely retired, wipe/reimage the test Pi for a new
    identity, provision a persistent unique machine ID and install the verified
@@ -397,8 +430,9 @@ also read **VM / multi-host upgrade rules** and **Encrypted seed / custody**.
 SCB restore now always refuses, including preview and `--confirm`; there is no
 bypass. Previous preview started a node from historical channel state and could
 broadcast a revoked commitment. Do not downgrade to recover that behavior or
-roll back a live LDK directory. Preserve backups for a compatible recovery
-procedure. Whitelist sidecars must now be restored explicitly with
+roll back a live LDK directory. On current main, encrypted backups can serve
+as read-only indexes for [lost-disk recovery](v2/RECOVERY.md); they are never
+imported into the live store. Whitelist sidecars must now be restored explicitly with
 `konsensus whitelist restore`; they are no longer applied by SCB restore.
 
 To move funds from a healthy node, stop the normal service and follow

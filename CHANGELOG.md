@@ -7,6 +7,12 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Added
 
+- Safe-restore docs/status (#271, PR5): document the shipped owner-console
+  `konsensus recover` R1/R2 flow, hub dependency, backup-as-index limits,
+  sweep consent and externally funded LSPS2/1-sat verification. Owner
+  `/api/v1/status` reports a sanitized, read-only recovery journal state;
+  public health and non-owner callers receive no recovery state.
+
 - CLN backend preview: file-loaded restricted rune (mode 0600), pinned-CA HTTPS
   without public roots, and `getinfo` checks for CLN >= v24.11 and the configured
   network. Supports invoices, incoming settlement verification (including keysend

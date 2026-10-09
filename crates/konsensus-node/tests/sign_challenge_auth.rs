@@ -74,6 +74,7 @@ async fn owner_router(identity: Arc<NodeIdentity>) -> axum::Router {
         sponsor: Default::default(),
         stun_port: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        recovery_dir: None,
         gossip_validator: None,
     });
     konsensus_api::build_router(state)

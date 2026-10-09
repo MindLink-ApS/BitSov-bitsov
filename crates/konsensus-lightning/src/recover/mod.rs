@@ -3,8 +3,8 @@ mod journal;
 use crate::move_home::{Plan, Result, Sweep, FINAL_CONFIRMATIONS};
 use bitcoin::{FeeRate, OutPoint};
 pub use journal::{
-    ensure_normal_start, ensure_recovery_root, ensure_verification_store, initialize, Job, Report,
-    Verification,
+    ensure_normal_start, ensure_recovery_root, ensure_verification_store, initialize, status, Job,
+    JournalState, Report, Status, Verification,
 };
 use konsensus_chain::recovery::RecoveryChain;
 use konsensus_recovery::{BackupIndex, FoundOutput, RecoveryKeys, RecoveryScript};
