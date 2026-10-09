@@ -1,20 +1,139 @@
 # Upgrading a retained node
 
 This note covers common failure modes when replacing the `konsensus` binary on a
-retained data directory without re-running `konsensus init`. The test Pi's
-planned wipe and fresh onboarding are documented separately below.
+retained data directory without re-running `konsensus init`.
 
-**rc13 preparation (2026-10-08):** includes all 12 PRs after `v0.3.0-rc12`
-(`41b9e78`), through `fc103f1`. The release commit will be the `main` HEAD after
-this rc13 docs/version PR merges, not the preparation tip. See the
-[signing checklist](releases/v0.3.0-rc13.md). For nodes skipping releases, apply
-older procedures below first, then rc12 → rc13. Historical sections describe
-their release's behavior; the rc13 restrictions here supersede those descriptions.
+**rc14 preparation (2026-10-09):** six merged PRs after `v0.3.0-rc13`
+(`d625e85`), through `945eaf2`: #289–#293 and #295. CLN receive/read (#297)
+is drafted below but **pending merge and operator confirmation**. The release
+commit is the `main` HEAD after #297 and this docs/version PR merge, recorded
+at signing time. See the [signing checklist](releases/v0.3.0-rc14.md).
+For nodes skipping releases, apply the earlier procedures first, then
+rc13 → rc14. Historical sections describe their release's behavior; the rc14
+pairing schema and recovery guidance supersede those descriptions.
 
-## Current main: lost-disk recovery (#271)
+## rc13 → rc14 procedure
+
+1. **Prepare the retained node.** Reconcile pending payments, channel opens
+   and top-ups, verify the rc14 artifact and signed checksums under the
+   [release policy](ops/RELEASE_POLICY.md), then stop the node cleanly. Keep the
+   same config and latest live data directory on the same host/filesystem.
+   Preserve identity, pairings/grants, transport pins, current LDK state,
+   heartbeat and safety markers. Do not re-run `init`, restore an SD image or
+   start a copied directory. Install the verified binary and check that
+   `konsensus --version` reports `konsensus 0.3.0-rc14` before restarting.
+2. **Plan for pairing file v6 (#290).** rc14 reads v2–v5 pairing stores and
+   persists `pairing/clients.json` as v6. Once written, rc13 and older binaries
+   refuse it. There is no reverse migration: preserve the latest store and
+   roll forward; never lower the version, remove breaker fields or restore an
+   older pairing file to bypass restrictions. The existing generation-3 LDK
+   fence remains forward-only, including `ldk/INSTANCE`, recovery and move-home
+   journals. Do not delete or edit those markers to downgrade or resume.
+3. **Review and replace legacy grants deliberately (#290).** Persisted grants
+   without breaker fields load all four limits as `u64::MAX`; their original
+   budget, recipient caps and expiry remain in force, but upgrading alone
+   adds no finite burst protection and cannot reconstruct history. Explicitly
+   replace them with newly approved grants to gain breakers. Relation-envelope
+   renewal preserves grandfathered limits too; it is not replacement.
+   This is the **first node release with breakers**, required by the app's
+   separate AI pairing (#195). That app feature is not delivered by this node
+   release, and must not assume an old grant acquired the new defaults.
+4. **Account for the defaults and the fixed relation-grant breaker.** New
+   grants default to **10 attempts/minute, 60/hour, 5 consecutive failures and
+   1,000 sats/10 minutes**, using rolling windows. Console approval can choose
+   other positive limits with `--max-payments-per-minute`,
+   `--max-payments-per-hour`, `--max-consecutive-failures` and
+   `--max-sats-per-10-minutes`; zero is invalid. New device relation grants use
+   these fixed defaults, shared across all their recipient envelopes. A larger
+   envelope or per-act allowance does **not** raise the 1,000-sat/10-minute
+   ceiling, and the device intent has no breaker override. Envelope renewal
+   preserves history and pause. A live console grant must be revoked through
+   the console before a device can open a relation grant in its place.
+   Every positive charge counts, including fan-out members and additional
+   admission reservations. Velocity includes the fee ceiling and is not
+   refunded by failure or a lower final fee. Budget availability alone does
+   not guarantee another dispatch.
+5. **Handle refusals without blind retries.** HTTP 409 `budget_exceeded` adds
+   `rate_limit_minute`, `rate_limit_hour`, `velocity_limit`, `grant_paused` and
+   `failure_limit_pending`. Rolling limits expire with usage; the failure pause
+   stays latched across time, restart, refresh and renewal. Pending/unknown
+   payments occupy possible failure slots until resolved. Inspect
+   `konsensus pair-status`, owner socket status or `/api/v1/pair/grant` for
+   breaker limits, usage and pause. Only an independent owner-control session
+   may run `konsensus grant-reset-breakers --client-id <id> --op <grant-op-id>`.
+   A `--home` service does not provide that console authority: use the
+   [owner-console procedure](operations/home-node.md#enroll-your-first-owner-device)
+   with the service stopped and typed-password `--owner-control` startup.
+   Reset clears rolling history, the failure streak and pause, but preserves
+   spent budget, pending/unknown reservations, expiry, payee restrictions and
+   consumed payment IDs. It cannot make an uncertain payment safe to repeat.
+   No paired HTTP/device-intent reset exists. See
+   [the breaker contract](SPEND_BUDGET_GRANTS.md#circuit-breakers-n2).
+6. **Retain the backend and home setup policy.** Embedded LDK remains the Pi's
+   normal backend. CLN is an opt-in preview, not an LDK wallet migration: use
+   pinned HTTPS, the correct network and CLN >= v24.11, and a private mode-0600
+   rune file. #293 supports `getinfo` only. **After #297 is confirmed merged**,
+   receive/read additionally requires rune methods `invoice`, `listinvoices`,
+   `listpays`, `listpeerchannels` and `listfunds`; restart after rotating the
+   file. Even then outgoing payments/keysend refuse and money readiness is
+   false. CLN funds require CLN's own backups, not the BitSov seed.
+   The LAN page now limits per-IP requests, bodies to 2 KiB, header/body reads
+   to five seconds each and concurrent connections to 32 across listeners
+   (#292). Avoid aggressive polling; SAS approval, the 15-minute setup window
+   and three-cancel limit still apply. Retained enrollment and pins remain.
+7. **Restart and inspect.** Start the same home service, reconnect with the
+   existing pinned owner device and unlock. Check owner status, chain sync,
+   balances, channels, `channel_safety`, offline-safety diagnostics and grant
+   breaker views. An open/invalid recovery journal or host-binding refusal is
+   not an upgrade prompt to wipe state. For lost disks use the
+   [rc14 recovery procedure](#rc14-lost-disk-recovery-271) below; a healthy
+   hardware move uses [move-home](operations/move-home.md).
+
+### Test Pi: retained rc13 → rc14 upgrade
+
+This is an operator procedure, **not a completed Pi smoke test**. It assumes the
+rc13 home node is already enrolled and its funds/channels are retained. The
+older fresh-onboarding exercise below does not authorize wiping this node.
+For the dedicated-user system unit from the [home-node guide](operations/home-node.md#install-the-system-service),
+confirm `uname -m` is `aarch64`, the service uses `/usr/bin/konsensus` and the
+config is `/var/lib/bitsov/konsensus.toml`. If the Pi still uses a user unit or
+other paths, use that unit's actual account and paths; do not run both services.
+
+After downloading and independently verifying the **published** rc14 Linux
+aarch64 artifact and signed checksums, from its download directory:
+
+```sh
+uname -m
+systemctl cat bitsov.service
+chmod 0755 ./bitsov-linux-aarch64
+./bitsov-linux-aarch64 --version
+# Expect konsensus 0.3.0-rc14. Reconcile outstanding work before stopping.
+sudo systemctl stop bitsov.service
+systemctl is-active bitsov.service
+# Expect inactive; do not replace while a node process is still running.
+sudo install -o root -g root -m 0755 ./bitsov-linux-aarch64 /usr/bin/konsensus
+/usr/bin/konsensus --version
+sudo systemctl start bitsov.service
+systemctl status bitsov.service --no-pager
+sudo journalctl -u bitsov.service -n 100 --no-pager
+```
+
+Wait for LOCKED, reconnect using the existing owner device and pins, then
+unlock into UNLOCKED. Verify the checks in step 7, including the pairing v6
+upgrade and the distinction between legacy and new breaker limits. Review any
+legacy grants before using the app's AI pairing; a renewed old relation grant
+still has grandfathered limits. Use owner-console maintenance separately if
+revocation/replacement or a breaker reset is needed, then stop that console
+process before restarting the home service. Record the artifact checksum,
+version, status and smoke result with the release evidence. If startup refuses,
+retain the latest state, inspect the refusal and roll forward; do not reinstall
+rc13 against v6 or restore an old SD image. No recovery drill, fresh seed or
+CLN backend switch is part of this retained-node upgrade.
+
+## rc14: lost-disk recovery (#271)
 
 PRs #289 and #291 add the encrypted backup index and owner-console
-`konsensus recover` flow after the rc13 preparation baseline described below.
+`konsensus recover` flow; #295 documents it and adds read-only owner status.
 For a lost/wiped disk, follow [R1/R2](v2/RECOVERY.md#r1--lost-or-wiped-disk-original-hub-reachable):
 `konsensus restore --dir <empty-absolute-dir> --tier full` writes an open
 `ldk/recover.json`, then `konsensus recover --config <new-config>` previews
@@ -86,8 +205,8 @@ markers, or restore a directory snapshot to bypass them.
    challenge and the old process disabled. It cannot bypass journals or prove
    freshness. Follow the [hardware-move runbook](operations/home-node.md#owner-override-for-a-legitimate-hardware-move).
    The rc13 preparation baseline contained only the #282 recovery library.
-   Current main adds `konsensus recover`; follow the [current recovery
-   procedure](#current-main-lost-disk-recovery-271) for lost disks. For a healthy
+   rc14 adds `konsensus recover`; follow the [rc14 recovery
+   procedure](#rc14-lost-disk-recovery-271) for lost disks. For a healthy
    source use [move-home](operations/move-home.md).
 4. **Treat pairing schema v5 as forward-only (#278).** rc13 reads existing
    v2–v4 grant stores, but writes `pairing/clients.json` as v5; older nodes

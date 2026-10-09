@@ -5,30 +5,82 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
-### Added
+## [0.3.0-rc14] — 2026-10-09 (prep; not tagged yet)
 
-- Safe-restore docs/status (#271, PR5): document the shipped owner-console
-  `konsensus recover` R1/R2 flow, hub dependency, backup-as-index limits,
-  sweep consent and externally funded LSPS2/1-sat verification. Owner
-  `/api/v1/status` reports a sanitized, read-only recovery journal state;
-  public health and non-owner callers receive no recovery state.
+**Pre-release.** Not for production use. Includes the six PRs merged after
+`v0.3.0-rc13` (`d625e85`), through preparation tip `945eaf2`: #289–#293 and
+#295. The #297 entry below is prepared for its expected merge and remains
+**pending operator confirmation**; it is not in this preparation tree.
+The [signing checklist](docs/releases/v0.3.0-rc14.md) records the scope and
+merge gate. Upgrade steps, including the retained test Pi:
+[UPGRADING](docs/UPGRADING.md#rc13--rc14-procedure).
 
-- CLN backend preview: file-loaded restricted rune (mode 0600), pinned-CA HTTPS
-  without public roots, and `getinfo` checks for CLN >= v24.11 and the configured
-  network. Reports connectivity and node public key; money operations remain
-  disabled. Includes credential redaction, local rustls transport tests, and
-  [configuration documentation](docs/CLN.md).
 ### Security
 
-- Add owner-configurable spend-grant circuit breakers (N2): rolling minute/hour
-  payment rates, all-in 10-minute velocity, and a latched consecutive-failure
-  pause. Checks and history share the durable atomic reservation transaction;
-  unresolved outcomes retain failure capacity across crashes. Grant status
-  exposes limits and usage; only the owner console can reset breakers without
-  refunding budget or clearing dedupe. New defaults: 10/min, 60/hour, 5 failures,
-  1,000 sats/10 min. Store schema 6 preserves legacy grants' existing allowance
-  until replacement and prevents downgrade bypass. See
+- First release with spend-grant circuit breakers (#290; `f88f594`), required
+  by the app's separate AI pairing work (#195). New grants default to 10 payment
+  attempts per rolling minute, 60 per rolling hour, 5 consecutive failures and
+  1,000 sats per rolling 10 minutes. Velocity includes the full reservation and
+  fee ceiling; failed attempts do not refund rolling usage. History and limits
+  are persisted atomically before dispatch, and unresolved outcomes retain
+  possible failure slots across crashes. Failure pause is latched: time,
+  restart, token refresh and envelope renewal cannot clear it.
+- Breaker upgrade and authority boundaries (#290). Pairing file **v6 is
+  forward-only**; rc13 and older nodes refuse it. Existing v2–v5 grants without
+  breaker fields keep `u64::MAX` limits until explicitly replaced, including
+  relation grants whose envelopes are renewed. New relation grants use the
+  **fixed defaults above**, shared across their envelopes; a larger envelope
+  does not raise the 1,000-sat/10-minute breaker. Console grant approval can
+  choose other positive limits; zero is invalid. Only the owner console can
+  run `grant-reset-breakers --client-id <id> --op <grant-op-id>`; reset preserves
+  spent budget, pending reservations, expiry, payee restrictions and consumed
+  payment IDs. A device intent cannot replace a live console grant. See
   [spend grants](docs/SPEND_BUDGET_GRANTS.md#circuit-breakers-n2).
+- Bound LAN setup-page resource use (#292; `62d4d52`): shared per-IP read and
+  POST budgets, bounded source tracking, a 2 KiB request-body limit, absolute
+  five-second header/body read deadlines and a shared 32-connection cap across
+  LAN listeners. Existing SAS, box approval and setup-window rules still apply.
+
+### Node / Recovery
+
+- Encrypted backup index (#289; `bbf9e89`). Decrypt and parse SCB metadata in
+  memory with bounded framing and seed-derived v2 static-script checks. This
+  is a **read-only index**, never a manager/monitor import, current-balance
+  proof or permission to start old channel state.
+- Owner-console `konsensus recover` (#291; `6f4ba63`). Full-tier seed restore
+  into an empty directory writes an open recovery journal; normal startup
+  remains fenced. Offline preview does not start LDK or contact the chain.
+  Confirmed recovery requires a reachable original hub to close from its
+  state, typed console consent for closure and each sweep, confirmed receipts,
+  then an externally funded fresh LSPS2 channel and a settled 1-sat hub test.
+  Resume the same plan after interruption and retain the new verification
+  store. There is **no backup force-close fallback** for an unreachable hub;
+  seed-only scanning cannot prove every old channel closed. Embedded LDK only;
+  HTLCs and legacy non-v2 channel keys are outside the recovery scope.
+- Recovery runbook and owner status (#295; `945eaf2`). Document R1/R2, hub trust,
+  sweep consent and completion limits. Owner `GET /api/v1/status` exposes only
+  read-only `recovery.state` (`absent`, `open`, `done`, `unavailable`) for LDK;
+  public/non-owner callers receive no recovery state. Recovery maintenance
+  serves no API and has no paired-app restore control. See
+  [recovery](docs/v2/RECOVERY.md).
+
+### Lightning
+
+- CLN backend preview (#293; `168a271`): opt-in `backend = "cln"`, pinned-CA
+  HTTPS without public roots, a restricted rune read from a mode-0600 file,
+  and `getinfo` checks for CLN >= v24.11 and the configured network. This
+  merged slice provides connectivity and node identity only, with no money
+  operations. CLN owns its wallet and backups; the BitSov mnemonic does not
+  recover CLN funds. See [configuration](docs/CLN.md).
+- **Pending #297 merge/confirmation:** extend the CLN preview with invoice
+  creation, settlement lookup, payment history, channel listing and balances.
+  Outgoing invoice payments and keysend still refuse before dispatch;
+  **CLN cannot pay**, and payment capability / money readiness remain false.
+  Reading outgoing history does not enable sending. Use a restricted rune for
+  `getinfo`, `invoice`, `listinvoices`, `listpays`, `listpeerchannels` and
+  `listfunds`; rotate/restart if upgrading from the getinfo-only preview.
+  Channel management, on-chain sends, hold invoices and inbound keysend TLV
+  watching remain unsupported. Confirm the final merged scope before tagging.
 
 ## [0.3.0-rc13] — 2026-10-08 (prep; not tagged yet)
 
