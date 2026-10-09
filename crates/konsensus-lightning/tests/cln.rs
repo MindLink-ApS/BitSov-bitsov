@@ -337,6 +337,23 @@ fn hash() -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest([42; 32]))
 }
+fn bolt11() -> String {
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    lightning_invoice::InvoiceBuilder::new(lightning_invoice::Currency::Regtest)
+        .amount_milli_satoshis(1234)
+        .description("memo".into())
+        .payment_hash(hash().parse().unwrap())
+        .payment_secret(lightning_invoice::PaymentSecret([42; 32]))
+        .duration_since_epoch(std::time::Duration::from_secs(1700000000))
+        .expiry_time(std::time::Duration::from_secs(60))
+        .min_final_cltv_expiry_delta(18)
+        .build_signed(|message| {
+            Secp256k1::new()
+                .sign_ecdsa_recoverable(message, &SecretKey::from_slice(&[42; 32]).unwrap())
+        })
+        .unwrap()
+        .to_string()
+}
 fn incoming(status: &str) -> Value {
     json!({"label":"keysend-1700000000.1", "payment_hash":hash(), "status":status,
         "amount_msat":1000, "amount_received_msat":2500, "payment_preimage":hex::encode([42;32]),
@@ -380,6 +397,28 @@ async fn t3_invoice_statuses_use_received_amount_and_invoice_precedence() {
         .iter()
         .skip(1)
         .all(|(path, body)| path == "/v1/listinvoices" && *body == json!({"payment_hash":hash()})));
+}
+
+#[tokio::test]
+async fn amountless_invoices_use_received_amount_only_when_paid() {
+    let (server, _dir, provider) = read_provider().await;
+    for (state, status, amount) in [
+        ("paid", PaymentStatus::Settled, 2500),
+        ("unpaid", PaymentStatus::Pending, 0),
+        ("expired", PaymentStatus::Expired, 0),
+    ] {
+        let mut row = incoming(state);
+        row["amount_msat"] = json!("any");
+        server.route("listinvoices", json!({"invoices":[row]}));
+        let details = provider.get_payment_status(&hash()).await.unwrap();
+        assert_eq!(details.status, status);
+        assert_eq!(details.amount_msat, amount);
+        assert_eq!(details.direction, PaymentDirection::Incoming);
+        assert_eq!(
+            details.preimage,
+            (state == "paid").then(|| hex::encode([42; 32]))
+        );
+    }
 }
 
 #[tokio::test]
@@ -440,6 +479,10 @@ async fn malformed_settlement_and_rpc_errors_fail_closed_without_secret_echo() {
         ("status", json!("unknown")),
         ("amount_received_msat", json!(-1)),
         ("amount_received_msat", json!("oops")),
+        ("amount_received_msat", json!("any")),
+        ("amount_msat", json!("ANY")),
+        ("amount_msat", json!("oops")),
+        ("amount_msat", json!({"any":null})),
     ] {
         let mut row = incoming("paid");
         row[field] = value;
@@ -474,11 +517,11 @@ async fn creates_invoice_with_unique_labels_and_backend_expiry() {
     let (server, _dir, provider) = read_provider().await;
     server.route(
         "invoice",
-        json!({"bolt11":"lnbcrt-test", "payment_hash":hash(), "expires_at":1700000060}),
+        json!({"bolt11":bolt11(), "payment_hash":hash().to_uppercase(), "expires_at":1700000060}),
     );
     for _ in 0..2 {
         let invoice = provider.create_invoice(1234, "memo", 60).await.unwrap();
-        assert_eq!(invoice.bolt11, "lnbcrt-test");
+        assert_eq!(invoice.bolt11, bolt11());
         assert_eq!(invoice.payment_hash, hash());
         assert_eq!(invoice.created_at, 1700000000);
         assert_eq!(invoice.expiry_secs, 60);
@@ -501,9 +544,32 @@ async fn creates_invoice_with_unique_labels_and_backend_expiry() {
     }
     server.route(
         "invoice",
-        json!({"bolt11":"invoice", "payment_hash":hash(),"expires_at":1}),
+        json!({"bolt11":bolt11(), "payment_hash":hash(),"expires_at":1}),
     );
     assert!(provider.create_invoice(1234, "memo", 60).await.is_err());
+}
+
+#[tokio::test]
+async fn create_invoice_rejects_mismatched_bolt11_payment_hash() {
+    let (server, _dir, provider) = read_provider().await;
+    server.route(
+        "invoice",
+        json!({"bolt11":bolt11(), "payment_hash":"11".repeat(32), "expires_at":1700000060}),
+    );
+    assert!(provider.create_invoice(1234, "memo", 60).await.is_err());
+}
+
+#[tokio::test]
+async fn create_invoice_rejects_invalid_bolt11_without_secret_echo() {
+    let (server, _dir, provider) = read_provider().await;
+    for invalid in ["", "lnbcrt-test", RUNE] {
+        server.route(
+            "invoice",
+            json!({"bolt11":invalid, "payment_hash":hash(), "expires_at":1700000060}),
+        );
+        let err = provider.create_invoice(1234, "memo", 60).await.unwrap_err();
+        assert!(!format!("{err:?}").contains(RUNE));
+    }
 }
 
 fn channel(state: &str, connected: bool) -> Value {
@@ -647,7 +713,7 @@ async fn t6_keysend_gate_accepts_real_settlement_rejects_forgery_and_underpaymen
         envelope
     };
     let mut row = incoming("paid");
-    row.as_object_mut().unwrap().remove("amount_msat"); // CLN keysend amount=any
+    row["amount_msat"] = json!("any");
     server.route("listinvoices", json!({"invoices":[row.clone()]}));
     let valid = envelope([42; 32], 2000);
     assert!(gate
@@ -699,6 +765,61 @@ async fn t6_keysend_gate_accepts_real_settlement_rejects_forgery_and_underpaymen
             .await,
         Err(GateRejection::PaymentSettlementMismatch(_))
     ));
+}
+
+#[tokio::test]
+async fn gate_refuses_unpaid_and_expired_invoices() {
+    use konsensus_core::{
+        gate::{GateConfig, GateRejection, PaymentGate},
+        identity::NodeIdentity,
+        kind::KIND_CHAT,
+        types::{NodeId, PaymentProof, Recipient, Signature},
+        UkmEnvelopeBuilder,
+    };
+    let (server, _dir, provider) = read_provider().await;
+    let identity = NodeIdentity::from_mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "").unwrap();
+    let recipient = NodeId::from_bytes([2; 32]);
+    let gate = PaymentGate::with_config(GateConfig {
+        verify_lightning_settlement: true,
+        ..Default::default()
+    });
+    let mut envelope = UkmEnvelopeBuilder::new(
+        KIND_CHAT,
+        *identity.node_id(),
+        Recipient::Node(recipient),
+        b"encrypted".to_vec(),
+        PaymentProof::new(
+            hex::decode(hash()).unwrap().try_into().unwrap(),
+            [42; 32],
+            2000,
+        ),
+    )
+    .build();
+    envelope.signature = Signature::from_ed25519(&identity.sign(&envelope.signable_bytes()));
+    for state in ["unpaid", "expired"] {
+        for amount in [json!(2500), json!("any")] {
+            let mut row = incoming(state);
+            row["amount_msat"] = amount;
+            // Even a valid preimage and sufficient received amount must not
+            // override the backend's unsettled status.
+            server.route("listinvoices", json!({"invoices":[row]}));
+            assert!(
+                matches!(
+                    gate.validate_paid_envelope(
+                        &envelope,
+                        &Price,
+                        None,
+                        Some(&provider),
+                        0.0,
+                        Some(&recipient)
+                    )
+                    .await,
+                    Err(GateRejection::PaymentNotSettled(_))
+                ),
+                "{state}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

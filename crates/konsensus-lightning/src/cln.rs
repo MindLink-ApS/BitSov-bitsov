@@ -194,6 +194,24 @@ impl<'de> Deserialize<'de> for Msat {
         }
     }
 }
+// Only an invoice's requested amount can be "any" (notably for keysend).
+// It means no fixed amount; received amounts and all other msat stay numeric.
+fn deserialize_invoice_amount<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Msat>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        Fixed(Msat),
+        Text(String),
+    }
+    match Option::<Wire>::deserialize(deserializer)? {
+        Some(Wire::Fixed(amount)) => Ok(Some(amount)),
+        Some(Wire::Text(text)) if text == "any" => Ok(None),
+        None => Ok(None),
+        _ => Err(serde::de::Error::custom("invalid CLN invoice amount")),
+    }
+}
 fn required<T>(value: Option<T>) -> Result<T, LightningError> {
     value.ok_or_else(|| error("CLN response is missing a required field"))
 }
@@ -242,6 +260,7 @@ struct Invoices {
 struct ClnInvoice {
     payment_hash: String,
     status: String,
+    #[serde(default, deserialize_with = "deserialize_invoice_amount")]
     amount_msat: Option<Msat>,
     amount_received_msat: Option<Msat>,
     payment_preimage: Option<String>,
@@ -593,8 +612,12 @@ impl LightningProvider for ClnProvider {
             )
             .await?;
         let payment_hash = hex32(&response.payment_hash)?;
-        if response.bolt11.is_empty() {
-            return Err(error("CLN invoice is missing BOLT11"));
+        let bolt11 = response
+            .bolt11
+            .parse::<lightning_invoice::Bolt11Invoice>()
+            .map_err(|_| error("CLN invoice BOLT11 is invalid"))?;
+        if bolt11.payment_hash().to_string() != payment_hash {
+            return Err(error("CLN invoice BOLT11 payment hash does not match"));
         }
         Ok(Invoice {
             bolt11: response.bolt11,
