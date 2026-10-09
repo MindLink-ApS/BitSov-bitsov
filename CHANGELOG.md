@@ -5,6 +5,13 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+### Added
+
+- CLN backend preview: file-loaded restricted rune (mode 0600), pinned-CA HTTPS
+  without public roots, and `getinfo` checks for CLN >= v24.11 and the configured
+  network. Reports connectivity and node public key; money operations remain
+  disabled. Includes credential redaction, local rustls transport tests, and
+  [configuration documentation](docs/CLN.md).
 ### Security
 
 - Add owner-configurable spend-grant circuit breakers (N2): rolling minute/hour

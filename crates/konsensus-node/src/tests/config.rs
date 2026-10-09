@@ -3503,3 +3503,75 @@ fn ldk_debug_redacts_token_and_keeps_channel_safety_config() {
         }
     }
 }
+
+#[test]
+fn cln_config_preview_and_guards() {
+    let text = r#"backend = "cln"
+rest_url = "https://localhost:2107"
+ca_cert_path = "/cln/ca.pem"
+rune_file = "/secrets/bitsov.rune"
+network = "regtest"
+"#;
+    let lightning: LightningConfig = toml::from_str(text).unwrap();
+    assert_eq!(lightning.backend_name(), "cln");
+    assert_eq!(lightning.bitcoin_network().as_deref(), Some("regtest"));
+    assert!(toml::from_str::<LightningConfig>(&format!("{text}rune = 'inline-secret'\n")).is_err());
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.peers.clear();
+    config.lightning = lightning;
+    config.payment_gate.verify_lightning_settlement = None;
+    assert!(
+        config
+            .payment_gate_runtime_config()
+            .verify_lightning_settlement
+    );
+    config.validate_routing_fee_backend().unwrap();
+    config.validate().unwrap();
+    config.payment_gate.verify_lightning_settlement = Some(false);
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("verify_lightning_settlement"));
+}
+
+#[test]
+fn cln_config_tower_and_debug_guards() {
+    let text = r#"backend = "cln"
+rest_url = "https://user:DO_NOT_LOG@localhost/?rune=DO_NOT_LOG#DO_NOT_LOG"
+ca_cert_path = "/cln/ca.pem"
+rune_file = "/secrets/bitsov.rune"
+network = "regtest"
+minimum_version = "v26.06"
+"#;
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    config.lightning = toml::from_str(text).unwrap();
+    for debug in [
+        format!("{:?}", config.lightning),
+        format!("{:#?}", config.lightning),
+        format!("{config:?}"),
+        format!("{config:#?}"),
+    ] {
+        assert!(!debug.contains("DO_NOT_LOG"));
+    }
+    config.tower.clients.insert(
+        "friend".into(),
+        konsensus_lightning::tower::TowerEndpoint {
+            node_id: "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5".into(),
+            endpoint: "guard.example:9736".into(),
+        },
+    );
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("embedded LDK"));
+}

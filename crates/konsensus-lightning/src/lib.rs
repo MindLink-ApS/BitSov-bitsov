@@ -4,12 +4,14 @@
 //! - **LNbits** — HTTP REST API (fastest path to payment gate)
 //! - **LND** — direct REST API to LND daemon (Full tier, no LNbits middleman)
 //! - **LDK** — embedded sovereign Lightning node (no external daemon)
+//! - **CLN (preview)** — pinned HTTPS connectivity/status only; no payments
 //! - **Mock** — in-memory provider for testing
 
 #![forbid(unsafe_code)]
 
 mod balance;
 pub mod circuit_breaker;
+pub mod cln;
 pub mod move_home;
 mod onchain;
 pub mod recover;
@@ -32,6 +34,7 @@ pub mod shared_mock;
 mod lnbits_tests;
 
 pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerLightning};
+pub use cln::{ClnConfig, ClnProvider};
 pub use ldk::{
     esplora_tx_visible, probe_esplora_fee_estimates, select_esplora_endpoint, LdkConfig,
     LdkProvider,

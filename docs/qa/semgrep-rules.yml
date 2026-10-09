@@ -219,6 +219,41 @@ rules:
         - "**/*mock*.rs"
         - "**/benches/**"
 
+  - id: bitsov-cln-insecure-tls
+    languages: [rust]
+    severity: ERROR
+    message: CLN must use HTTPS and only the configured CA; never bypass certificate/hostname checks or enable public roots.
+    pattern-either:
+      - pattern: $C.danger_accept_invalid_certs(true)
+      - pattern: $C.danger_accept_invalid_hostnames(true)
+      - pattern: $C.tls_built_in_root_certs(true)
+      - pattern: $C.tls_built_in_webpki_certs(true)
+      - pattern: $C.tls_built_in_native_certs(true)
+      - pattern: $C.https_only(false)
+    paths:
+      include: ["**/cln.rs"]
+      exclude: ["docs/qa/semgrep-tests/**"]
+
+  - id: bitsov-cln-rune-debug
+    paths:
+      exclude: ["docs/qa/semgrep-tests/**"]
+    languages: [generic]
+    severity: ERROR
+    message: Rune holders need a handwritten redacting Debug implementation; do not derive Debug.
+    pattern-regex: '(?s)#\[derive\([^\]]*\bDebug\b[^\]]*\)\]\s*(?:pub\s+)?struct\s+\w+\s*\{[^}]*\brune\s*:'
+
+  - id: bitsov-cln-rune-exposure
+    languages: [generic]
+    severity: ERROR
+    message: Never interpolate the rune into logs, errors, URLs, JSON, query parameters or command arguments. Use only the sensitive Rune header.
+    pattern-either:
+      - pattern-regex: '\b(?:info|debug|warn|error|trace)!\s*\([^;\n]*\brune\s*='
+      - pattern-regex: '\b(?:info|debug|warn|error|trace|format)!\s*\("[^"\n]*\{(?:self\.)?rune[:}]'
+      - pattern-regex: '\b(?:info|debug|warn|error|trace|format)!\s*\("[^"\n]*"\s*,[^;\n]*\b(?:self\.)?rune\b'
+      - pattern-regex: '\.(?:arg|args|query|json)\([^;\n]*\b(?:self\.)?rune\b'
+    paths:
+      include: ["**/cln.rs"]
+      exclude: ["docs/qa/semgrep-tests/**"]
   - id: bitsov-grant-reserve-must-check-breakers
     languages: [rust]
     severity: ERROR
