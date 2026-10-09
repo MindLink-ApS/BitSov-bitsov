@@ -17,9 +17,13 @@ also live on the corresponding GitHub pre-release pages.
   without public roots, and `getinfo` checks for CLN >= v24.11 and the configured
   network. Supports invoices, incoming settlement verification (including keysend
   receipts and overpayment), balances, channels and merged payment history.
-  Outgoing payments/keysend still refuse before dispatch. Includes mocked REST
-  status and payment-gate tests, credential redaction, local rustls transport
-  tests, and [configuration documentation](docs/CLN.md).
+  Adds fee-capped `xpay` and `xkeysend`/`keysend`, startup command discovery,
+  local invoice validation, fresh-hash protection, ambiguous POST handling and a
+  sticky overspend shutdown. Caller limits can only tighten routing policy.
+  Existing preview runes must add `help` and payment methods. Includes mocked
+  TLS money-path/status/payment-gate tests, credential redaction, Semgrep guards
+  and [configuration documentation](docs/CLN.md). Real CLN regtest settlement,
+  high-fee refusal and rune enforcement remain unverified (harness is LDK-only).
 ### Security
 
 - Add owner-configurable spend-grant circuit breakers (N2): rolling minute/hour

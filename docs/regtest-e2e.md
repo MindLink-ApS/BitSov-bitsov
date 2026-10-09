@@ -249,3 +249,25 @@ The production [hub LSPS2 regression](three-node-paid-e2e.md#hub-lsps2-provider)
 now exercises actual JIT service/client negotiation, overprovisioning and
 stateless admission with a configured positive forwarding tariff. It is separate
 from the legacy routing-only service fixture and the #225 opt-in control above.
+
+## CLN coverage gap
+
+The current runner and `regtest_e2e` topology construct LDK nodes only. They do
+not provision `lightningd`, clnrest TLS, restricted runes or a CLN-to-LDK channel.
+CLN backend PR3 could not run a real-node test: this environment also has neither
+`lightningd` nor Docker installed. No mocked test is evidence of real CLN HTLC
+settlement or rune enforcement.
+
+Pending real-node coverage, on CLN v24.11 and v26.06:
+
+- T7: CLN sends a fee-capped keysend to LDK; the paid-message gate admits it and
+  a paid reply settles in the reverse direction.
+- T8: Route through a high-fee hop above the configured ceiling. Verify `xpay`
+  refuses, no recipient invoice settles, no HTLC remains, and no funds are debited.
+- T9: Using the restricted BitSov rune, submit `xpay` without `maxfee`, with an
+  over-limit numeric `maxfee`, and `withdraw`; all must refuse. Repeat fee checks
+  for the selected keysend method and verify an allowed capped payment succeeds.
+
+The TLS mocks in `cln_fee_limits.rs` cover the client request/error contract for
+these cases. Implementing CLN lifecycle/topology support is required before this
+runner can claim real-node coverage. See [CLN configuration](CLN.md).

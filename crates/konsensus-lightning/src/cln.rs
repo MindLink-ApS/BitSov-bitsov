@@ -1,11 +1,12 @@
-//! Core Lightning clnrest receive/read preview. Outgoing payments remain disabled.
+//! Core Lightning clnrest backend with absolute routing-fee ceilings.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     fs::File,
     io::Read,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -61,6 +62,9 @@ pub struct ClnProvider {
     network: String,
     minimum_version: (u32, u32, u32),
     routing_fee_policy: RoutingFeePolicy,
+    invoice_attempts: tokio::sync::Mutex<HashSet<String>>,
+    payment_capable: AtomicBool,
+    keysend_method: Option<&'static str>,
 }
 impl fmt::Debug for ClnProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -68,7 +72,10 @@ impl fmt::Debug for ClnProvider {
             .field("rune", &"<redacted>")
             .field("network", &self.network)
             .field("minimum_version", &self.minimum_version)
-            .field("payment_capable", &false)
+            .field(
+                "payment_capable",
+                &self.payment_capable.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -169,6 +176,34 @@ struct GetInfo {
     id: String,
     version: String,
     network: String,
+    warning_bitcoind_sync: Option<String>,
+    warning_lightningd_sync: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Help {
+    help: Vec<HelpCommand>,
+}
+#[derive(Deserialize)]
+struct HelpCommand {
+    command: String,
+}
+impl Help {
+    fn contains(&self, method: &str) -> bool {
+        self.help
+            .iter()
+            .any(|entry| entry.command.split_whitespace().next() == Some(method))
+    }
+}
+
+// xpay/xkeysend do not return payment_hash or status; keysend does.
+#[derive(Deserialize)]
+struct Paid {
+    payment_preimage: String,
+    payment_hash: Option<String>,
+    amount_msat: Msat,
+    amount_sent_msat: Msat,
+    status: Option<String>,
 }
 
 // CLN uses integer msat in modern replies; accept its legacy "123msat" form
@@ -442,16 +477,102 @@ impl ClnProvider {
             .build()
             .map_err(|_| error("CLN HTTPS client initialization failed"))?;
         endpoint.set_path("/v1/getinfo");
-        let provider = Self {
+        let mut provider = Self {
             client,
             endpoint,
             rune,
             network: config.network,
             minimum_version,
             routing_fee_policy: RoutingFeePolicy::default(),
+            invoice_attempts: tokio::sync::Mutex::new(HashSet::new()),
+            payment_capable: AtomicBool::new(true),
+            keysend_method: None,
         };
-        provider.getinfo().await?;
+        let info = provider.getinfo().await?;
+        let help: Help = provider
+            .rpc("help", json!({}))
+            .await
+            .map_err(|_| error("not_supported: cannot discover CLN xpay; rune must allow help"))?;
+        if !help.contains("xpay") {
+            return Err(error(
+                "not_supported: CLN requires >= v24.11 with xpay to cap routing fees",
+            ));
+        }
+        provider.keysend_method = if release_version(&info.version).is_some_and(|v| v >= (26, 6, 0))
+            && help.contains("xkeysend")
+        {
+            Some("xkeysend")
+        } else if help.contains("keysend") {
+            Some("keysend")
+        } else {
+            None
+        };
         Ok(provider)
+    }
+
+    /// A health probe must never clear the overspend latch.
+    async fn require_payment_capable(&self) -> Result<(), LightningError> {
+        if !self.is_payment_capable().await {
+            return Err(LightningError::PaymentNotDispatched(
+                "CLN payments disabled or node not synchronized".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn payment_result(
+        &self,
+        paid: Paid,
+        expected_hash: Option<&str>,
+        amount: u64,
+        max_fee: u64,
+        memo: Option<&str>,
+    ) -> Result<PaymentDetails, LightningError> {
+        use sha2::{Digest, Sha256};
+        let fee = paid
+            .amount_sent_msat
+            .0
+            .checked_sub(paid.amount_msat.0)
+            .ok_or_else(|| error("CLN payment amounts are inconsistent"))?;
+        if fee > max_fee {
+            // Already paid: report the actual settlement for reconciliation.
+            // Never log a reply, invoice or preimage, and never re-enable on success.
+            self.payment_capable.store(false, Ordering::Relaxed);
+            tracing::error!(
+                fee_msat = fee,
+                max_fee_msat = max_fee,
+                "CLN exceeded routing fee ceiling; outgoing payments disabled until restart"
+            );
+        }
+        if paid.amount_msat.0 != amount || paid.status.as_deref().is_some_and(|s| s != "complete") {
+            return Err(error(
+                "CLN payment result does not match requested settlement",
+            ));
+        }
+        let preimage = hex32(&paid.payment_preimage)?;
+        let hash = hex::encode(Sha256::digest(
+            hex::decode(&preimage).map_err(|_| error("CLN payment preimage is invalid"))?,
+        ));
+        if expected_hash.is_some_and(|expected| expected != hash)
+            || paid
+                .payment_hash
+                .as_deref()
+                .map(hex32)
+                .transpose()?
+                .is_some_and(|echoed| echoed != hash)
+        {
+            return Err(error("CLN payment preimage does not match payment hash"));
+        }
+        Ok(PaymentDetails {
+            payment_hash: hash,
+            preimage: Some(preimage),
+            amount_msat: amount,
+            status: PaymentStatus::Settled,
+            direction: PaymentDirection::Outgoing,
+            timestamp: chrono::Utc::now().timestamp().max(0) as u64,
+            memo: memo.map(str::to_owned),
+            fee_msat: Some(fee),
+        })
     }
 
     async fn outgoing_status(&self, hash: &str) -> Result<PaymentDetails, LightningError> {
@@ -540,7 +661,9 @@ impl ClnProvider {
         let mut endpoint = self.endpoint.clone();
         endpoint.set_path(&format!("/v1/{method}"));
         // Never propagate reqwest/serde errors or backend response bodies: the
-        // remote server can echo the credential into any of them.
+        // remote server can echo the credential into any of them. After POST,
+        // all transport/status/decode errors are ambiguous Backend errors, never
+        // PaymentNotDispatched: CLN may have already sent or settled HTLCs.
         let mut response = self
             .client
             .post(endpoint)
@@ -631,10 +754,113 @@ impl LightningProvider for ClnProvider {
                 .ok_or_else(|| error("CLN invoice expiry is invalid"))?,
         })
     }
-    async fn pay_invoice(&self, _bolt11: &str) -> Result<PaymentDetails, LightningError> {
-        Err(LightningError::PaymentNotDispatched(
-            "not_supported: CLN preview payments".into(),
-        ))
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentDetails, LightningError> {
+        // The capped path applies policy even when callers request no tighter limit.
+        self.pay_invoice_with_fee_limit(bolt11, u64::MAX).await
+    }
+    async fn pay_invoice_with_fee_limit(
+        &self,
+        bolt11: &str,
+        max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
+        let invoice: lightning_invoice::Bolt11Invoice = bolt11
+            .parse()
+            .map_err(|_| LightningError::InvalidBolt11("invalid BOLT11 invoice".into()))?;
+        let amount = invoice
+            .amount_milli_satoshis()
+            .ok_or_else(|| LightningError::PaymentNotDispatched("amountless invoice".into()))?;
+        let max_fee = self.routing_fee_policy.ceiling(amount, Some(max_fee_msat));
+        let hash = invoice.payment_hash().to_string();
+        self.require_payment_capable().await?;
+        let mut attempts = self.invoice_attempts.lock().await;
+        if attempts.contains(&hash) {
+            return Err(LightningError::PaymentNotDispatched(
+                "capped payments require a fresh invoice hash".into(),
+            ));
+        }
+        // Existence alone is sufficient: even failed attempts forbid a retry.
+        // Do not require unrelated fields of a historical payment to deserialize.
+        #[derive(Deserialize)]
+        struct ExistingPays {
+            pays: Vec<serde_json::Value>,
+        }
+        let existing: ExistingPays = self
+            .rpc("listpays", json!({"payment_hash":hash}))
+            .await
+            .map_err(|_| {
+                LightningError::PaymentNotDispatched("cannot verify fresh CLN invoice hash".into())
+            })?;
+        if !existing.pays.is_empty() {
+            return Err(LightningError::PaymentNotDispatched(
+                "capped payments require a fresh invoice hash".into(),
+            ));
+        }
+        // Another in-flight payment could have tripped the latch during the read.
+        if !self.payment_capable.load(Ordering::Relaxed) {
+            return Err(LightningError::PaymentNotDispatched(
+                "CLN payments disabled".into(),
+            ));
+        }
+        // Reserve BEFORE POST, including cancellation and ambiguous outcomes.
+        attempts.insert(hash.clone());
+        drop(attempts);
+        let paid = self
+            .rpc(
+                "xpay",
+                json!({
+                    "invstring":bolt11, "maxfee":max_fee, "retry_for":60,
+                }),
+            )
+            .await?;
+        self.payment_result(paid, Some(&hash), amount, max_fee, None)
+    }
+    async fn keysend(
+        &self,
+        dest_pubkey: &str,
+        amount_msat: u64,
+        memo: Option<&str>,
+    ) -> Result<PaymentDetails, LightningError> {
+        self.keysend_with_fee_limit(dest_pubkey, amount_msat, memo, u64::MAX)
+            .await
+    }
+    async fn keysend_with_fee_limit(
+        &self,
+        dest_pubkey: &str,
+        amount_msat: u64,
+        memo: Option<&str>,
+        max_fee_msat: u64,
+    ) -> Result<PaymentDetails, LightningError> {
+        if amount_msat == 0
+            || dest_pubkey.len() != 66
+            || dest_pubkey
+                .parse::<bitcoin::secp256k1::PublicKey>()
+                .is_err()
+        {
+            return Err(LightningError::PaymentNotDispatched(
+                "invalid CLN keysend destination or amount".into(),
+            ));
+        }
+        let method = self.keysend_method.ok_or_else(|| {
+            LightningError::PaymentNotDispatched(
+                "not_supported: CLN has no fee-capped keysend command".into(),
+            )
+        })?;
+        let max_fee = self
+            .routing_fee_policy
+            .ceiling(amount_msat, Some(max_fee_msat));
+        self.require_payment_capable().await?;
+        // CLN generates the preimage. Never retry/fallback after POST: a second
+        // keysend would use a new hash and could pay twice. Memo is local only.
+        let paid = self
+            .rpc(
+                method,
+                json!({
+                    "destination":dest_pubkey, "amount_msat":amount_msat,
+                    "maxfee":max_fee, "retry_for":60,
+                }),
+            )
+            .await?;
+        self.payment_result(paid, None, amount_msat, max_fee, memo)
     }
     async fn get_payment_status(
         &self,
@@ -722,10 +948,17 @@ impl LightningProvider for ClnProvider {
         self.getinfo().await.ok().map(|info| info.id)
     }
     async fn is_payment_capable(&self) -> bool {
-        false
+        if !self.payment_capable.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.getinfo().await.is_ok_and(|info| {
+            info.warning_bitcoind_sync.is_none()
+                && info.warning_lightningd_sync.is_none()
+                && self.payment_capable.load(Ordering::Relaxed)
+        })
     }
     async fn money_ready(&self) -> bool {
-        false
+        self.is_payment_capable().await
     }
 }
 
