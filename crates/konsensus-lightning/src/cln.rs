@@ -673,7 +673,11 @@ impl ClnProvider {
             .await
             .map_err(|_| error("CLN HTTPS request failed"))?;
         if response.status() != reqwest::StatusCode::OK {
-            return Err(error("CLN RPC returned non-200 status"));
+            // Only the numeric status: the body may echo the credential.
+            return Err(LightningError::Backend(format!(
+                "CLN RPC returned non-200 status {}",
+                response.status().as_u16()
+            )));
         }
         // Invoice pages contain BOLT strings and descriptions; getinfo's small
         // PR1 bound is unsuitable for history, funds and channel snapshots.
