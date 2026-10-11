@@ -19,14 +19,14 @@ use crate::pairing::{PairingError, PairingService, RelationIntent};
 use crate::spend_budget::GrantView;
 use crate::state::AppState;
 
-fn service(state: &AppState) -> Result<&Arc<PairingService>, ApiError> {
+pub(super) fn service(state: &AppState) -> Result<&Arc<PairingService>, ApiError> {
     state
         .pairing
         .as_ref()
         .ok_or_else(|| ApiError::Internal("pairing is not configured on this node".into()))
 }
 
-fn binding(auth: &ScopedAuth<Read>) -> Result<&PairingBinding, ApiError> {
+pub(super) fn binding(auth: &ScopedAuth<Read>) -> Result<&PairingBinding, ApiError> {
     auth.pairing.as_ref().ok_or_else(|| {
         ApiError::Forbidden("device keys belong to a paired client — pair first".into())
     })
@@ -34,7 +34,7 @@ fn binding(auth: &ScopedAuth<Read>) -> Result<&PairingBinding, ApiError> {
 
 /// A signature problem is a refusal of this request, not of the caller's
 /// token: never a 401 that would send the app back to pairing.
-fn map_err(e: PairingError) -> ApiError {
+pub(super) fn map_err(e: PairingError) -> ApiError {
     match e {
         PairingError::DeviceApprovalsDisabled(reason) => {
             ApiError::Forbidden(e.to_string()).with_reason(reason)

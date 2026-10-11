@@ -396,10 +396,13 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         for path in [
             "/api/v1/pair/device-key",
             "/api/v1/pair/device-key/op/delegate",
+            "/api/v1/pair/ticket",
         ] {
             assert_eq!(tunnel.post(path, json!({})).await.0, 404, "locked {path}");
         }
         for (method, path) in [
+            ("GET", "/api/v1/pair/ticket?approver_key_id=key"),
+            ("GET", "/api/v1/pair/device-key/pending?approver_key_id=key"),
             ("GET", "/api/v1/pair/device-keys"),
             ("GET", "/api/v1/pair/device-key/op"),
             ("DELETE", "/api/v1/pair/device-key/op"),
@@ -465,14 +468,13 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
             .unwrap();
         let token:Value=http.post(format!("http://{}/api/v1/pair/token",f.api)).json(&json!({"client_id":f.record.client_id,"challenge":challenge["challenge"],"signature":hex::encode(f.client.sign(challenge["challenge"].as_str().unwrap().as_bytes()).to_bytes())})).send().await.unwrap().json().await.unwrap();
         let token = token["token"].as_str().unwrap();
-        // Enrollment requests are available while unlocked; authority writes
-        // (including delegation) remain absent even with a paired token.
+        // Enrollment is available while unlocked. Owner-device capabilities
+        // require local-owner mode; console authority writes remain absent.
         let (mut unlocked_tunnel, auth) =
             Tunnel::connect_pinned(&f, f.identity.x25519_public().as_bytes(), json!({"v": 1}))
                 .await;
         assert_eq!(auth["status"], "ok");
         for path in [
-            "/api/v1/pair/device-key/op/delegate",
             "/api/v1/pair/relation-intent",
             "/api/v1/pair/first-contact-grant",
             "/api/v1/identity/replacement-request",
@@ -485,6 +487,46 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
                 404,
                 "unlocked {path}"
             );
+        }
+        let (status, _) = unlocked_tunnel
+            .post_with_token(
+                "/api/v1/pair/device-key/op/delegate",
+                json!({"approver_key_id":f.record.key_id,"signature":"00"}),
+                Some(token),
+            )
+            .await;
+        assert_eq!(status, if local { 404 } else { 403 });
+        let (status, challenge) = unlocked_tunnel
+            .request(
+                "GET",
+                &format!("/api/v1/pair/ticket?approver_key_id={}", f.record.key_id),
+                json!({}),
+                Some(token),
+            )
+            .await;
+        assert_eq!(status, if local { 200 } else { 403 });
+        if local {
+            let message = challenge["message"].as_str().unwrap();
+            assert_eq!(
+                message,
+                format!(
+                    "bitsov-ticket-v1\nnode:{}\nnonce:{}",
+                    pairing::identity_fingerprint(&f.identity.node_id().to_hex()),
+                    challenge["nonce"].as_str().unwrap()
+                )
+            );
+            let signature = hex::encode(
+                f.device
+                    .sign(&ring::rand::SystemRandom::new(), message.as_bytes())
+                    .unwrap()
+                    .as_ref(),
+            );
+            let (status, result) = unlocked_tunnel.post_with_token("/api/v1/pair/ticket", json!({"approver_key_id":f.record.key_id,"nonce":challenge["nonce"],"signature":signature}),Some(token)).await;
+            assert_eq!(status, 200, "{result}");
+            let link = wire::PairLink::from_uri(result["uri"].as_str().unwrap()).unwrap();
+            link.verify_endpoints(&f.identity.node_id().to_hex())
+                .unwrap();
+            assert!(!logs(&log).contains(&link.code));
         }
         let (status, keys) = unlocked_tunnel
             .request("GET", "/api/v1/pair/device-keys", json!({}), Some(token))

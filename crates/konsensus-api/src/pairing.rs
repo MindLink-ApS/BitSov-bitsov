@@ -58,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{self, Scope, TokenError};
 
 pub mod device;
+pub mod ticket;
 use crate::spend_budget::{
     BudgetRefusal, Charge, GrantBudget, GrantTerms, GrantView, Reservation,
     MAX_SPEND_GRANT_TTL_SECS,
@@ -650,6 +651,7 @@ struct Inner {
     // Wrong grant confirmations in this run (see `OWNER_CODE_FAILURES_PER_RUN`).
     owner_code_failures: u32,
     sas_failures: u8,
+    owner_tickets: ticket::OwnerTickets,
     // Requests cancelled by wrong codes in this run, so their status reads
     // `lost` (their durable records are deleted, so a restart cannot revive them).
     cancelled_ops: std::collections::HashMap<String, String>,
@@ -881,6 +883,7 @@ impl PairingService {
                 owner_confirmations: HashMap::new(),
                 owner_code_failures: 0,
                 sas_failures: 0,
+                owner_tickets: ticket::OwnerTickets::default(),
                 cancelled_ops: std::collections::HashMap::new(),
                 first_contact: HashMap::new(),
             }),
@@ -1650,15 +1653,32 @@ impl PairingService {
         remote_transport_pubkey: &[u8; 32],
         require_window: bool,
     ) -> Result<PairedClient, PairingError> {
+        let mut inner = self.lock();
+        self.create_remote_pairing_locked(
+            &mut inner,
+            name,
+            client_pubkey_hex,
+            remote_transport_pubkey,
+            require_window,
+        )
+    }
+
+    fn create_remote_pairing_locked(
+        &self,
+        inner: &mut Inner,
+        name: &str,
+        client_pubkey_hex: &str,
+        remote_transport_pubkey: &[u8; 32],
+        require_window: bool,
+    ) -> Result<PairedClient, PairingError> {
         let normalized_pubkey = client_pubkey_hex.to_ascii_lowercase();
         parse_pubkey(&normalized_pubkey)?;
         let remote_hex = hex::encode(remote_transport_pubkey);
         let client_id = client_id_from_pubkey(&normalized_pubkey);
         let now = chrono::Utc::now().timestamp();
 
-        let mut inner = self.lock();
         let open = if require_window {
-            Self::open_inner(&inner)
+            Self::open_inner(inner)
         } else {
             !inner.pairing_closed
         };

@@ -73,13 +73,86 @@ P-256/SHA-256 DER hex. The node re-verifies the approver's owner approval and
 current epoch, verifies the exact pending tuple, then signs the standard
 `owner_approval_message` and records `enrolled_by: "device:<approver_key_id>"`.
 The pending request and nonce are consumed atomically with enrollment. They
-survive restart until expiry or cancellation; legacy requests with no nonce
+survive restart until expiry or cancellation only for legacy non-SAS requests.
+SAS ceremonies require a fresh request after restart; legacy requests with no nonce
 need a fresh request for delegation. Replays, changed tuples and revoked
 approvers fail. Console-only and ordinary sidecar starts refuse delegation.
 Console `device revoke` and pairing epoch bumps retire delegated keys and
 end their envelopes exactly as for console-enrolled keys. Provenance is
 informational, so revoking an approver does not cascade to previously approved
 keys on other pairings; revoke those keys explicitly when needed.
+
+### Adding a device over the Noise tunnel
+
+Available while unlocked in `--local-owner-device` mode (including `--home`),
+with the owner signing key held in memory. Locked mode exposes none of these
+routes. Owner-local v1 delegation remains compatible for legacy non-SAS
+requests; **tunnel delegation always requires SAS v1 enrollment and v2 signing**.
+
+All routes below require the approver's live paired token on its own authenticated
+Noise connection. The key must belong to that pairing and current epoch and
+carry a valid seed-derived owner approval. An ordinary pairing, including an AI
+client with read/receive or a spend grant, has no such authority. Key revocation,
+pairing revocation/rotation and epoch changes are checked again under the same
+lock as issuance or enrollment; a stale session or token cannot bypass them.
+
+| Route | Request / response |
+|---|---|
+| `GET /api/v1/pair/ticket?approver_key_id=<key>` | Returns `{nonce, message}`. The server chooses a 32-byte hex nonce, bound to the caller's key and epoch for at most five minutes. Repeated reads reuse the live nonce. |
+| `POST /api/v1/pair/ticket` | `{approver_key_id, nonce, signature}` → `{uri, expires_at}`. P-256/SHA-256 DER hex signature over the bytes below. |
+| `GET /api/v1/pair/device-key/pending?approver_key_id=<key>` | Returns `{pending: [...]}` for live SAS operations. Lets the owner discover the new device without transferring an operation id. Expired, cancelled, completed and restarted ceremonies are omitted. |
+| `GET /api/v1/pair/device-key/{op_id}/delegation?approver_key_id=<key>` | Owner-only view of the new device's operation: `op_id`, `client_id`, `name`, `public_key`, `expires_at`, `sas_version`, `box_nonce`, four `sas_words`, and `delegation_message` (null until SAS finalization). The client obtains the operation id from the owner pending list. |
+| `POST /api/v1/pair/device-key/{op_id}/delegate` | Existing `{approver_key_id, signature}` body; returns `{op_id, key_id, status: "registered"}`. |
+
+Ticket signature bytes (UTF-8, no trailing newline; `node` is the identity
+fingerprint):
+
+```text
+bitsov-ticket-v1
+node:{fp}
+nonce:{server nonce}
+```
+
+Ticket issuance consumes the challenge. The QR URI is PairLink v2 with signed
+endpoints and box transport pin. The ticket code is an opaque `owner_`-prefixed
+random value, valid once for five minutes. Only its hash is kept in memory;
+neither code nor URI is written to disk or the audit log. Challenges and unused
+tickets are invalid after restart. Five successful issues per rolling 15 minutes
+are allowed node-wide; challenge reads are capped at 30 per minute (HTTP 429).
+Invalid signatures do not consume the challenge. Issuer authority is rechecked
+when consuming the ticket, so revocation also invalidates unused tickets. Ticket
+consumption and pairing creation are serialized, including concurrent requests.
+Exact ticket-auth replays fail; after a lost success response, reconnect with
+saved pairing keys **without** the code. Tickets never open `/pair/request`.
+
+The new device completes the existing claim-bound SAS ceremony on its own Noise
+session; see [SAS protocol](pairing.md). The owner view discloses neither claim
+code nor commitment. The enrolled device compares the displayed four words
+before signing these bytes:
+
+```text
+bitsov-owner-delegation-v2
+node:{fp}
+client_pubkey:{new pairing public key}
+epoch:{new pairing epoch}
+device_key:{new SEC1 uncompressed public key hex}
+op_id:{pending operation id}
+nonce:{server-issued 16-byte lowercase hex nonce}
+sas_digest:{full lowercase hex SAS digest}
+```
+
+Unconfirmed, cancelled, expired, restarted or legacy non-SAS operations cannot
+be delegated through the tunnel. Wrong-node/tuple/digest signatures, self-approval
+with an unenrolled key, revoked keys and replays fail. No seed-derived signature
+is produced until every existing delegation and SAS check passes. Pending
+operation consumption and enrollment persistence are atomic. Ticket and
+SAS-view responses use `Cache-Control: no-store`.
+
+Audit events `pair.ticket_issued`, `pair.ticket_refused`,
+`pair.device_delegated` and `pair.device_delegation_refused` record the approver
+pairing, epoch, key id and (for delegation) operation id. They exclude nonce,
+ticket, signature, SAS and claim secrets. Enrollment does not convey the unlock
+password or enable console grants.
 
 ### Keep a second owner device
 
