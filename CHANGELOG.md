@@ -5,6 +5,13 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+### Security
+
+- Reject empty or whitespace-only mnemonic-file encryption passwords in restore,
+  init (including descriptor input), seed encryption, and encrypted bootstrap.
+  Invalid passwords fail before writing files instead of silently saving a
+  plaintext mnemonic. Existing encrypted and plaintext files remain readable.
+
 ## [0.3.0-rc14] — 2026-10-09 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Includes the seven PRs merged after

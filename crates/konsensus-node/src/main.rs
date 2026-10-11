@@ -342,6 +342,38 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Resolve encryption intent before any initialization writes. Only omission
+/// permits plaintext; a missing or blank requested password is an error.
+fn mnemonic_encryption_password(
+    encrypt: Option<Option<String>>,
+    password: Option<Zeroizing<String>>,
+    non_interactive: bool,
+) -> Result<Option<Zeroizing<String>>> {
+    let encrypt = encrypt.map(|value| value.map(Zeroizing::new));
+    let password = match (password, encrypt) {
+        (Some(pw), _) | (None, Some(Some(pw))) => Some(pw),
+        (None, Some(None)) => {
+            anyhow::ensure!(
+                !non_interactive,
+                "--encrypt requires a password in non-interactive mode; use --password-fd"
+            );
+            use std::io::Write;
+            println!("Enter a non-empty password to encrypt your mnemonic:");
+            std::io::stdout().flush()?;
+            let mut raw = Zeroizing::new(String::new());
+            std::io::stdin().read_line(&mut raw)?;
+            Some(Zeroizing::new(
+                raw.trim_end_matches(['\r', '\n']).to_owned(),
+            ))
+        }
+        (None, None) => None,
+    };
+    if let Some(pw) = &password {
+        mnemonic_crypto::validate_encryption_password(pw)?;
+    }
+    Ok(password)
+}
+
 /// `konsensus init` — generate identity and create config file.
 fn cmd_init(
     dir: &Path,
@@ -350,7 +382,7 @@ fn cmd_init(
     encrypt: Option<Option<String>>,
     password: Option<Zeroizing<String>>,
 ) -> Result<()> {
-    let encrypt = encrypt.map(|value| value.map(Zeroizing::new));
+    let password = mnemonic_encryption_password(encrypt, password, non_interactive)?;
     use crate::config::NodeTier;
 
     // Create directory if needed
@@ -401,24 +433,6 @@ fn cmd_init(
     if !non_interactive {
         confirm_mnemonic_backup(&mnemonic)?;
     }
-
-    // Descriptor input implies encryption; clap rejects combining it with
-    // --encrypt. All owned password buffers are scrubbed on errors as well.
-    let password = match (password, encrypt) {
-        (Some(pw), _) | (None, Some(Some(pw))) => Some(pw),
-        (None, Some(None)) if !non_interactive => {
-            println!("Enter a password to encrypt your mnemonic (leave empty for plaintext):");
-            let mut raw = Zeroizing::new(String::new());
-            std::io::stdin().read_line(&mut raw)?;
-            let pw = Zeroizing::new(raw.trim().to_owned());
-            if pw.is_empty() {
-                None
-            } else {
-                Some(pw)
-            }
-        }
-        _ => None,
-    };
 
     let final_mnemonic_path = mnemonic_crypto::write_mnemonic(
         &mnemonic_path,
@@ -495,6 +509,8 @@ fn cmd_restore(
 ) -> Result<()> {
     use crate::config::NodeTier;
 
+    let password = mnemonic_encryption_password(encrypt, None, false)?;
+
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create directory: {}", dir.display()))?;
 
@@ -568,26 +584,6 @@ fn cmd_restore(
         prompt_tier_selection()?
     };
 
-    // Determine encryption password
-    let password: Option<String> = match &encrypt {
-        Some(Some(pw)) => Some(pw.clone()),
-        Some(None) => {
-            use std::io::{self, BufRead, Write};
-            println!("Enter a password to encrypt your mnemonic (leave empty for plaintext):");
-            let mut pw = String::new();
-            io::stdout().flush()?;
-            io::stdin().lock().read_line(&mut pw)?;
-            let pw = pw.trim().to_string();
-            if pw.is_empty() {
-                None
-            } else {
-                Some(pw)
-            }
-        }
-        _ => None,
-    };
-    let password_ref = password.as_deref();
-
     // Fence embedded channel recovery before restored identity/config is usable.
     // Identity-only tiers have no local Lightning state to recover.
     let embedded_recovery = matches!(tier, NodeTier::Full);
@@ -596,9 +592,12 @@ fn cmd_restore(
     }
 
     // Write mnemonic to file
-    let final_mnemonic_path =
-        mnemonic_crypto::write_mnemonic(&mnemonic_path, &mnemonic, password_ref)
-            .with_context(|| format!("failed to write mnemonic to {}", mnemonic_path.display()))?;
+    let final_mnemonic_path = mnemonic_crypto::write_mnemonic(
+        &mnemonic_path,
+        &mnemonic,
+        password.as_deref().map(String::as_str),
+    )
+    .with_context(|| format!("failed to write mnemonic to {}", mnemonic_path.display()))?;
 
     // Generate tier-specific config
     let config = NodeConfig::default_for_tier(tier, final_mnemonic_path.clone(), dir);
@@ -1013,6 +1012,11 @@ async fn cmd_start(
     let data_dir = owner_cmd::data_dir_of(config_path);
     match startup_mode {
         konsensus_api::bootstrap::StartupMode::Bootstrap => {
+            // A new encrypted seed must reject blank input before even logging
+            // creates files. Initialized nodes retain legacy decryption semantics.
+            if let Some(password) = &password {
+                mnemonic_crypto::validate_encryption_password(password)?;
+            }
             // A positively empty directory with --remote-unlock serves the
             // remote first run; the password then arrives only through
             // the Noise tunnel and --local-owner-device applies after unlock.

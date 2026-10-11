@@ -85,7 +85,12 @@ account that will own the files:
 konsensus restore --dir /absolute/path/recovered-node --tier full --encrypt
 ```
 
-Enter the mnemonic at the prompt and a non-empty file-encryption password.
+Enter the mnemonic at the prompt and a file-encryption password containing at
+least one non-whitespace character. `--encrypt` rejects empty or whitespace-only
+passwords before creating the destination directory or writing any files; it
+never falls back to plaintext. Omit `--encrypt` only if you deliberately want a
+plaintext mnemonic file. Existing plaintext and encrypted files remain readable,
+including encrypted files created with a blank password by older versions.
 `restore` refuses a non-empty directory. Full tier writes an open
 `ldk/recover.json` before the restored config becomes usable; normal `start`
 remains fenced. Cloud/light identity-only restores do not create this embedded

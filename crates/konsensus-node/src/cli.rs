@@ -59,7 +59,7 @@ pub enum Command {
         #[arg(long)]
         tier: Option<String>,
 
-        /// Encrypt the mnemonic file with a password.
+        /// Encrypt the mnemonic file; empty or whitespace-only passwords are rejected.
         /// If set without a value, prompts for the password interactively.
         #[arg(long)]
         encrypt: Option<Option<String>>,
@@ -168,7 +168,7 @@ pub enum Command {
         #[arg(long)]
         tier: Option<String>,
 
-        /// Encrypt the mnemonic file with a password.
+        /// Encrypt the mnemonic file; empty or whitespace-only passwords are rejected.
         #[arg(long)]
         encrypt: Option<Option<String>>,
     },

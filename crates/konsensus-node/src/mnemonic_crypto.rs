@@ -35,6 +35,10 @@ const HEADER_LEN: usize = 1 + SALT_LEN + NONCE_LEN;
 /// Errors from mnemonic encryption/decryption.
 #[derive(Debug, Error)]
 pub enum MnemonicCryptoError {
+    /// A new encrypted mnemonic requires a non-blank password.
+    #[error("mnemonic-file encryption password must not be empty or whitespace-only")]
+    EmptyPassword,
+
     /// Password-based key derivation failed.
     #[error("key derivation failed: {0}")]
     KeyDerivation(String),
@@ -85,13 +89,20 @@ pub fn owner_secret(password: &str, node_id_hex: &str) -> Result<zeroize::Zeroiz
     Ok(zeroize::Zeroizing::new(derive_key(password.as_bytes(), &salt.as_bytes()[..16])?))
 }
 
+/// Validate only new encryption passwords; legacy decryption stays permissive.
+/// The original password bytes (including surrounding spaces) are preserved.
+pub fn validate_encryption_password(password: &str) -> Result<(), MnemonicCryptoError> {
+    if password.trim().is_empty() {
+        return Err(MnemonicCryptoError::EmptyPassword);
+    }
+    Ok(())
+}
+
 /// Encrypt a mnemonic phrase with a password.
 ///
 /// Returns the encrypted bytes in the `.enc` format (version + salt + nonce + ciphertext).
-pub fn encrypt_mnemonic(
-    mnemonic: &str,
-    password: &str,
-) -> Result<Vec<u8>, MnemonicCryptoError> {
+pub fn encrypt_mnemonic(mnemonic: &str, password: &str) -> Result<Vec<u8>, MnemonicCryptoError> {
+    validate_encryption_password(password)?;
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut salt);
@@ -188,20 +199,21 @@ pub fn read_mnemonic(
 
 /// Write a mnemonic to a file, encrypting if a password is provided.
 ///
-/// If password is empty, writes plaintext with restricted permissions.
-/// If password is provided, writes encrypted `.enc` file.
+/// Only `None` writes plaintext with restricted permissions.
+/// A provided password must contain a non-whitespace character; otherwise no
+/// file is created or modified. Valid passwords write an encrypted `.enc` file.
 pub fn write_mnemonic(
     path: &std::path::Path,
     mnemonic: &str,
     password: Option<&str>,
 ) -> Result<std::path::PathBuf, MnemonicCryptoError> {
     let (final_path, data) = match password {
-        Some(pw) if !pw.is_empty() => {
+        Some(pw) => {
             let enc_path = path.with_extension("enc");
             let encrypted = encrypt_mnemonic(mnemonic, pw)?;
             (enc_path, encrypted)
         }
-        _ => (path.to_path_buf(), mnemonic.as_bytes().to_vec()),
+        None => (path.to_path_buf(), mnemonic.as_bytes().to_vec()),
     };
 
     std::fs::write(&final_path, &data)?;

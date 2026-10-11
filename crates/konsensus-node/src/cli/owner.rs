@@ -998,12 +998,7 @@ pub struct LocalOwnerBootstrap {
 
 impl LocalOwnerBootstrap {
     fn into_hooks(self) -> Result<bootstrap::LocalOwnerHooks> {
-        // write_mnemonic intentionally supports plaintext for an empty password;
-        // this ceremony must never reach that fallback.
-        anyhow::ensure!(
-            !self.password.is_empty(),
-            "bootstrap password must not be empty"
-        );
+        crate::mnemonic_crypto::validate_encryption_password(&self.password)?;
         let password = std::sync::Arc::new(self.password);
         let signing_password = password.clone();
         Ok(bootstrap::LocalOwnerHooks {
@@ -1110,7 +1105,7 @@ pub async fn serve_bootstrap_mode(
                     enroll_device: true,
                 }
                 .into_hooks()
-                .map_err(|_| bootstrap::CommitError::Io("bootstrap password rejected".into()))
+                .map_err(|e| bootstrap::CommitError::Io(e.to_string()))
             }),
             tunnel: tunnel_clients.clone(),
         });
@@ -1531,12 +1526,17 @@ mod startup_tests {
     #[test]
     fn encrypted_bootstrap_hooks_reject_empty_password_and_sign_owner() {
         use zeroize::Zeroizing;
-        assert!(LocalOwnerBootstrap {
-            password: Zeroizing::new(String::new()),
-            enroll_device: true
+        for password in ["", "          ", "\t\r\n", "\u{2003}\u{a0}"] {
+            let result = LocalOwnerBootstrap {
+                password: Zeroizing::new(password.into()),
+                enroll_device: true,
+            }
+            .into_hooks();
+            let error = result.err().expect("blank bootstrap password must fail");
+            assert!(error
+                .to_string()
+                .contains("must not be empty or whitespace-only"));
         }
-        .into_hooks()
-        .is_err());
         let password = "bootstrap-test-password";
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let dir = tempfile::tempdir().unwrap();
