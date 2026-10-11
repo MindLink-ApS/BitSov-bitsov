@@ -151,3 +151,31 @@ fn blank_bootstrap_password_writes_nothing() {
         );
     }
 }
+
+#[test]
+fn piped_restore_reads_password_before_mnemonic() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_konsensus"))
+        .args(["restore", "--dir"])
+        .arg(temp.path())
+        .args(["--tier", "full", "--encrypt"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "  piped password-é  \r\n{PHRASE}"
+    )
+    .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("piped password"));
+    assert!(temp.path().join("mnemonic.enc").exists());
+    assert!(!temp.path().join("mnemonic.txt").exists());
+}

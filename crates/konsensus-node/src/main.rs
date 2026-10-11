@@ -357,14 +357,21 @@ fn mnemonic_encryption_password(
                 !non_interactive,
                 "--encrypt requires a password in non-interactive mode; use --password-fd"
             );
-            use std::io::Write;
+            use std::io::{IsTerminal, Write};
             println!("Enter a non-empty password to encrypt your mnemonic:");
             std::io::stdout().flush()?;
-            let mut raw = Zeroizing::new(String::new());
-            std::io::stdin().read_line(&mut raw)?;
-            Some(Zeroizing::new(
-                raw.trim_end_matches(['\r', '\n']).to_owned(),
-            ))
+            if std::io::stdin().is_terminal() {
+                Some(Zeroizing::new(
+                    rpassword::read_password().context("failed to read password from terminal")?,
+                ))
+            } else {
+                // Keep piped input on stdin: rpassword reads the controlling terminal.
+                let mut raw = Zeroizing::new(String::new());
+                std::io::stdin().read_line(&mut raw)?;
+                Some(Zeroizing::new(
+                    raw.trim_end_matches(['\r', '\n']).to_owned(),
+                ))
+            }
         }
         (None, None) => None,
     };

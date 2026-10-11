@@ -85,8 +85,9 @@ account that will own the files:
 konsensus restore --dir /absolute/path/recovered-node --tier full --encrypt
 ```
 
-Enter the mnemonic at the prompt and a file-encryption password containing at
-least one non-whitespace character. `--encrypt` rejects empty or whitespace-only
+Enter a file-encryption password containing at least one non-whitespace character
+first (input is hidden on a terminal), then enter the mnemonic at the next prompt.
+`--encrypt` rejects empty or whitespace-only
 passwords before creating the destination directory or writing any files; it
 never falls back to plaintext. Omit `--encrypt` only if you deliberately want a
 plaintext mnemonic file. Existing plaintext and encrypted files remain readable,
