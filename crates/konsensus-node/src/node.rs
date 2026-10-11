@@ -215,7 +215,7 @@ impl KonsensusNode {
                 .with_routing_fee_policy(config.routing_fees);
                 info!(
                     backend = "cln",
-                    "lightning provider (CLN preview; payments disabled)"
+                    "lightning provider (CLN; fee-capped payments)"
                 );
                 Arc::new(provider)
             }

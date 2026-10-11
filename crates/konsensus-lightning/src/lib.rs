@@ -4,7 +4,7 @@
 //! - **LNbits** — HTTP REST API (fastest path to payment gate)
 //! - **LND** — direct REST API to LND daemon (Full tier, no LNbits middleman)
 //! - **LDK** — embedded sovereign Lightning node (no external daemon)
-//! - **CLN (preview)** — pinned HTTPS connectivity/status only; no payments
+//! - **CLN** — pinned HTTPS, receive/read and fee-capped invoice/keysend payments
 //! - **Mock** — in-memory provider for testing
 
 #![forbid(unsafe_code)]

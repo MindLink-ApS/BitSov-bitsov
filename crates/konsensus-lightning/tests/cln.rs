@@ -1,179 +1,14 @@
-//! Local TLS transport tests. Fixture keys are public test material, never credentials.
+//! Local TLS transport and receive/read tests.
+#[path = "common/cln.rs"]
+mod common;
+use common::*;
 use konsensus_core::traits::lightning::{
     LightningError, LightningProvider, PaymentDirection, PaymentStatus,
 };
-use konsensus_lightning::{ClnConfig, ClnProvider};
+use konsensus_lightning::ClnProvider;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
-use tokio_rustls::{
-    rustls::{
-        self,
-        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
-    },
-    TlsAcceptor,
-};
-
-const RUNE: &str = "TEST_ONLY_RUNE_DO_NOT_LOG";
-const PUBKEY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-fn info(version: &str, network: &str) -> String {
-    serde_json::json!({"id": PUBKEY, "version": version, "network": network}).to_string()
-}
-struct Server {
-    port: u16,
-    requests: Arc<Mutex<Vec<String>>>,
-    response: Arc<Mutex<(u16, String)>>,
-    routes: Arc<Mutex<HashMap<String, (u16, String)>>>,
-    task: tokio::task::JoinHandle<()>,
-}
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-impl Server {
-    async fn new(status: u16, body: String) -> Self {
-        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(
-                include_bytes!("fixtures/cln/server.der").to_vec(),
-            )],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                include_bytes!("fixtures/cln/server-key.der").to_vec(),
-            )),
-        )
-        .unwrap();
-        let acceptor = TlsAcceptor::from(Arc::new(tls));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let response = Arc::new(Mutex::new((status, body)));
-        let routes = Arc::new(Mutex::new(HashMap::<String, (u16, String)>::new()));
-        let routing = routes.clone();
-        let (seen, reply) = (requests.clone(), response.clone());
-        let task = tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (acceptor, seen, reply) = (acceptor.clone(), seen.clone(), reply.clone());
-                let routing = routing.clone();
-                tokio::spawn(async move {
-                    let Ok(mut stream) = acceptor.accept(stream).await else {
-                        return;
-                    };
-                    let mut request = Vec::new();
-                    loop {
-                        let mut buf = [0; 1024];
-                        let n = stream.read(&mut buf).await.unwrap_or(0);
-                        if n == 0 {
-                            return;
-                        }
-                        request.extend_from_slice(&buf[..n]);
-                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                            let headers =
-                                String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
-                            let len = headers
-                                .lines()
-                                .find_map(|l| l.strip_prefix("content-length: "))
-                                .unwrap_or("0")
-                                .parse::<usize>()
-                                .unwrap();
-                            if request.len() >= end + 4 + len {
-                                break;
-                            }
-                        }
-                    }
-                    let request = String::from_utf8(request).unwrap();
-                    let (headers, params) = request.split_once("\r\n\r\n").unwrap();
-                    let path = headers.split_whitespace().nth(1).unwrap();
-                    let params: Value = serde_json::from_str(params).unwrap();
-                    let key = if let Some(start) = params.get("start") {
-                        format!("{path}?start={start}")
-                    } else {
-                        path.to_string()
-                    };
-                    let (status, body) = routing
-                        .lock()
-                        .unwrap()
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_else(|| reply.lock().unwrap().clone());
-                    seen.lock().unwrap().push(request);
-                    let redirect = if status == 302 {
-                        format!("location: {body}\r\n")
-                    } else {
-                        String::new()
-                    };
-                    let wire = format!("HTTP/1.1 {status} Test\r\n{redirect}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
-                    let _ = stream.write_all(wire.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-        });
-        Self {
-            port,
-            requests,
-            response,
-            routes,
-            task,
-        }
-    }
-    fn route(&self, method: &str, value: Value) {
-        self.routes
-            .lock()
-            .unwrap()
-            .insert(format!("/v1/{method}"), (200, value.to_string()));
-    }
-    fn calls(&self) -> Vec<(String, Value)> {
-        self.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|request| {
-                let (head, body) = request.split_once("\r\n\r\n").unwrap();
-                (
-                    head.split_whitespace().nth(1).unwrap().to_string(),
-                    serde_json::from_str(body).unwrap(),
-                )
-            })
-            .collect()
-    }
-    fn config(&self, dir: &tempfile::TempDir) -> ClnConfig {
-        let rune_file = dir.path().join("rune");
-        if rune_file.exists() {
-            std::fs::remove_file(&rune_file).unwrap();
-        }
-        std::fs::write(&rune_file, format!("{RUNE}\n")).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&rune_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        ClnConfig {
-            rest_url: format!("https://localhost:{}", self.port),
-            resolve_ip: Some("127.0.0.1".parse().unwrap()),
-            ca_cert_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/cln/ca.pem"),
-            rune_file,
-            network: "regtest".into(),
-            minimum_version: "v24.11".into(),
-        }
-    }
-}
-
 #[tokio::test]
-async fn connects_with_header_only_and_reports_preview_status() {
+async fn connects_with_header_only_and_reports_payment_readiness() {
     let server = Server::new(200, info("v24.11", "regtest")).await;
     let dir = tempfile::tempdir().unwrap();
     let config = server.config(&dir);
@@ -189,12 +24,15 @@ async fn connects_with_header_only_and_reports_preview_status() {
     assert!(format!("{provider:?}").contains("<redacted>"));
     assert!(provider.is_available().await);
     assert_eq!(provider.get_node_pubkey().await.as_deref(), Some(PUBKEY));
-    assert!(!provider.is_payment_capable().await);
-    assert!(!provider.money_ready().await);
-    assert!(!provider.readiness().await.money_ready);
+    assert!(provider.is_payment_capable().await);
+    assert!(provider.money_ready().await);
+    assert!(provider.readiness().await.money_ready);
     for request in server.requests.lock().unwrap().iter() {
         let (head, body) = request.split_once("\r\n\r\n").unwrap();
-        assert!(head.starts_with("POST /v1/getinfo HTTP/1.1\r\n"));
+        assert!(
+            head.starts_with("POST /v1/getinfo HTTP/1.1\r\n")
+                || head.starts_with("POST /v1/help HTTP/1.1\r\n")
+        );
         assert_eq!(
             head.lines()
                 .filter(|l| l.contains(RUNE))
@@ -206,15 +44,10 @@ async fn connects_with_header_only_and_reports_preview_status() {
     let count = server.requests.lock().unwrap().len();
     assert!(matches!(
         provider.pay_invoice("test").await,
-        Err(LightningError::PaymentNotDispatched(_))
+        Err(LightningError::InvalidBolt11(_))
     ));
     assert!(provider
         .pay_invoice_with_fee_limit("test", 0)
-        .await
-        .is_err());
-    assert!(provider.keysend(PUBKEY, 1, None).await.is_err());
-    assert!(provider
-        .keysend_with_fee_limit(PUBKEY, 1, None, 0)
         .await
         .is_err());
     assert!(matches!(
@@ -395,7 +228,7 @@ async fn t3_invoice_statuses_use_received_amount_and_invoice_precedence() {
     assert!(server
         .calls()
         .iter()
-        .skip(1)
+        .skip(2)
         .all(|(path, body)| path == "/v1/listinvoices" && *body == json!({"payment_hash":hash()})));
 }
 
@@ -447,7 +280,7 @@ async fn t3_outgoing_statuses_and_unknown_hash() {
         provider.get_payment_status(&hash()).await,
         Err(LightningError::PaymentNotFound(_))
     ));
-    for pair in server.calls()[1..].chunks(2) {
+    for pair in server.calls()[2..].chunks(2) {
         assert_eq!(
             pair[0],
             ("/v1/listinvoices".into(), json!({"payment_hash":hash()}))
@@ -529,8 +362,8 @@ async fn creates_invoice_with_unique_labels_and_backend_expiry() {
         assert_eq!(invoice.description, "memo");
     }
     let calls = server.calls();
-    assert_ne!(calls[1].1["label"], calls[2].1["label"]);
-    for (path, body) in &calls[1..] {
+    assert_ne!(calls[2].1["label"], calls[3].1["label"]);
+    for (path, body) in &calls[2..] {
         assert_eq!(path, "/v1/invoice");
         assert_eq!(body["amount_msat"], 1234);
         assert_eq!(body["description"], "memo");
@@ -628,7 +461,7 @@ async fn balances_and_channels_preserve_units_and_unknown_categories() {
 async fn history_pages_through_short_mpp_pages_merges_newest_and_refreshes_fees() {
     let (server, _dir, provider) = read_provider().await;
     assert!(provider.list_payments(0).await.unwrap().is_empty());
-    assert_eq!(server.calls().len(), 1);
+    assert_eq!(server.calls().len(), 2);
     let mut newer = incoming("paid");
     newer["created_index"] = json!(5);
     newer["paid_at"] = json!(1700000002);
@@ -653,7 +486,7 @@ async fn history_pages_through_short_mpp_pages_merges_newest_and_refreshes_fees(
     for (_, body) in server
         .calls()
         .into_iter()
-        .skip(1)
+        .skip(2)
         .filter(|(_, b)| b.get("start").is_some())
     {
         assert_eq!(body["index"], "created");

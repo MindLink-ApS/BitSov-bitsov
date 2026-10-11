@@ -500,7 +500,7 @@ pub enum LightningConfig {
         #[serde(default)]
         tls_cert_path: Option<String>,
     },
-    /// Core Lightning clnrest preview: connection/status only, no payments.
+    /// Core Lightning clnrest: pinned HTTPS, receive/read and fee-capped payments.
     #[serde(rename = "cln")]
     Cln {
         rest_url: String,

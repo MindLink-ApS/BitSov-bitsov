@@ -46,8 +46,9 @@ Key settings:
 ### CLN (preview)
 
 Connect to an existing Core Lightning node over pinned-CA HTTPS for invoices,
-settlement lookup, balances, channels and payment history. Outgoing payments
-and keysend remain disabled in this preview.
+settlement lookup, balances, channels, payment history and fee-capped invoice
+payments/keysend. Requires CLN >= v24.11 with `xpay`; real CLN regtest coverage
+is still pending.
 See the [CLN configuration reference](docs/CLN.md).
 
 ## Sovereignty Tiers
