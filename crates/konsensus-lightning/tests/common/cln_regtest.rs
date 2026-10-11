@@ -282,7 +282,8 @@ impl Cln {
                     "--bitcoin-rpcconnect=127.0.0.1",
                     "--bitcoin-rpcuser=cln-regtest",
                     "--bitcoin-rpcpassword=disposable-regtest",
-                    "--bitcoin-poll=1",
+                    "--developer",
+                    "--dev-bitcoind-poll=1",
                     "--clnrest-host=127.0.0.1",
                     "--clnrest-protocol=https",
                 ])
