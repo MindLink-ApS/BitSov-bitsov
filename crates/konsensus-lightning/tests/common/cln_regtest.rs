@@ -56,7 +56,7 @@ fn port() -> u16 {
 }
 struct Daemon {
     child: Child,
-    log: PathBuf,
+    logs: Vec<PathBuf>,
 }
 impl Daemon {
     fn spawn(command: &mut Command, log: PathBuf) -> Self {
@@ -69,14 +69,28 @@ impl Daemon {
             .stderr(output)
             .spawn()
             .unwrap();
-        Self { child, log }
+        Self {
+            child,
+            logs: vec![log],
+        }
     }
     fn alive(&mut self) {
-        assert!(
-            self.child.try_wait().unwrap().is_none(),
-            "daemon exited; see {}",
-            self.log.display()
-        );
+        if let Some(status) = self.child.try_wait().unwrap() {
+            panic!("daemon exited ({status})");
+        }
+    }
+    async fn wait_ready(&mut self, ready: impl std::future::Future<Output = ()>) {
+        // Poll independently so even a stuck admin RPC cannot hide an exit.
+        self.alive();
+        tokio::select! {
+            _ = ready => self.alive(),
+            _ = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    self.alive();
+                }
+            } => unreachable!(),
+        }
     }
 }
 impl Drop for Daemon {
@@ -99,10 +113,42 @@ impl Drop for Daemon {
             .status();
         let _ = self.child.wait();
         if std::thread::panicking() {
-            // Do not dump daemon logs: createrune replies may contain credentials.
-            eprintln!("daemon failure; temporary log: {}", self.log.display());
+            for log in &self.logs {
+                eprintln!("daemon failure; last 80 lines of {}:", log.display());
+                match redacted_log_tail(log) {
+                    Ok(tail) => eprint!("{tail}"),
+                    Err(_) => eprintln!("[log unavailable]"),
+                }
+            }
         }
     }
+}
+
+fn redacted_log_tail(path: &Path) -> std::io::Result<String> {
+    use std::collections::VecDeque;
+    use std::io::{BufRead, BufReader};
+    let mut tail = VecDeque::with_capacity(80);
+    for line in BufReader::new(std::fs::File::open(path)?).lines() {
+        let line = line?;
+        let lower = line.to_ascii_lowercase();
+        // Deliberately over-redact: hex is a subset of base64, and both
+        // standard and URL-safe alphabets can carry credentials without labels.
+        let sensitive = ["rune", "secret", "password", "macaroon"]
+            .iter()
+            .any(|word| lower.contains(word))
+            || line
+                .split(|c: char| !c.is_ascii_alphanumeric() && !"+/_-=".contains(c))
+                .any(|token| token.len() >= 32);
+        if tail.len() == 80 {
+            tail.pop_front();
+        }
+        tail.push_back(if sensitive {
+            "[redacted]".to_owned()
+        } else {
+            line
+        });
+    }
+    Ok(tail.into_iter().map(|line| line + "\n").collect())
 }
 
 pub async fn wait<F, Fut>(label: &str, mut check: F)
@@ -142,7 +188,7 @@ impl Core {
     pub async fn start(executable: &Path) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let port = port();
-        let daemon = Daemon::spawn(
+        let mut daemon = Daemon::spawn(
             Command::new(executable)
                 .args([
                     "-regtest",
@@ -162,6 +208,7 @@ impl Core {
                 .arg(format!("-rpcport={port}")),
             dir.path().join("bitcoind.log"),
         );
+        daemon.logs.push(dir.path().join("regtest/debug.log"));
         let mut core = Self {
             daemon,
             port,
@@ -225,7 +272,7 @@ impl Cln {
         let certs = dir.path().join("certs");
         std::fs::create_dir(&certs).unwrap();
         let rest_port = port();
-        let daemon = Daemon::spawn(
+        let mut daemon = Daemon::spawn(
             Command::new(&binaries.lightningd)
                 .args([
                     "--network=regtest",
@@ -248,6 +295,18 @@ impl Cln {
                 .arg(format!("--clnrest-certs={}", certs.display())),
             dir.path().join("lightningd.log"),
         );
+        daemon
+            .wait_ready(wait(
+                "lightningd admin RPC and clnrest certificate",
+                || async {
+                    socket.exists()
+                        && certs.join("ca.pem").exists()
+                        && Self::try_rpc_at(&socket, "getinfo", json!({}))
+                            .await
+                            .is_some()
+                },
+            ))
+            .await;
         let mut cln = Self {
             daemon,
             dir,
@@ -257,13 +316,6 @@ impl Cln {
             version: String::new(),
             keysend_method: "keysend",
         };
-        wait("lightningd admin RPC and clnrest certificate", || async {
-            cln.socket.exists()
-                && certs.join("ca.pem").exists()
-                && cln.try_rpc("getinfo", json!({})).await.is_some()
-        })
-        .await;
-        cln.daemon.alive();
         cln.version = cln.rpc("getinfo", json!({})).await["version"]
             .as_str()
             .unwrap()
@@ -323,15 +375,20 @@ impl Cln {
             .open(cln.dir.path().join("bitsov.rune"))
             .unwrap();
         file.write_all(cln.rune.as_bytes()).unwrap();
-        wait("restricted clnrest TLS", || async {
-            ClnProvider::new(cln.config()).await.is_ok()
-        })
-        .await;
+        let config = cln.config();
+        cln.daemon
+            .wait_ready(wait("restricted clnrest TLS", || async {
+                ClnProvider::new(config.clone()).await.is_ok()
+            }))
+            .await;
         cln
     }
     async fn try_rpc(&self, method: &str, params: Value) -> Option<Value> {
+        Self::try_rpc_at(&self.socket, method, params).await
+    }
+    async fn try_rpc_at(path: &Path, method: &str, params: Value) -> Option<Value> {
         tokio::time::timeout(Duration::from_secs(30), async {
-            let mut socket = tokio::net::UnixStream::connect(&self.socket).await.ok()?;
+            let mut socket = tokio::net::UnixStream::connect(path).await.ok()?;
             socket
                 .write_all(
                     format!(
@@ -623,4 +680,91 @@ fn failed_attempt_evidence_requires_a_record_and_only_failures() {
     ] {
         assert_eq!(recorded_failed_attempts(&attempts), expected, "{attempts}");
     }
+}
+
+#[test]
+fn daemon_log_tail_redacts_credentials_and_keeps_useful_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("lightningd.log");
+    let mut lines = vec!["old message"; 85];
+    lines.extend([
+        "ModuleNotFoundError: No module named 'json5'",
+        "RuNe: disposable",
+        "client SECRET value",
+        "rpcpassword=disposable",
+        "Macaroon: disposable",
+        "hash=0123456789abcdef0123456789abcdef",
+        "token=AbCdEfGhIjKlMnOpQrStUvWxYz012345+/==",
+        "token=AbCdEfGhIjKlMnOpQrStUvWxYz012345-_",
+        "plugin exited with code 1",
+    ]);
+    std::fs::write(&log, lines.join("\n")).unwrap();
+    let tail = redacted_log_tail(&log).unwrap();
+    let lines: Vec<_> = tail.lines().collect();
+    assert_eq!(lines.len(), 80);
+    assert_eq!(lines[71], "ModuleNotFoundError: No module named 'json5'");
+    assert_eq!(&lines[72..79], &["[redacted]"; 7]);
+    assert_eq!(lines[79], "plugin exited with code 1");
+    assert!(redacted_log_tail(&dir.path().join("missing.log")).is_err());
+}
+
+#[tokio::test]
+async fn daemon_exit_interrupts_pending_readiness() {
+    use futures::FutureExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut daemon = Daemon::spawn(
+        Command::new("/bin/sh").args(["-c", "exit 7"]),
+        dir.path().join("lightningd.log"),
+    );
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        std::panic::AssertUnwindSafe(daemon.wait_ready(std::future::pending::<()>()))
+            .catch_unwind(),
+    )
+    .await
+    .expect("an exited daemon must not wait for the startup timeout");
+    let panic = outcome.expect_err("an exited daemon must fail readiness");
+    assert!(panic
+        .downcast_ref::<String>()
+        .unwrap()
+        .contains("daemon exited"));
+}
+
+#[tokio::test]
+async fn daemon_failure_prints_redacted_logs() {
+    const CHILD_ENV: &str = "CLN_REGTEST_DIAGNOSTICS_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = Daemon::spawn(
+            Command::new("/bin/sh").args(["-c", "exit 7"]),
+            dir.path().join("lightningd.log"),
+        );
+        std::fs::write(
+            &daemon.logs[0],
+            "ModuleNotFoundError: No module named 'json5'\nrune=do-not-print-me\n",
+        )
+        .unwrap();
+        let debug = dir.path().join("debug.log");
+        std::fs::write(&debug, "Core diagnostic\npassword=do-not-print-me\n").unwrap();
+        daemon.logs.push(debug);
+        daemon.wait_ready(std::future::pending()).await;
+        return;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "fixture::daemon_failure_prints_redacted_logs",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("ModuleNotFoundError: No module named 'json5'"));
+    assert!(stderr.contains("Core diagnostic"));
+    assert!(stderr.contains("lightningd.log"));
+    assert!(stderr.contains("debug.log"));
+    assert_eq!(stderr.matches("[redacted]").count(), 2);
+    assert!(!stderr.contains("do-not-print-me"));
 }

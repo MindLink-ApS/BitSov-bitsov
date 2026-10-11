@@ -53,11 +53,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgmp10 libsqlite3-0 libsodium23 libpq5 libffi8 libssl3t64 zlib1g python3 python3-venv
-          # The 24.11 clnrest plugin is Python; newer releases may ship it
-          # compiled. Keep a private environment for the Python plugin.
-          python3 -m venv "$RUNNER_TEMP/cln-python"
-          "$RUNNER_TEMP/cln-python/bin/pip" install pyln-client flask flask-cors flask-restx flask-socketio gunicorn gevent gevent-websocket cryptography
-          echo "$RUNNER_TEMP/cln-python/bin" >> "$GITHUB_PATH"
+          # v24.11.2 plugins/clnrest/pyproject.toml requires the Python stack
+          # below. 26.06 ships Rust clnrest and does not need this venv.
+          # gevent 23.9.1 satisfies ^23.9.0.post1 and has Python 3.12 wheels.
+          if [[ "$CLN_VERSION" == 24.11.* ]]; then
+            python3 -m venv "$RUNNER_TEMP/cln-python"
+            "$RUNNER_TEMP/cln-python/bin/pip" install \
+              json5==0.9.14 flask==2.3.3 flask-restx==1.1.0 \
+              gunicorn==21.2.0 pyln-client==24.8 flask-socketio==5.3.6 \
+              gevent==23.9.1 gevent-websocket==0.10.1 flask-cors==4.0.0 \
+              Werkzeug==2.3.8 cryptography==43.0.3
+            # flask-restx 1.1 uses Werkzeug's pre-3.x API; cryptography is
+            # used to generate the plugin's TLS certificates.
+            "$RUNNER_TEMP/cln-python/bin/pip" check
+            echo "$RUNNER_TEMP/cln-python/bin" >> "$GITHUB_PATH"
+          fi
       - name: Provision hash-pinned Bitcoin Core and official CLN
         shell: bash
         run: |
