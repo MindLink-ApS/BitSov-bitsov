@@ -142,6 +142,14 @@ pub fn encrypt_seed(
             }
         }
     }
+    let password = password()?;
+    mnemonic_crypto::validate_encryption_password(&password)?;
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        anyhow::bail!(
+            "the password must be at least {MIN_PASSWORD_CHARS} characters; nothing was changed"
+        );
+    }
+
     // One run at a time: the lock is created exclusively and removed at the end.
     let _lock = Lock::take(&lock_path)?;
     if std::fs::symlink_metadata(&encrypted).is_ok() {
@@ -157,11 +165,6 @@ pub fn encrypt_seed(
         .context("the recovery phrase does not derive an identity; nothing was changed")?
         .node_id()
         .to_hex();
-
-    let password = password()?;
-    if password.chars().count() < MIN_PASSWORD_CHARS {
-        anyhow::bail!("the password must be at least {MIN_PASSWORD_CHARS} characters; nothing was changed");
-    }
 
     // 1. Create the encrypted file exclusively (never overwrite, never follow
     //    a symlink), owner-only from the first byte, and make it durable.
@@ -441,6 +444,24 @@ mod tests {
         }
         // A second run has nothing to do and changes nothing.
         assert!(encrypt_seed(&config, pw("correct horse battery")).unwrap_err().to_string().contains("already encrypted"));
+    }
+
+    #[test]
+    fn blank_passwords_leave_seed_and_config_untouched() {
+        for password in ["", "          ", "\t\r\n", "\u{2003}\u{a0}"] {
+            let (dir, config, plaintext) = node();
+            let before = std::fs::read(&config).unwrap();
+            let error = encrypt_seed(&config, pw(password)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not be empty or whitespace-only"),
+                "{error:#}"
+            );
+            assert_eq!(std::fs::read_to_string(&plaintext).unwrap(), PHRASE);
+            assert_eq!(std::fs::read(&config).unwrap(), before);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        }
     }
 
     #[test]

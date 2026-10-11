@@ -15,6 +15,10 @@ also live on the corresponding GitHub pre-release pages.
   checks. Non-owner pairings cannot issue tickets or approve keys; locked-mode
   and console-only authority boundaries remain unchanged. Client QR/approval
   UI support is required. See [home-node operations](docs/operations/home-node.md#add-further-devices-by-delegation).
+- Reject empty or whitespace-only mnemonic-file encryption passwords in restore,
+  init (including descriptor input), seed encryption, and encrypted bootstrap.
+  Invalid passwords fail before writing files instead of silently saving a
+  plaintext mnemonic. Existing encrypted and plaintext files remain readable.
 
 ## [0.3.0-rc14] — 2026-10-09 (prep; not tagged yet)
 

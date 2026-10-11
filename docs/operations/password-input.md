@@ -27,14 +27,27 @@ The input is a nonempty UTF-8 password, at most **4096 bytes**, including any
 line ending. Trailing CR and LF bytes are removed; spaces and interior newlines
 are preserved. Empty, invalid UTF-8, oversized, unreadable, and closed-descriptor
 inputs fail without a prompt or a fallback to plaintext initialization. An open
-pipe whose writer has not closed will wait for EOF. Use `--non-interactive` for
-unattended init so its backup ceremony does not also consume stdin.
+pipe whose writer has not closed will wait for EOF. When creating an encrypted
+mnemonic (`init` or first-run bootstrap), whitespace-only passwords are also
+rejected. Existing encrypted files retain their original password semantics.
+Use `--non-interactive` for unattended init so its backup ceremony does not also
+consume stdin.
 
 `start` rejects combinations of `--password-fd`, `--password`, and
 `--password-file`. `init --password-fd` implies encryption and conflicts with
 `--encrypt` (including its interactive form); omit `--encrypt` entirely.
 The legacy `init --encrypt <password>` and `start --password <password>` forms
 still work, but expose the secret in process arguments.
+
+`init --encrypt` and `restore --encrypt` require a password with at least one
+non-whitespace character; a blank prompt answer is an error, never a request for
+plaintext. `init --non-interactive --encrypt` without a value is also an error;
+use `--password-fd` for unattended encrypted initialization. Omit encryption
+options to deliberately create a plaintext mnemonic. `seed encrypt` keeps its
+minimum of ten characters and also rejects whitespace-only passwords. Invalid
+encryption passwords leave existing files untouched and create no new files.
+Passwords containing non-whitespace characters keep their spaces; only trailing
+CR/LF input terminators are removed from prompt and descriptor input.
 
 The node reads into a bounded zeroizing buffer, never prints the supplied bytes,
 and zeroizes the owned password after encryption or startup's last password use,
@@ -71,7 +84,8 @@ On a positively empty directory, `--password-fd` retains the password in
 zeroizing memory for encrypted bootstrap. Adding `--local-owner-device` enables
 first-run owner enrollment: create a pending identity, record the phrase once,
 and finalize with three backup words and the device's P-256 possession proof.
-The password is never an HTTP field. Empty passwords are rejected before serving.
+The password is never an HTTP field. Empty or whitespace-only passwords are
+rejected before serving.
 Without the enrollment flag, encrypted two-phase creation is available without
 a device. Legacy HTTP create/restore also write `identity/mnemonic.enc` whenever
 a startup password is supplied (including flag/file passwords, which still
