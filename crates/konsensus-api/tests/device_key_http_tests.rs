@@ -1129,7 +1129,6 @@ async fn tunnel_keeps_approval_and_owner_management_routes_absent() {
         ..(*base).clone()
     });
     for (method, path) in [
-        ("POST", "/api/v1/pair/device-key/op/delegate"),
         ("POST", "/api/v1/pair/device-key/op/approve"),
         ("DELETE", "/api/v1/pair/device-keys/key"),
         ("GET", "/api/v1/pair"),
@@ -1156,7 +1155,7 @@ async fn tunnel_keeps_approval_and_owner_management_routes_absent() {
 }
 
 // Pin the route declarations themselves: merging the full local device router
-// would accidentally expose delegation, self-revocation and relation intents.
+// would accidentally expose self-revocation and relation intents.
 #[test]
 fn remote_pairing_route_declarations_are_an_explicit_allowlist() {
     let source = include_str!("../src/handlers/pairing_routes.rs");
@@ -1192,6 +1191,10 @@ fn remote_pairing_route_declarations_are_an_explicit_allowlist() {
     assert_eq!(
         declarations,
         vec![
+            r#""/api/v1/pair/ticket",get(super::owner_device_routes::ticket_challenge).post(super::owner_device_routes::mint_ticket)"#,
+            r#""/api/v1/pair/device-key/pending",get(super::owner_device_routes::pending_devices)"#,
+            r#""/api/v1/pair/device-key/:op_id/delegation",get(super::owner_device_routes::pending_device)"#,
+            r#""/api/v1/pair/device-key/:op_id/delegate",post(super::owner_device_routes::delegate)"#,
             r#""/api/v1/pair/challenge",get(pair_challenge)"#,
             r#""/api/v1/pair/token",post(pair_token)"#,
             r#""/api/v1/pair/rotate",post(rotate_pairing)"#,
@@ -1352,4 +1355,335 @@ async fn sas_enrollment_http_uses_server_noise_context_and_grants_no_authority()
     ] {
         assert!(!pending.to_string().contains(&forbidden));
     }
+}
+
+#[tokio::test]
+async fn owner_tunnel_ticket_and_sas_delegation_happy_path_and_refusals() {
+    use konsensus_api::pairing::device;
+    use konsensus_api::rate_limit::{remote_tunnel_identity, RemoteTunnelClients};
+    let dir = tempfile::tempdir().unwrap();
+    let base = test_state();
+    let fp = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
+    let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "", &[9; 32]).unwrap();
+    let console = OwnerConsole::default();
+    let svc = PairingService::open(dir.path(), fp.clone(), true)
+        .unwrap()
+        .with_owner_approval_key(owner.verifying_key())
+        .with_owner_console(Box::new(console.clone()))
+        .without_stdout_code();
+    let signing = SigningKey::from_bytes(&[91; 32]);
+    let client = svc
+        .create_ticket_remote_pairing(
+            "owner",
+            &hex::encode(signing.verifying_key().to_bytes()),
+            &[92; 32],
+        )
+        .unwrap();
+    let rng = ring::rand::SystemRandom::new();
+    let new_key = || {
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap()
+    };
+    let key = new_key();
+    let sign = |key: &EcdsaKeyPair, msg: &str| {
+        hex::encode(key.sign(&rng, msg.as_bytes()).unwrap().as_ref())
+    };
+    let public = hex::encode(key.public_key().as_ref());
+    let op = svc
+        .request_device_key(
+            &client.client_id,
+            &public,
+            "owner",
+            &sign(&key, &registration_message(&fp, &client.client_id, &public)),
+        )
+        .unwrap();
+    let approved = svc
+        .approve_device_key(
+            &op.op_id,
+            &console.owner_code(&op.op_id),
+            &hex::encode(
+                owner
+                    .sign(
+                        device::owner_approval_message(
+                            &fp,
+                            &client.client_pubkey,
+                            client.epoch,
+                            &public,
+                        )
+                        .as_bytes(),
+                    )
+                    .to_bytes(),
+            ),
+        )
+        .unwrap();
+    drop(svc);
+    let svc = Arc::new(
+        PairingService::open(dir.path(), fp.clone(), false)
+            .unwrap()
+            .with_local_owner_device()
+            .with_owner_signing_key(owner)
+            .without_stdout_code(),
+    );
+    svc.configure_owner_tickets(&base.identity, vec!["127.0.0.1:9737".into()])
+        .unwrap();
+    let token_for = |client: &pairing::PairedClient, signing: &SigningKey| {
+        let challenge = svc.issue_token_challenge(&client.client_id).unwrap();
+        svc.issue_token(
+            &base.identity.node_id().to_hex(),
+            &base.jwt_secret,
+            &client.client_id,
+            &challenge,
+            &hex::encode(signing.sign(challenge.as_bytes()).to_bytes()),
+        )
+        .unwrap()
+        .token
+    };
+    let token = token_for(&client, &signing);
+    let state = Arc::new(AppState {
+        pairing: Some(svc.clone()),
+        data_dir: Some(dir.path().into()),
+        audit_log: Arc::new(
+            konsensus_api::audit::AuditLog::open(dir.path().join("audit.jsonl")).unwrap(),
+        ),
+        ..(*base).clone()
+    });
+    let tunnels = Arc::new(RemoteTunnelClients::default());
+    let peer = "127.0.0.1:40001".parse().unwrap();
+    let binding = konsensus_api::sas::NoiseBinding {
+        handshake_hash: [93; 32],
+        box_public_key: svc.box_transport_pubkey(),
+        client_static: [92; 32],
+    };
+    let registration = tunnels.register_noise(peer, client.client_id.clone(), binding);
+    let router = konsensus_api::build_remote_router_with_limiter(
+        state.clone(),
+        Arc::new(konsensus_api::rate_limit::RateLimiter::new(10_000)),
+    )
+    .layer(axum::middleware::from_fn_with_state(
+        tunnels.clone(),
+        remote_tunnel_identity,
+    ))
+    .layer(axum::extract::connect_info::MockConnectInfo(peer));
+    let challenge_path = format!("/api/v1/pair/ticket?approver_key_id={}", approved.key_id);
+    assert_eq!(
+        remote_call(&state, "GET", &challenge_path, None, Some(&token))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&state, "GET", &challenge_path, None, Some(&token))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, challenge) =
+        call_router(router.clone(), "GET", &challenge_path, None, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let body = json!({"approver_key_id":approved.key_id,"nonce":challenge["nonce"],"signature":sign(&key,challenge["message"].as_str().unwrap())});
+    let mut bad = body.clone();
+    bad["signature"] = json!(sign(&new_key(), challenge["message"].as_str().unwrap()));
+    assert_eq!(
+        call_router(
+            router.clone(),
+            "POST",
+            "/api/v1/pair/ticket",
+            Some(bad),
+            Some(&token)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, ticket) = call_router(
+        router.clone(),
+        "POST",
+        "/api/v1/pair/ticket",
+        Some(body.clone()),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ticket}");
+    assert_eq!(
+        call_router(
+            router.clone(),
+            "POST",
+            "/api/v1/pair/ticket",
+            Some(body),
+            Some(&token)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let link =
+        konsensus_api::remote_access::PairLink::from_uri(ticket["uri"].as_str().unwrap()).unwrap();
+    link.verify_endpoints(&base.identity.node_id().to_hex())
+        .unwrap();
+    let phone_signing = SigningKey::from_bytes(&[94; 32]);
+    let phone = svc
+        .consume_owner_ticket(
+            &link.code,
+            "phone",
+            &hex::encode(phone_signing.verifying_key().to_bytes()),
+            &[95; 32],
+        )
+        .unwrap();
+    let phone_token = token_for(&phone, &phone_signing);
+    // A read/receive (including AI) pairing cannot borrow the owner's key or token.
+    assert_eq!(
+        call_router(
+            router.clone(),
+            "GET",
+            &challenge_path,
+            None,
+            Some(&phone_token)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    drop(registration);
+    let phone_binding = konsensus_api::sas::NoiseBinding {
+        handshake_hash: [96; 32],
+        client_static: [95; 32],
+        ..binding
+    };
+    let phone_registration = tunnels.register_noise(peer, phone.client_id.clone(), phone_binding);
+    assert_eq!(
+        call_router(
+            router.clone(),
+            "GET",
+            &challenge_path,
+            None,
+            Some(&phone_token)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let phone_key = new_key();
+    let phone_public = hex::encode(phone_key.public_key().as_ref());
+    let (claim, _) = konsensus_api::sas::initialize(dir.path()).unwrap();
+    let (status,pending) = call_router(router.clone(),"POST","/api/v1/pair/device-key",Some(json!({"sas_version":1,"public_key":phone_public,"name":"phone","proof":sign(&phone_key,&registration_message(&fp,&phone.client_id,&phone_public))})),Some(&phone_token)).await;
+    assert_eq!(status, StatusCode::OK, "{pending}");
+    let op = pending["op_id"].as_str().unwrap();
+    let digest = konsensus_api::sas::digest(
+        &phone_binding,
+        &phone_key.public_key().as_ref().try_into().unwrap(),
+        &hex::decode(pending["box_nonce"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        &claim.commitment(),
+    );
+    let pending_path = format!(
+        "/api/v1/pair/device-key/pending?approver_key_id={}",
+        approved.key_id
+    );
+    assert_eq!(
+        call_router(
+            router.clone(),
+            "GET",
+            &pending_path,
+            None,
+            Some(&phone_token)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let view_path = format!(
+        "/api/v1/pair/device-key/{op}/delegation?approver_key_id={}",
+        approved.key_id
+    );
+    assert_eq!(
+        call_router(router.clone(), "GET", &view_path, None, Some(&phone_token))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(call_router(router.clone(),"POST",&format!("/api/v1/pair/device-key/{op}/finalize"),Some(json!({"sas_version":1,"sas_digest":digest.to_hex().to_string(),"proof":sign(&phone_key,&device::sas_registration_message(&fp,&phone.client_id,&phone_public,&digest))})),Some(&phone_token)).await.0,StatusCode::NO_CONTENT);
+    drop(phone_registration);
+    let _registration = tunnels.register_noise(peer, client.client_id.clone(), binding);
+    // The owner discovers the operation without receiving the phone's op id.
+    let pending_path = format!(
+        "/api/v1/pair/device-key/pending?approver_key_id={}",
+        approved.key_id
+    );
+    let (status, discovery) =
+        call_router(router.clone(), "GET", &pending_path, None, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{discovery}");
+    assert_eq!(discovery["pending"].as_array().unwrap().len(), 1);
+    let mut secret = Vec::new();
+    claim.write_local(&mut secret).unwrap();
+    assert!(!discovery
+        .to_string()
+        .contains(std::str::from_utf8(&secret).unwrap()));
+    assert!(!discovery
+        .to_string()
+        .contains(&hex::encode(claim.commitment())));
+    let discovered_op = discovery["pending"][0]["op_id"].as_str().unwrap();
+    let view_path = format!(
+        "/api/v1/pair/device-key/{discovered_op}/delegation?approver_key_id={}",
+        approved.key_id
+    );
+    let (status, view) = call_router(router.clone(), "GET", &view_path, None, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["sas_words"], json!(konsensus_api::sas::words(&digest)));
+    let delegation = json!({"approver_key_id":approved.key_id,"signature":sign(&key,view["delegation_message"].as_str().unwrap())});
+    let path = format!("/api/v1/pair/device-key/{discovered_op}/delegate");
+    assert_eq!(
+        remote_call(
+            &state,
+            "POST",
+            &path,
+            Some(delegation.clone()),
+            Some(&token)
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, result) = call_router(
+        router.clone(),
+        "POST",
+        &path,
+        Some(delegation.clone()),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["status"], "registered");
+    assert_eq!(
+        call_router(
+            router.clone(),
+            "POST",
+            &path,
+            Some(delegation),
+            Some(&token)
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let (_, discovery) =
+        call_router(router.clone(), "GET", &pending_path, None, Some(&token)).await;
+    assert_eq!(discovery["pending"], json!([]));
+    let audit = std::fs::read_to_string(state.audit_log.path()).unwrap();
+    assert!(audit.contains("pair.ticket_refused"));
+    assert!(audit.contains("pair.ticket_issued"));
+    assert!(audit.contains("pair.device_delegated"));
+    assert!(!audit.contains(&link.code));
+    assert!(!audit.contains(&digest.to_hex().to_string()));
+    svc.revoke_device_key(&approved.key_id, Some(&client.client_id))
+        .unwrap();
+    assert_eq!(
+        call_router(router, "GET", &challenge_path, None, Some(&token))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(svc.device_keys_for(&phone.client_id).len(), 1);
 }

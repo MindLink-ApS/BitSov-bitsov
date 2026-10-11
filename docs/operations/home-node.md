@@ -144,8 +144,10 @@ must happen before enabling remote unlock.
 While unlocked, the Noise tunnel exposes enrollment requests, status polling,
 cancellation, and read-only key listing. A tunnel-only paired client can request
 its key and wait for console approval. The HTTP API stays bound to loopback;
-no SSH port forward is needed for those four operations. Nothing on the tunnel
-can approve a device: delegation remains on the owner-local API.
+no SSH port forward is needed for those operations. An already enrolled owner
+device can also issue a short-lived ticket and approve a new device with a
+claim-bound SAS delegation over its own tunnel; see option D below. A paired
+token alone cannot issue tickets or approve a key.
 
 Pending registrations are capped at eight node-wide across local and tunnel
 requests (HTTP 429 at capacity), with the existing 30-second per-client floor,
@@ -209,25 +211,44 @@ cancellation, approval, or expiry frees a slot.
 
 ### Add further devices by delegation
 
-Use **option D** while the node is unlocked after a
-`--remote-unlock --local-owner-device` start. Issue another ticket, pair the new
-device, and have it request `POST /api/v1/pair/device-key` over the unlocked
-Noise tunnel or owner-local API. An already approved
-owner device verifies the node and compares the new device's fingerprint, then
-signs the exact pending `delegation_message`. Using **the approving device's
-paired token**, it submits `{approver_key_id, signature}` to
-`POST /api/v1/pair/device-key/{op_id}/delegate` on the owner-local API (available
-only through a local connection or a private SSH port forward to the loopback
-API, never through the Noise tunnel).
+Use **option D** while the node is unlocked after `--home` (or
+`--remote-unlock --local-owner-device`). With client support, the already enrolled
+owner device can add a phone over its existing Noise session, without an SSH
+forward, console approval, or node restart:
 
-This needs client support for delegation; see the
-[delegation contract](../security/device-keys.md#delegating-another-owner-device).
+1. The owner device requests `GET /api/v1/pair/ticket?approver_key_id=<key>` and
+   signs the returned `bitsov-ticket-v1` message with its enrolled P-256 key.
+   It posts `{approver_key_id, nonce, signature}` to `POST /api/v1/pair/ticket`.
+   The response contains a `bitsov://pair` URI for the new device's QR/link.
+   Tickets expire in five minutes, work once, and are lost on restart. The node
+   allows five tickets per rolling 15 minutes, shared across all owner devices.
+2. The new device consumes the ticket over Noise, then requests
+   `POST /api/v1/pair/device-key` with `sas_version: 1`, its key, name and
+   possession proof. It uses the returned `box_nonce`, its Noise transcript and
+   the existing claim-code ceremony to compute the four SAS words, then submits
+   its SAS-bound possession proof to `/api/v1/pair/device-key/{op_id}/finalize`.
+   The claim code remains required; the ticket does not replace it.
+3. The owner device discovers the pending request with
+   `GET /api/v1/pair/device-key/pending?approver_key_id=<key>` over its own
+   tunnel. It can refresh that operation at
+   `/api/v1/pair/device-key/{op_id}/delegation?approver_key_id=<key>`. Both
+   devices display the four words. After the owner compares them, the enrolled device signs the exact v2 `delegation_message` and posts
+   `{approver_key_id, signature}` to `/api/v1/pair/device-key/{op_id}/delegate`
+   using **the approving device's paired token**. The message is available only
+   after the new device completes SAS finalization.
+
+See the [wire contract](../security/device-keys.md#adding-a-device-over-the-noise-tunnel)
+for signature bytes, refusal rules and client integration details. The node
+provides these capabilities; the app must implement the QR and approval screens.
+Existing owner-local delegation remains available.
+
 The new device polls its pending operation until registered. After a restart,
 each paired device's unlock challenge lists its own approved `key_ids`; a pending,
 unapproved key is absent and cannot unlock. The node retains the owner signing
 key in memory after local-owner unlock so it can approve delegation. No console
 approval command is available in this mode. If there is no approved device,
-return to option A rather than trying to enroll while locked.
+return to option A rather than trying to enroll while locked. Enrollment does
+not transfer the seed password; the new device still needs it for later unlock.
 
 ## Receiving and channel safety while locked
 

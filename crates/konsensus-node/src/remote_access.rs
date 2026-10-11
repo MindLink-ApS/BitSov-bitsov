@@ -354,6 +354,7 @@ impl RemoteAccessServer {
             Some(&endpoints),
             konsensus_api::pairing::fsync_dir_strict,
         )?;
+        pairing.configure_owner_tickets(&identity, endpoints.clone())?;
         let path = pairing.remote_access_link_path();
         let _guard = crate::ticket_cmd::lock_ticket(path.parent().unwrap())?;
         let mut pairing_code = None;
@@ -1045,6 +1046,15 @@ fn authenticate_ticket(
     verifying
         .verify(proof.as_bytes(), &signature)
         .context("remote pairing proof did not verify")?;
+
+    // Owner-device tickets are strictly single use, including exact retries.
+    // Dispatch before the legacy CLI idempotency path; consumed/restarted tickets
+    // cannot fall back to an existing transport mapping.
+    if code.starts_with(konsensus_api::pairing::ticket::OWNER_TICKET_PREFIX) {
+        return pairing
+            .consume_owner_ticket(code, name, pubkey_hex, remote_static)
+            .map_err(anyhow::Error::from);
+    }
 
     // A response can be lost after the durable pairing is written and the
     // one-time code is consumed. Let that exact Ed25519 + Noise identity retry
@@ -1837,6 +1847,168 @@ mod tests {
         )
         .is_err());
         assert_eq!(pairing.list_clients().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn owner_ticket_listener_verifies_proof_consumes_once_and_rejects_exact_replay() {
+        use konsensus_api::pairing::device;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        #[derive(Clone, Default)]
+        struct Console(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Console {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let node = identity();
+        let fp = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
+        let owner = konsensus_core::OwnerApprovalKey::from_mnemonic(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "", &[9;32]).unwrap();
+        let console = Console::default();
+        let pairing = PairingService::open(dir.path(), fp.clone(), true)
+            .unwrap()
+            .with_owner_approval_key(owner.verifying_key())
+            .with_owner_console(Box::new(console.clone()))
+            .without_stdout_code();
+        let client_key = SigningKey::from_bytes(&[81; 32]);
+        let client = pairing
+            .create_ticket_remote_pairing(
+                "owner",
+                &hex::encode(client_key.verifying_key().to_bytes()),
+                &[82; 32],
+            )
+            .unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let device =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
+        let sign = |msg: &str| hex::encode(device.sign(&rng, msg.as_bytes()).unwrap().as_ref());
+        let public = hex::encode(device.public_key().as_ref());
+        let op = pairing
+            .request_device_key(
+                &client.client_id,
+                &public,
+                "owner",
+                &sign(&device::registration_message(
+                    &fp,
+                    &client.client_id,
+                    &public,
+                )),
+            )
+            .unwrap();
+        let text = String::from_utf8(console.0.lock().unwrap().clone()).unwrap();
+        let code = text
+            .lines()
+            .find_map(|l| l.split("type this code when it asks: ").nth(1))
+            .unwrap();
+        let key = pairing
+            .approve_device_key(
+                &op.op_id,
+                code,
+                &hex::encode(
+                    owner
+                        .sign(
+                            device::owner_approval_message(
+                                &fp,
+                                &client.client_pubkey,
+                                client.epoch,
+                                &public,
+                            )
+                            .as_bytes(),
+                        )
+                        .to_bytes(),
+                ),
+            )
+            .unwrap();
+        drop(pairing);
+        let pairing = Arc::new(
+            PairingService::open(dir.path(), fp.clone(), false)
+                .unwrap()
+                .with_local_owner_device()
+                .with_owner_signing_key(owner),
+        );
+        let server = RemoteAccessServer::bind(
+            &RemoteAccessConfig {
+                listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+                advertised_endpoint: Some("node.example:8443".into()),
+                ..Default::default()
+            },
+            node.clone(),
+            pairing.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            Arc::new(RemoteTunnelClients::default()),
+        )
+        .await
+        .unwrap();
+        let nonce = pairing
+            .owner_ticket_challenge(&client.client_id, client.epoch, &key.key_id)
+            .unwrap();
+        let ticket = pairing
+            .mint_owner_ticket(
+                &client.client_id,
+                client.epoch,
+                &key.key_id,
+                &nonce,
+                &sign(&format!("bitsov-ticket-v1\nnode:{fp}\nnonce:{nonce}")),
+            )
+            .unwrap();
+        ticket.verify_endpoints(&node.node_id().to_hex()).unwrap();
+        let request = request(
+            &node,
+            &[83; 32],
+            &ticket.code,
+            &SigningKey::from_bytes(&[84; 32]),
+        );
+        let mut bad = request.clone();
+        bad.signature = Some(URL_SAFE_NO_PAD.encode([0; 64]));
+        assert!(authenticate_from_file(
+            &bad,
+            &[83; 32],
+            &node.node_id().to_hex(),
+            &pairing,
+            &server.pairing_code
+        )
+        .is_err());
+        let barrier = std::sync::Barrier::new(2);
+        let successes = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        authenticate_from_file(
+                            &request,
+                            &[83; 32],
+                            &node.node_id().to_hex(),
+                            &pairing,
+                            &server.pairing_code,
+                        )
+                        .is_ok()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|ok| *ok)
+                .count()
+        });
+        assert_eq!(successes, 1);
+        assert_eq!(pairing.list_clients().len(), 2);
+        assert!(!pairing.remote_access_link_path().exists());
+        assert!(authenticate_from_file(
+            &request,
+            &[83; 32],
+            &node.node_id().to_hex(),
+            &pairing,
+            &server.pairing_code
+        )
+        .is_err());
     }
 
     #[tokio::test]
