@@ -377,9 +377,23 @@ impl Cln {
             .unwrap();
         file.write_all(cln.rune.as_bytes()).unwrap();
         let config = cln.config();
+        // Provider errors are static strings (never the rune or a response body),
+        // so print each distinct one: a timeout alone hides why construction failed.
+        let last_error = std::sync::Mutex::new(String::new());
         cln.daemon
             .wait_ready(wait("restricted clnrest TLS", || async {
-                ClnProvider::new(config.clone()).await.is_ok()
+                match ClnProvider::new(config.clone()).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        let message = e.to_string();
+                        let mut last = last_error.lock().unwrap();
+                        if *last != message {
+                            eprintln!("CLN provider not ready yet: {message}");
+                            *last = message;
+                        }
+                        false
+                    }
+                }
             }))
             .await;
         cln
