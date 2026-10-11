@@ -228,14 +228,19 @@ exactly the same JWT, live pairing binding and `read` scope checks as loopback:
 
 These routes never issue a grant. The unlocked Noise bridge forwards HTTP bytes
 without a path allowlist, but its destination is `build_remote_router_with_limiter`,
-which selects `pairing_routes::remote_routes`. Only the four device-key operations
-above are exposed. Delegation (`POST /pair/device-key/{op_id}/delegate`),
-self-revocation (`DELETE /pair/device-keys/{key_id}`), pairing list/revoke/window/
+which selects `pairing_routes::remote_routes`. Enrollment reads/requests and
+SAS finalization confer no owner authority. The tunnel additionally exposes
+owner-device ticket challenge/issuance, an owner-only pending SAS read, and
+`POST /pair/device-key/{op_id}/delegate`. These require an enrolled owner device,
+the matching live Noise pairing and local-owner mode; issuance and delegation
+also require that device's P-256 signature. Tunnel delegation accepts only the
+claim-bound SAS v2 message. See the [owner-device contract](device-keys.md#adding-a-device-over-the-noise-tunnel).
+
+Self-revocation (`DELETE /pair/device-keys/{key_id}`), pairing list/revoke/window/
 request/confirm, relation intents, first-contact-grant POST and identity replacement
-requests remain absent on the tunnel. Nothing on the tunnel approves a key.
-Approval stays at `konsensus device approve` or existing owner-device delegation
-on the owner-local API. Console enrollment requires `--owner-control` with a
-**typed** seed password; `--password-fd` disables owner device authority in that
+requests remain absent on the tunnel. Console approval itself remains available
+only at `konsensus device approve`. Console enrollment requires
+`--owner-control` with a **typed** seed password; `--password-fd` disables owner device authority in that
 mode. Spend elevation is still granted only through the owner control socket.
 Asking or quoting confers no spend scope.
 
@@ -673,7 +678,9 @@ The enrolling client then sends the tunnel-only
 confirmation. Existing console approval or an already enrolled device's signed
 delegation is still required. The v2 delegation domain additionally binds
 `\nsas_digest:<digest>`; its signing message is available only after confirmation.
-This PR does not expose delegation or ticket-minting over the tunnel.
+Enrolled owner devices can issue tickets, discover pending SAS operations and
+delegate over the tunnel in local-owner mode; see the
+[owner-device contract](device-keys.md#adding-a-device-over-the-noise-tunnel).
 
 Three mismatches/cancellations close new device ceremonies for that process.
 SAS confirmation is memory-only; its durable version marker ensures a restart

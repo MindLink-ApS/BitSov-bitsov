@@ -1871,3 +1871,381 @@ fn sas_device_cancels_and_mismatches_share_budget_and_restart_cannot_approve_old
         .is_err());
     assert!(restarted.device_keys().is_empty());
 }
+
+// Removing owner-key verification, nonce consumption, or issuer revalidation
+// must make these ticket authority tests fail.
+#[test]
+fn owner_ticket_signature_single_use_and_revocation() {
+    for revoke in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (svc, _, client, device, key_id) = registered(tmp.path());
+        drop(svc);
+        let svc = delegation_run(tmp.path());
+        let identity = konsensus_core::NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
+        svc.configure_owner_tickets(&identity, vec!["127.0.0.1:9737".into()])
+            .unwrap();
+        let nonce = svc
+            .owner_ticket_challenge(&client.client_id, client.epoch, &key_id)
+            .unwrap();
+        let message = format!("bitsov-ticket-v1\nnode:{}\nnonce:{}", fingerprint(), nonce);
+        assert!(svc
+            .mint_owner_ticket(
+                &client.client_id,
+                client.epoch,
+                &key_id,
+                &nonce,
+                &device.sign("wrong")
+            )
+            .is_err());
+        let ticket = svc
+            .mint_owner_ticket(
+                &client.client_id,
+                client.epoch,
+                &key_id,
+                &nonce,
+                &device.sign(&message),
+            )
+            .unwrap();
+        assert!(ticket.expires_at <= chrono::Utc::now().timestamp() + 300);
+        assert!(svc
+            .mint_owner_ticket(
+                &client.client_id,
+                client.epoch,
+                &key_id,
+                &nonce,
+                &device.sign(&message)
+            )
+            .is_err());
+        if revoke {
+            svc.revoke_device_key(&key_id, Some(&client.client_id))
+                .unwrap();
+        }
+        let target = SigningKey::from_bytes(&[93; 32]);
+        let result = svc.consume_owner_ticket(
+            &ticket.code,
+            "phone",
+            &hex::encode(target.verifying_key().to_bytes()),
+            &[94; 32],
+        );
+        assert_eq!(result.is_ok(), !revoke);
+        assert!(svc
+            .consume_owner_ticket(
+                &ticket.code,
+                "other",
+                &hex::encode(SigningKey::from_bytes(&[95; 32]).verifying_key().to_bytes()),
+                &[96; 32]
+            )
+            .is_err());
+        assert!(!svc.pairing_open());
+    }
+}
+
+#[test]
+fn owner_tickets_refuse_unenrolled_clients_wrong_epoch_and_rate_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (svc, _, client, device, key_id) = registered(tmp.path());
+    let (ai, _) = pair(&svc, 98);
+    drop(svc);
+    let svc = delegation_run(tmp.path());
+    let identity = konsensus_core::NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
+    svc.configure_owner_tickets(&identity, vec!["127.0.0.1:9737".into()])
+        .unwrap();
+    assert!(svc
+        .owner_ticket_challenge(&ai.client_id, ai.epoch, &key_id)
+        .is_err());
+    assert!(svc
+        .owner_ticket_challenge(&client.client_id, client.epoch + 1, &key_id)
+        .is_err());
+    for _ in 0..5 {
+        let nonce = svc
+            .owner_ticket_challenge(&client.client_id, client.epoch, &key_id)
+            .unwrap();
+        let message = format!("bitsov-ticket-v1\nnode:{}\nnonce:{}", fingerprint(), nonce);
+        svc.mint_owner_ticket(
+            &client.client_id,
+            client.epoch,
+            &key_id,
+            &nonce,
+            &device.sign(&message),
+        )
+        .unwrap();
+    }
+    let nonce = svc
+        .owner_ticket_challenge(&client.client_id, client.epoch, &key_id)
+        .unwrap();
+    let message = format!("bitsov-ticket-v1\nnode:{}\nnonce:{}", fingerprint(), nonce);
+    assert!(matches!(
+        svc.mint_owner_ticket(
+            &client.client_id,
+            client.epoch,
+            &key_id,
+            &nonce,
+            &device.sign(&message)
+        ),
+        Err(PairingError::TooManyPending)
+    ));
+    drop(svc);
+    assert!(delegation_run(tmp.path())
+        .mint_owner_ticket(
+            &client.client_id,
+            client.epoch,
+            &key_id,
+            &nonce,
+            &device.sign(&message)
+        )
+        .is_err());
+}
+
+#[test]
+fn tunnel_delegation_requires_confirmed_claim_sas_and_v2_signature() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (svc, _, client, device, key_id) = registered(tmp.path());
+    drop(svc);
+    let svc = delegation_run(tmp.path());
+    let target = svc
+        .create_ticket_remote_pairing(
+            "phone",
+            &hex::encode(SigningKey::from_bytes(&[78; 32]).verifying_key().to_bytes()),
+            &[79; 32],
+        )
+        .unwrap();
+    let new = Device::new();
+    let (claim, _) = konsensus_api::sas::initialize(tmp.path()).unwrap();
+    let binding = konsensus_api::sas::NoiseBinding {
+        handshake_hash: [80; 32],
+        box_public_key: svc.box_transport_pubkey(),
+        client_static: [79; 32],
+    };
+    let op = svc
+        .request_device_key_with_sas(
+            &target.client_id,
+            &new.public_hex(),
+            "phone",
+            &new.proof(&target.client_id),
+            Some(binding),
+        )
+        .unwrap();
+    let digest = konsensus_api::sas::digest(
+        &binding,
+        &new.key.public_key().as_ref().try_into().unwrap(),
+        &hex::decode(op.box_nonce().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        &claim.commitment(),
+    );
+    let message = format!("bitsov-owner-delegation-v2\nnode:{}\nclient_pubkey:{}\nepoch:{}\ndevice_key:{}\nop_id:{}\nnonce:{}\nsas_digest:{}",fingerprint(),op.client_pubkey,op.epoch,op.public_key,op.op_id,op.delegation_nonce,digest.to_hex());
+    let delegate = |signature: &str| {
+        svc.delegate_device_key_over_tunnel(
+            &client.client_id,
+            client.epoch,
+            &op.op_id,
+            &key_id,
+            signature,
+        )
+    };
+    assert!(delegate(&device.sign(&message)).is_err());
+    assert!(svc
+        .owner_pending_device(&target.client_id, target.epoch, &key_id, &op.op_id)
+        .is_err());
+    let view = svc
+        .owner_pending_device(&client.client_id, client.epoch, &key_id, &op.op_id)
+        .unwrap();
+    assert_eq!(
+        view["sas_words"],
+        serde_json::json!(konsensus_api::sas::words(&digest))
+    );
+    assert!(view["delegation_message"].is_null());
+    assert_eq!(
+        svc.owner_pending_devices(&client.client_id, client.epoch, &key_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    let restarted = delegation_run(tmp.path());
+    assert!(restarted
+        .owner_pending_devices(&client.client_id, client.epoch, &key_id)
+        .unwrap()
+        .is_empty());
+    assert!(restarted
+        .delegate_device_key_over_tunnel(
+            &client.client_id,
+            client.epoch,
+            &op.op_id,
+            &key_id,
+            &device.sign(&message)
+        )
+        .is_err());
+
+    svc.confirm_device_sas(
+        &target.client_id,
+        &op.op_id,
+        &binding,
+        &digest.to_hex(),
+        &new.sign(&device::sas_registration_message(
+            &fingerprint(),
+            &target.client_id,
+            &new.public_hex(),
+            &digest,
+        )),
+    )
+    .unwrap();
+    for invalid in [
+        delegation_bytes(&op),
+        message.replace(&digest.to_hex().to_string(), &"00".repeat(32)),
+        message.replace(&op.op_id, &"00".repeat(12)),
+    ] {
+        assert!(delegate(&device.sign(&invalid)).is_err());
+        assert_eq!(svc.device_keys().len(), 1);
+    }
+    let view = svc
+        .owner_pending_device(&client.client_id, client.epoch, &key_id, &op.op_id)
+        .unwrap();
+    assert_eq!(view["delegation_message"], message);
+    assert!(delegate(&new.sign(&message)).is_err());
+    delegate(&device.sign(&message)).unwrap();
+    assert!(delegate(&device.sign(&message)).is_err());
+    assert_eq!(svc.device_keys_for(&target.client_id).len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn owner_ticket_and_nonce_expire_and_rate_window_recovers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (svc, _, client, device, key_id) = registered(tmp.path());
+    drop(svc);
+    let svc = delegation_run(tmp.path());
+    let identity = konsensus_core::NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
+    svc.configure_owner_tickets(&identity, vec!["127.0.0.1:9737".into()])
+        .unwrap();
+    let mint = |nonce: &str| {
+        svc.mint_owner_ticket(
+            &client.client_id,
+            client.epoch,
+            &key_id,
+            nonce,
+            &device.sign(&format!(
+                "bitsov-ticket-v1\nnode:{}\nnonce:{nonce}",
+                fingerprint()
+            )),
+        )
+    };
+    let nonce = svc
+        .owner_ticket_challenge(&client.client_id, client.epoch, &key_id)
+        .unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(300)).await;
+    assert!(mint(&nonce).is_err(), "expired challenge must not mint");
+    let nonce = svc
+        .owner_ticket_challenge(&client.client_id, client.epoch, &key_id)
+        .unwrap();
+    let ticket = mint(&nonce).unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(300)).await;
+    assert!(svc
+        .consume_owner_ticket(
+            &ticket.code,
+            "phone",
+            &hex::encode(SigningKey::from_bytes(&[97; 32]).verifying_key().to_bytes()),
+            &[98; 32]
+        )
+        .is_err());
+    for _ in 0..4 {
+        let n = svc
+            .owner_ticket_challenge(&client.client_id, client.epoch, &key_id)
+            .unwrap();
+        mint(&n).unwrap();
+    }
+    let nonce = svc
+        .owner_ticket_challenge(&client.client_id, client.epoch, &key_id)
+        .unwrap();
+    assert!(matches!(mint(&nonce), Err(PairingError::TooManyPending)));
+    tokio::time::advance(std::time::Duration::from_secs(900)).await;
+    let nonce = svc
+        .owner_ticket_challenge(&client.client_id, client.epoch, &key_id)
+        .unwrap();
+    mint(&nonce).unwrap();
+}
+
+#[test]
+fn owner_ticket_rechecks_mode_signer_approval_pairing_epoch_and_restart() {
+    for refusal in ["mode", "signer", "approval", "pairing", "epoch", "restart"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (svc, _, client, device, key_id) = registered(tmp.path());
+        drop(svc);
+        let mut svc = delegation_run(tmp.path());
+        let identity = konsensus_core::NodeIdentity::from_mnemonic(MNEMONIC, "").unwrap();
+        svc.configure_owner_tickets(&identity, vec!["127.0.0.1:9737".into()])
+            .unwrap();
+        let nonce = svc
+            .owner_ticket_challenge(&client.client_id, client.epoch, &key_id)
+            .unwrap();
+        let sig = device.sign(&format!(
+            "bitsov-ticket-v1\nnode:{}\nnonce:{nonce}",
+            fingerprint()
+        ));
+        let ticket = svc
+            .mint_owner_ticket(&client.client_id, client.epoch, &key_id, &nonce, &sig)
+            .unwrap();
+        match refusal {
+            "mode" => {
+                svc = PairingService::open(tmp.path(), fingerprint(), true)
+                    .unwrap()
+                    .with_owner_approval_key(owner_key().verifying_key());
+            }
+            "signer" => {
+                svc = local_run(tmp.path());
+            }
+            "approval" => {
+                svc = svc.with_owner_signing_key(
+                    OwnerApprovalKey::from_mnemonic(MNEMONIC, "", &[8; 32]).unwrap(),
+                );
+            }
+            "pairing" => svc.revoke(&client.client_id).unwrap(),
+            "epoch" => {
+                svc.bump_epoch(&client.client_id).unwrap();
+            }
+            "restart" => {
+                svc = delegation_run(tmp.path());
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            svc.mint_owner_ticket(&client.client_id, client.epoch, &key_id, &nonce, &sig)
+                .is_err(),
+            "{refusal}"
+        );
+        assert!(
+            svc.consume_owner_ticket(
+                &ticket.code,
+                "phone",
+                &hex::encode(SigningKey::from_bytes(&[97; 32]).verifying_key().to_bytes()),
+                &[98; 32]
+            )
+            .is_err(),
+            "{refusal}"
+        );
+    }
+}
+
+#[test]
+fn tunnel_delegation_cannot_downgrade_a_legacy_operation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (svc, _, client, device, key_id) = registered(tmp.path());
+    let (target, _) = pair(&svc, 99);
+    drop(svc);
+    let svc = delegation_run(tmp.path());
+    let new = Device::new();
+    let op = svc
+        .request_device_key(
+            &target.client_id,
+            &new.public_hex(),
+            "phone",
+            &new.proof(&target.client_id),
+        )
+        .unwrap();
+    let sig = device.sign(&delegation_bytes(&op));
+    assert!(svc
+        .delegate_device_key_over_tunnel(&client.client_id, client.epoch, &op.op_id, &key_id, &sig)
+        .is_err());
+    assert!(svc.device_keys_for(&target.client_id).is_empty());
+    svc.delegate_device_key(&client.client_id, client.epoch, &op.op_id, &key_id, &sig)
+        .unwrap();
+}

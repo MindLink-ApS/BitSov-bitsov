@@ -5,6 +5,17 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+### Node / Security
+
+- Enrolled owner devices can add another device over their existing Noise tunnel
+  while unlocked in `--home` / local-owner mode. Device-signed ticket issuance
+  produces five-minute, single-use tickets with replay protection, rate limits,
+  issuer revocation checks and audit events. Owner-only SAS inspection and v2
+  delegation retain the existing claim, possession, epoch and owner-approval
+  checks. Non-owner pairings cannot issue tickets or approve keys; locked-mode
+  and console-only authority boundaries remain unchanged. Client QR/approval
+  UI support is required. See [home-node operations](docs/operations/home-node.md#add-further-devices-by-delegation).
+
 ## [0.3.0-rc14] — 2026-10-09 (prep; not tagged yet)
 
 **Pre-release.** Not for production use. Includes the seven PRs merged after

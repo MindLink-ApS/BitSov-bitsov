@@ -312,7 +312,7 @@ pub fn intent_message(node: &str, client_id: &str, intent: &RelationIntent) -> S
     )
 }
 
-fn parse_public_key(public_key_hex: &str) -> Result<Vec<u8>, PairingError> {
+pub(super) fn parse_public_key(public_key_hex: &str) -> Result<Vec<u8>, PairingError> {
     let raw = hex::decode(public_key_hex)
         .map_err(|_| PairingError::Malformed("device key is not hex".into()))?;
     if raw.len() != 65 || raw[0] != 0x04 {
@@ -325,7 +325,11 @@ fn parse_public_key(public_key_hex: &str) -> Result<Vec<u8>, PairingError> {
 
 /// ECDSA P-256 / SHA-256, DER signature (what CryptoKit's
 /// `derRepresentation` produces). `ring` rejects points off the curve.
-fn verify_p256(public_key: &[u8], message: &[u8], signature_hex: &str) -> Result<(), PairingError> {
+pub(super) fn verify_p256(
+    public_key: &[u8],
+    message: &[u8],
+    signature_hex: &str,
+) -> Result<(), PairingError> {
     let sig = hex::decode(signature_hex).map_err(|_| PairingError::BadProof)?;
     ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, public_key)
         .verify(message, &sig)
@@ -835,6 +839,44 @@ impl PairingService {
         approver_key_id: &str,
         signature: &str,
     ) -> Result<DeviceKey, PairingError> {
+        self.delegate_device_key_inner(
+            approver_client_id,
+            approver_epoch,
+            op_id,
+            approver_key_id,
+            signature,
+            false,
+        )
+    }
+
+    /// Tunnel delegation always requires the claim-bound SAS v2 ceremony.
+    pub fn delegate_device_key_over_tunnel(
+        &self,
+        approver_client_id: &str,
+        approver_epoch: u64,
+        op_id: &str,
+        approver_key_id: &str,
+        signature: &str,
+    ) -> Result<DeviceKey, PairingError> {
+        self.delegate_device_key_inner(
+            approver_client_id,
+            approver_epoch,
+            op_id,
+            approver_key_id,
+            signature,
+            true,
+        )
+    }
+
+    fn delegate_device_key_inner(
+        &self,
+        approver_client_id: &str,
+        approver_epoch: u64,
+        op_id: &str,
+        approver_key_id: &str,
+        signature: &str,
+        require_sas: bool,
+    ) -> Result<DeviceKey, PairingError> {
         if !self.local_owner_device {
             return Err(PairingError::OwnerChannelUnavailable);
         }
@@ -853,6 +895,9 @@ impl PairingService {
             .find(|p| p.op_id == op_id)
             .cloned()
             .ok_or(PairingError::UnknownOperation)?;
+        if require_sas && (op.sas_version != Some(1) || op.sas.is_none()) {
+            return Err(PairingError::BadProof);
+        }
         let now = chrono::Utc::now().timestamp();
         if op.expires_at <= now {
             return Err(PairingError::Expired);
@@ -1246,7 +1291,7 @@ impl PairingService {
             .ok_or(PairingError::DeviceApprovalsDisabled(OWNER_KEY_UNAVAILABLE))
     }
 
-    fn intent_key(
+    pub(super) fn intent_key(
         &self,
         inner: &Inner,
         client_id: &str,

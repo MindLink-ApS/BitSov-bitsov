@@ -715,13 +715,31 @@ pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
 /// transport. The remote listener performs first pairing itself, so the
 /// file-challenge ceremony and owner-management routes are not exposed here.
 /// Device-key requests, status, cancellation and listing confer no authority;
-/// approval/delegation, key revocation and relation intents stay owner-local.
+/// owner-device ticket issuance and SAS delegation require an enrolled key.
+/// Console approval, key revocation and relation intents stay owner-local.
 /// Locked mode uses its own four-route router, never this one.
 pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
     if !pairing_enabled {
         return Router::new();
     }
     Router::new()
+        .route(
+            "/api/v1/pair/ticket",
+            get(super::owner_device_routes::ticket_challenge)
+                .post(super::owner_device_routes::mint_ticket),
+        )
+        .route(
+            "/api/v1/pair/device-key/pending",
+            get(super::owner_device_routes::pending_devices),
+        )
+        .route(
+            "/api/v1/pair/device-key/:op_id/delegation",
+            get(super::owner_device_routes::pending_device),
+        )
+        .route(
+            "/api/v1/pair/device-key/:op_id/delegate",
+            post(super::owner_device_routes::delegate),
+        )
         .route("/api/v1/pair/challenge", get(pair_challenge))
         .route("/api/v1/pair/token", post(pair_token))
         .route("/api/v1/pair/rotate", post(rotate_pairing))
