@@ -709,6 +709,7 @@ pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
             post(replacement_request),
         )
         .merge(super::device_routes::routes())
+        .merge(super::owner_approval_routes::request_routes())
 }
 
 /// Pairing routes needed by a client that has already authenticated its Noise
@@ -723,6 +724,22 @@ pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
         return Router::new();
     }
     Router::new()
+        .route(
+            "/api/v1/pair/approval-request",
+            post(super::owner_approval_routes::request),
+        )
+        .route(
+            "/api/v1/pair/approval/:op_id",
+            get(super::owner_approval_routes::status),
+        )
+        .route(
+            "/api/v1/pair/approvals/pending",
+            get(super::owner_approval_routes::pending),
+        )
+        .route(
+            "/api/v1/pair/approval/:op_id/approve",
+            post(super::owner_approval_routes::approve),
+        )
         .route(
             "/api/v1/pair/ticket",
             get(super::owner_device_routes::ticket_challenge)

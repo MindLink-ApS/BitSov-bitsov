@@ -19,6 +19,7 @@ pub mod invites;
 pub mod messages;
 pub mod onboarding;
 pub mod organism;
+pub(crate) mod owner_approval_routes;
 pub(crate) mod owner_device_routes;
 pub mod pairing_routes;
 pub mod payments;

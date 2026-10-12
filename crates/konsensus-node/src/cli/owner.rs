@@ -282,7 +282,11 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             front_door_grants,
             device_keys,
             pending_device_keys,
+            pending_owner_approvals,
         } => {
+            for p in pending_owner_approvals {
+                safe_println!("PENDING OWNER APPROVAL {} kind={} client={} expires_at={} (approve on a different enrolled owner device)", p.op_id, p.kind, p.client_id, p.expires_at);
+            }
             for k in &device_keys {
                 safe_println!(
                     "DEVICE KEY {}  {:?}  client={}",

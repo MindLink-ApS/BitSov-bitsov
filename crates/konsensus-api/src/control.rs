@@ -200,6 +200,9 @@ pub enum ControlResponse {
         /// Device keys awaiting the owner.
         #[serde(default)]
         pending_device_keys: Vec<PendingDeviceKeySummary>,
+        /// Pending separate-device spend/first-contact approvals.
+        #[serde(default)]
+        pending_owner_approvals: Vec<OwnerApprovalSummary>,
     },
     /// A rendered pending operation and public label, never its secret nonce.
     Describe {
@@ -270,6 +273,19 @@ pub struct DeviceKeySummary {
     pub name: String,
     /// Unix seconds it was approved.
     pub registered_at: i64,
+}
+
+/// An observational summary, never an approval credential.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerApprovalSummary {
+    /// Server-issued operation id.
+    pub op_id: String,
+    /// Requesting pairing.
+    pub client_id: String,
+    /// spend_grant or first_contact.
+    pub kind: String,
+    /// Approval deadline.
+    pub expires_at: i64,
 }
 
 /// A device key awaiting the owner, as rendered to the owner.
@@ -469,6 +485,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                         registered_at: k.registered_at,
                     })
                     .collect(),
+                pending_owner_approvals: service.pending_owner_approvals().into_iter().map(|p| OwnerApprovalSummary {op_id:p.operation.op_id, client_id:p.operation.client_id, kind:p.operation.request.kind().into(), expires_at:p.operation.expires_at}).collect(),
                 pending_device_keys: service
                     .pending_device_keys()
                     .into_iter()

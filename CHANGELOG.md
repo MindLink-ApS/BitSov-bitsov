@@ -7,6 +7,15 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Node / Security
 
+- Add `owner_device_approval_v1`: paired clients can request bounded spend
+  windows and one-use first-contact approvals; only a different enrolled owner
+  device on its own token and authenticated Noise session can approve the exact
+  node-rendered terms. Includes atomic consumption, signed spend receipts,
+  current-epoch checks, request/approval limits, secret-free audit events and
+  pending/status discovery. Works in owner-control and home modes; console
+  approvals remain available. Breaker reset and root-of-trust operations are
+  outside this change. See [owner approvals](docs/v2/OWNER-APPROVALS.md).
+
 - Enrolled owner devices can add another device over their existing Noise tunnel
   while unlocked in `--home` / local-owner mode. Device-signed ticket issuance
   produces five-minute, single-use tickets with replay protection, rate limits,

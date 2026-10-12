@@ -1227,6 +1227,7 @@ impl PairingService {
                 let mut op = [0u8; 12];
                 rand::thread_rng().fill_bytes(&mut op);
                 inner.file.grants.push(SpendGrant {
+                    owner_approval: None,
                     op_id: format!("rel-{}", hex::encode(op)),
                     client_id: client_id.to_string(),
                     scopes: vec![Scope::Spend],

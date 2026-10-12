@@ -1191,6 +1191,10 @@ fn remote_pairing_route_declarations_are_an_explicit_allowlist() {
     assert_eq!(
         declarations,
         vec![
+            r#""/api/v1/pair/approval-request",post(super::owner_approval_routes::request)"#,
+            r#""/api/v1/pair/approval/:op_id",get(super::owner_approval_routes::status)"#,
+            r#""/api/v1/pair/approvals/pending",get(super::owner_approval_routes::pending)"#,
+            r#""/api/v1/pair/approval/:op_id/approve",post(super::owner_approval_routes::approve)"#,
             r#""/api/v1/pair/ticket",get(super::owner_device_routes::ticket_challenge).post(super::owner_device_routes::mint_ticket)"#,
             r#""/api/v1/pair/device-key/pending",get(super::owner_device_routes::pending_devices)"#,
             r#""/api/v1/pair/device-key/:op_id/delegation",get(super::owner_device_routes::pending_device)"#,

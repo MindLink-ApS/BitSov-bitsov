@@ -202,9 +202,12 @@ that are not on the curve.
 for an existing enrolled key. It requires a descriptor password and an encrypted
 seed with no plaintext sibling; the owner signing key stays in zeroizing memory
 for delegation. Enrollment requires an existing owner device signature.
-It never enables console grants, front-door, replacement or
-first-contact approval. Local spend scopes, staging and dispatch require an
-owner verifier and a live `device:` grant with a `recipients_only` budget. Startup
+It never enables console grants, front-door or replacement. First-contact
+and ordinary spend windows can be approved by a **different enrolled owner
+device** through [owner-approval-v1](../v2/OWNER-APPROVALS.md), over that device's
+own token and authenticated Noise session. Local spend scopes, staging and
+dispatch require an owner verifier and either a live `device:` relation grant
+with a `recipients_only` budget or a verified owner-approval-v1 spend receipt. Startup
 refuses local mode before writing files if the owner verifier cannot be derived.
 Console grants on disk stay inactive. See
 [password input](../operations/password-input.md) for launcher trust and release
@@ -326,3 +329,17 @@ the biometric lives on the device.
   `spend` that move no value (such as the file-upload gate) accept it too.
 - Pending identity replacements also get fresh codes after a restart. As
   before, they accept only the full console line.
+
+## Separate-device spend and first-contact approval
+
+`owner_device_approval_v1` adds proposal-only paired requests and tunnel-only
+approval by another owner device. The node renders the exact requester/node
+bindings, grant snapshot, budget terms, operation, nonce and expiry; the owner
+signs those bytes. `intent_key` rechecks the owner attestation and current epoch.
+AI/read-only tokens without an enrolled owner key, revoked keys, and the
+requesting pairing itself cannot approve. Consumption and grant persistence
+share the pairing mutex, with bounded request/approval rates and secret-free
+audit events. First contact reuses console budget checks, lasts at most two
+minutes and is consumed once. See [the protocol](../v2/OWNER-APPROVALS.md) for
+wire examples, signed receipts, status and compatibility. Breaker resets and
+root-of-trust operations are outside this feature.

@@ -68,6 +68,9 @@ pub const FIRST_CONTACT_MAX_MSAT: u64 = 100_000;
 /// Paying it still debits the budget grant, once, for what actually settled.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirstContactGrant {
+    /// Provenance of a device approval; absent on the unchanged console path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_by: Option<String>,
     /// Canonical recipient key (lowercase hex node id).
     pub recipient: String,
     /// Admission plus first message and approved routing fees, msat.

@@ -15,7 +15,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 
-use crate::auth::scoped::{ScopedAuth, Read};
+use crate::auth::scoped::{Read, ScopedAuth};
 use crate::freshness::DataFreshness;
 use crate::state::AppState;
 
@@ -118,7 +118,9 @@ pub fn stun_url(endpoint: Option<&str>, stun_port: Option<u16>) -> Option<String
     }
     if host.is_empty()
         || host.eq_ignore_ascii_case("localhost")
-        || !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
     {
         return None;
     }
@@ -189,17 +191,25 @@ async fn health(State(state): State<Arc<AppState>>) -> (DataFreshness, Json<Publ
     let chain_read = DataFreshness::now();
     let (block_height, freshness) = if !readiness.money_ready {
         (None, DataFreshness::unknown())
-    } else { match tokio::time::timeout(std::time::Duration::from_secs(1), state.chain.get_block_height()).await {
-        Ok(Ok(h)) => (Some(h), chain_read),
-        _ => {
-            (None, DataFreshness::unknown())
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.chain.get_block_height(),
+        )
+        .await
+        {
+            Ok(Ok(h)) => (Some(h), chain_read),
+            _ => (None, DataFreshness::unknown()),
         }
-    }};
+    };
 
     (
         freshness,
         Json(PublicHealthResponse {
-            hosted_by: state.pairing.as_ref().and_then(|p| p.hosted_by().map(str::to_owned)),
+            hosted_by: state
+                .pairing
+                .as_ref()
+                .and_then(|p| p.hosted_by().map(str::to_owned)),
             status: "ok",
             connected_peers: connected.len(),
             e2ee_sessions: session_count,
@@ -263,8 +273,16 @@ async fn status(
     let uptime = state.started_at.elapsed().as_secs();
 
     let block_height = if readiness.money_ready {
-        tokio::time::timeout(std::time::Duration::from_secs(1), state.chain.get_block_height()).await.ok().and_then(Result::ok)
-    } else { None };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.chain.get_block_height(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+    } else {
+        None
+    };
 
     let peer = state.introduction.endpoint_view();
     let disk = state.lightning.disk_status();
@@ -286,6 +304,7 @@ async fn status(
         money_ready: readiness.money_ready,
         readiness,
         api_capabilities: vec![
+            crate::pairing::approval::CAPABILITY,
             "storage_list_diagnostics_v1",
             "offline_readiness_v1",
             "message_operations_v1",
