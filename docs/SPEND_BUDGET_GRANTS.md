@@ -6,8 +6,9 @@ A paired client's `spend` now comes only from a **budget grant**: an absolute
 expiry (at most 24 h), a total budget, optional per-recipient budgets and a
 per-call maximum. The 30-day unmetered grant is gone. A pre-G1 grant without a
 budget is dropped when the pairing store is opened and is never honoured. The
-store is now version 6. Older nodes refuse to open it rather than ignore
-allowlists, payment deduplication or circuit breakers; existing version 2–5 grants remain readable.
+store is now version 7. Older nodes refuse to open it rather than ignore
+allowlists, payment deduplication, circuit breakers or device-reset limits;
+existing version 2–6 grants remain readable.
 
 ## Owner flow (one command per budget window)
 
@@ -151,7 +152,7 @@ a payment already handed to the backend cannot be recalled.
 `konsensus pair-status`, owner socket status and `/api/v1/pair/grant` expose a
 `breakers` view: limits, minute/hour attempt counts, reserved msat in the last
 10 minutes, consecutive failures, unresolved payments, and `paused`.
-The owner console alone can reset the exact reviewed grant:
+The owner console can reset the exact reviewed grant:
 
 ```sh
 konsensus grant-reset-breakers --client-id <id> --op <grant-op-id>
@@ -160,9 +161,19 @@ konsensus grant-reset-breakers --client-id <id> --op <grant-op-id>
 This clears rolling history, the failure streak and the pause atomically. It
 preserves spent budget, pending/unknown reservations, expiry, payee restrictions
 and consumed payment IDs. Thus a reset cannot refund money or make an uncertain
-payment safe to repeat; pending failure slots still apply. There is no paired
-HTTP or device-intent reset operation. Reset requires the owner control channel
-and names the grant operation to prevent resetting a replacement by accident.
+payment safe to repeat; pending failure slots still apply. The console reset
+requires the owner control channel and names the grant operation to prevent
+resetting a replacement by accident. Its command and authorization are unchanged.
+
+With `owner_device_approval_breaker_reset_v1`, a paired client may also request
+`breaker_reset` through [owner-approval-v1](v2/OWNER-APPROVALS.md#breaker-reset-v1-sub-flag).
+Only a different enrolled owner device, using its own token and matching Noise
+session, can sign the node-rendered grant/breaker/remaining-budget/failure terms.
+Even an enrolled owner device cannot reset its own pairing. Three successful
+device resets per grant per rolling day are allowed, durably and atomically;
+console reset cannot erase that quota. Accounting changes or an intervening
+reset invalidate old terms. Pairing storage v7 retains the quota, reset
+generation and observed rate/velocity refusal; older binaries refuse v7.
 A failed write refuses reservation/reset and restores the previous meter; a
 failed resolution retains the original reservation and its possible failure slot.
 

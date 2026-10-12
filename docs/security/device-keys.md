@@ -330,7 +330,7 @@ the biometric lives on the device.
 - Pending identity replacements also get fresh codes after a restart. As
   before, they accept only the full console line.
 
-## Separate-device spend and first-contact approval
+## Separate-device spend, first-contact and breaker-reset approval
 
 `owner_device_approval_v1` adds proposal-only paired requests and tunnel-only
 approval by another owner device. The node renders the exact requester/node
@@ -341,5 +341,15 @@ requesting pairing itself cannot approve. Consumption and grant persistence
 share the pairing mutex, with bounded request/approval rates and secret-free
 audit events. First contact reuses console budget checks, lasts at most two
 minutes and is consumed once. See [the protocol](../v2/OWNER-APPROVALS.md) for
-wire examples, signed receipts, status and compatibility. Breaker resets and
-root-of-trust operations are outside this feature.
+wire examples, signed receipts, status and compatibility.
+
+The additive `owner_device_approval_breaker_reset_v1` sub-flag allows a different
+enrolled owner device to approve `breaker_reset`. A paused pairing can never
+reset itself, even with an enrolled key. Exact signed terms include the grant,
+tripped breakers, remaining budget, failure streak, unresolved slots and reset
+quota. The node rechecks the complete meter snapshot and reset generation under
+the pairing mutex. Reset preserves spent budget, pending reservations, dedupe,
+expiry and restrictions. Three device resets per grant per rolling day are
+persisted across restart and console reset; successful and refused approvals
+are audited. Pairing storage v7 prevents older binaries discarding this state.
+Console reset and root-of-trust operations retain their existing authority paths.

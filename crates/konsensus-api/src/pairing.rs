@@ -496,7 +496,8 @@ impl PairingFile {
 /// 4 (remote access): pairings may bind an X25519 transport public key.
 /// 5: optional payee allowlists and durable payment deduplication.
 /// 6: durable circuit breaker limits, rolling history and failure pauses.
-pub const PAIRING_FILE_VERSION: u32 = 6;
+/// 7: durable device-reset quota, reset generation and observed rolling refusals.
+pub const PAIRING_FILE_VERSION: u32 = 7;
 
 /// A pending pairing request. Held in memory; the challenge itself lives in the
 /// protected file under `data_dir`, which is the actual control.
@@ -3035,6 +3036,14 @@ impl PairingService {
             ));
         }
         if let Err(refusal) = budget.reserve_at(&charges, now) {
+            if budget.record_breaker_refusal(&refusal, now) {
+                if let Err(e) = self.persist(&mut inner.file) {
+                    if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
+                        g.budget = before;
+                    }
+                    return Err(BudgetRefusal::Ledger(e.to_string()));
+                }
+            }
             tracing::warn!(client_id, grant_op_id = %op_id, reason = refusal.reason(), "grant reservation refused");
             return Err(refusal);
         }

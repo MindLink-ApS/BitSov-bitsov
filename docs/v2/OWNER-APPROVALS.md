@@ -146,7 +146,9 @@ These local commands do not add an app-callable approval route. See also
 # Owner device approvals (v1)
 
 `owner_device_approval_v1` in `/api/v1/status` advertises support for
-`spend_grant` and `first_contact`. This is the node portion of the feature;
+`spend_grant` and `first_contact`. The additive sub-flag
+`owner_device_approval_breaker_reset_v1` advertises `breaker_reset`; clients must
+check this sub-flag before offering device resets. This is the node portion of the feature;
 apps must implement display, biometric signing, discovery and continuation.
 Older apps and the existing owner console continue to work.
 
@@ -194,7 +196,7 @@ consumes its authorization once and still reserves against the live budget.
 The device-issued first-contact grant lasts at most **120 seconds**, and never
 past the spend window. The console's existing lifetime is unchanged.
 
-Both request bodies reject unknown fields. Client identity, epoch, node,
+All request bodies reject unknown fields. Client identity, epoch, node,
 live `grant_op`, nonce and operation id come exclusively from node state.
 The response includes `op_id`, `expires_at`, `approval_message`, `owner_action`,
 `status` and the structured operation. After a spend grant is approved, the
@@ -218,7 +220,7 @@ not text supplied by the requester. UTF-8, no trailing newline:
 ```text
 bitsov-owner-approval-v1
 node:{fingerprint}
-kind:{spend_grant|first_contact}
+kind:{spend_grant|first_contact|breaker_reset}
 client:{requesting client id}
 client_pubkey:{requesting pairing public key}
 epoch:{requesting pairing epoch}
@@ -270,10 +272,86 @@ nonce, recovery phrase or other secret material. Invalid transport reaching
 the handler is also audited; authentication/malformed-body middleware may
 reject a request before the handler runs.
 
+## Breaker reset (v1 sub-flag)
+
+```http
+POST /pair/approval-request
+{"kind":"breaker_reset","terms":{}}
+```
+
+This requests a reset of the requesting pairing's current live spend grant.
+No grant id, counters, budget or reset limits may be supplied by the caller.
+A grant with no tripped breaker is refused. A **different enrolled owner
+pairing** must approve, even when the paused pairing has an enrolled owner key.
+OWNER authority means the node-verified owner attestation on the device key;
+a read/spend token by itself never supplies it. The token and authenticated
+Noise session must belong to the approving pairing.
+
+The structured `breaker_reset` snapshot includes `tripped`, `breakers`, the
+original `budget_msat` and `per_call_max_msat`, `remaining_msat`,
+`grant_expires_at`, `resets_last_day`, and `state_digest`. Failure pause is
+latched; minute/hour rate and ten-minute velocity limits recover with time.
+`tripped` lists `grant_paused`, `rate_limit_minute`, `rate_limit_hour`, and/or
+`velocity_limit`. Rolling refusals are recorded by the node, including a batch
+that crosses a limit before the counter reaches it; they remain relevant for
+that rolling window. Recent failures are shown as the consecutive failure
+streak, alongside unresolved payment slots. No payment identifiers or backend
+error text are exposed.
+
+For reset messages the base fields use `recipient:-`, `max_total_msat:0`, the
+original grant budget/per-call cap, and `window_secs:-`. After `expires_at`,
+the node appends these lines in this exact order (still no trailing newline):
+
+```text
+tripped:{comma-separated reasons, failure/minute/hour/velocity order}
+remaining_msat:{remaining budget}
+grant_expires_at:{original Unix deadline}
+paused:{true|false}
+consecutive_failures:{count}
+unresolved_payments:{count}
+payments_last_minute:{count}
+payments_last_hour:{count}
+reserved_msat_last_10_minutes:{msat}
+max_payments_per_minute:{limit}
+max_payments_per_hour:{limit}
+max_consecutive_failures:{limit}
+max_msat_per_10_minutes:{limit}
+resets_last_day:{count}
+max_resets_per_day:3
+state_digest:{lowercase BLAKE3 digest of the durable meter}
+```
+
+The owner displays and signs the entire node-returned message. Existing spend
+and first-contact message bytes are unchanged. A payment reservation, outcome,
+changed budget, grant replacement or intervening reset invalidates the reviewed
+snapshot; request fresh terms. Even identical counters after a later pause
+cannot revive old approval: every reset advances a durable generation.
+
+At most **three successful device resets per grant per rolling 86,400 seconds**
+are allowed, shared across approvers and pending operations. The count and
+approver key/approval operation metadata are persisted atomically with reset;
+restart, token refresh and console reset cannot clear this allowance. Future
+timestamps still count after clock rollback. Over-limit approval returns 429
+and leaves the breaker and request unchanged. Existing request and per-key
+attempt limits apply too. Successes and refusals use the existing
+`pair.owner_approved` / `pair.owner_approval_refused` audit events with
+`kind:breaker_reset`; signatures and nonce are never logged.
+
+Reset clears only rolling history, the failure streak and pause. It never
+refunds spent budget, clears pending/unknown reservations or payment dedupe,
+changes expiry/payees/caps, or replenishes unresolved failure slots. Write
+failure rolls back the meter and leaves approval unconsumed. The original
+spend approval receipt is preserved. The console command, its authorization
+and its unlimited manual reset policy remain unchanged.
+
+Pairing storage advances to **v7** for reset history/generation and rolling
+refusal evidence. Existing v2–v6 files load with empty reset history and
+migrate on write; older binaries refuse v7 instead of dropping this state.
+Back up before upgrading; do not downgrade a v7 pairing store.
+
 ## Boundaries and fallback
 
-Breaker reset is **not** part of v1 PR A; `breaker_reset` is rejected. Identity
-replacement, recovery/restore, revoking/opening windows for other pairings,
+Identity replacement, recovery/restore, revoking/opening windows for other pairings,
 revoking other device keys, and first-owner enrollment without bootstrap stay
 on their existing console/root-of-trust paths. No approval route enables them.
 

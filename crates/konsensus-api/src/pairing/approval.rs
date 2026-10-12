@@ -1,15 +1,21 @@
-//! Separate-owner-device approvals. Requests and rate counters are process-local;
-//! only a verified, consumed spend approval is persisted with its signature.
+//! Separate-owner-device approvals. Pending requests and hourly attempt limits
+//! are process-local; spend receipts and per-grant reset quotas are durable.
 use super::{device, DeviceKey, Inner, PairingError, PairingService, SpendGrant};
 use crate::auth::Scope;
-use crate::spend_budget::{BudgetRefusal, GrantBudget, GrantTerms};
+use crate::spend_budget::{
+    BreakerStatus, BudgetRefusal, DeviceBreakerReset, GrantBudget, GrantTerms,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-/// Feature detection for the two PR A approval kinds.
+/// Base feature detection for spend and first-contact approval.
 pub const CAPABILITY: &str = "owner_device_approval_v1";
+/// Additive feature detection: the base v1 flag alone does not promise resets.
+pub const BREAKER_RESET_CAPABILITY: &str = "owner_device_approval_breaker_reset_v1";
+const RESET_PER_DAY: usize = 3;
+const RESET_WINDOW: i64 = 86_400;
 const TTL: i64 = 300;
 const PER_HOUR: usize = 30;
 
@@ -22,6 +28,8 @@ const PER_HOUR: usize = 30;
     deny_unknown_fields
 )]
 pub enum ApprovalRequest {
+    /// Reset the requesting pairing's current grant; every term comes from the node.
+    BreakerReset {},
     /// A bounded ordinary spend window. Breakers cannot be weakened by the client.
     SpendGrant {
         /// Total budget in millisatoshis.
@@ -47,6 +55,7 @@ impl ApprovalRequest {
     /// Stable audit/protocol kind.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::BreakerReset {} => "breaker_reset",
             Self::SpendGrant { .. } => "spend_grant",
             Self::FirstContact { .. } => "first_contact",
         }
@@ -72,6 +81,7 @@ impl ApprovalRequest {
     }
     fn normalize(mut self) -> Result<Self, PairingError> {
         let recipient = match &mut self {
+            Self::BreakerReset {} => None,
             Self::SpendGrant { recipient, .. } => recipient.as_mut(),
             Self::FirstContact { recipient, .. } => Some(recipient),
         };
@@ -98,6 +108,65 @@ impl ApprovalRequest {
     }
 }
 
+/// Node-derived reset terms, signed with the base approval bindings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BreakerResetTerms {
+    /// The breaker(s) currently blocking or recently refusing payments.
+    pub tripped: Vec<String>,
+    /// Current counters, failure streak, unresolved slots and configured limits.
+    pub breakers: BreakerStatus,
+    /// Original grant total, never replenished by reset.
+    pub budget_msat: u64,
+    /// Current budget left, including outstanding reservations as spent.
+    pub remaining_msat: u64,
+    /// Original per-call limit.
+    pub per_call_max_msat: u64,
+    /// Original grant deadline, never extended by reset.
+    pub grant_expires_at: i64,
+    /// Successful device resets within the rolling day, including future timestamps.
+    pub resets_last_day: usize,
+    /// Digest of the entire durable meter, preventing stale approvals from laundering state.
+    pub state_digest: String,
+}
+impl BreakerResetTerms {
+    fn from_grant(grant: &SpendGrant, now: i64) -> Result<Self, PairingError> {
+        let b = grant
+            .budget
+            .as_ref()
+            .ok_or(PairingError::UnknownOperation)?;
+        let tripped = b.reset_reasons(now);
+        if tripped.is_empty() {
+            return Err(PairingError::NotGrantable(
+                "grant has no tripped breaker".into(),
+            ));
+        }
+        Ok(Self {
+            tripped,
+            breakers: b.breaker_status(now),
+            budget_msat: b.budget_msat,
+            remaining_msat: b.remaining_msat(),
+            per_call_max_msat: b.per_call_max_msat,
+            grant_expires_at: grant.expires_at,
+            resets_last_day: b
+                .device_breaker_resets
+                .iter()
+                .filter(|r| r.at > now.saturating_sub(RESET_WINDOW))
+                .count(),
+            state_digest: blake3::hash(
+                &serde_json::to_vec(b).map_err(|e| PairingError::Io(e.to_string()))?,
+            )
+            .to_hex()
+            .to_string(),
+        })
+    }
+    fn message(&self) -> String {
+        let b = &self.breakers;
+        let l = &b.limits;
+        format!("\ntripped:{}\nremaining_msat:{}\ngrant_expires_at:{}\npaused:{}\nconsecutive_failures:{}\nunresolved_payments:{}\npayments_last_minute:{}\npayments_last_hour:{}\nreserved_msat_last_10_minutes:{}\nmax_payments_per_minute:{}\nmax_payments_per_hour:{}\nmax_consecutive_failures:{}\nmax_msat_per_10_minutes:{}\nresets_last_day:{}\nmax_resets_per_day:{}\nstate_digest:{}",
+            self.tripped.join(","), self.remaining_msat, self.grant_expires_at, b.paused, b.consecutive_failures, b.unresolved_payments, b.payments_last_minute, b.payments_last_hour, b.reserved_msat_last_10_minutes, l.max_payments_per_minute, l.max_payments_per_hour, l.max_consecutive_failures, l.max_msat_per_10_minutes, self.resets_last_day, RESET_PER_DAY, self.state_digest)
+    }
+}
+
 /// Public exact terms, all binding fields supplied by the node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalOperation {
@@ -113,6 +182,9 @@ pub struct ApprovalOperation {
     pub epoch: u64,
     /// Live grant snapshot, if any; replacing it invalidates this request.
     pub grant_op: Option<String>,
+    /// Present only for breaker_reset; supplied exclusively by the node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breaker_reset: Option<BreakerResetTerms>,
     /// Canonical bounded terms.
     pub request: ApprovalRequest,
     /// Server-generated 16-byte nonce, hex.
@@ -124,6 +196,17 @@ impl ApprovalOperation {
     /// UTF-8 protocol bytes, without a trailing newline.
     pub fn message(&self) -> String {
         let (recipient, max, budget, per_call, window) = match &self.request {
+            ApprovalRequest::BreakerReset {} => (
+                "-",
+                0,
+                self.breaker_reset
+                    .as_ref()
+                    .map_or_else(|| "-".into(), |r| r.budget_msat.to_string()),
+                self.breaker_reset
+                    .as_ref()
+                    .map_or_else(|| "-".into(), |r| r.per_call_max_msat.to_string()),
+                "-".into(),
+            ),
             ApprovalRequest::SpendGrant {
                 budget_msat,
                 per_call_max_msat,
@@ -148,7 +231,7 @@ impl ApprovalOperation {
                 "-".into(),
             ),
         };
-        format!("bitsov-owner-approval-v1\nnode:{}\nkind:{}\nclient:{}\nclient_pubkey:{}\nepoch:{}\ngrant_op:{}\nrecipient:{}\nmax_total_msat:{}\nbudget_msat:{}\nper_call_max_msat:{}\nwindow_secs:{}\nop_id:{}\nnonce:{}\nexpires_at:{}", self.node, self.request.kind(), self.client_id, self.client_pubkey, self.epoch, self.grant_op.as_deref().unwrap_or("-"), recipient, max, budget, per_call, window, self.op_id, self.nonce, self.expires_at)
+        format!("bitsov-owner-approval-v1\nnode:{}\nkind:{}\nclient:{}\nclient_pubkey:{}\nepoch:{}\ngrant_op:{}\nrecipient:{}\nmax_total_msat:{}\nbudget_msat:{}\nper_call_max_msat:{}\nwindow_secs:{}\nop_id:{}\nnonce:{}\nexpires_at:{}", self.node, self.request.kind(), self.client_id, self.client_pubkey, self.epoch, self.grant_op.as_deref().unwrap_or("-"), recipient, max, budget, per_call, window, self.op_id, self.nonce, self.expires_at) + &self.breaker_reset.as_ref().map_or_else(String::new, BreakerResetTerms::message)
     }
 }
 /// A status read conveys no authority.
@@ -347,6 +430,16 @@ impl PairingService {
                 "first contact requires a live spend grant".into(),
             ));
         }
+        let breaker_reset = if matches!(request, ApprovalRequest::BreakerReset {}) {
+            let grant = self
+                .approval_grant(&inner, client_id, epoch, now)
+                .ok_or_else(|| {
+                    PairingError::NotGrantable("reset requires a live spend grant".into())
+                })?;
+            Some(BreakerResetTerms::from_grant(grant, now)?)
+        } else {
+            None
+        };
         inner.owner_approvals.pending.retain(|_, p| p.live(now));
         if inner.owner_approvals.pending.len() >= 1024
             || inner
@@ -369,6 +462,7 @@ impl PairingService {
             client_pubkey: client.client_pubkey,
             epoch,
             grant_op,
+            breaker_reset,
             request,
             nonce: hex::encode(nonce),
             expires_at: now + TTL,
@@ -485,6 +579,42 @@ impl PairingService {
             return Err(PairingError::BindingMismatch.into());
         }
         match &op.request {
+            ApprovalRequest::BreakerReset {} => {
+                let grant = self
+                    .approval_grant(&inner, &op.client_id, op.epoch, now)
+                    .ok_or(PairingError::UnknownOperation)?;
+                let current = BreakerResetTerms::from_grant(grant, now)?;
+                if current.resets_last_day >= RESET_PER_DAY {
+                    return Err(PairingError::TooManyPending.into());
+                }
+                let reviewed = op.breaker_reset.as_ref().ok_or(PairingError::BadProof)?;
+                if current.state_digest != reviewed.state_digest
+                    || current.grant_expires_at != reviewed.grant_expires_at
+                {
+                    return Err(PairingError::BindingMismatch.into());
+                }
+                let before = inner.file.clone();
+                let budget = inner
+                    .file
+                    .grants
+                    .iter_mut()
+                    .find(|g| Some(&g.op_id) == op.grant_op.as_ref())
+                    .and_then(|g| g.budget.as_mut())
+                    .ok_or(PairingError::UnknownOperation)?;
+                budget.reset_breakers();
+                budget
+                    .device_breaker_resets
+                    .retain(|r| r.at > now.saturating_sub(RESET_WINDOW));
+                budget.device_breaker_resets.push(DeviceBreakerReset {
+                    at: now,
+                    approver_key_id: key_id.into(),
+                    approval_op_id: op.op_id.clone(),
+                });
+                if let Err(e) = self.persist(&mut inner.file) {
+                    inner.file = before;
+                    return Err(e.into());
+                }
+            }
             ApprovalRequest::SpendGrant { .. } => {
                 let terms = op.request.spend_terms()?;
                 let grant = SpendGrant {
@@ -951,5 +1081,491 @@ mod tests {
         grant.budget.as_mut().unwrap().budget_msat -= 1;
         grant.expires_at += 1;
         assert!(!f.svc.permits_spend_grant(&grant));
+    }
+    impl Fixture {
+        fn paused(&self) {
+            let grant = self.request();
+            self.approve(&grant).unwrap();
+            self.trip();
+        }
+        fn trip(&self) {
+            let mut inner = self.svc.lock();
+            let budget = inner
+                .file
+                .grants
+                .last_mut()
+                .unwrap()
+                .budget
+                .as_mut()
+                .unwrap();
+            for _ in 0..5 {
+                budget.record_outcome(100, 0, chrono::Utc::now().timestamp());
+            }
+        }
+        fn reset_request(&self) -> ApprovalView {
+            self.svc
+                .request_owner_approval(
+                    &self.requester.client_id,
+                    self.requester.epoch,
+                    serde_json::from_str(r#"{"kind":"breaker_reset","terms":{}}"#).unwrap(),
+                )
+                .unwrap()
+        }
+        fn budget(&self) -> GrantBudget {
+            self.svc
+                .lock()
+                .file
+                .grants
+                .last()
+                .unwrap()
+                .budget
+                .clone()
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn breaker_reset_preserves_accounting_and_consumes_once() {
+        let f = Fixture::new();
+        f.paused();
+        {
+            let mut inner = f.svc.lock();
+            let b = inner
+                .file
+                .grants
+                .last_mut()
+                .unwrap()
+                .budget
+                .as_mut()
+                .unwrap();
+            b.used_msat = 1200;
+            b.used_by_recipient.insert("aa".repeat(32), 1200);
+            b.pending
+                .insert("unknown".into(), [("aa".repeat(32), 200)].into());
+            b.payment_ids.insert("paid-once".into());
+        }
+        let before = f.budget();
+        let op = f.reset_request();
+        assert!(op.approval_message.contains("kind:breaker_reset"));
+        assert!(op.approval_message.contains("remaining_msat:98800"));
+        assert!(op.approval_message.contains("consecutive_failures:5"));
+        assert!(op.approval_message.contains("tripped:grant_paused"));
+        assert_eq!(f.approve(&op).unwrap().status, "consumed");
+        let after = f.budget();
+        assert!(!after.is_paused());
+        assert_eq!(after.used_msat, before.used_msat);
+        assert_eq!(after.used_by_recipient, before.used_by_recipient);
+        assert_eq!(after.pending, before.pending);
+        assert_eq!(after.payment_ids, before.payment_ids);
+        assert_eq!(after.breakers, before.breakers);
+        let mut expected = before;
+        expected.reset_breakers();
+        expected.device_breaker_resets = after.device_breaker_resets.clone();
+        assert_eq!(after, expected);
+        assert!(f
+            .svc
+            .permits_spend_grant(f.svc.lock().file.grants.last().unwrap()));
+        assert!(f.approve(&op).is_err());
+    }
+
+    #[test]
+    fn breaker_reset_refuses_expired_tampered_revoked_self_and_unenrolled() {
+        for case in 0..8 {
+            let f = Fixture::new();
+            f.paused();
+            let mut op = f.reset_request();
+            let before = f.budget();
+            match case {
+                0 => {
+                    f.svc
+                        .lock()
+                        .owner_approvals
+                        .pending
+                        .get_mut(&op.operation.op_id)
+                        .unwrap()
+                        .created = Instant::now() - std::time::Duration::from_secs(301);
+                }
+                1 => {
+                    op.approval_message = op
+                        .approval_message
+                        .replace("remaining_msat:100000", "remaining_msat:99999");
+                }
+                2 => {
+                    f.svc
+                        .revoke_device_key(&f.key_id, Some(&f.owner.client_id))
+                        .unwrap();
+                }
+                3 => {
+                    f.svc.bump_epoch(&f.owner.client_id).unwrap();
+                }
+                4 => {
+                    f.svc.revoke(&f.owner.client_id).unwrap();
+                }
+                5 => {
+                    f.svc
+                        .lock()
+                        .owner_approvals
+                        .pending
+                        .get_mut(&op.operation.op_id)
+                        .unwrap()
+                        .operation
+                        .expires_at = chrono::Utc::now().timestamp();
+                }
+                6 => {
+                    f.svc.lock().file.device_keys.clear();
+                }
+                _ => {
+                    // A real enrolled key cannot approve a reset of its own pairing.
+                    let mut inner = f.svc.lock();
+                    let grant = inner.file.grants.last_mut().unwrap();
+                    grant.client_id = f.owner.client_id.clone();
+                    grant.epoch = f.owner.epoch;
+                    grant.owner_approval = None;
+                    grant.granted_by = "cli".into();
+                    drop(inner);
+                    op = f
+                        .svc
+                        .request_owner_approval(
+                            &f.owner.client_id,
+                            f.owner.epoch,
+                            serde_json::from_str(r#"{"kind":"breaker_reset","terms":{}}"#).unwrap(),
+                        )
+                        .unwrap();
+                }
+            }
+            assert!(f.approve(&op).is_err(), "case {case}");
+            assert_eq!(f.budget(), before, "case {case}");
+        }
+        // AI/read-only pairing cannot borrow another device's enrolled key.
+        let f = Fixture::new();
+        f.paused();
+        let op = f.reset_request();
+        assert!(f
+            .svc
+            .approve_owner_request(
+                &f.requester.client_id,
+                f.requester.epoch,
+                &op.operation.op_id,
+                &f.key_id,
+                "00"
+            )
+            .is_err());
+        assert!(f.budget().is_paused());
+    }
+
+    #[test]
+    fn breaker_reset_limit_is_per_grant_durable_and_console_is_unchanged() {
+        let f = Fixture::new();
+        f.paused();
+        for _ in 0..3 {
+            let op = f.reset_request();
+            f.approve(&op).unwrap();
+            f.trip();
+        }
+        let op = f.reset_request();
+        assert!(matches!(
+            f.approve(&op),
+            Err(ApprovalError::Pairing(PairingError::TooManyPending))
+        ));
+        assert!(f.budget().is_paused());
+        // Loading the durable meter must retain the limit.
+        let disk = f.svc.reload_from_disk().unwrap();
+        f.svc.lock().file = disk;
+        f.trip();
+        assert!(matches!(
+            f.approve(&op),
+            Err(ApprovalError::Pairing(PairingError::TooManyPending))
+        ));
+        let grant_op = f.svc.lock().file.grants.last().unwrap().op_id.clone();
+        f.svc
+            .reset_grant_breakers(&f.requester.client_id, &grant_op)
+            .unwrap();
+        assert!(!f.budget().is_paused());
+    }
+
+    #[test]
+    fn breaker_reset_handles_rate_and_velocity_refusals_and_rejects_stale_snapshot() {
+        use crate::spend_budget::Charge;
+        for reason in ["rate_limit_minute", "rate_limit_hour", "velocity_limit"] {
+            let f = Fixture::new();
+            f.paused();
+            {
+                let mut inner = f.svc.lock();
+                let g = inner.file.grants.last_mut().unwrap();
+                g.owner_approval = None;
+                g.granted_by = "cli".into();
+                let b = g.budget.as_mut().unwrap();
+                b.reset_breakers();
+                match reason {
+                    "rate_limit_minute" => b.breakers.max_payments_per_minute = 1,
+                    "rate_limit_hour" => b.breakers.max_payments_per_hour = 1,
+                    _ => b.breakers.max_msat_per_10_minutes = 150,
+                }
+            }
+            let charge = || {
+                vec![Charge {
+                    recipient: "aa".repeat(32),
+                    amount_msat: 100,
+                }]
+            };
+            let reservation = f
+                .svc
+                .reserve_spend(&f.requester.client_id, f.requester.epoch, charge())
+                .unwrap();
+            f.svc.resolve_spend(&reservation, &"aa".repeat(32), 100);
+            assert_eq!(
+                f.svc
+                    .reserve_spend(&f.requester.client_id, f.requester.epoch, charge())
+                    .unwrap_err()
+                    .reason(),
+                reason
+            );
+            let durable = f.svc.reload_from_disk().unwrap();
+            assert_eq!(
+                durable
+                    .grants
+                    .last()
+                    .unwrap()
+                    .budget
+                    .as_ref()
+                    .unwrap()
+                    .reset_reasons(chrono::Utc::now().timestamp()),
+                vec![reason.to_string()]
+            );
+            let op = f.reset_request();
+            assert!(op.approval_message.contains(&format!("tripped:{reason}")));
+            let stale = f.reset_request();
+            f.approve(&op).unwrap();
+            assert!(f.approve(&stale).is_err());
+            assert_eq!(f.budget().used_msat, 100);
+            f.svc
+                .reserve_spend(&f.requester.client_id, f.requester.epoch, charge())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn breaker_reset_changed_accounting_or_failed_write_never_clears_pause() {
+        let f = Fixture::new();
+        f.paused();
+        let op = f.reset_request();
+        f.svc
+            .lock()
+            .file
+            .grants
+            .last_mut()
+            .unwrap()
+            .budget
+            .as_mut()
+            .unwrap()
+            .used_msat += 1;
+        assert!(f.approve(&op).is_err());
+        let op = f.reset_request();
+        let before = f.budget();
+        let parent = f.svc.dir().to_path_buf();
+        let backup = parent.with_extension("reset-backup");
+        std::fs::rename(&parent, &backup).unwrap();
+        std::fs::write(&parent, b"not a directory").unwrap();
+        assert!(matches!(
+            f.approve(&op),
+            Err(ApprovalError::Pairing(PairingError::Io(_)))
+        ));
+        assert_eq!(f.budget(), before);
+        assert_eq!(
+            f.svc
+                .owner_approval_status(
+                    &f.requester.client_id,
+                    f.requester.epoch,
+                    &op.operation.op_id
+                )
+                .unwrap()
+                .status,
+            "pending"
+        );
+        std::fs::remove_file(&parent).unwrap();
+        std::fs::rename(&backup, &parent).unwrap();
+        f.approve(&op).unwrap();
+    }
+
+    #[test]
+    fn breaker_reset_console_reset_invalidates_prior_approval_even_if_counters_repeat() {
+        let f = Fixture::new();
+        f.paused();
+        let op = f.reset_request();
+        let grant_op = f.svc.lock().file.grants.last().unwrap().op_id.clone();
+        f.svc
+            .reset_grant_breakers(&f.requester.client_id, &grant_op)
+            .unwrap();
+        f.trip();
+        assert!(f.approve(&op).is_err());
+        assert!(f.budget().is_paused());
+    }
+
+    #[test]
+    fn breaker_reset_daily_limit_boundary_clock_rollback_and_parallel_approvals() {
+        let f = Fixture::new();
+        f.paused();
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut inner = f.svc.lock();
+            let b = inner
+                .file
+                .grants
+                .last_mut()
+                .unwrap()
+                .budget
+                .as_mut()
+                .unwrap();
+            b.device_breaker_resets = (0..3)
+                .map(|_| DeviceBreakerReset {
+                    at: now + 60,
+                    approver_key_id: f.key_id.clone(),
+                    approval_op_id: "earlier".into(),
+                })
+                .collect();
+        }
+        let op = f.reset_request();
+        assert!(matches!(
+            f.approve(&op),
+            Err(ApprovalError::Pairing(PairingError::TooManyPending))
+        ));
+        {
+            let mut inner = f.svc.lock();
+            for reset in &mut inner
+                .file
+                .grants
+                .last_mut()
+                .unwrap()
+                .budget
+                .as_mut()
+                .unwrap()
+                .device_breaker_resets
+            {
+                reset.at = now - RESET_WINDOW;
+            }
+        }
+        let a = f.reset_request();
+        let b = f.reset_request();
+        std::thread::scope(|s| {
+            let a = s.spawn(|| f.approve(&a));
+            let b = s.spawn(|| f.approve(&b));
+            assert_eq!(
+                usize::from(a.join().unwrap().is_ok()) + usize::from(b.join().unwrap().is_ok()),
+                1
+            );
+        });
+        assert_eq!(f.budget().device_breaker_resets.len(), 1);
+    }
+    #[test]
+    fn breaker_reset_requires_unchanged_live_grant_and_strict_empty_terms() {
+        for field in [
+            "grant_op",
+            "budget_msat",
+            "remaining_msat",
+            "tripped",
+            "client_id",
+        ] {
+            let body = serde_json::json!({"kind":"breaker_reset","terms":{field: "forged"}});
+            assert!(serde_json::from_value::<ApprovalRequest>(body).is_err());
+        }
+        for change in 0..5 {
+            let f = Fixture::new();
+            let reset = || {
+                f.svc.request_owner_approval(
+                    &f.requester.client_id,
+                    f.requester.epoch,
+                    ApprovalRequest::BreakerReset {},
+                )
+            };
+            assert!(reset().is_err());
+            let spend = f.request();
+            f.approve(&spend).unwrap();
+            assert!(reset().is_err());
+            f.trip();
+            let op = f.reset_request();
+            match change {
+                0 => {
+                    f.svc.revoke(&f.requester.client_id).unwrap();
+                }
+                1 => {
+                    f.svc.bump_epoch(&f.requester.client_id).unwrap();
+                }
+                2 => {
+                    f.svc.lock().file.grants.last_mut().unwrap().expires_at =
+                        chrono::Utc::now().timestamp();
+                }
+                3 => {
+                    let new = f.request();
+                    f.approve(&new).unwrap();
+                }
+                _ => {
+                    f.svc.lock().identity_fingerprint = "changed-node".into();
+                }
+            }
+            assert!(f.approve(&op).is_err(), "change {change}");
+        }
+    }
+
+    #[test]
+    fn breaker_reset_v6_defaults_and_v7_persistence_retain_security_state() {
+        let f = Fixture::new();
+        f.paused();
+        let mut old = serde_json::to_value(f.svc.lock().file.clone()).unwrap();
+        old["version"] = serde_json::json!(6);
+        let budget = old["grants"][0]["budget"].as_object_mut().unwrap();
+        budget.remove("device_breaker_resets");
+        budget.remove("breaker_reset_generation");
+        let old: super::super::PairingFile = serde_json::from_value(old).unwrap();
+        assert!(old.grants[0]
+            .budget
+            .as_ref()
+            .unwrap()
+            .device_breaker_resets
+            .is_empty());
+        f.svc.lock().file = old;
+        let op = f.reset_request();
+        f.approve(&op).unwrap();
+        let disk = f.svc.reload_from_disk().unwrap();
+        assert_eq!(disk.version, 7);
+        let b = disk.grants[0].budget.as_ref().unwrap();
+        assert_eq!(b.device_breaker_resets.len(), 1);
+        assert_eq!(b.breaker_reset_generation, 1);
+        assert_eq!(b.device_breaker_resets[0].approver_key_id, f.key_id);
+        assert_eq!(
+            b.device_breaker_resets[0].approval_op_id,
+            op.operation.op_id
+        );
+    }
+    #[test]
+    fn breaker_reset_repeated_refusal_does_not_invalidate_reviewed_snapshot() {
+        let f = Fixture::new();
+        f.paused();
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut inner = f.svc.lock();
+            let b = inner
+                .file
+                .grants
+                .last_mut()
+                .unwrap()
+                .budget
+                .as_mut()
+                .unwrap();
+            assert!(b.record_breaker_refusal(&BudgetRefusal::RateLimitMinute, now));
+        }
+        let op = f.reset_request();
+        {
+            let mut inner = f.svc.lock();
+            let b = inner
+                .file
+                .grants
+                .last_mut()
+                .unwrap()
+                .budget
+                .as_mut()
+                .unwrap();
+            assert!(!b.record_breaker_refusal(&BudgetRefusal::RateLimitMinute, now + 1));
+        }
+        f.approve(&op).unwrap();
     }
 }

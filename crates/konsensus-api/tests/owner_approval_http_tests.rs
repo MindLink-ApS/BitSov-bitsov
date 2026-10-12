@@ -313,7 +313,7 @@ async fn wrong_node_tampered_terms_revoked_key_and_stale_epoch_are_refused() {
     assert!(f.svc.grant_view_for(&f.requester.client_id).is_none());
 }
 #[tokio::test]
-async fn request_limit_discovery_status_and_strict_pr_a_kinds() {
+async fn request_limit_discovery_status_and_reset_requires_a_grant() {
     let f = Fixture::new(true);
     let op = f.request(false).await;
     let path = format!("/api/v1/pair/approval/{}", op["op_id"].as_str().unwrap());
@@ -753,6 +753,10 @@ async fn status_advertises_capability_and_console_cannot_approve_device_operatio
         .as_array()
         .unwrap()
         .contains(&json!("owner_device_approval_v1")));
+    assert!(body["api_capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("owner_device_approval_breaker_reset_v1")));
     let op = f.request(false).await;
     let response=test_router(f.state.clone()).oneshot(Request::builder().method("POST")
         .uri(format!("/api/v1/pair/approval/{}/approve",op["op_id"].as_str().unwrap()))
@@ -788,4 +792,187 @@ async fn read_only_paired_token_can_request_but_cannot_approve() {
         StatusCode::FORBIDDEN
     );
     assert!(f.svc.grant_view_for(&f.requester.client_id).is_none());
+}
+
+impl Fixture {
+    fn trip_failure_breaker(&self) {
+        use konsensus_api::spend_budget::Charge;
+        for _ in 0..5 {
+            let reservation = self
+                .svc
+                .reserve_spend(
+                    &self.requester.client_id,
+                    self.requester.epoch,
+                    vec![Charge {
+                        recipient: PEER.into(),
+                        amount_msat: 100,
+                    }],
+                )
+                .unwrap();
+            self.svc.resolve_spend(&reservation, PEER, 0);
+        }
+    }
+    async fn reset_request(&self) -> Value {
+        let (status, op) = self
+            .call(
+                false,
+                true,
+                "POST",
+                "/api/v1/pair/approval-request",
+                json!({"kind":"breaker_reset","terms":{}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{op}");
+        op
+    }
+}
+
+#[tokio::test]
+async fn breaker_reset_is_bounded_audited_and_requires_an_independent_owner_tunnel() {
+    use konsensus_api::auth::{create_paired_token, Scope};
+    for home in [true, false] {
+        let mut f = Fixture::new(home);
+        let spend = f.request(false).await;
+        assert_eq!(
+            f.approve(
+                &spend,
+                f.sign(spend["approval_message"].as_str().unwrap()),
+                true,
+                true
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        // A read-only AI token may propose a reset, never grant one.
+        f.token = create_paired_token(
+            &f.state.identity.node_id().to_hex(),
+            &f.state.jwt_secret,
+            vec![Scope::Read],
+            &f.requester.client_id,
+            f.requester.epoch,
+            &f.svc.bound_fingerprint(),
+        )
+        .unwrap();
+        f.trip_failure_breaker();
+        let first = f.reset_request().await;
+        let message = first["approval_message"].as_str().unwrap();
+        assert!(message.contains("tripped:grant_paused"));
+        assert!(message.contains("consecutive_failures:5"));
+        assert_eq!(first["grant_op"], spend["op_id"]);
+        assert_eq!(first["breaker_reset"]["remaining_msat"], 100000);
+        let sig = f.sign(message);
+        for (signature, owner, noise) in [
+            (sig.clone(), false, true),
+            (sig.clone(), true, false),
+            (
+                f.sign(&message.replace("remaining_msat:100000", "remaining_msat:99999")),
+                true,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                f.approve(&first, signature, owner, noise).await.0,
+                StatusCode::FORBIDDEN
+            );
+            assert!(
+                f.svc
+                    .grant_view_for(&f.requester.client_id)
+                    .unwrap()
+                    .breakers
+                    .paused
+            );
+        }
+        let pending = format!(
+            "/api/v1/pair/approvals/pending?approver_key_id={}",
+            f.key_id
+        );
+        let (_, found) = f.call(true, true, "GET", &pending, json!(null)).await;
+        assert_eq!(
+            found["pending"][0]["approval_message"],
+            first["approval_message"]
+        );
+        assert_eq!(
+            f.approve(&first, sig.clone(), true, true).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            f.approve(&first, sig.clone(), true, true).await.0,
+            StatusCode::FORBIDDEN
+        );
+        for _ in 1..3 {
+            f.trip_failure_breaker();
+            let op = f.reset_request().await;
+            assert_eq!(
+                f.approve(
+                    &op,
+                    f.sign(op["approval_message"].as_str().unwrap()),
+                    true,
+                    true
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+        }
+        f.trip_failure_breaker();
+        let op = f.reset_request().await;
+        assert_eq!(
+            f.approve(
+                &op,
+                f.sign(op["approval_message"].as_str().unwrap()),
+                true,
+                true
+            )
+            .await
+            .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(
+            f.svc
+                .grant_view_for(&f.requester.client_id)
+                .unwrap()
+                .breakers
+                .paused
+        );
+        let audit = std::fs::read_to_string(f.dir.path().join("audit.jsonl")).unwrap();
+        let resets: Vec<Value> = audit
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event.to_string().contains("breaker_reset"))
+            .collect();
+        assert!(resets
+            .iter()
+            .any(|e| e.to_string().contains("pair.owner_approved")));
+        assert!(resets
+            .iter()
+            .any(|e| e.to_string().contains("pair.owner_approval_refused")));
+        assert!(!audit.contains(&sig));
+        assert!(!audit.contains(first["nonce"].as_str().unwrap()));
+        // The reset allowance and current pause survive a real reopen.
+        let root = konsensus_core::OwnerApprovalKey::from_mnemonic(MNEMONIC, "", &[9; 32]).unwrap();
+        let reopened = PairingService::open(f.dir.path(), f.svc.bound_fingerprint(), !home)
+            .unwrap()
+            .with_local_owner_device()
+            .with_owner_approval_key(root.verifying_key());
+        let op = reopened
+            .request_owner_approval(
+                &f.requester.client_id,
+                f.requester.epoch,
+                serde_json::from_value(json!({"kind":"breaker_reset","terms":{}})).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            reopened.approve_owner_request(
+                &f.owner.client_id,
+                f.owner.epoch,
+                &op.operation.op_id,
+                &f.key_id,
+                &f.sign(&op.approval_message)
+            ),
+            Err(pairing::approval::ApprovalError::Pairing(
+                pairing::PairingError::TooManyPending
+            ))
+        ));
+    }
 }
