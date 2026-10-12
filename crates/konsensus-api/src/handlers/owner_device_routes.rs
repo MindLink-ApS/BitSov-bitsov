@@ -20,7 +20,7 @@ use crate::{
     state::AppState,
 };
 
-fn tunnel<'a>(
+pub(super) fn tunnel<'a>(
     auth: &'a ScopedAuth<Read>,
     state: &AppState,
     noise: Option<Extension<AuthenticatedNoise>>,

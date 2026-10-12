@@ -140,3 +140,144 @@ The existing HTTP boundaries remain enforced:
 These local commands do not add an app-callable approval route. See also
 [F1 capped first contact](F1-CAPPED-FIRST-CONTACT.md) and
 [K1 sponsor kit](K1-SPONSOR-KIT.md).
+
+---
+
+# Owner device approvals (v1)
+
+`owner_device_approval_v1` in `/api/v1/status` advertises support for
+`spend_grant` and `first_contact`. This is the node portion of the feature;
+apps must implement display, biometric signing, discovery and continuation.
+Older apps and the existing owner console continue to work.
+
+A paired client, including an AI or read-only client, may **request** an
+approval. A request grants nothing. Approval requires a **different pairing**
+with an enrolled owner-approved P-256 device key at its current epoch, its own
+paired token, and its own matching authenticated Noise session. Possession of
+a token, a requester signature, or a claimed biometric result is insufficient.
+`intent_key` re-verifies the enrolled key's seed-derived owner attestation for
+this node. Unknown, revoked, forged and old-epoch keys cannot approve.
+Even an enrolled owner device cannot approve its own pairing's request.
+
+The node must be running with `--owner-control` or `--local-owner-device`
+(including `--home`), with device approvals enabled. Capability advertisement
+indicates protocol support, not that device authority is currently enabled.
+Consult the existing `device_approvals` readiness signal before offering approval.
+
+## Request and discover
+
+All paths below are relative to `/api/v1`. Use a paired read token.
+
+```http
+POST /pair/approval-request
+{"kind":"spend_grant","terms":{"budget_msat":100000,"per_call_max_msat":10000,"window_secs":600}}
+```
+
+Spend terms use the console's normalized budget/per-call/window limits and
+conservative default circuit breakers. An optional `recipient` is a 64-hex
+node id; when present, that recipient is the exclusive payee and its cap is
+the total budget. This version cannot customize breakers, authorize liquidity
+fees, grant other scopes, or specify multiple recipients.
+
+```http
+POST /pair/approval-request
+{"kind":"first_contact","terms":{"recipient":"<64-hex node id>","max_total_msat":1000,"budget_msat":50000}}
+```
+
+First contact requires a current live spend grant. `max_total_msat` is
+1–100,000 msat. Optional `budget_msat` means the console's contact budget:
+a persistent recipient cap covering this payment, no larger than the total
+budget and equal to an existing recipient cap, if any. First-contact approval
+uses the same per-call, remaining-total and remaining-recipient checks as the
+console, rechecked at approval time. It does not itself debit money. Compose
+consumes its authorization once and still reserves against the live budget.
+The device-issued first-contact grant lasts at most **120 seconds**, and never
+past the spend window. The console's existing lifetime is unchanged.
+
+Both request bodies reject unknown fields. Client identity, epoch, node,
+live `grant_op`, nonce and operation id come exclusively from node state.
+The response includes `op_id`, `expires_at`, `approval_message`, `owner_action`,
+`status` and the structured operation. After a spend grant is approved, the
+requester must refresh its paired token to obtain the new spend scope before
+sending; approval does not widen a previously issued read/receive token. Requests expire after five minutes;
+restart discards all pending operations. Limits: three unconsumed live requests
+and 30 requests per hour per pairing, plus a node-wide bound of 1,024 live
+operation records. Consumed records remain readable until expiry/cleanup.
+
+`GET /pair/approval/{op_id}` is restricted to the requesting pairing and epoch.
+`GET /pair/approvals/pending?approver_key_id=<key>` requires the owner's token
+and matching Noise session and returns `{"pending":[...]}` with exact messages.
+Discovery excludes the approver's own requests. `konsensus pair-status` also
+lists pending operations, without granting authority.
+
+## Exact bytes to display and sign
+
+The owner app displays and signs the **node-returned** message from discovery,
+not text supplied by the requester. UTF-8, no trailing newline:
+
+```text
+bitsov-owner-approval-v1
+node:{fingerprint}
+kind:{spend_grant|first_contact}
+client:{requesting client id}
+client_pubkey:{requesting pairing public key}
+epoch:{requesting pairing epoch}
+grant_op:{current live grant op or -}
+recipient:{canonical node id or -}
+max_total_msat:{maximum first-contact payment or spend total}
+budget_msat:{spend total or optional contact budget or -}
+per_call_max_msat:{spend per-call cap or -}
+window_secs:{spend window or -}
+op_id:{server operation id}
+nonce:{server 16-byte hex nonce}
+expires_at:{absolute approval deadline in Unix seconds}
+```
+
+The deadline is signed as well as enforced by both wall time and elapsed time.
+The first-contact authorization's separate 120-second lifetime begins when
+approved. All numeric values are decimal integers; recipients are lowercase.
+
+```http
+POST /pair/approval/{op_id}/approve
+{"approver_key_id":"<owner key id>","signature":"<hex DER P-256/SHA-256 signature>"}
+```
+
+This route and owner discovery are exposed only on the unlocked remote router.
+Requests and own status are also available locally. Approval checks mode,
+`intent_key`, expiry, consumption, distinct pairing, requester/node bindings,
+signature and the live grant snapshot while holding the pairing mutex.
+A replacement/expired grant invalidates the request. Verification, grant write
+and single-use consumption cannot race revocation or another approval. Failed
+persistence restores the previous grant and leaves the operation unconsumed.
+Approval attempts are limited to 30 per hour per enrolled key, including failed
+signatures; rate refusals are HTTP 429. Signature/self/binding refusals are 403,
+expired operations 409, unknown operations 404; budget failures retain the
+console path's `BudgetRefusal` API representation.
+
+Spend grants record `granted_by: device:<key>` and persist the exact operation,
+owner-attested device key and signature. The node verifies that evidence and
+the immutable grant bounds before using these grants, including in home mode
+and after restart. Revocation/epoch checks apply when approving: revoking the
+approver later does not retroactively revoke another pairing's completed grant.
+Revoke the requesting pairing or its grant to end that authority. First-contact evidence is memory-only with its one-use
+authorization, so restart drops it. These receipts do not make the entire
+mutable accounting ledger tamper-proof or change the trust model of older
+console grants and relation envelopes.
+
+Audit events `pair.owner_approved` and `pair.owner_approval_refused` contain the
+approver key id, operation id and kind. They never contain signatures, tokens,
+nonce, recovery phrase or other secret material. Invalid transport reaching
+the handler is also audited; authentication/malformed-body middleware may
+reject a request before the handler runs.
+
+## Boundaries and fallback
+
+Breaker reset is **not** part of v1 PR A; `breaker_reset` is rejected. Identity
+replacement, recovery/restore, revoking/opening windows for other pairings,
+revoking other device keys, and first-owner enrollment without bootstrap stay
+on their existing console/root-of-trust paths. No approval route enables them.
+
+Without the capability or enabled device authority, use the existing console
+workflow. Console requests/codes are independent; device requests never expose,
+consume or bypass those codes. To approve from the console, use the existing
+elevation/first-contact workflow rather than a device-approval operation id.

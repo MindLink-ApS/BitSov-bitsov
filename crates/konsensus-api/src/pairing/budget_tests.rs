@@ -13,6 +13,7 @@ fn first_contact_service(dir: &Path) -> PairingService {
     let now = chrono::Utc::now().timestamp();
     let mut inner = service.lock();
     inner.file.grants.push(SpendGrant {
+        owner_approval: None,
         op_id: "grant".into(),
         client_id: client.client_id,
         scopes: vec![Scope::Spend],
@@ -123,6 +124,7 @@ fn expiry_during_reservation_persistence(live_reads: usize) {
             last_seen: None,
         });
         inner.file.grants.push(SpendGrant {
+            owner_approval: None,
             op_id: "grant".into(),
             client_id: "client".into(),
             scopes: vec![Scope::Spend],

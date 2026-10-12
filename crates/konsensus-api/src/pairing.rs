@@ -33,12 +33,13 @@
 //! In the sidecar deployment the app launches the node and owns its stdout and
 //! its `data_dir`, so no node-emitted secret can exclude it. Rather than
 //! pretend a channel is owner-only when the app can drive it, `spend` and
-//! live-identity replacement are simply **unavailable** over HTTP: this module
+//! live-identity replacement are **unavailable to token-only HTTP callers**: this module
 //! exposes `create_*_request` (writes a pending record, no authority) and
-//! reads, while every function that writes a grant or consumes an approval is
-//! reachable only from the owner CLI over `<data_dir>/control.sock`
-//! (see [`crate::control`]) and refuses outright unless owner-run mode was
-//! explicitly enabled.
+//! reads. Console approval writes remain behind the owner CLI over
+//! `<data_dir>/control.sock` (see [`crate::control`]). The explicit
+//! [`approval`] protocol additionally permits a different enrolled owner
+//! device to sign bounded spend/first-contact terms over its own Noise
+//! session. A paired token alone never grants authority.
 //!
 //! The same rule governs grants that already exist on disk. A grant the owner
 //! wrote while running the node with the control socket is **not honoured** by
@@ -57,6 +58,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, Scope, TokenError};
 
+pub mod approval;
 pub mod device;
 pub mod ticket;
 use crate::spend_budget::{
@@ -307,13 +309,16 @@ pub struct SpendGrant {
     pub identity_fingerprint: String,
     /// Pairing epoch at grant time — a revocation invalidates the grant too.
     pub epoch: u64,
-    /// Always `"cli"`: the HTTP surface can never write one of these.
+    /// `"cli"` or `"device:<key_id>"`; token-only requests cannot write a grant.
     pub granted_by: String,
     /// The meter. A grant without one (written by a pre-G1 node) is never
     /// honoured and is dropped when the store is opened. In memory, removing
     /// the meter also marks a revoked grant awaiting durable deletion.
     #[serde(default)]
     pub budget: Option<GrantBudget>,
+    /// Exact signed evidence for owner-approval-v1 spend windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_approval: Option<approval::ApprovalReceipt>,
 }
 
 impl SpendGrant {
@@ -652,6 +657,7 @@ struct Inner {
     owner_code_failures: u32,
     sas_failures: u8,
     owner_tickets: ticket::OwnerTickets,
+    owner_approvals: approval::OwnerApprovals,
     // Requests cancelled by wrong codes in this run, so their status reads
     // `lost` (their durable records are deleted, so a restart cannot revive them).
     cancelled_ops: std::collections::HashMap<String, String>,
@@ -691,6 +697,7 @@ struct PendingFirstContact {
     budget_op_id: String,
     /// Retain one terminal observation per client; polling cannot revive it.
     consumed: bool,
+    owner_approval: Option<approval::ApprovalReceipt>,
 }
 
 /// Digests of what the owner channel delivered for one pending operation.
@@ -884,6 +891,7 @@ impl PairingService {
                 owner_code_failures: 0,
                 sas_failures: 0,
                 owner_tickets: ticket::OwnerTickets::default(),
+                owner_approvals: approval::OwnerApprovals::default(),
                 cancelled_ops: std::collections::HashMap::new(),
                 first_contact: HashMap::new(),
             }),
@@ -928,6 +936,11 @@ impl PairingService {
 
     /// Deployment gate shared by scopes, grant views, staging, reservation and dispatch.
     fn permits_spend_grant(&self, grant: &SpendGrant) -> bool {
+        if let Some(receipt) = &grant.owner_approval {
+            return (self.owner_control_enabled || self.local_owner_device)
+                && self.device_authority_off.is_none()
+                && receipt.verifies(self, grant);
+        }
         self.owner_control_enabled
             || (self.local_owner_device
                 && self.owner_approval_key.is_some()
@@ -2035,8 +2048,8 @@ impl PairingService {
     /// identically at issuance and at per-request verification.
     ///
     /// Console grants require owner control. A local owner device start can
-    /// honour only device-granted, recipient-only spend budgets. Grantable
-    /// scopes embedded in a base pairing record never widen sidecar authority.
+    /// honour recipient-only device budgets or verified owner-approval receipts.
+    /// Grantable scopes embedded in a base pairing record never widen sidecar authority.
     fn effective_scopes(&self, inner: &Inner, record: &PairedClient, now_unix: i64) -> Vec<Scope> {
         let mut scopes = record.scopes.clone();
         if !self.owner_control_enabled {
@@ -2520,6 +2533,7 @@ impl PairingService {
             epoch: client.epoch,
             granted_by: "cli".to_string(),
             budget: Some(GrantBudget::from_terms(&terms)),
+            owner_approval: None,
         };
         inner.file.pending_elevations.retain(|e| e.op_id != op_id);
         // A new budget window replaces the client's old one. A live front-door
@@ -3095,13 +3109,33 @@ impl PairingService {
         max_total_msat: u64,
         contact_budget_msat: Option<u64>,
     ) -> Result<crate::spend_budget::FirstContactGrant, BudgetRefusal> {
+        if !self.owner_control_enabled {
+            return Err(BudgetRefusal::NoGrant);
+        }
+        self.grant_first_contact_locked(
+            &mut self.lock(),
+            client_id,
+            grant_op_id,
+            recipient,
+            max_total_msat,
+            contact_budget_msat,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn grant_first_contact_locked(
+        &self,
+        inner: &mut Inner,
+        client_id: &str,
+        grant_op_id: &str,
+        recipient: &str,
+        max_total_msat: u64,
+        contact_budget_msat: Option<u64>,
+    ) -> Result<crate::spend_budget::FirstContactGrant, BudgetRefusal> {
         use crate::spend_budget::{
             canonical_recipient, FirstContactGrant, FIRST_CONTACT_GRANT_TTL_SECS,
             FIRST_CONTACT_MAX_MSAT,
         };
-        if !self.owner_control_enabled {
-            return Err(BudgetRefusal::NoGrant);
-        }
         let recipient = canonical_recipient(recipient)
             .filter(|key| key.len() == 64)
             .ok_or_else(|| BudgetRefusal::FirstContact("the recipient is not a node id".into()))?;
@@ -3110,7 +3144,6 @@ impl PairingService {
                 "a first contact may cover 1..={FIRST_CONTACT_MAX_MSAT} msat"
             )));
         }
-        let mut inner = self.lock();
         let now = chrono::Utc::now().timestamp();
         let fingerprint = inner.identity_fingerprint.clone();
         let Some(grant) = inner.file.grants.iter().find(|g| {
@@ -3166,6 +3199,7 @@ impl PairingService {
             }
         }
         let issued = FirstContactGrant {
+            granted_by: None,
             recipient,
             max_total_msat,
             expires_at: (now + FIRST_CONTACT_GRANT_TTL_SECS).min(grant.expires_at),
@@ -3200,6 +3234,7 @@ impl PairingService {
                 epoch,
                 budget_op_id,
                 consumed: false,
+                owner_approval: None,
             },
         );
         Ok(issued)
@@ -3223,7 +3258,7 @@ impl PairingService {
         let recipient = crate::spend_budget::canonical_recipient(recipient)?;
         let inner = self.lock();
         let now = chrono::Utc::now().timestamp();
-        if !self.owner_control_enabled
+        if !(self.owner_control_enabled || self.local_owner_device)
             || !inner
                 .file
                 .clients
@@ -3234,6 +3269,7 @@ impl PairingService {
                     && g.client_id == client_id
                     && g.epoch == epoch
                     && g.identity_fingerprint == inner.identity_fingerprint
+                    && self.permits_spend_grant(g)
                     && g.budget.is_some()
                     && g.is_live(now)
             })

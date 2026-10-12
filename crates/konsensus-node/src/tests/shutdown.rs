@@ -108,6 +108,7 @@ async fn timed_out_drain_still_prunes_expired_grants() {
     let file = PairingFile {
         version: PAIRING_FILE_VERSION,
         grants: vec![SpendGrant {
+            owner_approval: None,
             op_id: "shutdown-test".into(),
             client_id: "client".into(),
             scopes: vec![konsensus_api::auth::Scope::Spend],
