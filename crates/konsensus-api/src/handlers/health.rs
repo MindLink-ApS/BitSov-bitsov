@@ -305,6 +305,7 @@ async fn status(
         readiness,
         api_capabilities: vec![
             crate::pairing::approval::CAPABILITY,
+            crate::pairing::approval::BREAKER_RESET_CAPABILITY,
             "storage_list_diagnostics_v1",
             "offline_readiness_v1",
             "message_operations_v1",

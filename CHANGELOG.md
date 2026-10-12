@@ -7,6 +7,17 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Node / Security
 
+- Add owner-device `breaker_reset` approvals, advertised by
+  `owner_device_approval_breaker_reset_v1`. A different enrolled owner device
+  signs node-rendered grant, breaker, remaining-budget and failure terms; a
+  paused pairing cannot reset itself. Reset preserves all spending accounting
+  and pending slots, rejects stale snapshots, and is audited and limited to
+  three successful device resets per grant per rolling day across restarts.
+  Pairing storage v7 retains reset history/generation and observed rolling
+  refusals; v2–v6 migrate on write and older binaries refuse v7. The console
+  reset command and authority are unchanged. See
+  [owner approvals](docs/v2/OWNER-APPROVALS.md#breaker-reset-v1-sub-flag).
+
 - Add `owner_device_approval_v1`: paired clients can request bounded spend
   windows and one-use first-contact approvals; only a different enrolled owner
   device on its own token and authenticated Noise session can approve the exact

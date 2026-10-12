@@ -170,6 +170,9 @@ pub struct BreakerState {
     last_at: Option<i64>,
     consecutive_failures: u64,
     paused: bool,
+    /// Last observed rolling refusal; no payment authority is created by recording it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_refusal: Option<(String, i64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -326,6 +329,12 @@ pub struct GrantBudget {
     pub breakers: BreakerLimits,
     #[serde(default)]
     pub breaker_state: BreakerState,
+    /// Successful device resets in the rolling day. Console resets never clear this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) device_breaker_resets: Vec<DeviceBreakerReset>,
+    /// Changes on every owner reset, even when later counters repeat exactly.
+    #[serde(default)]
+    pub(crate) breaker_reset_generation: u64,
     /// Payment identities consumed for this grant's entire lifetime, including failures.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub payment_ids: BTreeSet<String>,
@@ -366,12 +375,23 @@ pub struct GrantBudget {
     pub recipient_expires_at: BTreeMap<String, i64>,
 }
 
+/// Durable, bounded reset audit metadata. Signed terms stay in the approval operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeviceBreakerReset {
+    pub at: i64,
+    pub approver_key_id: String,
+    pub approval_op_id: String,
+}
+
 impl GrantBudget {
     /// A fresh meter for approved terms.
     pub fn from_terms(terms: &GrantTerms) -> Self {
         Self {
             breakers: terms.breakers.clone(),
             breaker_state: BreakerState::default(),
+            device_breaker_resets: Vec::new(),
+            breaker_reset_generation: 0,
             payment_ids: BTreeSet::new(),
             payee_allowlist: terms.payee_allowlist.clone(),
             allow_liquidity_fees: terms.allow_liquidity_fees,
@@ -607,8 +627,70 @@ impl GrantBudget {
         }
     }
 
-    /// Owner console only. Budget, pending reservations and dedupe survive.
+    /// Remember actual rolling refusals, including a batch that crosses a limit
+    /// before its counter is full. The caller persists this before returning.
+    pub(crate) fn record_breaker_refusal(&mut self, refusal: &BudgetRefusal, now: i64) -> bool {
+        let window = match refusal {
+            BudgetRefusal::RateLimitMinute => 60,
+            BudgetRefusal::RateLimitHour => 3600,
+            BudgetRefusal::VelocityLimit => 600,
+            _ => return false,
+        };
+        let now = self.breaker_state.last_at.map_or(now, |last| now.max(last));
+        // Retries change no spending state. Keep the original observation so
+        // they neither invalidate an owner's pending review nor cause disk churn.
+        if self
+            .breaker_state
+            .last_refusal
+            .as_ref()
+            .is_some_and(|(reason, at)| {
+                reason == refusal.reason() && *at > now.saturating_sub(window)
+            })
+        {
+            return false;
+        }
+        self.breaker_state.last_refusal = Some((refusal.reason().into(), now));
+        true
+    }
+
+    pub(crate) fn reset_reasons(&self, now: i64) -> Vec<String> {
+        let status = self.breaker_status(now);
+        let mut reasons = Vec::new();
+        if status.paused {
+            reasons.push("grant_paused".into());
+        }
+        for (reason, saturated, window) in [
+            (
+                "rate_limit_minute",
+                status.payments_last_minute >= self.breakers.max_payments_per_minute,
+                60,
+            ),
+            (
+                "rate_limit_hour",
+                status.payments_last_hour >= self.breakers.max_payments_per_hour,
+                3600,
+            ),
+            (
+                "velocity_limit",
+                status.reserved_msat_last_10_minutes >= self.breakers.max_msat_per_10_minutes,
+                600,
+            ),
+        ] {
+            let refused = self
+                .breaker_state
+                .last_refusal
+                .as_ref()
+                .is_some_and(|(r, at)| r == reason && *at > now.saturating_sub(window));
+            if saturated || refused {
+                reasons.push(reason.into());
+            }
+        }
+        reasons
+    }
+
+    /// Independent owner reset. Budget, pending reservations and dedupe survive.
     pub(crate) fn reset_breakers(&mut self) {
+        self.breaker_reset_generation = self.breaker_reset_generation.saturating_add(1);
         self.breaker_state = BreakerState::default();
     }
 
