@@ -349,3 +349,92 @@ async fn failed_prepared_listing_selects_only_prepared_rows_with_an_error() {
     assert_eq!(listed.iter().map(|op| op.operation_id.as_str()).collect::<Vec<_>>(), ["stuck"]);
     assert_eq!(listed[0].recovery, b"{\"dispatched\":false}", "recovery is decrypted");
 }
+
+#[tokio::test]
+async fn abandoned_operations_recover_pending_accounting_and_compact_like_released() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    for state in ["abandoned", "released"] {
+        for pending in [false, true] {
+            let mut op =
+                OutboxOperation::prepared(format!("{state}-{pending}"), "".into(), 0, "".into());
+            op.state = state.into();
+            op.accounting_pending = pending;
+            op.updated_at = 0;
+            db.insert_outbox_operation(&op).await.unwrap();
+        }
+    }
+    let recoverable = db.list_recoverable_operations().await.unwrap();
+    assert_eq!(
+        recoverable
+            .iter()
+            .map(|op| op.operation_id.as_str())
+            .collect::<Vec<_>>(),
+        ["abandoned-true", "released-true"]
+    );
+    let mut compactable: Vec<_> = db
+        .list_compactable_operations(1, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|op| op.operation_id)
+        .collect();
+    compactable.sort();
+    assert_eq!(compactable, ["abandoned-false", "released-false"]);
+}
+
+#[tokio::test]
+async fn migration_029_preserves_receipts_versions_and_opaque_recovery() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let migrations = dir.path().join("migrations");
+    std::fs::create_dir(&migrations).unwrap();
+    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if entry.path().is_file() && name.to_str().unwrap() < "029" {
+            std::fs::copy(entry.path(), migrations.join(name)).unwrap();
+        }
+    }
+    let path = dir.path().join("before-abandon.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO outbox_operations (operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted) VALUES ('retained', 'peer', 1, 'digest', 'acked', 'message-payment', 'admission-payment', 'message-id', 1000, 2000, 11, 22, 33, 4, 'error', 7, X'00FFAA', FALSE, TRUE)")
+        .execute(&pool).await.unwrap();
+    let before: OutboxOperation = sqlx::query_as("SELECT * FROM outbox_operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let db = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        db.get_outbox_operation("retained").await.unwrap(),
+        Some(before.clone())
+    );
+    let mut abandoned = OutboxOperation::prepared("unused".into(), "".into(), 0, "".into());
+    abandoned.state = "abandoned".into();
+    abandoned.accounting_pending = false;
+    assert!(db.insert_outbox_operation(&abandoned).await.unwrap());
+    db.pool().close().await;
+    let db = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        db.get_outbox_operation("retained").await.unwrap(),
+        Some(before)
+    );
+    assert_eq!(
+        db.get_outbox_operation("unused").await.unwrap(),
+        Some(abandoned)
+    );
+}

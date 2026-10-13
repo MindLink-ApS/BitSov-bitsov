@@ -7,6 +7,16 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Node / Security
 
+- Add `POST /api/v1/messages/operations/{id}/abandon`, advertised by
+  `message_operation_abandon_v1`. Under the compose lock, unused IDs and
+  prepared/released operations without payment evidence become durable
+  tombstones; late compose requests return `operation_abandoned`. Conflicts
+  return the current operation receipt, including paid admission evidence.
+  Admission journal and wallet evidence also gate abandonment. Recovery clears
+  proven-unpaid linked budget reservations while preserving abandoned IDs and
+  their replay protection after compaction. Migration 029 adds
+  SQLite/PostgreSQL state and retention support.
+  See [durable message operations](docs/v2/EXACTLY-ONCE-OPERATIONS.md#abandoning-an-unused-operation-id).
 - Update transitive `quinn-proto` from 0.11.15 to 0.11.18 to fix RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341 and RUSTSEC-2026-0342.
 
 - Add owner-device `breaker_reset` approvals, advertised by

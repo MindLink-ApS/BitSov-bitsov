@@ -1,6 +1,6 @@
 # Durable message operations (slice 2)
 
-Single-recipient `POST /api/v1/messages/compose` accepts `operation_id`, a client-generated UUIDv4. Generate it before the first request and retain it through timeouts and restarts. Repeating the same request with that ID returns the original receipt or resends its stored envelope without paying again. Changing recipient, kind, plaintext, or references returns `409 operation_mismatch` before debit or payment.
+Single-recipient `POST /api/v1/messages/compose` accepts `operation_id`, a client-generated UUIDv4. Generate it before the first request and retain it through timeouts and restarts. Repeating the same request with that ID returns the original receipt or resends its stored envelope without paying again. Changing recipient, kind, plaintext, or references returns `409 operation_mismatch` before debit or payment, unless the ID is abandoned (always `409 operation_abandoned`).
 
 If omitted, the node generates an ID and returns it. `deny_unknown_fields` remains enabled: unsupported fields fail during JSON extraction before spending. The API advertises `message_operations_v1`. Room requests remain compatible without an operation ID; explicit room IDs are refused before spending until per-member operations are implemented.
 
@@ -8,6 +8,7 @@ Responses add `operation_id`, `state`, `accepted`, `payment_hash`, and `retry_al
 
 | State | Same POST |
 | --- | --- |
+| abandoned | Always `409 operation_abandoned`, even for a different request. Use a new ID. |
 | prepared | Resume an operation proven not to have dispatched payment; normal authorization and caps apply. |
 | paying / payment_unknown | Reconcile the recorded hash. If still unresolved, return `409 payment_unresolved`; no new payment. |
 | released | A backend-positive Failed/Expired result permits one new authorized attempt. |
@@ -31,6 +32,54 @@ Existing pending deliveries receive `legacy:<message_id>:<recipient_id>` status 
 
 Regression coverage includes persistent SQLite reopen, concurrent duplicate POSTs, prepared/dispatch/hash/settlement/message/queue/paid/send/ACK interruption boundaries, invoice response loss, unresolved keysend, positive failure release, invalid settled proof, rejection backoff, immediate ACK, encrypted recovery data, and paired-budget liability after journal failure. PostgreSQL parity is exercised by the repository's ignored PostgreSQL integration test and its dedicated CI workflow.
 
+## Abandoning an unused operation ID
+
+Nodes advertising `message_operation_abandon_v1` in `/api/v1/status`
+`api_capabilities` accept `POST /api/v1/messages/operations/{operation_id}/abandon`
+with no request body. This requires the same `spend` scope and paired-caller
+binding as compose. The ID must be a UUIDv4; legacy synthetic IDs are read-only.
+
+The route takes the compose operation lock and returns the ordinary
+`ComposeResponse` view:
+
+- `200`, `state: abandoned`, `retry_allowed: false`: a permanent tombstone was
+  inserted for a missing ID, or a `prepared`/`released` row was fenced. Such a
+  row must have no dispatch, pending or paid admission, payment hash, settled
+  message amount, or re-admission amount. The same unpaid-evidence check used
+  by recovery also checks the admission journal (including retained attempts)
+  and wallet; ambiguous or unreadable evidence cannot authorize abandonment.
+  Missing-row tombstones have an empty request hash and no pending accounting.
+- `409`: the current operation view, including amounts and payment hash. This
+  includes a repeated abandon of an already abandoned ID. A live compose holds
+  the lock until it finishes or is cancelled; abandon waits and then evaluates
+  its durable result. Paying, unresolved and paid operations are never abandoned.
+
+A GET returning `404`, `prepared`, or `released` alone cannot fence a late POST.
+Before releasing an unpaid spending reservation, clients should obtain the
+abandon result and classify its state and payment evidence. A `prepared` row can
+already contain a paid first-contact admission. After a confirmed abandonment,
+use a **new operation ID** for any new send. Repeating abandon after a lost reply
+can confirm the tombstone through its `409` view. Transport failure is still an
+unknown outcome. Clients must gate this protocol on the capability flag.
+
+Recovery resolves proven-unpaid linked budget reservations to zero through the
+durable accounting queue, including debits cancelled before attachment to the
+operation row. The operation stays `abandoned` throughout recovery and restart.
+
+Abandoning an operation also releases any pending call reservation keyed by its
+ID, even if the call POST was cancelled before inserting the operation row.
+A cleanup storage error leaves the tombstone intact and returns an error;
+repeated abandon requests, periodic reconciliation and startup recovery retry
+the release idempotently without reopening the operation.
+
+Abandoned IDs survive restarts and payload compaction, cannot re-enter paying,
+and are excluded from payment recovery. Pending budget or call reservations can
+still bring them into a cleanup sweep without authorizing another payment.
+Migration 029 adds the state constraint and retention index on both backends;
+SQLite rebuilds the table transactionally while preserving all existing rows,
+including encrypted recovery bytes and CAS versions. Older binaries cannot be
+used to resume writes after this upgrade.
+
 ## Reservation and admission crash boundaries
 
 The pairing ledger atomically records each reservation's operation ID, execution ID and purpose with the debit. This includes first contact and child re-admission debits. Recovery can therefore discover a reservation even if cancellation prevents its asynchronous attachment to the operation recovery blob. These references restore reconciliation identity, never dispatch authority.
@@ -47,7 +96,7 @@ Additive migration 025 adds `accounting_pending` and `recovery_compacted` to SQL
 
 Each sweep snapshots the pairing ledger's unresolved operation links once and unions those operation IDs with the SQL result. This also discovers a late debit from a fenced execution after its row left the SQL index, including after terminal compaction. Attachment and resolution still use execution identity and the original reservation. Duplicate POST and ordinary reconciliation read durable row references without scanning grants or acquiring a pairing lock for resolved accounting; actual ledger resolutions retain their lock and persistence requirements. Sweep work is proportional to active recovery rows, unresolved links (plus traversing the current grant set), and a bounded maintenance batch, independent of resolved message history. SQLite pins the partial indexes so missing planner statistics cannot choose a terminal-history state scan.
 
-After 30 days without a terminal/accounting update, at most 100 `acked`/`failed_paid` rows per sweep have their bulky recovery draft, settlement and execution material compacted. Any unresolved accounting or discovered ledger link defers compaction. The version CAS protects concurrent changes. Operation IDs, request hashes, caller binding, state, message/payment IDs, amount/readmission/fee response fields and other scalar receipt metadata remain permanent tombstones; deleting those identities would let a duplicate POST pay again. This is payload retention, not a TTL on replay protection. Unknown-fee liabilities, retryable/unresolved operations and undelivered paid envelopes never qualify.
+After 30 days without a terminal/accounting update, at most 100 `acked`/`failed_paid`/`released`/`abandoned` rows per sweep have their bulky recovery draft, settlement and execution material compacted. Any unresolved accounting or discovered ledger link defers compaction. The version CAS protects concurrent changes. Operation IDs, request hashes, caller binding, state, message/payment IDs, amount/readmission/fee response fields and other scalar receipt metadata remain permanent tombstones; deleting those identities would let a duplicate POST pay again. This is payload retention, not a TTL on replay protection. Unknown-fee liabilities, retryable paid or unresolved operations and undelivered paid envelopes never qualify. Compacted released rows retain their existing retry semantics; abandoned IDs remain permanently refused.
 
 Coordination with #103: compaction does not touch `payment_receipts`, its migration-022 immutable envelope bindings, nonces, pending deliveries or message content. Recipient duplicate ACK and proof-reuse decisions remain valid after sender recovery compaction and independent message-content retention. Paid-message retention continues to follow `PAID-DELIVERY-SLICE-1.md`.
 

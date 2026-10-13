@@ -1811,6 +1811,10 @@ async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() 
         konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
         let op = f.op().await;
         assert_eq!(op.state, "prepared", "{case}: never released, left as it was");
+        let before = f.get().await;
+        let (status, view) = f.abandon().await;
+        assert_eq!(status, StatusCode::CONFLICT, "{case}: {view}");
+        assert_eq!(view, before, "{case}: current view");
         assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0, "{case}");
     }
     // Controls. The pilot: an empty journal directory. And an undispatched
@@ -1832,6 +1836,7 @@ async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() 
         f.restart().await;
         konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
         assert_eq!(f.op().await.state, "released", "{control}");
+        assert_eq!(f.abandon().await.0, StatusCode::OK, "{control}");
     }
 }
 
@@ -1863,4 +1868,517 @@ async fn a_recovered_dispatch_unknown_admission_is_not_released() {
     assert!(body["error"].as_str().unwrap().contains("outcome unknown"), "{body}");
     assert_ne!(body["state"], "released", "{body}");
     assert_ne!(f.op().await.state, "released", "a possibly dispatched admission is not unpaid");
+    let before = f.get().await;
+    let (status, view) = f.abandon().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{view}");
+    assert_eq!(view, before, "conflict returns the current operation view");
+    assert_eq!(f.get().await, before, "abandon must not mutate ambiguous evidence");
+}
+
+impl Fixture {
+    fn abandon_request(&self) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/messages/operations/{}/abandon", self.id))
+            .header("authorization", common::auth_header(&self.state))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn abandon(&self) -> (StatusCode, serde_json::Value) {
+        operation_reply(
+            common::test_router(self.state.clone())
+                .oneshot(self.abandon_request())
+                .await
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn seed_unpaid(&self, state: &str) {
+        let mut op = konsensus_storage::OutboxOperation::prepared(
+            self.id.clone(),
+            self.peer.to_hex(),
+            1,
+            "original-request".into(),
+        );
+        op.state = state.into();
+        op.accounting_pending = false;
+        op.recovery = serde_json::to_vec(&serde_json::json!({
+            "caller": null, "draft": null, "dispatched": false,
+            "expected_msat": 0, "settlement": null, "reservation": null,
+            "fee_ceiling_msat": 0, "admission_msat": 0, "admission_fee_msat": 0
+        }))
+        .unwrap();
+        assert!(self.db.insert_outbox_operation(&op).await.unwrap());
+    }
+}
+
+async fn operation_reply(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 16384)
+        .await
+        .unwrap();
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| serde_json::json!({"raw": String::from_utf8_lossy(&bytes)}));
+    (status, body)
+}
+
+#[tokio::test]
+async fn abandon_missing_is_durable_through_restart_and_compaction() {
+    let mut f = Fixture::new().await;
+    let (status, body) = f.abandon().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "abandoned");
+    assert_eq!(body["retry_allowed"], false);
+    assert_eq!(body["amount_msat"], 0);
+    assert_eq!(body["operation_id"], f.id);
+    let op = f.op().await;
+    assert_eq!(op.request_hash, "");
+    assert!(!op.accounting_pending);
+    assert!(f.db.list_recoverable_operations().await.unwrap().is_empty());
+    // The response was lost: a repeated abandon returns the current view.
+    let (status, again) = f.abandon().await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(again, body);
+    f.restart().await;
+    let (status, refusal) = f.post().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+    assert_eq!(refusal["code"], "operation_abandoned");
+    sqlx::query("UPDATE outbox_operations SET updated_at = 0")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    assert!(f.op().await.recovery_compacted);
+    f.restart().await;
+    let (status, refusal) = f.post().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+    assert_eq!(refusal["code"], "operation_abandoned");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn abandon_prepared_and_released_fence_late_posts() {
+    for state in ["prepared", "released"] {
+        let f = Fixture::new().await;
+        f.seed_unpaid(state).await;
+        let (status, body) = f.abandon().await;
+        assert_eq!(status, StatusCode::OK, "{state}: {body}");
+        assert_eq!(body["state"], "abandoned");
+        let (status, refusal) = f.post().await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+        assert_eq!(refusal["code"], "operation_abandoned");
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn abandon_refuses_each_payment_evidence_and_returns_the_get_view() {
+    for state in ["prepared", "released"] {
+        for evidence in [
+            "dispatched",
+            "admission_pending",
+            "admission_msat",
+            "payment_hash",
+            "settled_msat",
+            "readmission_msat",
+        ] {
+            let f = Fixture::new().await;
+            f.seed_unpaid(state).await;
+            let mut op = f.op().await;
+            let mut data: serde_json::Value = serde_json::from_slice(&op.recovery).unwrap();
+            match evidence {
+                "payment_hash" => op.payment_hash = Some("ab".repeat(32)),
+                "settled_msat" => op.settled_msat = 1000,
+                "readmission_msat" => op.readmission_msat = 1000,
+                "admission_msat" => data[evidence] = 1000.into(),
+                _ => data[evidence] = true.into(),
+            }
+            op.recovery = serde_json::to_vec(&data).unwrap();
+            assert!(f.db.update_outbox_operation(&op).await.unwrap());
+            let before = f.op().await;
+            let (status, body) = f.abandon().await;
+            assert_eq!(status, StatusCode::CONFLICT, "{state}/{evidence}: {body}");
+            let get = Request::builder()
+                .uri(format!("/api/v1/messages/operations/{}", f.id))
+                .header("authorization", common::auth_header(&f.state))
+                .body(Body::empty())
+                .unwrap();
+            let (get_status, view) = operation_reply(
+                common::test_router(f.state.clone())
+                    .oneshot(get)
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(get_status, StatusCode::OK);
+            assert_eq!(body, view, "{state}/{evidence}");
+            assert_eq!(f.op().await, before);
+            assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+    for state in [
+        "paying",
+        "payment_unknown",
+        "paid",
+        "sent",
+        "acked",
+        "failed_paid",
+        "rejected_retryable",
+    ] {
+        let f = Fixture::new().await;
+        f.seed_unpaid(state).await;
+        let (status, body) = f.abandon().await;
+        assert_eq!(status, StatusCode::CONFLICT, "{state}: {body}");
+        assert_eq!(body["state"], state);
+    }
+}
+
+#[tokio::test]
+async fn abandon_waits_for_live_post_and_never_claims_its_payment_is_unpaid() {
+    for cancel in [false, true] {
+        let f = Fixture::new().await;
+        f.wallet.pause_next_ready.store(true, Ordering::SeqCst);
+        let (app, request) = (common::test_router(f.state.clone()), f.request());
+        let post = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            f.wallet.ready_started.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.op().await.state, "paying");
+        let abandon = f.abandon();
+        tokio::pin!(abandon);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut abandon)
+                .await
+                .is_err(),
+            "abandon must wait for the compose lock"
+        );
+        if cancel {
+            post.abort();
+            assert!(post.await.unwrap_err().is_cancelled());
+        } else {
+            f.wallet.ready_continue.notify_one();
+            assert_eq!(post.await.unwrap().status(), StatusCode::OK);
+        }
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(5), abandon)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["state"], if cancel { "paying" } else { "sent" });
+        assert_eq!(
+            f.wallet.calls.load(Ordering::SeqCst),
+            if cancel { 0 } else { 1 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn abandon_racing_before_post_insert_prevents_payment() {
+    let f = Fixture::new().await;
+    // Hold the SQLite writer so abandon owns the operation lock but cannot
+    // finish inserting its tombstone. A compose is then queued behind it.
+    let mut writer = f.db.pool().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let abandon = f.abandon();
+    tokio::pin!(abandon);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut abandon)
+            .await
+            .is_err()
+    );
+    let post = f.post();
+    tokio::pin!(post);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut post)
+            .await
+            .is_err()
+    );
+    sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+    let (a, p) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(abandon, post)
+    })
+    .await
+    .unwrap();
+    assert_eq!(a.0, StatusCode::OK, "{}", a.1);
+    assert_eq!(p.0, StatusCode::CONFLICT, "{}", p.1);
+    assert_eq!(p.1["code"], "operation_abandoned");
+    assert_eq!(f.op().await.state, "abandoned");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn abandon_capability_is_advertised() {
+    let f = Fixture::new().await;
+    let request = Request::builder()
+        .uri("/api/v1/status")
+        .header("authorization", common::auth_header(&f.state))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = operation_reply(
+        common::test_router(f.state.clone())
+            .oneshot(request)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["api_capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("message_operation_abandon_v1")));
+}
+
+#[tokio::test]
+async fn abandon_requires_spend_scope_and_valid_uuid() {
+    use konsensus_api::auth::{create_token, Scope};
+    let f = Fixture::new().await;
+    for (scopes, expected) in [
+        (vec![Scope::Read], StatusCode::FORBIDDEN),
+        (vec![Scope::Spend], StatusCode::OK),
+    ] {
+        let token = create_token(
+            &f.state.identity.node_id().to_hex(),
+            &f.state.jwt_secret,
+            scopes,
+        )
+        .unwrap();
+        let mut request = f.abandon_request();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let response = common::test_router(f.state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::FORBIDDEN {
+            assert!(f.db.get_outbox_operation(&f.id).await.unwrap().is_none());
+        }
+    }
+    let mut request = f.abandon_request();
+    *request.uri_mut() = "/api/v1/messages/operations/not-a-uuid/abandon"
+        .parse()
+        .unwrap();
+    assert_eq!(
+        common::test_router(f.state.clone())
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn released_compaction_does_not_mark_the_next_execution_compacted() {
+    let f = Fixture::new().await;
+    f.fail_before_payment().await;
+    let _ = f.post().await;
+    assert_eq!(f.op().await.state, "released");
+    sqlx::query("UPDATE outbox_operations SET updated_at = 0")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    assert!(f.op().await.recovery_compacted);
+    f.allow_payment().await;
+    f.wallet.mode.store(4, Ordering::SeqCst);
+    let (app, request) = (common::test_router(f.state.clone()), f.request());
+    let post = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while f.wallet.calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    post.abort();
+    assert!(post.await.unwrap_err().is_cancelled());
+    let op = f.op().await;
+    assert_eq!(op.state, "paying");
+    assert!(!op.recovery_compacted, "a new execution must retain current recovery/ledger semantics, not late-link zero resolution");
+    konsensus_api::handlers::messages::reconcile_operations(&f.state)
+        .await
+        .unwrap();
+    assert_eq!(f.op().await.state, "payment_unknown");
+    assert!(!f.op().await.recovery_compacted);
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn abandon_releases_call_reservations_live_and_after_restart() {
+    for crash_after_tombstone in [false, true] {
+        let mut f = Fixture::new().await;
+        let call_id = "0123456789abcdef0123456789abcdef";
+        let plaintext = format!(r#"{{"v":1,"call_id":"{call_id}","media":"audio","sdp":"v=0"}}"#);
+        konsensus_api::calls::reserve_outgoing(
+            f.db.as_ref(),
+            f.state.identity.node_id(),
+            &f.peer,
+            400,
+            &plaintext,
+            &f.id,
+            "original-request",
+        )
+        .await
+        .unwrap();
+        f.seed_unpaid("prepared").await;
+        sqlx::query("UPDATE outbox_operations SET kind = 400")
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        assert!(f
+            .db
+            .call_get(&f.peer, call_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending
+            .is_some());
+        if crash_after_tombstone {
+            // The durable tombstone committed but the process stopped before
+            // it could release its call-state reservation.
+            sqlx::query("UPDATE outbox_operations SET state = 'abandoned'")
+                .execute(f.db.pool())
+                .await
+                .unwrap();
+            f.restart().await;
+            konsensus_api::calls::recover(f.db.as_ref()).await.unwrap();
+        } else {
+            assert_eq!(f.abandon().await.0, StatusCode::OK);
+        }
+        assert!(
+            f.db.call_get(&f.peer, call_id).await.unwrap().is_none(),
+            "abandoned calls must release the peer's open-call capacity"
+        );
+    }
+}
+
+// Durable state at cancellation between reserve_outgoing and the operation INSERT.
+async fn reserve_call_without_operation(f: &Fixture, call_id: &str) {
+    let plaintext = format!(r#"{{"v":1,"call_id":"{call_id}","media":"audio","sdp":"v=0"}}"#);
+    konsensus_api::calls::reserve_outgoing(
+        f.db.as_ref(),
+        f.state.identity.node_id(),
+        &f.peer,
+        400,
+        &plaintext,
+        &f.id,
+        "cancelled-request",
+    )
+    .await
+    .unwrap();
+    assert!(f.db.get_outbox_operation(&f.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn abandon_missing_call_operations_frees_every_slot_for_the_next_invite() {
+    let mut f = Fixture::new().await;
+    for n in 0..konsensus_core::payloads::call::MAX_OPEN_CALLS_PER_PEER {
+        f.id = uuid::Uuid::new_v4().to_string();
+        reserve_call_without_operation(&f, &format!("{n:032x}")).await;
+        assert_eq!(f.abandon().await.0, StatusCode::OK);
+        assert_eq!(f.abandon().await.0, StatusCode::CONFLICT);
+    }
+    assert!(
+        f.db.call_pending().await.unwrap().is_empty(),
+        "abandon must release reservations even without operation metadata"
+    );
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    assert_eq!(f.db.call_counts(&f.peer, now).await.unwrap().open_peer, 0);
+    let answering = answer_call_prices(&f);
+    f.id = uuid::Uuid::new_v4().to_string();
+    let (status, body) = operation_reply(
+        common::test_router(f.state.clone())
+            .oneshot(call_request(&f, &f.id, &format!("{:032x}", 99), "v=0", 0))
+            .await
+            .unwrap(),
+    )
+    .await;
+    answering.abort();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn abandon_missing_call_cleanup_retries_after_storage_failure_without_restart() {
+    for background in [false, true] {
+        let mut f = Fixture::new().await;
+        let call_id = format!("{:032x}", 1);
+        reserve_call_without_operation(&f, &call_id).await;
+        let abandoned_id = f.id.clone();
+        // An unrelated pending operation must keep its reservation.
+        f.id = uuid::Uuid::new_v4().to_string();
+        let other_call = format!("{:032x}", 2);
+        reserve_call_without_operation(&f, &other_call).await;
+        let unrelated = f.db.call_get(&f.peer, &other_call).await.unwrap();
+        f.id = abandoned_id;
+        sqlx::raw_sql("CREATE TRIGGER call_cleanup_failure BEFORE DELETE ON call_state BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END")
+            .execute(f.db.pool()).await.unwrap();
+        assert_eq!(f.abandon().await.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            f.op().await.state,
+            "abandoned",
+            "cleanup failure must keep the durable fence"
+        );
+        assert!(f.db.call_get(&f.peer, &call_id).await.unwrap().is_some());
+        assert!(f.db.list_recoverable_operations().await.unwrap().is_empty());
+        // A failed sweep must leave the reservation discoverable for another try.
+        konsensus_api::handlers::messages::reconcile_operations(&f.state)
+            .await
+            .unwrap();
+        assert!(f.db.call_get(&f.peer, &call_id).await.unwrap().is_some());
+        sqlx::raw_sql("DROP TRIGGER call_cleanup_failure")
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            if background {
+                konsensus_api::handlers::messages::reconcile_operations(&f.state)
+                    .await
+                    .unwrap();
+            } else {
+                assert_eq!(f.abandon().await.0, StatusCode::CONFLICT);
+            }
+            assert!(f.db.call_get(&f.peer, &call_id).await.unwrap().is_none());
+            assert_eq!(
+                f.db.call_get(&f.peer, &other_call).await.unwrap(),
+                unrelated
+            );
+        }
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn abandoned_id_refuses_call_compose_before_reserving() {
+    let f = Fixture::new().await;
+    assert_eq!(f.abandon().await.0, StatusCode::OK);
+    let call_id = "0123456789abcdef0123456789abcdef";
+    let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", common::auth_header(&f.state)).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"operation_id": f.id, "recipient": f.peer.to_hex(), "kind": 400,
+            "plaintext": format!(r#"{{"v":1,"call_id":"{call_id}","media":"audio","sdp":"v=0"}}"#), "wait_ack_ms": 0}).to_string())).unwrap();
+    let (status, body) = operation_reply(
+        common::test_router(f.state.clone())
+            .oneshot(request)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "operation_abandoned");
+    assert!(f.db.call_get(&f.peer, call_id).await.unwrap().is_none());
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
 }
