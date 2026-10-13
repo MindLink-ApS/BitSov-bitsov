@@ -1915,123 +1915,218 @@ impl LightningProvider for ReadyPauseBeforeDebit {
 
 #[tokio::test]
 async fn cancel_before_reservation_attachment_does_not_leak_grant() {
+    for first_contact in [false, true] {
+        cancel_before_reservation_attachment(first_contact, false).await;
+    }
+}
+
+#[tokio::test]
+async fn abandon_after_cancelled_debit_and_capped_retry_releases_linked_reservation() {
+    cancel_before_reservation_attachment(false, true).await;
+}
+
+async fn cancel_before_reservation_attachment(first_contact: bool, abandon_after_retry: bool) {
     use konsensus_storage::{SqliteStorage, Storage};
     use std::time::Duration;
-    for first_contact in [false, true] {
-        let mut fx = fixture().await;
-        let db = Arc::new(
-            SqliteStorage::open(fx.tmp.path().join("review113-link.db").to_str().unwrap())
+    let mut fx = fixture().await;
+    let db = Arc::new(
+        SqliteStorage::open(fx.tmp.path().join("review113-link.db").to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    fx.state = Arc::new(AppState {
+        storage: db.clone(),
+        ..(*fx.state).clone()
+    });
+    let token = fx.grant(None, GrantTerms::new(2500)).await;
+    if first_contact {
+        fx.state = Arc::new(AppState {
+            session_manager: Arc::new(konsensus_crypto::SessionManager::new(
+                fx.state.identity.clone(),
+            )),
+            ..(*fx.state).clone()
+        });
+        assert_eq!(
+            fx.owner_confirm(&fx.peer.to_hex(), 2500).await.0,
+            StatusCode::OK
+        );
+    }
+    let wallet = Arc::new(ReadyPauseBeforeDebit {
+        inner: fx.wallet.clone(),
+        pause_once: AtomicBool::new(true),
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    fx.state = Arc::new(AppState {
+        lightning: wallet.clone(),
+        ..(*fx.state).clone()
+    });
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let mut body = json!({"operation_id": operation_id, "recipient":fx.peer.to_hex(), "kind":100, "plaintext":"hi", "wait_ack_ms":0});
+    if first_contact {
+        body["max_total_msat"] = 2500.into();
+        body["kind"] = 0.into();
+    }
+    let state = fx.state.clone();
+    let request_token = token.clone();
+    let request_body = body.clone();
+    let request = tokio::spawn(async move {
+        call(
+            &state,
+            "POST",
+            "/api/v1/messages/compose",
+            Some(request_body),
+            Some(&request_token),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), wallet.entered.notified())
+        .await
+        .expect("readiness checkpoint");
+    let claimed = db
+        .get_outbox_operation(&operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.state, "paying");
+    assert_eq!(fx.used(), 0);
+
+    // SqliteStorage::open sets max_connections(10). Hold all connections;
+    // the next DB await in attach_debit cannot execute until we release them.
+    let mut held = Vec::new();
+    for _ in 0..10 {
+        held.push(
+            tokio::time::timeout(Duration::from_secs(10), db.pool().acquire())
                 .await
+                .expect("pool checkpoint")
                 .unwrap(),
         );
-        fx.state = Arc::new(AppState {
-            storage: db.clone(),
-            ..(*fx.state).clone()
-        });
-        let token = fx.grant(None, GrantTerms::new(2500)).await;
-        if first_contact {
-            fx.state = Arc::new(AppState {
-                session_manager: Arc::new(konsensus_crypto::SessionManager::new(
-                    fx.state.identity.clone(),
-                )),
-                ..(*fx.state).clone()
-            });
-            assert_eq!(
-                fx.owner_confirm(&fx.peer.to_hex(), 2500).await.0,
-                StatusCode::OK
-            );
+    }
+    wallet.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fx.used() == 0 {
+            tokio::task::yield_now().await;
         }
-        let wallet = Arc::new(ReadyPauseBeforeDebit {
-            inner: fx.wallet.clone(),
-            pause_once: AtomicBool::new(true),
-            entered: tokio::sync::Notify::new(),
-            resume: tokio::sync::Notify::new(),
-        });
-        fx.state = Arc::new(AppState {
-            lightning: wallet.clone(),
-            ..(*fx.state).clone()
-        });
-        let operation_id = uuid::Uuid::new_v4().to_string();
-        let mut body = json!({"operation_id": operation_id, "recipient":fx.peer.to_hex(), "kind":100, "plaintext":"hi", "wait_ack_ms":0});
-        if first_contact {
-            body["max_total_msat"] = 2500.into();
-            body["kind"] = 0.into();
-        }
-        let state = fx.state.clone();
-        let request_token = token.clone();
-        let request_body = body.clone();
-        let request = tokio::spawn(async move {
-            call(
-                &state,
+    })
+    .await
+    .expect("grant debit checkpoint");
+    assert_eq!(fx.used(), if first_contact { 2500 } else { 1000 });
+    assert_eq!(fx.wallet.money(), 0);
+    assert!(
+        !request.is_finished(),
+        "request must be suspended before reservation attachment"
+    );
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    drop(held);
+
+    let cancelled = db
+        .get_outbox_operation(&operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let recovery: Value = serde_json::from_slice(&cancelled.recovery).unwrap();
+    assert!(recovery["reservation"].is_null());
+    assert_eq!(cancelled.state, "paying");
+    if abandon_after_retry {
+        // A lower cap refuses the same ID before a new debit attaches, leaving
+        // the cancelled execution's 1,000 msat reservation only in the ledger.
+        body["max_total_msat"] = 1.into();
+        let (status, refusal) = fx
+            .call(
                 "POST",
                 "/api/v1/messages/compose",
-                Some(request_body),
-                Some(&request_token),
+                Some(body.clone()),
+                Some(&token),
             )
-            .await
-        });
-        tokio::time::timeout(Duration::from_secs(10), wallet.entered.notified())
-            .await
-            .expect("readiness checkpoint");
-        let claimed = db
-            .get_outbox_operation(&operation_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(claimed.state, "paying");
-        assert_eq!(fx.used(), 0);
-
-        // SqliteStorage::open sets max_connections(10). Hold all connections;
-        // the next DB await in attach_debit cannot execute until we release them.
-        let mut held = Vec::new();
-        for _ in 0..10 {
-            held.push(
-                tokio::time::timeout(Duration::from_secs(10), db.pool().acquire())
-                    .await
-                    .expect("pool checkpoint")
-                    .unwrap(),
-            );
-        }
-        wallet.resume.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while fx.used() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("grant debit checkpoint");
-        assert_eq!(fx.used(), if first_contact { 2500 } else { 1000 });
-        assert_eq!(fx.wallet.money(), 0);
-        assert!(
-            !request.is_finished(),
-            "request must be suspended before reservation attachment"
-        );
-        request.abort();
-        assert!(request.await.unwrap_err().is_cancelled());
-        drop(held);
-
-        let cancelled = db
-            .get_outbox_operation(&operation_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let recovery: Value = serde_json::from_slice(&cancelled.recovery).unwrap();
-        assert!(recovery["reservation"].is_null());
-        assert_eq!(cancelled.state, "paying");
-        fx.restart(); // Reopen the persisted paired budget as well as run startup recovery.
+            .await;
+        assert!(!status.is_success(), "{refusal}");
+        assert_eq!(refusal["state"], "released");
+        assert_eq!(fx.used(), 1000);
+        let (status, abandoned) = fx
+            .call(
+                "POST",
+                &format!("/api/v1/messages/operations/{operation_id}/abandon"),
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{abandoned}");
+        assert_eq!(abandoned["state"], "abandoned");
+        // Crash boundary: the ledger releases the debit, but SQL cannot clear
+        // its durable resolution. Restart must find the queue without a link.
+        sqlx::raw_sql("CREATE TRIGGER no_resolution_clear BEFORE UPDATE ON outbox_operations WHEN OLD.accounting_pending = 1 AND NEW.accounting_pending = 0 BEGIN SELECT RAISE(ABORT, 'resolution save failed'); END")
+            .execute(db.pool()).await.unwrap();
         konsensus_api::handlers::messages::reconcile_operations(&fx.state)
             .await
             .unwrap();
-        assert_eq!(
-            db.get_outbox_operation(&operation_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
+        assert_eq!(fx.used(), 0);
+        let pending = db
+            .get_outbox_operation(&operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.state, "abandoned");
+        assert!(pending.accounting_pending);
+        let data: Value = serde_json::from_slice(&pending.recovery).unwrap();
+        assert_eq!(data["budget_resolutions"][0]["actual_msat"], 0);
+        let budget = fx.service.reload_from_disk().unwrap().grants[0]
+            .budget
+            .clone()
+            .unwrap();
+        assert!(budget.pending.is_empty());
+        assert!(budget.operation_links.is_empty());
+        sqlx::raw_sql("DROP TRIGGER no_resolution_clear")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        fx.state = Arc::new(AppState {
+            storage: Arc::new(
+                SqliteStorage::open(fx.tmp.path().join("review113-link.db").to_str().unwrap())
+                    .await
+                    .unwrap(),
+            ),
+            ..(*fx.state).clone()
+        });
+    }
+    fx.restart(); // Reopen the persisted paired budget as well as run startup recovery.
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_outbox_operation(&operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        if abandon_after_retry {
+            "abandoned"
+        } else {
             "prepared"
-        );
+        }
+    );
+    assert_eq!(fx.wallet.money(), 0);
+    assert_eq!(fx.used(), 0, "no-dispatch cancellation must release the durable grant reservation before a same-operation retry");
+    assert!(
+        !db.get_outbox_operation(&operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .accounting_pending
+    );
+    let budget = fx.service.reload_from_disk().unwrap().grants[0]
+        .budget
+        .clone()
+        .unwrap();
+    assert!(budget.pending.is_empty());
+    assert!(budget.operation_links.is_empty());
+    if abandon_after_retry {
+        let (status, refusal) = fx
+            .call("POST", "/api/v1/messages/compose", Some(body), Some(&token))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+        assert_eq!(refusal["code"], "operation_abandoned");
         assert_eq!(fx.wallet.money(), 0);
-        assert_eq!(fx.used(), 0, "no-dispatch cancellation must release the durable grant reservation before a same-operation retry");
     }
 }
 

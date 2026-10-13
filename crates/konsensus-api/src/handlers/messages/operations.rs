@@ -809,12 +809,7 @@ pub(super) async fn abandon_operation(
         return Err(ApiError::Forbidden("operation belongs to another caller".into()));
     }
     if matches!(op.state.as_str(), "prepared" | "released")
-        && !data.dispatched
-        && !data.admission_pending
-        && data.admission_msat == 0
-        && op.payment_hash.is_none()
-        && op.settled_msat == 0
-        && op.readmission_msat == 0
+        && proven_unpaid(&state, &op, &data).await
     {
         recover_budget(&state, &mut op).await?;
         data = recovery(&op)?;
@@ -1184,8 +1179,22 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             else {
                 return Ok::<(), ApiError>(());
             };
-            // Ledger links can union IDs back in after the SQL exclusion.
+            // Ledger links can union abandoned IDs back in after the SQL
+            // exclusion. A cancelled debit may never have reached the row.
             if op.state == "abandoned" {
+                if let Some(linked) = links.get(&id) {
+                    let mut data = recovery(&op)?;
+                    if proven_unpaid(state, &op, &data).await {
+                        for (_, reservation) in linked {
+                            queue_resolution(&mut data, reservation.clone(), Some(0));
+                        }
+                        encode(&mut op, &data)?;
+                        save(state, &mut op).await?;
+                    }
+                }
+                // Persist the intents before touching the ledger so a crash
+                // can replay them without reopening the abandoned operation.
+                drain_resolutions(state, &mut op).await?;
                 return Ok(());
             }
             if let Some(linked) = links.get(&id) {

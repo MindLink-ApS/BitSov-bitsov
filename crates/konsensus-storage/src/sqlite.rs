@@ -670,7 +670,7 @@ impl Storage for SqliteStorage {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_recovery WHERE (accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable')) AND state != 'abandoned' ORDER BY created_at").fetch_all(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_recovery WHERE (accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable')) ORDER BY created_at").fetch_all(&self.pool).await?)
     }
     // Pin the partial index: without statistics SQLite can prefer the old
     // state index, walking all terminal history and sorting before LIMIT.

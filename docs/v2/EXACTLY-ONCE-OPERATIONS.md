@@ -45,8 +45,10 @@ The route takes the compose operation lock and returns the ordinary
 - `200`, `state: abandoned`, `retry_allowed: false`: a permanent tombstone was
   inserted for a missing ID, or a `prepared`/`released` row was fenced. Such a
   row must have no dispatch, pending or paid admission, payment hash, settled
-  message amount, or re-admission amount. Missing-row tombstones have an empty
-  request hash and no pending accounting.
+  message amount, or re-admission amount. The same unpaid-evidence check used
+  by recovery also checks the admission journal (including retained attempts)
+  and wallet; ambiguous or unreadable evidence cannot authorize abandonment.
+  Missing-row tombstones have an empty request hash and no pending accounting.
 - `409`: the current operation view, including amounts and payment hash. This
   includes a repeated abandon of an already abandoned ID. A live compose holds
   the lock until it finishes or is cancelled; abandon waits and then evaluates
@@ -59,6 +61,10 @@ already contain a paid first-contact admission. After a confirmed abandonment,
 use a **new operation ID** for any new send. Repeating abandon after a lost reply
 can confirm the tombstone through its `409` view. Transport failure is still an
 unknown outcome. Clients must gate this protocol on the capability flag.
+
+Recovery resolves proven-unpaid linked budget reservations to zero through the
+durable accounting queue, including debits cancelled before attachment to the
+operation row. The operation stays `abandoned` throughout recovery and restart.
 
 Abandoning a call-signal operation also releases its pending call reservation;
 startup recovery repairs a crash between the tombstone and that release.

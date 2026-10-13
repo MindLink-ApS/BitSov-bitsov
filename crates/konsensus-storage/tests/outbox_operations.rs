@@ -351,7 +351,7 @@ async fn failed_prepared_listing_selects_only_prepared_rows_with_an_error() {
 }
 
 #[tokio::test]
-async fn abandoned_operations_are_never_recovered_and_compact_like_released() {
+async fn abandoned_operations_recover_pending_accounting_and_compact_like_released() {
     let db = SqliteStorage::in_memory().await.unwrap();
     for state in ["abandoned", "released"] {
         for pending in [false, true] {
@@ -369,7 +369,7 @@ async fn abandoned_operations_are_never_recovered_and_compact_like_released() {
             .iter()
             .map(|op| op.operation_id.as_str())
             .collect::<Vec<_>>(),
-        ["released-true"]
+        ["abandoned-true", "released-true"]
     );
     let mut compactable: Vec<_> = db
         .list_compactable_operations(1, 100)

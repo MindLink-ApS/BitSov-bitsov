@@ -782,7 +782,7 @@ impl Storage for PostgresStorage {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = $1").bind(id).fetch_optional(&self.pool).await?)
     }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE (accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable')) AND state != 'abandoned' ORDER BY created_at").fetch_all(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE (accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable')) ORDER BY created_at").fetch_all(&self.pool).await?)
     }
     async fn list_failed_prepared_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE state = 'prepared' AND last_error IS NOT NULL ORDER BY created_at").fetch_all(&self.pool).await?)
@@ -3587,7 +3587,7 @@ mod migration_recovery_tests {
                         assert!(db.insert_outbox_operation(&row).await.unwrap());
                     }
                 }
-                assert_eq!(db.list_recoverable_operations().await.unwrap().len(), 14);
+                assert_eq!(db.list_recoverable_operations().await.unwrap().len(), 15);
                 sqlx::query("UPDATE outbox_operations SET updated_at = 0 WHERE state IN ('released', 'abandoned')").execute(&db.pool).await.unwrap();
                 let compactable = db.list_compactable_operations(1, 100).await.unwrap();
                 assert_eq!(compactable.len(), 2);

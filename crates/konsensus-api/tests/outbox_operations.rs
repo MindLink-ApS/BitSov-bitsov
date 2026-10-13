@@ -1811,6 +1811,10 @@ async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() 
         konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
         let op = f.op().await;
         assert_eq!(op.state, "prepared", "{case}: never released, left as it was");
+        let before = f.get().await;
+        let (status, view) = f.abandon().await;
+        assert_eq!(status, StatusCode::CONFLICT, "{case}: {view}");
+        assert_eq!(view, before, "{case}: current view");
         assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0, "{case}");
     }
     // Controls. The pilot: an empty journal directory. And an undispatched
@@ -1832,6 +1836,7 @@ async fn a_stuck_prepared_row_is_never_released_against_the_admission_journal() 
         f.restart().await;
         konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
         assert_eq!(f.op().await.state, "released", "{control}");
+        assert_eq!(f.abandon().await.0, StatusCode::OK, "{control}");
     }
 }
 
@@ -1863,6 +1868,11 @@ async fn a_recovered_dispatch_unknown_admission_is_not_released() {
     assert!(body["error"].as_str().unwrap().contains("outcome unknown"), "{body}");
     assert_ne!(body["state"], "released", "{body}");
     assert_ne!(f.op().await.state, "released", "a possibly dispatched admission is not unpaid");
+    let before = f.get().await;
+    let (status, view) = f.abandon().await;
+    assert_eq!(status, StatusCode::CONFLICT, "{view}");
+    assert_eq!(view, before, "conflict returns the current operation view");
+    assert_eq!(f.get().await, before, "abandon must not mutate ambiguous evidence");
 }
 
 impl Fixture {
