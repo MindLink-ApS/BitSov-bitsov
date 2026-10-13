@@ -191,6 +191,7 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (26, "outstanding web requests", include_str!("../migrations/026_outstanding_web_requests.sql")),
     (27, "call state", include_str!("../migrations/027_call_state.sql")),
     (28, "call request hold", include_str!("../migrations/028_call_request_hold.sql")),
+    (29, "operation abandon", include_str!("../migrations/029_operation_abandon.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -669,7 +670,7 @@ impl Storage for SqliteStorage {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = ?").bind(id).fetch_optional(&self.pool).await?)
     }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_recovery WHERE accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable') ORDER BY created_at").fetch_all(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_recovery WHERE (accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable')) AND state != 'abandoned' ORDER BY created_at").fetch_all(&self.pool).await?)
     }
     // Pin the partial index: without statistics SQLite can prefer the old
     // state index, walking all terminal history and sorting before LIMIT.
@@ -677,7 +678,7 @@ impl Storage for SqliteStorage {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_state WHERE state = 'prepared' AND last_error IS NOT NULL ORDER BY created_at").fetch_all(&self.pool).await?)
     }
     async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_retention WHERE accounting_pending = FALSE AND recovery_compacted = FALSE AND state IN ('acked', 'failed_paid') AND updated_at < ? ORDER BY updated_at LIMIT ?")
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations INDEXED BY outbox_operations_retention WHERE accounting_pending = FALSE AND recovery_compacted = FALSE AND state IN ('acked', 'failed_paid', 'released', 'abandoned') AND updated_at < ? ORDER BY updated_at LIMIT ?")
             .bind(before_ms).bind(i64::from(limit)).fetch_all(&self.pool).await?)
     }
 

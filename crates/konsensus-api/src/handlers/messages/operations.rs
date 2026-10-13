@@ -8,6 +8,7 @@ use crate::{
 };
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     Json,
 };
 use konsensus_core::{
@@ -525,6 +526,9 @@ pub(super) async fn compose_call(
     // already paid is answered from the journal, without reserving.
     let request_hash = request_digest(&peer, &req)?;
     let journal = state.storage.get_outbox_operation(&id).await.map_err(storage)?;
+    if let Some(op) = journal.as_ref().filter(|op| op.state == "abandoned") {
+        return Err(contextual(ApiError::OperationConflict("operation_abandoned"), op));
+    }
     if let Some(op) = journal.as_ref().filter(|op| op.request_hash != request_hash) {
         return Err(mismatch(op));
     }
@@ -585,6 +589,11 @@ async fn compose_locked(
                 "operation belongs to another caller".into(),
             ));
         }
+        // Missing-row tombstones intentionally have no request hash. Refuse
+        // them before mismatch checks or any recovery/re-payment work.
+        if op.state == "abandoned" {
+            return Err(contextual(ApiError::OperationConflict("operation_abandoned"), &op));
+        }
         if op.request_hash != digest {
             return Err(mismatch(&op));
         }
@@ -628,7 +637,11 @@ async fn compose_locked(
     // The CAS also serializes processes sharing a database. A claimed operation
     // never re-enters the paying handler without positive nonpayment evidence.
     op.state = "paying".into();
+    // A compacted released receipt may start a new execution. Its accounting
+    // links and fee evidence now belong to that execution, not the old receipt.
+    op.recovery_compacted = false;
     let mut data = recovery(&op)?;
+    data.compacted_fee_paid_msat = None;
     data.dispatched = false;
     data.settlement = None;
     let execution_id = uuid::Uuid::new_v4().to_string();
@@ -772,6 +785,55 @@ async fn wait_response(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// Permanently fence an unused ID, serialized with compose. A conflict is a
+/// current operation view, not evidence that nothing was paid.
+pub(super) async fn abandon_operation(
+    auth: MeteredSpend,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ComposeResponse>), ApiError> {
+    let id = operation_id(Some(&id))?;
+    let _guard = lock(&state, &id).await?;
+    let mut op = OutboxOperation::prepared(id.clone(), String::new(), 0, String::new());
+    op.state = "abandoned".into();
+    encode(&mut op, &Recovery { caller: caller(&auth), ..Default::default() })?;
+    if state.storage.insert_outbox_operation(&op).await.map_err(storage)? {
+        return Ok((StatusCode::OK, Json(response(&state.lightning_backend, &op, false)?)));
+    }
+    op = state.storage.get_outbox_operation(&id).await.map_err(storage)?
+        .ok_or_else(|| storage("missing operation"))?;
+    let mut data = recovery(&op)?;
+    if caller(&auth).is_some() && caller(&auth) != data.caller {
+        return Err(ApiError::Forbidden("operation belongs to another caller".into()));
+    }
+    if matches!(op.state.as_str(), "prepared" | "released")
+        && !data.dispatched
+        && !data.admission_pending
+        && data.admission_msat == 0
+        && op.payment_hash.is_none()
+        && op.settled_msat == 0
+        && op.readmission_msat == 0
+    {
+        recover_budget(&state, &mut op).await?;
+        data = recovery(&op)?;
+        data.execution_id = None;
+        op.state = "abandoned".into();
+        encode(&mut op, &data)?;
+        op.updated_at = chrono::Utc::now().timestamp_millis();
+        if state.storage.update_outbox_operation(&op).await.map_err(storage)? {
+            crate::calls::settle_operation(state.storage.as_ref(), &op, true).await;
+            return Ok((StatusCode::OK, Json(response(&state.lightning_backend, &op, false)?)));
+        }
+        // A different process may have claimed the row. Its current receipt
+        // must keep the caller's spending fence in place.
+        op = state.storage.get_outbox_operation(&id).await.map_err(storage)?
+            .ok_or_else(|| storage("missing operation"))?;
+    }
+    Ok((StatusCode::CONFLICT, Json(response(
+        &state.lightning_backend, &op, op.last_sent_at.is_some() || op.state == "acked",
+    )?)))
 }
 
 pub(super) async fn get_operation(
@@ -1122,6 +1184,10 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             else {
                 return Ok::<(), ApiError>(());
             };
+            // Ledger links can union IDs back in after the SQL exclusion.
+            if op.state == "abandoned" {
+                return Ok(());
+            }
             if let Some(linked) = links.get(&id) {
                 attach_recovered_reservations(state, &mut op, linked).await?;
             }
@@ -1327,7 +1393,7 @@ async fn compact_terminal_operations(
             if op.accounting_pending
                 || op.recovery_compacted
                 || op.updated_at >= cutoff
-                || !matches!(op.state.as_str(), "acked" | "failed_paid")
+                || !matches!(op.state.as_str(), "acked" | "failed_paid" | "released" | "abandoned")
             {
                 return Ok(());
             }

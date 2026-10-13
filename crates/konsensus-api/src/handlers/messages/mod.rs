@@ -130,6 +130,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/v1/messages/search", get(query::search_messages))
         .route("/api/v1/messages/compose", post(compose_observed))
         .route("/api/v1/messages/operations/:id", get(operations::get_operation))
+        .route("/api/v1/messages/operations/:id/abandon", post(operations::abandon_operation))
         .route("/api/v1/messages/resync", post(resync::resync_messages))
         .route("/api/v1/messages/first-contact/quote", post(compose::first_contact_quote))
         .route(

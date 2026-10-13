@@ -7,6 +7,15 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Node / Security
 
+- Add `POST /api/v1/messages/operations/{id}/abandon`, advertised by
+  `message_operation_abandon_v1`. Under the compose lock, unused IDs and
+  prepared/released operations without payment evidence become durable
+  tombstones; late compose requests return `operation_abandoned`. Conflicts
+  return the current operation receipt, including paid admission evidence.
+  Abandoned IDs are excluded from recovery and retain replay protection after
+  compaction. Migration 029 adds SQLite/PostgreSQL state and retention support.
+  See [durable message operations](docs/v2/EXACTLY-ONCE-OPERATIONS.md#abandoning-an-unused-operation-id).
+
 - Add owner-device `breaker_reset` approvals, advertised by
   `owner_device_approval_breaker_reset_v1`. A different enrolled owner device
   signs node-rendered grant, breaker, remaining-budget and failure terms; a

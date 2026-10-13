@@ -440,6 +440,7 @@ impl PostgresStorage {
     (26, "outstanding web requests", include_str!("../migrations/026_outstanding_web_requests.sql")),
     (27, "call state", include_str!("../migrations/027_call_state.sql")),
     (28, "call request hold", include_str!("../migrations/028_call_request_hold.sql")),
+    (29, "operation abandon", include_str!("../migrations/postgres/029_operation_abandon.sql")),
         ]
     }
 
@@ -781,13 +782,13 @@ impl Storage for PostgresStorage {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = $1").bind(id).fetch_optional(&self.pool).await?)
     }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable') ORDER BY created_at").fetch_all(&self.pool).await?)
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE (accounting_pending = TRUE OR state IN ('paying', 'payment_unknown', 'paid', 'sent', 'rejected_retryable')) AND state != 'abandoned' ORDER BY created_at").fetch_all(&self.pool).await?)
     }
     async fn list_failed_prepared_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
         Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE state = 'prepared' AND last_error IS NOT NULL ORDER BY created_at").fetch_all(&self.pool).await?)
     }
     async fn list_compactable_operations(&self, before_ms: i64, limit: u32) -> Result<Vec<crate::OutboxOperation>, StorageError> {
-        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE accounting_pending = FALSE AND recovery_compacted = FALSE AND state IN ('acked', 'failed_paid') AND updated_at < $1 ORDER BY updated_at LIMIT $2")
+        Ok(sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE accounting_pending = FALSE AND recovery_compacted = FALSE AND state IN ('acked', 'failed_paid', 'released', 'abandoned') AND updated_at < $1 ORDER BY updated_at LIMIT $2")
             .bind(before_ms).bind(i64::from(limit)).fetch_all(&self.pool).await?)
     }
 
@@ -3578,7 +3579,7 @@ mod migration_recovery_tests {
                 batch[0].recovery = b"receipt".to_vec();
                 assert!(db.update_outbox_operation(&batch[0]).await.unwrap());
                 assert!(db.list_compactable_operations(1, 100).await.unwrap().is_empty());
-                for state in ["prepared", "released", "paying", "payment_unknown", "paid", "sent", "acked", "rejected_retryable", "failed_paid"] {
+                for state in ["prepared", "released", "paying", "payment_unknown", "paid", "sent", "acked", "rejected_retryable", "failed_paid", "abandoned"] {
                     for pending in [false, true] {
                         let mut row = crate::OutboxOperation::prepared(format!("{state}-{pending}"), peer.to_hex(), 1, "request".into());
                         row.state = state.into();
@@ -3587,6 +3588,11 @@ mod migration_recovery_tests {
                     }
                 }
                 assert_eq!(db.list_recoverable_operations().await.unwrap().len(), 14);
+                sqlx::query("UPDATE outbox_operations SET updated_at = 0 WHERE state IN ('released', 'abandoned')").execute(&db.pool).await.unwrap();
+                let compactable = db.list_compactable_operations(1, 100).await.unwrap();
+                assert_eq!(compactable.len(), 2);
+                assert!(compactable.iter().any(|op| op.operation_id == "abandoned-false"));
+                assert!(compactable.iter().any(|op| op.operation_id == "released-false"));
                 assert!(db.list_failed_prepared_operations().await.unwrap().is_empty());
                 let mut failed = crate::OutboxOperation::prepared("prepared-failed".into(), peer.to_hex(), 1, "request".into());
                 failed.last_error = Some("admission journal: os error 2".into());

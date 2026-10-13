@@ -461,7 +461,7 @@ pub enum Settlement {
 /// Classify an outbox operation state (`None`: the operation was never created).
 pub fn settlement(state: Option<&str>) -> Settlement {
     match state {
-        None | Some("prepared" | "released") => Settlement::Unpaid,
+        None | Some("prepared" | "released" | "abandoned") => Settlement::Unpaid,
         Some("paid" | "sent" | "acked" | "rejected_retryable" | "failed_paid") => Settlement::Paid,
         _ => Settlement::Ambiguous,
     }
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn journal_states_decide_commit_release_or_keep() {
-        for s in [None, Some("prepared"), Some("released")] {
+        for s in [None, Some("prepared"), Some("released"), Some("abandoned")] {
             assert_eq!(settlement(s), Settlement::Unpaid);
         }
         for s in ["paid", "sent", "acked", "rejected_retryable", "failed_paid"] {
