@@ -7,6 +7,8 @@ also live on the corresponding GitHub pre-release pages.
 
 ### Node / Security
 
+- Update transitive `quinn-proto` from 0.11.15 to 0.11.18 to fix RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341 and RUSTSEC-2026-0342.
+
 - Add owner-device `breaker_reset` approvals, advertised by
   `owner_device_approval_breaker_reset_v1`. A different enrolled owner device
   signs node-rendered grant, breaker, remaining-budget and failure terms; a
