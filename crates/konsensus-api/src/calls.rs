@@ -244,6 +244,21 @@ pub async fn settle_operation(store: Store<'_>, op: &konsensus_storage::OutboxOp
     }
 }
 
+/// Release every reservation of a durably abandoned operation. The caller
+/// holds its operation lock and has already persisted the tombstone: a
+/// cancelled POST may have reserved a signal before inserting any operation
+/// metadata. Keep the pending row on write failure so a retry/sweep finds it.
+pub(crate) async fn release_abandoned(store: Store<'_>, operation_id: &str) -> Result<(), konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    for (peer, call_id, entry) in store.call_pending().await? {
+        if entry.pending.as_ref().is_some_and(|p| p.operation_id == operation_id) {
+            let next = rules::release(entry, operation_id);
+            write(store, &peer, &call_id, next.as_ref()).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Startup: settle or release every reservation a crash left, from the
 /// operation journal. Ambiguous ones stay for a same-operation retry. Run
 /// before the receive loop and the outbox resend start.

@@ -2265,6 +2265,102 @@ async fn abandon_releases_call_reservations_live_and_after_restart() {
     }
 }
 
+// Durable state at cancellation between reserve_outgoing and the operation INSERT.
+async fn reserve_call_without_operation(f: &Fixture, call_id: &str) {
+    let plaintext = format!(r#"{{"v":1,"call_id":"{call_id}","media":"audio","sdp":"v=0"}}"#);
+    konsensus_api::calls::reserve_outgoing(
+        f.db.as_ref(),
+        f.state.identity.node_id(),
+        &f.peer,
+        400,
+        &plaintext,
+        &f.id,
+        "cancelled-request",
+    )
+    .await
+    .unwrap();
+    assert!(f.db.get_outbox_operation(&f.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn abandon_missing_call_operations_frees_every_slot_for_the_next_invite() {
+    let mut f = Fixture::new().await;
+    for n in 0..konsensus_core::payloads::call::MAX_OPEN_CALLS_PER_PEER {
+        f.id = uuid::Uuid::new_v4().to_string();
+        reserve_call_without_operation(&f, &format!("{n:032x}")).await;
+        assert_eq!(f.abandon().await.0, StatusCode::OK);
+        assert_eq!(f.abandon().await.0, StatusCode::CONFLICT);
+    }
+    assert!(
+        f.db.call_pending().await.unwrap().is_empty(),
+        "abandon must release reservations even without operation metadata"
+    );
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    assert_eq!(f.db.call_counts(&f.peer, now).await.unwrap().open_peer, 0);
+    let answering = answer_call_prices(&f);
+    f.id = uuid::Uuid::new_v4().to_string();
+    let (status, body) = operation_reply(
+        common::test_router(f.state.clone())
+            .oneshot(call_request(&f, &f.id, &format!("{:032x}", 99), "v=0", 0))
+            .await
+            .unwrap(),
+    )
+    .await;
+    answering.abort();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn abandon_missing_call_cleanup_retries_after_storage_failure_without_restart() {
+    for background in [false, true] {
+        let mut f = Fixture::new().await;
+        let call_id = format!("{:032x}", 1);
+        reserve_call_without_operation(&f, &call_id).await;
+        let abandoned_id = f.id.clone();
+        // An unrelated pending operation must keep its reservation.
+        f.id = uuid::Uuid::new_v4().to_string();
+        let other_call = format!("{:032x}", 2);
+        reserve_call_without_operation(&f, &other_call).await;
+        let unrelated = f.db.call_get(&f.peer, &other_call).await.unwrap();
+        f.id = abandoned_id;
+        sqlx::raw_sql("CREATE TRIGGER call_cleanup_failure BEFORE DELETE ON call_state BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END")
+            .execute(f.db.pool()).await.unwrap();
+        assert_eq!(f.abandon().await.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            f.op().await.state,
+            "abandoned",
+            "cleanup failure must keep the durable fence"
+        );
+        assert!(f.db.call_get(&f.peer, &call_id).await.unwrap().is_some());
+        assert!(f.db.list_recoverable_operations().await.unwrap().is_empty());
+        // A failed sweep must leave the reservation discoverable for another try.
+        konsensus_api::handlers::messages::reconcile_operations(&f.state)
+            .await
+            .unwrap();
+        assert!(f.db.call_get(&f.peer, &call_id).await.unwrap().is_some());
+        sqlx::raw_sql("DROP TRIGGER call_cleanup_failure")
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            if background {
+                konsensus_api::handlers::messages::reconcile_operations(&f.state)
+                    .await
+                    .unwrap();
+            } else {
+                assert_eq!(f.abandon().await.0, StatusCode::CONFLICT);
+            }
+            assert!(f.db.call_get(&f.peer, &call_id).await.unwrap().is_none());
+            assert_eq!(
+                f.db.call_get(&f.peer, &other_call).await.unwrap(),
+                unrelated
+            );
+        }
+        assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[tokio::test]
 async fn abandoned_id_refuses_call_compose_before_reserving() {
     let f = Fixture::new().await;

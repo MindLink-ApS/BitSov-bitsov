@@ -800,6 +800,7 @@ pub(super) async fn abandon_operation(
     op.state = "abandoned".into();
     encode(&mut op, &Recovery { caller: caller(&auth), ..Default::default() })?;
     if state.storage.insert_outbox_operation(&op).await.map_err(storage)? {
+        crate::calls::release_abandoned(state.storage.as_ref(), &id).await.map_err(storage)?;
         return Ok((StatusCode::OK, Json(response(&state.lightning_backend, &op, false)?)));
     }
     op = state.storage.get_outbox_operation(&id).await.map_err(storage)?
@@ -807,6 +808,9 @@ pub(super) async fn abandon_operation(
     let mut data = recovery(&op)?;
     if caller(&auth).is_some() && caller(&auth) != data.caller {
         return Err(ApiError::Forbidden("operation belongs to another caller".into()));
+    }
+    if op.state == "abandoned" {
+        crate::calls::release_abandoned(state.storage.as_ref(), &id).await.map_err(storage)?;
     }
     if matches!(op.state.as_str(), "prepared" | "released")
         && proven_unpaid(&state, &op, &data).await
@@ -818,7 +822,7 @@ pub(super) async fn abandon_operation(
         encode(&mut op, &data)?;
         op.updated_at = chrono::Utc::now().timestamp_millis();
         if state.storage.update_outbox_operation(&op).await.map_err(storage)? {
-            crate::calls::settle_operation(state.storage.as_ref(), &op, true).await;
+            crate::calls::release_abandoned(state.storage.as_ref(), &id).await.map_err(storage)?;
             return Ok((StatusCode::OK, Json(response(&state.lightning_backend, &op, false)?)));
         }
         // A different process may have claimed the row. Its current receipt
@@ -1162,6 +1166,15 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
         .map(|op| op.operation_id)
         .collect();
     ids.extend(links.keys().cloned());
+    // A cancelled call POST can leave a reservation before its operation row
+    // exists. Its later tombstone is outside list_recoverable_operations, so
+    // use pending reservations as durable cleanup intents too.
+    match state.storage.call_pending().await {
+        Ok(pending) => ids.extend(pending.into_iter().filter_map(|(_, _, entry)| {
+            entry.pending.map(|p| p.operation_id)
+        })),
+        Err(error) => tracing::warn!(%error, "call reservation cleanup deferred"),
+    }
     // Never let this listing hold up recovery of paid or unresolved rows.
     if let Err(error) = release_failed_prepared(state).await {
         tracing::warn!(%error, "failed operation release deferred");
@@ -1182,6 +1195,7 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             // Ledger links can union abandoned IDs back in after the SQL
             // exclusion. A cancelled debit may never have reached the row.
             if op.state == "abandoned" {
+                crate::calls::release_abandoned(state.storage.as_ref(), &id).await.map_err(storage)?;
                 if let Some(linked) = links.get(&id) {
                     let mut data = recovery(&op)?;
                     if proven_unpaid(state, &op, &data).await {

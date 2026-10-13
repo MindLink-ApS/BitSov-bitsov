@@ -66,11 +66,15 @@ Recovery resolves proven-unpaid linked budget reservations to zero through the
 durable accounting queue, including debits cancelled before attachment to the
 operation row. The operation stays `abandoned` throughout recovery and restart.
 
-Abandoning a call-signal operation also releases its pending call reservation;
-startup recovery repairs a crash between the tombstone and that release.
+Abandoning an operation also releases any pending call reservation keyed by its
+ID, even if the call POST was cancelled before inserting the operation row.
+A cleanup storage error leaves the tombstone intact and returns an error;
+repeated abandon requests, periodic reconciliation and startup recovery retry
+the release idempotently without reopening the operation.
 
 Abandoned IDs survive restarts and payload compaction, cannot re-enter paying,
-and are excluded from recovery even if a stale accounting link names the ID.
+and are excluded from payment recovery. Pending budget or call reservations can
+still bring them into a cleanup sweep without authorizing another payment.
 Migration 029 adds the state constraint and retention index on both backends;
 SQLite rebuilds the table transactionally while preserving all existing rows,
 including encrypted recovery bytes and CAS versions. Older binaries cannot be
