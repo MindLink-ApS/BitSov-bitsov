@@ -4,16 +4,66 @@ This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
 **rc15 preparation (2026-10-14):** six merged PRs after `v0.3.0-rc14`
-(`d55a88e4`): #301, #302, #303, #304, #306 and #307, through main
-`9fdb14806971879661bdb07bd72b414d33974bae`. This branch changes documentation
-only; versions remain rc14. Rasmus will select the final rc15 release commit
-and tag/sign separately. See the [signing checklist](releases/v0.3.0-rc15.md).
+(`d55a88e4`): #301, #302, #303, #304, #306 and #307, plus
+`fix/ldk-0.2.7-security`, `fix/ldk-node-071-backports` and
+`fix/ldk-node-late-failure`. The candidate is late-failure head
+`be3b00ac535582262157535a5139a7d812939474` plus the reviewed release/upgrade
+docs and this security update on `docs/rc15-release-notes-security`. This
+update changes documentation only; versions remain rc14. Rasmus will select
+the final rc15 release commit and tag/sign separately. See the [signing checklist](releases/v0.3.0-rc15.md).
 For nodes skipping releases, apply the earlier procedures first, then
 rc14 → rc15. Historical sections describe their release's behavior; the rc15
 pairing v7 and independent owner-device reset guidance supersede rc14's v6
 and console-only reset descriptions.
 
 ## rc14 → rc15 procedure
+
+**Read these security changes before replacing the binary:**
+
+- Vendored `lightning` moves from **0.2.2 to 0.2.7**, bringing the funds-theft
+  fixes **#5057** (commitment rollback) and **#5042** (underfunded LSPS2
+  forwarding), and the **#4867 Electrum DoS fix**. The locked liquidity and
+  transaction-sync companions also move to 0.2.7; both core and liquidity
+  changes are required for LSPS2. See [Lightning evidence](security/ldk-0.2.7/README.md).
+- Vendored `ldk-node` remains **0.7.0 with selected 0.7.1 backports**:
+  **#1032** fails closed on ChannelManager read errors other than `NotFound`;
+  **#899** rejects unauthorized nonzero skims on unregistered receives;
+  **#1157** rejects unknown required custom TLVs before exposing claimability;
+  **#1035** removes preimages from successful-send logs (receipts/events retain
+  them). **possiblyrandom 0.2.1** restores default-feature OS entropy on
+  supported targets; unsupported targets or OS failure can still yield zeros.
+  See [backport evidence](security/ldk-node-0.7.1/README.md).
+- Late `PaymentFailed` events no longer overwrite a successful outbound
+  Lightning receipt or emit a contradictory failure event. Circular inbound
+  HTLCs using an outbound hash are still rejected without changing that
+  outbound payment's status. This includes the circular-payment part of
+  **#1157**. A stale failure notification is not permission to repay; reconcile
+  the persisted receipt. See [payment-status evidence](security/ldk-node-0.7.1/PAYMENT-STATUS.md).
+
+**No downgrade to rc14 after running rc15 with embedded LDK.** New optional
+fields persisted by Lightning 0.2.7 are skipped by 0.2.2 and dropped if it
+rewrites the state. Read compatibility does not mean safe downgrade; the
+existing LDK rollback rule already forbids it. Keep the latest state and roll
+forward. Step 8's reviewed cutoff and narrow restoration exception for a
+failed start before LDK remain unchanged; generation 3 does not make a
+downgrade safe.
+
+**If startup now fails closed:** look for
+`Failed to read channel manager from store: <error>` in the LDK log. This
+returns `BuildError::ReadFailed`; BitSov surfaces
+`failed to build LDK node: Failed to read from store.` The latter can also
+refer to other store reads, so use the log to identify the failing component.
+Stop, preserve the latest state, and diagnose storage availability,
+permissions or corruption. **Do not delete or replace the ChannelManager to
+"fix" the error**, copy in an older manager, or initialize fresh state.
+Only `NotFound` permits fresh manager creation; making retained state look
+missing bypasses the protection and can endanger channel funds.
+
+**On the hub, drain or inspect old queued LSPS2/JIT HTLCs before relying on
+the fix.** HTLCs queued by the old LSPS2 code keep their unchecked amounts;
+upgrading/restarting does not retroactively validate them. Account for these
+flows during step 1's reconciliation. No deployed queue inspection or live
+upgrade is recorded by the security evidence.
 
 1. **Prepare the retained node and pre-swap backup.** Complete any seed
    encryption or rc14 maintenance described in step 4 before the final shutdown.
