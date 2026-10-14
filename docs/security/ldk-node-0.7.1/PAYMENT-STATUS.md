@@ -36,7 +36,7 @@ already-failed replay and missing-record event delivery.
 Before the fix, the success regression failed because status changed from
 `Succeeded` to `Failed`; the replay control passed. Both pass with the backport.
 They run under the existing `ldk-node-security` CI job's unfiltered vendored
-`--lib` command. Full follow-up validation is recorded below when completed.
+`--lib` command. Full follow-up validation is recorded below.
 
 ## Circular inbound HTLC using an outbound hash
 
@@ -60,3 +60,95 @@ restart. Before the fix it failed on the pending record becoming `Failed`;
 after the fix it passes for both statuses. It uses the same existing CI job.
 The synthetic event has no corresponding live ChannelManager HTLC; failure
 propagation on a funded network is not exercised.
+
+
+## Application settlement boundary
+
+`crates/konsensus-lightning/src/tests/ldk_late_failure.rs` restores a successful
+receipt and a stale application `PaymentFailed` notification into a real SQLite
+store/queue. It runs the production drainer and consumer, subscribes through
+`outgoing_payment_updates`, then calls the real `get_payment_status` on the hint.
+For failures both with and without a payment hash, the result remains `Settled`
+with the same preimage, amount, fee and complete underlying receipt.
+
+This is complementary coverage: the vendor regression tests raw LDK
+`PaymentSent` → `PaymentFailed` handling and fails without the backport; the
+application regression pins the contract that an application event is only a
+wake-up hint and the persisted record is authoritative. The application test
+alone does not detect removing the vendor guard, and does not run
+`konsensus-api`'s `await_settlement` loop. No test-only production API was added.
+
+## BitSov `crates/` audit
+
+No independent production transition from `Succeeded`/`Settled` to `Failed`
+was found. No BitSov production code was changed.
+
+- `konsensus-lightning/src/ldk.rs`: `spawn_event_drainer` broadcasts only a hash;
+  `outgoing_update_hash` supplies that hint; `get_payment_status` reads node
+  records; `convert_status` maps `Succeeded` to `Settled` and `Failed` to
+  `Failed`. It does not mutate the record in response to application failure
+  notifications. This is why fixing the vendor store mutation is essential.
+- `konsensus-lightning/src/mock.rs`: the direct `Failed` assignment in
+  `cancel_hodl_invoice` is guarded by `Pending` while holding the payment lock.
+- LND, CLN and LNbits adapters map backend-reported states; they do not locally
+  overwrite a previously successful stored LDK payment. They rely on their
+  external backends' state reporting, which was not audited here.
+- `konsensus-api/src/handlers/messages/compose.rs` returns on `Settled` rather
+  than continuing to process hints; `operations.rs` prefers a stored settled
+  proof and refuses to release a payment when a failure contradicts recorded
+  settlement. `handlers/sponsor.rs::record_outcome` fences funded state against
+  later failure results. Budget resolution removes pending reservations once,
+  so repeat resolution cannot turn a completed debit into a refund.
+- Storage/node consumers were checked for payment-status writes, success/failure
+  variants and string-state assignments. Outbox `failed_paid` is a delivery
+  failure that retains payment liability; it is not an unpaid payment status.
+
+A separate read-only review confirmed the production diff, regression scope and
+absence of an additional local success-to-failure write. This is a targeted
+source audit, not a whole-repository security certification.
+
+## Preservation
+
+[payment-status-preservation.json](payment-status-preservation.json) compares
+all tracked vendor files with `d23eb4202ee85ec00509a9186ad02953fb07be5e`:
+232 existing files are byte-identical; only `event.rs`, `payment/store.rs` and
+the existing event-test module change. The two production files were rebuilt
+from base bytes plus the two original release patches in a temporary directory
+and compared byte-for-byte to this tree. The existing test file is identical
+after removing its two new module declarations. Two new vendor test files are
+added. No manifests, locks, package versions, persistence formats, CI workflow
+or other vendor patches changed. Earlier archive-relative inventories remain
+historical snapshots, explicitly identified in README.
+
+## Observed validation
+
+Environment: macOS arm64, Rust/Cargo 1.91.1. All Cargo runs use
+`CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`, with
+`CARGO_TARGET_DIR=/tmp/ldk-security-vendor-target` for the vendor and
+`/tmp/ldk-security-target` for the workspace crate. Dependencies were already
+cached; `--locked --offline` prevents resolution/network changes.
+
+| Command/check | Result |
+|---|---|
+| Before fixes: `cargo test --locked --offline --manifest-path vendor/ldk-node/Cargo.toml --lib payment_status` | 2 expected vulnerability failures; 1 replay control passed |
+| Late-failure-only focused run after its fix | 2 passed |
+| `cargo test --locked --offline --manifest-path vendor/ldk-node/Cargo.toml --lib` | 163 passed, 0 failed, 0 ignored |
+| `cargo test --locked --offline -p konsensus-lightning --no-fail-fast` in restricted sandbox | 257 passed, 135 failed, 2 ignored; localhost bind permission errors, including secondary Mockito server errors |
+| Same full konsensus-lightning command with local socket binds permitted | 392 passed, 0 failed, 2 ignored; exit 0 |
+| `git diff --check d23eb420` | Passed |
+| Reapply exact upstream patches to base and compare; all-vendor hash inventory | Passed |
+
+The two ignored tests are `close_current_channel_restart_and_send_only_home`
+and `recover_latest_hub_state_with_and_without_stale_backup`, which require a
+local bitcoind and real regtest channels. No integration feature or live funds
+were used. The first application-test compilation required correcting owned
+`Vec<u8>` arguments for `KVStoreSync::write`; the subsequent full runs include
+the corrected test. No production code changed to address sandbox failures.
+
+[payment-status-results.json](payment-status-results.json) preserves all run
+counts, failed target/test names from the sandbox and red runs, and SHA-256
+hashes/paths of local raw logs. Those temporary logs are not portable artifacts.
+The full workspace and hosted CI were not rerun for this follow-up. The existing
+CI job will execute all 163 vendor lib tests. Upstream tag signing identity,
+funded-network behavior and general concurrent-writer races are outside this
+validation.

@@ -1,5 +1,19 @@
 # Validation
 
+## Payment-status follow-up on `d23eb420`
+
+The full vendored library suite passed **163/163**. The full
+`konsensus-lightning` suite passed **392 tests**, with **0 failures and 2 existing
+regtest ignores**, after permitting the local socket binds its fixtures require.
+Both new vendor regressions failed against the unfixed handlers; the replay
+control passed. The new application-boundary settlement regression also passed.
+See [PAYMENT-STATUS.md](PAYMENT-STATUS.md) for commands, scope, audit and provenance,
+and [payment-status-results.json](payment-status-results.json) for per-target
+counts and the initial sandbox failures. The older results below remain an
+unchanged record of the initial review.
+
+## Initial backport validation
+
 Environment: macOS arm64, Rust/Cargo 1.91.1. Tests run in the provided sandbox,
 with two Cargo build jobs, `CARGO_PROFILE_DEV_DEBUG=0` and
 `CARGO_PROFILE_TEST_DEBUG=0`; build artifacts and raw logs are outside the

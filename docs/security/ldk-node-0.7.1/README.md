@@ -1,7 +1,11 @@
 # ldk-node 0.7.1 security backports
 
-Base: `26e0b7e5` on `fix/ldk-0.2.7-security`. This branch retains the patched
-ldk-node **0.7.0** vendor tree and selectively backports four fixes; it does not
+**Payment-status follow-up:** [PAYMENT-STATUS.md](PAYMENT-STATUS.md) records the
+additional late-failure and circular-payment backports stacked on `d23eb420`,
+with regression results, the `crates/` audit and byte-preservation evidence.
+
+Initial review base: `26e0b7e5` on `fix/ldk-0.2.7-security`. That phase retained the patched
+ldk-node **0.7.0** vendor tree and selectively backported four fixes; it does not
 claim to include every change in 0.7.1. The prior Lightning 0.2.7 review is recorded
 in [../ldk-0.2.7](../ldk-0.2.7/README.md).
 
@@ -28,7 +32,8 @@ parameters to metadata; upstream's 0.7.1 backport deliberately takes only the
 missing fee check, and this branch follows that narrow backport. #1157 contains
 three commits; this work takes its required-TLV fix. The pre-existing local
 successful-receipt duplicate protection remains unchanged; the PR's separate
-outbound circular-payment status change is outside this requested backport.
+outbound circular-payment status change was outside that initial backport and
+is now included in the [payment-status follow-up](PAYMENT-STATUS.md).
 
 [Giving possiblyrandom access to OS randomness, rust-lightning #4719](https://github.com/lightningdevkit/rust-lightning/pull/4719)
 merged as `0f3916781b9a36f7f33ad296700eb020bf353be7`, with implementation
@@ -58,6 +63,8 @@ duplicate guard, stateless quote authentication and expiry, and all wallet,
 watchtower, capacity, peer and sync patches are retained. No wire format,
 persistence encoding, public API or vendor package version changes.
 
+The inventories in this paragraph describe the initial review through `d23eb420`;
+the follow-up has a separate [preservation inventory](payment-status-preservation.json).
 `local-before.json` is the prior review's complete archive-relative patch
 inventory, checked against the base commit. `local-after.json` uses the same
 schema against original ldk-node 0.7.0 and Lightning 0.2.7 archives, recording

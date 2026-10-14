@@ -1,0 +1,586 @@
+{
+  "runs": [
+    {
+      "run": "vendor_red",
+      "log": "/tmp/latefail-vendor-red.log",
+      "log_sha256": "a2317bcfbb8f7e80d63a61c0df7606b9411faf71291faa1c8c5ac76d269202d8",
+      "exit_code": 101,
+      "totals": {
+        "passed": 1,
+        "failed": 2,
+        "ignored": 0
+      },
+      "targets": [
+        {
+          "target": "unittests src/lib.rs",
+          "passed": 1,
+          "failed": 2,
+          "ignored": 0,
+          "failed_tests": [
+            "event::bitsov_jit_tests::security_071_tests::payment_status::circular_receive_preserves_pending_and_succeeded_outbound_records",
+            "event::bitsov_jit_tests::security_071_tests::payment_status::late_failure_preserves_successful_lightning_receipt_and_emits_no_failure"
+          ]
+        }
+      ]
+    },
+    {
+      "run": "vendor_late_green",
+      "log": "/tmp/latefail-vendor-green.log",
+      "log_sha256": "27b649c790a1f05a91472a82662e01fd168814f9371c4bbd31ace0c4f70341d1",
+      "exit_code": 0,
+      "totals": {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      },
+      "targets": [
+        {
+          "target": "unittests src/lib.rs",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        }
+      ]
+    },
+    {
+      "run": "vendor_full",
+      "log": "/tmp/latefail-vendor-full.log",
+      "log_sha256": "bab01ccff4eda16ad0f025102e902439a6fd7bba70c3d20a99361cc33a0ab91f",
+      "exit_code": 0,
+      "totals": {
+        "passed": 163,
+        "failed": 0,
+        "ignored": 0
+      },
+      "targets": [
+        {
+          "target": "unittests src/lib.rs",
+          "passed": 163,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        }
+      ]
+    },
+    {
+      "run": "lightning_sandbox",
+      "log": "/tmp/latefail-lightning-full.log",
+      "log_sha256": "db8c0affb912dc6389be76736df891851919554b9cc108ee733c512a4f9e37ac",
+      "exit_code": 101,
+      "totals": {
+        "passed": 257,
+        "failed": 135,
+        "ignored": 2
+      },
+      "targets": [
+        {
+          "target": "unittests src/lib.rs",
+          "passed": 190,
+          "failed": 77,
+          "ignored": 0,
+          "failed_tests": [
+            "lnbits_tests::tests::create_invoice_5xx_returns_backend_error",
+            "lnbits_tests::tests::create_invoice_auth_error",
+            "lnbits_tests::tests::create_invoice_999_msat_rejected",
+            "lnbits_tests::tests::create_invoice_exactly_1000_msat_succeeds",
+            "lnbits_tests::tests::create_invoice_malformed_json_returns_backend_error",
+            "lnbits_tests::tests::create_invoice_rejects_zero_amount",
+            "lnbits_tests::tests::create_invoice_success",
+            "lnbits_tests::tests::create_invoice_zero_msat_rejected",
+            "lnbits_tests::tests::create_invoice_missing_payment_hash",
+            "lnbits_tests::tests::fresh_provider_is_payment_capable",
+            "lnbits_tests::tests::get_balance",
+            "lnbits_tests::tests::get_balance_missing_fields_returns_zero",
+            "lnbits_tests::tests::get_balance_5xx_returns_backend_error",
+            "lnbits_tests::tests::get_balance_auth_error",
+            "lnbits_tests::tests::get_balance_negative_returns_zero",
+            "lnbits_tests::tests::get_balance_malformed_json_returns_backend_error",
+            "lnbits_tests::tests::get_balance_with_balance_field_instead_of_msat",
+            "lnbits_tests::tests::get_payment_status_malformed_json_returns_backend_error",
+            "lnbits_tests::tests::get_payment_status_no_details_returns_defaults",
+            "lnbits_tests::tests::get_payment_status_pending",
+            "lnbits_tests::tests::get_payment_status_expired",
+            "lnbits_tests::tests::get_payment_status_not_found",
+            "lnbits_tests::tests::get_payment_status_outgoing_direction_from_negative_amount",
+            "lnbits_tests::tests::get_payment_status_settled",
+            "lnbits_tests::tests::get_payment_status_incoming_direction_from_positive_amount",
+            "lnbits_tests::tests::get_payment_status_zero_amount_is_incoming",
+            "lnbits_tests::tests::is_available_returns_true",
+            "lnbits_tests::tests::list_payments_caps_at_100",
+            "lnbits_tests::tests::list_payments_empty",
+            "lnbits_tests::tests::is_available_returns_false_on_5xx",
+            "lnbits_tests::tests::list_payments_malformed_json_returns_backend_error",
+            "lnbits_tests::tests::list_payments_status_mapping",
+            "lnbits_tests::tests::list_payments_parses_direction_and_status",
+            "lnbits_tests::tests::pay_invoice_5xx_returns_backend_error",
+            "lnbits_tests::tests::pay_invoice_auth_error",
+            "lnbits_tests::tests::list_payments_returns_entries",
+            "lnbits_tests::tests::pay_invoice_malformed_json_returns_backend_error",
+            "lnbits_tests::tests::pay_invoice_5xx_marks_payment_incapable",
+            "lnbits_tests::tests::pay_invoice_success",
+            "lnbits_tests::tests::probe_detects_unreachable_api",
+            "lnbits_tests::tests::probe_detects_voidwallet",
+            "lnbits_tests::tests::trailing_slash_in_url_works",
+            "lnbits_tests::tests::successful_payment_clears_incapable_flag",
+            "lnbits_tests::tests::verify_payment_rejects_unsettled",
+            "lnbits_tests::tests::verify_payment_settled",
+            "lnbits_tests::tests::probe_succeeds_with_real_funding_source",
+            "lnd::tests::empty_balance_returns_zero",
+            "lnd::tests::empty_channels_returns_empty_vec",
+            "lnd::tests::garbage_json_returns_backend_error",
+            "lnd::tests::get_node_pubkey_from_mock_lnd",
+            "lnd::tests::http_401_returns_auth_error",
+            "lnd::tests::http_500_list_channels_returns_backend_error",
+            "lnd::tests::http_404_balance_returns_error",
+            "lnd::tests::http_500_marks_payment_incapable",
+            "lnd::tests::keysend_failure_returns_error",
+            "lnd::tests::keysend_invalid_hex_pubkey_returns_error",
+            "lnd::tests::keysend_success_returns_payment_details",
+            "lnd::tests::list_payments_empty_returns_empty_vec",
+            "lnd::tests::list_payments_limit_capped_at_100",
+            "lnd::tests::list_payments_returns_parsed_payments",
+            "lnd::tests::malformed_invoice_missing_payment_request",
+            "lnd::tests::mock_lnd_create_invoice",
+            "lnd::tests::mock_lnd_get_balance",
+            "lnd::tests::mock_lnd_is_available",
+            "lnd::tests::malformed_invoice_missing_r_hash",
+            "lnd::tests::mock_lnd_list_channels",
+            "lnd::tests::mock_lnd_probe_synced",
+            "lnd::tests::pay_invoice_empty_body_returns_error",
+            "lnd::tests::pay_invoice_error_response_returns_payment_failed",
+            "lnd::tests::pay_invoice_mixed_garbage_finds_valid_line",
+            "lnd::tests::pay_invoice_streaming_uses_final_result",
+            "lnd::tests::payment_status_falls_through_to_outgoing_payments",
+            "lnd::tests::payment_status_not_found_in_either",
+            "lnd::tests::payment_status_zero_preimage_filtered",
+            "lnd::tests::payment_status_settled_invoice",
+            "lnd::tests::probe_not_synced_marks_incapable",
+            "lnd::tests::verify_payment_settled_returns_ok"
+          ]
+        },
+        {
+          "target": "tests/channel_capacity.rs",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/cln.rs",
+          "passed": 0,
+          "failed": 21,
+          "ignored": 0,
+          "failed_tests": [
+            "malformed_balances_cannot_become_zero_or_wrapped",
+            "malformed_outgoing_records_and_stalled_history_are_errors",
+            "balances_and_channels_preserve_units_and_unknown_categories",
+            "outgoing_external_retries_prioritize_complete_then_pending_then_latest_failure",
+            "refuses_bad_rune_files",
+            "gate_refuses_unpaid_and_expired_invoices",
+            "creates_invoice_with_unique_labels_and_backend_expiry",
+            "create_invoice_rejects_invalid_bolt11_without_secret_echo",
+            "history_ranks_full_multipart_records_before_truncating",
+            "history_pages_through_short_mpp_pages_merges_newest_and_refreshes_fees",
+            "connects_with_header_only_and_reports_preview_status",
+            "create_invoice_rejects_mismatched_bolt11_payment_hash",
+            "malformed_settlement_and_rpc_errors_fail_closed_without_secret_echo",
+            "amountless_invoices_use_received_amount_only_when_paid",
+            "refuses_unsafe_urls_tls_and_redirects",
+            "t3_invoice_statuses_use_received_amount_and_invoice_precedence",
+            "t3_outgoing_statuses_and_unknown_hash",
+            "t6_keysend_gate_accepts_real_settlement_rejects_forgery_and_underpayment",
+            "unknown_settled_outgoing_amount_is_not_reported_as_zero",
+            "valid_invoice_history_page_can_exceed_getinfo_size_limit",
+            "validates_versions_network_and_untrusted_responses"
+          ]
+        },
+        {
+          "target": "tests/debug_redaction.rs",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/esplora_fallback.rs",
+          "passed": 3,
+          "failed": 15,
+          "ignored": 0,
+          "failed_tests": [
+            "issue66_mixed_key_primary_falls_over_to_healthy_fallback",
+            "issue66_probe_err_on_malformed_success_body",
+            "issue66_probe_err_on_mixed_valid_and_invalid_keys",
+            "esplora_fallback_probe_err_on_http_5xx",
+            "esplora_fallback_probe_err_on_http_404",
+            "issue66_probe_err_on_empty_or_nonpositive_estimates",
+            "esplora_fallback_probe_ok_on_http_200",
+            "esplora_fallback_select_returns_primary_when_primary_healthy",
+            "esplora_fallback_probe_normalizes_trailing_slash",
+            "esplora_fallback_select_switches_to_fallback_when_primary_fails",
+            "esplora_fallback_select_switches_when_primary_returns_5xx",
+            "issue66_probe_err_on_rate_limited_primary",
+            "issue66_probe_ok_on_real_esplora_shape",
+            "issue66_unusable_primary_falls_over_to_healthy_fallback",
+            "issue66_probe_u16_key_boundary"
+          ]
+        },
+        {
+          "target": "tests/fee_rate_safety.rs",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/keysend_dispatch.rs",
+          "passed": 0,
+          "failed": 2,
+          "ignored": 0,
+          "failed_tests": [
+            "local_key_rejection_is_proven_before_dispatch",
+            "missing_or_malformed_remote_results_never_prove_no_dispatch"
+          ]
+        },
+        {
+          "target": "tests/ldk_dispatch_refusals.rs",
+          "passed": 1,
+          "failed": 1,
+          "ignored": 0,
+          "failed_tests": [
+            "real_ldk_route_refusals_are_not_dispatched_and_preserve_capability"
+          ]
+        },
+        {
+          "target": "tests/ldk_event_drain.rs",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/ldk_payment_e2e.rs",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/ldk_shutdown.rs",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/lnd_fee_limits.rs",
+          "passed": 0,
+          "failed": 2,
+          "ignored": 0,
+          "failed_tests": [
+            "invoice_and_keysend_pass_exact_msat_limit_including_zero",
+            "existing_or_unverifiable_invoice_never_posts_and_terminal_failure_stays_typed"
+          ]
+        },
+        {
+          "target": "tests/move_home.rs",
+          "passed": 13,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/move_home_regtest.rs",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/payment_gate_e2e.rs",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/recover.rs",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/recover_regtest.rs",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/recovery_lifecycle.rs",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/scb_producer.rs",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/scb_restore_locked.rs",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/send_onchain_verify.rs",
+          "passed": 1,
+          "failed": 4,
+          "ignored": 0,
+          "failed_tests": [
+            "http_404_means_unconfirmed",
+            "http_200_means_visible",
+            "http_5xx_is_err",
+            "trailing_slash_in_url_is_normalized"
+          ]
+        },
+        {
+          "target": "tests/shared_mock.rs",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/startup_retry.rs",
+          "passed": 1,
+          "failed": 13,
+          "ignored": 0,
+          "failed_tests": [
+            "electrum_startup_failure_never_contacts_esplora_or_fallback",
+            "electrum_sync_failure_is_visible_and_never_contacts_esplora_or_fallback",
+            "persistent_fee_failure_is_bounded_and_actionable",
+            "cancel_during_backoff_stops_retries_and_allows_identity_reuse",
+            "empty_mainnet_fee_data_never_becomes_ready",
+            "occupied_listening_port_is_config_error_without_retry",
+            "cancel_in_flight_fee_timeout_does_not_leave_startup_work",
+            "startup_fee_timeout_after_healthy_preflight_recovers",
+            "bitcoind_sync_failure_is_visible_and_never_contacts_esplora_or_fallback",
+            "invalid_local_config_fails_before_network_io",
+            "transient_fee_failure_recovers_and_preserves_identity",
+            "actual_primary_failure_uses_configured_fallback",
+            "offline_boot_recovers_after_sync_without_duplicate_ldk_tasks"
+          ]
+        },
+        {
+          "target": "tests/stateless_quotes.rs",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "Doc-tests konsensus_lightning",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        }
+      ]
+    },
+    {
+      "run": "lightning_socket_permitted",
+      "log": "/tmp/latefail-lightning-unrestricted.log",
+      "log_sha256": "457f66835cedce6b1417ecd4ee6a4f091c9ca70fee2221255a8295accde70a89",
+      "exit_code": 0,
+      "totals": {
+        "passed": 392,
+        "failed": 0,
+        "ignored": 2
+      },
+      "targets": [
+        {
+          "target": "unittests src/lib.rs",
+          "passed": 267,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/channel_capacity.rs",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/cln.rs",
+          "passed": 21,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/debug_redaction.rs",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/esplora_fallback.rs",
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/fee_rate_safety.rs",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/keysend_dispatch.rs",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/ldk_dispatch_refusals.rs",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/ldk_event_drain.rs",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/ldk_payment_e2e.rs",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/ldk_shutdown.rs",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/lnd_fee_limits.rs",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/move_home.rs",
+          "passed": 13,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/move_home_regtest.rs",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/payment_gate_e2e.rs",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/recover.rs",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/recover_regtest.rs",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/recovery_lifecycle.rs",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/scb_producer.rs",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/scb_restore_locked.rs",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/send_onchain_verify.rs",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/shared_mock.rs",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/startup_retry.rs",
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "tests/stateless_quotes.rs",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        },
+        {
+          "target": "Doc-tests konsensus_lightning",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "failed_tests": []
+        }
+      ]
+    }
+  ]
+}
