@@ -30,12 +30,13 @@ and console-only reset descriptions.
    between this final backup and replacement. If any node starts in between,
    stop cleanly and take a new pre-swap backup. Keep the live config/data on
    the same host/filesystem, and do not re-run `init`.
-2. **Plan for pairing file v7 (#304).** rc15 reads v2–v6 stores and persists
-   `pairing/clients.json` as v7, including device-reset history/generation and
-   observed rolling refusals. Once written, **rc14 refuses v7**. There is no
+2. **Plan for pairing file v7 (#304).** rc15 reads v2–v6 stores and migrates
+   `pairing/clients.json` to v7 on its first write, including device-reset
+   history/generation and observed rolling refusals. Once written, **rc14 refuses v7**. There is no
    reverse migration: do not lower the file version, remove security fields,
-   or restore an older pairing file by itself. Existing grants and their
-   restrictions are retained; upgrading does not replace a legacy grant.
+   or restore an older pairing file by itself. For a v7 file, **do not follow
+   rc14's refusal hint “remove the file to re-pair from scratch”**; preserve
+   the file and use rc15. Existing grants and their restrictions are retained; upgrading does not replace a legacy grant.
 3. **Keep embedded migrations enabled (#306).** Migration
    `029_operation_abandon.sql` is **forward-only** for SQLite and PostgreSQL.
    It adds `abandoned` operations and retention support; SQLite rebuilds the
@@ -48,8 +49,12 @@ and console-only reset descriptions.
    mnemonic-file encryption passwords cannot be empty or whitespace-only;
    init, restore, seed encryption and encrypted bootstrap reject them before
    mnemonic writes. Existing plaintext/encrypted files remain readable.
-   Upgrading alone does not encrypt the seed. If needed, stop the service and
-   use `konsensus seed encrypt --config <path>` before step 1's final backup.
+   Upgrading alone does not encrypt the seed. Before running `seed encrypt`,
+   confirm your offline recovery-phrase backup is complete and readable, and
+   record the new encryption password somewhere safe. The command shreds the
+   plaintext seed file (overwrites, flushes and deletes it). If encryption is
+   needed, stop the service and use `konsensus seed encrypt --config <path>`
+   before step 1's final backup.
    For owner-console approval checks after installing rc15 in step 7, start
    with `--owner-control` and **type the seed password at startup**.
    The seed must be encrypted with no adjacent plaintext `.txt` copy.
@@ -98,17 +103,50 @@ and console-only reset descriptions.
    Restart the same service, reconnect with the existing owner device/pins and
    unlock. Check owner status, chain sync, balances, channels, `channel_safety`,
    offline-safety diagnostics, grant/breaker views and `device_approvals`.
-   Confirm migration 029 applied and the pairing store writes v7. #307 updates
-   locked `quinn-proto` from 0.11.15 to 0.11.18; it needs no operator config
-   change. No backend switch, fresh seed or recovery drill is part of this upgrade.
+   Confirm migration 029 applied with this read-only query, using the actual
+   SQLite database file resolved from the service's `[storage].path` (not a
+   SQLite connection URL or the backup):
+
+   ```sh
+   sqlite3 -readonly /absolute/path/to/live/database.sqlite 'SELECT version FROM _sqlx_migrations WHERE version = 29 AND success = 1;'
+   ```
+
+   Expect `29`. No row or a query error is not evidence that rollback is safe;
+   apply step 8. Inspect `pairing/clients.json`: a retained v6 file can remain
+   v6 until its first write; the first write persists v7 (including an expiry
+   cleanup write). Do not force a pairing mutation merely to change its version.
+   #307 updates locked `quinn-proto` from 0.11.15 to 0.11.18; it needs no
+   operator config change. No backend switch, fresh seed or recovery drill is part of this upgrade.
 8. **Rollback is a matched restore, not a binary swap.** Stop the node and
    preserve the failed-upgrade state for diagnosis. Rollback means restoring
    the coherent **pre-swap backup together with the rc14 binary**, including
    its pre-029 database and pre-v7 pairing store. Never run rc14 against the
    upgraded store or mix old pairing/accounting files with new state.
-   **For embedded LDK, this is only an option before the first LDK start on
-   rc15.** After that, retain the latest live state and roll forward; never
-   start the historical backup. External Lightning backends need their own
+   **For embedded LDK, conservatively treat LDK as started and never restore
+   the pre-swap backup if any of these is true:** rc15 ever reached `UNLOCKED`;
+   rc15 was ever started with a descriptor (`--password-fd`) or `--home`
+   password; migration 029 is recorded as applied; or you cannot tell.
+   Check the live SQLite database read-only:
+
+   ```sh
+   sqlite3 -readonly /absolute/path/to/live/database.sqlite 'SELECT version FROM _sqlx_migrations WHERE version = 29 AND success = 1;'
+   ```
+
+   `29` closes the rollback window. No row/error alone does not open it.
+   In all four cases, **keep the latest state and roll forward**. Restoration
+   is allowed only when none applies and you can establish that rc15 stopped
+   while still `LOCKED` or failed before storage opened. Storage opening
+   applies 029 and is immediately followed by Lightning provider construction;
+   do not wait for a payment or channel change as evidence. Descriptor starts
+   skip the remote `LOCKED` wait; `--home` waits for remote unlock, after which
+   construction proceeds. An active service alone does not prove it is still
+   `LOCKED`.
+   **After the first rc15 unlock**, rename the pre-swap backup's `ldk/` to
+   `ldk.STALE-DO-NOT-RESTORE/` (or quarantine it separately), and add a note
+   with the unlock time and “Stale after rc15 unlock; never restore or run
+   this channel state; keep latest state and roll forward.” Mark it stale
+   likewise if another cutoff above applies. Change only the backup's `ldk/`,
+   never the live directory. External Lightning backends need their own
    reconciliation and recovery policy. Generation 3 and host/volume fences
    do not prove freshness. Do not delete/lower `STATE_GENERATION`, `ldk/INSTANCE`
    or recovery/move-home journals to force startup. See
@@ -130,12 +168,33 @@ confirm it is inactive with no node process left running. Complete and verify
 the protected pre-swap backup in step 1 **before** installing the new binary.
 Only then replace `/usr/bin/konsensus` (or the unit's actual binary path),
 verify the installed version, start the service and inspect its status/logs.
-Wait for LOCKED, reconnect with existing pins, and unlock into UNLOCKED.
+For a remote-unlock/`--home` unit, wait for LOCKED, reconnect with existing
+pins, and unlock into UNLOCKED. A descriptor-password start skips that wait;
+treat it as past the rollback cutoff from startup. After the first rc15
+unlock, mark the backup's `ldk/` stale as in step 8.
 Perform step 7's checks; exercise enrollment, independent approval/reset and
 abandonment only with a compatible client and deliberate test operations.
 Record artifact checksum, version, backup location, migration/pairing versions
-and smoke result in the release evidence. On refusal retain the latest state
-and follow step 8; neither a wipe nor an old SD-image restore is authorized.
+and smoke result in the release evidence.
+
+**On refusal**, retain the latest state and follow step 8. Treat LDK as started
+and never restore the pre-swap backup if rc15 ever reached `UNLOCKED`, ever
+started with a descriptor (`--password-fd`) or `--home` password, migration
+029 is recorded as applied, or you cannot tell. Against the actual live SQLite
+database file, use the read-only command:
+
+```sh
+sqlite3 -readonly /absolute/path/to/live/database.sqlite 'SELECT version FROM _sqlx_migrations WHERE version = 29 AND success = 1;'
+```
+
+`29` closes the rollback window; no row/error alone does not prove safety.
+In all four cases keep the latest state and roll forward. Restore only if none
+applies and rc15 stopped while `LOCKED` or failed before storage opened. After
+the first rc15 unlock (or another cutoff), rename the backup's `ldk/` to
+`ldk.STALE-DO-NOT-RESTORE/` or quarantine it, with a dated note saying it is
+stale and must never be restored/run; do not rename the live `ldk/`. For v7
+pairing files, ignore rc14's “remove the file to re-pair from scratch” hint.
+Neither a wipe nor an old SD-image restore is authorized.
 
 **rc14 preparation (2026-10-09):** seven merged PRs after `v0.3.0-rc13`
 (`d625e85`): #289–#293, #295 and #297. CLN receive/read (#297) is included
