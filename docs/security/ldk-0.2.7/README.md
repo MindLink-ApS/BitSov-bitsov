@@ -8,9 +8,9 @@ The annotated rust-lightning v0.2.7 tag resolves to `5ce2ecb33d32e3b61ef01d5ead0
 
 | Issue | Mainline commit | Actual 0.2 release-branch commit | Build applicability |
 |---|---|---|---|
-| #5057, acknowledged commitment rollback | `e6f108dba271a4de2f9f4a9ec86bf10100bb6a8a` | `7f427fd87ff3c212ca40a511e316a3400fe8d04d` | Core `Channel::channel_reestablish`: normal channel peers can reach it. Retransmission now requires an outstanding remote revocation. |
-| #5042, underfunded LSPS2 forwards | `6f621695542c1bb00e692b7283e49aaee050327f` | `094c5001515938b73daff61cf468ab2f3b32c4b5` | Opt-in hub service: `ldk.rs` -> `set_liquidity_provider_lsps2`, vendored event/liquidity handler -> `LSPS2ServiceHandler::htlc_intercepted`. Requires **both** Lightning and lightning-liquidity fixes. |
-| #4867, Electrum script-history amplification | `b1f8e3f6e1499b1acb3d2b80569c65c75a1b6c4c` | `1aea235f6e1d6f01803c6ddfc14e5d29e93958ea` | Optional `ldk.rs` -> `set_chain_source_electrum`; lightning-transaction-sync now retains registered scripts and prefers a matching non-OP_RETURN output. Esplora/Core do not use this Electrum history path. |
+| #5057, acknowledged commitment rollback | `e6f108dba271a4de2f9f4a9ec86bf10100bb6a8a` | [7f427fd87ff3c212ca40a511e316a3400fe8d04d](https://github.com/lightningdevkit/rust-lightning/commit/7f427fd87ff3c212ca40a511e316a3400fe8d04d) | Core `Channel::channel_reestablish`: normal channel peers can reach it. Retransmission now requires an outstanding remote revocation. |
+| #5042, underfunded LSPS2 forwards | `6f621695542c1bb00e692b7283e49aaee050327f` | [094c5001515938b73daff61cf468ab2f3b32c4b5](https://github.com/lightningdevkit/rust-lightning/commit/094c5001515938b73daff61cf468ab2f3b32c4b5) | Opt-in hub service: `ldk.rs` -> `set_liquidity_provider_lsps2`, vendored event/liquidity handler -> `LSPS2ServiceHandler::htlc_intercepted`. Requires **both** Lightning and lightning-liquidity fixes. |
+| #4867, Electrum script-history amplification | `b1f8e3f6e1499b1acb3d2b80569c65c75a1b6c4c` | [1aea235f6e1d6f01803c6ddfc14e5d29e93958ea](https://github.com/lightningdevkit/rust-lightning/commit/1aea235f6e1d6f01803c6ddfc14e5d29e93958ea) | Optional `ldk.rs` -> `set_chain_source_electrum`; lightning-transaction-sync now retains registered scripts and prefers a matching non-OP_RETURN output. Esplora/Core do not use this Electrum history path. |
 
 All three release-branch commits are included in v0.2.7 and absent from v0.2.6. These are the first 0.2 release tags containing these particular changes. Release source and package source were compared, not inferred from version labels alone. The liquidity crate's generated sync utility files differ from the Git tree as expected for packaging; its LSPS2 service source matches.
 
@@ -39,6 +39,8 @@ All archives downloaded from `https://static.crates.io/crates/<name>/<name>-<ver
 | lightning 0.2.7 | `982ffb82e8362ea95e03a5de8a6004bceb7a577fc1f07d5b02cfc3fc7c930a90` |
 | lightning-liquidity 0.2.7 | `75947be75873138097adb72c080a853ad576a295ac63f73d8fbeb07543c136b1` |
 | lightning-transaction-sync 0.2.7 | `dbcb06ccc3abb415465c396448562a811e4405ea3da893c52ccda31d3ed853ad` |
+| lightning-background-processor 0.2.3 | `994fb200e17bbe125491cbe3f35602180a360484b9763837b9ea2130b7293b5f` |
+| lightning-types 0.3.5 | `c77c676d4a34cceb2ae3756916e446b4d17f9430a24107e099981f0f9aec77e6` |
 | ldk-node 0.7.1 (inspected, not adopted) | `9a890a268dd7430d16ae5a867d73070414beab83fc744b07147aab3a33e38360` |
 
 ## Limits and uncertainties
@@ -59,7 +61,8 @@ independent reviewer confirmed this separately. The sole three-way conflict was
 an old brace-format change overlapping upstream's new
 `BackgroundEvent::AttemptUnblockMonitorUpdates` handler; the upstream handler is
 retained. Local TLV 49 remains unused by upstream (its schema ends at 47).
-The old monitor/reload whitespace-only deltas are absorbed by upstream.
+The old reload whitespace-only delta is absorbed by upstream; the monitor
+whitespace cleanup remains inventoried.
 Node production **and test source** files are byte-identical to `9fdb1480`.
 Node manifest, standalone lock and patch documentation are the only node changes.
 
