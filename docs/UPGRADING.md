@@ -10,7 +10,8 @@ retained data directory without re-running `konsensus init`.
 `be3b00ac535582262157535a5139a7d812939474` plus the reviewed release/upgrade
 docs and this security update on `docs/rc15-release-notes-security`. This
 update changes documentation only; versions remain rc14. Rasmus will select
-the final rc15 release commit and tag/sign separately. See the [signing checklist](releases/v0.3.0-rc15.md).
+the final rc15 release commit and tag/sign separately. See the
+[signing checklist](releases/v0.3.0-rc15.md).
 For nodes skipping releases, apply the earlier procedures first, then
 rc14 → rc15. Historical sections describe their release's behavior; the rc15
 pairing v7 and independent owner-device reset guidance supersede rc14's v6
@@ -47,11 +48,17 @@ existing LDK rollback rule already forbids it. Keep the latest state and roll
 forward. Step 8's reviewed cutoff and narrow restoration exception for a
 failed start before LDK remain unchanged; generation 3 does not make a
 downgrade safe.
+A `ReadFailed` / "Failed to read channel manager from store" start always
+occurs after storage has opened and migrations have run, past step 8's
+cutoff, so it never qualifies for this exception and you must never restore
+the pre-swap backup because of it.
 
 **If startup now fails closed:** look for
-`Failed to read channel manager from store: <error>` in the LDK log. This
+`Failed to read channel manager from store: <error>` in the LDK log
+`ldk_node.log` in the storage directory. This
 returns `BuildError::ReadFailed`; BitSov surfaces
-`failed to build LDK node: Failed to read from store.` The latter can also
+`lightning backend error: failed to build LDK node: Failed to read from store.`
+The latter can also
 refer to other store reads, so use the log to identify the failing component.
 Stop, preserve the latest state, and diagnose storage availability,
 permissions or corruption. **Do not delete or replace the ChannelManager to
